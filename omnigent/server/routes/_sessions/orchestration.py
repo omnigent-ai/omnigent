@@ -11709,6 +11709,14 @@ async def _handle_mcp_tools_call(
 
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
+        if operation_id is not None:
+            # The runner retaining this operation is between tunnel generations;
+            # tell it to wait for the rebind instead of failing its call.
+            return _mcp_error_response(
+                rpc_id,
+                RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
+            )
         return _mcp_error_response(rpc_id, -32000, f"No runner bound for session {session_id!r}")
     try:
         from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S

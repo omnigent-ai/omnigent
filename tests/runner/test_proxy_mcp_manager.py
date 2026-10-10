@@ -10,12 +10,17 @@ Covers:
 - ``call_tool`` -32000 RPC error → JSON error string (soft error, not raised)
 - ``call_tool`` non-32000 RPC error → raises RuntimeError
 - ``call_tool`` network failure → raises RuntimeError
+- ``call_tool`` request lost between runner and server (gateway 502/504,
+  dropped connection) → re-sends the retained operation without replaying it
+- ``call_tool`` re-send budget and reconnect window after long requests and
+  approval waits
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +29,7 @@ import pytest
 
 from omnigent.runner import mcp_execution_registry as mcp_execution_registry_mod
 from omnigent.runner import pending_approvals
+from omnigent.runner import proxy_mcp_manager as proxy_mcp_manager_mod
 from omnigent.runner.mcp_execution_registry import (
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
@@ -372,36 +378,63 @@ async def test_call_tool_happy_path_returns_text() -> None:
     assert call.body["params"]["arguments"] == {"query": "asyncio"}
 
 
+def _input_required(elicitation_id: str, request_state: str, rpc_id: int) -> httpx.Response:
+    """Build the ``input_required`` result the server returns for an ASK gate.
+
+    :param elicitation_id: Server-minted approval id, e.g. ``"elicit_1"``.
+    :param request_state: Opaque state the retry must echo back.
+    :param rpc_id: JSON-RPC id of the request being answered.
+    :returns: A JSON-RPC response carrying the elicitation.
+    """
+    return _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": {
+                "resultType": "input_required",
+                "inputRequests": {
+                    elicitation_id: {
+                        "method": "elicitation/create",
+                        "params": {
+                            "message": "Approve shell command?",
+                            "requestedSchema": {
+                                "type": "object",
+                                "properties": {"approved": {"type": "boolean"}},
+                                "required": ["approved"],
+                            },
+                        },
+                    }
+                },
+                "requestState": request_state,
+            },
+        }
+    )
+
+
+async def _wait_until_registered(elicitation_id: str) -> None:
+    """Yield until ``call_tool`` parks on the approval for ``elicitation_id``."""
+    for _ in range(1000):
+        if pending_approvals.has_pending_elicitation(elicitation_id):
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError(f"approval {elicitation_id} was never registered")
+
+
+class _FakeClock:
+    """Replacement for ``monotonic`` whose time moves only when a test says so."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 @pytest.mark.asyncio
 async def test_call_tool_recreates_approval_after_server_reconnect() -> None:
     """A reconnect discards stale requestState and repeats the original call."""
     old_elicitation = "elicit_old_server"
     new_elicitation = "elicit_new_server"
-
-    def _input_required(elicitation_id: str, request_state: str, rpc_id: int) -> httpx.Response:
-        return _json_resp(
-            {
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "result": {
-                    "resultType": "input_required",
-                    "inputRequests": {
-                        elicitation_id: {
-                            "method": "elicitation/create",
-                            "params": {
-                                "message": "Approve shell command?",
-                                "requestedSchema": {
-                                    "type": "object",
-                                    "properties": {"approved": {"type": "boolean"}},
-                                    "required": ["approved"],
-                                },
-                            },
-                        }
-                    },
-                    "requestState": request_state,
-                },
-            }
-        )
 
     transport = _StubTransport(
         [
@@ -424,13 +457,6 @@ async def test_call_tool_recreates_approval_after_server_reconnect() -> None:
     task = asyncio.create_task(
         manager.call_tool(_make_spec("github"), "sys_os_shell", {"command": "printf ok"})
     )
-
-    async def _wait_until_registered(elicitation_id: str) -> None:
-        for _ in range(1000):
-            if elicitation_id in pending_approvals._pending:
-                return
-            await asyncio.sleep(0.001)
-        raise AssertionError(f"approval {elicitation_id} was never registered")
 
     try:
         await _wait_until_registered(old_elicitation)
@@ -520,10 +546,10 @@ async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
     task = asyncio.create_task(manager.call_tool(None, "github__deploy", {}))
     try:
         for _ in range(1000):
-            if pending_approvals._server_reconnect_waiters:
+            if pending_approvals.has_reconnect_waiters():
                 break
             await asyncio.sleep(0.001)
-        assert pending_approvals._server_reconnect_waiters
+        assert pending_approvals.has_reconnect_waiters()
         clock = 2.0
         pending_approvals.notify_server_reconnect()
 
@@ -539,6 +565,1003 @@ async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
     first_params, retry_params = [call.body["params"] for call in transport.calls]
     assert retry_params == first_params
     assert first_params[MCP_OPERATION_ID_PARAM].startswith("mcpop_")
+
+
+class _DropFirstRequestTransport(httpx.AsyncBaseTransport):
+    """Server stand-in whose first ``tools/call`` is lost on the way back.
+
+    Every request starts or reattaches to the retained runner execution the
+    way ``/mcp/execute`` does, so a test can show the tool ran exactly once.
+
+    :param registry: The runner-side registry shared with the manager.
+    :param first_failure: Builds the status response to return, or the
+        transport error to raise, for the first request only.
+    """
+
+    def __init__(
+        self,
+        registry: McpExecutionRegistry,
+        first_failure: Callable[[], httpx.Response | Exception],
+    ) -> None:
+        self._registry = registry
+        self._first_failure = first_failure
+        self.calls: list[_Call] = []
+        self.external_invocations = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.calls.append(_Call(url=str(request.url), body=body))
+
+        async def _retained_work() -> McpExecutionResult:
+            self.external_invocations += 1
+            return McpExecutionResult(status_code=200, content={"result": {"output": "done"}})
+
+        await self._registry.execute(
+            session_id="conv_test",
+            operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+            step="initial",
+            params={"name": body["params"]["name"], "arguments": body["params"]["arguments"]},
+            run=_retained_work,
+        )
+        if len(self.calls) == 1:
+            failure = self._first_failure()
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+        return _json_resp(
+            {
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {
+                    "content": [{"type": "text", "text": "poll finished"}],
+                    "isError": False,
+                },
+            }
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_failure",
+    [
+        pytest.param(lambda: httpx.Response(502, text="502 Bad Gateway"), id="gateway-502"),
+        pytest.param(
+            lambda: httpx.Response(503, text="503 Service Unavailable"), id="gateway-503"
+        ),
+        pytest.param(lambda: httpx.Response(504, text="504 Gateway Timeout"), id="gateway-504"),
+        pytest.param(
+            lambda: httpx.RemoteProtocolError("Server disconnected without sending a response."),
+            id="connection-dropped",
+        ),
+    ],
+)
+async def test_call_tool_reattaches_after_request_drops_while_server_stays_up(
+    monkeypatch: pytest.MonkeyPatch,
+    first_failure: Callable[[], httpx.Response | Exception],
+) -> None:
+    """A gateway cutoff or dropped connection must not lose a running command's result.
+
+    No server restart happens, so the call re-sends the retained operation
+    without waiting for a new server generation, and the runner-side registry
+    hands back the single execution instead of running the tool again.
+    """
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01)
+    # Keep a wait-for-reconnect failure short instead of hanging the run.
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_SERVER_RECONNECT_WAIT_S", 0.2)
+    registry = McpExecutionRegistry()
+    transport = _DropFirstRequestTransport(registry, first_failure)
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        result = await manager.call_tool(
+            None, "sys_os_shell", {"command": "sleep 400; gh pr checks", "timeout": 600}
+        )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert result == "poll finished"
+    assert transport.external_invocations == 1, "the shell command must not run twice"
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    first_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert retry_params == first_params
+
+
+@pytest.mark.asyncio
+async def test_call_tool_reattaches_after_long_request_detaches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel drop after minutes of execution still gets the full reconnect window.
+
+    The detached reply lands long after the request was sent, so the time the
+    tool spent running must not count against the wait for a replacement server.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(proxy_mcp_manager_mod, "monotonic", clock)
+    registry = McpExecutionRegistry()
+
+    def _detach_after_long_run() -> httpx.Response:
+        clock.now += proxy_mcp_manager_mod._SERVER_RECONNECT_WAIT_S + 60.0
+        pending_approvals.notify_server_reconnect()
+        return _json_resp(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                    "message": "Runner MCP execution detached.",
+                },
+            }
+        )
+
+    transport = _DropFirstRequestTransport(registry, _detach_after_long_run)
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        result = await manager.call_tool(
+            None, "sys_os_shell", {"command": "sleep 400; gh pr checks", "timeout": 600}
+        )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert result == "poll finished"
+    assert transport.external_invocations == 1, "the shell command must not run twice"
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    first_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert retry_params == first_params
+
+
+@pytest.mark.asyncio
+async def test_call_tool_waits_for_rebind_before_resending_detached_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a detached reply the runner re-sends only once its tunnel has rebound.
+
+    A server without the detached-while-unbound reply answers an early re-send
+    with the terminal ``No runner bound`` error, which would lose the result.
+    """
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01)
+    registry = McpExecutionRegistry()
+    rebound = False
+
+    class _LegacyServerTransport(httpx.AsyncBaseTransport):
+        """Reports the execution detached, then refuses calls until the tunnel rebinds."""
+
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+            if len(self.calls) > 1 and not rebound:
+                return _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": {"code": -32000, "message": "No runner bound for session"},
+                    }
+                )
+
+            async def _retained_work() -> McpExecutionResult:
+                self.external_invocations += 1
+                return McpExecutionResult(status_code=200, content={"result": {"output": "ok"}})
+
+            await registry.execute(
+                session_id="conv_test",
+                operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                step="initial",
+                params={"name": body["params"]["name"], "arguments": body["params"]["arguments"]},
+                run=_retained_work,
+            )
+            if len(self.calls) == 1:
+                return _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": {
+                            "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                            "message": "Runner MCP execution detached.",
+                        },
+                    }
+                )
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "rebound"}],
+                        "isError": False,
+                    },
+                }
+            )
+
+    transport = _LegacyServerTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(
+        manager.call_tool(None, "sys_os_shell", {"command": "sleep 400; echo ok", "timeout": 600})
+    )
+    try:
+        for _ in range(1000):
+            if pending_approvals.has_reconnect_waiters():
+                break
+            await asyncio.sleep(0.001)
+        assert pending_approvals.has_reconnect_waiters()
+        # Long enough for a polling runner to re-send and hit the legacy error.
+        await asyncio.sleep(0.05)
+        assert len(transport.calls) == 1, "the runner must not re-send before its tunnel rebinds"
+        rebound = True
+        pending_approvals.notify_server_reconnect()
+
+        assert await task == "rebound"
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.external_invocations == 1, "the shell command must not run twice"
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    first_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert retry_params == first_params
+
+
+@pytest.mark.asyncio
+async def test_call_tool_waits_for_rebind_after_legacy_unbound_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy server's ``No runner bound`` reply is a rebind signal, not a loss.
+
+    A dropped request leaves this runner holding the retained execution. A server
+    without the detached-while-unbound reply answers the early re-send with the
+    terminal ``No runner bound`` error. The runner must read that as the tunnel
+    still being unbound and wait for the rebind, not hand the harness that error
+    and discard the retained result.
+    """
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01)
+    registry = McpExecutionRegistry()
+    rebound = False
+
+    class _LegacyUnboundAfterDropTransport(httpx.AsyncBaseTransport):
+        """Loses the first request, then refuses with the legacy error until rebind."""
+
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+            if len(self.calls) == 2 and not rebound:
+                # The server's tunnel to this runner has not rebound yet, so it
+                # cannot reattach and answers with the legacy error.
+                return _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": {
+                            "code": -32000,
+                            "message": "No runner bound for session 'conv_test'",
+                        },
+                    }
+                )
+
+            async def _retained_work() -> McpExecutionResult:
+                self.external_invocations += 1
+                return McpExecutionResult(status_code=200, content={"result": {"output": "ok"}})
+
+            await registry.execute(
+                session_id="conv_test",
+                operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                step="initial",
+                params={"name": body["params"]["name"], "arguments": body["params"]["arguments"]},
+                run=_retained_work,
+            )
+            if len(self.calls) == 1:
+                # The retained execution keeps running; the response is lost.
+                raise httpx.ReadError("connection reset mid-execution")
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "rebound"}],
+                        "isError": False,
+                    },
+                }
+            )
+
+    transport = _LegacyUnboundAfterDropTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(
+        manager.call_tool(None, "sys_os_shell", {"command": "sleep 400; echo ok", "timeout": 600})
+    )
+    try:
+        for _ in range(1000):
+            if len(transport.calls) >= 2 and pending_approvals.has_reconnect_waiters():
+                break
+            await asyncio.sleep(0.001)
+        assert len(transport.calls) == 2
+        assert pending_approvals.has_reconnect_waiters()
+        # The legacy error must not make the runner hammer the server.
+        await asyncio.sleep(0.05)
+        assert len(transport.calls) == 2, "the runner must not re-send before its tunnel rebinds"
+        rebound = True
+        pending_approvals.notify_server_reconnect()
+
+        assert await task == "rebound"
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.external_invocations == 1, "the shell command must not run twice"
+    assert [call.body["id"] for call in transport.calls] == [1, 2, 3]
+    params_seen = [call.body["params"] for call in transport.calls]
+    assert params_seen[0] == params_seen[1] == params_seen[2]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_resets_rebind_window_when_long_run_detaches_after_short_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long re-run that detaches gets a fresh rebind window despite an earlier drop.
+
+    A brief transport blip starts the reconnect-wait streak. The re-sent request
+    then runs for minutes before the tunnel drops and the server reports it
+    detached. The minutes it ran must not count against the window, so the call
+    waits for the rebind instead of failing immediately with no replacement.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(proxy_mcp_manager_mod, "monotonic", clock)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01)
+    registry = McpExecutionRegistry()
+
+    class _ShortDropThenLongDetachTransport(httpx.AsyncBaseTransport):
+        """Blips on the first request, then runs long and detaches on the re-send."""
+
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+            if len(self.calls) == 2:
+                # The re-sent request runs for minutes, then the tunnel drops and
+                # the server reports the retained execution detached.
+                clock.now += proxy_mcp_manager_mod._SERVER_RECONNECT_WAIT_S + 280.0
+                pending_approvals.notify_server_reconnect()
+                return _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": {
+                            "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                            "message": "Runner MCP execution detached.",
+                        },
+                    }
+                )
+
+            async def _retained_work() -> McpExecutionResult:
+                self.external_invocations += 1
+                return McpExecutionResult(status_code=200, content={"result": {"output": "ok"}})
+
+            await registry.execute(
+                session_id="conv_test",
+                operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                step="initial",
+                params={"name": body["params"]["name"], "arguments": body["params"]["arguments"]},
+                run=_retained_work,
+            )
+            if len(self.calls) == 1:
+                # A brief blip loses the response moments after it was sent.
+                raise httpx.ReadError("brief drop")
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "resumed"}],
+                        "isError": False,
+                    },
+                }
+            )
+
+    transport = _ShortDropThenLongDetachTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        result = await manager.call_tool(
+            None, "sys_os_shell", {"command": "sleep 400; gh pr checks", "timeout": 600}
+        )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert result == "resumed"
+    assert transport.external_invocations == 1, "the shell command must not run twice"
+    assert [call.body["id"] for call in transport.calls] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_resets_rebind_window_on_each_successful_rebind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel that keeps rebinding never exhausts the reconnect window.
+
+    Each short detach-then-rebind cycle proves the runner became reachable
+    again, so the window restarts from the latest rebind. Without the reset a
+    long run of brief flaps would fail the call even though every rebind
+    succeeded; here the window would run out after the sixth detach.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(proxy_mcp_manager_mod, "monotonic", clock)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01)
+    registry = McpExecutionRegistry()
+    cycle_s = 20.0
+    detach_cycles = 9
+
+    class _FlappingRebindTransport(httpx.AsyncBaseTransport):
+        """Rebinds then detaches on every re-send until the last call succeeds."""
+
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+
+            async def _retained_work() -> McpExecutionResult:
+                self.external_invocations += 1
+                return McpExecutionResult(status_code=200, content={"result": {"output": "ok"}})
+
+            await registry.execute(
+                session_id="conv_test",
+                operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                step="initial",
+                params={"name": body["params"]["name"], "arguments": body["params"]["arguments"]},
+                run=_retained_work,
+            )
+            if len(self.calls) <= detach_cycles:
+                # The tunnel rebinds right away, then drops again before the
+                # re-send reaches the runner; each flap stays under the long-run
+                # threshold so only a reset keeps the window alive.
+                clock.now += cycle_s
+                pending_approvals.notify_server_reconnect()
+                return _json_resp(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "error": {
+                            "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                            "message": "Runner MCP execution detached.",
+                        },
+                    }
+                )
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "resumed"}],
+                        "isError": False,
+                    },
+                }
+            )
+
+    transport = _FlappingRebindTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        result = await manager.call_tool(
+            None, "sys_os_shell", {"command": "sleep 400; gh pr checks", "timeout": 600}
+        )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert result == "resumed"
+    assert transport.external_invocations == 1, "the shell command must not run twice"
+    assert len(transport.calls) == detach_cycles + 1
+
+
+@pytest.mark.asyncio
+async def test_call_tool_resets_rebind_window_on_each_rebind_after_transport_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The transport-loss retry window also restarts on each successful rebind.
+
+    Quick transport failures start the reconnect streak; the tunnel reconnects
+    near the original deadline and more quick failures follow. The window must
+    restart from the latest rebind, as the detached-reply branch does, so the
+    call recovers instead of expiring against the stale deadline. Without the
+    reset the window would run out after the sixth drop.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(proxy_mcp_manager_mod, "monotonic", clock)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01)
+    registry = McpExecutionRegistry()
+    cycle_s = 20.0
+    drop_cycles = 8
+
+    class _FlappingDropTransport(httpx.AsyncBaseTransport):
+        """Rebinds then drops the next re-send in transit until the last call."""
+
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+
+            async def _retained_work() -> McpExecutionResult:
+                self.external_invocations += 1
+                return McpExecutionResult(status_code=200, content={"result": {"output": "ok"}})
+
+            await registry.execute(
+                session_id="conv_test",
+                operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                step="initial",
+                params={"name": body["params"]["name"], "arguments": body["params"]["arguments"]},
+                run=_retained_work,
+            )
+            if len(self.calls) <= drop_cycles:
+                # The tunnel rebinds right away, then the next re-send drops in
+                # transit; each flap stays under the long-run threshold so only
+                # a reset keeps the window alive.
+                clock.now += cycle_s
+                pending_approvals.notify_server_reconnect()
+                raise httpx.ReadError("brief drop")
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "resumed"}],
+                        "isError": False,
+                    },
+                }
+            )
+
+    transport = _FlappingDropTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        result = await manager.call_tool(
+            None, "sys_os_shell", {"command": "sleep 400; gh pr checks", "timeout": 600}
+        )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert result == "resumed"
+    assert transport.external_invocations == 1, "the shell command must not run twice"
+    assert len(transport.calls) == drop_cycles + 1
+
+
+@pytest.mark.asyncio
+async def test_call_tool_returns_unrelated_server_error_without_waiting_for_rebind() -> None:
+    """A ``-32000`` that is not the unbound-runner reply is surfaced at once.
+
+    The retained operation is still registered, so only the exact unbound-runner
+    message may start the rebind wait. Any other server-defined error, such as a
+    tool denial, returns to the harness immediately rather than stalling.
+    """
+    registry = McpExecutionRegistry()
+
+    class _DenyAfterRetainTransport(httpx.AsyncBaseTransport):
+        """Retains the operation, then answers with an unrelated ``-32000``."""
+
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+
+            async def _retained_work() -> McpExecutionResult:
+                self.external_invocations += 1
+                return McpExecutionResult(status_code=200, content={"result": {"output": "ok"}})
+
+            await registry.execute(
+                session_id="conv_test",
+                operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                step="initial",
+                params={"name": body["params"]["name"], "arguments": body["params"]["arguments"]},
+                run=_retained_work,
+            )
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "error": {"code": -32000, "message": "Tool call denied by policy"},
+                }
+            )
+
+    transport = _DenyAfterRetainTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        result = await asyncio.wait_for(
+            manager.call_tool(
+                None, "sys_os_shell", {"command": "sleep 400; gh pr checks", "timeout": 600}
+            ),
+            timeout=10.0,
+        )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert json.loads(result) == {"error": "Tool call denied by policy"}
+    assert [call.body["id"] for call in transport.calls] == [1], (
+        "an unrelated -32000 must not trigger a re-send"
+    )
+    assert not pending_approvals.has_reconnect_waiters()
+
+
+@pytest.mark.asyncio
+async def test_call_tool_budget_restarts_after_user_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hours spent waiting for an approval leave the whole budget for the approved call."""
+    clock = _FakeClock()
+    monkeypatch.setattr(proxy_mcp_manager_mod, "monotonic", clock)
+    elicitation = "elicit_long_wait"
+    registry = McpExecutionRegistry()
+
+    class _ApproveAfterLongWaitTransport(httpx.AsyncBaseTransport):
+        """Asks for approval, then answers the approved call a full budget later."""
+
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+            if len(self.calls) == 1:
+                return _input_required(elicitation, "approved-state", body["id"])
+
+            async def _retained_work() -> McpExecutionResult:
+                self.external_invocations += 1
+                return McpExecutionResult(status_code=200, content={"result": {"output": "ok"}})
+
+            await registry.execute(
+                session_id="conv_test",
+                operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                step="retry",
+                params={"name": body["params"]["name"], "arguments": body["params"]["arguments"]},
+                run=_retained_work,
+            )
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "approved and done"}],
+                        "isError": False,
+                    },
+                }
+            )
+
+    transport = _ApproveAfterLongWaitTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(
+        manager.call_tool(None, "sys_os_shell", {"command": "sleep 300; echo ok", "timeout": 600})
+    )
+    try:
+        await _wait_until_registered(elicitation)
+        clock.now += proxy_mcp_manager_mod.MCP_PROXY_CALL_TIMEOUT_S + 3_600.0
+        assert pending_approvals.resolve(elicitation, approved=True)
+
+        assert await task == "approved and done"
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.external_invocations == 1, "the approved command must not run twice"
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    _, approved_params = [call.body["params"] for call in transport.calls]
+    assert elicitation in approved_params["inputResponses"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_cannot_recover_an_approved_call_lost_after_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An approved call whose reply is lost cannot be replayed; the server rejects it.
+
+    The server consumes the elicitation on the first approved request, so a
+    re-send after a gateway drop gets ``Elicitation not found`` instead of the
+    retained result. This known limitation surfaces as a soft error, not a hang.
+    """
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01)
+    elicitation = "elicit_lost_reply"
+    registry = McpExecutionRegistry()
+
+    class _ApproveThenLoseReplyTransport(httpx.AsyncBaseTransport):
+        """Asks for approval, loses the approved reply, then rejects the re-send."""
+
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+            if len(self.calls) == 1:
+                return _input_required(elicitation, "approved-state", body["id"])
+            if len(self.calls) == 2:
+
+                async def _retained_work() -> McpExecutionResult:
+                    self.external_invocations += 1
+                    return McpExecutionResult(
+                        status_code=200, content={"result": {"output": "ok"}}
+                    )
+
+                await registry.execute(
+                    session_id="conv_test",
+                    operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                    step="retry",
+                    params={
+                        "name": body["params"]["name"],
+                        "arguments": body["params"]["arguments"],
+                    },
+                    run=_retained_work,
+                )
+                return httpx.Response(502, text="502 Bad Gateway")
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "error": {
+                        "code": -32000,
+                        "message": "Elicitation not found or already resolved",
+                    },
+                }
+            )
+
+    transport = _ApproveThenLoseReplyTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(
+        manager.call_tool(None, "sys_os_shell", {"command": "sleep 300; echo ok", "timeout": 600})
+    )
+    try:
+        await _wait_until_registered(elicitation)
+        assert pending_approvals.resolve(elicitation, approved=True)
+
+        result = await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert json.loads(result) == {"error": "Elicitation not found or already resolved"}
+    assert transport.external_invocations == 1, "the approved command must not run twice"
+    assert [call.body["id"] for call in transport.calls] == [1, 2, 3]
+    approved_params, retry_params = [call.body["params"] for call in transport.calls[1:]]
+    assert retry_params == approved_params
+    assert elicitation in retry_params["inputResponses"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_non_gateway_http_error_raises_without_retry() -> None:
+    """Only gateway statuses mean the request was lost; a 500 is a terminal failure."""
+    transport = _StubTransport([_json_resp({"detail": "boom"}, status=500)])
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=McpExecutionRegistry(),
+    )
+
+    with pytest.raises(RuntimeError, match="500"):
+        await manager.call_tool(None, "sys_os_shell", {"command": "true"})
+    await client.aclose()
+
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_call_tool_gateway_error_without_retained_operation_raises() -> None:
+    """Without a runner-side operation to reattach to, a gateway error is reported as-is."""
+    transport = _StubTransport([_json_resp({}, status=502)])
+    manager = _make_manager(transport)
+
+    with pytest.raises(RuntimeError, match="502"):
+        await manager.call_tool(None, "sys_os_shell", {"command": "true"})
+
+    assert len(transport.calls) == 1
+
+
+class _CountingFailureTransport(httpx.AsyncBaseTransport):
+    """Transport that fails every request the same way and counts attempts.
+
+    :param failure: Builds the status response to return, or the error to raise.
+    """
+
+    def __init__(self, failure: Callable[[], httpx.Response | Exception]) -> None:
+        self._failure = failure
+        self.attempts = 0
+        self.read_timeouts: list[float] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.attempts += 1
+        self.read_timeouts.append(request.extensions["timeout"]["read"])
+        failure = self._failure()
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+
+
+@pytest.mark.asyncio
+async def test_call_tool_stops_reattaching_when_no_server_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fast refusals keep today's bounded reconnect window instead of the whole call budget."""
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_SERVER_RECONNECT_WAIT_S", 0.1)
+    transport = _CountingFailureTransport(lambda: httpx.ConnectError("connection refused"))
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=McpExecutionRegistry(),
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        with pytest.raises(RuntimeError, match="no replacement connected") as exc_info:
+            await manager.call_tool(None, "sys_os_shell", {"command": "true"})
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert "connection refused" in str(exc_info.value)
+    assert transport.attempts > 1, "the retained operation must be re-sent before giving up"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_reattach_loop_is_bounded_by_the_call_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated cutoffs of long requests stop at the proxy call budget.
+
+    Each re-send may only read for the budget that is left, and nothing is sent
+    once the budget is spent, so the whole call ends within the budget.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(proxy_mcp_manager_mod, "monotonic", clock)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.001)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "MCP_PROXY_CALL_TIMEOUT_S", 100.0)
+
+    def _cut_after_forty_seconds() -> httpx.Response:
+        clock.now += 40.0
+        return httpx.Response(502, text="502 Bad Gateway")
+
+    transport = _CountingFailureTransport(_cut_after_forty_seconds)
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=McpExecutionRegistry(),
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        with pytest.raises(RuntimeError, match="did not complete within 100s") as exc_info:
+            await manager.call_tool(None, "sys_os_shell", {"command": "sleep 400"})
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert "502" in str(exc_info.value)
+    assert transport.read_timeouts == [100.0, 60.0, 20.0]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_overall_deadline_bounds_a_slow_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single attempt that stays in flight past the budget still ends the call.
+
+    httpx's read timeout resets on every byte, so a slow-drip response that
+    never stalls long enough to trip it could outlive the budget; the overall
+    deadline must end such an attempt even though its read timeout never fires.
+    """
+    monkeypatch.setattr(proxy_mcp_manager_mod, "MCP_PROXY_CALL_TIMEOUT_S", 2.0)
+
+    class _NeverCompletingTransport(httpx.AsyncBaseTransport):
+        """Holds the response open past the budget without tripping a read timeout."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.calls += 1
+            await asyncio.sleep(30.0)
+            return _json_resp({"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    transport = _NeverCompletingTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=McpExecutionRegistry(),
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        with pytest.raises(RuntimeError, match="did not complete within"):
+            await asyncio.wait_for(
+                manager.call_tool(None, "sys_os_shell", {"command": "sleep 600"}),
+                timeout=10.0,
+            )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.calls == 1
 
 
 @pytest.mark.asyncio
@@ -708,8 +1731,8 @@ async def test_call_tool_uses_configured_read_timeout() -> None:
 
     timeout = captured["timeout"]
     assert isinstance(timeout, dict), "httpx records the timeout as a per-op dict"
-    assert timeout["read"] == MCP_PROXY_CALL_TIMEOUT_S, (
-        "ProxyMcpManager must pass MCP_PROXY_CALL_TIMEOUT_S as the read timeout; "
+    assert timeout["read"] == pytest.approx(MCP_PROXY_CALL_TIMEOUT_S, abs=1.0), (
+        "ProxyMcpManager must pass the MCP_PROXY_CALL_TIMEOUT_S budget as the read timeout; "
         "otherwise call_tool may regress to httpx's shorter default."
     )
     assert timeout["connect"] == 10.0, "Connect timeout stays short to fail fast on a dead server"
