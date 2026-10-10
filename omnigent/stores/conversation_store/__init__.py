@@ -75,6 +75,11 @@ FORK_CARRY_HISTORY_LABEL_KEY = "omnigent.fork.carry_history"
 # normal approval/sandbox stance.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
+# When ``"1"``, the runner launches Claude Code on its native ``~/.claude``
+# config, skipping provider/ucode resolution (no gateway env, no ``--model``).
+# Set by ``omnigent claude --use-native-config``; label-persisted since launch is daemon-routed.
+CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY = "omnigent.claude_native.use_native_config"
+
 # Reserved label key that stores a session's sidebar "project" membership
 # (implicit collections — a project exists while ≥1 session carries this key).
 # Namespaced so it never collides with the user-facing "project" term or other

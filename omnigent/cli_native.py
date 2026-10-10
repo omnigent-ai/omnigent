@@ -142,7 +142,10 @@ def register_native_commands(cli: click.Group) -> None:
         help=(
             "Use your existing Claude Code configuration instead of Databricks auth. "
             "When set, any configured provider is ignored and Claude "
-            "authenticates via its own ``~/.claude/`` settings."
+            "authenticates via its own ``~/.claude/`` settings. The choice sticks "
+            "to the session: resuming it later without this flag does not turn it "
+            "back off. It takes effect the next time the session's terminal "
+            "launches, not on an already-running one."
         ),
     )
     @click.option(
