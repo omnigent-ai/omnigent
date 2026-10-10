@@ -9,9 +9,13 @@ falls back to the PTY watcher when the file never appears or vanishes.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
+import pytest
+
+from omnigent.harnesses.claude_native import status_file as status_file_module
 from omnigent.harnesses.claude_native.status_file import (
     IDLE,
     RUNNING,
@@ -19,6 +23,7 @@ from omnigent.harnesses.claude_native.status_file import (
     read_session_status,
     resolve_status_file,
     sessions_dir,
+    SessionStatus,
 )
 
 
@@ -359,6 +364,49 @@ def test_resync_republishes_an_unchanged_file(tmp_path: Path) -> None:
     # Still reading the same resolved file — a resync re-asserts a working
     # poller rather than restarting resolution.
     assert poller.active is True
+
+
+def test_resync_requested_mid_read_is_applied_by_the_next_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resync that lands while a tick is reading is not lost to that tick.
+
+    ``resync()`` is called from the event loop while ticks run on the watcher
+    thread, so it only sets a flag: the tick that was mid-read finishes with its
+    own baselines, and the following tick drops them and republishes the
+    retained ``busy`` value.
+    """
+    sessions = tmp_path / "sessions"
+    path = _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    published: list[tuple[str, str | None]] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, reason: published.append((status, reason)),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    assert published == [(RUNNING, None)]
+
+    # The file is rewritten with the same value, so the next tick re-reads it;
+    # the resync request arrives in the middle of that read.
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+    real_read = status_file_module.read_session_status
+
+    def _read_with_resync(file: Path) -> SessionStatus | None:
+        poller.resync()
+        return real_read(file)
+
+    monkeypatch.setattr(status_file_module, "read_session_status", _read_with_resync)
+    poller.tick()
+    monkeypatch.setattr(status_file_module, "read_session_status", real_read)
+    assert published == [(RUNNING, None)], "the mid-read tick keeps its own unchanged edge"
+
+    poller.tick()
+    assert published == [(RUNNING, None), (RUNNING, None)], (
+        "the tick after the request must re-assert the retained busy value"
+    )
 
 
 def test_resync_does_not_revive_a_retired_poller(tmp_path: Path) -> None:

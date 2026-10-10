@@ -832,3 +832,39 @@ async def test_pane_activity_of_another_native_harness_does_not_rearm(
 
     assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is None
     assert CHILD_SESSION_ID in subagent_work._drained_delivered_subagent_children
+
+
+@pytest.mark.asyncio
+async def test_pane_idle_of_another_native_harness_does_not_settle_an_events_rearm(
+    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-claude worker re-armed on ``/events`` is not rolled back by a pane lull.
+
+    Its pane watcher publishes a quiescence ``idle`` mid-turn and no pane
+    ``running`` could cancel a settle, so no settle may be scheduled for it; the
+    forwarder's terminal edge settles the dispatch.
+    """
+    held = _HeldSleep()
+    monkeypatch.setattr(subagent_work, "_wake_retry_sleep", held)
+    server = _ChildSnapshotServerClient()
+    app, inbox, work_id = _dispatch_worker(server)
+    _pin_child_harness(app, harness="codex-native")
+    publish_pane_status = _pane_status_publisher(app)
+
+    async with _runner_client(app) as client:
+        await _deliver_and_drain_round_one(client, inbox, server)
+        r2_running = await _post_status(client, status="running")
+        assert r2_running.status_code == 204
+        live = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+        assert live is not None and live.rearmed and live.status == "running"
+
+        publish_pane_status(CHILD_SESSION_ID, "idle", None)
+        await _let_settle_run()
+        assert held.calls == [] and not app.state.rearm_settle_tasks
+        assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is live
+
+        r2_idle = await _post_status(
+            client, status="idle", output="round two: should I open the PR?", turn_completed=True
+        )
+        assert r2_idle.status_code == 204
+        _assert_fresh_result(_drain_queue(inbox), work_id=work_id)

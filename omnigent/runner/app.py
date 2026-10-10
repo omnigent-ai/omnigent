@@ -1660,6 +1660,11 @@ def create_runner_app(
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            _logger.warning(
+                "Sub-agent re-arm settle skipped off-loop for %s; the dispatch may stay live",
+                child_id,
+                extra={"session_id": child_id},
+            )
             return
 
         async def _settle() -> None:
@@ -1702,14 +1707,17 @@ def create_runner_app(
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
-        if status in ("running", "waiting"):
+        if status in ("running", "waiting", "idle") and (
+            _session_harness_name(session_id) == "claude-native"
+        ):
             # Claude's status-file poller publishes a claude-native child's
-            # ``running`` here, never on ``/events``. Other harnesses' pane
-            # repaints also arrive here and do not mark a new turn.
-            if _session_harness_name(session_id) == "claude-native":
+            # ``running`` here, never on ``/events``, and only its stale ``busy``
+            # needs settling. Other harnesses' pane repaints also arrive here and
+            # neither mark nor end a turn.
+            if status == "idle":
+                _settle_subagent_rearm_later(session_id)
+            else:
                 _note_subagent_child_activity(session_id)
-        elif status == "idle":
-            _settle_subagent_rearm_later(session_id)
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
