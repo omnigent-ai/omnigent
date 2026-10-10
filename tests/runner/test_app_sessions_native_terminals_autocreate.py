@@ -1540,6 +1540,63 @@ async def test_auto_create_claude_terminal_inherits_agent_sandbox(
     await fake_client.aclose()
 
 
+async def _run_auto_create_ucode_gateway_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_id: str,
+    ucode: Any,
+) -> tuple[Any, dict[str, Any]]:
+    """Drive host-spawned ``_auto_create_claude_terminal`` with a stub ucode gateway.
+
+    Applies the shared managed-launch setup (trusted bridge roots, an isolated
+    ``auth:`` config home, a no-op forwarder, and ``_ucode_config_for_profile``
+    returning ``ucode``) and returns the launch spec and recorded configs.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    # The supported credential source for a host-spawned runner: the global
+    # config's ``auth:`` block, isolated to a temp config home so the
+    # developer's real config can't leak in.
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "auth:\n  type: databricks\n  profile: test-profile\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    # The runner imports ``_ucode_config_for_profile`` from
+    # ``omnigent.harnesses.claude_native.main`` per call, so patch it at the source.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._ucode_config_for_profile",
+        lambda profile, *, refresh_models=True: ucode,
+    )
+
+    captured: dict[str, Any] = {}
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"labels": {}}),
+        ),
+    )
+    recorded_configs: dict[str, Any] = {}
+    try:
+        await _auto_create_claude_terminal(
+            session_id,
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            record_launch_config=recorded_configs.__setitem__,
+        )
+    finally:
+        await fake_client.aclose()
+    return captured["spec"], recorded_configs
+
+
 @pytest.mark.asyncio
 async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     tmp_path: Path,
@@ -1563,25 +1620,6 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
-    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
-    # The supported credential source for a host-spawned runner: the
-    # global config's ``auth:`` block (written by ``omnigent setup``),
-    # isolated to a temp config home so the developer's real config
-    # can't leak in.
-    config_home = tmp_path / "config-home"
-    config_home.mkdir()
-    (config_home / "config.yaml").write_text(
-        "auth:\n  type: databricks\n  profile: test-profile\n"
-    )
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
-
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
-        _no_op_forwarder,
-    )
-
     gateway_env = {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}
     ucode = ClaudeNativeUcodeConfig(
         env=dict(gateway_env),
@@ -1598,32 +1636,13 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
             "claude-sonnet-5": "databricks-claude-sonnet-5",
         },
     )
-    # The runner imports ``_ucode_config_for_profile`` from
-    # ``omnigent.harnesses.claude_native.main`` per call, so patch it at the source.
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.main._ucode_config_for_profile",
-        lambda profile, *, refresh_models=True: ucode,
+
+    spec, recorded_configs = await _run_auto_create_ucode_gateway_launch(
+        tmp_path,
+        monkeypatch,
+        session_id="13efa494411f3ae60211e6be5635062a",
+        ucode=ucode,
     )
-
-    captured: dict[str, Any] = {}
-
-    fake_client = httpx.AsyncClient(
-        base_url="http://test-server",
-        transport=httpx.MockTransport(
-            lambda req: httpx.Response(200, json={"labels": {}}),
-        ),
-    )
-    recorded_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
-
-    await _auto_create_claude_terminal(
-        "13efa494411f3ae60211e6be5635062a",
-        _RecordingClaudeRegistry(captured),
-        lambda _sid, _evt: None,
-        server_client=fake_client,
-        record_launch_config=recorded_configs.__setitem__,
-    )
-
-    spec = captured["spec"]
     # The gateway env points ``claude`` at the Databricks gateway, and
     # ENABLE_TOOL_SEARCH forces Claude Code to defer MCP tool schemas
     # instead of loading all 200+ bridge tools into startup context.
@@ -1634,9 +1653,11 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     }
     assert spec.command == "claude"
-    # The gateway default model is applied (no per-session override here).
+    # The gateway default model is applied (no per-session override here);
+    # a managed 1M-capable Opus/Sonnet launch carries the [1m] window marker
+    # so Claude Code sizes the session at 1M rather than its 200K default.
     assert "--model" in spec.args
-    assert spec.args[spec.args.index("--model") + 1] == "databricks-claude-opus-4-7"
+    assert spec.args[spec.args.index("--model") + 1] == "databricks-claude-opus-4-7[1m]"
     # The apiKeyHelper is registered in private settings, not subprocess argv.
     assert all("sk-sentinel-do-not-use" not in arg for arg in spec.args)
     settings = _load_claude_invocation_settings(spec.args)
@@ -1646,9 +1667,51 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         "claude-opus-4-8": "databricks-claude-opus-4-8",
         "claude-sonnet-5": "databricks-claude-sonnet-5",
     }
+    # The recorded config stays bare: the [1m] marker rides only the launched
+    # --model, so a resume re-derives it from the same config without the
+    # window pin leaking into the stored env.
     assert recorded_configs == {"13efa494411f3ae60211e6be5635062a": ucode}
 
-    await fake_client.aclose()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "session_id"),
+    [
+        # Haiku serves only 200K at every version.
+        ("databricks-claude-haiku-4-5", "9f8e7d6c5b4a39281706f5e4d3c2b1a0"),
+        # Opus 4.5 predates the 4.6 that first serves 1M, so it stays 200K.
+        ("databricks-claude-opus-4-5", "a1b2c3d4e5f60718293a4b5c6d7e8f90"),
+    ],
+)
+async def test_auto_create_claude_terminal_leaves_a_non_1m_launch_at_the_default_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    session_id: str,
+) -> None:
+    """A 200K-only launch is left unmarked, with an unchanged recorded config."""
+    from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+
+    canonical = model.removeprefix("databricks-")
+    ucode = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"},
+        api_key_helper="printf %s sk-sentinel-do-not-use",
+        model=model,
+        routable_models=(model,),
+        model_overrides={canonical: model},
+    )
+
+    spec, recorded_configs = await _run_auto_create_ucode_gateway_launch(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        ucode=ucode,
+    )
+
+    # A 200K-only model keeps a bare launch id: no [1m] marker.
+    launched = spec.args[spec.args.index("--model") + 1]
+    assert launched == model
+    assert recorded_configs == {session_id: ucode}
 
 
 @pytest.mark.asyncio
@@ -4243,6 +4306,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     session_id: str,
     routed: bool,
     auto_harness: bool = False,
+    custom_slot: str = "workspace-picker-row",
 ) -> Any:
     """Drive the claude-native launch and return the captured terminal spec.
 
@@ -4276,7 +4340,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
         env={
             "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
             "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
-            "ANTHROPIC_CUSTOM_MODEL_OPTION": "workspace-picker-row",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": custom_slot,
             "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Workspace pick",
         },
         api_key_helper="printf %s sk-sentinel-do-not-use",
@@ -4408,10 +4472,39 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
 
     assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
     assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
-    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+    # The custom-slot pin tracks the launched 1M-capable Opus, so it carries the
+    # same [1m] window marker the launch model does.
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7[1m]"
     # A pinned session's spawns stay on the claude family, so it gets neither
     # the routed-spawn note nor the pre-approvals the cross-family hop needs.
     assert "--append-system-prompt" not in spec.args
+
+
+async def test_a_routed_launch_remarks_a_bare_matching_custom_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A custom slot already holding the launch id bare is rewritten with [1m].
+
+    A resumed session may re-enter with its own id already parked in the custom
+    slot but bare. Reading the normalized match as "already pinned" would leave
+    the slot bare and ``/model`` would re-select it at 200K, so the routed
+    launch must rewrite the slot to the marked id to keep the 1M window.
+    """
+    from omnigent.models.claude_model_vocabulary import claude_model_command_arg
+
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f604",
+        routed=True,
+        custom_slot="databricks-claude-opus-4-7",
+    )
+
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7[1m]"
+    assert (
+        claude_model_command_arg("databricks-claude-opus-4-7[1m]", spec.env)
+        == "databricks-claude-opus-4-7[1m]"
+    )
 
 
 async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_routed(
@@ -4437,7 +4530,8 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
     # The whole routed apparatus, not just the spawn note.
     assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
     assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
-    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+    # The custom-slot pin tracks the launched 1M-capable Opus and carries [1m].
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7[1m]"
     # And the auto-harness extras, which only make sense alongside the router.
     assert "--append-system-prompt" in spec.args
     allowed = spec.args[spec.args.index("--allowedTools") + 1]
@@ -4556,7 +4650,8 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         assert args[args.index("--model") + 1] == selected_model
         assert pick_resets == []
     else:
-        assert args[args.index("--model") + 1] == "system.ai.claude-opus-5"
+        # The folded reset lands on the gateway default Opus, marked [1m].
+        assert args[args.index("--model") + 1] == "system.ai.claude-opus-5[1m]"
         assert pick_resets == [{"model_override": "default"}]
 
     await fake_client.aclose()
@@ -4821,7 +4916,7 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
     ("pin", "custom_option", "expected_launch"),
     [
         ("system.ai.claude-opus-4-8[1m]", None, "claude-opus-4-8[1m]"),
-        ("sonnet_5", "system.ai.claude-sonnet-5", "claude-sonnet-5"),
+        ("sonnet_5", "system.ai.claude-sonnet-5", "claude-sonnet-5[1m]"),
     ],
     ids=["gateway-namespace-pin", "custom-slot-pin"],
 )
