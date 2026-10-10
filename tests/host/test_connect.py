@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -7971,6 +7972,7 @@ async def test_handle_import_local_exact_id_does_not_list_sessions(
 
 async def test_handle_import_local_reports_unreadable_sessions_as_failed(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A session that fails to load sends no frame but is counted on the done frame."""
     from omnigent.host.frames import (
@@ -8011,10 +8013,11 @@ async def test_handle_import_local_reports_unreadable_sessions_as_failed(
         async def send(self, text: str) -> None:
             sent.append(text)
 
-    await host._handle_import_local(
-        _FakeWs(),  # type: ignore[arg-type]
-        HostImportLocalFrame(request_id="req_fail", source="all", limit=5),
-    )
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
+        await host._handle_import_local(
+            _FakeWs(),  # type: ignore[arg-type]
+            HostImportLocalFrame(request_id="req_fail", source="all", limit=5),
+        )
 
     frames = [decode_host_frame(text) for text in sent]
     session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
@@ -8033,10 +8036,17 @@ async def test_handle_import_local_reports_unreadable_sessions_as_failed(
             "reason": "This session's transcript could not be read.",
         }
     ]
+    # ERROR records ship to the debug-log sink and count against session reliability.
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and r.name == "omnigent.host.connect"
+    ] == []
 
 
 async def test_handle_import_local_unexpected_error_skips_only_that_session(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An unexpected error loading one session must not abort the whole batch.
 
@@ -8084,10 +8094,11 @@ async def test_handle_import_local_unexpected_error_skips_only_that_session(
         async def send(self, text: str) -> None:
             sent.append(text)
 
-    await host._handle_import_local(
-        _FakeWs(),  # type: ignore[arg-type]
-        HostImportLocalFrame(request_id="req_boom", source="all", limit=5),
-    )
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
+        await host._handle_import_local(
+            _FakeWs(),  # type: ignore[arg-type]
+            HostImportLocalFrame(request_id="req_boom", source="all", limit=5),
+        )
 
     frames = [decode_host_frame(text) for text in sent]
     session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
@@ -8106,6 +8117,81 @@ async def test_handle_import_local_unexpected_error_skips_only_that_session(
             "reason": "This session could not be read.",
         }
     ]
+    # ERROR records ship to the debug-log sink and count against session reliability.
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and r.name == "omnigent.host.connect"
+    ] == []
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (ValueError("truncated transcript"), "This session's transcript could not be read."),
+        (RuntimeError("normalizer blew up"), "This session could not be read."),
+    ],
+    ids=["expected-read-error", "unexpected-error"],
+)
+async def test_handle_import_local_recovered_skip_logs_below_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    reason: str,
+) -> None:
+    """Both skip sites (the loader's expected read failures and a surprise exception
+    type) count the session on the done frame and log below ERROR, naming the cause."""
+    from omnigent.host.frames import HostImportLocalDoneFrame, decode_host_frame
+
+    host = _make_host_process()
+
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "bad")]
+
+    def _fake_load(source: str, session_id: str) -> NoReturn:
+        raise error
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    with caplog.at_level(logging.DEBUG, logger="omnigent.host.connect"):
+        await host._handle_import_local(
+            _FakeWs(),  # type: ignore[arg-type]
+            HostImportLocalFrame(request_id="req_skiplog", source="all", limit=5),
+        )
+
+    # The recovery itself still holds: skip counted with its reason, stream closed ok.
+    done_frames = [
+        f
+        for f in (decode_host_frame(text) for text in sent)
+        if isinstance(f, HostImportLocalDoneFrame)
+    ]
+    assert len(done_frames) == 1
+    assert done_frames[0].status == "ok" and done_frames[0].failed == 1
+    assert done_frames[0].failures == [
+        {"external_session_id": "bad", "source": "claude", "reason": reason}
+    ]
+
+    # One WARNING diagnostic naming the cause, with the traceback kept at DEBUG.
+    skip_records = [r for r in caplog.records if "id='bad'" in r.getMessage()]
+    assert [r.levelno for r in skip_records] == [logging.WARNING, logging.DEBUG], caplog.text
+    diagnostic, traceback_record = skip_records
+    assert f"({type(error).__name__}: {error})" in diagnostic.getMessage()
+    assert getattr(diagnostic, "event_name", None) == "import_local_session_skipped"
+    assert getattr(diagnostic, "attributes", None) == {
+        "source": "claude",
+        "error_category": "unknown",
+        "error_impact": "benign",
+    }
+    assert traceback_record.exc_info is not None and traceback_record.exc_info[1] is error
 
 
 async def test_handle_import_local_send_failure_skips_only_that_session(
