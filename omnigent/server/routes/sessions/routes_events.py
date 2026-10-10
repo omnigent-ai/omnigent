@@ -42,10 +42,16 @@ from omnigent.entities.conversation import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import (
+    HOST_LOGIN_EXPIRED_ERROR_CODE as _HOST_LOGIN_EXPIRED_ERROR_CODE,
+)
+from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.host.frames import (
     classify_launch_refusal as _classify_launch_refusal,
+)
+from omnigent.host.frames import (
+    host_login_expired_message as _host_login_expired_message,
 )
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
@@ -2494,11 +2500,14 @@ def register_events_routes(
                         # Rebuild from the authorized session row instead
                         # of reflecting arbitrary host-provided text.
                         host_error = _workspace_missing_message(conv.workspace)
+                    elif host_error_code == _HOST_LOGIN_EXPIRED_ERROR_CODE:
+                        # Authored server-side for the same reason, naming the
+                        # re-login command rather than echoing host text.
+                        host_error = _host_login_expired_message()
                     if host_error_code is not None:
-                        # No runner can connect after either safe categorical
-                        # refusal. Consume the message and record the actionable
-                        # reason instead of waiting into a generic unavailable
-                        # response. The binding stays for a later retry.
+                        # No runner can connect after a safe categorical refusal, so
+                        # record the actionable reason instead of waiting into a
+                        # generic unavailable response. The binding stays for retry.
                         item_id = await _persist_host_launch_failure_turn(
                             session_id,
                             conv,

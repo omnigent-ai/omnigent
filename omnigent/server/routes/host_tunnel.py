@@ -64,7 +64,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
-from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.host.identity import HOST_AUTH_REQUIRED_HEADER, MANAGED_HOST_TOKEN_HEADER
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
     PongFrame,
@@ -306,7 +306,17 @@ def create_host_tunnel_router(
                 )
                 return
 
-        await ws.accept()
+        # Tell the host whether this server requires authentication so it can
+        # refuse doomed launches once its login lapses without false-refusing
+        # against an auth-disabled server. Older hosts ignore the extra header.
+        await ws.accept(
+            headers=[
+                (
+                    HOST_AUTH_REQUIRED_HEADER.encode(),
+                    b"1" if auth_provider is not None else b"0",
+                )
+            ]
+        )
         conn: HostConnection | None = None
         host_persisted = False
         stage = "hello"

@@ -59,10 +59,16 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
 from omnigent.host.frames import (
+    HOST_LOGIN_EXPIRED_ERROR_CODE as _HOST_LOGIN_EXPIRED_ERROR_CODE,
+)
+from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.host.frames import (
     classify_launch_refusal as _classify_launch_refusal,
+)
+from omnigent.host.frames import (
+    host_login_expired_message as _host_login_expired_message,
 )
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
@@ -4613,21 +4619,32 @@ async def ensure_runner_connected(
                 # Harness refusals keep the host's text by design: it is a
                 # deterministic setup hint, not runner output.
                 _refusal_message = _workspace_missing_message(conv.workspace)
+            elif _refusal_code == _HOST_LOGIN_EXPIRED_ERROR_CODE:
+                # Authored server-side for the same reason, naming the re-login
+                # command rather than echoing the host's text.
+                _refusal_message = _host_login_expired_message()
             else:
                 _refusal_message = launch_attempt.error or ""
             if _refusal_code is not None and raise_host_refusal:
-                raise OmnigentError(
-                    _refusal_message
-                    or (
+                # Keys cover classify_launch_refusal's full categorical domain, so a
+                # non-None _refusal_code is always present in both maps below.
+                _refusal_error_codes = {
+                    _HARNESS_NOT_CONFIGURED_ERROR_CODE: ErrorCode.HARNESS_NOT_CONFIGURED,
+                    _WORKSPACE_MISSING_ERROR_CODE: ErrorCode.WORKSPACE_MISSING,
+                    _HOST_LOGIN_EXPIRED_ERROR_CODE: ErrorCode.HOST_LOGIN_EXPIRED,
+                }
+                _refusal_defaults = {
+                    _HARNESS_NOT_CONFIGURED_ERROR_CODE: (
                         "The session harness is not configured on this host."
-                        if _refusal_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
-                        else "The session workspace no longer exists on the host."
                     ),
-                    code=(
-                        ErrorCode.HARNESS_NOT_CONFIGURED
-                        if _refusal_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
-                        else ErrorCode.WORKSPACE_MISSING
+                    _WORKSPACE_MISSING_ERROR_CODE: (
+                        "The session workspace no longer exists on the host."
                     ),
+                    _HOST_LOGIN_EXPIRED_ERROR_CODE: _host_login_expired_message(),
+                }
+                raise OmnigentError(
+                    _refusal_message or _refusal_defaults[_refusal_code],
+                    code=_refusal_error_codes[_refusal_code],
                 )
             if _refusal_code is not None and _refusal_message:
                 _rer = getattr(app_state, "runner_exit_reports", None)
@@ -5545,9 +5562,10 @@ async def _persist_host_launch_failure_turn(
     :param conv: Conversation row for the session.
     :param body: Original user message event.
     :param conversation_store: Store used for the durable append.
-    :param host_error: The refusal text to surface. Workspace refusals must
-        pass the server-rebuilt message (see
-        :func:`~omnigent.host.frames.workspace_missing_message`); harness
+    :param host_error: The refusal text to surface. Workspace and
+        stored-login-expired refusals must pass the server-rebuilt message
+        (see :func:`~omnigent.host.frames.workspace_missing_message` and
+        :func:`~omnigent.host.frames.host_login_expired_message`); harness
         refusals pass the host's own text, which is a deterministic setup
         hint rather than runner output.
     :param runner_router: Router used to resolve a sub-agent's runner for
@@ -5557,17 +5575,19 @@ async def _persist_host_launch_failure_turn(
     :param host_error_code: Allowlisted structured host failure category.
     :returns: Store-assigned id of the consumed user message item.
     """
-    if host_error_code not in {
-        _HARNESS_NOT_CONFIGURED_ERROR_CODE,
-        _WORKSPACE_MISSING_ERROR_CODE,
-    }:
+    fallback_messages = {
+        _HARNESS_NOT_CONFIGURED_ERROR_CODE: (
+            "the agent's harness is not configured on the selected host — "
+            f"run `{cli_invocation()} setup`"
+        ),
+        _WORKSPACE_MISSING_ERROR_CODE: (
+            "The session workspace no longer exists on the selected host."
+        ),
+        _HOST_LOGIN_EXPIRED_ERROR_CODE: _host_login_expired_message(),
+    }
+    if host_error_code not in fallback_messages:
         raise ValueError(f"unsafe host launch error code: {host_error_code!r}")
-    fallback_message = (
-        "the agent's harness is not configured on the selected host — "
-        f"run `{cli_invocation()} setup`"
-        if host_error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
-        else "The session workspace no longer exists on the selected host."
-    )
+    fallback_message = fallback_messages[host_error_code]
     error = ErrorData(
         source="execution",
         code=host_error_code,

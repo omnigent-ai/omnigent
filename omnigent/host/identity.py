@@ -37,6 +37,11 @@ HOST_TOKEN_ENV_VAR = identity_env.HOST_TOKEN_ENV_VAR
 # auth provider.
 MANAGED_HOST_TOKEN_HEADER = "X-Omnigent-Host-Token"
 
+# Server→host handshake signal carried on the accepted tunnel upgrade: "1" when
+# the server requires authentication, "0" when auth is disabled. Older servers
+# omit it, so the host falls back to whether it presented a bearer at connect.
+HOST_AUTH_REQUIRED_HEADER = "X-Omnigent-Auth-Required"
+
 
 @dataclass
 class HostIdentity:

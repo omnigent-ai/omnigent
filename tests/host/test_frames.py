@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_LOGIN_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -65,6 +66,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
+    host_login_expired_message,
     workspace_missing_message,
 )
 
@@ -2262,6 +2264,7 @@ def test_fs_result_null_payload_round_trip() -> None:
     [
         (HARNESS_NOT_CONFIGURED_ERROR_CODE, "any text", HARNESS_NOT_CONFIGURED_ERROR_CODE),
         (WORKSPACE_MISSING_ERROR_CODE, "any text", WORKSPACE_MISSING_ERROR_CODE),
+        (HOST_LOGIN_EXPIRED_ERROR_CODE, "any text", HOST_LOGIN_EXPIRED_ERROR_CODE),
         # Rolling upgrade: an older host sends the reason with no code.
         (None, "workspace path does not exist: /w", WORKSPACE_MISSING_ERROR_CODE),
         # Uncategorized failures stay generic, however they are worded.
@@ -2274,7 +2277,7 @@ def test_fs_result_null_payload_round_trip() -> None:
 def test_classify_launch_refusal(
     error_code: str | None, error: str | None, expected: str | None
 ) -> None:
-    """Only the two categorical refusals classify; everything else is generic."""
+    """Only the categorical refusals classify; everything else is generic."""
     assert classify_launch_refusal(error_code, error, "/w") == expected
 
 
@@ -2284,6 +2287,13 @@ def test_workspace_missing_message_is_the_host_spelling() -> None:
     assert classify_launch_refusal(None, workspace_missing_message("/w"), "/w") == (
         WORKSPACE_MISSING_ERROR_CODE
     )
+
+
+def test_host_login_expired_message_names_the_relogin_command() -> None:
+    """The server-authored refusal points the user at the `login` command."""
+    message = host_login_expired_message()
+    assert "stored login has expired" in message
+    assert "login" in message
 
 
 def test_list_worktrees_legacy_request_defaults_to_picker_mode() -> None:

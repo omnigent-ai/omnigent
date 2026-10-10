@@ -16,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_LOGIN_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
@@ -641,6 +642,13 @@ async def test_launch_runner_happy_path(
             WORKSPACE_MISSING_ERROR_CODE,
             "workspace path does not exist: /tmp/test-workspace",
         ),
+        (
+            HOST_LOGIN_EXPIRED_ERROR_CODE,
+            "runner log tail: SECRET_TOKEN\nhost 'laptop' stored login has expired",
+            503,
+            HOST_LOGIN_EXPIRED_ERROR_CODE,
+            "stored login has expired",
+        ),
     ],
 )
 async def test_launch_runner_categorical_failure_returns_specific_status(
@@ -731,6 +739,11 @@ async def test_launch_runner_categorical_failure_returns_specific_status(
         )
         assert "SECRET_TOKEN" not in body["error"]["message"]
         assert "forged workspace failure" not in body["error"]["message"]
+    if expected_error_code == HOST_LOGIN_EXPIRED_ERROR_CODE:
+        # The re-login message is authored server-side, not reflected from the
+        # host's text, so a log tail in the host error cannot leak to the client.
+        assert "login" in body["error"]["message"].lower()
+        assert "SECRET_TOKEN" not in body["error"]["message"]
 
     # _rollback_failed_launch ran: the session is fully unbound so a
     # retry after `omnigent setup` starts clean.

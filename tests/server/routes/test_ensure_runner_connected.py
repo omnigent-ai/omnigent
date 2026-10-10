@@ -289,6 +289,62 @@ async def test_raised_harness_refusal_keeps_host_setup_hint(
 
 
 @pytest.mark.asyncio
+async def test_raised_login_expired_refusal_rebuilds_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stored-login-expired relaunch refusal raises an actionable 503, no wait.
+
+    Like the workspace case, the message is authored server-side so a host log
+    tail cannot leak, and the refusal must not fall through to the doomed
+    connect wait that the generic path takes.
+    """
+    monkeypatch.setattr(orchestration, "_get_runner_client", _async_return(None))
+    monkeypatch.setattr(
+        orchestration,
+        "_maybe_wake_stale_resumable_managed_sandbox",
+        _async_return(False),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_launch_runner_on_host",
+        _async_return(
+            SimpleNamespace(
+                runner_id=None,
+                error_code=orchestration._HOST_LOGIN_EXPIRED_ERROR_CODE,
+                error="runner log tail: SECRET_TOKEN\nhost 'box' stored login has expired",
+            )
+        ),
+    )
+
+    def _boom(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("a refused launch must not wait for a runner")
+
+    monkeypatch.setattr(orchestration, "_wait_for_runner_client", _boom)
+
+    conv = _conv(host_id="host_1", workspace="/w")
+    app_state = SimpleNamespace(
+        host_registry=SimpleNamespace(get=lambda _hid: SimpleNamespace(owner="alice@example.com")),
+        runner_exit_reports=None,
+        tunnel_registry=None,
+    )
+
+    with pytest.raises(OmnigentError) as excinfo:
+        await orchestration.ensure_runner_connected(
+            session_id="conv_1",
+            conv=conv,
+            app_state=app_state,
+            conversation_store=_Store(conv),
+            runner_router=None,
+            raise_host_refusal=True,
+        )
+
+    assert excinfo.value.code == ErrorCode.HOST_LOGIN_EXPIRED
+    assert excinfo.value.message == orchestration._host_login_expired_message()
+    assert "login" in excinfo.value.message.lower()
+    assert "SECRET_TOKEN" not in excinfo.value.message
+
+
+@pytest.mark.asyncio
 async def test_reuses_booting_runner_within_connect_grace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

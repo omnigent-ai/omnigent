@@ -2272,20 +2272,20 @@ def create_app(
             error_impact=exc.impact.value,
             error_phase=exc.phase.value,
         )
-        if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
-            # A session state, not a fault: the user's machine is asleep or
-            # the host disconnected, and clients render it as a reconnect
-            # affordance. Through the 5xx arm every poll of an offline
-            # session added an "Internal error" plus a stack, which is what
-            # buried the real 500s.
+        if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.HOST_LOGIN_EXPIRED):
+            # A session/host state, not a server fault (machine asleep, host
+            # disconnected, or host login lapsed); clients render it as a
+            # reconnect / re-login affordance. Logging it at 5xx buried real 500s.
+            _login_expired = exc.code == ErrorCode.HOST_LOGIN_EXPIRED
             _logger.warning(
-                "Runner unavailable: %s",
+                "%s: %s",
+                "Host login expired" if _login_expired else "Runner unavailable",
                 exc.message,
                 extra=_error_audit_extra(
                     request,
-                    phase="unavailable",
+                    phase="login_expired" if _login_expired else "unavailable",
                     code=str(exc.code),
-                    http_status="503",
+                    http_status=str(exc.http_status),
                     error_category=exc.category.value,
                     error_impact=exc.impact.value,
                     error_phase=exc.phase.value,
