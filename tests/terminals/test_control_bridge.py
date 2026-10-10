@@ -1164,3 +1164,244 @@ async def test_control_attach_pins_client_term_over_inherited_dumb(
         )
     finally:
         await _kill_and_join(sock, task)
+
+
+async def _tmux_window_width(sock: Path, target: str) -> int:
+    tmux = shutil.which("tmux")
+    assert tmux
+    proc = await asyncio.create_subprocess_exec(
+        tmux,
+        "-S",
+        str(sock),
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{window_width}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    assert proc.returncode == 0, err.decode()
+    return int(out.decode().strip())
+
+
+async def _tmux_window_height(sock: Path, target: str) -> int:
+    tmux = shutil.which("tmux")
+    assert tmux
+    proc = await asyncio.create_subprocess_exec(
+        tmux,
+        "-S",
+        str(sock),
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{window_height}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    assert proc.returncode == 0, err.decode()
+    return int(out.decode().strip())
+
+
+async def _tmux_client_widths(sock: Path) -> list[int]:
+    tmux = shutil.which("tmux")
+    assert tmux
+    proc = await asyncio.create_subprocess_exec(
+        tmux,
+        "-S",
+        str(sock),
+        "list-clients",
+        "-F",
+        "#{client_width}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    assert proc.returncode == 0, err.decode()
+    return [int(w) for w in out.decode().split() if w.strip().isdigit()]
+
+
+async def _wait_for_pane_text(sock: Path, target: str, needle: str) -> None:
+    """Wait until ``needle`` is in the pane, confirming it landed pre-attach.
+
+    Polling capture-pane (rather than sleeping) guarantees the text is in pane
+    history before attaching, so the attach exercises the capture-pane seed path
+    instead of racing a post-attach ``%output`` frame carrying the same text.
+    """
+    tmux = shutil.which("tmux")
+    assert tmux
+    for _ in range(100):
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            str(sock),
+            "capture-pane",
+            "-p",
+            "-t",
+            target,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await proc.communicate()
+        if needle.encode() in out:
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"{needle!r} never rendered in the pane")
+
+
+async def _wait_for_client_width(sock: Path, width: int) -> None:
+    """Wait until an attached client reports ``width`` columns.
+
+    A client's size reaches tmux only once the bridge forwards its resize, so a
+    client reaching ``width`` signals that tmux has run its window-size policy
+    for that client -- more reliable than a fixed sleep on a loaded machine.
+    """
+    for _ in range(100):
+        if width in await _tmux_client_widths(sock):
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError(
+        f"no client reached {width} columns; saw {await _tmux_client_widths(sock)}"
+    )
+
+
+async def _wait_for_client_count(sock: Path, count: int) -> None:
+    for _ in range(100):
+        if len(await _tmux_client_widths(sock)) == count:
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError(
+        f"expected {count} attached client(s); saw {await _tmux_client_widths(sock)}"
+    )
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_second_interactive_client_does_not_shrink_first_clients_pane() -> None:
+    """A second owner tab (a phone) attaching narrower leaves the desktop pane wide.
+
+    The two tabs use crossed dimensions -- a wide, short desktop and a narrow,
+    tall phone -- so ``largest`` must max columns and rows independently to a
+    160x40 shared window rather than tracking either client wholesale.
+    """
+    sock, target = await _new_private_tmux("cat")
+
+    desktop = _FakeWebSocket(
+        inbound=[{"type": "websocket.receive", "text": '{"type":"resize","cols":160,"rows":20}'}]
+    )
+    phone = _FakeWebSocket(
+        inbound=[{"type": "websocket.receive", "text": '{"type":"resize","cols":45,"rows":40}'}]
+    )
+
+    async def _attach(ws: _FakeWebSocket) -> None:
+        await bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+
+    desktop_task = asyncio.create_task(_attach(desktop))
+    phone_task: asyncio.Task[None] | None = None
+    try:
+        # Wait for the desktop's 160-col resize to reach tmux before sampling.
+        await _wait_for_client_width(sock, 160)
+        assert await _tmux_window_width(sock, target) == 160
+
+        # Attach the phone and wait for its 45-col resize to land, so tmux has
+        # run its window-size policy for both clients before we read the width.
+        phone_task = asyncio.create_task(_attach(phone))
+        await _wait_for_client_width(sock, 45)
+        width_with_phone = await _tmux_window_width(sock, target)
+        height_with_phone = await _tmux_window_height(sock, target)
+
+        # Detach the phone and wait for its bridge to exit, then for tmux to
+        # drop the client. A hung detach fails here directly instead of as a
+        # vaguer client-count timeout below.
+        phone._recv_gate.set()
+        await asyncio.wait_for(phone_task, timeout=5)
+        await _wait_for_client_count(sock, 1)
+        width_after_phone_left = await _tmux_window_width(sock, target)
+
+        assert width_with_phone == 160, (
+            f"desktop pane shrank to the phone's {width_with_phone} columns "
+            "while the phone was attached"
+        )
+        assert height_with_phone == 40, (
+            f"shared window height did not grow to the phone's 40 rows "
+            f"(got {height_with_phone}); largest must max rows and columns independently"
+        )
+        assert width_after_phone_left == 160, (
+            f"desktop pane did not stay at 160 columns after the phone left "
+            f"(got {width_after_phone_left})"
+        )
+    finally:
+        if phone_task is not None:
+            phone_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await phone_task
+        await _kill_and_join(sock, desktop_task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_attach_continues_when_window_size_option_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tmux that rejects ``window-size`` still attaches and streams I/O.
+
+    The pane-width guard is best-effort: ``_set_shared_window_size_largest``
+    swallows a non-zero ``set-window-option`` exit, so an older tmux keeps the
+    previous behavior instead of breaking the attach.
+    """
+    real_tmux = shutil.which("tmux")
+    assert real_tmux
+    # Wrapper tmux: fail any ``window-size`` option, exec the real binary for
+    # every other command so the control-mode attach behaves normally.
+    wrapper = tmp_path / "tmux"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'for arg in "$@"; do\n'
+        '  if [ "$arg" = "window-size" ]; then\n'
+        "    exit 1\n"
+        "  fi\n"
+        "done\n"
+        f'exec {shlex.quote(real_tmux)} "$@"\n'
+    )
+    wrapper.chmod(0o755)
+
+    # `cat` echoes input to the pane (-> %output); the printf lands pre-attach
+    # so it can only reach the browser via the capture-pane seed.
+    sock, target = await _new_private_tmux("printf 'SEEDED-LINE\\n'; cat")
+    await _wait_for_pane_text(sock, target, "SEEDED-LINE")
+    real_which = shutil.which
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda cmd, *a, **kw: str(wrapper) if cmd == "tmux" else real_which(cmd, *a, **kw),
+    )
+
+    ws = _FakeWebSocket(
+        inbound=[
+            {"type": "websocket.receive", "text": '{"type":"resize","cols":100,"rows":30}'},
+            {"type": "websocket.receive", "bytes": b"typed-input\r"},
+        ]
+    )
+
+    async def _run() -> None:
+        await bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+
+    task = asyncio.create_task(_run())
+    try:
+        for _ in range(100):
+            joined = b"".join(ws.sent)
+            if b"SEEDED-LINE" in joined and b"typed-input" in joined:
+                break
+            await asyncio.sleep(0.1)
+        joined = b"".join(ws.sent)
+        assert b"SEEDED-LINE" in joined, "attach seed failed when window-size was rejected"
+        assert b"typed-input" in joined, "input echo failed when window-size was rejected"
+    finally:
+        await _kill_and_join(sock, task)
