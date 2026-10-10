@@ -10,14 +10,15 @@ session, which is what a rolling deploy did.
 
 Two sources set the signal:
 
-* Explicit: an entrypoint that owns the uvicorn ``Server`` (``omnigent
-  server``) calls :func:`mark_server_shutting_down` from its ``shutdown()``
-  override, before the tunnels close.
+* Explicit: every in-tree launcher serves the app through
+  :class:`omnigent.server.graceful_shutdown.ShutdownSignalingServer`, whose
+  ``shutdown()`` override calls :func:`mark_server_shutting_down` before the
+  tunnels close (``omnigent server`` and the Docker/Databricks entrypoints).
 * In-band: uvicorn closes WebSockets with close code 1012 ("service
   restart") only while shutting down, so a runner-tunnel disconnect carrying
   that code proves the close was ours. The tunnel route reports every close
-  code through :func:`note_tunnel_close_code`, which covers entrypoints that
-  run a bare ``uvicorn.run(app)`` (the Databricks Apps wrapper).
+  code through :func:`note_tunnel_close_code`, a backstop for any launcher
+  that serves the app with a bare ``uvicorn.run(app)``.
 
 The mark is process-wide: while it is fresh, disconnect reconciliation is
 suppressed for every runner, so a genuine runner death inside that window

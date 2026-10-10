@@ -283,11 +283,30 @@ try:
     )
 
     if __name__ == "__main__":
+        import contextlib
+
+        from omnigent.server.graceful_shutdown import (
+            SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+            ShutdownSignalingServer,
+        )
+
         logger.info("Starting omnigent on 0.0.0.0:%d", PORT)
-        # Tunnel frame cap + keepalive: without them uvicorn's 20 s default closes
-        # a busy-but-healthy runner or host tunnel with 1011 after a client-path
-        # stall, while both clients tolerate 90 s.
-        uvicorn.run(app, host="0.0.0.0", port=PORT, **uvicorn_tunnel_kwargs())
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=PORT,
+            # Tunnel frame cap + keepalive: without them uvicorn's 20 s default closes
+            # a busy-but-healthy runner or host tunnel with 1011 after a client-path
+            # stall, while both clients tolerate 90 s.
+            **uvicorn_tunnel_kwargs(),
+            # Bound the graceful wait and drain SSE streams so a held session
+            # stream can't keep the app alive until the platform SIGKILLs it.
+            # Matches `omnigent server`.
+            timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        )
+        # uvicorn.run() swallows KeyboardInterrupt; match that behaviour.
+        with contextlib.suppress(KeyboardInterrupt):
+            ShutdownSignalingServer(config).run()
 
 except Exception:  # noqa: BLE001 — startup catch-all; we want every failure logged
     logger.error("FATAL: omnigent failed to start:\n%s", traceback.format_exc())

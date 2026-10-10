@@ -1,7 +1,9 @@
 """Tests for the shared tunnel budget and the launchers that must apply it.
 
 Scope note (#1116): these guard the shared constants, the tunnel-vs-app-level
-invariant, and that every in-tree launcher hands the budget to uvicorn. They do
+invariant, that every in-tree launcher hands the budget to uvicorn, and that the
+deploy entrypoints serve through the shared graceful-shutdown Server subclass.
+They do
 NOT assert anything about the server-global reach of uvicorn's ``ws_ping_*`` —
 that setting applies the same 30 s/90 s budget to every WebSocket route
 (session-updates, terminal-attach), which is deliberate: for an idle such socket
@@ -19,7 +21,9 @@ from typing import Any
 
 import pytest
 import uvicorn
+import uvicorn.server
 
+from omnigent.server.graceful_shutdown import SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S
 from omnigent.util.tunnel_limits import (
     RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
@@ -102,14 +106,12 @@ def test_deprecated_runner_path_reexports_the_same_objects() -> None:
         assert getattr(shim, name) is getattr(canonical, name), name
 
 
-def test_docker_entrypoint_hands_the_tunnel_budget_to_uvicorn(
+def test_docker_entrypoint_hands_the_tunnel_budget_and_graceful_shutdown_to_uvicorn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The OSS Docker image must serve tunnels with the 30 s/90 s budget.
-
-    Regression: it passed ``ws_max_size`` alone, leaving uvicorn's 20 s keepalive
-    to close busy-but-healthy tunnels — and this image serves external runners
-    only, so every session rides one.
+    """The OSS Docker image must serve tunnels with the 30 s/90 s budget and the
+    bounded graceful shutdown, not a bare ``uvicorn.run`` that leaves a held
+    ``GET /v1/sessions/{id}/stream`` to keep the container alive until SIGKILL.
     """
     import sys
 
@@ -125,23 +127,35 @@ def test_docker_entrypoint_hands_the_tunnel_budget_to_uvicorn(
     monkeypatch.setattr(entrypoint, "_resolve_config", lambda: resolved_config)
     monkeypatch.setattr(entrypoint, "run_migrations", lambda url: None)
     monkeypatch.setattr(entrypoint, "build_app", lambda cfg: built)
-    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: captured.update(kw))
+
+    # Intercept the server launch without binding a port: ShutdownSignalingServer
+    # subclasses uvicorn.server.Server and does not override run().
+    def _capture_run(self: uvicorn.server.Server) -> None:
+        captured["config"] = self.config
+        captured["server_class"] = type(self).__name__
+
+    monkeypatch.setattr(uvicorn.server.Server, "run", _capture_run)
 
     entrypoint.main()
 
-    assert captured, "main() never reached uvicorn.run"
+    assert captured, "main() never reached the server launch"
+    config = captured["config"]
     for key, value in uvicorn_tunnel_kwargs().items():
-        assert captured.get(key) == value, key
+        assert getattr(config, key) == value, key
+    assert config.timeout_graceful_shutdown == SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S
+    assert captured["server_class"] == "ShutdownSignalingServer"
 
 
-def test_every_deploy_entrypoint_spreads_the_budget_into_uvicorn() -> None:
+def test_every_deploy_entrypoint_serves_through_the_shared_graceful_launcher() -> None:
     """No in-repo launcher may serve the omnigent app on uvicorn's defaults.
 
-    Both deploy entrypoints call ``uvicorn.run`` behind ``if __name__ ==
-    "__main__"``, so this reads the call site rather than executing it (the
-    Docker one is driven for real in the test above). It exists because the
-    drift happened twice: the Docker entrypoint carried ``ws_max_size`` alone,
-    and the Databricks Apps entrypoint carried none of the three.
+    Both deploy entrypoints build their ``uvicorn.Config`` and run it behind
+    ``if __name__ == "__main__"``, so this reads the call site rather than
+    executing it (the Docker one is driven for real in the test above). It exists
+    because the drift happened repeatedly: the Docker entrypoint once carried
+    ``ws_max_size`` alone, the Databricks entrypoint carried none of the three
+    keepalive kwargs, and neither bounded uvicorn's graceful shutdown, so a held
+    SSE stream kept the process alive until the orchestrator SIGKILLed it.
     """
     entrypoints = (
         "deploy/docker/entrypoint.py",
@@ -149,9 +163,22 @@ def test_every_deploy_entrypoint_spreads_the_budget_into_uvicorn() -> None:
     )
     for relative in entrypoints:
         source = (_REPO_ROOT / relative).read_text()
-        run_call = source[source.index("uvicorn.run(") :]
-        run_call = run_call[: run_call.index(")\n")]
-        assert "uvicorn_tunnel_kwargs()" in run_call, (
-            f"{relative} calls uvicorn.run without spreading uvicorn_tunnel_kwargs(), "
-            "so it serves tunnels on uvicorn's 20 s keepalive and 16 MiB frame cap"
+        # Drop comment lines so a comment that mentions uvicorn.run() for context
+        # doesn't read as a call site.
+        code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
+        assert "uvicorn_tunnel_kwargs()" in code, (
+            f"{relative} does not spread uvicorn_tunnel_kwargs(), so it serves "
+            "tunnels on uvicorn's 20 s keepalive and 16 MiB frame cap"
+        )
+        assert "timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S" in code, (
+            f"{relative} does not bound uvicorn's graceful shutdown, so a held SSE "
+            "stream blocks SIGTERM until the orchestrator SIGKILLs the process"
+        )
+        assert "ShutdownSignalingServer(" in code, (
+            f"{relative} does not serve through ShutdownSignalingServer, so open "
+            "SSE session streams are force-cancelled instead of drained on shutdown"
+        )
+        assert "uvicorn.run(" not in code, (
+            f"{relative} still calls bare uvicorn.run(), which cannot install the "
+            "graceful-shutdown Server subclass"
         )
