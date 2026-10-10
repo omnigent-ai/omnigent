@@ -293,6 +293,52 @@ export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
   return null;
 }
 
+/** CSI cursor-left, what terminals expect while DECCKM is off. */
+export const CURSOR_LEFT_CSI = "\x1b[D";
+
+/** SS3 cursor-left, what terminals expect while DECCKM is on. */
+export const CURSOR_LEFT_SS3 = "\x1bOD";
+
+/**
+ * Realign an IME append whose caret lands inside its new text. xterm tracks
+ * composition by textarea value, not caret, so an auto-pair can put the next
+ * candidate after the closing mark. Only the newly appended tail is safe to
+ * unstage while moving the PTY cursor left.
+ */
+export function imeInsertRealignment(
+  previousValue: string,
+  value: string,
+  selectionStart: number | null,
+): { moveLeft: number; stagedValue: string } | null {
+  if (selectionStart === null) return null;
+  if (value.length <= previousValue.length || !value.startsWith(previousValue)) return null;
+  if (selectionStart < previousValue.length || selectionStart >= value.length) return null;
+  // Line editors move one character per arrow key regardless of its column
+  // width, so count code points, not UTF-16 units.
+  return {
+    moveLeft: [...value.slice(selectionStart)].length,
+    stagedValue: value.slice(0, selectionStart),
+  };
+}
+
+/**
+ * Bound an IME commit at the caret. xterm commits a composition as the
+ * textarea text from the length it saw at compositionstart to the end, so
+ * text sitting after the caret when the commit is read (the closing mark a
+ * keyboard kept after the candidate) rides along as if it were composed.
+ * Returns null when the data is not such a slice or needs no correction.
+ */
+export function imeCommitBeforeCaret(
+  committed: string,
+  value: string,
+  selectionStart: number | null,
+): string | null {
+  if (selectionStart === null || selectionStart >= value.length) return null;
+  const tailLength = value.length - selectionStart;
+  if (committed.length < tailLength || !value.endsWith(committed)) return null;
+  return committed.slice(0, committed.length - tailLength);
+}
+
 // Reused across keystrokes — allocating a fresh TextEncoder per keypress
 // is needless churn on the input hot path.
 const INPUT_ENCODER = new TextEncoder();
@@ -780,6 +826,111 @@ export class TerminalSession {
       { capture: true, signal },
     );
 
+    // xterm anchors and diffs IME input by textarea value length, so a
+    // keyboard that leaves the caret before trailing text (an auto-inserted
+    // closing mark) needs the PTY cursor and that bookkeeping realigned.
+    const textarea = this.term.textarea;
+    let imeCommitPending = false;
+    let imeComposing = false;
+    // Caret and expected value of a commit whose trailing mark onData
+    // suppressed; cleanup trims only that recorded tail and bails if the
+    // field moved on.
+    let imeCorrection: { caret: number; value: string } | null = null;
+    if (textarea) {
+      // xterm registered its own textarea listeners during term.open() above,
+      // so its zero-delay diff and commit timers are queued ahead of the
+      // realignment timers below; that ordering lets us correct after xterm.
+      let imeGeneration = 0;
+      // Snapshot at keydown; focus and input also resync IMEs without keydown.
+      let valueBeforeInput = textarea.value;
+      const snapshotValue = () => {
+        valueBeforeInput = textarea.value;
+      };
+      // Drop the text after the caret so xterm's next anchor and diff start
+      // where the IME inserts.
+      const unstageTail = (caret: number) => {
+        const staged = textarea.value.slice(0, caret);
+        textarea.value = staged;
+        textarea.selectionStart = staged.length;
+        textarea.selectionEnd = staged.length;
+        valueBeforeInput = staged;
+      };
+      textarea.addEventListener("focus", snapshotValue, { signal });
+      textarea.addEventListener("keydown", snapshotValue, { signal });
+      textarea.addEventListener(
+        "compositionstart",
+        () => {
+          imeComposing = true;
+          imeGeneration += 1;
+          imeCommitPending = true;
+          imeCorrection = null;
+        },
+        { signal },
+      );
+      textarea.addEventListener(
+        "compositionend",
+        () => {
+          imeComposing = false;
+          const generation = imeGeneration;
+          // xterm reads the commit on its own zero-delay timer, queued ahead
+          // of this one; a keyboard that kept the closing mark leaves it
+          // after the caret.
+          setTimeout(() => {
+            if (generation !== imeGeneration || this.disposed) {
+              imeCorrection = null;
+              return;
+            }
+            imeCommitPending = false;
+            // Trim only the tail a commit carried past the caret, and only
+            // while the field still holds that recorded value.
+            const correction = imeCorrection;
+            imeCorrection = null;
+            if (
+              correction &&
+              textarea.value === correction.value &&
+              correction.caret < textarea.value.length
+            ) {
+              unstageTail(correction.caret);
+            }
+          }, 0);
+        },
+        { signal },
+      );
+      textarea.addEventListener(
+        "input",
+        (ev) => {
+          const { isComposing, inputType } = ev as InputEvent;
+          const previousValue = valueBeforeInput;
+          valueBeforeInput = textarea.value;
+          // Leave composition updates, including their commit input, untouched.
+          if (imeComposing || isComposing || inputType === "insertCompositionText") return;
+          const realign = imeInsertRealignment(
+            previousValue,
+            textarea.value,
+            textarea.selectionStart,
+          );
+          if (realign === null) return;
+          const decidedValue = textarea.value;
+          const decidedCaret = textarea.selectionStart;
+          // xterm's zero-delay diff must forward the append before cursor-left.
+          setTimeout(() => {
+            if (imeComposing || this.disposed) return;
+            // A later edit or xterm clear invalidates the earlier decision.
+            if (textarea.value !== decidedValue || textarea.selectionStart !== decidedCaret) {
+              return;
+            }
+            unstageTail(realign.stagedValue.length);
+            // DECCKM picks the arrow encoding, as xterm's keyboard path does.
+            const cursorLeft = this.term.modes.applicationCursorKeysMode
+              ? CURSOR_LEFT_SS3
+              : CURSOR_LEFT_CSI;
+            this.term.input(cursorLeft.repeat(realign.moveLeft), true);
+          }, 0);
+        },
+        { signal },
+      );
+    }
+
     this.ws.addEventListener(
       "open",
       () => {
@@ -833,12 +984,30 @@ export class TerminalSession {
     );
 
     this.dataDispose = this.term.onData((d) => {
+      let data = d;
+      // Correct only the commit flushed after compositionend, never data
+      // emitted mid-composition.
+      if (imeCommitPending && !imeComposing && textarea) {
+        // Only the first flush after compositionend is the commit; disarm now
+        // so a genuine keystroke in the cleanup window is never trimmed, even
+        // when this flush needs no correction.
+        imeCommitPending = false;
+        const corrected = imeCommitBeforeCaret(d, textarea.value, textarea.selectionStart);
+        if (corrected !== null) {
+          data = corrected;
+          // Record the tail xterm re-sent so cleanup can unstage it.
+          imeCorrection = { caret: textarea.selectionStart, value: textarea.value };
+        }
+      }
+      // xterm emitting nothing is not a user action; a commit trimmed to empty
+      // still is, so refresh input trust before dropping the empty send.
+      if (d.length === 0) return;
       onInput?.();
       // Stamp before the readyState guard so clipboard trust still reflects
       // local input during a momentary WebSocket hiccup.
       this.lastUserInputAt = performance.now();
-      if (this.ws.readyState !== WebSocket.OPEN) return;
-      this.ws.send(INPUT_ENCODER.encode(d));
+      if (data.length === 0 || this.ws.readyState !== WebSocket.OPEN) return;
+      this.ws.send(INPUT_ENCODER.encode(data));
     });
 
     this.term.attachCustomKeyEventHandler((e) => {

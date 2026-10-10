@@ -9,12 +9,16 @@
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  CURSOR_LEFT_CSI,
+  CURSOR_LEFT_SS3,
   SHIFT_ENTER_CSI_U,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
   decodeTerminalClipboardBase64,
   hadRecentTerminalInput,
+  imeCommitBeforeCaret,
+  imeInsertRealignment,
   isUnexpectedTerminalClose,
   loadWebglRenderer,
   openTerminalLink,
@@ -365,6 +369,68 @@ describe("terminalKeyEventPayload", () => {
     expect(
       terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, altKey: true })),
     ).toBeNull();
+  });
+});
+
+describe("imeInsertRealignment", () => {
+  it("realigns an auto-inserted pair that left the caret inside", () => {
+    expect(imeInsertRealignment("", "()", 1)).toEqual({
+      moveLeft: 1,
+      stagedValue: "(",
+    });
+  });
+
+  it("realigns a pair appended after previously staged text", () => {
+    expect(imeInsertRealignment("(", "(b)", 2)).toEqual({
+      moveLeft: 1,
+      stagedValue: "(b",
+    });
+  });
+
+  it("is a no-op when the caret sits at the end of the value", () => {
+    expect(imeInsertRealignment("", "你好", 2)).toBeNull();
+  });
+
+  it("moves one cell per code point, not per UTF-16 unit", () => {
+    expect(imeInsertRealignment("", "a😀😀", 1)).toEqual({
+      moveLeft: 2,
+      stagedValue: "a",
+    });
+  });
+
+  it("refuses a caret inside text staged before this event", () => {
+    expect(imeInsertRealignment("()", "()!", 1)).toBeNull();
+  });
+
+  it("refuses changes that are not a pure append", () => {
+    expect(imeInsertRealignment("(a)", "(b)", 2)).toBeNull();
+    expect(imeInsertRealignment("()", "()", 1)).toBeNull();
+    expect(imeInsertRealignment("()", "(", 0)).toBeNull();
+  });
+
+  it("is a no-op without a caret position", () => {
+    expect(imeInsertRealignment("", "()", null)).toBeNull();
+  });
+});
+
+describe("imeCommitBeforeCaret", () => {
+  it("drops the text after the caret from xterm's value-end commit", () => {
+    expect(imeCommitBeforeCaret("你)", "(你)", 2)).toBe("你");
+    expect(imeCommitBeforeCaret("好)", "(你好)", 3)).toBe("好");
+  });
+
+  it("leaves a commit alone when the caret sits at the end of the value", () => {
+    expect(imeCommitBeforeCaret("你", "(你", 2)).toBeNull();
+    expect(imeCommitBeforeCaret("你)", "(你)", null)).toBeNull();
+  });
+
+  it("yields nothing when only the trailing text was committed", () => {
+    expect(imeCommitBeforeCaret(")", "(你)", 2)).toBe("");
+  });
+
+  it("ignores data that is not xterm's slice of the value", () => {
+    expect(imeCommitBeforeCaret(CURSOR_LEFT_CSI, "()", 1)).toBeNull();
+    expect(imeCommitBeforeCaret("\r", "(ni)", 3)).toBeNull();
   });
 });
 
@@ -726,6 +792,49 @@ describe("TerminalSession", () => {
     );
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
+
+  // Let xterm's and the session's zero-delay IME timers drain.
+  const settle = () =>
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, 25);
+    });
+
+  // Decode the binary keystroke frames the session sent, in order.
+  const sentText = (socket: FakeWebSocket) =>
+    socket.sent
+      // instanceof Uint8Array fails across jsdom realms.
+      .filter((frame) => typeof frame !== "string")
+      .map((frame) => new TextDecoder().decode(frame as Uint8Array))
+      .join("");
+
+  // Synthetic IME event sequence bound to one textarea.
+  const imeDriver = (textarea: HTMLTextAreaElement) => ({
+    fire229: (type: string) => {
+      const ev = new KeyboardEvent(type, { key: "Process", bubbles: true, cancelable: true });
+      Object.defineProperty(ev, "keyCode", { get: () => 229 });
+      textarea.dispatchEvent(ev);
+    },
+    setField: (value: string, caret: number) => {
+      textarea.value = value;
+      textarea.selectionStart = caret;
+      textarea.selectionEnd = caret;
+    },
+    insertText: (data: string) =>
+      textarea.dispatchEvent(
+        new InputEvent("input", { data, inputType: "insertText", bubbles: true, composed: true }),
+      ),
+    compositionInput: (data: string) =>
+      textarea.dispatchEvent(
+        new InputEvent("input", {
+          data,
+          inputType: "insertCompositionText",
+          bubbles: true,
+          composed: true,
+        }),
+      ),
+    composition: (type: string, data: string) =>
+      textarea.dispatchEvent(new CompositionEvent(type, { data, bubbles: true })),
+  });
 
   it("reports 'connected' and sends an initial resize on socket open", () => {
     // WHY: the open handler must push a resize frame before the user sees the
@@ -1206,6 +1315,246 @@ describe("TerminalSession", () => {
     const { container, session } = makeSession();
     const observer = FakeResizeObserver.instances[0];
     expect(observer.observed).toContain(container);
+    session.dispose();
+  });
+
+  it("realigns the cursor and composition anchor after an IME auto-pair", async () => {
+    // The PTY must receive the pair, cursor-left, then candidate; never preedit.
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    const textarea = term.textarea!;
+    textarea.focus();
+    const { fire229, setField, insertText, composition, compositionInput } = imeDriver(textarea);
+
+    fire229("keydown");
+    setField("()", 1);
+    insertText("()");
+    fire229("keyup");
+    await settle();
+
+    // CompositionHelper anchors at the end of the unstaged value.
+    expect(textarea.value).toBe("(");
+    expect(textarea.selectionStart).toBe(1);
+
+    // Compose "ni" at the in-pair caret.
+    fire229("keydown");
+    composition("compositionstart", "");
+    setField("(n", 2);
+    composition("compositionupdate", "n");
+    compositionInput("n");
+    fire229("keyup");
+    await settle();
+    fire229("keydown");
+    setField("(ni", 3);
+    composition("compositionupdate", "ni");
+    compositionInput("ni");
+    fire229("keyup");
+    await settle();
+
+    // Commit the selected candidate.
+    setField("(你", 2);
+    composition("compositionupdate", "你");
+    composition("compositionend", "你");
+    compositionInput("你");
+    await settle();
+
+    expect(sentText(socket)).toBe(`()${CURSOR_LEFT_CSI}你`);
+    session.dispose();
+  });
+
+  it("realigns even when the auto-pair event reports only the typed character", async () => {
+    // Some keyboards report only "(" in InputEvent.data for the pair.
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    const textarea = term.textarea!;
+    textarea.focus();
+    const { fire229, setField, insertText } = imeDriver(textarea);
+
+    fire229("keydown");
+    setField("()", 1);
+    insertText("(");
+    fire229("keyup");
+    await settle();
+
+    expect(textarea.value).toBe("(");
+    expect(textarea.selectionStart).toBe(1);
+    expect(sentText(socket)).toBe(`()${CURSOR_LEFT_CSI}`);
+    session.dispose();
+  });
+
+  it("encodes the realigning arrow per application-cursor-keys mode", async () => {
+    // DECCKM expects SS3 arrows rather than CSI.
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    await new Promise<void>((resolve) => {
+      term.write("\x1b[?1h", resolve);
+    });
+    expect(term.modes.applicationCursorKeysMode).toBe(true);
+    const textarea = term.textarea!;
+    textarea.focus();
+    const { fire229, setField, insertText } = imeDriver(textarea);
+
+    fire229("keydown");
+    setField("()", 1);
+    insertText("()");
+    fire229("keyup");
+    await settle();
+
+    expect(sentText(socket)).toBe(`()${CURSOR_LEFT_SS3}`);
+    session.dispose();
+  });
+
+  it("commits only the text before the caret when the keyboard keeps the closing mark", async () => {
+    // A keyboard that re-asserts its own view of the field puts ')' back
+    // after the caret; xterm's value-end slice must not carry it into the
+    // commit, and the next candidate must anchor at the caret again.
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    const textarea = term.textarea!;
+    textarea.focus();
+    const { fire229, setField, insertText, composition, compositionInput } = imeDriver(textarea);
+
+    fire229("keydown");
+    setField("()", 1);
+    insertText("()");
+    fire229("keyup");
+    await settle();
+
+    composition("compositionstart", "");
+    setField("(ni)", 3);
+    composition("compositionupdate", "ni");
+    compositionInput("ni");
+    await settle();
+    setField("(你)", 2);
+    composition("compositionupdate", "你");
+    composition("compositionend", "你");
+    compositionInput("你");
+    await settle();
+
+    expect(textarea.value).toBe("(你");
+    expect(textarea.selectionStart).toBe(2);
+
+    composition("compositionstart", "");
+    setField("(你h)", 3);
+    composition("compositionupdate", "h");
+    compositionInput("h");
+    await settle();
+    setField("(你好)", 3);
+    composition("compositionupdate", "好");
+    composition("compositionend", "好");
+    compositionInput("好");
+    await settle();
+
+    expect(sentText(socket)).toBe(`()${CURSOR_LEFT_CSI}你好`);
+    expect(textarea.value).toBe("(你好");
+    session.dispose();
+  });
+
+  it("skips the deferred realignment when the field moves before the timer", async () => {
+    // A later edit between the auto-pair insert and its zero-delay realignment
+    // invalidates the decision; no corrective arrow may reach the PTY and the
+    // field must not be unstaged behind the user's back.
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    const textarea = term.textarea!;
+    textarea.focus();
+    const { fire229, setField, insertText } = imeDriver(textarea);
+
+    fire229("keydown");
+    setField("()", 1);
+    insertText("()");
+    fire229("keyup");
+    // The user keeps typing before the realignment timer runs.
+    setField("()x", 3);
+    await settle();
+
+    expect(sentText(socket)).not.toContain(CURSOR_LEFT_CSI);
+    expect(textarea.value).toBe("()x");
+    session.dispose();
+  });
+
+  it("stamps input but sends no frame when a commit trims to empty", async () => {
+    // A commit can sit entirely past the caret, so bounding it at the caret
+    // yields an empty payload. That is still a user action for input trust,
+    // but there is nothing to forward.
+    const onInput = vi.fn();
+    const { socket, session } = makeSession(undefined, onInput);
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    const textarea = term.textarea!;
+    textarea.focus();
+    const { fire229, setField, composition } = imeDriver(textarea);
+    onInput.mockClear();
+    const sentBefore = sentText(socket);
+
+    // The field already holds the committed character with the caret before
+    // it, so xterm's own compositionend flush is a no-op and the only commit
+    // reaching onData is the one we drive, which bounds to empty at the caret.
+    setField("你", 0);
+    fire229("keydown");
+    composition("compositionstart", "");
+    composition("compositionend", "");
+    term.input("你", true);
+    await settle();
+
+    expect(onInput).toHaveBeenCalled();
+    expect(sentText(socket)).toBe(sentBefore);
+    session.dispose();
+  });
+
+  it("disarms the commit window even when the commit needs no trim", async () => {
+    // A commit landing with the caret at the end trims nothing, but the window
+    // must still close so a following genuine keystroke whose text equals the
+    // field suffix is forwarded, not swallowed as a stale commit tail.
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    const textarea = term.textarea!;
+    textarea.focus();
+    const { fire229, setField, composition } = imeDriver(textarea);
+    const sentBefore = sentText(socket);
+
+    // The value stays constant so xterm's own compositionend flush is a no-op;
+    // only the caret moves between the commit and the next keystroke.
+    setField("ab", 2);
+    fire229("keydown");
+    composition("compositionstart", "");
+    composition("compositionend", "");
+    term.input("ab", true);
+    setField("ab", 1);
+    term.input("b", true);
+    await settle();
+
+    expect(sentText(socket)).toBe(`${sentBefore}abb`);
+    session.dispose();
+  });
+
+  it("abandons the deferred realignment when composition starts before the timer", async () => {
+    // If the IME begins composing before the zero-delay realignment runs, the
+    // stale cursor-left must be dropped, never injected into the live
+    // composition, and the in-pair field must survive untouched.
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    const textarea = term.textarea!;
+    textarea.focus();
+    const { fire229, setField, insertText, composition } = imeDriver(textarea);
+
+    fire229("keydown");
+    setField("()", 1);
+    insertText("()");
+    // Composition starts before the zero-delay realignment timer drains.
+    composition("compositionstart", "");
+    await settle();
+
+    expect(sentText(socket)).not.toContain(CURSOR_LEFT_CSI);
+    expect(textarea.value).toBe("()");
+    expect(textarea.selectionStart).toBe(1);
     session.dispose();
   });
 });
