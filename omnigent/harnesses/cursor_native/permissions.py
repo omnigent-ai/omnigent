@@ -47,7 +47,12 @@ from pathlib import Path
 
 import httpx
 
-from omnigent.harnesses.cursor_native.bridge import capture_cursor_pane, send_cursor_pane_keys
+from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE
+from omnigent.harnesses.cursor_native.bridge import (
+    capture_cursor_pane,
+    cursor_pane_gone,
+    send_cursor_pane_keys,
+)
 
 # Reuse the forwarder's store discovery and WAL-aware blob reader so the
 # transcript-based detector binds to the SAME cursor chat the forwarder mirrors
@@ -60,6 +65,10 @@ _POLL_INTERVAL_S = 0.3
 # The approval hook parks server-side until a human answers; allow a day, well
 # past any realistic wait, so the runner's POST never abandons a live prompt.
 _POST_TIMEOUT_S = 86400.0
+
+# Agent label stamped on chat notices, so they render like the forwarder's
+# mirrored items.
+_MIRROR_AGENT_NAME = CURSOR_NATIVE_WRAPPER_VALUE
 
 
 @dataclass(frozen=True)
@@ -145,14 +154,90 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
             await asyncio.sleep(_KEY_ENTER_SETTLE_S)
         try:
             await asyncio.to_thread(send_cursor_pane_keys, bridge_dir, key)
-        except RuntimeError:
-            _logger.exception(
-                "failed to send cursor keystroke %r (of %r); session=%s", key, keys, session_id
-            )
+        except (OSError, RuntimeError) as exc:
+            if await asyncio.to_thread(cursor_pane_gone, bridge_dir):
+                # A confirmed dead pane is an expected end-of-life state, not a
+                # malfunction; an indeterminate probe keeps the loud ERROR.
+                _logger.warning(
+                    "cursor pane is gone; keystroke %r (of %r) was not delivered (%s); session=%s",
+                    key,
+                    keys,
+                    exc,
+                    session_id,
+                )
+            else:
+                _logger.exception(
+                    "failed to send cursor keystroke %r (of %r); session=%s", key, keys, session_id
+                )
             return False
         await asyncio.sleep(_KEY_INTERVAL_S)
     _logger.debug("cursor keystrokes sent: %r; session=%s", keys, session_id)
     return True
+
+
+async def _post_verdict_undelivered_notice(
+    client: httpx.AsyncClient, *, session_id: str, description: str, pane_gone: bool
+) -> None:
+    """Post recovery guidance for a verdict that never reached the cursor TUI.
+
+    The card has already settled as answered by then. ``pane_gone`` picks the
+    remedy: relaunch for a confirmed dead pane, otherwise the embedded terminal.
+    """
+    if pane_gone:
+        reason = (
+            "the Cursor terminal for this session is no longer running, so "
+            "cursor-agent never received it. Send a new message to relaunch the "
+            "terminal and respond again if it is still needed."
+        )
+    else:
+        reason = (
+            "the keystroke could not be sent to the Cursor terminal. Answer the "
+            "prompt in the embedded terminal if it is still waiting."
+        )
+    text = f"Your response to “{description}” could not be delivered: {reason}"
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_assistant_message",
+                "data": {"agent": _MIRROR_AGENT_NAME, "text": text},
+            },
+            timeout=10.0,
+        )
+        if response.status_code >= 400:
+            _logger.warning(
+                "cursor undelivered-verdict notice rejected: status=%s body=%s",
+                response.status_code,
+                response.text[:512],
+            )
+    except httpx.HTTPError:
+        _logger.exception("cursor undelivered-verdict notice POST failed")
+
+
+async def _deliver_verdict_keys(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    keys: tuple[str, ...],
+    description: str,
+) -> bool:
+    """Deliver a web verdict's keystrokes, or tell the user in chat why they could not land.
+
+    The parked hook can hold a verdict for up to :data:`_POST_TIMEOUT_S`, so the
+    pane may be gone by the time a human answers. Delivery is still attempted;
+    only a confirmed dead pane, never an indeterminate probe, selects the
+    relaunch guidance.
+
+    :returns: Whether the keystrokes were handed to tmux.
+    """
+    if await _send_cursor_keys(bridge_dir, session_id, *keys):
+        return True
+    pane_gone = await asyncio.to_thread(cursor_pane_gone, bridge_dir) is True
+    await _post_verdict_undelivered_notice(
+        client, session_id=session_id, description=description, pane_gone=pane_gone
+    )
+    return False
 
 
 async def _run_one_approval(
@@ -178,7 +263,7 @@ async def _run_one_approval(
         return
     action = result.get("action")
     if action == "accept":
-        await _send_cursor_keys(bridge_dir, session_id, prompt.accept_key)
+        keys: tuple[str, ...] = (prompt.accept_key,)
     elif action in {"decline", "cancel"}:
         # Cursor's tool-reject doesn't dismiss on the decline key alone — it
         # opens a "Reason for rejection (Enter to submit, Esc to cancel)"
@@ -187,7 +272,19 @@ async def _run_one_approval(
         # the TUI parked at the reason input (which the user then has to clear
         # by hand). The settle pause before Enter (see _send_cursor_keys) gives
         # the reason prompt time to render first.
-        await _send_cursor_keys(bridge_dir, session_id, prompt.decline_key, "Enter")
+        keys = (prompt.decline_key, "Enter")
+    else:
+        _logger.warning(
+            "cursor approval verdict: unexpected action=%r; session=%s", action, session_id
+        )
+        return
+    await _deliver_verdict_keys(
+        client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        keys=keys,
+        description=prompt.message,
+    )
 
 
 async def _run_one_question(
@@ -224,19 +321,28 @@ async def _run_one_question(
     action = result.get("action")
     if action == "accept":
         content = result.get("content")
-        keys = _askquestion_keystrokes(call.args, content if isinstance(content, dict) else {})
+        keys = tuple(
+            _askquestion_keystrokes(call.args, content if isinstance(content, dict) else {})
+        )
         _logger.debug(
             "cursor question accept; session=%s content=%r keys=%r", session_id, content, keys
         )
-        await _send_cursor_keys(bridge_dir, session_id, *keys)
     elif action in {"decline", "cancel"}:
         # The question picker's "Esc to skip" dismisses cleanly (no rejection-
         # reason sub-prompt like the tool-approval gate has), so a single key.
-        await _send_cursor_keys(bridge_dir, session_id, _TRANSCRIPT_DECLINE_KEY)
+        keys = (_TRANSCRIPT_DECLINE_KEY,)
     else:
         _logger.warning(
             "cursor question verdict: unexpected action=%r; session=%s", action, session_id
         )
+        return
+    await _deliver_verdict_keys(
+        client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        keys=keys,
+        description=_askquestion_message(call.args),
+    )
 
 
 async def _post_external_elicitation_resolved(
