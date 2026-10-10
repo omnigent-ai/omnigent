@@ -34,7 +34,7 @@ export function latestActivityErrorWindow(
         if (block.level === "info") {
           return { state: resolvedFailure(), boundaryResolved: true };
         }
-        if (block.code === "runner_disconnected") {
+        if (block.code === "runner_disconnected" || block.code === "session_stream_lost") {
           disconnect = hostOnline === true ? "recovered_disconnect" : "disconnected";
           break;
         }

@@ -679,6 +679,29 @@ describe("ErrorBanner", () => {
     await waitFor(() => expect(onRetry).toHaveBeenCalledWith(relatedDisconnect));
   });
 
+  it("offers recovery from a retryable related session-stream loss", async () => {
+    const onRetry = vi.fn(async () => {});
+    const relatedStreamLost = {
+      itemId: "related-stream-lost",
+      message: "The live session connection was lost.",
+      source: "execution",
+      code: "session_stream_lost",
+    };
+    render(
+      <ErrorBanner
+        itemId="primary-error"
+        message="The runner failed."
+        source="execution"
+        code="runner_error"
+        relatedErrors={[relatedStreamLost]}
+        onRetry={onRetry}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+    await waitFor(() => expect(onRetry).toHaveBeenCalledWith(relatedStreamLost));
+  });
+
   it("retries classified rate-limit errors and preserves the provider's details", async () => {
     let resolveRetry: (() => void) | undefined;
     const onRetry = vi.fn(

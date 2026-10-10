@@ -7439,13 +7439,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             } satisfies ErrorBlock,
           ];
         }
-        // A `runner_disconnected` card is an observation ("can't reach the
-        // runner"), not a turn result: any live status edge from the runner
-        // proves it is reachable again, so the stale card goes.
+        // A `runner_disconnected` / `session_stream_lost` card is an observation
+        // ("can't reach the session right now"), not a turn result: any live
+        // status edge proves it is reachable again, so the stale card goes.
         if (event.status !== "failed") {
           const current = patch.blocks ?? s.blocks;
           const reachable = current.filter(
-            (b) => !(b.type === "error" && b.code === "runner_disconnected"),
+            (b) =>
+              !(
+                b.type === "error" &&
+                (b.code === "runner_disconnected" || b.code === "session_stream_lost")
+              ),
           );
           if (reachable.length !== current.length) patch.blocks = reachable;
         }

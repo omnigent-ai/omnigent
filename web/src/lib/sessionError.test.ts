@@ -41,6 +41,12 @@ describe("latestActivityIsError", () => {
     expect(latestActivityErrorState([error], true)).toBe("error");
   });
 
+  it("treats a lost session stream as a disconnect, not a genuine fault", () => {
+    const streamLost = { ...error, code: "session_stream_lost" };
+    expect(latestActivityErrorState([streamLost], false)).toBe("disconnected");
+    expect(latestActivityErrorState([streamLost], true)).toBe("recovered_disconnect");
+  });
+
   it("preserves a genuine fault in a mixed fault and disconnect cascade", () => {
     const disconnected = { ...error, code: "runner_disconnected", message: "Tunnel dropped" };
     expect(latestActivityErrorState([error, disconnected], false)).toBe("error");
