@@ -1,9 +1,7 @@
-"""Codex on a managed sandbox without inference config offers a model choice like Claude Code.
+"""Codex on a managed sandbox without an inference catalog offers a model choice like Claude Code.
 
-The server is this checkout's real ``omnigent server`` configured with an
-``agent_sandbox`` provider and no ``inference`` block, so ``/v1/info`` offers
-the Sandbox target without ``inference_models``. Only the final create POST is
-intercepted: no cluster exists here to launch the sandbox.
+Drives this checkout's real server (``agent_sandbox`` provider, no ``inference`` block);
+only the final create POST is intercepted because no cluster exists here.
 """
 
 from __future__ import annotations
