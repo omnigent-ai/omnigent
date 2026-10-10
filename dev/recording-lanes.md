@@ -324,6 +324,42 @@ pane greyed out behind "Bridge closed: terminal session ended", a deleted
 session, a result list emptied by fixture cleanup — means the recording outlived
 the test body. Fix the stop point and re-record; do not caption around it.
 
+Look at the frame, not at a proxy for it. Extract the final frame with
+`ffmpeg -i <clip> -update 1 last-frame.png` and open the image; when the
+caption names several states, sample a frame for each. That command decodes the
+whole clip and keeps the last decoded frame, so it does not depend on the
+container knowing its duration (Playwright's `.webm` does not). A seek-and-grab
+such as `-sseof -0.5 … -frames:v 1` returns an earlier frame instead — the
+first one on a duration-less `.webm`. Pixel-colour counts, file sizes, or the
+test's own intent do not tell you what is on screen.
+
+**If the frames cannot be inspected** — no image viewer, `ffmpeg` filter
+errors, a missing image library — caption only the state the driver's DOM
+assertions established and say so in the caption itself, e.g. `"… → Chat shows
+no question card (frames not inspected; state verified by DOM assertions)"`.
+Record the failed inspection attempt and the assertions that ran in `evidence`.
+Do not describe a screen nobody verified.
+
+**A `before` clip of something missing must rule out a different failure.**
+When the reported symptom is an absence — no card, no notice, a turn that
+"looks stalled" — a driver that only asserts the expected element is absent
+will also pass on a session that failed for an unrelated reason, and the clip
+then shows that failure instead: a red "Something went wrong" pill in an
+otherwise empty transcript, an error badge on the session row. Alongside the
+missing-element assertion, first wait for the stall context the caption
+describes to be visible — the user message, the pending tool call, or the
+running-turn indicator — and only then assert that no generic error notice is
+on screen; a zero-count assertion passes vacuously while the page is still
+loading. In the web lane that means no transcript error pill
+(`expect(page.locator('[data-testid="error-pill"][data-level="error"]')).to_have_count(0)`;
+the same pill with `data-level="info"` is an informational notice, not a
+failure) and no error badge on the session's sidebar row
+(`expect(row.locator('[data-testid="session-state-badge"][data-state="error"]')).to_have_count(0)`;
+the badge reflects session state and outlives a dismissed pill). If an error
+notice does appear, find what raised it (the seeded
+session's own turn or the injected event) and fix the setup before filming; a
+clip of an error notice demonstrates that error, not a silent stall.
+
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in
 what the clip shows: e.g. `"start a session → open the model picker → select the
