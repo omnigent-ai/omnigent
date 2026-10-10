@@ -1,10 +1,15 @@
 import {
   forwardRef,
+  useCallback,
+  useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
+  useState,
   type ComponentPropsWithRef,
   type ComponentPropsWithoutRef,
   type KeyboardEvent,
+  type MutableRefObject,
   type ReactNode,
   type RefObject,
 } from "react";
@@ -13,10 +18,35 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
+  markerRevealRanges,
+  normalizeLineBreaks,
+  plainComposerMarkdown,
+  tokenizeComposerMarkdown,
+  type ComposerMarkdown,
+  type RevealRange,
+} from "@/lib/composerMarkdown";
+import {
+  ComposerCompactView,
+  ComposerHighlightLayer,
+  type ComposerAccentRange,
+  type ScrollAnchor,
+} from "./ComposerHighlightLayer";
+import { compactLayout } from "@/lib/composerCompact";
+import {
   isComposerAltNewlineKey,
   isComposerSendKey,
   isComposerSteerAllKey,
 } from "@/lib/composerSendShortcutPreferences";
+import { fenceArrowDown, fenceEnter, fenceNewline, type ComposerEdit } from "@/lib/composerEditing";
+import {
+  NO_PAIRS,
+  editAfterKeystroke,
+  editBeforeKeystroke,
+  followKeystroke,
+  isPairChar,
+  pairsAround,
+  type PairState,
+} from "@/lib/composerAutoPair";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 
 export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
@@ -77,11 +107,12 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
     "data-testid"?: string;
     "data-slash-command"?: string;
     "data-has-draft"?: string;
+    accentRange?: ComposerAccentRange | null;
+    onCompactChange?: () => void;
   };
   slots?: {
     beforeInput?: ReactNode;
     inputPrefix?: ReactNode;
-    inputBackdrop?: ReactNode;
     inputHint?: ReactNode;
     attachments?: ReactNode;
   };
@@ -118,7 +149,6 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
         className={slots?.inputPrefix ? "max-h-[320px] overflow-y-auto" : undefined}
       >
         {slots?.inputPrefix}
-        {slots?.inputBackdrop}
         <ComposerTextInput input={input} keyboard={keyboard} />
         {slots?.inputHint}
       </ComposerInputArea>
@@ -248,35 +278,109 @@ export function ComposerTextInput({
   input,
   keyboard,
 }: Pick<ChatComposerProps, "input" | "keyboard">) {
+  const parsedRef = useRef<ComposerParse | null>(null);
   return (
     <ComposerTextarea
       {...input}
+      parsedRef={parsedRef}
       onKeyDown={(event) => {
-        // A newline in every mode and on touch devices; completion menus never see it.
+        const textarea = event.currentTarget;
+        // Keys reuse the draft's current parse; one that's stale or missing
+        // (a draft past the parse cap) skips code-block handling, never
+        // re-tokenizes.
+        const parse = parsedRef.current;
+        const markdown = parse?.text === textarea.value ? parse.markdown : null;
+        // A newline in every mode and on touch devices; completion menus never
+        // see it. In a quoted or listed code block it keeps the block going.
         if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
           event.preventDefault();
-          insertLineBreak(event.currentTarget);
+          const { selectionStart, selectionEnd } = textarea;
+          const continued =
+            markdown && fenceNewline(textarea.value, selectionStart, selectionEnd, markdown);
+          if (continued) applyComposerEdit(textarea, continued);
+          else insertLineBreak(textarea);
           return;
         }
-        if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
-        const shouldSubmitFromKeyboard = isComposerSendKey(
-          { ...event, isComposing: event.nativeEvent.isComposing },
-          keyboard.submitWithModEnter,
-          keyboard.preventsKeyboardSubmit,
-        );
+        const plain = !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey;
+        // Enter inside a fenced block makes a newline, and exits from its
+        // empty last line; Cmd/Ctrl+Enter and the send button still send.
+        const inFence =
+          markdown && event.key === "Enter" && plain && !event.nativeEvent.isComposing
+            ? fenceEnter(textarea.value, textarea.selectionStart, textarea.selectionEnd, markdown)
+            : null;
+        const editFence = () => {
+          if (inFence?.kind !== "edit" || event.defaultPrevented) return;
+          event.preventDefault();
+          applyComposerEdit(textarea, inFence.edit);
+        };
+        if (keyboard.preventsKeyboardSubmit && event.key === "Enter") {
+          editFence();
+          return;
+        }
+        const shouldSubmitFromKeyboard =
+          inFence === null &&
+          isComposerSendKey(
+            { ...event, isComposing: event.nativeEvent.isComposing },
+            keyboard.submitWithModEnter,
+            keyboard.preventsKeyboardSubmit,
+          );
         const shouldSteerAllFromKeyboard = isComposerSteerAllKey(
           { ...event, isComposing: event.nativeEvent.isComposing },
           keyboard.submitWithModEnter,
           keyboard.preventsKeyboardSubmit,
         );
+        // Menus (slash commands, mentions) see the key first and may claim it.
         input.onKeyDown?.(event, {
           shouldSubmitFromKeyboard,
           shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
           shouldSteerAllFromKeyboard,
         });
+        editFence();
+        if (markdown && event.key === "ArrowDown" && plain && !event.defaultPrevented) {
+          const down = fenceArrowDown(
+            textarea.value,
+            textarea.selectionStart,
+            textarea.selectionEnd,
+            markdown,
+          );
+          if (!down) return;
+          event.preventDefault();
+          if ("edit" in down) applyComposerEdit(textarea, down.edit);
+          else textarea.setSelectionRange(down.move, down.move);
+        }
       }}
     />
   );
+}
+
+/**
+ * Apply an edit the composer makes for the user as one undoable change: the
+ * browser's own insertText command keeps it on the textarea's undo stack.
+ * Where that command isn't available the value is set directly (not undoable).
+ */
+export function applyComposerEdit(textarea: HTMLTextAreaElement, edit: ComposerEdit) {
+  textarea.focus();
+  textarea.setSelectionRange(edit.start, edit.end);
+  let applied: boolean;
+  try {
+    applied =
+      typeof document.execCommand === "function" &&
+      document.execCommand("insertText", false, edit.insert);
+  } catch {
+    applied = false;
+  }
+  if (!applied) {
+    const value =
+      textarea.value.slice(0, edit.start) + edit.insert + textarea.value.slice(edit.end);
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(
+      textarea,
+      value,
+    );
+    textarea.dispatchEvent(
+      new InputEvent("input", { bubbles: true, inputType: "insertReplacementText" }),
+    );
+  }
+  textarea.setSelectionRange(edit.caret, edit.caret);
 }
 
 export function ComposerInputArea({ className, ...props }: ComponentPropsWithoutRef<"div">) {
@@ -333,36 +437,510 @@ export function ComposerFeedbackRow({
   );
 }
 
-export const ComposerTextarea = forwardRef<
-  HTMLTextAreaElement,
-  ComponentPropsWithoutRef<"textarea">
->(function ComposerTextarea(
-  { className, onKeyDown, onCompositionStart, onCompositionEnd, ...props },
-  ref,
+/**
+ * A safety cap far above a several-thousand-line paste: past this many
+ * characters Markdown is not parsed, though a command token is still tinted.
+ */
+export const MAX_HIGHLIGHTED_DRAFT_LENGTH = 1_000_000;
+
+/** The draft's current parse, and the text it's of. */
+export interface ComposerParse {
+  text: string;
+  /** Null when the draft isn't parsed (past the parse cap). */
+  markdown: ComposerMarkdown | null;
+}
+
+type ComposerTextareaProps = ComponentPropsWithoutRef<"textarea"> & {
+  /** Receives the draft's current parse after each render, for key handling. */
+  parsedRef?: MutableRefObject<ComposerParse | null>;
+  /** Draft range to tint as a slash command or skill token. */
+  accentRange?: ComposerAccentRange | null;
+  /**
+   * Called in the same task as the switch to or from the compact preview,
+   * whose height differs, so a transcript can re-pin before the next paint.
+   */
+  onCompactChange?: () => void;
+};
+
+/**
+ * The draft input. Markdown in the draft is styled live by an aria-hidden
+ * highlight layer painted behind the textarea: while the layer is shown, the
+ * textarea's glyphs are transparent but it keeps the caret, selection, IME and
+ * every input behavior. The layer mirrors the textarea's box and typography so
+ * each glyph lands exactly under the one it replaces, and follows its height
+ * and scroll. It steps aside during IME composition so the native composition
+ * text and underline show. Markdown markers are hidden except those of the
+ * tokens the focused textarea's caret or selection touches; blur hides them all.
+ *
+ * Hidden markers keep their width while editing, since the caret must line up.
+ * Once the textarea has lost focus (and no press is still in progress), a
+ * compact preview takes its place: markers take no space and code fences
+ * collapse. The textarea stays mounted, focusable and in the accessibility
+ * tree, just out of the flow and not painted; a click on the preview focuses
+ * it with the caret on the character clicked, and keyboard focus keeps its
+ * previous selection.
+ */
+export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComposerTextareaProps>(
+  function ComposerTextarea(
+    {
+      className,
+      onKeyDown,
+      onCompositionStart,
+      onCompositionEnd,
+      onScroll,
+      onFocus,
+      onBlur,
+      onSelect,
+      onInput,
+      onKeyUp,
+      onMouseUp,
+      accentRange,
+      parsedRef,
+      onCompactChange,
+      value,
+      ...props
+    },
+    ref,
+  ) {
+    const isComposingRef = useRef(false);
+    // Set once the textarea has settled out of focus; the preview needs it.
+    const [unfocused, setUnfocused] = useState(false);
+    const [composing, setComposing] = useState(false);
+    const [selection, setSelection] = useState<{ start: number; end: number } | null>(null);
+    const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+    const layerRef = useRef<HTMLDivElement>(null);
+    const setTextareaRef = useCallback(
+      (node: HTMLTextAreaElement | null) => {
+        textareaRef.current = node;
+        if (typeof ref === "function") ref(node);
+        else if (ref) ref.current = node;
+      },
+      [ref],
+    );
+    // The textarea shows every line break as LF; the layer lays out that text.
+    const shown = useMemo(
+      () => (typeof value === "string" ? normalizeLineBreaks(value) : null),
+      [value],
+    );
+    const accent = useMemo(() => {
+      if (!shown || !accentRange || accentRange.end <= accentRange.start) return null;
+      return { start: shown.offset(accentRange.start), end: shown.offset(accentRange.end) };
+    }, [shown, accentRange]);
+    const parsed = shown !== null && shown.text.length <= MAX_HIGHLIGHTED_DRAFT_LENGTH;
+    const needsPlain = !parsed && accent !== null;
+    const markdown = useMemo(() => {
+      if (!shown) return null;
+      if (parsed) return tokenizeComposerMarkdown(shown.text);
+      return needsPlain ? plainComposerMarkdown(shown.text) : null;
+    }, [shown, parsed, needsPlain]);
+    const highlighted = !composing && markdown !== null && (markdown.styled || accent !== null);
+    const revealRanges = useStableRanges(
+      useMemo(
+        () =>
+          parsed && markdown && selection
+            ? markerRevealRanges(markdown, selection.start, selection.end)
+            : NO_RANGES,
+        [parsed, markdown, selection],
+      ),
+    );
+    // Composition text is not the draft yet; its caret is read once it commits.
+    const readSelection = useCallback(() => {
+      const textarea = textareaRef.current;
+      if (!textarea || isComposingRef.current) return;
+      if (textarea.ownerDocument.activeElement !== textarea) {
+        setSelection(null);
+        return;
+      }
+      const { selectionStart: start, selectionEnd: end } = textarea;
+      setSelection((previous) =>
+        previous?.start === start && previous.end === end ? previous : { start, end },
+      );
+    }, []);
+    useEffect(() => {
+      if (!highlighted) return;
+      // Arrow keys, drag selection and programmatic moves all fire this.
+      document.addEventListener("selectionchange", readSelection);
+      return () => document.removeEventListener("selectionchange", readSelection);
+    }, [highlighted, readSelection]);
+    useTypingEdits(textareaRef, isComposingRef);
+    useHighlightLayerSync(textareaRef, layerRef, highlighted, shown?.text);
+    const scheduleUnfocused = useSettledBlur(textareaRef, setUnfocused);
+    const compact = useMemo(
+      () => (unfocused && highlighted && parsed && markdown ? compactLayout(markdown) : null),
+      [unfocused, highlighted, parsed, markdown],
+    );
+    const compacted = compact?.collapsed === true;
+    const onCompactChangeRef = useRef(onCompactChange);
+    useLayoutEffect(() => {
+      onCompactChangeRef.current = onCompactChange;
+    });
+    const wasCompactedRef = useRef(compacted);
+    useLayoutEffect(() => {
+      if (wasCompactedRef.current === compacted) return;
+      wasCompactedRef.current = compacted;
+      onCompactChangeRef.current?.();
+    }, [compacted]);
+    useOutOfFlow(textareaRef, compacted);
+    // The layer's lookup of the draft line at the textarea's scroll position.
+    const anchorRef = useRef<((top: number) => ScrollAnchor | null) | null>(null);
+    const readAnchor = useCallback(() => {
+      const textarea = textareaRef.current;
+      return textarea ? (anchorRef.current?.(textarea.scrollTop) ?? null) : null;
+    }, []);
+    const placeCaret = useCallback((at: number) => {
+      const textarea = textareaRef.current;
+      if (!textarea || textarea.disabled) return;
+      textarea.focus({ preventScroll: true });
+      textarea.setSelectionRange(at, at);
+    }, []);
+    useLayoutEffect(() => {
+      if (parsedRef)
+        parsedRef.current = { text: shown?.text ?? "", markdown: parsed ? markdown : null };
+    });
+    return (
+      <div
+        className="composer-input-text relative text-ui"
+        data-compact={compacted ? "" : undefined}
+        // The textarea below the preview adds no height or scroll (nor its
+        // line box's strut); a quote's bar still reaches into the left gutter.
+        // Inline styles here and below: a class change on these restyles
+        // every span of the draft.
+        style={compacted ? { overflowY: "clip", lineHeight: 0 } : undefined}
+      >
+        {highlighted && markdown && (
+          <ComposerHighlightLayer
+            ref={layerRef}
+            markdown={markdown}
+            accentRange={accent}
+            revealRanges={revealRanges}
+            disabled={props.disabled}
+            hidden={compacted}
+            anchorRef={anchorRef}
+          />
+        )}
+        {compact && compacted && (
+          <ComposerCompactView
+            layout={compact}
+            accentRange={accent}
+            disabled={props.disabled}
+            textareaRef={textareaRef}
+            readAnchor={readAnchor}
+            onPlaceCaret={placeCaret}
+          />
+        )}
+        <textarea
+          ref={setTextareaRef}
+          value={value}
+          className={cn(
+            "composer-input-text relative max-h-[180px] w-full resize-none overflow-y-auto border-none bg-transparent p-0 text-ui text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 md:min-h-[42px] md:select-text [&::-webkit-scrollbar]:hidden",
+            // The layer paints the glyphs; selected text must not repaint over it.
+            highlighted &&
+              "text-transparent caret-foreground [-webkit-text-fill-color:transparent] selection:text-transparent selection:[-webkit-text-fill-color:transparent]",
+            className,
+          )}
+          {...props}
+          // Under the preview, unpainted but focusable. A negative margin (see
+          // useOutOfFlow) keeps its box and scroll; repositioning it would re-lay
+          // out all its text.
+          style={
+            compacted
+              ? { ...props.style, opacity: 0, pointerEvents: "none", verticalAlign: "top" }
+              : props.style
+          }
+          onScroll={(event) => {
+            if (layerRef.current) layerRef.current.scrollTop = event.currentTarget.scrollTop;
+            onScroll?.(event);
+          }}
+          onFocus={(event) => {
+            setUnfocused(false);
+            readSelection();
+            onFocus?.(event);
+          }}
+          onBlur={(event) => {
+            setSelection(null);
+            scheduleUnfocused();
+            onBlur?.(event);
+          }}
+          onSelect={(event) => {
+            readSelection();
+            onSelect?.(event);
+          }}
+          onInput={(event) => {
+            readSelection();
+            onInput?.(event);
+          }}
+          onKeyUp={(event) => {
+            readSelection();
+            onKeyUp?.(event);
+          }}
+          onMouseUp={(event) => {
+            readSelection();
+            onMouseUp?.(event);
+          }}
+          onCompositionStart={(event) => {
+            isComposingRef.current = true;
+            setComposing(true);
+            onCompositionStart?.(event);
+          }}
+          onCompositionEnd={(event) => {
+            isComposingRef.current = false;
+            setComposing(false);
+            readSelection();
+            onCompositionEnd?.(event);
+          }}
+          onKeyDown={(event) => {
+            if (!isImeCompositionKeyEvent(event, isComposingRef.current)) onKeyDown?.(event);
+          }}
+        />
+      </div>
+    );
+  },
+);
+
+const NO_RANGES: readonly RevealRange[] = [];
+
+/**
+ * While `active`, the textarea takes no height in the flow: a negative bottom
+ * margin as tall as it is, kept current as it auto-grows (dictation can add
+ * text while the preview shows).
+ */
+function useOutOfFlow(textareaRef: RefObject<HTMLTextAreaElement | null>, active: boolean) {
+  useLayoutEffect(() => {
+    const textarea = textareaRef.current;
+    if (!active || !textarea) return;
+    const sync = () => {
+      textarea.style.marginBottom = `-${textarea.getBoundingClientRect().height}px`;
+    };
+    sync();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(sync);
+    observer?.observe(textarea);
+    return () => {
+      observer?.disconnect();
+      textarea.style.marginBottom = "";
+    };
+  }, [textareaRef, active]);
+}
+
+/**
+ * Report the textarea as unfocused once focus has settled elsewhere: after a
+ * press that blurred it ends (so a click on a control lands before the
+ * composer changes height), and not when focus comes straight back or the
+ * window alone lost it. A textarea that starts unfocused is checked shortly
+ * after mount, once the page has had its chance to focus it; a press or a
+ * focus first cancels that check, which blur takes over from. Returns the
+ * function to call on blur.
+ */
+function useSettledBlur(
+  textareaRef: RefObject<HTMLTextAreaElement | null>,
+  setUnfocused: (unfocused: boolean) => void,
+): () => void {
+  const pressedRef = useRef(false);
+  const pendingRef = useRef<() => void>(() => {});
+  const check = useCallback(() => {
+    const textarea = textareaRef.current;
+    if (textarea && textarea.ownerDocument.activeElement !== textarea) setUnfocused(true);
+  }, [textareaRef, setUnfocused]);
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    const mount = window.setTimeout(check, 50);
+    const cancelMount = () => window.clearTimeout(mount);
+    const press = () => {
+      pressedRef.current = true;
+      cancelMount();
+    };
+    const release = () => {
+      pressedRef.current = false;
+    };
+    document.addEventListener("pointerdown", press, true);
+    document.addEventListener("pointerup", release, true);
+    document.addEventListener("pointercancel", release, true);
+    textarea?.addEventListener("focus", cancelMount);
+    return () => {
+      document.removeEventListener("pointerdown", press, true);
+      document.removeEventListener("pointerup", release, true);
+      document.removeEventListener("pointercancel", release, true);
+      textarea?.removeEventListener("focus", cancelMount);
+      cancelMount();
+      pendingRef.current();
+    };
+  }, [check, textareaRef]);
+  return useCallback(() => {
+    pendingRef.current();
+    let timer = 0;
+    const later = () => {
+      timer = window.setTimeout(check, 0);
+    };
+    pendingRef.current = () => {
+      document.removeEventListener("pointerup", later, true);
+      document.removeEventListener("pointercancel", later, true);
+      window.clearTimeout(timer);
+    };
+    if (!pressedRef.current) {
+      later();
+      return;
+    }
+    // After the press ends and its click has run.
+    document.addEventListener("pointerup", later, { capture: true, once: true });
+    document.addEventListener("pointercancel", later, { capture: true, once: true });
+  }, [check]);
+}
+
+/** Keep the previous array while the ranges are unchanged, so the layer skips re-rendering. */
+function useStableRanges(ranges: readonly RevealRange[]): readonly RevealRange[] {
+  const previousRef = useRef(ranges);
+  const previous = previousRef.current;
+  const same =
+    previous.length === ranges.length &&
+    previous.every((range, i) => range.start === ranges[i].start && range.end === ranges[i].end);
+  if (!same) previousRef.current = ranges;
+  return same ? previous : ranges;
+}
+
+/**
+ * Edits made as the user types Markdown: an opening `` ` ``, `*` or `_` gets
+ * its closer (see `composerAutoPair`), a closing marker tidies a stray space
+ * inside its pair or completes an open `**`, and a third backtick on an empty
+ * line makes a code block. Only a typed character triggers one (an
+ * `insertText` input, not composing): never a paste, IME composition,
+ * dictation, history recall or draft restore, which don't arrive as typed
+ * input. Each is its own undoable change, applied after the keystroke lands,
+ * so one undo restores exactly what was typed. Backspace in an empty inserted
+ * pair and a marker typed over a selection replace the keystroke instead.
+ */
+function useTypingEdits(
+  textareaRef: RefObject<HTMLTextAreaElement | null>,
+  isComposingRef: RefObject<boolean>,
 ) {
-  const isComposingRef = useRef(false);
-  return (
-    <textarea
-      ref={ref}
-      className={cn(
-        "composer-input-text relative max-h-[180px] w-full resize-none overflow-y-auto border-none bg-transparent p-0 text-ui text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 md:min-h-[42px] md:select-text [&::-webkit-scrollbar]:hidden",
-        className,
-      )}
-      {...props}
-      onCompositionStart={(event) => {
-        isComposingRef.current = true;
-        onCompositionStart?.(event);
-      }}
-      onCompositionEnd={(event) => {
-        isComposingRef.current = false;
-        onCompositionEnd?.(event);
-      }}
-      onKeyDown={(event) => {
-        if (!isImeCompositionKeyEvent(event, isComposingRef.current)) onKeyDown?.(event);
-      }}
-    />
-  );
-});
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    let applying = false;
+    // The closers inserted here, valid while the draft is `trackedValue`.
+    let state: PairState = NO_PAIRS;
+    let trackedValue = textarea.value;
+    // The draft and selection before the next keystroke: refreshed after every
+    // change, and at `beforeinput` when that fires (not for execCommand).
+    let before = { value: textarea.value, start: 0, end: 0 };
+    const snapshot = () => {
+      const { value, selectionStart, selectionEnd } = textarea;
+      // A change that didn't come as input (restore, dictation) ends tracking.
+      if (value !== trackedValue) state = NO_PAIRS;
+      trackedValue = value;
+      before = { value, start: selectionStart, end: selectionEnd };
+    };
+    const apply = (edit: ComposerEdit) => {
+      applying = true;
+      try {
+        applyComposerEdit(textarea, edit);
+      } finally {
+        applying = false;
+      }
+      trackedValue = textarea.value;
+      snapshot();
+    };
+    const onBeforeInput = (event: Event) => {
+      const input = event as InputEvent;
+      if (applying || input.isComposing || isComposingRef.current) return;
+      snapshot();
+      const { value, selectionStart, selectionEnd } = textarea;
+      const replaced = editBeforeKeystroke(
+        value,
+        selectionStart,
+        selectionEnd,
+        input.inputType,
+        input.data,
+        state,
+      );
+      if (!replaced) return;
+      input.preventDefault();
+      if (replaced.edit) apply(replaced.edit);
+      if (replaced.selection) textarea.setSelectionRange(...replaced.selection);
+      state = replaced.state;
+      snapshot();
+    };
+    const onInput = (event: Event) => {
+      const input = event as InputEvent;
+      if (applying) return;
+      const { value, selectionStart } = textarea;
+      state = followKeystroke(state, input.inputType, before, value, selectionStart);
+      trackedValue = value;
+      snapshot();
+      const typed = input.data;
+      if (input.inputType !== "insertText" || input.isComposing || isComposingRef.current) return;
+      if (typed?.length !== 1 || (!isPairChar(typed) && typed !== " ")) {
+        state = { ...state, swallow: null };
+        return;
+      }
+      queueMicrotask(() => {
+        const { value: text, selectionStart: caret, selectionEnd } = textarea;
+        if (caret !== selectionEnd || text[caret - 1] !== typed) return;
+        const result = editAfterKeystroke(text, caret, typed, state);
+        state = result.state;
+        if (result.edit) apply(result.edit);
+        if (result.then) apply(result.then);
+      });
+    };
+    // A caret moved out of a pair's text leaves its closer as plain text.
+    const onSelection = () => {
+      if (document.activeElement !== textarea || applying) return;
+      const { selectionStart, selectionEnd } = textarea;
+      state = {
+        pairs: selectionStart === selectionEnd ? pairsAround(state.pairs, selectionStart) : [],
+        swallow: state.swallow?.at === selectionStart ? state.swallow : null,
+      };
+      snapshot();
+    };
+    textarea.addEventListener("beforeinput", onBeforeInput);
+    textarea.addEventListener("input", onInput);
+    document.addEventListener("selectionchange", onSelection);
+    return () => {
+      textarea.removeEventListener("beforeinput", onBeforeInput);
+      textarea.removeEventListener("input", onInput);
+      document.removeEventListener("selectionchange", onSelection);
+    };
+  }, [textareaRef, isComposingRef]);
+}
+
+/**
+ * Keep the highlight layer on the textarea's box: its height follows the
+ * textarea's (auto-grow, the max-height cap) and its scroll offset is copied on
+ * mount, resize, scroll and the frame after each edit. That frame's layout is
+ * already clean, so the copy never forces an extra layout per keystroke.
+ */
+function useHighlightLayerSync(
+  textareaRef: RefObject<HTMLTextAreaElement | null>,
+  layerRef: RefObject<HTMLDivElement | null>,
+  highlighted: boolean,
+  text: string | undefined,
+) {
+  useEffect(() => {
+    if (!highlighted) return;
+    const frame = requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      const layer = layerRef.current;
+      if (textarea && layer && layer.scrollTop !== textarea.scrollTop)
+        layer.scrollTop = textarea.scrollTop;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [textareaRef, layerRef, highlighted, text]);
+  useLayoutEffect(() => {
+    const textarea = textareaRef.current;
+    const layer = layerRef.current;
+    if (!highlighted || !textarea || !layer) return;
+    const sync = () => {
+      // The used height, fractions included (offsetHeight rounds). Not laid
+      // out yet (hidden, or jsdom): keep the CSS full-height fallback.
+      const height = parseFloat(getComputedStyle(textarea).height);
+      if (height > 0) layer.style.height = `${height}px`;
+      layer.scrollTop = textarea.scrollTop;
+    };
+    sync();
+    if (typeof ResizeObserver === "undefined") return;
+    const resizeObserver = new ResizeObserver(sync);
+    resizeObserver.observe(textarea);
+    return () => resizeObserver.disconnect();
+  }, [textareaRef, layerRef, highlighted]);
+}
 
 export const ComposerActionRow = forwardRef<HTMLDivElement, ComponentPropsWithoutRef<"div">>(
   function ComposerActionRow({ className, ...props }, ref) {
