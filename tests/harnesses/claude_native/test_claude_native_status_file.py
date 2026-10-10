@@ -19,11 +19,11 @@ from omnigent.harnesses.claude_native import status_file as status_file_module
 from omnigent.harnesses.claude_native.status_file import (
     IDLE,
     RUNNING,
+    SessionStatus,
     SessionStatusPoller,
     read_session_status,
     resolve_status_file,
     sessions_dir,
-    SessionStatus,
 )
 
 
