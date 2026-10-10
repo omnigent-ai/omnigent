@@ -7,6 +7,18 @@ import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
+vi.mock("./VideoViewer", () => ({
+  VideoViewer: ({ path }: { path: string }) => <div data-testid="video-viewer-stub">{path}</div>,
+}));
+
+describe("video dispatch", () => {
+  it("dispatches video before the binary fallback without JSON content", () => {
+    renderViewer("", true, "clip.mp4");
+    expect(screen.getByTestId("video-viewer-stub")).toHaveTextContent("clip.mp4");
+    expect(screen.queryByText("Preview not available for binary files.")).toBeNull();
+  });
+});
+
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));

@@ -133,9 +133,9 @@ function clickDownloadLink(href: string, filename: string): void {
  * :param path: Workspace-relative file path, e.g. ``"src/main.py"``.
  */
 export async function downloadWorkspaceFile(conversationId: string, path: string): Promise<void> {
-  const url = workspaceFileUrl(conversationId, path, { download: "true" });
+  const url = workspaceFileDownloadUrl(conversationId, path);
   const filename = path.split("/").pop() ?? path;
-  if (!isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell()) {
+  if (usesDirectFileDownload()) {
     // A direct anchor navigation, so it must carry the deployment subpath the
     // fetch paths get for free via hostFetch/authenticatedFetch. Without it a
     // stripping proxy (`/proxy/<port>/`) sends it to the origin root and misses
@@ -144,9 +144,30 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
     clickDownloadLink(withBasePath(url), filename);
     return;
   }
-  const res = await authenticatedFetch(url);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  triggerBrowserDownload(await res.blob(), filename);
+  triggerBrowserDownload(await fetchWorkspaceFileBlob(conversationId, path), filename);
+}
+
+/** Build the uncapped download URL for a workspace-relative or host-absolute file. */
+export function workspaceFileDownloadUrl(conversationId: string, path: string): string {
+  return workspaceFileUrl(conversationId, path, { download: "true" });
+}
+
+/** Use direct downloads where navigation can authenticate without a blob fetch. */
+export function usesDirectFileDownload(): boolean {
+  return !isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell();
+}
+
+/** Fetch a complete workspace file as an authenticated blob, optionally abortable. */
+export async function fetchWorkspaceFileBlob(
+  conversationId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const response = await authenticatedFetch(workspaceFileDownloadUrl(conversationId, path), {
+    signal,
+  });
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  return response.blob();
 }
 
 /**
@@ -161,7 +182,11 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
  * once at end-of-turn, avoiding continuous refetches that would reset the
  * editor's scroll and cursor position.
  */
-export function useFileContent(conversationId: string | undefined, path: string | null) {
+export function useFileContent(
+  conversationId: string | undefined,
+  path: string | null,
+  enabled = true,
+) {
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const sessionActive =
@@ -192,7 +217,7 @@ export function useFileContent(conversationId: string | undefined, path: string 
   return useQuery({
     queryKey: ["file-content", conversationId, path],
     queryFn: () => fetchFileContent(conversationId!, path!),
-    enabled: !!conversationId && !!path && serveable !== false,
+    enabled: enabled && !!conversationId && !!path && serveable !== false,
     staleTime: 5_000,
   });
 }

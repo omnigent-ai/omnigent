@@ -3534,6 +3534,90 @@ _DOWNLOAD_URL = (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("range_header", "status", "content_range", "body"),
+    [
+        ("bytes=2-5", 206, "bytes 2-5/10", b"2345"),
+        ("bytes=10-", 416, "bytes */10", b""),
+        ("bytes=2-5", 200, None, b"0123456789"),
+        (None, 200, None, b"0123456789"),
+    ],
+)
+async def test_filesystem_download_proxy_ranges(
+    client: httpx.AsyncClient,
+    range_header: str | None,
+    status: int,
+    content_range: str | None,
+    body: bytes,
+) -> None:
+    from fastapi import Response
+
+    runner = FastAPI()
+    seen: list[str | None] = []
+
+    @runner.get(_FS_ROUTE)
+    async def serve(request: Request) -> Response:
+        seen.append(request.headers.get("range"))
+        headers = {
+            "Content-Disposition": 'attachment; filename="big.bin"',
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(len(body)),
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if content_range is not None:
+            headers["Content-Range"] = content_range
+        if status == 416:
+            del headers["Content-Disposition"]
+        return Response(body, status_code=status, headers=headers)
+
+    async with _runner_app_client(runner):
+        response = await client.get(
+            _DOWNLOAD_URL, headers={"Range": range_header} if range_header is not None else {}
+        )
+    assert seen == [range_header]
+    assert response.status_code == status
+    assert response.content == body
+    assert response.headers.get("content-range") == content_range
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["content-length"] == str(len(body))
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_range", [None, "items */10", "bytes 1-2/10"])
+async def test_filesystem_download_proxy_rejects_unmarked_416(
+    client: httpx.AsyncClient,
+    content_range: str | None,
+) -> None:
+    """An unmarked runner 416 follows the existing non-download error handling."""
+    from fastapi import Response
+
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def serve(request: Request) -> Response:
+        assert request.headers["range"] == "bytes=10-"
+        headers = {
+            "Content-Disposition": 'attachment; filename="big.bin"',
+            "Accept-Ranges": "bytes",
+        }
+        if content_range is not None:
+            headers["Content-Range"] = content_range
+        return Response(b"not a range response", status_code=416, headers=headers)
+
+    async with _runner_app_client(runner):
+        response = await client.get(_DOWNLOAD_URL, headers={"Range": "bytes=10-"})
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "runner download failed"}
+    assert "content-range" not in response.headers
+    assert "content-disposition" not in response.headers
+    assert "accept-ranges" not in response.headers
+
+
+@pytest.mark.asyncio
 async def test_filesystem_download_streams_runner_attachment(
     client: httpx.AsyncClient,
     tmp_path: Path,

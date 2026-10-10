@@ -216,9 +216,8 @@ def test_file_viewer_download_saves_the_complete_file(
     expect(row).to_be_visible(timeout=30_000)
     row.click()
     expect(rail.get_by_test_id("file-viewer")).to_be_visible()
-    rail.get_by_role("button", name="View settings").click()
     with page.expect_download() as download_info:
-        page.get_by_role("menuitem", name="Download file").click()
+        rail.get_by_role("button", name="Download file").click()
     download = download_info.value
     assert download.suggested_filename == "big-download.txt"
     saved = tmp_path / "big-download.txt"

@@ -68,8 +68,10 @@ import {
   isModelFile,
   isNotebookPath,
   isPdfFile,
+  isVideoFile,
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
+import { VideoViewer } from "./VideoViewer";
 import { NotebookPreview } from "./NotebookPreview";
 import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
@@ -774,6 +776,9 @@ export function CodeViewer({
     };
   }, [content]);
 
+  if (isVideoFile(path, fileQuery.data?.content_type)) {
+    return <VideoViewer conversationId={conversationId} path={path} />;
+  }
   if (fileQuery.isLoading) {
     return (
       <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">

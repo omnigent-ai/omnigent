@@ -11,11 +11,27 @@ import {
   isModelFile,
   isNotebookPath,
   isPdfFile,
+  isVideoFile,
   lineOverlapsSelection,
   modelViewerTheme,
   openHtmlArtifactInNewTab,
   prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
+
+describe("isVideoFile", () => {
+  it.each(["mp4", "m4v", "webm", "mov", "ogv"])("recognizes %s and uppercase", (extension) => {
+    expect(isVideoFile(`clip.${extension}`)).toBe(true);
+    expect(isVideoFile(`clip.${extension.toUpperCase()}`)).toBe(true);
+    expect(isBinaryPath(`clip.${extension}`)).toBe(true);
+  });
+  it("uses video MIME before the extension", () => {
+    expect(isVideoFile("clip.bin", "video/mp4")).toBe(true);
+    expect(isVideoFile("clip.mp4", "application/octet-stream")).toBe(true);
+  });
+  it.each(["notes.txt", "photo.png", "audio.ogg", "extensionless"])("rejects %s", (path) => {
+    expect(isVideoFile(path)).toBe(false);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // detectLang — language matrix backing syntax highlighting

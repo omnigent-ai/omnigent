@@ -587,6 +587,62 @@ async def test_download_returns_complete_file_past_read_cap(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("range_header", "status", "body", "content_range"),
+    [
+        (None, 200, b"0123456789", None),
+        ("bytes=2-5", 206, b"2345", "bytes 2-5/10"),
+        ("bytes=7-", 206, b"789", "bytes 7-9/10"),
+        ("bytes=-3", 206, b"789", "bytes 7-9/10"),
+        ("bytes=-20", 206, b"0123456789", "bytes 0-9/10"),
+        ("bytes=8-99", 206, b"89", "bytes 8-9/10"),
+        ("bytes=10-", 416, b"", "bytes */10"),
+        ("bytes=-0", 416, b"", "bytes */10"),
+        ("bytes=bad", 200, b"0123456789", None),
+        ("bytes=0-1,3-4", 200, b"0123456789", None),
+        ("items=0-1", 200, b"0123456789", None),
+        ("bytes=5-2", 200, b"0123456789", None),
+        ("bytes=-", 200, b"0123456789", None),
+    ],
+)
+async def test_download_byte_ranges(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    range_header: str | None,
+    status: int,
+    body: bytes,
+    content_range: str | None,
+) -> None:
+    (workspace / "range.bin").write_bytes(b"0123456789")
+    response = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+        "/filesystem/range.bin?download=true",
+        headers={"Range": range_header} if range_header is not None else {},
+    )
+    assert response.status_code == status
+    assert response.content == body
+    assert response.headers.get("content-range") == content_range
+    assert response.headers["content-length"] == str(len(body))
+    assert response.headers["accept-ranges"] == "bytes"
+    if status != 416:
+        assert response.headers["content-disposition"] == 'attachment; filename="range.bin"'
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_download_range_on_empty_file(client: httpx.AsyncClient, workspace: Path) -> None:
+    (workspace / "empty.bin").write_bytes(b"")
+    response = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+        "/filesystem/empty.bin?download=true",
+        headers={"Range": "bytes=0-"},
+    )
+    assert response.status_code == 416
+    assert response.headers["content-range"] == "bytes */0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("path", "status", "code"),
     [("src", 400, "invalid_path"), ("nope.bin", 404, "path_not_found")],
 )
