@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -782,6 +782,86 @@ async def test_pty_edges_drive_status_when_poller_inactive(tmp_path: Path) -> No
     # Status edges publish via loop.call_soon_threadsafe; let them drain.
     await asyncio.sleep(0)
     assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_queued_terminal_exit_preserves_replacement(tmp_path: Path) -> None:
+    """An old exit must leave the replacement observable until its own exit."""
+    session_id = "conv_replaced_exit"
+    callbacks, _statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, session_id
+    )
+    terminals = registry._terminal_registry
+    assert terminals is not None
+    old = terminals.get(session_id, "claude", "main")
+    assert old is not None
+    exits: list[TerminalExitEvent] = []
+    registry.set_terminal_exit_publisher(exits.append)
+    callbacks["on_exit"]()
+
+    replacement = make_test_terminal_instance("claude", "main", tmp_path / "replacement")
+    replacement.close = AsyncMock()
+    terminals._by_conversation[session_id][("claude", "main")] = replacement
+    await _observe_native_agent_terminal_and_capture(registry, terminals, replacement, session_id)
+    registry.note_session_turn_started(session_id)
+    await registry.wait_for_terminal_exit_cleanup()
+
+    assert terminals.get(session_id, "claude", "main") is replacement
+    assert registry.terminal_resource_role(session_id, "terminal_claude_main") == (
+        CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+    assert registry.session_turn_is_active(session_id)
+    assert registry._status_pollers[session_id] is pollers[-1]
+    assert exits == []
+
+    replacement.running = False
+    await registry._handle_terminal_exit(
+        session_id=session_id,
+        terminal_name="claude",
+        session_key="main",
+        lifecycle=TerminalLifecycle.REQUIRED,
+        instance=replacement,
+    )
+    assert len(exits) == 1
+    assert exits[0].lifecycle == TerminalLifecycle.REQUIRED
+    assert exits[0].session_was_idle is False
+    assert terminals.get(session_id, "claude", "main") is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_close_error_preserves_replacement(tmp_path: Path) -> None:
+    """A replacement installed during failed teardown owns the current turn."""
+    session_id = "conv_replaced_close"
+    callbacks, _statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, session_id
+    )
+    terminals = registry._terminal_registry
+    assert terminals is not None
+    old = terminals.get(session_id, "claude", "main")
+    assert old is not None
+    replacement = make_test_terminal_instance("claude", "main", tmp_path / "replacement")
+
+    async def failing_close() -> None:
+        terminals._by_conversation.setdefault(session_id, {})[("claude", "main")] = replacement
+        await _observe_native_agent_terminal_and_capture(
+            registry, terminals, replacement, session_id
+        )
+        registry.note_session_turn_started(session_id)
+        raise RuntimeError("terminal teardown failed")
+
+    old.close = AsyncMock(side_effect=failing_close)
+    exits: list[TerminalExitEvent] = []
+    registry.set_terminal_exit_publisher(exits.append)
+    callbacks["on_exit"]()
+    await registry.wait_for_terminal_exit_cleanup()
+
+    assert terminals.get(session_id, "claude", "main") is replacement
+    assert registry.terminal_resource_role(session_id, "terminal_claude_main") == (
+        CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+    assert registry.session_turn_is_active(session_id)
+    assert registry._status_pollers[session_id] is pollers[-1]
+    assert exits == []
 
 
 @pytest.mark.asyncio

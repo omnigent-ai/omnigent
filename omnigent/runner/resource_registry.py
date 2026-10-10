@@ -1741,9 +1741,21 @@ class SessionResourceRegistry:
     ) -> None:
         """Clean up and publish lifecycle events for an unexpected terminal exit."""
         terminal_id = terminal_resource_id(terminal_name, session_key)
+        current = (
+            self._terminal_registry.get(session_id, terminal_name, session_key)
+            if self._terminal_registry is not None
+            else None
+        )
+        superseded = instance is not None and current is not None and current is not instance
         with self._lock:
-            observed = self._terminal_lifecycles.pop((session_id, terminal_id), None)
-            observed_role = self._terminal_roles.pop((session_id, terminal_id), None)
+            key = (session_id, terminal_id)
+            # Keep superseded exits observable without consuming the replacement's metadata.
+            if superseded:
+                observed = self._terminal_lifecycles.get(key)
+                observed_role = self._terminal_roles.get(key)
+            else:
+                observed = self._terminal_lifecycles.pop(key, None)
+                observed_role = self._terminal_roles.pop(key, None)
         if observed is None:
             return
         if observed != lifecycle:
@@ -1807,10 +1819,9 @@ class SessionResourceRegistry:
                     terminal_name,
                     session_key,
                 )
-            else:
-                current = self._terminal_registry.get(session_id, terminal_name, session_key)
-                if current is not None and instance is not None and current is not instance:
-                    superseded_by = current
+            current = self._terminal_registry.get(session_id, terminal_name, session_key)
+            if current is not None and instance is not None and current is not instance:
+                superseded_by = current
 
         # A replaced launch must not consume its successor's status memo.
         session_status_before_exit = (
