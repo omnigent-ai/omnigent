@@ -144,7 +144,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
-from omnigent.process_logging import log_info_once
+from omnigent.process_logging import env_truthy, log_info_once
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -436,6 +436,15 @@ class ClaudeNativeUcodeConfig:
     model_overrides: dict[str, str] = field(default_factory=dict)
 
 
+def _anthropic_api_host(base_url: str) -> bool:
+    """Whether *base_url* points at the first-party Anthropic API; unparsable URLs do not."""
+    try:
+        host = (urlparse(base_url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "anthropic.com" or host.endswith(".anthropic.com")
+
+
 def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> bool:
     """Whether the config's endpoint accepts canonical Anthropic ids and aliases.
 
@@ -448,8 +457,79 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
     if not base_url:
         return True
-    host = (urlparse(base_url).hostname or "").lower()
-    return host == "anthropic.com" or host.endswith(".anthropic.com")
+    return _anthropic_api_host(base_url)
+
+
+#: Env flags that put Claude Code in a cloud-provider mode where it gates
+#: WebSearch itself and ignores ``ANTHROPIC_BASE_URL``.
+_CLAUDE_CLOUD_PROVIDER_FLAG_ENVS: tuple[str, ...] = (
+    _CLAUDE_CODE_USE_BEDROCK_ENV,
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+
+
+def _managed_claude_env() -> dict[str, str]:
+    """The ``env`` block of the first readable Claude Code managed-settings file, else empty."""
+    for path in _managed_settings_paths():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_env = payload.get("env")
+        if not isinstance(raw_env, dict):
+            return {}
+        return {
+            key: value.strip()
+            for key, value in raw_env.items()
+            if isinstance(value, str) and value.strip()
+        }
+    return {}
+
+
+def _effective_claude_env_value(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    name: str,
+    managed_env: dict[str, str],
+) -> str | None:
+    """The value Claude Code sees for *name*.
+
+    Managed settings win, then the launch config, then the inherited process env.
+    """
+    if managed_env.get(name):
+        return managed_env[name]
+    if claude_config is not None and claude_config.env.get(name, "").strip():
+        return claude_config.env[name].strip()
+    return os.environ.get(name, "").strip() or None
+
+
+def endpoint_disallowed_claude_tools(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> tuple[str, ...]:
+    """Withhold WebSearch for non-Anthropic gateways; leave first-party and cloud launches alone.
+
+    Claude Code treats any ``ANTHROPIC_BASE_URL`` as first-party and runs WebSearch
+    through a nested ``web_search`` request to it, so a gateway that cannot serve
+    that tool hands the user its raw error as the search result. Bedrock, Vertex
+    and Foundry modes gate the tool themselves. Signals resolve as Claude Code
+    does at launch: managed settings, then the launch config, then inherited env.
+
+    :param claude_config: The resolved launch config, or ``None`` for Claude
+        Code's own login.
+    :returns: ``("WebSearch",)`` to merge into ``--disallowedTools``, or ``()``.
+    """
+    managed_env = _managed_claude_env()
+    if any(
+        env_truthy(_effective_claude_env_value(claude_config, name, managed_env))
+        for name in _CLAUDE_CLOUD_PROVIDER_FLAG_ENVS
+    ):
+        return ()
+    base_url = _effective_claude_env_value(claude_config, _UCODE_CLAUDE_BASE_URL_ENV, managed_env)
+    if not base_url or _anthropic_api_host(base_url):
+        return ()
+    return ("WebSearch",)
 
 
 def _ambient_env_is_non_anthropic_gateway() -> bool:
@@ -6443,6 +6523,7 @@ def _claude_terminal_request(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
+        disallowed_tools=endpoint_disallowed_claude_tools(claude_config),
     )
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by
