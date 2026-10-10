@@ -3189,6 +3189,7 @@ export function NewChatLandingScreen() {
   // resolves, so the picker offers that default instead of "Models unavailable".
   const sandboxUsesHarnessDefault =
     sandboxSelected &&
+    info !== "loading" &&
     sandboxCatalog === undefined &&
     !sandboxCatalogPending &&
     sandboxCatalogError === null;
