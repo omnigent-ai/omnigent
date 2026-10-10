@@ -767,15 +767,25 @@ def _is_context_overflow_error(
 def _response_failed_payload(
     error: Mapping[str, object],
     source: str = "execution",
+    *,
+    input_stable_id: str | None = None,
 ) -> _JsonObject:
-    """Build a failure envelope with required error fields and a legacy mirror."""
+    """Build a failure envelope with required error fields and a legacy mirror.
+
+    :param input_stable_id: Web stable id of the message this turn carried;
+        set when the failure happened before the harness received it so the
+        server can settle exactly that queued input.
+    """
     failure_error = {**_normalize_turn_error(error), **error}
-    return {
+    payload: _JsonObject = {
         "type": "response.failed",
         "source": source,
         "response": {"status": "failed", "error": failure_error},
         "error": failure_error,
     }
+    if input_stable_id is not None:
+        payload["input_stable_id"] = input_stable_id
+    return payload
 
 
 def _response_failed_event(
@@ -4792,11 +4802,14 @@ def create_runner_app(
         # can't suppress this turn's legitimate terminal publish.
         _desynced_sessions.discard(conv)
         _desync_terminalized.pop(conv, None)
+        # Flipped by the setup routine right before the harness handoff; a
+        # failure while this is still False means nothing reached the harness.
+        handed_off = [False]
         # Locate any uncoded exception logged below in the turn phase (this task's
         # context carries it for its lifetime). Coded errors keep their own phase.
         with phase_scope(ErrorPhase.TURN):
             try:
-                await _run_turn_bg_setup_and_stream(msg_body, conv)
+                await _run_turn_bg_setup_and_stream(msg_body, conv, handed_off)
             except _ContextWindowOverflow:
                 # Re-raise so the streaming-phase handler (which publishes the
                 # error event) is never shadowed by the generic except below.
@@ -4819,7 +4832,20 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": conv},
                 )
-                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                error: dict[str, Any] = {"message": f"turn setup failed: {exc}"}
+                if not handed_off[0]:
+                    # Nothing reached the harness, so no mirror will settle this web
+                    # input; report it undelivered instead of leaving it to look missing.
+                    _stable_id = msg_body.get("stable_id")
+                    if isinstance(_stable_id, str) and _stable_id:
+                        _publish_event(
+                            conv,
+                            _response_failed_payload(
+                                {**error, "undelivered": True},
+                                input_stable_id=_stable_id,
+                            ),
+                        )
+                _on_proxy_stream_end(conv, error=error)
             finally:
                 # Permanent-wedge floor: guarantee _active_turns is never left stale,
                 # however the body exits — including a BaseException that escapes
@@ -4859,6 +4885,7 @@ def create_runner_app(
     async def _run_turn_bg_setup_and_stream(
         msg_body: _JsonObject,
         conv: str,
+        handed_off: list[bool],
     ) -> None:
         _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
         await _sync_session_agent(
@@ -5238,6 +5265,9 @@ def create_runner_app(
             )
 
         try:
+            # From here on the harness may have received the message, so a
+            # later failure must not settle its queued input as undelivered.
+            handed_off[0] = True
             response = await _stream_message_to_harness(
                 harness_body,
                 conv,
