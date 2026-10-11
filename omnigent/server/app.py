@@ -3444,6 +3444,11 @@ def create_app(
         replica's tunnel is authoritative now, and this one's registry
         only ever knew about its own connections.
 
+        However the lease resolves without a reconnect here, this replica's
+        own liveness-stamp reference for the runner is released
+        (:func:`session_live_state.forget_liveness_stamp`); a later
+        reconnect hello records a fresh one.
+
         :param runner_id: The disconnected runner's id.
         :param reference_stamp: This replica's own last liveness stamp for
             *runner_id*, captured in :func:`_on_runner_disconnect` before
@@ -3464,6 +3469,11 @@ def create_app(
         reconnected = await tunnel_registry.wait_for_runner(
             runner_id, timeout_s=RUNNER_DISCONNECT_GRACE_S
         )
+        if reconnected is None:
+            # The runner is not coming back to this replica, so no disconnect
+            # decision here compares against its stamp again; release the
+            # reference instead of keeping one per runner ever seen.
+            session_live_state.forget_liveness_stamp(runner_id)
         if shutdown_state.server_shutting_down():
             _logger.info(
                 "Runner %s dropped because this server is shutting down; skipping offline-marking",
@@ -3626,6 +3636,9 @@ def create_app(
         # A runner this replica saw connect already ran, so its idle sessions lost
         # no work; a replica that never saw it has no stamp and keeps failing them.
         runner_ran = session_live_state.last_liveness_stamp(runner_id) is not None
+        # A crashed runner never re-tunnels, so the cancelled timer was the
+        # last reader of this replica's liveness-stamp reference for it.
+        session_live_state.forget_liveness_stamp(runner_id)
         try:
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
