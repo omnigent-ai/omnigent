@@ -116,7 +116,7 @@ export function useResizablePanel(open: boolean, defaultWidthVw = 50, minWidthPx
     enabled: open && isDesktop,
     overlay: true,
     onStart: widthStore.beginDrag,
-    onCancel: widthStore.rollbackDrag,
+    onCancel: () => widthStore.rollbackDrag((w) => clampWidth(w, minWidthRef.current)),
     onCommit: widthStore.persist,
     onMove: useCallback((e: React.PointerEvent<HTMLElement>) => {
       widthStore.set(clampWidth(window.innerWidth - e.clientX, minWidthRef.current));
