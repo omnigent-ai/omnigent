@@ -100,6 +100,8 @@ const statusTree = {
       tool: "frontend_engineer",
       session_name: "rail",
       busy: true,
+      model_override: "databricks-gpt-5-4",
+      reasoning_effort: "high",
       last_message_preview: "Inspecting rail layout and status indicators…",
     }),
     child({
@@ -116,6 +118,8 @@ const statusTree = {
       tool: "Explore",
       session_name: "find-callers",
       current_task_status: "completed",
+      routed_model: "databricks-claude-sonnet-5",
+      reasoning_effort: "medium",
       last_message_preview: "Found 14 call sites of the legacy API.",
     }),
     child({
@@ -131,6 +135,7 @@ const statusTree = {
       title: "technical-writer:docs",
       tool: "technical-writer",
       session_name: "docs",
+      llm_model: "databricks-claude-sonnet-5",
     }),
   ],
 };

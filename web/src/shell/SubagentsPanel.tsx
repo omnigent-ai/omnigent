@@ -507,6 +507,20 @@ function SubagentRow({
   const RoleIcon = iconForAgentType(iconRoleForChild(child));
   const primary = childPrimaryLabel(child);
   const isActive = conversationId === child.id;
+  const effectiveModel = child.model_override ?? child.routed_model ?? child.llm_model;
+  const modelLabel = effectiveModel ? shortModelName(effectiveModel) : null;
+  const effortLabel = child.reasoning_effort ?? "Default";
+  const modelEffortCue = modelLabel ? `${modelLabel} · ${effortLabel}` : child.reasoning_effort;
+  const modelDescription = child.routed_model
+    ? `Smart routing picked ${child.routed_model}`
+    : child.model_override
+      ? `Model override: ${child.model_override}`
+      : child.llm_model
+        ? `Effective model: ${child.llm_model}`
+        : null;
+  const modelEffortTitle = [modelDescription, `Reasoning effort: ${effortLabel}`]
+    .filter((part): part is string => part !== null)
+    .join(" · ");
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
   // — but never the row the user is currently viewing.
   const dim = !isActive && SETTLED_STATE[status.activity];
@@ -617,15 +631,13 @@ function SubagentRow({
                   )}
                 </span>
                 <span className="min-w-0 flex-1 truncate text-sm font-medium">{primary}</span>
-                {child.routed_model ? (
-                  // Model the intelligent router picked for this sub-agent — the
-                  // per-subagent half of routing visibility.
+                {modelEffortCue ? (
                   <span
-                    data-testid="subagent-routed-model"
-                    title={`Smart routing picked ${child.routed_model}`}
+                    data-testid="subagent-model-effort"
+                    title={modelEffortTitle}
                     className="shrink-0 truncate font-mono text-[10px] text-muted-foreground"
                   >
-                    {shortModelName(child.routed_model)}
+                    {modelEffortCue}
                   </span>
                 ) : null}
               </div>

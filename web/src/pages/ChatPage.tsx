@@ -3871,6 +3871,8 @@ function ComposerImpl(
                   modelLabelOptions={modelLabelOptions}
                   modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
+                  sessionIsChild={composerSession?.parentSessionId != null}
+                  sessionReasoningEffort={composerSession?.reasoningEffort ?? null}
                   // Config changes persist server-side and apply on the next
                   // wake/turn (the runner forward is best-effort), so the gear
                   // stays live wherever a message could be sent — including
@@ -4501,6 +4503,8 @@ function SessionHarnessPicker({
   modelLabelHostId,
   costRoutingEligible,
   disabled,
+  sessionIsChild,
+  sessionReasoningEffort,
   openNonce = 0,
 }: {
   busy: boolean;
@@ -4520,6 +4524,8 @@ function SessionHarnessPicker({
   modelLabelHostId: string | null | undefined;
   costRoutingEligible: boolean;
   disabled: boolean;
+  sessionIsChild: boolean;
+  sessionReasoningEffort: string | null;
   openNonce?: number;
 }) {
   const isMobile = useIsMobileViewport();
@@ -4572,7 +4578,10 @@ function SessionHarnessPicker({
     showModels,
     showEffort,
   });
-  const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
+  const effortLabel =
+    !routingOn && (showEffort || sessionIsChild)
+      ? formatStatusEffortLabel(sessionIsChild ? sessionReasoningEffort : selectedEffort)
+      : null;
   const label = routingOn
     ? SMART_ROUTING_LABEL
     : modelLabelLoading

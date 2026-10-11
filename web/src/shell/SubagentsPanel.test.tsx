@@ -1522,16 +1522,21 @@ describe("SubagentsPanel", () => {
     expect(useChildSessionsMock).not.toHaveBeenCalledWith("c3");
   });
 
-  it("shows the router's model on a routed sub-agent row, and nothing when unrouted", () => {
-    // Per-subagent routing visibility: the row carries the short model name
-    // the router picked. An unrouted sibling must stay unchanged — the pill
-    // would otherwise imply a decision that never happened.
+  it("shows the effective model and effort on each configured sub-agent row", () => {
     mockChildTree({
       conv_root: [
         childInfo({
           id: "conv_routed",
           tool: "researcher",
           routed_model: "databricks-claude-sonnet-5",
+          reasoning_effort: "high",
+        }),
+        childInfo({
+          id: "conv_explicit",
+          tool: "researcher",
+          model_override: "databricks-gpt-5-4",
+          llm_model: "databricks-gpt-5-4",
+          reasoning_effort: "medium",
         }),
         childInfo({ id: "conv_plain", tool: "researcher" }),
       ],
@@ -1540,9 +1545,18 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
     const routed = childRow(container, "conv_routed");
-    expect(within(routed).getByTestId("subagent-routed-model").textContent).toBe("sonnet");
+    expect(within(routed).getByTestId("subagent-model-effort")).toHaveTextContent("sonnet · high");
+    expect(within(routed).getByTestId("subagent-model-effort")).toHaveAttribute(
+      "title",
+      "Smart routing picked databricks-claude-sonnet-5 · Reasoning effort: high",
+    );
+
+    const explicit = childRow(container, "conv_explicit");
+    expect(within(explicit).getByTestId("subagent-model-effort")).toHaveTextContent(
+      "gpt-5-4 · medium",
+    );
     expect(
-      within(childRow(container, "conv_plain")).queryByTestId("subagent-routed-model"),
+      within(childRow(container, "conv_plain")).queryByTestId("subagent-model-effort"),
     ).toBeNull();
   });
 
