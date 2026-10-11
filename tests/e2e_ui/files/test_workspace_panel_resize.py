@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui._touch import touch_drag_between
 
 _FINE_GUTTER_PX = 10
+
+
+def _width(locator: Locator) -> float:
+    box = locator.bounding_box()
+    assert box is not None
+    return box["width"]
 
 
 def _open_execution_logs_panel(page: Page) -> None:
@@ -27,8 +33,9 @@ def test_workspace_panel_pointer_resize_persists_without_annexing_chat(
 
     panel = page.get_by_test_id("execution-logs-panel")
     handle = page.get_by_role("separator", name="Resize panel")
-    initial_width = panel.bounding_box()["width"]
+    initial_width = _width(panel)
     handle_box = handle.bounding_box()
+    assert handle_box is not None
 
     touch_drag_between(
         page,
@@ -36,10 +43,11 @@ def test_workspace_panel_pointer_resize_persists_without_annexing_chat(
         end=(handle_box["x"] - 80, handle_box["y"] + 100),
     )
 
-    resized_width = panel.bounding_box()["width"]
+    resized_width = _width(panel)
     assert resized_width >= initial_width + 70
 
     panel_box = panel.bounding_box()
+    assert panel_box is not None
     probe_x = panel_box["x"] - _FINE_GUTTER_PX - 8
     probe_y = panel_box["y"] + panel_box["height"] / 2
     assert panel.evaluate(
@@ -62,9 +70,9 @@ def test_workspace_panel_pointer_resize_persists_without_annexing_chat(
     page.mouse.move(probe_x - 12, probe_y, steps=2)
     page.mouse.up()
     expect(page.locator("html")).to_have_attribute("data-resize-probe-received", "true")
-    assert abs(panel.bounding_box()["width"] - resized_width) <= 1
+    assert abs(_width(panel) - resized_width) <= 1
 
     page.reload()
     _open_execution_logs_panel(page)
-    persisted_width = page.get_by_test_id("execution-logs-panel").bounding_box()["width"]
+    persisted_width = _width(page.get_by_test_id("execution-logs-panel"))
     assert abs(persisted_width - resized_width) <= 1

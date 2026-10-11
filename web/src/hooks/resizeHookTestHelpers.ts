@@ -1,6 +1,5 @@
-// Shared jsdom scaffolding for the resizable-hook test suites. Each suite still
-// captures and restores window.innerWidth / window.matchMedia itself; these are
-// just the byte-identical helpers that several suites otherwise duplicated.
+// Shared jsdom scaffolding for the resizable-hook test suites: the innerWidth
+// setter and a controllable matchMedia mock that several suites duplicated.
 
 type MediaListener = (e: MediaQueryListEvent) => void;
 
@@ -10,6 +9,7 @@ export function setInnerWidth(px: number): void {
 
 /** Controllable matchMedia mock: per-query matches plus a change-event firer. */
 export function mockMatchMedia(matches: Record<string, boolean> = {}) {
+  const original = window.matchMedia;
   const listeners = new Map<string, Set<MediaListener>>();
   window.matchMedia = ((query: string) => ({
     // A getter, like a real MediaQueryList: `fire()` must be visible through a
@@ -34,6 +34,10 @@ export function mockMatchMedia(matches: Record<string, boolean> = {}) {
       for (const cb of listeners.get(query) ?? new Set<MediaListener>()) {
         cb({ matches: value } as MediaQueryListEvent);
       }
+    },
+    /** Reinstate the `matchMedia` this mock replaced. */
+    restore() {
+      window.matchMedia = original;
     },
   };
 }
