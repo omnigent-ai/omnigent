@@ -868,6 +868,78 @@ def test_load_or_refresh_token_refused_returns_none(token_dir, monkeypatch) -> N
     assert entry["refresh_token"] == "refresh-1"
 
 
+def test_load_or_refresh_token_refused_uses_still_valid_token(token_dir, monkeypatch) -> None:
+    """A near-expiry token that hasn't lapsed is still returned when renewal is refused."""
+    import httpx
+
+    from omnigent.cli_auth import REFRESH_MIN_REMAINING_SECONDS, load_or_refresh_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="near-expiry",
+        user_id="a@x",
+        expires_at=time.time() + REFRESH_MIN_REMAINING_SECONDS / 2,
+        refresh_token="refresh-1",
+    )
+    posted: list[str] = []
+    monkeypatch.setattr(httpx, "post", _fake_refresh_post(400, posted))
+
+    assert load_or_refresh_token("http://localhost:6767") == "near-expiry"
+    assert posted == ["http://localhost:6767/oauth/token"]
+
+
+def test_load_or_refresh_token_successful_renewal_skips_expiry_warning(
+    token_dir, monkeypatch, caplog
+) -> None:
+    """Renewing in the same command must not first warn that the login expired."""
+    import logging
+
+    import httpx
+
+    from omnigent.cli_auth import load_or_refresh_token, store_token
+
+    monkeypatch.setattr("omnigent.cli_auth._warned_expired_servers", set())
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(httpx, "post", _fake_refresh_post(200, []))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+        assert load_or_refresh_token("http://localhost:6767") == "fresh"
+
+    assert not [r for r in caplog.records if "expired" in r.getMessage()]
+
+
+def test_load_or_refresh_token_refused_renewal_keeps_expiry_warning(
+    token_dir, monkeypatch, caplog
+) -> None:
+    """When renewal fails, the expiry warning still points the user at re-login."""
+    import logging
+
+    import httpx
+
+    from omnigent.cli_auth import load_or_refresh_token, store_token
+
+    monkeypatch.setattr("omnigent.cli_auth._warned_expired_servers", set())
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(httpx, "post", _fake_refresh_post(400, []))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+        assert load_or_refresh_token("http://localhost:6767") is None
+
+    assert any("expired" in r.getMessage() for r in caplog.records)
+
+
 def test_has_refreshable_login(token_dir) -> None:
     """Valid tokens and expired-but-renewable logins count; dead or pointer records don't."""
     from omnigent.cli_auth import has_refreshable_login, store_databricks_auth, store_token

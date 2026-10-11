@@ -299,7 +299,9 @@ def _load_entry(server_url: str) -> dict[str, str | float] | None:
     return entry if isinstance(entry, dict) else None
 
 
-def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | None:
+def load_token(
+    server_url: str, *, min_remaining_seconds: float = 0.0, warn_expired: bool = True
+) -> str | None:
     """Load a stored session token for a server.
 
     Returns ``None`` if no token is stored, the token has expired,
@@ -314,6 +316,9 @@ def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | 
         the historical behaviour. A caller that can renew passes
         :data:`REFRESH_MIN_REMAINING_SECONDS` so a token about to lapse
         mid-handshake is refreshed instead of used.
+    :param warn_expired: Log the once-per-process expiry warning. A caller
+        about to renew passes ``False`` so a successful refresh isn't
+        preceded by a stale "expired" warning.
     :returns: The session JWT string, or ``None``.
     """
     entry = _load_entry(server_url)
@@ -330,7 +335,8 @@ def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | 
 
     expires_at = entry.get("expires_at", 0)
     if isinstance(expires_at, (int, float)) and expires_at < time.time():
-        _warn_expired_once(server_url, expires_at, has_refresh="refresh_token" in entry)
+        if warn_expired:
+            _warn_expired_once(server_url, expires_at, has_refresh="refresh_token" in entry)
         return None
     # Near-expiry but still valid: decline quietly (no expiry warning — it
     # has not expired) so the caller can choose to renew.
@@ -578,7 +584,10 @@ def load_or_refresh_token(server_url: str) -> str | None:
     :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
     :returns: A session JWT, or ``None`` when no login can authenticate.
     """
-    token = load_token(server_url, min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS)
+    # Expiry is warned only if renewal below fails, not before it succeeds.
+    token = load_token(
+        server_url, min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS, warn_expired=False
+    )
     if token:
         return token
     refreshed = refresh_stored_token(server_url)
