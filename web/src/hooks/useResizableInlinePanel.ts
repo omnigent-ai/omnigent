@@ -66,6 +66,7 @@ function clamp(
   minPx = MIN_WIDTH_PX,
   reservedPx = 0,
   chatMinPx = CHAT_MIN_WIDTH_PX,
+  chatHardMinPx = CHAT_HARD_MIN_WIDTH_PX,
 ): number {
   // No viewport ceiling available off the DOM (SSR / node test env) — this runs
   // during render, so guard before reading `window` to avoid a hard throw.
@@ -73,14 +74,11 @@ function clamp(
   // Reserve the largest possible gutter footprint so a pointer-capability
   // change cannot pull the chat below its floor.
   const available = window.innerWidth - reservedPx - COARSE_GUTTER_PX;
-  // The chat holds its comfortable minimum only while the row also fits the
-  // rail's floor plus a usable drag range. On tablet-width rows (an unfolded
-  // foldable with the sidebar open) reserving the full 480px pinned the clamp's
-  // floor onto its ceiling — every drag computed the same width — so the chat
-  // cedes down to its hard floor before the rail loses its travel.
+  // On cramped (tablet-width) rows the chat cedes below its comfort minimum,
+  // down to its hard floor, before the rail loses MIN_DRAG_RANGE_PX of travel.
   const chatReserve = Math.min(
     chatMinPx,
-    Math.max(CHAT_HARD_MIN_WIDTH_PX, available - minPx - MIN_DRAG_RANGE_PX),
+    Math.max(chatHardMinPx, available - minPx - MIN_DRAG_RANGE_PX),
   );
   // 99vw is the nominal ceiling, but the chat reservation (plus the gap
   // between the two) is the one that actually binds on a normal desktop.
@@ -154,7 +152,8 @@ export function resetWidthStoreForTesting(): void {
  *
  * `enabled` disables manual resizing while the panel is hidden. `persistEnabled`
  * separately disables interaction while the storage key is tentative.
- * `chatMinWidthPx` lets a nested Canvas conversation use its own width floor.
+ * `chatMinWidthPx` lets a nested Canvas conversation use its own width floor;
+ * a caller-supplied floor is hard, only the default comfort minimum cedes.
  */
 export function useResizableInlinePanel(
   sessionId: string | null,
@@ -162,9 +161,11 @@ export function useResizableInlinePanel(
   reservedPx = 0,
   enabled = true,
   persistEnabled = true,
-  chatMinWidthPx = CHAT_MIN_WIDTH_PX,
+  chatMinWidthPx?: number,
 ) {
   const { anyCoarse } = useInputCapabilities();
+  const chatMinPx = chatMinWidthPx ?? CHAT_MIN_WIDTH_PX;
+  const chatHardMinPx = chatMinWidthPx ?? CHAT_HARD_MIN_WIDTH_PX;
   const raw = useResizableWidthSnapshot(widthStore);
   // On a session switch the module store still holds the previous session's
   // width until the effect below re-seeds it after commit. Derive this render's
@@ -180,7 +181,13 @@ export function useResizableInlinePanel(
   // Clamped at render time only — the store keeps the user's preferred width, so
   // a temporary squeeze (sidebar opening) is undone when the space returns.
   const preferredPanelWidth = Math.max(minWidthPx, effectiveRaw ?? defaultWidthPx());
-  const resolvedWidth = clamp(preferredPanelWidth, minWidthPx, reservedPx, chatMinWidthPx);
+  const resolvedWidth = clamp(
+    preferredPanelWidth,
+    minWidthPx,
+    reservedPx,
+    chatMinPx,
+    chatHardMinPx,
+  );
   // `resolvedWidth` reads `window.innerWidth` at render, but a viewport resize
   // that leaves the stored (no-reserve) width unchanged wouldn't otherwise
   // re-render — so the render-time reserve clamp would go stale and the chat
@@ -191,8 +198,10 @@ export function useResizableInlinePanel(
   minWidthRef.current = minWidthPx;
   const reservedRef = useRef(reservedPx);
   reservedRef.current = reservedPx;
-  const chatMinRef = useRef(chatMinWidthPx);
-  chatMinRef.current = chatMinWidthPx;
+  const chatMinRef = useRef(chatMinPx);
+  chatMinRef.current = chatMinPx;
+  const chatHardMinRef = useRef(chatHardMinPx);
+  chatHardMinRef.current = chatHardMinPx;
 
   // Re-clamp on viewport resize so the panel can't overflow a shrunken window.
   // Re-derive the effective width from the persisted preference so widening the
@@ -205,7 +214,7 @@ export function useResizableInlinePanel(
       widthStore.set((prev) => {
         const base = widthStore.getPreferred() ?? prev;
         return base !== null
-          ? clamp(base, minWidthRef.current, 0, chatMinRef.current)
+          ? clamp(base, minWidthRef.current, 0, chatMinRef.current, chatHardMinRef.current)
           : defaultWidthPx();
       });
       // Force a re-render even when the stored width is unchanged, so the
@@ -233,6 +242,7 @@ export function useResizableInlinePanel(
           minWidthRef.current,
           reservedRef.current,
           chatMinRef.current,
+          chatHardMinRef.current,
         ),
       );
     }
@@ -290,6 +300,7 @@ export function useResizableInlinePanel(
             minWidthRef.current,
             reservedRef.current,
             chatMinRef.current,
+            chatHardMinRef.current,
           ),
         true,
       );
@@ -308,14 +319,18 @@ export function useResizableInlinePanel(
       "aria-label": "Resize panel",
       "aria-valuenow": resolvedWidth,
       "aria-valuemin": Math.min(minWidthPx, resolvedWidth),
-      "aria-valuemax": clamp(Number.POSITIVE_INFINITY, minWidthPx, reservedPx, chatMinWidthPx),
+      "aria-valuemax":
+        typeof window === "undefined"
+          ? resolvedWidth
+          : clamp(Number.POSITIVE_INFINITY, minWidthPx, reservedPx, chatMinPx, chatHardMinPx),
       "aria-disabled": !resizeEnabled,
       hidden: !enabled || resolvedWidth === 0,
       tabIndex: resizeEnabled ? 0 : -1,
     }),
     [
       anyCoarse,
-      chatMinWidthPx,
+      chatHardMinPx,
+      chatMinPx,
       enabled,
       minWidthPx,
       onKeyDown,
@@ -328,7 +343,7 @@ export function useResizableInlinePanel(
 
   return {
     panelWidth: resolvedWidth,
-    preferredContentWidth: preferredPanelWidth + chatMinWidthPx + COARSE_GUTTER_PX,
+    preferredContentWidth: preferredPanelWidth + chatMinPx + COARSE_GUTTER_PX,
     handleProps,
     isDragging,
   };

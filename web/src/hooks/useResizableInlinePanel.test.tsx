@@ -222,7 +222,8 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
     );
     const preferred = nudgeWiderOnce(result);
     rerender({ reserved: 750 });
-    expect(result.current.panelWidth).toBe(360);
+    // The Canvas floor is caller-supplied, so it stays hard: 1440 - 750 - 12 - 380.
+    expect(result.current.panelWidth).toBe(298);
     expect(result.current.preferredContentWidth).toBe(preferred + 380 + 12);
     expect(readSessionWorkspaceState(SESSION).widthPx).toBe(preferred);
     rerender({ reserved: 0 });
@@ -313,12 +314,9 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
 });
 
 describe("useResizableInlinePanel tablet-width viewports", () => {
-  // On unfolded-foldable / tablet widths (~768–1100px) the sidebar defaults
-  // open, and reserving it plus the chat's full 480px comfort minimum used to
-  // consume the whole row: the clamp's floor collapsed onto its ceiling, so
-  // every drag computed the same width and resize gestures were no-ops. The
-  // chat must cede below its comfort minimum (down to a hard floor) before
-  // the rail loses its drag range.
+  // On tablet widths (~768–1100px) the open sidebar plus the chat's 480px
+  // comfort minimum can exhaust the row; the chat must cede toward its hard
+  // floor so the rail keeps a usable drag range.
   it("keeps a usable drag range at 1024px with the sidebar open", () => {
     setInnerWidth(1024);
     const { result } = renderHook(() => useResizableInlinePanel(SESSION, undefined, 320));
