@@ -1,10 +1,6 @@
-// One configurable `window.matchMedia` stub for jsdom suites.
-//
-// Evaluates the queries the shell actually asks — viewport width
-// (`min-width` / `max-width`), pointer coarseness and hover capability,
-// including `and`-joined compounds — against one declared environment, so
-// every suite answers a new query the same way instead of each file carrying
-// its own partial evaluator. Unknown conditions answer false.
+// One configurable `window.matchMedia` stub for jsdom suites: evaluates the
+// width (min/max-width), pointer and hover queries the shell asks, including
+// `and`-compounds, against one declared environment; unknown conditions are false.
 
 export interface MediaEnvironment {
   /** Simulated viewport width in CSS px (default: a 1280px desktop). */

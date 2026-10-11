@@ -369,10 +369,9 @@ describe("useResizableCommentsPanel pointer drag", () => {
 });
 
 describe("useResizableCommentsPanel touch affordances", () => {
-  // The handle is a divider gutter: a real flex child whose layout footprint
-  // is the gutter width (4px painted strip + padding + the cancelling
-  // negative margins) and whose hit box overhangs each neighbor by only a
-  // capped sliver. Derived from the returned style:
+  // Gutter geometry derived from the returned style: footprint = strip + padding
+  // + cancelling negative margins; the hit box overhangs each neighbor by a
+  // capped sliver.
   const gutterGeometry = (style: React.CSSProperties) => {
     const padLeft = Number(style.paddingLeft);
     const padRight = Number(style.paddingRight);
@@ -415,7 +414,7 @@ describe("useResizableCommentsPanel touch affordances", () => {
     mockMatchMedia({ "(pointer: coarse)": false, "(any-pointer: coarse)": true });
     const { result, unmount } = renderHook(() => useResizableCommentsPanel());
 
-    // Coarse: 8px gutter, 26px hit total — TR-7's 24px floor with the same
+    // Coarse: 8px gutter, 26px hit total — above the 24px minimum with the same
     // sliver caps (the preferred 44px would need a visually wide gutter).
     const g = gutterGeometry(result.current.handleProps.style);
     expect(g.hitTotal).toBe(26);
