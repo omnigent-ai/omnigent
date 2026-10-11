@@ -223,12 +223,9 @@ describe("useResizableSidebar", () => {
       backgroundClip: "content-box",
     });
 
-    // Effective offsets of the absolutely anchored handle (not class names):
-    // with `insetInlineEnd` overriding the class's `right: 0`, the border box
-    // right edge sits at seam + outward reach, and the box must span
-    // [seam − INWARD_SLIVER − inset, seam + OUTWARD_SLIVER + inset] with the
-    // 4px painted strip's right edge flush at the seam — clear of the
-    // conversation rows' hover kebab.
+    // `insetInlineEnd` overrides the class's `right: 0`, so the box spans
+    // [seam − INWARD_SLIVER − inset, seam + OUTWARD_SLIVER + inset] with the 4px
+    // strip flush at the seam, clear of the rows' hover kebab.
     const style = result.current.handleProps.style;
     const paintedStripPx = 4;
     const outwardReach = -Number(style.insetInlineEnd);

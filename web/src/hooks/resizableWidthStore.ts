@@ -20,6 +20,7 @@ export function createResizableWidthStore(
 
   const set = (next: WidthUpdater, persist = false) => {
     const value = typeof next === "function" ? next(width) : next;
+    // An unchanged width keeps the stored preference, even on an explicit persist.
     if (value === width) return;
     width = value;
     if (persist) {
