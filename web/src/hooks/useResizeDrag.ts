@@ -126,7 +126,9 @@ export function useResizeDrag<T extends Element = Element>({
       };
       const onContextMenu = cancelDrag;
       const onWindowBlur = cancelDrag;
-      const onVisibilityChange = cancelDrag;
+      const onVisibilityChange = () => {
+        if (document.visibilityState === "hidden") cancelDrag();
+      };
       const observer = observeHandleRemoval
         ? new MutationObserver(() => {
             if (activeHandle.current && !activeHandle.current.isConnected) cancelDrag();
