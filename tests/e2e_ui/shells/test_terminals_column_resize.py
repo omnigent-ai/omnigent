@@ -157,11 +157,9 @@ def test_terminals_column_resizes_by_pointer_and_keyboard(
     expect(handle).to_have_attribute("aria-valuenow", str(_DEFAULT_WIDTH))
     assert abs(_list_panel_width(page) - _DEFAULT_WIDTH) < 2
 
-    # --- Pointer drag: press on the handle, pull right, release. The width
-    # follows the pointer (measured from the split row's left edge) and the
-    # new width persists after the pointer lifts. hover() first: the panel
-    # slides in (translate transition), and hover's actionability check waits
-    # for the handle's position to stabilize before we read its box.
+    # --- Pointer drag: press, pull right, release; the released width sticks.
+    # hover() first: the panel slides in, and hover's actionability check waits
+    # for the handle's position to settle before we read its box.
     handle.hover()
     box = handle.bounding_box()
     assert box is not None, "resize handle should have a bounding box"

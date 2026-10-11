@@ -33,16 +33,9 @@ const OUTWARD_SLIVER_PX = 10;
 function gutterStyle(coarsePointer: boolean): React.CSSProperties {
   const gutter = coarsePointer ? COARSE_GUTTER_PX : FINE_GUTTER_PX;
   const inset = (gutter - PAINTED_STRIP_PX) / 2;
-  // The handle is absolutely anchored to the sidebar's right edge (the seam),
-  // NOT an in-flow flex gutter, so it must position with an explicit negative
-  // end inset: on an absolutely positioned right-anchored box the flex hooks'
-  // negative `marginInlineStart` is absorbed by the auto left inset, which
-  // shifted the whole hit box inward — overlapping the conversation rows'
-  // hover kebab — and pulled the painted strip off the seam. Anchoring the
-  // border box at seam + OUTWARD_SLIVER and padding the 4px strip back to the
-  // seam makes the hit box span
-  // [seam − INWARD_SLIVER − inset, seam + OUTWARD_SLIVER + inset], matching
-  // the flex-gutter hooks' inward/outward reach.
+  // Absolutely right-anchored box: a negative inline-start margin is absorbed by
+  // the auto left inset, so anchor with a negative end inset instead. The hit box
+  // spans [seam − INWARD_SLIVER − inset, seam + OUTWARD_SLIVER + inset].
   return {
     touchAction: "none",
     boxSizing: "content-box",
