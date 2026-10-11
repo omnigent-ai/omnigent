@@ -11,11 +11,9 @@ export const MD_BREAKPOINT_PX = 768;
 /** `(min-width: …)` media query — matches Tailwind's `md:` variant. */
 export const MD_MIN_WIDTH_QUERY = `(min-width: ${MD_BREAKPOINT_PX}px)`;
 
-// One MediaQueryList for the breakpoint, shared by every reader and
-// subscriber (the sidebar calls `isMobileViewport` per row per render, so a
-// fresh `matchMedia` each time is measurable). Created lazily and dropped when
-// the last subscriber leaves, so tests that swap `window.matchMedia` see the
-// replacement on the next read.
+// One shared, lazily created MediaQueryList (per-row sidebar reads make fresh
+// `matchMedia` calls measurable), dropped on the last unsubscribe so tests that
+// swap `window.matchMedia` are honored on the next read.
 let mdList: MediaQueryList | null = null;
 const subscribers = new Set<() => void>();
 
