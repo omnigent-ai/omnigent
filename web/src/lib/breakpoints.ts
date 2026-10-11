@@ -1,10 +1,6 @@
-// Canonical `md` (768px) layout breakpoint: every JS reader derives from this
-// one `min-width` query so it can't drift from Tailwind's `md:` variants.
-// Input capability (touch, hover) is a separate axis: `useInputCapabilities`.
-//
-// The predicate is "mobile unless provably md+": at fractional widths just under
-// 768 (browser zoom) neither `md:` nor `max-md:` matches and the page renders
-// its mobile base styles, so a max-md predicate would disagree with the screen.
+// Canonical `md` (768px) breakpoint: every JS reader derives from this one
+// `min-width` query so it can't drift from Tailwind's `md:` variants. Mobile is
+// "not provably md+", so fractional sub-768 widths follow Tailwind's base styles.
 
 export const MD_BREAKPOINT_PX = 768;
 
