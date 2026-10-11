@@ -29,14 +29,9 @@ const MIN_WIDTH_PX = 200;
 const MAX_WIDTH_PX = 640;
 /** Keep at least this much room for the code/diff viewer beside the panel. */
 const MIN_VIEWER_PX = 240;
-// The handle is a dedicated divider gutter between the viewer and the panel —
-// a real flex child outside both scroll containers, so its hit area overlays
-// almost no content. The painted strip (`w-1`) sits centered in the gutter;
-// invisible padding fills the rest and overhangs each side by a small sliver
-// via negative margins. The slivers are capped so the viewer's scrollbar and
-// the panel's header/tabs/cards keep their taps and scroll starts — which
-// also caps the hit total at 26px coarse / 24px fine (TR-7's 24px floor; the
-// preferred 44px would need a visually wide gutter the layout doesn't permit).
+// Divider gutter between viewer and panel: padding overhangs each neighbor by
+// a capped sliver (negative margins cancel the footprint) so both keep their
+// pointer streams; hit total 26px coarse / 24px fine (TR-7 floor).
 const PAINTED_STRIP_PX = 4; // must match the handle's `w-1` class
 const GUTTER_COARSE_PX = 8;
 const GUTTER_FINE_PX = 6;
@@ -90,11 +85,9 @@ export function useResizableCommentsPanel() {
   const width = Math.max(MIN_WIDTH_PX, Math.min(raw ?? DEFAULT_WIDTH_PX, MAX_WIDTH_PX));
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  // Clamp a candidate width to [MIN, dynamic max], leaving MIN_VIEWER_PX for
-  // the sibling code/diff viewer so the panel can't swallow the whole row.
-  // The divider gutter is a third flex child in the row, so its footprint
-  // comes out of the budget too — always the coarse 8px, so a pointer-type
-  // flip mid-session can never shrink the viewer below its minimum.
+  // Clamp to [MIN, dynamic max], reserving MIN_VIEWER_PX for the sibling viewer
+  // plus the gutter — always the coarse 8px, so a pointer-type flip mid-session
+  // can't shrink the viewer below its minimum.
   const reachableMax = useCallback((): number => {
     const parent = containerRef.current?.parentElement;
     const parentWidth =
@@ -200,12 +193,8 @@ export function useResizableCommentsPanel() {
       "aria-valuemin": MIN_WIDTH_PX,
       "aria-valuemax": ariaValueMax,
       tabIndex: 0,
-      // The gutter owns its touches outright (no scroll/selection may start
-      // from it). With content-box sizing the `w-1` class is the painted
-      // strip; padding centers it in the gutter and adds the overhang
-      // slivers, whose footprint the negative margins cancel — so the
-      // element occupies exactly the gutter width and the hover/active
-      // background (content-box clipped) never widens visually.
+      // The gutter owns its touches outright; the gutter constants above explain
+      // its geometry.
       style: gutterStyle(anyCoarse),
     },
   };
