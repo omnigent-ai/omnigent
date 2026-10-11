@@ -113,11 +113,8 @@ export function useResizableSidebar() {
     observeHandleRemoval: true,
   });
 
-  // A touch/pen drag started at desktop width can outlive the viewport
-  // crossing below the md breakpoint: the handle hides (the sidebar becomes a
-  // full-screen overlay) but pointer capture persists, so release would write
-  // an unintended width. Cancel — restoring the pre-drag width — the moment
-  // the desktop query stops matching.
+  // Cancel when the md breakpoint flips mid-drag: the handle hides but pointer
+  // capture persists, so a later release would persist an unintended width.
   const cancelResizeDrag = resizeDrag.cancelDrag;
   useEffect(
     () =>
