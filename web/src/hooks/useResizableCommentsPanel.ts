@@ -31,7 +31,7 @@ const MAX_WIDTH_PX = 640;
 const MIN_VIEWER_PX = 240;
 // Divider gutter between viewer and panel: padding overhangs each neighbor by
 // a capped sliver (negative margins cancel the footprint) so both keep their
-// pointer streams; hit total 26px coarse / 24px fine (TR-7 floor).
+// pointer streams; hit total 26px coarse / 24px fine (24px minimum hit target).
 const PAINTED_STRIP_PX = 4; // must match the handle's `w-1` class
 const GUTTER_COARSE_PX = 8;
 const GUTTER_FINE_PX = 6;
@@ -193,8 +193,7 @@ export function useResizableCommentsPanel() {
       "aria-valuemin": MIN_WIDTH_PX,
       "aria-valuemax": ariaValueMax,
       tabIndex: 0,
-      // The gutter owns its touches outright; the gutter constants above explain
-      // its geometry.
+      // The gutter owns its touches outright.
       style: gutterStyle(anyCoarse),
     },
   };

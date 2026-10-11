@@ -282,13 +282,9 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
   });
 
   it("keeps the chat above its hard floor when the viewport shrinks with both sidebars open", () => {
-    // The reported bug: with the left sidebar open (reserved) AND the rail wide,
-    // shrinking the window let the chat collapse entirely — the panel's own 240
-    // comfort minimum was overriding the chat-preserving ceiling, and a resize
-    // that didn't move the stored width never re-rendered. The chat floor must
-    // win and the recompute must fire on every resize. At 1000px with the
-    // sidebar open the row is tablet-cramped, so the chat holds its 240 hard
-    // floor (not the 480 comfort minimum) while the rail keeps its drag range.
+    // With the sidebar open and the rail wide, shrinking to 1000px makes the row
+    // tablet-cramped: the chat holds its 240 hard floor (not the 480 comfort
+    // minimum), the rail keeps its drag range, and every resize recomputes.
     setInnerWidth(1400);
     const reservedPx = 320; // open left sidebar
     const { result, rerender } = renderHook(
