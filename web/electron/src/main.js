@@ -1102,7 +1102,7 @@ function oidcSignInMessage(serverUrl, error, serverName) {
   const server = serverDisplayName(serverUrl, serverName);
   switch (error?.code) {
     case "SIGNED_OUT":
-      return `You're signed out of ${server}.`;
+      return null;
     case "SIGN_OUT_INCOMPLETE":
       return signOutIncompleteMessage(server);
     case "expired_token":
@@ -1137,10 +1137,9 @@ function showOidcAuthRequired(win, serverUrl, error, serverName = null) {
     origin: originOf(serverUrl),
     code: error?.code,
   });
-  const params = new URLSearchParams({
-    error: oidcSignInMessage(serverUrl, error, serverName),
-    url: serverUrl,
-  });
+  const params = new URLSearchParams({ url: serverUrl });
+  const message = oidcSignInMessage(serverUrl, error, serverName);
+  if (message) params.set("error", message);
   if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
   oidcAuth?.detach(win);
   pinWindow(win, null);
@@ -2958,11 +2957,8 @@ async function signOutOfDatabricks(origin) {
     // A reconnect may have re-pinned the window while sign-out waited.
     pinWindow(w, null);
     setWindowServerUrl(w, null);
-    const server = serverDisplayName(serverUrl);
-    const params = new URLSearchParams({
-      error: complete ? `You're signed out of ${server}.` : signOutIncompleteMessage(server),
-      url: serverUrl,
-    });
+    const params = new URLSearchParams({ url: serverUrl });
+    if (!complete) params.set("error", signOutIncompleteMessage(serverDisplayName(serverUrl)));
     if (ephemeral) params.set("ephemeral", "1");
     void loadSetupPage(w, params.toString());
   }

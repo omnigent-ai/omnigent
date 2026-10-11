@@ -319,8 +319,8 @@ sign-in has a passkey step), then `just electron-dev`:
    (the cookie is renewed silently).
 5. **Invalidate Cached Refresh Token**, then **Simulate Session Expiry**, then
    reload: the connect screen says "Sign in to <host> to continue."
-6. Sign out from the app's settings: the connect screen says "You're signed out
-   of <host>." Relaunching doesn't sign you back in.
+6. Sign out from the app's settings: the connect screen opens without a message.
+   Relaunching doesn't sign you back in.
 7. An accounts-mode server and `http://localhost:6767` (header mode) still sign
    in exactly as before.
 
