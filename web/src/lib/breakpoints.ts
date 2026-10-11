@@ -1,19 +1,10 @@
-// Canonical encoding of the shell's `md` layout breakpoint.
+// Canonical `md` (768px) layout breakpoint: every JS reader derives from this
+// one `min-width` query so it can't drift from Tailwind's `md:` variants.
+// Input capability (touch, hover) is a separate axis: `useInputCapabilities`.
 //
-// Tailwind's `md` breakpoint (768px) is the shell's single mobile/desktop
-// layout pivot, used both by CSS (`md:` / `max-md:` classes) and by JS call
-// sites. Every JS encoding of that line derives from this module so the
-// variants (767px / 767.98px / 768) can't drift apart. Viewport width is a
-// LAYOUT concern only — input capability (touch, hover) is a separate axis,
-// exposed by `useInputCapabilities`.
-//
-// Pole choice: the layout predicate is "mobile unless provably md+", i.e.
-// `!(min-width: 768px)`. Tailwind's `md:` overrides are what produce the
-// desktop layout, and they apply only at >= 768px — at fractional widths in
-// (767.98, 768) (reachable under browser zoom) neither `md:` nor `max-md:`
-// matches, so the page renders its mobile base styles. A max-md-based
-// predicate would call that sliver "desktop" and disagree with what's on
-// screen; deliberately none exists here.
+// The predicate is "mobile unless provably md+": at fractional widths just under
+// 768 (browser zoom) neither `md:` nor `max-md:` matches and the page renders
+// its mobile base styles, so a max-md predicate would disagree with the screen.
 
 export const MD_BREAKPOINT_PX = 768;
 

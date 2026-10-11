@@ -66,11 +66,9 @@ _CLAMP_SLACK_PX = 20
 # Pixel tolerance for width assertions (sub-pixel layout rounding).
 _TOLERANCE = 3.0
 
-# The gutter's invisible hit sliver may overhang the viewer by at most this
-# many px (VIEWER_SLIVER_PX in useResizableCommentsPanel.ts). The negative
-# probe presses just left of this budget, measured from the VIEWER's right
-# edge — never from the gutter's own box, which a hit-region regression
-# would move (dragging the probe along with it and masking the leak).
+# Max px the gutter's hit sliver may overhang the viewer (VIEWER_SLIVER_PX in
+# useResizableCommentsPanel.ts). The negative probe is anchored to the VIEWER's
+# right edge so a widened sliver can't drag the probe along and mask the leak.
 _VIEWER_SLIVER_BUDGET_PX = 10
 
 # Safety margin between the budget line and the probe press point, absorbing
@@ -225,12 +223,9 @@ def test_gutter_drag_resizes_panel_and_persists(
         f"panel width {reloaded_width} after reload lost the dragged width {dragged_width}"
     )
 
-    # 3. NEGATIVE: press-and-drag over the viewer, just left of the gutter's
-    #    sliver budget, must not resize — the viewer keeps its own pointer
-    #    stream (text selection / scrollbar). The probe is anchored to the
-    #    VIEWER's right edge plus the fixed budget, NOT to the separator's own
-    #    box: a regression that widens the hit sliver would shift that box and
-    #    carry a box-relative probe out of harm's way, hiding the leak.
+    # 3. NEGATIVE: a drag starting left of the sliver budget must not resize —
+    #    the viewer keeps its own pointer stream. Anchor to the viewer's edge,
+    #    not the separator box (see _VIEWER_SLIVER_BUDGET_PX).
     outside_x = _viewer_right(separator) - _VIEWER_SLIVER_BUDGET_PX - _PROBE_MARGIN_PX
     page.mouse.move(outside_x, y)
     page.mouse.down()

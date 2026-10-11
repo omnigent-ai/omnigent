@@ -7,13 +7,9 @@ import { useResizeDrag } from "@/hooks/useResizeDrag";
 // Width of the painted separator strip (the consumer's `w-1` element).
 const PAINTED_WIDTH_PX = 4;
 
-// Invisible hit-target padding around the painted strip. The handle sits over
-// the boundary between the terminal list and the xterm pane, so the pad is
-// biased toward the terminal side: list rows end with a status badge flush
-// against the boundary (taps there must select the row), while the xterm's
-// leftmost pixels are rarely interactive. Coarse pointers get a 44px total
-// target; fine pointers get the 24px minimum so the pad steals less hover
-// area from the row badges.
+// Invisible hit padding biased toward the terminal-list side (taps on the
+// rows' trailing status badges must still select the row); coarse pointers
+// get a 44px total target, fine pointers the 24px minimum.
 const COARSE_PAD = { left: 12, right: 28 }; // 12 + 4 + 28 = 44px
 const FINE_PAD = { left: 6, right: 14 }; // 6 + 4 + 14 = 24px
 
