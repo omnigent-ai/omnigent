@@ -66,7 +66,7 @@ describe("useInputCapabilities", () => {
   });
 
   it("shares one media-query subscription across concurrent consumers and rerenders", () => {
-    installMatchMedia({ "(hover: hover)": true });
+    installMatchMedia({});
     const matchMedia = vi.mocked(window.matchMedia);
     const { rerender } = renderHook(() => {
       useInputCapabilities();
