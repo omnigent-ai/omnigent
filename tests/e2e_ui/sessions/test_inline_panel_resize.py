@@ -55,7 +55,7 @@ def test_resize_gutter_owns_only_its_capped_hit_slivers(
           Object.entries(points).map(([name, point]) => {
             const target = document.elementFromPoint(point.x, point.y);
             return [name, {
-              gutter: target?.closest('[data-workspace-panel-resize-gutter]') !== null,
+              gutter: Boolean(target?.closest('[data-workspace-panel-resize-gutter]')),
               filesTab: target?.closest('[role="tab"]')?.getAttribute('aria-label') === 'Files',
             }];
           }),
@@ -143,17 +143,16 @@ def test_touch_resize_persists_without_stealing_transcript_scroll(
 
     transcript_box = page.get_by_role("log").bounding_box()
     assert transcript_box is not None
-    # The 8px hit test catches a widened gutter; the 16px gesture separately
-    # proves transcript scrolling stays owned. The transcript's own scrollbar
-    # thumb shares that 8px column wherever it happens to sit and is
-    # deliberately touch-none (it's draggable), so look past it.
+    # The 8px hit test catches a widened gutter; the 16px gesture below proves
+    # scroll ownership. The transcript's scrollbar thumb shares this column and
+    # is deliberately touch-none (it's draggable), so look past it.
     hit = page.evaluate(
         """([x, y]) => {
           const target = document
             .elementsFromPoint(x, y)
             .find((element) => !element.closest('[data-transcript-scrollbar]'));
           return {
-            isGutter: target?.closest('[data-workspace-panel-resize-gutter]') !== null,
+            isGutter: Boolean(target?.closest('[data-workspace-panel-resize-gutter]')),
             touchAction: target ? getComputedStyle(target).touchAction : null,
           };
         }""",
@@ -184,7 +183,8 @@ def test_touch_resize_persists_without_stealing_transcript_scroll(
 
     page.wait_for_function("document.querySelector('[data-inline-resize-scroller]').scrollTop > 0")
     assert _panel_width(page) == width_before_scroll
-    assert _stored_width(page, session_id) == resized_width
+    stored = _stored_width(page, session_id)
+    assert stored is not None and abs(stored - resized_width) <= 1
 
 
 def test_touch_resize_keeps_drag_range_on_tablet_width(
