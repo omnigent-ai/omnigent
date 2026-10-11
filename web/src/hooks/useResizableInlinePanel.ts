@@ -305,6 +305,12 @@ export function useResizableInlinePanel(
     },
     [resizeEnabled, resolvedWidth],
   );
+  // Recomputed every render: a viewport resize moves the ceiling even when the
+  // resolved width stays put, and `bumpViewport` only forces the render.
+  const ariaValueMax =
+    typeof window === "undefined"
+      ? resolvedWidth
+      : clamp(Number.POSITIVE_INFINITY, minWidthPx, reservedPx, chatMinPx, chatHardMinPx);
   // Stable identity so consumers memoized on this prop (WorkspacePanel) don't
   // re-render on every parent render — the object only changes when its inputs do.
   const handleProps = useMemo(
@@ -317,22 +323,17 @@ export function useResizableInlinePanel(
       "aria-label": "Resize panel",
       "aria-valuenow": resolvedWidth,
       "aria-valuemin": Math.min(minWidthPx, resolvedWidth),
-      "aria-valuemax":
-        typeof window === "undefined"
-          ? resolvedWidth
-          : clamp(Number.POSITIVE_INFINITY, minWidthPx, reservedPx, chatMinPx, chatHardMinPx),
+      "aria-valuemax": ariaValueMax,
       "aria-disabled": !resizeEnabled,
       hidden: !enabled || resolvedWidth === 0,
       tabIndex: resizeEnabled ? 0 : -1,
     }),
     [
       anyCoarse,
-      chatHardMinPx,
-      chatMinPx,
+      ariaValueMax,
       enabled,
       minWidthPx,
       onKeyDown,
-      reservedPx,
       resizeDrag.handleProps,
       resizeEnabled,
       resolvedWidth,
