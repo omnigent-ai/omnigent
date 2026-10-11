@@ -42,6 +42,7 @@ afterEach(() => {
   cleanup();
   document.body.style.cursor = "";
   document.body.style.userSelect = "";
+  Reflect.deleteProperty(document, "visibilityState");
 });
 
 describe("useResizeDrag cancellation", () => {
@@ -49,7 +50,13 @@ describe("useResizeDrag cancellation", () => {
     ["Escape", () => fireEvent.keyDown(document, { key: "Escape" })],
     ["context menu", () => document.dispatchEvent(new Event("contextmenu"))],
     ["window blur", () => window.dispatchEvent(new Event("blur"))],
-    ["tab visibility change", () => document.dispatchEvent(new Event("visibilitychange"))],
+    [
+      "tab hidden",
+      () => {
+        Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+        document.dispatchEvent(new Event("visibilitychange"));
+      },
+    ],
     ["programmatic cancellation", () => fireEvent.click(screen.getByRole("button"))],
   ])("fully releases a real DOM drag on %s", (_signal, abort) => {
     const onMove = vi.fn();
@@ -73,6 +80,20 @@ describe("useResizeDrag cancellation", () => {
     expect(document.body.style.userSelect).toBe("text");
     fireEvent.pointerMove(handle, { pointerId: 17 });
     expect(onMove).not.toHaveBeenCalled();
+  });
+
+  it("keeps the drag through a visibility change that leaves the page visible", () => {
+    const onMove = vi.fn();
+    render(<DragHandle name="Resize first" onMove={onMove} />);
+    const handle = screen.getByLabelText("Resize first");
+    installPointerCapture(handle);
+
+    startDrag(handle, 17);
+    document.dispatchEvent(new Event("visibilitychange"));
+
+    expect(overlaySelector()).not.toBeNull();
+    fireEvent.pointerMove(handle, { pointerId: 17 });
+    expect(onMove).toHaveBeenCalled();
   });
 
   it("keeps shared body styles until every concurrent hook finishes", () => {
