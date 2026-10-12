@@ -9,11 +9,9 @@ each of those rebuilds the React Flow nodes from the fresh session list.
 
 from __future__ import annotations
 
-import os
 import re
 
 import httpx
-import pytest
 from playwright.sync_api import Page, expect
 
 from tests._helpers.session import post_session_bundle
@@ -39,12 +37,6 @@ def _create_session(live_server: str, title: str) -> str:
     return session_id
 
 
-# Fails mid-shard on CI (target node missing after the live update) but passes
-# alone; skipped on CI only until the cause is found. Still runs locally.
-@pytest.mark.skipif(
-    os.environ.get("CI") == "true",
-    reason="fails mid-shard on CI; passes in isolation, under investigation",
-)
 def test_clicked_card_keeps_selected_highlight_across_live_updates(
     page: Page,
     live_server: str,
@@ -65,6 +57,9 @@ def test_clicked_card_keeps_selected_highlight_across_live_updates(
     expect(page.get_by_role("status", name="Loading sessions")).to_have_count(0)
 
     target_card.click()
+    # Opening the session narrows the canvas and keeps the viewport, so with a
+    # long session list cards can fall off-screen (and stop rendering). Refit.
+    page.get_by_role("button", name="Fit view").click()
     target_node = page.locator(".react-flow__node").filter(has_text="Canvas highlight target")
     expect(target_node).to_have_class(SELECTED_NODE_CLASS)
     expect(target_card).to_have_class(SELECTED_CARD_CLASS)
