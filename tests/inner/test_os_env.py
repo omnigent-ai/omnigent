@@ -14,6 +14,7 @@ import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
+    CallerProcessOSEnvironment,
     _child_shell_env,
     _project_root,
     _read_impl,
@@ -515,3 +516,30 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+def test_windows_os_env_helper_starts_without_sandbox_tmpdir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``sandbox: none`` environment runs a shell through Windows config delivery.
+
+    Without an active sandbox the helper must create its own scratch directory
+    for the Windows config file, then remove it on close.
+    """
+    monkeypatch.setattr("omnigent.inner.os_env.IS_WINDOWS", True)
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert isinstance(os_env, CallerProcessOSEnvironment)
+    try:
+        result = asyncio.run(os_env.shell("echo degraded-mode-shell-ok"))
+        created = os_env._helper._tmpdir
+        assert created is not None and created.exists()
+    finally:
+        os_env.close()
+
+    assert "degraded-mode-shell-ok" in result.get("stdout", "")
+    assert result.get("exit_code") == 0
+    assert os_env._helper._tmpdir is None
+    assert not created.exists()

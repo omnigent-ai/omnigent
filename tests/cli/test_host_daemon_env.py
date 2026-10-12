@@ -425,3 +425,28 @@ def test_runner_env_preserves_claude_telemetry_opt_in() -> None:
     # Then
     assert env.get("OTEL_METRICS_EXPORTER") == "otlp"
     assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"
+
+
+@pytest.mark.parametrize("value", ["1", "0", None])
+def test_host_daemon_env_preserves_pythonutf8(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+) -> None:
+    """The daemon env mirrors the user's PYTHONUTF8 choice and adds no default.
+
+    The daemon survives legacy stdio by relaxing its own stream errors, not by
+    forcing UTF-8 mode, so an explicit ``"0"`` must survive and an unset
+    variable must stay unset in both local and remote modes.
+    """
+    if value is None:
+        monkeypatch.delenv("PYTHONUTF8", raising=False)
+    else:
+        monkeypatch.setenv("PYTHONUTF8", value)
+    remote_env = _build_host_daemon_env(server_url="https://server.example")
+    local_env = _build_host_daemon_env(server_url=None)
+    assert remote_env.get("PYTHONUTF8") == value, (
+        f"remote host-daemon env did not mirror PYTHONUTF8={value!r}"
+    )
+    assert local_env.get("PYTHONUTF8") == value, (
+        f"local host-daemon env did not mirror PYTHONUTF8={value!r}"
+    )

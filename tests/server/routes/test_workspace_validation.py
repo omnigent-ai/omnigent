@@ -606,3 +606,34 @@ async def test_tilde_boundary_passed_through_to_host(
         spec_cwd="~/universe",
     )
     assert canonical == "/Users/corey/universe/src/foo"
+
+
+async def test_workspace_validation_accepts_windows_drive_paths() -> None:
+    """Windows drive-absolute paths must pass the absoluteness check."""
+    # No host registered: an accepted (absolute) workspace reaches the
+    # offline-host failure, while a relative one is rejected earlier.
+    registry = HostRegistry()
+
+    async def _rejection(workspace: str) -> str:
+        try:
+            await validate_workspace(
+                host_registry=registry,
+                host_id="host_missing",
+                workspace=workspace,
+                spec_cwd=None,
+            )
+        except WorkspaceValidationError as exc:
+            return str(exc)
+        return ""
+
+    for workspace in ("D:\\myproject", "C:\\Users\\dev\\proj", "C:/Users/dev/proj"):
+        message = await _rejection(workspace)
+        assert "absolute path" not in message, (
+            f"absolute Windows workspace rejected as non-absolute: {workspace!r}: {message}"
+        )
+        assert "offline" in message, f"expected the offline-host failure, got: {message!r}"
+    for workspace in ("myproject", "relative\\path"):
+        message = await _rejection(workspace)
+        assert "absolute path" in message, (
+            f"relative workspace passed the absoluteness check: {workspace!r}: {message!r}"
+        )
