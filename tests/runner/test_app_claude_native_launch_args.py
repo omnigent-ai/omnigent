@@ -30,6 +30,7 @@ from omnigent.runner.native.orchestration import (
     _routed_spawn_launch_args,
 )
 from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+from omnigent.stores.conversation_store import CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY
 
 
 @pytest.mark.parametrize(
@@ -753,3 +754,183 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
             await asyncio.wait_for(task, timeout=10)
         if closing.is_set():
             await asyncio.wait_for(closed.wait(), timeout=10)
+
+
+@pytest.mark.parametrize(
+    ("model_override", "expected_model_arg"),
+    [
+        ("repro-explicit-model-5", "repro-explicit-model-5"),
+        (None, None),
+    ],
+    ids=["explicit-override-kept", "no-override"],
+)
+async def test_native_config_launch_ignores_binding_but_keeps_explicit_model(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_override: str | None,
+    expected_model_arg: str | None,
+) -> None:
+    """A ``--use-native-config`` launch skips provider routing and the catalog
+    default while retaining an explicit per-session model override.
+
+    Even with a configured inference binding present, the runner must null it,
+    never resolve a provider/ucode config, and pass no gateway
+    ``ANTHROPIC_BASE_URL`` or catalog-derived ``--model`` so Claude Code uses
+    its own ``~/.claude`` config. An explicit ``/model`` override still reaches
+    Claude as ``--model`` so the user's choice is honoured.
+    """
+    from unittest.mock import AsyncMock, Mock
+
+    import httpx
+
+    from omnigent.harnesses.claude_native import diagnostics
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+        RunnerSessionInitSnapshot,
+    )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", lambda _: None
+    )
+    # A binding IS configured; the native-config path must still ignore it, so
+    # resolve_bound_model is never consulted.
+    monkeypatch.setattr(
+        "omnigent.inference_config.load_runtime_inference_config", lambda: {"configured": True}
+    )
+    monkeypatch.setattr(
+        "omnigent.inference_config.binding_for_harness", lambda *_a, **_k: object()
+    )
+
+    def _resolve_bound_model_must_not_run(*_a: object, **_k: object) -> str:
+        raise AssertionError("resolve_bound_model ran: the configured binding was not ignored")
+
+    monkeypatch.setattr(
+        "omnigent.inference_config.resolve_bound_model", _resolve_bound_model_must_not_run
+    )
+
+    def _claude_launch_catalog_must_not_run(*_a: object, **_k: object) -> object:
+        raise AssertionError("claude_launch_catalog ran on the native-config path")
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog",
+        _claude_launch_catalog_must_not_run,
+    )
+    monkeypatch.setattr("omnigent.config.load_effective_config", dict)
+    monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
+    monkeypatch.setattr(diagnostics, "ClaudeDebugLogFollower", lambda _: Mock())
+
+    captured: dict[str, object] = {}
+    sentinel = RuntimeError("stop after the launch spec is built")
+
+    def _capture_spec(**kwargs: object) -> None:
+        captured["spec"] = kwargs["spec"]
+        raise sentinel
+
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.launch_required_terminal.side_effect = _capture_spec
+
+    session_id = "conv_native_config_launch"
+    session_init = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id=session_id,
+        agent_id="agent",
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=0,
+            updated_at=0,
+            workspace=str(bridge_dir),
+            labels={CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY: "1"},
+            model_override=model_override,
+        ),
+    )
+
+    resolve_launch_config = AsyncMock(return_value=None)
+    with pytest.raises(RuntimeError, match="stop after the launch spec is built"):
+        await orchestration._auto_create_claude_terminal(
+            session_id,
+            registry,
+            Mock(),
+            server_client=AsyncMock(spec=httpx.AsyncClient),
+            session_init=session_init,
+            auth_token_factory=lambda: None,
+            resolve_launch_config=resolve_launch_config,
+        )
+
+    # Provider/ucode resolution is skipped entirely on the native-config path.
+    resolve_launch_config.assert_not_awaited()
+    spec = captured["spec"]
+    # No gateway routing env leaks into the launch.
+    assert "ANTHROPIC_BASE_URL" not in spec.env
+    launched_args = list(spec.args)
+    if expected_model_arg is None:
+        assert "--model" not in launched_args
+    else:
+        assert "--model" in launched_args
+        assert launched_args[launched_args.index("--model") + 1] == expected_model_arg
+
+
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        ({CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY: "1"}, True),
+        ({CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY: "0"}, False),
+        ({}, False),
+    ],
+    ids=["set", "off", "absent"],
+)
+def test_envelope_metadata_reads_the_native_config_flag(
+    labels: dict[str, str],
+    expected: bool,
+) -> None:
+    """The label a `--use-native-config` launch stamps reaches the runner.
+
+    The daemon-spawned runner, not the CLI, launches Claude, so the intent
+    to skip provider/ucode resolution can only travel on the session.
+    """
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+    )
+
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id="conv_abc",
+        agent_id="agent",
+        snapshot={
+            "created_at": 0,
+            "updated_at": 0,
+            "labels": labels,
+        },
+    )
+
+    assert _claude_launch_metadata_from_envelope(envelope).use_native_config is expected
+
+
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        ({CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY: "1"}, True),
+        ({}, False),
+    ],
+    ids=["set", "absent"],
+)
+async def test_legacy_metadata_loader_reads_the_native_config_flag(
+    labels: dict[str, str],
+    expected: bool,
+) -> None:
+    """The removable legacy snapshot path must parse the flag too."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": labels})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        metadata = await _load_legacy_claude_launch_metadata(client, "conv_abc")
+
+    assert metadata.use_native_config is expected
