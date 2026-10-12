@@ -49,6 +49,7 @@ from typing import Any
 
 import httpx
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
@@ -256,7 +257,7 @@ async def _drive_sdk_readiness(base_url: str, host: dict[str, Any]) -> None:
                         state="visible", timeout=_FIRST_TURN_ERROR_TIMEOUT_MS
                     )
                     first_turn_error = (await error_pill.inner_text()).strip()
-                except Exception:
+                except PlaywrightTimeoutError:
                     first_turn_error = None
                 if session_id is not None:
                     items = httpx.get(
