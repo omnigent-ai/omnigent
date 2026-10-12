@@ -310,7 +310,12 @@ function registerBrowserIpc({
     if (
       !r.ok &&
       opts?.agent &&
-      (await recoverAgentNavigationForEvent(event, url, opts?.sourceHostId))
+      (await recoverAgentNavigationForEvent(
+        event,
+        url,
+        opts?.sourceHostId,
+        opts?.rememberedArcaHostId,
+      ))
     ) {
       // Recovery updates main-owned identity, so rebuild the context and ask
       // the registry to evaluate the same navigation once more.

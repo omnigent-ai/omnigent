@@ -215,7 +215,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} url
    * @param {{x:number,y:number,width:number,height:number,devicePixelRatio?:number}} [bounds]
-   * @param {{force?: boolean, agent?: boolean}} [opts]
+   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, rememberedArcaHostId?: string}} [opts]
    */
   browserOpenOrNavigate: (conversationId, url, bounds, opts) =>
     ipcRenderer.invoke("omnigent:browser-open-or-navigate", { conversationId, url, bounds, opts }),

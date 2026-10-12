@@ -146,6 +146,7 @@ function loadNavigationHarness({
   arcaPath = null,
   arcaResult = { ok: true, alreadyRunning: false },
   arcaLoginResult = { ok: true },
+  arcaConsentResult,
   loadServer = async () => {},
   loadURL = null,
   managedServers = [],
@@ -178,6 +179,7 @@ function loadNavigationHarness({
     loading: [],
     reloads: 0,
     arcaConnects: [],
+    arcaConsentRuns: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
     arcaLogins: [],
@@ -581,6 +583,23 @@ function loadNavigationHarness({
       startLocalServer: async () => ({ ok: false }),
     },
   };
+
+  if (arcaConsentResult !== undefined) {
+    localRequires["./arca_connect_window"] = {
+      createArcaConnectFlow: (deps) => ({
+        run: async (_parentWin, consentServerUrl, options) => {
+          calls.arcaConsentRuns.push({ serverUrl: consentServerUrl, options });
+          const consent =
+            typeof arcaConsentResult === "function"
+              ? await arcaConsentResult(consentServerUrl, options)
+              : arcaConsentResult;
+          if (consent?.ok !== true) return consent;
+          const connect = deps.startConnect(consentServerUrl, () => {});
+          return { ...(await connect.promise), shownInConsole: true };
+        },
+      }),
+    };
+  }
 
   const mainPath = path.join(__dirname, "../src/main.js");
   const mainRequire = createRequire(mainPath);
@@ -3648,7 +3667,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     );
   });
 
-  it("restores missing Arca identity on the first localhost preview", async (t) => {
+  it("never runs recovery for a source session outside remembered Arca", async (t) => {
     const { arcaTarget } = require("../src/arcaIdentity");
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
     const hostId = "a".repeat(32);
@@ -3656,6 +3675,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       serverUrl,
       internalFeatures: true,
       arcaPath: "/usr/local/bin/arca",
+      arcaConsentResult: { ok: false, canceled: true },
       arcaResult: {
         ok: true,
         alreadyRunning: true,
@@ -3668,15 +3688,98 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
 
     assert.equal(
-      await deps.recoverAgentNavigationForEvent(event, "http://localhost:5173", hostId),
-      true,
-    );
-    assert.deepEqual(h.calls.arcaConnects, [serverUrl]);
-    assert.equal(deps.getAgentNavigationHintForEvent(event, "http://localhost:5173"), null);
-    assert.equal(
-      await deps.recoverAgentNavigationForEvent(event, "http://localhost:5173", hostId),
+      await deps.recoverAgentNavigationForEvent(
+        event,
+        "http://localhost:5173",
+        "b".repeat(32),
+        hostId,
+      ),
       false,
     );
+    assert.deepEqual(h.calls.arcaConsentRuns, []);
+    assert.deepEqual(h.calls.arcaConnects, []);
+  });
+
+  it("asks consent once when preview recovery is not opted into auto-connect", async (t) => {
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaConsentResult: { ok: false, canceled: true },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const recover = h.browserIpcDeps().recoverAgentNavigationForEvent;
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+    assert.equal(await recover(event, "http://localhost:5173", hostId, hostId), false);
+    assert.equal(h.calls.arcaConsentRuns.length, 1);
+    assert.equal(h.calls.arcaConsentRuns[0].serverUrl, serverUrl);
+    assert.equal(h.calls.arcaConsentRuns[0].options.reason, "preview-reconnect");
+    assert.deepEqual(h.calls.arcaConnects, []);
+    assert.equal(await recover(event, "http://localhost:5173", hostId, hostId), false);
+    assert.equal(h.calls.arcaConsentRuns.length, 1);
+  });
+
+  it("keeps opted-in preview recovery silent", async (t) => {
+    const { arcaTarget } = require("../src/arcaIdentity");
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaConsentResult: { ok: false, canceled: true },
+      arcaResult: {
+        ok: true,
+        alreadyRunning: true,
+        identity: { serverUrl: arcaTarget(serverUrl), hostId },
+      },
+    });
+    t.after(h.cleanup);
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ arca_auto_connect: true }));
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+    assert.equal(
+      await h
+        .browserIpcDeps()
+        .recoverAgentNavigationForEvent(event, "http://localhost:5173", hostId, hostId),
+      true,
+    );
+    assert.deepEqual(h.calls.arcaConsentRuns, []);
+    assert.deepEqual(h.calls.arcaConnects, [serverUrl]);
+  });
+
+  it("recovers through consent and verifies the resulting source identity", async (t) => {
+    const { arcaTarget } = require("../src/arcaIdentity");
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaConsentResult: { ok: true },
+      arcaResult: {
+        ok: true,
+        identity: { serverUrl: arcaTarget(serverUrl), hostId },
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+    assert.equal(
+      await h
+        .browserIpcDeps()
+        .recoverAgentNavigationForEvent(event, "http://localhost:5173", hostId, hostId),
+      true,
+    );
+    assert.equal(h.calls.arcaConsentRuns.length, 1);
+    assert.equal(h.calls.arcaConsentRuns[0].serverUrl, serverUrl);
+    assert.equal(h.calls.arcaConsentRuns[0].options.reason, "preview-reconnect");
     assert.deepEqual(h.calls.arcaConnects, [serverUrl]);
   });
 

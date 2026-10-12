@@ -4,6 +4,8 @@
 "use strict";
 
 const serverEl = document.getElementById("server");
+const titleEl = document.getElementById("title");
+const introEl = document.getElementById("intro");
 const commandEl = document.getElementById("command");
 const terminalEl = document.getElementById("terminal");
 const statusEl = document.getElementById("status");
@@ -25,10 +27,15 @@ function resizeToContent() {
 new ResizeObserver(resizeToContent).observe(document.body);
 void document.fonts?.ready.then(resizeToContent);
 
-window.arcaConnect.onInit(({ serverUrl, command }) => {
+window.arcaConnect.onInit(({ serverUrl, command, reason }) => {
   // textContent only: the server URL is remote-influenced data.
   serverEl.textContent = serverUrl;
   commandEl.textContent = command;
+  if (reason === "preview-reconnect") {
+    titleEl.textContent = "Reconnect Arca for this preview?";
+    introEl.textContent = "To load this preview, run the command below over ";
+    confirmBtn.textContent = "Reconnect";
+  }
   resizeToContent();
 });
 

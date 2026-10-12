@@ -20,6 +20,7 @@ vi.mock("@/lib/sessionsApi", () => ({
   getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
 }));
 import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { writeArcaHostId } from "@/lib/arcaHost";
 
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
@@ -110,6 +111,7 @@ function postedResult(): Record<string, unknown> {
 }
 
 beforeEach(() => {
+  writeArcaHostId(null);
   authenticatedFetch.mockReset();
   getSessionSlim.mockReset().mockImplementation(async (id: string) => ({
     id,
@@ -287,6 +289,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
   });
   it("derives inherited provenance from the source session, never model args or visible host", async () => {
     const bridge = installBridge();
+    writeArcaHostId("arca-host");
     setSessionHost(CONV, "local-host");
     setSessionHost("parent", "arca-host");
     setSessionParent("conv_background_A", "parent");
@@ -307,7 +310,12 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       "conv_background_A",
       "http://localhost:5173",
       undefined,
-      { force: true, agent: true, sourceHostId: "arca-host" },
+      {
+        force: true,
+        agent: true,
+        sourceHostId: "arca-host",
+        rememberedArcaHostId: "arca-host",
+      },
     );
     expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(["conv_background_A", "parent"]);
   });

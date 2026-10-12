@@ -527,13 +527,15 @@ Eligibility is scoped to the selected server/workspace, not all sessions on
 a Databricks server.
 
 After restarting the desktop, launch-time auto-connect restores this identity
-for users who opted into it. Otherwise, the first Arca agent request for a
-loopback preview performs the same idempotent connection once, captures the
-daemon identity, verifies that its host ID matches the source session, and
-retries the navigation. A failed or unrecognized capture keeps localhost
-denied and tells the user to restart Omnigent before retrying; it never grants
-another host access. **Run on Arca** remains available only while the remembered
-Arca host is offline or missing from the host list.
+for users who opted into it. Otherwise, the first loopback preview request from
+the remembered Arca host offers the shell-owned reconnect console; nothing runs
+until the user confirms. Opted-in recovery stays silent. Both paths run at most
+once per workspace per launch, capture the daemon identity, verify that its host
+ID matches the source session, and retry the navigation once. Requests from any
+other host never start recovery. A decline, failure, or unrecognized capture
+keeps localhost denied and tells the user to restart Omnigent before retrying.
+**Run on Arca** remains available only while the remembered Arca host is offline
+or missing from the host list.
 
 The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
 redirects and links that would open a new window (which stay in the same pane).

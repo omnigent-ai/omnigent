@@ -444,6 +444,7 @@ const arcaAutoConnect = createArcaAutoConnect({
   },
   log: (message) => console.log(`[omnigent] ${message}`),
 });
+const arcaPreviewRecoveryTargets = new Set();
 
 /**
  * The auto-connect opt-in shared by overlapping onboarding connects: how many
@@ -4748,10 +4749,12 @@ function registerIpc() {
       serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
       sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
     }),
-    recoverAgentNavigationForEvent: async (event, url, sourceHostId) => {
+    recoverAgentNavigationForEvent: async (event, url, sourceHostId, rememberedArcaHostId) => {
       const recoveryWin = BrowserWindow.fromWebContents(event.sender);
       if (
         typeof sourceHostId !== "string" ||
+        typeof rememberedArcaHostId !== "string" ||
+        sourceHostId !== rememberedArcaHostId ||
         !isLoopbackPreviewUrl(url) ||
         !isPinnedOriginSender(event) ||
         !recoveryWin ||
@@ -4764,13 +4767,19 @@ function registerIpc() {
       if (
         !isDatabricksManagedServerUrl(windows.get(recoveryWin)?.serverUrl) ||
         !isDatabricksManagedServerUrl(target) ||
-        arcaIdentities.get(target)
+        arcaIdentities.get(target) ||
+        arcaPreviewRecoveryTargets.has(target)
       ) {
         return false;
       }
+      arcaPreviewRecoveryTargets.add(target);
       await refreshArcaBinary(true);
-      const status = await arcaAutoConnect.recover(target);
-      return status.state === "online" && arcaIdentities.get(target)?.hostId === sourceHostId;
+      if (cachedArcaBinary() === null) return false;
+      const recovered = arcaAutoConnectFeatureEnabled()
+        ? (await arcaAutoConnect.recover(target)).state === "online"
+        : (await arcaConnectFlow.run(recoveryWin, target, { reason: "preview-reconnect" })).ok ===
+          true;
+      return recovered && arcaIdentities.get(target)?.hostId === sourceHostId;
     },
     getAgentNavigationHintForEvent: (event, url) => {
       const win = BrowserWindow.fromWebContents(event.sender);

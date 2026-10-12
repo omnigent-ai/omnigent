@@ -62,7 +62,14 @@ it("renders consent, sign-in, retry, and completion", (t) => {
   events.Init({
     serverUrl: "https://account.databricks.com/omnigent?o=123",
     command: "host command",
+    reason: "preview-reconnect",
   });
+  assert.equal(document.getElementById("title").textContent, "Reconnect Arca for this preview?");
+  assert.equal(
+    document.getElementById("intro").textContent,
+    "To load this preview, run the command below over ",
+  );
+  assert.equal(confirm.textContent, "Reconnect");
   assert.equal(sizes.at(-1).height, 360);
   assert.equal(sizes.at(-1).phase, "asking");
   confirm.click();
@@ -248,6 +255,7 @@ describe("arca connect console flow", () => {
 
     const init = win.webContents.sent.find(([c]) => c === "arca-connect:init");
     assert.equal(init[1].command, "arca ssh isaac omni host --server https://srv.example.com …");
+    assert.equal(init[1].reason, null);
     assert.equal(world.connects.length, 0); // nothing ran yet — consent first
 
     world.sendFrom(win, "arca-connect:confirm");
@@ -264,6 +272,16 @@ describe("arca connect console flow", () => {
     const done = win.webContents.sent.find(([c]) => c === "arca-connect:done");
     assert.deepEqual(done[1], { ok: true, error: null });
     assert.equal(win.destroyed, false); // stays open so the output is readable
+  });
+
+  it("labels preview recovery as a reconnect before asking consent", () => {
+    const { world, flow } = flowHarness();
+    void flow.run(null, "https://srv.example.com", { reason: "preview-reconnect" });
+    const win = world.windows[0];
+    const init = win.webContents.sent.find(([channel]) => channel === "arca-connect:init");
+    assert.equal(win.options.title, "Reconnect Arca");
+    assert.equal(init[1].reason, "preview-reconnect");
+    assert.equal(world.connects.length, 0);
   });
 
   it("uses content bounds and honors only its renderer's measured height", () => {

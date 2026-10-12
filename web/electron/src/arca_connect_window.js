@@ -40,7 +40,7 @@ const { arcaTarget } = require("./arcaIdentity");
  *   loginCommandLine: (serverUrl: string) => string,
  *   log?: (message: string) => void,
  * }} deps
- * @returns {{ run: (parentWin: unknown, serverUrl: string) => Promise<object> }}
+ * @returns {{ run: (parentWin: unknown, serverUrl: string, options?: { reason?: "preview-reconnect" }) => Promise<object> }}
  */
 function createArcaConnectFlow({
   BrowserWindow,
@@ -100,8 +100,9 @@ function createArcaConnectFlow({
    *
    * @param {unknown} parentWin
    * @param {string} serverUrl
+   * @param {{ reason?: "preview-reconnect" }} [options]
    */
-  function run(parentWin, serverUrl) {
+  function run(parentWin, serverUrl, options = {}) {
     // Re-attach: an in-flight console survives an SPA refresh (it's a shell
     // window), so a repeat click surfaces it and awaits the same outcome
     // rather than erroring with "already in progress".
@@ -135,7 +136,7 @@ function createArcaConnectFlow({
         maximizable: false,
         fullscreenable: false,
         show: false,
-        title: "Connect Arca",
+        title: options.reason === "preview-reconnect" ? "Reconnect Arca" : "Connect Arca",
         webPreferences: {
           preload: preloadPath,
           contextIsolation: true,
@@ -247,7 +248,11 @@ function createArcaConnectFlow({
       // did-finish-load fires after the page's top-level script ran, so its
       // IPC listeners exist before init arrives (ready-to-show can race them).
       win.webContents.once("did-finish-load", () => {
-        send("arca-connect:init", { serverUrl, command: commandLine(serverUrl) });
+        send("arca-connect:init", {
+          serverUrl,
+          command: commandLine(serverUrl),
+          reason: options.reason ?? null,
+        });
       });
       win.once("ready-to-show", () => {
         win.show();

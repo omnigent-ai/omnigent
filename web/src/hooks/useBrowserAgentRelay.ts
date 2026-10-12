@@ -16,6 +16,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
 import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
+import { readArcaHostId } from "@/lib/arcaHost";
 import type { Session } from "@/lib/types";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
@@ -26,7 +27,12 @@ interface BrowserDesktopBridge {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean; sourceHostId?: string },
+    opts?: {
+      force?: boolean;
+      agent?: boolean;
+      sourceHostId?: string;
+      rememberedArcaHostId?: string;
+    },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserScreenshot?: (
     conversationId: string,
@@ -222,6 +228,7 @@ async function dispatch(
   args: Record<string, unknown>,
   desktop: BrowserDesktopBridge,
   sourceHostId: string | null,
+  rememberedArcaHostId: string | null,
 ): Promise<ActionResult> {
   try {
     switch (action) {
@@ -237,6 +244,7 @@ async function dispatch(
           force: true,
           agent: true,
           ...(sourceHostId ? { sourceHostId } : {}),
+          ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
         return { ok: true, data: { final_url: url } };
@@ -400,7 +408,14 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       }
       const result = cancelled
         ? { ok: false, error: "browser relay context changed" }
-        : await dispatch(sourceConversationId, evt.action, evt.args, desktop, sourceHostId);
+        : await dispatch(
+            sourceConversationId,
+            evt.action,
+            evt.args,
+            desktop,
+            sourceHostId,
+            evt.action === "navigate" ? readArcaHostId() : null,
+          );
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 
