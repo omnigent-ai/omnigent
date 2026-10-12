@@ -1,7 +1,14 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { DownloadIcon, PanelRightIcon, PlayIcon, VideoIcon } from "lucide-react";
+import {
+  DownloadIcon,
+  PanelRightCloseIcon,
+  PanelRightIcon,
+  PlayIcon,
+  VideoIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -195,19 +202,29 @@ function VideoPlayerContent(props: VideoPlayerProps) {
             </button>
           )}
           {chapters.length > 0 && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label={actionsOpen ? "Hide recording actions" : "Show recording actions"}
-              aria-expanded={actionsOpen}
-              aria-controls={actionsId}
-              title={actionsOpen ? "Hide recording actions" : "Show recording actions"}
-              className="border-none text-muted-foreground hover:text-foreground"
-              onClick={() => setActionsOpen((open) => !open)}
-            >
-              <PanelRightIcon aria-hidden="true" className="size-4" />
-            </Button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={actionsOpen ? "Hide recording actions" : "Show recording actions"}
+                  aria-expanded={actionsOpen}
+                  aria-controls={actionsId}
+                  className="border-none text-muted-foreground hover:text-foreground"
+                  onClick={() => setActionsOpen((open) => !open)}
+                >
+                  {actionsOpen ? (
+                    <PanelRightCloseIcon aria-hidden="true" className="size-4" />
+                  ) : (
+                    <PanelRightIcon aria-hidden="true" className="size-4" />
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <span>{actionsOpen ? "Collapse actions" : "Expand actions"}</span>
+              </TooltipContent>
+            </Tooltip>
           )}
         </span>
       </span>

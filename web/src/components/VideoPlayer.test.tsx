@@ -1,4 +1,11 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render as renderComponent,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VideoPlayer } from "./VideoPlayer";
 import { parseVideoChapters } from "@/lib/videoChapters";
@@ -16,6 +23,9 @@ vi.mock("@/hooks/useFileContent", () => ({
   useFileContent: vi.fn(),
 }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+
+const render = (ui: Parameters<typeof renderComponent>[0]) =>
+  renderComponent(ui, { wrapper: TooltipProvider });
 
 const fetchBlob = vi.mocked(fetchWorkspaceFileBlob);
 const createUrl = vi.fn(() => "blob:recording");
