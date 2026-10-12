@@ -631,9 +631,6 @@ def _body_to_file_yaml(
     """Serialize a request body as ``tools/mcp/<name>.yaml``."""
     result: dict[str, Any] = {"name": body.name, "transport": body.transport}
     _copy_description(result, body)
-    if body.transport == "registry":
-        _preserve_keys(result, existing, ("tools",))
-        return result
     if body.transport == "http":
         result["url"] = body.url
         _apply_headers(result, body, existing)
@@ -653,9 +650,6 @@ def _body_to_inline_yaml(
     """Serialize a request body as an inline ``tools`` MCP block."""
     result: dict[str, Any] = {"type": "mcp"}
     _copy_description(result, body)
-    if body.transport == "registry":
-        _preserve_keys(result, existing, ("tools",))
-        return {**result, "transport": "registry"}
     if body.transport == "http":
         result["url"] = body.url
         _apply_headers(result, body, existing)

@@ -1275,7 +1275,13 @@ class ClaudeNativeToolRelay:
     """
 
     def __init__(
-        self, *, bridge_dir: Path, httpd: ThreadingHTTPServer, advertised_url: str
+        self,
+        *,
+        bridge_dir: Path,
+        httpd: ThreadingHTTPServer,
+        advertised_url: str,
+        relay_info: _JsonObject,
+        tool_executor: ToolExecutor,
     ) -> None:
         """
         Initialize the relay handle.
@@ -1284,11 +1290,30 @@ class ClaudeNativeToolRelay:
             advertisement, e.g. ``Path("/tmp/omnigent/...")``.
         :param httpd: Started HTTP server for tool calls.
         :param advertised_url: Base URL advertised in ``tool_relay.json``.
+        :param relay_info: Current relay advertisement, including its stable token.
+        :param tool_executor: Callback for the current tool surface.
         :returns: None.
         """
         self._bridge_dir = bridge_dir
         self._httpd = httpd
         self._advertised_url = advertised_url
+        self._relay_info = relay_info
+        self._tool_executor = tool_executor
+
+    def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
+        """Refresh tools on the owning event loop without changing cached relay credentials.
+
+        :param tools: Replacement tool schemas.
+        :param tool_executor: Callback dispatching against the updated spec.
+        """
+        relay_info = {
+            **self._relay_info,
+            "tools": _normalize_relay_tool_specs(tools),
+            "updated_at": time.time(),
+        }
+        _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
+        self._relay_info = relay_info
+        self._tool_executor = tool_executor
 
     def close(self) -> None:
         """
@@ -6317,9 +6342,13 @@ def start_tool_relay(
     :returns: Started relay handle. Call :meth:`close` when done.
     """
     token = secrets.token_urlsafe(32)
+
+    async def _execute_current_tool(name: str, arguments: _JsonObject) -> object:
+        return await relay._tool_executor(name, arguments)
+
     handler_cls = _tool_relay_handler_factory(
         token,
-        tool_executor,
+        _execute_current_tool,
         loop,
         policy_client=policy_client,
         session_id=session_id,
@@ -6344,13 +6373,20 @@ def start_tool_relay(
         encoding="utf-8",
     )
     os.chmod(env_path, 0o600)
+    relay = ClaudeNativeToolRelay(
+        bridge_dir=bridge_dir,
+        httpd=httpd,
+        advertised_url=advertised_url,
+        relay_info=relay_info,
+        tool_executor=tool_executor,
+    )
     thread = threading.Thread(
         target=httpd.serve_forever,
         name="claude-native-tool-relay",
         daemon=True,
     )
     thread.start()
-    return ClaudeNativeToolRelay(bridge_dir=bridge_dir, httpd=httpd, advertised_url=advertised_url)
+    return relay
 
 
 def main(argv: list[str] | None = None) -> None:

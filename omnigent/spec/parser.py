@@ -2952,8 +2952,12 @@ def _discover_mcp_servers(
             )
         transport_str = str(transport)
         if transport_str == "registry":
-            servers.append(_parse_registry_mcp_server(str(name), raw, str(yaml_file)))
-        elif transport_str == "http":
+            raise OmnigentError(
+                "Managed MCP references must be inline in config.yaml tools, "
+                "where older servers can ignore them; registry sidecars are unsupported",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if transport_str == "http":
             servers.append(_parse_http_mcp_server(name, raw, yaml_file, expand_env=expand_env))
         elif transport_str == "stdio":
             servers.append(_parse_stdio_mcp_server(name, raw, yaml_file, expand_env=expand_env))

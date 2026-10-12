@@ -293,6 +293,32 @@ async def test_invalid_launch_selection_creates_no_session(
     launch.assert_not_awaited()
 
 
+@pytest.mark.parametrize("nested", [False, True])
+async def test_registry_sidecars_are_rejected_before_persistence(
+    client, tmp_path, monkeypatch, nested
+):
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes.session_mcp_servers import _tar_gz_dir
+    from omnigent.spec import extract_safe
+
+    root = tmp_path / "source"
+    extract_safe(build_agent_bundle("source", sub_agents=[{"name": "child"}]), root)
+    agent_root = root / "agents" / "child" if nested else root
+    mcp_dir = agent_root / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "tracker.yaml").write_text("name: tracker\ntransport: registry\n")
+    create = Mock(side_effect=AssertionError("incompatible source must not be persisted"))
+    monkeypatch.setattr(get_conversation_store(), "create_session_with_agent", create)
+    response = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={"bundle": ("agent.tar.gz", _tar_gz_dir(root), "application/gzip")},
+    )
+    assert response.status_code == 400, response.text
+    assert "inline in config.yaml" in response.text
+    create.assert_not_called()
+
+
 @pytest.mark.parametrize("allowed", [[], ["read_ticket"]])
 async def test_launch_selection_preserves_existing_registry_tool_restrictions(
     client, launch_registry, tmp_path, allowed
@@ -305,11 +331,10 @@ async def test_launch_selection_preserves_existing_registry_tool_restrictions(
 
     root = tmp_path / "source"
     extract_safe(build_agent_bundle("restricted-tools"), root)
-    mcp_dir = root / "tools" / "mcp"
-    mcp_dir.mkdir(parents=True)
-    (mcp_dir / "tracker.yaml").write_text(
-        yaml.safe_dump({"name": "tracker", "transport": "registry", "tools": allowed})
-    )
+    config_path = root / "config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config["tools"] = {"tracker": {"type": "mcp", "transport": "registry", "tools": allowed}}
+    config_path.write_text(yaml.safe_dump(config))
     uploaded = await client.post(
         "/v1/sessions",
         data={"metadata": "{}"},

@@ -1221,7 +1221,7 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("initial_revision", [None, "bundle.zip"])
-@pytest.mark.parametrize("harness_name", ["claude-native", "kiro-native"])
+@pytest.mark.parametrize("harness_name", ["claude-native", "kiro-native", "pi-native"])
 async def test_native_revision_refreshes_relay_before_turn_without_reset(
     tmp_path: Path,
     initial_revision: str | None,
@@ -1271,6 +1271,7 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
             try:
                 # Seed the shared relay; native CLI startup is outside this test.
                 await _launch_bridged(client, session_id)
+                initial_relay = json.loads(relay_file.read_text())
                 for revision, service in (
                     (initial_revision, None),
                     ("bundle.zip:mcp:alpha", "alpha"),
@@ -1309,6 +1310,9 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
                     )
                     assert "list_comments" in names
                     assert manager.get_client_calls[-1][1] == harness_name
+                    current_relay = json.loads(relay_file.read_text())
+                    assert current_relay["url"] == initial_relay["url"]
+                    assert current_relay["token"] == initial_relay["token"]
                 assert manager.released == []
             finally:
                 await client.delete(f"/v1/sessions/{session_id}")
@@ -1404,6 +1408,7 @@ async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> Non
         async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
             await _launch_bridged(c, session_id)
             assert (dir_a / _TOOL_RELAY_FILE).exists(), "no relay written for the first bridge"
+            old_relay = json.loads((dir_a / _TOOL_RELAY_FILE).read_text())
 
             server_client.agent_id = agent_b
             server_client.bridge_id = bridge_b
@@ -1419,6 +1424,14 @@ async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> Non
             assert not (dir_a / _TOOL_RELAY_FILE).exists(), (
                 "the previous bridge directory kept a stale relay advertisement"
             )
+            async with httpx.AsyncClient(trust_env=False) as relay_client:
+                with pytest.raises(httpx.ConnectError):
+                    await relay_client.post(
+                        f"{old_relay['url']}/tool",
+                        headers={"Authorization": f"Bearer {old_relay['token']}"},
+                        json={"name": "list_comments", "arguments": {}},
+                        timeout=2.0,
+                    )
     finally:
         with contextlib.suppress(httpx.HTTPError):
             async with httpx.AsyncClient(
@@ -1480,15 +1493,11 @@ async def test_agent_switch_rebuilds_same_named_tool_schema(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> None:
-    """A failed bridge-injected launch withdraws the relay that launch installed.
-
-    The rollback used to be gated on "was a relay already present", which a
-    relay left over from the previous agent makes true — so the relay this
-    launch built for the new agent stayed bound and advertised even though
-    the terminal never came up. Rollback is keyed on the relay instance
-    instead, so what this launch installed is what it removes.
-    """
+@pytest.mark.parametrize("switch_bridge", [False, True])
+async def test_failed_launch_rolls_back_only_new_relay(
+    tmp_path: Path, switch_bridge: bool
+) -> None:
+    """Failed launches retain an updated existing relay but close a newly started one."""
     agent_a, agent_b = "ag_first", "ag_second"
     server_client = _SwitchableServerClient(agent_a)
     registry = _FailingResourceRegistry(tmp_path)
@@ -1503,6 +1512,8 @@ async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> 
     bridge_dir = bridge_dir_for_bridge_id(session_id)
     prepare_bridge_dir(session_id, workspace=tmp_path)
     relay_file = bridge_dir / _TOOL_RELAY_FILE
+    next_bridge_id = f"bridge_{uuid.uuid4().hex[:12]}" if switch_bridge else session_id
+    next_bridge_dir = prepare_bridge_dir(next_bridge_id, workspace=tmp_path)
 
     try:
         transport = httpx.ASGITransport(app=app)
@@ -1511,15 +1522,18 @@ async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> 
             assert relay_file.exists()  # precondition: agent A's relay is up
 
             server_client.agent_id = agent_b
+            server_client.bridge_id = next_bridge_id
             await _reset_state(c, session_id)
 
             registry.fail_launch = True
             failed = await _launch_terminal(c, session_id, bridge_inject_dir=True)
             assert failed.status_code == 500
 
-            assert not relay_file.exists(), (
-                "the relay this failed launch installed stayed bound and advertised"
-            )
+            if switch_bridge:
+                assert not relay_file.exists()
+                assert not (next_bridge_dir / _TOOL_RELAY_FILE).exists()
+            else:
+                assert _sub_agent_enum(relay_file) == {"beta"}
     finally:
         with contextlib.suppress(httpx.HTTPError):
             async with httpx.AsyncClient(
@@ -1527,3 +1541,4 @@ async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> 
             ) as c:
                 await c.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
+        shutil.rmtree(next_bridge_dir, ignore_errors=True)

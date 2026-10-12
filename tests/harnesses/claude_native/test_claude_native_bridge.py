@@ -11814,6 +11814,52 @@ def _relay_request_raw(bridge_dir: Path, path: str, payload: dict[str, object]) 
 
 
 @pytest.mark.asyncio
+async def test_relay_tool_update_preserves_cached_policy_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cached native credentials keep enforcing policy as tools and callbacks change."""
+    verdict = {"result": "POLICY_ACTION_DENY", "reason": "blocked by test"}
+    policy_client = _ScriptedPolicyClient(verdict)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, policy_client)
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+    initial = json.loads(relay_file.read_text())
+    calls: list[str] = []
+
+    async def first_executor(name: str, arguments: dict[str, object]) -> str:
+        calls.append("first")
+        return "first result"
+
+    async def second_executor(name: str, arguments: dict[str, object]) -> str:
+        calls.append("second")
+        return "second result"
+
+    try:
+        async with httpx.AsyncClient(
+            base_url=initial["url"],
+            headers={"Authorization": f"Bearer {initial['token']}"},
+            trust_env=False,
+        ) as client:
+            for name, executor in (("first", first_executor), ("second", second_executor)):
+                relay.update_tools([{"name": name, "parameters": {"type": "object"}}], executor)
+                updated = json.loads(relay_file.read_text())
+                assert updated["url"] == initial["url"]
+                assert updated["token"] == initial["token"]
+                assert [tool["name"] for tool in updated["tools"]] == [name]
+                response = await client.post("/tool", json={"name": name, "arguments": {}})
+                assert response.status_code == 200
+                assert json.loads(response.json()["content"][0]["text"]) == {
+                    "result": f"{name} result"
+                }
+                response = await client.post("/policies/evaluate", json=_PRE_TOOL_USE_PAYLOAD)
+                assert response.status_code == 200
+                assert response.json() == verdict
+            assert calls == ["first", "second"]
+            assert policy_client.bodies == [_PRE_TOOL_USE_PAYLOAD, _PRE_TOOL_USE_PAYLOAD]
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
 async def test_hook_evaluate_endpoint_allows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

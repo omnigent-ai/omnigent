@@ -10,15 +10,17 @@ This describes the implemented prototype. Follow the
 The [API and integration contract](MCP_REGISTRY_API.md) describes the HTTP surface,
 existing Python hooks, and options for bringing an external registry or gateway.
 
-Picker selections keep the original stored bundle readable by older servers.
-Hand-authored registry declarations require the [reader prerequisite](https://github.com/omnigent-ai/omnigent/pull/9803)
-across all server replicas before those bundles are written. Until that happens,
-new-format uploads, installs and operator registrations are not mixed-server safe.
+No separate reader rollout is required. Picker selections preserve the original
+stored bundle. Authored references use inline MCP entries in native `config.yaml`,
+which older parsers already ignore when no URL or command is present. Registry
+sidecars and legacy YAML references are rejected before persistence; legacy agents
+can use the picker/API. Older servers can read the bundles and continue using
+ordinary tools, but managed MCP execution requires a capable server and runner.
 
 Execution hosts and runners must also run the MCP registry build. Their existing
 hello frames advertise `mcp_registry`; the server rejects incompatible registry
 launches, edits, bindings and dispatch with upgrade/restart guidance. Updating the
-server alone cannot teach an older runner to parse `transport: registry`. Plain
+server alone does not add managed MCP execution to an older runner. Plain
 sessions and direct HTTP/stdio MCPs keep their existing behavior. See the
 [deployment walkthrough](../examples/mcp-registry/README.md#server-and-execution-host-versions).
 

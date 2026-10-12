@@ -57,11 +57,13 @@ local MCP subprocess. Existing direct HTTP and stdio entries retain their behavi
 
 ## Server and execution-host versions
 
-Picker selections preserve ordinary stored bundles. For hand-authored
-`transport: registry` bundles, roll out the [reader prerequisite](https://github.com/omnigent-ai/omnigent/pull/9803)
-to all server replicas before allowing uploads, installs or operator registrations. An old
-server without that reader cannot load the new format. Upgrading only the host
-and runner does not protect server readers.
+No separate reader rollout is needed. Picker selections preserve ordinary stored
+bundles. Authored references must be inline under `tools` in native `config.yaml`
+(`spec_version: 1`); older servers already ignore these endpoint-free entries.
+Registry sidecars and legacy agent-YAML references are rejected with guidance to
+use native inline configuration or the picker/API. Existing HTTP/stdio entries
+keep their behavior. Reading a bundle on an old server does not enable managed MCP
+execution there; the new feature needs a capable server and runner.
 
 Install the MCP registry build on both the server and every execution host that
 will run selected registry services. For this prototype, use the same commit on
@@ -319,9 +321,11 @@ it, with the correct audience/scopes. Reusing a GitHub/Databricks resolver does 
 perform a new audience exchange. Its existing sandbox token-brokering behavior is
 unchanged; generic MCP credentials stay on the server.
 
-Session bundles can select services without the UI:
+Native `config.yaml` bundles (`spec_version: 1`) can select services without the UI:
 
 ```yaml
+spec_version: 1
+# Add these tools to the agent's existing config.yaml.
 tools:
   tracker:
     type: mcp
@@ -329,9 +333,13 @@ tools:
     tools: [read_ticket]  # optional further restriction; [] enables no tools
 ```
 
-Native sidecars use `name: tracker` and `transport: registry` in
-`tools/mcp/tracker.yaml`. Connection overrides (URLs, headers, commands, auth) are
-rejected. The administrator's allowlist always applies.
+Put these entries in the native `config.yaml` tools mapping, including each
+named child's own config when needed. Registry references in `tools/mcp/*.yaml`
+or legacy single-file agent YAML are unsupported because older readers reject
+them. Prototype configs using those forms must move the reference inline. The
+picker/API works with both native and legacy agents without editing their source.
+Connection overrides (URLs, headers, commands, auth) are rejected. The
+administrator's allowlist always applies.
 
 ```mermaid
 sequenceDiagram

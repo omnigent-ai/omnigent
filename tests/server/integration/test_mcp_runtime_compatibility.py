@@ -274,14 +274,17 @@ async def test_bundle_edit_is_guarded_and_removing_registry_service_is_allowed(
     assert (
         await client.post(f"{url}/mcp-servers", json={"name": "tracker", "transport": "registry"})
     ).status_code == 200
+    import yaml
+
     from omnigent.server.routes.session_mcp_servers import _tar_gz_dir
     from omnigent.spec import extract_safe
 
     root = tmp_path / "authored"
     extract_safe(build_agent_bundle("test-agent"), root)
-    mcp_dir = root / "tools" / "mcp"
-    mcp_dir.mkdir(parents=True)
-    (mcp_dir / "tracker.yaml").write_text("name: tracker\ntransport: registry\n")
+    config_path = root / "config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config["tools"] = {"tracker": {"type": "mcp", "transport": "registry"}}
+    config_path.write_text(yaml.safe_dump(config))
     bundle = _tar_gz_dir(root)
     get_conversation_store().set_host_id(sid, _HOST_ID, _SOURCE_REPO)
     before = get_agent_store().get(session["agent_id"]).bundle_location

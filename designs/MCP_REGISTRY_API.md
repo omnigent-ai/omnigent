@@ -31,12 +31,20 @@ does not allow users to register arbitrary destinations.
 
 ## Runtime compatibility
 
-Picker/API selections leave stored bundles readable by older servers. Those
-servers ignore the new session labels and do not provide registry execution.
-Hand-authored `transport: registry` bundles are a new format: deploy the [reader prerequisite](https://github.com/omnigent-ai/omnigent/pull/9803)
-on **all server replicas before** uploading, installing or registering
-such bundles. The reader prerequisite is separate from gateway execution support;
-this prototype must not be treated as a safe mixed-server rollout of that format.
+No separate reader rollout is required. Picker/API selections use session labels
+and leave stored bundles unchanged. Authored references are supported only as
+inline `type: mcp`, `transport: registry` entries under `tools` in native
+`config.yaml` (`spec_version: 1`). Older native parsers already skip MCP entries
+without a URL or command, retaining ordinary HTTP/stdio declarations. Registry
+sidecars and legacy agent-YAML references are rejected with migration guidance
+before persistence. Legacy agents can still select services through the picker/API.
+
+Older servers ignore these selections; they do not execute the new feature. A
+mixed fleet remains able to read agent bundles, but managed MCP execution requires
+a capable server and runner. Ignoring a reference never selects a fallback URL,
+local command or different credential.
+Downloads and source-preserving edits retain inline references. Rebuilding YAML
+from an older typed spec omits fields that reader does not understand.
 
 Registry references require `mcp_registry` in the host and runner hello
 `capabilities` lists. Omitted tokens mean unsupported, independent of the version
@@ -155,6 +163,8 @@ unchanged. Ordinary downloads receive the original bytes without this header.
 Resolved specs are cached per session. Dispatch revisions include a digest of
 selection labels, so the next turn recovers even if the immediate cache-reset
 request was lost. Without selections, revision strings keep their existing value.
+Native relays refresh their tools in place, preserving the endpoint and local
+authentication token cached by native policy hooks.
 
 Existing sessions use the shared MCP declaration API:
 

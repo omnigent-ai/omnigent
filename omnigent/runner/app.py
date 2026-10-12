@@ -4736,15 +4736,20 @@ def create_runner_app(
                 )
 
         try:
-            relay: ClaudeNativeToolRelay = start_tool_relay(
-                bridge_dir=bridge_dir,
-                tools=relay_schemas,
-                tool_executor=_relay_tool_executor,
-                loop=asyncio.get_running_loop(),
-                policy_client=server_client,
-                session_id=session_id,
-                file_change_observer=_observe_native_file_changes,
-            )
+            if current is not None and current.bridge_dir == bridge_dir:
+                # Native policy hooks can cache the relay URL/token at startup.
+                relay = current.relay
+                relay.update_tools(relay_schemas, _relay_tool_executor)
+            else:
+                relay = start_tool_relay(
+                    bridge_dir=bridge_dir,
+                    tools=relay_schemas,
+                    tool_executor=_relay_tool_executor,
+                    loop=asyncio.get_running_loop(),
+                    policy_client=server_client,
+                    session_id=session_id,
+                    file_change_observer=_observe_native_file_changes,
+                )
         except (OSError, RuntimeError):
             _logger.warning(
                 "Failed to start comment relay for session=%s",
@@ -4763,7 +4768,7 @@ def create_runner_app(
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
         # still points at the relay being closed, so a shared bridge dir
         # keeps the new file.
-        if superseded is not None:
+        if superseded is not None and superseded.relay is not relay:
             superseded.relay.close()
 
         async def _notify_tools_changed() -> None:
