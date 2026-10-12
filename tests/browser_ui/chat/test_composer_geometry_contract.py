@@ -674,8 +674,9 @@ def test_chat_width_scales_while_prose_remains_readable(
             frame: frame.getBoundingClientRect().width,
             inner: frame.clientWidth
               - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
-            prose: prose.getBoundingClientRect().width,
+            prose: prose.querySelector('.chat-markdown > p').getBoundingClientRect().width,
             table: table.getBoundingClientRect().width,
+            tableProse: table.querySelector('.chat-markdown > p').getBoundingClientRect().width,
             composer: composer.getBoundingClientRect().width,
             workspace: workspace.getBoundingClientRect().width,
             composerLeft: composer.getBoundingClientRect().left,
@@ -686,6 +687,7 @@ def test_chat_width_scales_while_prose_remains_readable(
     assert widths["frame"] == pytest.approx(expected_frame, abs=TOLERANCE)
     assert widths["prose"] == pytest.approx(expected_prose, abs=TOLERANCE)
     assert widths["table"] == pytest.approx(widths["inner"], abs=TOLERANCE)
+    assert widths["tableProse"] == pytest.approx(widths["inner"], abs=TOLERANCE)
     assert widths["composer"] == pytest.approx(expected_frame, abs=TOLERANCE)
     assert widths["workspace"] == pytest.approx(expected_frame, abs=TOLERANCE)
     assert widths["composerLeft"] == pytest.approx(widths["frameLeft"], abs=TOLERANCE)

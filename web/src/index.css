@@ -1515,11 +1515,6 @@ html[data-electron-mac] .breadcrumb-folder {
   margin-bottom: 0;
 }
 
-/* Prose stays readable on wide screens; tables and code use the full column. */
-.chat-markdown > :is(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6) {
-  max-width: 80ch;
-}
-
 .chat-markdown :is(ul, ol) {
   list-style-position: outside;
   padding-inline-start: 1.5em;
