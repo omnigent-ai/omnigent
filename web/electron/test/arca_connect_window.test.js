@@ -3,7 +3,13 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
-const { createArcaConnectFlow } = require("../src/arca_connect_window");
+const {
+  createArcaConnectFlow,
+  CONTENT_WIDTH,
+  MIN_CONTENT_HEIGHT,
+  RUNNING_CONTENT_HEIGHT,
+  MAX_CONTENT_HEIGHT,
+} = require("../src/arca_connect_window");
 const fs = require("node:fs");
 const path = require("node:path");
 const { JSDOM } = require("jsdom");
@@ -18,14 +24,37 @@ it("renders consent, sign-in, retry, and completion", (t) => {
   t.after(() => dom.window.close());
   const events = {};
   let confirms = 0;
+  const sizes = [];
   // Electron supplies this bridge; no remote process is launched by a renderer test.
-  dom.window.arcaConnect = { confirm: () => confirms++, cancel() {} };
+  dom.window.arcaConnect = {
+    confirm: () => confirms++,
+    cancel() {},
+    resizeToContent: (size) => sizes.push(size),
+  };
+  dom.window.ResizeObserver = class ResizeObserver {
+    observe() {}
+  };
+  dom.window.Terminal = class Terminal {
+    loadAddon() {}
+    open() {}
+    write() {}
+  };
+  dom.window.FitAddon = {
+    FitAddon: class FitAddon {
+      fit() {}
+    },
+  };
   for (const event of ["Init", "Started", "Output", "Done"]) {
     dom.window.arcaConnect[`on${event}`] = (listener) => {
       events[event] = listener;
     };
   }
-  dom.window.requestAnimationFrame = () => {};
+  dom.window.requestAnimationFrame = (callback) => {
+    callback();
+    return 1;
+  };
+  dom.window.cancelAnimationFrame = () => {};
+  Object.defineProperty(dom.window.document.documentElement, "scrollHeight", { value: 360 });
   dom.window.eval(fs.readFileSync(path.join(__dirname, "../arca-connect/console.js"), "utf8"));
   const document = dom.window.document;
   const confirm = document.getElementById("confirm");
@@ -34,6 +63,8 @@ it("renders consent, sign-in, retry, and completion", (t) => {
     serverUrl: "https://account.databricks.com/omnigent?o=123",
     command: "host command",
   });
+  assert.equal(sizes.at(-1).height, 360);
+  assert.equal(sizes.at(-1).phase, "asking");
   confirm.click();
   events.Started({ login: false, command: "host command" });
   assert.equal(confirm.disabled, true);
@@ -71,8 +102,9 @@ function flowHarness() {
   };
 
   class FakeWindow extends EventEmitter {
-    constructor() {
+    constructor(options) {
       super();
+      this.options = options;
       this.webContents = new EventEmitter();
       this.webContents.id = 100 + world.windows.length;
       this.webContents.sent = [];
@@ -82,11 +114,11 @@ function flowHarness() {
       this.destroyed = false;
       this.shown = 0;
       this.focused = 0;
-      this.size = null;
+      this.contentSize = null;
       world.windows.push(this);
     }
-    setSize(width, height) {
-      this.size = [width, height];
+    setContentSize(width, height) {
+      this.contentSize = [width, height];
     }
     loadFile() {
       // The page "loads" immediately: fire the init + show hooks.
@@ -148,8 +180,8 @@ function flowHarness() {
   });
 
   /** Emit a preload→main message as if it came from `win`'s webContents. */
-  world.sendFrom = (win, channel) =>
-    world.ipc.emit(channel, { sender: { id: win.webContents.id } });
+  world.sendFrom = (win, channel, payload) =>
+    world.ipc.emit(channel, { sender: { id: win.webContents.id } }, payload);
   return { world, flow };
 }
 
@@ -220,7 +252,8 @@ describe("arca connect console flow", () => {
 
     world.sendFrom(win, "arca-connect:confirm");
     assert.equal(world.connects.length, 1);
-    assert.deepEqual(win.size, [720, 500]); // grows to reveal the terminal pane
+    world.sendFrom(win, "arca-connect:resize", { height: 420, phase: "running" });
+    assert.deepEqual(win.contentSize, [CONTENT_WIDTH, RUNNING_CONTENT_HEIGHT]);
     world.connects[0].onOutput("booting…\n");
     assert.ok(
       win.webContents.sent.some(([c, p]) => c === "arca-connect:output" && p === "booting…\n"),
@@ -231,6 +264,21 @@ describe("arca connect console flow", () => {
     const done = win.webContents.sent.find(([c]) => c === "arca-connect:done");
     assert.deepEqual(done[1], { ok: true, error: null });
     assert.equal(win.destroyed, false); // stays open so the output is readable
+  });
+
+  it("uses content bounds and honors only its renderer's measured height", () => {
+    const { world, flow } = flowHarness();
+    void flow.run(null, "https://srv.example.com/a/very/long/path");
+    const win = world.windows[0];
+    assert.equal(win.options.useContentSize, true);
+    assert.equal(win.options.height, MIN_CONTENT_HEIGHT);
+
+    world.sendFrom(win, "arca-connect:resize", { height: 412, phase: "asking" });
+    assert.deepEqual(win.contentSize, [CONTENT_WIDTH, 412]);
+    world.sendFrom(win, "arca-connect:resize", { height: 5000, phase: "asking" });
+    assert.deepEqual(win.contentSize, [CONTENT_WIDTH, MAX_CONTENT_HEIGHT]);
+    world.ipc.emit("arca-connect:resize", { sender: { id: 9999 } }, { height: 333 });
+    assert.deepEqual(win.contentSize, [CONTENT_WIDTH, MAX_CONTENT_HEIGHT]);
   });
 
   it("Close still works after the run finished (routing outlives the result)", async () => {

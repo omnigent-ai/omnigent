@@ -379,9 +379,12 @@ let arcaProbe = null;
  *
  * @returns {Promise<string | null>}
  */
-function refreshArcaBinary() {
-  // Only auto-connect uses the cached binary; with the feature off, don't probe.
-  if (!arcaAutoConnectFeatureEnabled()) return Promise.resolve(null);
+function refreshArcaBinary(force = false) {
+  // Launch-time auto-connect uses the cached binary; with the feature off,
+  // don't probe until an agent preview explicitly needs identity recovery.
+  // On-demand preview recovery passes force=true because the preview itself
+  // supplies the demand signal even when launch-time auto-connect is disabled.
+  if (!force && !arcaAutoConnectFeatureEnabled()) return Promise.resolve(null);
   if (cachedArcaPath.path && arca.isExecutableFile(cachedArcaPath.path)) {
     return Promise.resolve(cachedArcaPath.path);
   }
@@ -428,6 +431,8 @@ const arcaAutoConnect = createArcaAutoConnect({
     arcaAutoConnectFeatureEnabled() &&
     isDatabricksManagedServerUrl(serverUrl) &&
     cachedArcaBinary() !== null,
+  isRecoveryEligible: (serverUrl) =>
+    isDatabricksManagedServerUrl(serverUrl) && cachedArcaBinary() !== null,
   startConnect: (serverUrl, onOutput) =>
     startArcaHostConnect(serverUrl, { onOutput, resolveArcaPath: cachedArcaBinary }),
   commandLine: (serverUrl) => {
@@ -3677,6 +3682,19 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
   });
 }
 
+/** Whether an agent URL names the loopback destinations Arca previews allow. */
+function isLoopbackPreviewUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return (
+      ["http:", "https:"].includes(parsed.protocol) &&
+      ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Build the per-conversation WebContentsView registry for a shell window
  * (positions child views in `win.contentView`, pings back via `win.webContents`).
@@ -4730,6 +4748,30 @@ function registerIpc() {
       serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
       sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
     }),
+    recoverAgentNavigationForEvent: async (event, url, sourceHostId) => {
+      const recoveryWin = BrowserWindow.fromWebContents(event.sender);
+      if (
+        typeof sourceHostId !== "string" ||
+        !isLoopbackPreviewUrl(url) ||
+        !isPinnedOriginSender(event) ||
+        !recoveryWin ||
+        recoveryWin.isDestroyed() ||
+        !databricksInternalFeaturesEnabled()
+      ) {
+        return false;
+      }
+      const target = windowArcaServerUrl(recoveryWin);
+      if (
+        !isDatabricksManagedServerUrl(windows.get(recoveryWin)?.serverUrl) ||
+        !isDatabricksManagedServerUrl(target) ||
+        arcaIdentities.get(target)
+      ) {
+        return false;
+      }
+      await refreshArcaBinary(true);
+      const status = await arcaAutoConnect.recover(target);
+      return status.state === "online" && arcaIdentities.get(target)?.hostId === sourceHostId;
+    },
     getAgentNavigationHintForEvent: (event, url) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const target = windowArcaServerUrl(win);
@@ -4741,16 +4783,8 @@ function registerIpc() {
       ) {
         return null;
       }
-      try {
-        const parsed = new URL(url);
-        if (
-          ["http:", "https:"].includes(parsed.protocol) &&
-          ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
-        ) {
-          return "If this session runs on Arca, open New session > Host > Run on Arca, complete the connect flow, then return to this session and retry. Other hosts remain ineligible.";
-        }
-      } catch {
-        // Invalid URLs keep the policy's original error.
+      if (isLoopbackPreviewUrl(url)) {
+        return "If this session runs on Arca, Omnigent couldn't restore its connection details automatically. Restart Omnigent and retry the preview. Other hosts remain ineligible.";
       }
       return null;
     },

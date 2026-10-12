@@ -3602,7 +3602,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       const event = { sender: h.webContents };
       for (const url of ["http://localhost:5173", "https://127.0.0.1", "http://[::1]"]) {
         if (expected) {
-          assert.match(hint(event, url), /If this session runs on Arca.*Run on Arca/);
+          assert.match(hint(event, url), /If this session runs on Arca.*automatically/);
         } else {
           assert.equal(hint(event, url), null);
         }
@@ -3634,7 +3634,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     const eligible = h.browserRegistryDeps().isArcaAgentContext;
     const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
     assert.equal(eligible(context), false);
-    assert.match(hint({ sender: h.webContents }, "http://localhost"), /Run on Arca/);
+    assert.match(hint({ sender: h.webContents }, "http://localhost"), /automatically/);
     await h.api.startArcaHostConnect(serverUrl).promise;
     assert.equal(eligible(context), true);
     assert.equal(hint({ sender: h.webContents }, "http://localhost"), null);
@@ -3646,6 +3646,38 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       eligible(h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId)),
       false,
     );
+  });
+
+  it("restores missing Arca identity on the first localhost preview", async (t) => {
+    const { arcaTarget } = require("../src/arcaIdentity");
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaResult: {
+        ok: true,
+        alreadyRunning: true,
+        identity: { serverUrl: arcaTarget(serverUrl), hostId },
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const deps = h.browserIpcDeps();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+    assert.equal(
+      await deps.recoverAgentNavigationForEvent(event, "http://localhost:5173", hostId),
+      true,
+    );
+    assert.deepEqual(h.calls.arcaConnects, [serverUrl]);
+    assert.equal(deps.getAgentNavigationHintForEvent(event, "http://localhost:5173"), null);
+    assert.equal(
+      await deps.recoverAgentNavigationForEvent(event, "http://localhost:5173", hostId),
+      false,
+    );
+    assert.deepEqual(h.calls.arcaConnects, [serverUrl]);
   });
 
   it("closes the window's browserRegistry when pinWindow changes origin", () => {

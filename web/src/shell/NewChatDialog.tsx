@@ -4991,9 +4991,11 @@ export function NewChatLandingScreen() {
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
   // The Arca row is remembered by host ID, never inferred from its machine hostname.
-  // Reconnect remains available to recapture daemon identity after a desktop restart.
+  // While it is online, the row itself is the only useful choice; the desktop
+  // restores its preview identity automatically when an agent first needs it.
   const arcaHostId = arcaEnabled ? readArcaHostId() : null;
-  const showArcaOption = arcaEnabled;
+  const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
+  const showArcaOption = arcaEnabled && !arcaHostOnline;
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : connectingArca

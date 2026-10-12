@@ -20,6 +20,11 @@
 /** Channels between this window's preload and main. */
 const CONFIRM_CHANNEL = "arca-connect:confirm";
 const CANCEL_CHANNEL = "arca-connect:cancel";
+const RESIZE_CHANNEL = "arca-connect:resize";
+const CONTENT_WIDTH = 720;
+const MIN_CONTENT_HEIGHT = 300;
+const RUNNING_CONTENT_HEIGHT = 500;
+const MAX_CONTENT_HEIGHT = 640;
 const { arcaTarget } = require("./arcaIdentity");
 
 /**
@@ -54,7 +59,7 @@ function createArcaConnectFlow({
    * must still route after the result promise settled. Only messages from a
    * registered console's own webContents are honored — a server page
    * (different webContents) can't spoof consent.
-   * @type {Map<number, { onConfirm: () => void, onCancel: () => void }>}
+   * @type {Map<number, { win: Electron.BrowserWindow, onConfirm: () => void, onCancel: () => void }>}
    */
   const consoles = new Map();
   /**
@@ -70,6 +75,20 @@ function createArcaConnectFlow({
   });
   ipcMain.on(CANCEL_CHANNEL, (event) => {
     consoles.get(event.sender.id)?.onCancel();
+  });
+  ipcMain.on(RESIZE_CHANNEL, (event, payload) => {
+    const consoleWindow = consoles.get(event.sender.id)?.win;
+    const measured = Number(payload?.height);
+    if (!consoleWindow || !Number.isFinite(measured) || measured <= 0) return;
+    const minimum = payload?.phase === "running" ? RUNNING_CONTENT_HEIGHT : MIN_CONTENT_HEIGHT;
+    const height = Math.min(MAX_CONTENT_HEIGHT, Math.max(minimum, Math.ceil(measured)));
+    try {
+      if (!consoleWindow.isDestroyed()) {
+        consoleWindow.setContentSize(CONTENT_WIDTH, height, true);
+      }
+    } catch {
+      // Window mid-teardown; content sizing is best-effort.
+    }
   });
 
   /**
@@ -109,8 +128,9 @@ function createArcaConnectFlow({
       const win = new BrowserWindow({
         parent: parentWin ?? undefined,
         modal: true,
-        width: 720,
-        height: 264, // fits the consent copy + a wrapped two-line command
+        width: CONTENT_WIDTH,
+        height: MIN_CONTENT_HEIGHT,
+        useContentSize: true,
         minimizable: false,
         maximizable: false,
         fullscreenable: false,
@@ -184,6 +204,7 @@ function createArcaConnectFlow({
       };
 
       consoles.set(consoleId, {
+        win,
         onConfirm: () => {
           if (phase === "auth-required") {
             loginAttempted = true;
@@ -192,12 +213,6 @@ function createArcaConnectFlow({
           }
           if (phase !== "asking") return;
           log(`arca connect: user confirmed; running against ${serverUrl}`);
-          // Grow to fit the terminal pane the page is about to reveal.
-          try {
-            win.setSize(720, 500, true);
-          } catch {
-            // Window mid-teardown; the run itself proceeds regardless.
-          }
           runCommand();
         },
         onCancel: () => {
@@ -247,4 +262,13 @@ function createArcaConnectFlow({
   return { run };
 }
 
-module.exports = { CANCEL_CHANNEL, CONFIRM_CHANNEL, createArcaConnectFlow };
+module.exports = {
+  CANCEL_CHANNEL,
+  CONFIRM_CHANNEL,
+  RESIZE_CHANNEL,
+  CONTENT_WIDTH,
+  MIN_CONTENT_HEIGHT,
+  RUNNING_CONTENT_HEIGHT,
+  MAX_CONTENT_HEIGHT,
+  createArcaConnectFlow,
+};

@@ -10,10 +10,26 @@ const statusEl = document.getElementById("status");
 const confirmBtn = document.getElementById("confirm");
 const cancelBtn = document.getElementById("cancel");
 
+let resizeFrame = null;
+function resizeToContent() {
+  if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+  resizeFrame = requestAnimationFrame(() => {
+    resizeFrame = null;
+    window.arcaConnect.resizeToContent({
+      height: document.documentElement.scrollHeight,
+      phase: document.body.dataset.phase,
+    });
+  });
+}
+
+new ResizeObserver(resizeToContent).observe(document.body);
+void document.fonts?.ready.then(resizeToContent);
+
 window.arcaConnect.onInit(({ serverUrl, command }) => {
   // textContent only: the server URL is remote-influenced data.
   serverEl.textContent = serverUrl;
   commandEl.textContent = command;
+  resizeToContent();
 });
 
 confirmBtn.addEventListener("click", () => {
@@ -29,6 +45,7 @@ window.arcaConnect.onStarted(({ login, command }) => {
   commandEl.textContent = command;
   // Reveal the terminal pane (the main process grows the window to match).
   document.body.dataset.phase = "running";
+  resizeToContent();
   // Mount the terminal now that its container has real dimensions.
   requestAnimationFrame(() => ensureTerminal());
   // The button itself carries the progress: spinner + "Connecting…".
@@ -82,4 +99,5 @@ window.arcaConnect.onDone(({ ok, error, authRequired, command }) => {
     confirmBtn.focus();
   }
   cancelBtn.textContent = authRequired ? "Cancel" : "Close";
+  resizeToContent();
 });

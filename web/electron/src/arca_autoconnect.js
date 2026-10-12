@@ -39,6 +39,7 @@ const OUTPUT_TAIL_CHARS = 8000;
 /**
  * @param {{
  *   isEligible: (serverUrl: string) => boolean,
+ *   isRecoveryEligible?: (serverUrl: string) => boolean,
  *   startConnect: (serverUrl: string, onOutput: (text: string) => void) =>
  *     ReturnType<typeof import("./arca").startArcaConnect>,
  *   commandLine: (serverUrl: string) => string | null,
@@ -49,6 +50,7 @@ const OUTPUT_TAIL_CHARS = 8000;
  */
 function createArcaAutoConnect({
   isEligible,
+  isRecoveryEligible = isEligible,
   startConnect,
   commandLine,
   onStatus = () => {},
@@ -178,6 +180,28 @@ function createArcaAutoConnect({
   }
 
   /**
+   * On-demand identity recovery for an agent localhost preview. Unlike
+   * launch-time ensure(), this does not require the auto-connect preference:
+   * the preview itself is the demand signal. It still runs at most once per
+   * target per launch and shares an existing run.
+   *
+   * @param {string | null | undefined} serverUrl
+   * @returns {Promise<ArcaStatus>}
+   */
+  function recover(serverUrl) {
+    const target = serverUrl ? targetOf(serverUrl) : null;
+    if (!target || !isRecoveryEligible(serverUrl)) {
+      return Promise.resolve({ state: "unavailable", command: null });
+    }
+    const entry = byTarget.get(target);
+    if (entry?.run) return entry.run;
+    if (entry?.status.state === "online" || entry?.status.state === "failed") {
+      return Promise.resolve(entry.status);
+    }
+    return runConnect(serverUrl, target);
+  }
+
+  /**
    * The in-flight run for `serverUrl`, if any — lets the manual connect share
    * it instead of racing a second `arca ssh`.
    *
@@ -189,7 +213,7 @@ function createArcaAutoConnect({
     return (target && byTarget.get(target)?.run) || null;
   }
 
-  return { ensure, retry, getStatus, inFlight };
+  return { ensure, retry, recover, getStatus, inFlight };
 }
 
 module.exports = { OUTPUT_TAIL_CHARS, createArcaAutoConnect };
