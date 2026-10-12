@@ -130,11 +130,8 @@ def spawn_multi_user_server(
     """
     agent_yaml_path = server_tmp / "hello_world.yaml"
     agent_yaml_path.write_text(_TEST_AGENT_YAML)
-    # Declare the admin roster via the admin-list file (one identity per line;
-    # see omnigent/server/admin_list.py). There is no admin *env var* — the
-    # roster is the config ``admins:`` list or this file — so point
-    # OMNIGENT_ADMIN_LIST_PATH at it. This makes the supplied admin identity resolve as admin
-    # so /v1/me reports is_admin:true and the Settings Admin group renders.
+    # The admin-list file makes this identity an admin in /v1/me and settings;
+    # OMNIGENT_ADMIN_LIST_PATH selects the roster for this isolated server.
     admins_path = server_tmp / "admins"
     admins_path.write_text(f"{admin_email}\n")
 
@@ -165,10 +162,8 @@ def spawn_multi_user_server(
         health_timeout=_HEALTH_TIMEOUT_S,
         poll_interval=_HEALTH_POLL_INTERVAL_S,
     ) as base_url:
-        # Create an admin-owned hello_world session (authenticated, so it's
-        # owned by the supplied admin identity — headerless would 401 here). No runner bind and
-        # no turn: the Share modal / button / settings nav only need a
-        # top-level session to exist at manage level, which the owner has.
+        # Authenticated creation establishes ownership. Share UI needs a top-level
+        # session at manage level, with no runner or agent turn.
         session_id = create_user_session(base_url, headers=admin_headers)
 
         yield MultiUserServer(
