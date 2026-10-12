@@ -57,7 +57,8 @@ place and preserves playback, keyboard focus, and the selected action. Plain
 recordings use the same card width; hiding actions gives annotated recordings
 the same player size as plain recordings.
 
-Click **VTT** in the toolbar to download the original companion file. The
+Open the recording download menu and choose **Download annotations (.vtt)**
+to save the original companion file. The
 annotation download stays available while actions are hidden. Long lists
 scroll within the panel. On wide previews, the panel stays as tall as the
 video; narrow previews limit the list height. The toolbar stays outside the

@@ -88,21 +88,20 @@ describe("VideoPlayer", () => {
       data: { encoding: "utf-8", content: "WEBVTT\n" },
     } as ReturnType<typeof useFileContent>);
     vi.mocked(parseVideoChapters).mockResolvedValue([{ time: 0, end: 5, title: "Open the app" }]);
-    vi.mocked(downloadWorkspaceFile).mockResolvedValueOnce();
+    vi.mocked(downloadWorkspaceFile).mockResolvedValue();
     render(<VideoPlayer {...props} />);
-    fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Download recording actions: Feature demo",
-      }),
-    );
+    const download = await screen.findByRole("button", {
+      name: "Download recording: Feature demo",
+    });
+    fireEvent.keyDown(download, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Download annotations (.vtt)" }));
     expect(downloadWorkspaceFile).toHaveBeenCalledWith("sess_1", "demo.webm.chapters.vtt");
     expect(fetchBlob).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Hide recording actions" }));
-    expect(
-      screen.getByRole("button", {
-        name: "Download recording actions: Feature demo",
-      }),
-    ).toBeVisible();
+    expect(download).toBeVisible();
+    fireEvent.keyDown(download, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Download video", exact: true }));
+    expect(downloadWorkspaceFile).toHaveBeenLastCalledWith("sess_1", "demo.webm");
   });
 
   it("leaves malformed or truncated annotations out of the player", () => {

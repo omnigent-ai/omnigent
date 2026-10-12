@@ -292,9 +292,9 @@ def test_recording_header_size_and_optional_controls(
     assert show.bounding_box() == toggle_box
     expect(acard.get_by_text("Recording actions", exact=True)).not_to_be_visible()
     expect(
-        acard.get_by_role("button", name="Download recording actions: Annotated", exact=True)
+        acard.get_by_role("button", name="Download recording: Annotated", exact=True)
     ).to_be_visible()
-    expect(pcard.get_by_role("button", name="Download recording actions: Plain")).to_have_count(0)
+    expect(pcard.get_by_role("button", name="Download recording: Plain")).to_have_count(0)
     for title in ["Annotated", "Plain"]:
         page.get_by_role("button", name=f"Play video: {title}", exact=True).click()
         _assert_playback(page, page.locator(f'video[aria-label="{title}"]'))

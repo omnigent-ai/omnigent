@@ -2,6 +2,12 @@ import { useEffect, useId, useRef, useState } from "react";
 import { ChevronRightIcon, DownloadIcon, ListVideoIcon, PlayIcon, VideoIcon } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
   downloadWorkspaceFile,
   fetchWorkspaceFileBlob,
   useFileContent,
@@ -136,6 +142,43 @@ function VideoPlayerContent(props: VideoPlayerProps) {
             >
               <DownloadIcon className="size-4" />
             </a>
+          ) : chapters.length > 0 ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={`Download recording: ${title}`}
+                  title="Download recording"
+                  className="rounded p-1 hover:bg-accent"
+                >
+                  <DownloadIcon className="size-4" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  onSelect={() => {
+                    if (conversationId && path) {
+                      void downloadWorkspaceFile(conversationId, path).catch(() =>
+                        showToast("Unable to download video."),
+                      );
+                    }
+                  }}
+                >
+                  Download video
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    if (conversationId && path) {
+                      void downloadWorkspaceFile(conversationId, `${path}.chapters.vtt`).catch(() =>
+                        showToast("Unable to download annotations."),
+                      );
+                    }
+                  }}
+                >
+                  Download annotations (.vtt)
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           ) : (
             <button
               type="button"
@@ -160,22 +203,6 @@ function VideoPlayerContent(props: VideoPlayerProps) {
                 {actionsOpen && "Recording actions"}
               </span>
             )}
-            <button
-              type="button"
-              aria-label={`Download recording actions: ${title}`}
-              title="Download annotations (.vtt)"
-              className="flex shrink-0 items-center gap-1 rounded p-1 hover:bg-accent"
-              onClick={() => {
-                if (conversationId && path) {
-                  void downloadWorkspaceFile(conversationId, `${path}.chapters.vtt`).catch(() =>
-                    showToast("Unable to download annotations."),
-                  );
-                }
-              }}
-            >
-              <DownloadIcon aria-hidden="true" className="size-4" />
-              <span className="text-xs">VTT</span>
-            </button>
             <button
               type="button"
               aria-label={actionsOpen ? "Hide recording actions" : "Show recording actions"}
