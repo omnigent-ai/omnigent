@@ -50,6 +50,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
+from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.launch_failure import (
     classify_native_turn_error,
@@ -2864,7 +2865,9 @@ def register_events_routes(
                     _agent.id,
                     _agent.bundle_location,
                 )
-                _has_mcp_servers = bool(_loaded_agent.spec.mcp_servers)
+                _has_mcp_servers = bool(
+                    selected_mcp_spec(_loaded_agent.spec, conv.labels).mcp_servers
+                )
                 # A declared sub-agent session resolves skills from its own child spec.
                 _skill_spec = _loaded_agent.spec
                 if conv.sub_agent_name:
@@ -2942,7 +2945,9 @@ def register_events_routes(
             created_by=created_by,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
-            agent_revision=_agent.bundle_location if _agent else None,
+            agent_revision=mcp_selection_revision(_agent.bundle_location, conv.labels)
+            if _agent
+            else None,
             background_titles_enabled=background_session_titles_enabled(request.headers),
             # Read only for the gateway-backing check that decides which router
             # serves this turn; absent, routing keeps its default posture.

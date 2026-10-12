@@ -1219,7 +1219,7 @@ def create_runner_app(
         _rt_globals._terminal_registry = terminal_registry
 
     _version_cache: dict[str, int] = {}  # conversation_id → last seen agent_version
-    _spec_cache: dict[str, _SpecEntry] = {}  # agent_id → cached AgentSpec for terminal tools
+    _session_root_spec_cache: dict[str, _SpecEntry] = {}  # session_id → unresolved root spec
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
     app.state.live_response_id = _live_response_id
@@ -1231,7 +1231,7 @@ def create_runner_app(
     # every spec-derived read (native-vs-SDK checks above all) still answers
     # with the harness the spec declared, which a routed session is not on.
     _session_harness_overrides: dict[str, str] = {}
-    # session_id → revision of the agent bundle its caches were built from
+    # session_id → effective revision of the bundle and MCP selections
     _session_agent_revisions: dict[str, str] = {}
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
@@ -2603,12 +2603,8 @@ def create_runner_app(
             )
 
         _session_start_cache.setdefault(session_id, time.time())
-        # The same reset that retires the spec entry also retires this
-        # binding, and later resets read it to decide which agent's shared
-        # ``_spec_cache`` entry to drop; reinstating a superseded binding
-        # would misdirect them at the old agent. Same fence as the spec-cache
-        # write above — a fenced-out reader falls back to the fresh session
-        # snapshot instead.
+        # Keep the binding and cached spec in the same generation; an older
+        # initialization must not restore the superseded agent after a reset.
         if _session_cache_generation_is_current(session_id, spec_cache_generation):
             _session_agent_ids[session_id] = agent_id
         else:
@@ -3386,6 +3382,7 @@ def create_runner_app(
         _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
 
         _session_spec_cache.pop(session_id, None)
+        _session_root_spec_cache.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_cursor_model_names.pop(session_id, None)
@@ -5257,6 +5254,10 @@ def create_runner_app(
                 explicit_bridge_dir=hermes_bridge_dir_for_session(conv),
                 await_notify=False,
             )
+        elif binding := _session_comment_relays.get(conv):
+            await _ensure_comment_relay_started(
+                conv, explicit_bridge_dir=binding.bridge_dir, await_notify=False
+            )
 
         try:
             response = await _stream_message_to_harness(
@@ -5494,13 +5495,12 @@ def create_runner_app(
         _mcp_tool_names: set[str] = set()
         _eager_spec_error: tuple[str, str] | None = None
         if _has_mcp_hint is True and _turn_agent_id:
-            _turn_spec_entry = _spec_cache.get(_turn_agent_id)
+            _turn_spec_entry = _session_spec_cache.get(conv_id) or _session_root_spec_cache.get(
+                conv_id
+            )
             _turn_spec = _unwrap_resolved_spec(_turn_spec_entry)
-            if _turn_spec is None:
-                _session_entry = _session_spec_cache.get(conv_id)
-                _turn_spec_entry = _session_entry
-                _turn_spec = _unwrap_resolved_spec(_session_entry)
             if _turn_spec is None and spec_resolver is not None:
+                generation = _session_cache_generation(conv_id)
                 try:
                     _resolved_turn_spec = await spec_resolver(_turn_agent_id, conv_id)
                     _turn_spec = _unwrap_resolved_spec(_resolved_turn_spec)
@@ -5522,7 +5522,8 @@ def create_runner_app(
                     )
                 else:
                     if _resolved_turn_spec is not None and _turn_spec is not None:
-                        _spec_cache[_turn_agent_id] = _resolved_turn_spec
+                        if _session_cache_generation_is_current(conv_id, generation):
+                            _session_root_spec_cache[conv_id] = _resolved_turn_spec
                         _turn_spec_entry = _resolved_turn_spec
             _turn_spec_resolved = True
             _turn_mcp = ProxyMcpManager(
@@ -5559,11 +5560,12 @@ def create_runner_app(
                 return session_cached, None
             if not _turn_agent_id or spec_resolver is None:
                 return None, None
-            cached = _spec_cache.get(_turn_agent_id)
+            cached = _session_root_spec_cache.get(conv_id)
             if cached is not None:
                 _turn_spec_entry = cached
                 _turn_spec = _unwrap_resolved_spec(cached)
                 return cached, None
+            generation = _session_cache_generation(conv_id)
             try:
                 resolved = await spec_resolver(_turn_agent_id, conv_id)
             except (httpx.HTTPError, RuntimeError) as exc:
@@ -5583,7 +5585,8 @@ def create_runner_app(
                     "Failed to resolve the agent spec for this turn.",
                 )
             if resolved is not None:
-                _spec_cache[_turn_agent_id] = resolved
+                if _session_cache_generation_is_current(conv_id, generation):
+                    _session_root_spec_cache[conv_id] = resolved
                 _turn_spec_entry = resolved
                 _turn_spec = _unwrap_resolved_spec(resolved)
                 return resolved, None
@@ -7316,8 +7319,9 @@ def create_runner_app(
             content=session_resource_view_to_dict(resource),
         )
 
-    def _clear_session_agent_caches(session_id: str, agent_id: str | None = None) -> None:
+    def _clear_session_agent_caches(session_id: str) -> None:
         _session_spec_cache.pop(session_id, None)
+        _session_root_spec_cache.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_agent_revisions.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
@@ -7331,10 +7335,8 @@ def create_runner_app(
         _session_mcp_spec_hash.pop(session_id, None)
         _instruction_delivery_warned.pop(session_id, None)
         _session_sub_agent_resolved.pop(session_id, None)
-        if agent_id:
-            _spec_cache.pop(agent_id, None)
 
-    async def _invalidate_session_agent_state(session_id: str, new_agent_id: str | None) -> None:
+    async def _invalidate_session_agent_state(session_id: str) -> None:
         """Clear all agent-derived caches and release the harness subprocess.
 
         Both dispatch paths (background ``_run_turn_bg_setup_and_stream`` and
@@ -7342,14 +7344,14 @@ def create_runner_app(
         on an in-conversation agent switch, so the eviction scope cannot
         diverge between the two paths.
         """
-        _clear_session_agent_caches(session_id, new_agent_id)
+        _clear_session_agent_caches(session_id)
         if process_manager is not None:
             await process_manager.release(session_id)
 
     async def _sync_session_agent(
         session_id: str, agent_id: str | None, revision: str | None
     ) -> None:
-        """Reset agent-derived state when a turn's agent or its bundle revision changed.
+        """Reset agent-derived state when a turn's agent or its effective revision changed.
 
         The server stamps ``agent_revision`` on each turn, so a reinstall or an
         edit made through any server replica reaches this session's next turn. A
@@ -7365,16 +7367,14 @@ def create_runner_app(
                 agent_id,
                 extra={"session_id": session_id},
             )
-            await _invalidate_session_agent_state(session_id, agent_id)
-        # ponytail: distrusting a spec cached without a revision can drop a fresh shared
-        # per-agent spec (one extra resolve); track per-agent revisions if that shows up.
+            await _invalidate_session_agent_state(session_id)
         elif (
             revision
             and revision != prior_revision
             and (
                 prior_revision is not None
                 or session_id in _session_spec_cache
-                or (agent_id is not None and agent_id in _spec_cache)
+                or session_id in _session_root_spec_cache
             )
         ):
             _logger.info(
@@ -7386,7 +7386,7 @@ def create_runner_app(
             # Same agent, new bundle: rebuild the spec like an MCP edit does,
             # keeping the harness process and the harness the server pinned.
             override = _session_harness_overrides.get(session_id)
-            _clear_session_agent_caches(session_id, agent_id)
+            _clear_session_agent_caches(session_id)
             if override is not None:
                 _session_harness_overrides[session_id] = override
         if agent_id:
@@ -7444,7 +7444,7 @@ def create_runner_app(
         if process_manager is not None:
             await process_manager.release(session_id)
         await resource_registry.cleanup_session(session_id)
-        _clear_session_agent_caches(session_id, _session_agent_ids.get(session_id))
+        _clear_session_agent_caches(session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -7469,7 +7469,7 @@ def create_runner_app(
                 if snapshot.ok and snapshot.agent_id:
                     agent_id = snapshot.agent_id
 
-        _clear_session_agent_caches(session_id, agent_id)
+        _clear_session_agent_caches(session_id)
         return JSONResponse(
             status_code=200,
             content={

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from builtins import ExceptionGroup
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -53,6 +55,26 @@ class TestIdentity(AuthProvider):
         return request.headers.get("x-test-user")
 
 
+@pytest.fixture
+def oauth_app(db_uri, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_MCP_OAUTH_STATE_SECRET", "test-signing-key-32-characters-long")
+    entry = service(
+        auth="oauth",
+        oauth={
+            "authorize_url": "https://auth.example.test/authorize",
+            "token_url": "https://auth.example.test/token",
+            "client_id": "demo",
+        },
+    )
+    store = CredentialStore(db_uri, _FakeCipher())
+    registry = McpRegistry(McpRegistryConfig(public_url="https://test", services=[entry]), store)
+    app = FastAPI()
+    app.state.mcp_registry = registry
+    app.state.mcp_registry_auth = TestIdentity()
+    app.include_router(create_mcp_registry_router(registry, TestIdentity()), prefix="/v1")
+    return app
+
+
 @pytest.mark.asyncio
 async def test_account_connection_is_reusable_and_private(registry):
     app = FastAPI()
@@ -94,7 +116,12 @@ async def test_tool_and_service_rules_are_checked_before_credential_resolution(
 
 
 @pytest.mark.asyncio
-async def test_refresh_is_reused_and_does_not_restore_disconnected_account(registry, monkeypatch):
+@pytest.mark.parametrize(
+    "refresh_response", [{}, {"refresh_token": None}, {"refresh_token": "rotated"}]
+)
+async def test_refresh_is_reused_and_does_not_restore_disconnected_account(
+    registry, monkeypatch, refresh_response
+):
     entry = service(
         auth="oauth",
         oauth={
@@ -110,20 +137,27 @@ async def test_refresh_is_reused_and_does_not_restore_disconnected_account(regis
         metadata={"expires_at": 0},
     )
     refresh = AsyncMock(
-        return_value={"access_token": "fresh", "refresh_token": "rotated", "expires_in": 3600}
+        side_effect=[
+            {"access_token": "fresh-1", "expires_in": 3600, **refresh_response},
+            {"access_token": "fresh-2", "expires_in": 3600},
+        ]
     )
     monkeypatch.setattr(registry, "exchange", refresh)
-    tokens = await asyncio.gather(
-        *(registry.token(entry, "alice", SimpleNamespace()) for _ in range(5))
-    )
-    assert tokens == ["fresh"] * 5
-    refresh.assert_awaited_once()
-    registry.store.upsert(
-        "alice",
-        "mcp:tracker",
-        secret={"access_token": "expired", "refresh_token": "rotated"},
-        metadata={"expires_at": 0},
-    )
+    expected_refresh = refresh_response.get("refresh_token") or "refresh"
+    for cycle in (1, 2):
+        tokens = await asyncio.gather(
+            *(registry.token(entry, "alice", SimpleNamespace()) for _ in range(5))
+        )
+        assert tokens == [f"fresh-{cycle}"] * 5
+        assert refresh.await_count == cycle
+        assert refresh.await_args.args[1]["refresh_token"] == (
+            "refresh" if cycle == 1 else expected_refresh
+        )
+        saved = registry.store.get("alice", "mcp:tracker", with_secret=True)
+        assert saved.secret["refresh_token"] == expected_refresh
+        registry.store.update_secret(
+            "alice", "mcp:tracker", secret=saved.secret, metadata={"expires_at": 0}
+        )
 
     async def disconnect_during_refresh(*args):
         registry.store.delete("alice", "mcp:tracker")
@@ -363,7 +397,30 @@ async def test_kms_rejects_oversized_serialized_bearer_before_encrypt(db_uri, to
 
 
 @pytest.mark.asyncio
-async def test_kms_oauth_size_error_is_a_connection_error(db_uri, monkeypatch):
+async def test_bearer_rejects_oversized_ciphertext_after_expansion(registry, monkeypatch):
+    monkeypatch.setattr(registry.store._engine.dialect, "name", "mysql")
+    token = "é" * 9000
+    assert len(json.dumps({"access_token": token}).encode("utf-8")) < 65_535
+    app = FastAPI()
+    app.include_router(create_mcp_registry_router(registry, TestIdentity()), prefix="/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.put(
+            "/v1/mcp-registry/services/tracker/connection",
+            headers={"x-test-user": "alice"},
+            json={"token": token},
+        )
+    assert response.status_code == 400, response.text
+    assert "65535 bytes" in response.json()["detail"]
+    assert "smaller credential" in response.json()["detail"]
+    assert token not in response.text
+    assert registry.store.get("alice", "mcp:tracker") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["kms", "expanding"])
+async def test_oauth_size_error_is_a_connection_error(db_uri, monkeypatch, backend):
     from unittest.mock import Mock
 
     from omnigent.server.mcp_registry import McpOAuthHooks
@@ -372,7 +429,8 @@ async def test_kms_oauth_size_error_is_a_connection_error(db_uri, monkeypatch):
     kms = Mock()
     kms.encrypt.return_value = {"CiphertextBlob": b"test-cipher"}
     kms.decrypt.return_value = {"Plaintext": b'{"nonce": "nonce", "verifier": "verifier"}'}
-    store = CredentialStore(db_uri, KmsSecretCipher("test-key", client=kms))
+    cipher = KmsSecretCipher("test-key", client=kms) if backend == "kms" else _FakeCipher()
+    store = CredentialStore(db_uri, cipher)
     store.upsert(
         "alice",
         "mcp-pending:tracker",
@@ -380,6 +438,7 @@ async def test_kms_oauth_size_error_is_a_connection_error(db_uri, monkeypatch):
         metadata={},
     )
     kms.encrypt.reset_mock()
+    monkeypatch.setattr(store._engine.dialect, "name", "mysql")
     entry = service(
         auth="oauth",
         oauth={
@@ -395,14 +454,88 @@ async def test_kms_oauth_size_error_is_a_connection_error(db_uri, monkeypatch):
     monkeypatch.setattr(
         registry,
         "exchange",
-        AsyncMock(return_value={"access_token": "short", "refresh_token": "x" * 4096}),
+        AsyncMock(
+            return_value={
+                "access_token": "short",
+                "refresh_token": "x" * 4096 if backend == "kms" else "é" * 9000,
+            }
+        ),
     )
-    with pytest.raises(ConnectionError, match="4096 serialized bytes"):
+    with pytest.raises(
+        ConnectionError, match="4096 serialized bytes" if backend == "kms" else "65535 bytes"
+    ):
         await McpOAuthHooks(registry, entry).complete(
             "alice", "code", {"nonce": "nonce", "service": "tracker"}
         )
     kms.encrypt.assert_not_called()
     assert store.get("alice", "mcp:tracker") is None
+
+
+@pytest.mark.asyncio
+async def test_oversized_refresh_preserves_current_grant(oauth_app, monkeypatch):
+    registry = oauth_app.state.mcp_registry
+    registry.store.upsert(
+        "alice",
+        "mcp:tracker",
+        secret={"access_token": "old", "refresh_token": "refresh"},
+        metadata={"expires_at": 0},
+    )
+    before = registry.store.get("alice", "mcp:tracker", with_secret=True)
+    monkeypatch.setattr(registry.store._engine.dialect, "name", "mysql")
+    monkeypatch.setattr(
+        registry,
+        "exchange",
+        AsyncMock(return_value={"access_token": "short", "refresh_token": "é" * 9000}),
+    )
+    with pytest.raises(ConnectionError, match="65535 bytes"):
+        await registry.token(registry.services["tracker"], "alice", oauth_app.state)
+    assert registry.store.get("alice", "mcp:tracker", with_secret=True) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["bearer", "start", "callback", "refresh"])
+async def test_backend_value_errors_do_not_expose_details(oauth_app, monkeypatch, caplog, phase):
+    registry = oauth_app.state.mcp_registry
+    if phase == "bearer":
+        registry.services["tracker"] = service()
+    if phase == "refresh":
+        registry.store.upsert(
+            "alice",
+            "mcp:tracker",
+            secret={"access_token": "expired", "refresh_token": "refresh"},
+            metadata={"expires_at": 0},
+        )
+    monkeypatch.setattr(
+        registry, "exchange", AsyncMock(return_value={"access_token": "synthetic-token"})
+    )
+    marker = "synthetic-private-backend-detail"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=oauth_app, raise_app_exceptions=False),
+        base_url="http://test",
+        headers={"x-test-user": "alice"},
+    ) as browser:
+        if phase == "callback":
+            start = await browser.get("/v1/connections/mcp-tracker/connect")
+            assert start.status_code == 302
+            state = parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
+        monkeypatch.setattr(
+            registry.store._cipher, "encrypt", Mock(side_effect=ValueError(marker))
+        )
+        if phase == "bearer":
+            response = await browser.put(
+                "/v1/mcp-registry/services/tracker/connection", json={"token": "synthetic-token"}
+            )
+        elif phase == "start":
+            response = await browser.get("/v1/connections/mcp-tracker/connect")
+        elif phase == "callback":
+            response = await browser.get(
+                "/v1/connections/mcp-tracker/callback",
+                params={"code": "synthetic-code", "state": state},
+            )
+        else:
+            response = await browser.post("/v1/mcp-registry/services/tracker/test")
+    assert response.status_code == (502 if phase == "refresh" else 500)
+    assert marker not in response.text + caplog.text
 
 
 def test_kms_size_boundary_counts_utf8_bytes():
@@ -422,30 +555,108 @@ def test_kms_size_boundary_counts_utf8_bytes():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["disallowed", "ciphertext-size"])
+async def test_oauth_start_errors_redirect_without_pending_grant(oauth_app, monkeypatch, failure):
+    registry = oauth_app.state.mcp_registry
+    if failure == "disallowed":
+        registry.services["tracker"].allowed_users = ["bob"]
+    else:
+        monkeypatch.setattr(registry.store._engine.dialect, "name", "mysql")
+        monkeypatch.setattr(registry.store._cipher, "encrypt", Mock(return_value="x" * 65_536))
+    upsert = Mock(wraps=registry.store.upsert)
+    monkeypatch.setattr(registry.store, "upsert", upsert)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=oauth_app),
+        base_url="http://test",
+        headers={"x-test-user": "alice"},
+    ) as browser:
+        response = await browser.get("/v1/connections/mcp-tracker/connect?return_to=/settings/mcp")
+    assert response.status_code == 302
+    assert response.headers["location"] == "/settings/mcp?mcp-tracker=error"
+    assert upsert.call_count == (0 if failure == "disallowed" else 1)
+    assert registry.store.get("alice", "mcp-pending:tracker") is None
+
+
+@pytest.mark.asyncio
+async def test_oauth_connect_keeps_event_loop_responsive(oauth_app, monkeypatch):
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def blocked_upsert(*args, **kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), "OAuth begin blocked the event loop"
+
+    monkeypatch.setattr(oauth_app.state.mcp_registry.store, "upsert", blocked_upsert)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=oauth_app),
+        base_url="http://test",
+        headers={"x-test-user": "alice"},
+    ) as browser:
+        pending = asyncio.create_task(browser.get("/v1/connections/mcp-tracker/connect"))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            catalog = await asyncio.wait_for(browser.get("/v1/mcp-registry/services"), timeout=1)
+            assert catalog.status_code == 200
+            assert not pending.done()
+        finally:
+            release.set()
+            response = await asyncio.wait_for(pending, timeout=5)
+    assert response.status_code == 302
+    assert response.headers["location"].startswith("https://auth.example.test/authorize?")
+
+
+@pytest.mark.asyncio
+async def test_oauth_rejects_superseded_nonce_and_completed_callback(oauth_app, monkeypatch):
+    registry = oauth_app.state.mcp_registry
+    exchange = AsyncMock(return_value={"access_token": "synthetic-token", "expires_in": 3600})
+    monkeypatch.setattr(registry, "exchange", exchange)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=oauth_app),
+        base_url="http://test",
+        headers={"x-test-user": "alice"},
+    ) as browser:
+        states = []
+        for _ in range(2):
+            start = await browser.get(
+                "/v1/connections/mcp-tracker/connect?return_to=/settings/mcp"
+            )
+            assert start.status_code == 302
+            states.append(parse_qs(urlsplit(start.headers["location"]).query)["state"][0])
+        stale = await browser.get(
+            "/v1/connections/mcp-tracker/callback",
+            params={"code": "synthetic-code", "state": states[0]},
+        )
+        assert stale.status_code == 302
+        assert stale.headers["location"] == "/settings/mcp?mcp-tracker=error"
+        exchange.assert_not_awaited()
+        assert registry.store.get("alice", "mcp:tracker") is None
+        assert registry.store.get("alice", "mcp-pending:tracker") is not None
+
+        for status in ("connected", "error"):
+            callback = await browser.get(
+                "/v1/connections/mcp-tracker/callback",
+                params={"code": "synthetic-code", "state": states[1]},
+            )
+            assert callback.status_code == 302
+            assert callback.headers["location"] == f"/settings/mcp?mcp-tracker={status}"
+            exchange.assert_awaited_once()
+            assert registry.store.get("alice", "mcp-pending:tracker") is None
+            assert registry.store.get("alice", "mcp:tracker", with_secret=True).secret == {
+                "access_token": "synthetic-token",
+                "expires_in": 3600,
+            }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure", ["timeout", "non-json", "array", "expiry", "infinite", "token-type", "empty-token"]
 )
 async def test_oauth_callback_errors_redirect_without_provider_secrets(
-    db_uri, monkeypatch, caplog, failure
+    oauth_app, monkeypatch, caplog, failure
 ):
-    from urllib.parse import parse_qs, urlsplit
-
-    monkeypatch.setenv("OMNIGENT_MCP_OAUTH_STATE_SECRET", "test-signing-key-32-characters-long")
-    entry = service(
-        auth="oauth",
-        oauth={
-            "authorize_url": "https://auth.example.test/authorize",
-            "token_url": "https://auth.example.test/token",
-            "client_id": "demo",
-        },
-    )
-    store = CredentialStore(db_uri, _FakeCipher())
-    registry = McpRegistry(McpRegistryConfig(public_url="https://test", services=[entry]), store)
-    app = FastAPI()
-    app.state.mcp_registry_auth = TestIdentity()
-    app.include_router(create_mcp_registry_router(registry, TestIdentity()), prefix="/v1")
+    store = oauth_app.state.mcp_registry.store
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
+        transport=httpx.ASGITransport(app=oauth_app),
         base_url="http://test",
         headers={"x-test-user": "alice"},
     ) as browser:

@@ -3168,3 +3168,43 @@ def test_runner_global_cleanup_ownership_is_explicit(
         monkeypatch.setenv(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR, raw_value)
 
     assert _runner_host_owns_global_cleanup_from_env() is expected
+
+
+@pytest.mark.asyncio
+async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path):
+    import json
+
+    from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle("selected-agent")
+    labels = [{MCP_SELECTION_PREFIX + "tracker": "1"}, {MCP_SELECTION_PREFIX + "tracker": "0"}, {}]
+
+    def handler(request):
+        assert request.headers[MCP_SELECTION_HEADER] == "1"
+        return httpx.Response(
+            200,
+            content=bundle,
+            headers={
+                "X-Agent-Version": "1",
+                "X-Agent-Session-Scoped": "true",
+                MCP_SELECTION_HEADER: json.dumps(labels.pop(0)),
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        results = [
+            await _resolve_agent_spec_from_server(
+                client, tmp_path, "ag_selected", session_id="session"
+            )
+            for _ in range(3)
+        ]
+    assert [[s.name for s in result.spec.mcp_servers] for result in results] == [
+        ["tracker"],
+        [],
+        [],
+    ]
+    assert len({result.workdir for result in results}) == 1
+    assert "registry" not in (results[0].workdir / "config.yaml").read_text()

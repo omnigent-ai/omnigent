@@ -220,9 +220,6 @@ async def test_launch_selection_is_present_before_sandbox_launch(
     async def launch(*, session_id, agent_id, **kwargs):
         conv = get_conversation_store().get_conversation(session_id)
         assert conv.agent_id == agent_id
-        assert agent_id != source["agent_id"]
-        agent = get_agent_store().get(agent_id)
-        assert agent.session_id == session_id
         summary = await client.get(f"/v1/sessions/{session_id}/agent")
         servers = summary.json()["mcp_servers"]
         assert [(s["name"], s["transport"]) for s in servers] == [("tracker", "registry")]
@@ -375,7 +372,7 @@ async def test_gateway_reports_upstream_permission_failure(
     assert f"session={session_id} failure=http http_status=403" in caplog.text
 
 
-async def test_launch_selection_preserves_initial_metadata(client, launch_registry):
+async def test_launch_selection_preserves_initial_metadata(client, launch_registry, monkeypatch):
     source = await create_test_session(client, name="registry-metadata")
     metadata = {
         "agent_id": source["agent_id"],
@@ -387,6 +384,12 @@ async def test_launch_selection_preserves_initial_metadata(client, launch_regist
         "subagent_routing_override": "off",
         "harness_override": "openai-agents",
     }
+    from omnigent.runtime import get_conversation_store
+
+    store = get_conversation_store()
+    monkeypatch.setattr(
+        store, "update_conversation", Mock(side_effect=AssertionError("overrides must be atomic"))
+    )
     response = await client.post("/v1/sessions", json=metadata)
     assert response.status_code == 201, response.text
     session = response.json()
@@ -442,3 +445,134 @@ async def test_registry_child_preserves_interactive_launch_args(
             get_conversation_store().get_conversation(response.json()["id"]).terminal_launch_args
         )
     assert persisted == [launch_args, launch_args]
+
+
+async def test_selection_is_session_scoped_and_forks_follow_the_agent(client, launch_registry):
+    source = await create_test_session(client, name="selection-source")
+    sibling = await client.post("/v1/sessions", json={"agent_id": source["agent_id"]})
+    sid = source["id"]
+    url = f"/v1/sessions/{sid}/agent"
+    before = await client.get(f"{url}/contents")
+    assert (
+        await client.post(f"{url}/mcp-servers", json={"name": "tracker", "transport": "registry"})
+    ).status_code == 200
+    after = await client.get(f"{url}/contents")
+    assert after.content == before.content
+    assert "X-Omnigent-MCP-Selection" not in after.headers
+    selected = await client.get(f"{url}/contents", headers={"X-Omnigent-MCP-Selection": "1"})
+    assert selected.content == before.content
+    assert json.loads(selected.headers["X-Omnigent-MCP-Selection"]) == {
+        "omnigent.mcp_service.tracker": "1"
+    }
+    unchanged = await client.get(f"/v1/sessions/{sibling.json()['id']}/agent")
+    assert unchanged.json()["mcp_servers"] == []
+    for method, path, extra in [
+        (client.post, "/v1/sessions", {"agent_id": source["agent_id"]}),
+        (client.patch, f"/v1/sessions/{sid}", {}),
+    ]:
+        rejected = await method(
+            path, json={**extra, "labels": {"omnigent.mcp_service.other": "1"}}
+        )
+        assert rejected.status_code == 400, rejected.text
+    conflict = await client.post(
+        f"{url}/mcp-servers",
+        json={"name": "tracker", "transport": "http", "url": "https://custom.example/mcp"},
+    )
+    assert conflict.status_code == 409, conflict.text
+    target = await create_test_session(client, name="fork-target")
+    for fields, expected in [({}, ["tracker"]), ({"agent_id": target["agent_id"]}, [])]:
+        forked = await client.post(f"/v1/sessions/{sid}/fork", json=fields)
+        assert forked.status_code == 201, forked.text
+        summary = await client.get(f"/v1/sessions/{forked.json()['id']}/agent")
+        assert [s["name"] for s in summary.json()["mcp_servers"]] == expected
+    assert (await client.delete(f"{url}/mcp-servers/tracker")).status_code == 204
+    assert (await client.get(f"{url}/contents")).content == before.content
+
+
+async def test_named_children_cannot_select_root_only_services(client, launch_registry):
+    from tests.server.helpers import create_test_agent
+
+    source = await create_test_agent(client, sub_agents=[{"name": "child"}])
+    child = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": source["id"],
+            "parent_session_id": source["_session_id"],
+            "sub_agent_name": "child",
+        },
+    )
+    assert child.status_code == 201, child.text
+    url = f"/v1/sessions/{child.json()['id']}/agent"
+    assert (await client.get(url)).json()["mcp_registry_editable"] is False
+    response = await client.post(
+        f"{url}/mcp-servers", json={"name": "tracker", "transport": "registry"}
+    )
+    assert response.status_code == 400, response.text
+    assert "authored MCP" in response.text
+    assert (await client.get(f"{url}/mcp-servers")).json()["data"] == []
+
+
+async def test_selection_edits_reach_next_turn_when_immediate_reset_is_missed(
+    client, launch_registry, monkeypatch
+):
+    from omnigent.server.routes import session_mcp_servers, sessions
+
+    source = await create_test_session(client)
+    sid = source["id"]
+    forwarded = []
+
+    def handler(request):
+        if request.url.path.endswith("/events"):
+            forwarded.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", AsyncMock())
+        monkeypatch.setattr(session_mcp_servers, "_reset_runner_session_agent_cache", AsyncMock())
+        for state in ["plain", "selected", "removed"]:
+            url = f"/v1/sessions/{sid}/agent/mcp-servers"
+            if state == "selected":
+                assert (
+                    await client.post(url, json={"name": "tracker", "transport": "registry"})
+                ).status_code == 200
+            elif state == "removed":
+                assert (await client.delete(f"{url}/tracker")).status_code == 204
+            response = await client.post(
+                f"/v1/sessions/{sid}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+                },
+            )
+            assert response.is_success, response.text
+    assert len(forwarded) == 3
+    assert len({body["agent_revision"] for body in forwarded}) == 3
+    assert [body["has_mcp_servers"] for body in forwarded] == [False, True, False]
+
+
+async def test_source_name_conflict_can_be_resolved_by_removing_selection(client, launch_registry):
+    source = await create_test_session(client)
+    selected = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": source["agent_id"],
+            "mcp_registry_services": ["tracker"],
+        },
+    )
+    url = f"/v1/sessions/{selected.json()['id']}/agent/mcp-servers"
+    custom = await client.post(
+        f"/v1/sessions/{source['id']}/agent/mcp-servers",
+        json={
+            "name": "tracker",
+            "transport": "http",
+            "url": "https://example.test/custom",
+        },
+    )
+    assert custom.status_code == 200, custom.text
+    assert (await client.get(url)).status_code == 409
+    assert (await client.delete(f"{url}/tracker")).status_code == 204
+    servers = (await client.get(url)).json()["data"]
+    assert [(s["name"], s["transport"]) for s in servers] == [("tracker", "http")]

@@ -265,6 +265,8 @@ class AgentObject(BaseModel):
         through the session UI by the authenticated caller. This requires
         ownership of both the effective session and its session-scoped agent;
         built-in template and native agents are read-only.
+    :param mcp_registry_editable: Whether this caller owns the session and can
+        select managed MCP services independently of agent ownership.
     :param policies: Guardrails policies declared on the agent.
         Each entry summarises the policy name, type, and
         phases. Empty list when the spec declares no policies
@@ -306,6 +308,7 @@ class AgentObject(BaseModel):
     harness: str | None = None
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     mcp_servers_editable: bool = False
+    mcp_registry_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)

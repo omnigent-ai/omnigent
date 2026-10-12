@@ -1021,16 +1021,6 @@ def register_core_routes(
             )
 
         bundle_bytes = await bundle.read()
-        if parsed_metadata.mcp_registry_services:
-            from omnigent.server.routes.session_mcp_servers import prepare_registry_launch_bundle
-
-            bundle_bytes = await asyncio.to_thread(
-                prepare_registry_launch_bundle,
-                request,
-                bundle_bytes,
-                parsed_metadata.mcp_registry_services,
-                user_id,
-            )
         # Validate the bundle BEFORE any row exists: the external-host
         # branch below needs the spec's os_env.cwd for workspace
         # validation, and _create_session_from_bundle reuses the parsed
@@ -1040,6 +1030,19 @@ def register_core_routes(
             bundle_bytes,
             enforce_handler_allowlist=not local_single_user_enabled(),
         )
+
+        if parsed_metadata.mcp_registry_services:
+            from omnigent.mcp_selection import registry_selection_labels, selected_mcp_spec
+            from omnigent.server.routes.session_mcp_servers import _require_registry_service
+
+            for service_id in parsed_metadata.mcp_registry_services:
+                _require_registry_service(request, service_id, user_id)
+            labels = {
+                **parsed_metadata.labels,
+                **registry_selection_labels(spec, parsed_metadata.mcp_registry_services),
+            }
+            parsed_metadata = parsed_metadata.model_copy(update={"labels": labels})
+            spec = selected_mcp_spec(spec, labels)
 
         # Caller-supplied external host: validate the workspace against
         # the uploaded spec's os_env boundary BEFORE creating the row
@@ -3518,7 +3521,12 @@ def register_core_routes(
         # otherwise ride along as stale metadata that could hydrate a wrong mode
         # in generic native-wrapper UI state. Drop it whenever the agent changes.
         if switching_agent:
+            from omnigent.mcp_selection import MCP_SELECTION_PREFIX
+
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+            dropped_label_keys_set.update(
+                key for key in source.labels if key.startswith(MCP_SELECTION_PREFIX)
+            )
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always

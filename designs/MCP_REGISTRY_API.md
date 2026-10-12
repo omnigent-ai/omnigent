@@ -24,22 +24,30 @@ A managed runner normally authenticates as the session owner, so an editor's tur
 can use the owner's connected account subject to the editor's tool policies.
 Generic grants are keyed by workspace, credential user and service.
 
-Registry declarations in session bundles contain a service ID, never its upstream
-URL or credential. Direct HTTP/stdio declarations retain their existing behavior.
+Session selections contain a service ID, never its upstream URL or credential.
+The picker stores selections separately from the agent bundle. Direct HTTP/stdio declarations retain their existing behavior.
 An administrator approves destinations and tool allowlists. The catalog API
 does not allow users to register arbitrary destinations.
 
 ## Runtime compatibility
 
+Picker/API selections leave stored bundles readable by older servers. Those
+servers ignore the new session labels and do not provide registry execution.
+Hand-authored `transport: registry` bundles are a new format: deploy the [reader prerequisite](https://github.com/omnigent-ai/omnigent/pull/9803)
+on **all server replicas before** uploading, installing or registering
+such bundles. The reader prerequisite is separate from gateway execution support;
+this prototype must not be treated as a safe mixed-server rollout of that format.
+
 Registry references require `mcp_registry` in the host and runner hello
 `capabilities` lists. Omitted tokens mean unsupported, independent of the version
 string. The server returns HTTP 503 with `error.code: runner_capability_mismatch`
 and an upgrade/restart message for known incompatible runtimes. This gate applies
-only when the agent bundle (including nested agents) uses registry MCPs. It does
+only when session selections or the agent bundle (including nested agents) use
+registry MCPs. It does
 not change existing direct HTTP/stdio transport behavior.
 
 Creation checks known runtimes before persistence; live MCP edits and runner
-rebinding reject before changing their respective bundle or runner binding.
+rebinding reject before changing their respective selections or runner binding.
 Unbound authoring remains possible. Managed sandboxes are checked when their
 execution host connects, and runner initialization/dispatch checks the actual
 runner. Replica-local absence preserves existing offline/reroute behavior rather
@@ -126,13 +134,27 @@ JSON creation returns `201 SessionResponse`; multipart returns
 The list defaults to empty, has a maximum of 40 entries and adds to authored
 tools. Unknown/disallowed IDs fail with 403 before persistence. Invalid IDs fail
 validation (422 for JSON, 400 for multipart); custom-server name collisions return
-409. A selected shared agent gets a session-scoped copy. Selection does not grant
-OAuth access or change the agent template. Existing narrower tool restrictions
-remain in force. Operator-template environment fields are resolved at launch
-using the existing bundle resolver, including nested agents, before storing the
-session copy. The source template stays unchanged. Only `operator_authored` agents
-are trusted templates. Installed user agents and uploaded bundles remain literal
-and never expand against the server environment.
+409. Selections are stored atomically with the session and its launch overrides in
+existing session labels (`omnigent.mcp_service.<id>`); no agent copy or schema
+migration is required. `1` enables a service, `0` removes an authored default,
+and an absent key leaves authored configuration unchanged. Use the MCP APIs to
+change these reserved labels. Selection does not grant OAuth access. Existing
+narrower tool restrictions remain in force.
+
+Downloaded bundles retain their original literal placeholders. The server and
+runner apply selections to the loaded spec without mutating shared caches.
+Only the original `operator_authored` provenance permits environment expansion
+at load time; selections never make installed/user/uploaded agents trusted.
+Same-agent forks inherit selections; switching agents drops them.
+
+A capable runner requests `GET /v1/sessions/{session}/agent/contents` with
+`X-Omnigent-MCP-Selection: 1`. The response returns the ordinary bundle plus a
+JSON map of selection labels in the same header. The runner applies it after
+loading the bundle, including when the bundle version and cached directory are
+unchanged. Ordinary downloads receive the original bytes without this header.
+Resolved specs are cached per session. Dispatch revisions include a digest of
+selection labels, so the next turn recovers even if the immediate cache-reset
+request was lost. Without selections, revision strings keep their existing value.
 
 Existing sessions use the shared MCP declaration API:
 
@@ -140,23 +162,34 @@ Existing sessions use the shared MCP declaration API:
 | --- | --- |
 | `GET /v1/sessions/{session}/agent/mcp-servers` | `200 {"object": "list", "data": [...]}`; requires session read access. |
 | `POST /v1/sessions/{session}/agent/mcp-servers` | Attach `{"name": "tracker", "transport": "registry"}`; returns a summary. |
-| `PUT /v1/sessions/{session}/agent/mcp-servers/{name}` | Replace a declaration using the same request shape; returns a summary. |
+| `PUT /v1/sessions/{session}/agent/mcp-servers/{name}` | Update an existing selection using the same name; returns a summary. Remove then add to switch services. |
 | `DELETE /v1/sessions/{session}/agent/mcp-servers/{name}` | Remove selection; returns 204 with no body. The account stays connected. |
 
-Mutations require a session-scoped agent, session edit access and agent
-ownership/admin rights. Shared/built-in agents return 400 through these mutation
-endpoints. Registry attachments also check service access. Optional `description`
-is supported; nonempty URL/header/command/argument overrides are rejected for
-registry entries. Unknown fields (including `auth`) are ignored by the REST
-request model, so clients must not depend on rejection of unsupported fields.
-Per-session tool restrictions are authored in the agent bundle, not edited by
-this API. Existing running sessions need a runner reload to see changed tools.
+Registry mutations require session ownership (or admin access), independently
+of agent ownership; built-in agents can use managed selections. Named sub-agent
+sessions use their authored MCP configuration and cannot add root-level selections. Custom HTTP/stdio
+edits still require both session and agent ownership and a session-scoped agent.
+The session agent response exposes `mcp_registry_editable` separately from
+`mcp_servers_editable`. Registry additions also check service access. Removing a
+selection remains available after the registry is disabled.
+
+Connection overrides (URL/header/command/arguments) are rejected for registry
+entries. The registry owns descriptions; selection requests do not change them.
+Unknown fields (including `auth`) are ignored by the REST request model, so clients
+must not depend on rejection of unsupported fields. Tool restrictions are authored
+in the agent bundle, not edited by this API. The runner refreshes selections on
+the next server-dispatched turn; a native client may still need a restart to
+refresh its own cached tool list.
 
 KMS-backed connections must fit within 4096 bytes after JSON serialization and
 UTF-8 encoding, including both access and refresh tokens. Oversized credentials
-are rejected before encryption with an operator-facing message; use the existing
-Vault Transit backend for larger grants. OAuth connection failures return to the
-UI as sign-in errors, with the storage-limit diagnosis in the server log.
+are rejected before encryption; use the existing Vault Transit backend for larger
+grants. On MySQL/MariaDB, every cipher's final envelope must also fit the existing
+TEXT limit of 65,535 bytes, checked before writing. Other databases retain their
+existing capacity. Failed updates retain the previous grant.
+OAuth connection failures return to the UI as sign-in errors, with the storage-limit
+diagnosis in the server log. A refresh response that omits a refresh token or returns
+null keeps the existing refresh token.
 
 ## Gateway requests and policy context
 

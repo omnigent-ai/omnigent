@@ -68,6 +68,7 @@ from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
+from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
 from omnigent.native.input_diagnostics import (
@@ -5672,6 +5673,7 @@ def _build_native_terminal_message_event(
     body: SessionEventInput,
     model_override: str | None = None,
     input_delivery: Mapping[str, object] | None = None,
+    agent_revision: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the runner event that delivers a web message to a native TUI.
@@ -5686,6 +5688,7 @@ def _build_native_terminal_message_event(
         message under one lock (no separate racing ``model_change``
         event). ``None`` when routing did not pick a model.
     :param input_delivery: Queued input identifiers and original enqueue time.
+    :param agent_revision: Effective spec revision used to invalidate runner caches.
     :returns: Harness ``MessageEvent`` body for the runner-local
         native terminal harness, including ``agent_id`` so the runner
         can resolve the harness spec on the first message.
@@ -5713,6 +5716,8 @@ def _build_native_terminal_message_event(
         # which always includes it.
         "agent_id": conv.agent_id,
     }
+    if agent_revision is not None:
+        event["agent_revision"] = agent_revision
     # The web's stable id for this message rides along so the runner can name
     # it on a turn that fails before the harness receives it; the relay then
     # settles exactly that queued entry (see _settle_undelivered_native_input).
@@ -5743,6 +5748,7 @@ async def _forward_native_terminal_message(
     artifact_store: ArtifactStore | None = None,
     model_override: str | None = None,
     input_delivery: Mapping[str, object] | None = None,
+    agent_revision: str | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -5767,13 +5773,18 @@ async def _forward_native_terminal_message(
         inject under one lock (no separate racing ``model_change``).
         ``None`` when routing did not pick a model.
     :param input_delivery: Queued input identifiers and original enqueue time.
+    :param agent_revision: Effective spec revision used to invalidate runner caches.
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     event = _build_native_terminal_message_event(
-        conv, body, model_override=model_override, input_delivery=input_delivery
+        conv,
+        body,
+        model_override=model_override,
+        input_delivery=input_delivery,
+        agent_revision=agent_revision,
     )
     log_input_event(
         _logger,
@@ -6372,7 +6383,7 @@ async def _forward_event_to_runner(
     :param host_store: Host registrations, read only to learn whether this
         session's harness is AI-Gateway-backed (which router may route it).
         ``None`` reads as unknown, which counts as backed.
-    :param agent_revision: The agent's current ``bundle_location``; the
+    :param agent_revision: The agent's effective bundle and selection revision; the
         runner rebuilds the session's spec when it changes.
     :returns: The store-assigned id of the persisted item.
     """
@@ -7299,8 +7310,8 @@ async def _dispatch_session_event_to_runner_impl(
         session's harness is AI-Gateway-backed (which router may route it).
         ``None`` reads as unknown, which counts as backed — the same posture
         an older host row gets.
-    :param agent_revision: The agent's current ``bundle_location``, stamped on
-        non-native forwards (see :func:`_forward_event_to_runner`).
+    :param agent_revision: The agent's effective bundle and selection revision, stamped on
+        both native and non-native forwards to invalidate runner caches.
     :returns: A :class:`_SessionEventDispatchResult` carrying the
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
@@ -7574,6 +7585,7 @@ async def _dispatch_session_event_to_runner_impl(
                     _native_routed_model if _native_applied_model is not None else None
                 ),
                 input_delivery=input_delivery,
+                agent_revision=agent_revision,
             )
             forwarded = True
             if pending_id is not None:
@@ -9607,7 +9619,9 @@ async def _wake_parent_for_blocked_child(
             file_store=None,
             artifact_store=None,
             runner_router=runner_router,
-            agent_revision=parent_agent.bundle_location if parent_agent is not None else None,
+            agent_revision=mcp_selection_revision(parent_agent.bundle_location, parent_conv.labels)
+            if parent_agent is not None
+            else None,
         )
     except (httpx.HTTPError, OmnigentError):
         _logger.warning(
@@ -10820,28 +10834,23 @@ async def _create_session_from_existing_agent(
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
 
-    registry_bundle: bytes | None = None
+    registry_labels: dict[str, str] = {}
     if body.mcp_registry_services:
-        from omnigent.server.routes.session_mcp_servers import prepare_registry_launch_bundle
+        from omnigent.mcp_selection import registry_selection_labels
+        from omnigent.server.routes.session_mcp_servers import _require_registry_service
 
         if body.sub_agent_name:
             raise OmnigentError(
                 "Named sub-agents use their authored MCP services",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if artifact_store is None:
-            raise OmnigentError("Artifact store unavailable", code=ErrorCode.INTERNAL_ERROR)
-        source_bundle = await asyncio.to_thread(artifact_store.get, agent.bundle_location)
-        if source_bundle is None:
-            raise OmnigentError("Agent bundle not found", code=ErrorCode.INTERNAL_ERROR)
-        registry_bundle = await asyncio.to_thread(
-            prepare_registry_launch_bundle,
-            request,
-            source_bundle,
-            body.mcp_registry_services,
-            user_id,
-            trusted_template=agent.operator_authored,
-        )
+        if selection_spec is None:
+            raise OmnigentError(
+                "Cannot load the agent's MCP configuration", code=ErrorCode.INVALID_INPUT
+            )
+        for service_id in body.mcp_registry_services:
+            _require_registry_service(request, service_id, user_id)
+        registry_labels = registry_selection_labels(selection_spec, body.mcp_registry_services)
 
     # Validate the host workspace before creating a session or worktree.
     canonical_workspace: str | None = body.workspace
@@ -11015,6 +11024,7 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    initial_labels.update(registry_labels)
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (
             WORKTREE_ROOT_LABEL_KEY,
@@ -11065,7 +11075,6 @@ async def _create_session_from_existing_agent(
             agent_for_user, agent_store, artifact_store, agent, user_id
         )
 
-    session_persisted = False
     try:
         # Include spec-seeded defaults before create; overflow must not leave a session.
         encode_session_overrides(
@@ -11078,91 +11087,29 @@ async def _create_session_from_existing_agent(
             }
         )
         with creation_stage("create_persistence_ms"):
-            if registry_bundle is not None:
-                assert artifact_store is not None
-                # Reuse session+agent persistence, including hosted store overrides.
-                created = await asyncio.to_thread(
-                    _create_session_from_bundle,
-                    conversation_store,
-                    artifact_store,
-                    SessionCreateMetadata(
-                        title=body.title,
-                        labels=initial_labels,
-                        parent_session_id=body.parent_session_id,
-                        host_id=body.host_id,
-                        workspace=canonical_workspace,
-                        terminal_launch_args=validated_launch_args,
-                        project_id=project_resolution.project_id,
-                        reasoning_effort=reasoning_effort,
-                    ),
-                    registry_bundle,
-                    spec=validate_agent_bundle(
-                        registry_bundle,
-                        enforce_handler_allowlist=not (
-                            agent.operator_authored or local_single_user_enabled()
-                        ),
-                    ),
-                    derive_launch_args=False,
-                    runner_id=inherited_runner_id,
-                    inference_snapshot=inference_snapshot,
-                    inference_model=model_override,
-                    created_by=user_id,
-                )
-                session_persisted = True
-                conv = await asyncio.to_thread(
-                    conversation_store.get_conversation, created.session_id
-                )
-                agent = await asyncio.to_thread(agent_store.get, created.agent_id)
-                assert conv is not None and agent is not None
-                if any(
-                    value is not None
-                    for value in (
-                        cost_control_mode_override,
-                        subagent_routing_override,
-                        harness_override,
-                    )
-                ):
-                    conv = await asyncio.to_thread(
-                        conversation_store.update_conversation,
-                        conv.id,
-                        cost_control_mode_override=cost_control_mode_override,
-                        subagent_routing_override=subagent_routing_override,
-                        harness_override=harness_override,
-                    )
-                    assert conv is not None
-                if git_branch is not None:
-                    assert body.host_id is not None
-                    conv = await asyncio.to_thread(
-                        conversation_store.set_host_id,
-                        conv.id,
-                        body.host_id,
-                        git_branch=git_branch,
-                    )
-            else:
-                conv = conversation_store.create_conversation(
-                    agent_id=agent.id,
-                    title=body.title,
-                    parent_conversation_id=body.parent_session_id,
-                    runner_id=inherited_runner_id,
-                    kind="sub_agent" if body.parent_session_id else "default",
-                    sub_agent_name=body.sub_agent_name,
-                    host_id=body.host_id,
-                    workspace=canonical_workspace,
-                    git_branch=git_branch,
-                    terminal_launch_args=validated_launch_args,
-                    project_id=project_resolution.project_id,
-                    labels=initial_labels or None,
-                    model_override=model_override,
-                    reasoning_effort=reasoning_effort,
-                    cost_control_mode_override=cost_control_mode_override,
-                    subagent_routing_override=subagent_routing_override,
-                    harness_override=harness_override,
-                    **snapshot_kwargs,
-                )
+            conv = conversation_store.create_conversation(
+                agent_id=agent.id,
+                title=body.title,
+                parent_conversation_id=body.parent_session_id,
+                runner_id=inherited_runner_id,
+                kind="sub_agent" if body.parent_session_id else "default",
+                sub_agent_name=body.sub_agent_name,
+                host_id=body.host_id,
+                workspace=canonical_workspace,
+                git_branch=git_branch,
+                terminal_launch_args=validated_launch_args,
+                project_id=project_resolution.project_id,
+                labels=initial_labels or None,
+                model_override=model_override,
+                reasoning_effort=reasoning_effort,
+                cost_control_mode_override=cost_control_mode_override,
+                subagent_routing_override=subagent_routing_override,
+                harness_override=harness_override,
+                **snapshot_kwargs,
+            )
     except NameAlreadyExistsError as exc:
         if (
-            not session_persisted
-            and created_worktree_path is not None
+            created_worktree_path is not None
             and body.host_id is not None
             and git_branch is not None
         ):
@@ -11179,8 +11126,6 @@ async def _create_session_from_existing_agent(
             )
         raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
     except Exception:
-        # After persistence, the workspace belongs to the session even if a
-        # follow-up metadata write fails. Before that, roll back our worktree.
         # Broad catch is intentional: ANY create_conversation failure
         # (integrity error, name clash, ...) must trigger orphan-worktree
         # cleanup before the error propagates. We re-raise unchanged
@@ -11189,8 +11134,7 @@ async def _create_session_from_existing_agent(
         # force-removed. An existing worktree bound via workspace_branch
         # also sets git_branch but is the user's — never destroy it.
         if (
-            not session_persisted
-            and created_worktree_path is not None
+            created_worktree_path is not None
             and body.host_id is not None
             and git_branch is not None
         ):
@@ -11386,7 +11330,7 @@ async def _create_session_from_existing_agent(
                     runner_router=runner_router,
                     host_store=getattr(request.app.state, "host_store", None),
                     background_titles_enabled=background_session_titles_enabled(request.headers),
-                    agent_revision=agent.bundle_location,
+                    agent_revision=mcp_selection_revision(agent.bundle_location, conv.labels),
                 )
                 if pending_background_title is not None:
                     pending_background_title.schedule(expected_seed_title=conv.title)
@@ -11421,8 +11365,6 @@ def _create_session_from_bundle(
     inference_model: str | None = None,
     created_by: str | None = None,
     agent_store: AgentStore | None = None,
-    *,
-    derive_launch_args: bool = True,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -11443,8 +11385,6 @@ def _create_session_from_bundle(
         parent session (caller-resolved, ownership-checked),
         e.g. ``"runner_abc123"``. ``None`` leaves the session
         unbound.
-    :param derive_launch_args: False for an internal template copy whose caller
-        already validated the launch arguments, including interactive children.
     :param spec: Optional pre-validated spec for *bundle_bytes*. The
         multipart route validates the bundle once up front (it needs
         ``os_env.cwd`` for workspace validation before any row
@@ -11486,7 +11426,7 @@ def _create_session_from_bundle(
         )
         metadata = metadata.model_copy(update={"reasoning_effort": seeded_effort})
 
-    if derive_launch_args and metadata.parent_session_id is not None:
+    if metadata.parent_session_id is not None:
         try:
             terminal_launch_args = _derive_terminal_launch_args_from_spec(spec)
         except ValueError as exc:
@@ -11495,7 +11435,7 @@ def _create_session_from_bundle(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
         metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
-    elif derive_launch_args and metadata.terminal_launch_args is None:
+    elif metadata.terminal_launch_args is None:
         # Top-level bundle create (the ``omnigent run <dir>`` shape): honor the
         # spec's explicit bypass opt-ins (e.g. codex-native ``yolo: true``);
         # an interactive session never inherits the headless default bypass.

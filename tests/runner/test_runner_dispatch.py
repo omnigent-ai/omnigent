@@ -13180,3 +13180,116 @@ async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
     failed = [e for e in published if e.get("type") == "response.failed"]
     assert failed, "response.failed was not published"
     assert failed[0]["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_shared_agent_selections_are_isolated_and_revision_recovers_missed_reset(
+    monkeypatch, stream
+):
+    from omnigent.mcp_selection import mcp_selection_revision
+    from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+    from omnigent.spec.types import MCPServerConfig
+
+    services = {"first": "tracker", "second": "other"}
+    resolved = []
+    resolve_counts = []
+    schemas_seen = []
+
+    async def resolver(agent_id, session_id):
+        resolved.append(session_id)
+        return AgentSpec(
+            spec_version=1,
+            name="shared",
+            instructions=f"Selected {services[session_id]}.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+            mcp_servers=[MCPServerConfig(name=services[session_id], transport="registry")],
+        )
+
+    async def schemas(self, spec):
+        schemas_seen.append([s.name for s in spec.mcp_servers])
+        return SimpleNamespace(schemas=[], tool_names=set(), failures={})
+
+    class SnapshotClient(NullServerClient):
+        async def get(self, url, **kwargs):
+            if url.endswith(("/v1/sessions/first", "/v1/sessions/second")):
+                return httpx.Response(200, json={"agent_id": "ag_shared"})
+            return await super().get(url, **kwargs)
+
+    monkeypatch.setattr(ProxyMcpManager, "schemas_for", schemas)
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=resolver,
+        server_client=SnapshotClient(),
+    )
+    async with _runner_test_client(app) as http:
+        for sid, service in [
+            ("first", "tracker"),
+            ("second", "other"),
+            ("first", "tracker"),
+            ("first", "updated"),
+            ("second", "other"),
+        ]:
+            services[sid] = service
+            schemas_seen.clear()
+            revision = mcp_selection_revision(
+                "ag_shared/source", {f"omnigent.mcp_service.{service}": "1"}
+            )
+            response = await http.post(
+                f"/v1/sessions/{sid}/events?stream={str(stream).lower()}",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_shared",
+                    "harness": "hermes",
+                    "agent_revision": revision,
+                    "has_mcp_servers": True,
+                    "content": [],
+                },
+            )
+            assert response.status_code == (200 if stream else 202), response.text
+            if not stream:
+                await _await_bg_turn_task(sid)
+            assert f"Selected {service}." in recording.posted_bodies[-1]["instructions"]
+            assert schemas_seen and all(names == [service] for names in schemas_seen)
+            resolve_counts.append(len(resolved))
+    first, second, first_again, updated, second_again = resolve_counts
+    assert first > 0 and second > first
+    assert first_again == second and updated > first_again and second_again == updated
+
+
+@pytest.mark.asyncio
+async def test_eager_mcp_cache_keeps_named_child_scope_after_revision_change(monkeypatch):
+    from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+    from omnigent.spec.types import MCPServerConfig
+
+    async def resolver(agent_id, session_id):
+        spec = _contract_root_spec(with_child=True)
+        spec.mcp_servers = [MCPServerConfig(name="tracker", transport="registry")]
+        return spec
+
+    async def schemas(self, spec):
+        return SimpleNamespace(schemas=[], tool_names=set(), failures={})
+
+    monkeypatch.setattr(ProxyMcpManager, "schemas_for", schemas)
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    conv = "named_child_mcp"
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=resolver,
+        server_client=_ContractSnapshotClient(conv),
+    )
+    async with _runner_test_client(app) as http:
+        for revision in ["source:first", "source:updated"]:
+            response = await _post_stream_message(
+                http,
+                conv,
+                agent_id="ag_contract_root",
+                harness="hermes",
+                has_mcp_servers=True,
+                agent_revision=revision,
+            )
+            assert response.status_code == 200, response.text
+            assert "Worker instructions." in recording.posted_bodies[-1]["instructions"]
+            assert "Root instructions." not in recording.posted_bodies[-1]["instructions"]

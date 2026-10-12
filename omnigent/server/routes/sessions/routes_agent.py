@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Annotated, Any
 
 from fastapi import (
@@ -17,6 +18,7 @@ from fastapi.responses import Response
 
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
 from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
@@ -38,6 +40,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     can_mutate_session_agent as _can_mutate_session_agent,
 )
@@ -161,12 +164,27 @@ def register_agent_routes(
                 runner_router=runner_router or get_server_runner_router(),
             )
             terminals_override = normalized or None
-        return _to_agent_object(
+        result = _to_agent_object(
             agent,
             agent_cache,
             terminals_override=terminals_override,
             mcp_servers_editable=mcp_servers_editable,
+            mcp_selection=conv.labels,
         )
+        result.mcp_registry_editable = not conv.sub_agent_name and (
+            mcp_servers_editable
+            or permission_store is None
+            or await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                session_id,
+                LEVEL_OWNER,
+                permission_store,
+                conversation_store,
+                conversation=conv,
+            )
+        )
+        return result
 
     @router.get(
         "/sessions/{session_id}/agent/contents",
@@ -238,11 +256,21 @@ def register_agent_routes(
                 "Agent bundle not found in artifact store",
                 code=ErrorCode.INTERNAL_ERROR,
             )
+        selection_headers = {}
+        if request.headers.get(MCP_SELECTION_HEADER) == "1":
+            selection_headers[MCP_SELECTION_HEADER] = json.dumps(
+                {
+                    key: value
+                    for key, value in conv.labels.items()
+                    if key.startswith(MCP_SELECTION_PREFIX)
+                }
+            )
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",
             headers={
                 "Cache-Control": "no-store",
+                **selection_headers,
                 "X-Agent-Id": agent.id,
                 "X-Agent-Version": str(agent.version),
                 "X-Agent-Name": agent.name,
@@ -345,7 +373,7 @@ def register_agent_routes(
         )
 
         require_registry_mcp_runtime(
-            registry_services(spec),
+            registry_services(selected_mcp_spec(spec, conv.labels)),
             host_id=await asyncio.to_thread(routing_host_id, conv, conversation_store),
             runner_id=conv.runner_id,
             host_registry=getattr(request.app.state, "host_registry", None),
@@ -356,7 +384,13 @@ def register_agent_routes(
 
         # Idempotency: same bundle content = no-op
         if new_loc == agent.bundle_location:
-            return _to_agent_object(agent, agent_cache, mcp_servers_editable=True)
+            return _to_agent_object(
+                agent,
+                agent_cache,
+                mcp_servers_editable=True,
+                mcp_selection=conv.labels,
+                mcp_registry_editable=not conv.sub_agent_name,
+            )
 
         if artifact_store is None:
             raise OmnigentError(
@@ -378,7 +412,13 @@ def register_agent_routes(
                 agent.id, new_loc, bundle_bytes, expand_env=agent.operator_authored
             )
 
-        return _to_agent_object(updated, agent_cache, mcp_servers_editable=True)
+        return _to_agent_object(
+            updated,
+            agent_cache,
+            mcp_servers_editable=True,
+            mcp_selection=conv.labels,
+            mcp_registry_editable=not conv.sub_agent_name,
+        )
 
     # ── POST /sessions/{session_id}/mcp ──────────────────────────────────
     # MCP Streamable HTTP proxy endpoint. Only registered when a

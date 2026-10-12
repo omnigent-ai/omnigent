@@ -10,6 +10,11 @@ This describes the implemented prototype. Follow the
 The [API and integration contract](MCP_REGISTRY_API.md) describes the HTTP surface,
 existing Python hooks, and options for bringing an external registry or gateway.
 
+Picker selections keep the original stored bundle readable by older servers.
+Hand-authored registry declarations require the [reader prerequisite](https://github.com/omnigent-ai/omnigent/pull/9803)
+across all server replicas before those bundles are written. Until that happens,
+new-format uploads, installs and operator registrations are not mixed-server safe.
+
 Execution hosts and runners must also run the MCP registry build. Their existing
 hello frames advertise `mcp_registry`; the server rejects incompatible registry
 launches, edits, bindings and dispatch with upgrade/restart guidance. Updating the
@@ -103,18 +108,20 @@ sequenceDiagram
   end
   B->>S: POST /v1/sessions with mcp_registry_services
   S->>S: Authorize service IDs and preserve authored restrictions
-  S->>A: Save session-scoped agent bundle and session
+  S->>A: Atomically save session, selections and launch overrides
   S->>H: Launch with session identity and registry references
 ```
 
 Launch waits while OAuth is pending. Existing accounts are reused. Bearer-token
 services must be connected in Settings first. JSON and multipart creation accept
-the selected IDs; a shared agent template is not modified. Operator-template
-environment fields are resolved into the session copy at launch; installed user
-agents and uploads stay unexpanded. Catalog responses use cursor pages of at most
+the selected IDs. Selections live in session labels; agent bundles keep their
+original literal placeholders and provenance. Only operator templates expand at
+load time; installed user agents and uploads stay unexpanded. The server and runner
+apply selections without changing shared cached specs. Catalog responses use cursor pages of at most
 100 services, with credential lookups limited to the current page. Unchecking removes
-the session selection without disconnecting the account. Changes to an existing
-session require its runner to reload, as the UI indicates.
+the session selection without disconnecting the account. The runner refreshes
+selections on the next server-dispatched turn. Native clients may still need a
+restart to refresh their own cached tool lists.
 
 ## Discover and call a tool
 
@@ -441,7 +448,7 @@ Start with [registry and OAuth resolution](../omnigent/server/mcp_registry.py),
 
 The walkthrough lists runnable tests and manual checks. Verify discovery **and**
 an allowed call, OAuth reuse across execution hosts, expiry refresh, a denied call,
-and disconnect. Browser tests cover local-host and sandbox selection on desktop
-and mobile. Backend integration covers local-host selection and calls through
+and disconnect. Browser tests cover representative desktop/sandbox and
+mobile/local-host selection paths plus desktop/mobile MCP management. Backend integration covers local-host selection and calls through
 `ProxyMcpManager`. Real GitHub OAuth and a native Claude sandbox have also been
 exercised; that does not validate every provider or harness.

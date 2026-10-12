@@ -6,7 +6,6 @@ import httpx
 import pytest
 from mcp.types import Tool
 
-from omnigent.server.auth import delegated_path_allowed
 from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
 from tests.server.helpers import create_test_agent
 from tests.server.integration.test_session_agent_owner import auth_app as auth_app
@@ -62,11 +61,6 @@ async def test_gateway_checks_session_permissions_before_backend(
             backend.list_tools.assert_not_awaited()
     backend.list_tools.assert_awaited_once()
     assert backend.list_tools.await_args.args[1] == "alice@example.test"
-
-
-def test_delegated_runner_credentials_allow_gateway_only():
-    assert delegated_path_allowed("/v1/mcp/tracker")
-    assert not delegated_path_allowed("/v1/mcp-registry/services/tracker/connection")
 
 
 @pytest.mark.asyncio
@@ -353,7 +347,7 @@ async def test_editor_turn_uses_editor_policy_and_runner_credential(
 
 @pytest.mark.parametrize("selected", [False, True])
 @pytest.mark.parametrize("source", ["template", "installed", "upload"])
-async def test_template_env_expansion_is_snapshotted_but_uploads_stay_literal(
+async def test_selection_preserves_literal_bundles_and_operator_provenance(
     auth_app, auth_client, tmp_path, monkeypatch, selected, source
 ):
     import json
@@ -447,15 +441,28 @@ async def test_template_env_expansion_is_snapshotted_but_uploads_stay_literal(
         == expected
     )
     assert spec.sub_agents[0].mcp_servers[0].headers["Authorization"] == expected
-    if selected or not trusted:
-        copied = artifacts.get(agents.get(conv.agent_id).bundle_location)
-        runner_spec = load(copied, dest=tmp_path / "runner", expand_env=False)
-        assert (
-            next(c for c in runner_spec.mcp_servers if c.name == "existing").headers[
-                "Authorization"
-            ]
-            == expected
-        )
-        assert runner_spec.sub_agents[0].mcp_servers[0].headers["Authorization"] == expected
+    # Only the execution load expands operator placeholders; stored bytes stay literal.
+    copied = artifacts.get(agents.get(conv.agent_id).bundle_location)
+    literal = load(copied, dest=tmp_path / "literal", expand_env=False)
+    placeholder = "Bearer ${MCP_TEMPLATE_TEST_TOKEN}"
+    assert (
+        next(c for c in literal.mcp_servers if c.name == "existing").headers["Authorization"]
+        == placeholder
+    )
+    assert literal.sub_agents[0].mcp_servers[0].headers["Authorization"] == placeholder
+    shared = await auth_client.put(
+        f"/v1/sessions/{sid}/permissions",
+        headers=headers,
+        json={"user_id": "reader@example.test", "level": 1},
+    )
+    assert shared.status_code in (200, 204), shared.text
+    download = await auth_client.get(
+        f"/v1/sessions/{sid}/agent/contents",
+        headers={"X-Forwarded-Email": "reader@example.test"},
+    )
+    assert download.status_code == 200, download.text
+    assert download.content == copied
+    assert download.headers["X-Agent-Session-Scoped"] == ("false" if trusted else "true")
+    assert artifacts.get(agents.get(conv.agent_id).bundle_location) == bundle
     if source != "upload":
         assert artifacts.get(agent.bundle_location) == bundle

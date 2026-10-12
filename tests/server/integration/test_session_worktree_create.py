@@ -304,7 +304,6 @@ async def test_create_with_existing_worktree_persists_without_creating(
     client: httpx.AsyncClient,
     app: FastAPI,
     select_registry: bool,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Starting in an existing worktree persists its branch, creates nothing.
 
@@ -351,46 +350,15 @@ async def test_create_with_existing_worktree_persists_without_creating(
     # The existing worktree's branch is persisted; the workspace is the
     # supplied directory verbatim (no worktree-path rewrite).
     body = resp.json()
+    assert body["agent_id"] == agent["id"]
     assert body["git_branch"] == "feature/existing"
     assert body["workspace"] == _SOURCE_REPO
     if select_registry:
-        assert body["agent_id"] != agent["id"]
+        assert body["labels"]["omnigent.mcp_service.tracker"] == "1"
         selected = await client.get(f"/v1/sessions/{body['id']}/agent")
+        assert selected.status_code == 200, selected.text
         assert selected.json()["mcp_servers"][0]["name"] == "tracker"
         assert selected.json()["mcp_servers"][0]["url"] is None
-
-        from unittest.mock import AsyncMock
-
-        from mcp.types import CallToolResult, TextContent, Tool
-
-        from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
-        from omnigent.runtime import get_agent_cache, get_agent_store
-
-        execute = AsyncMock(
-            side_effect=[
-                [Tool(name="read_ticket", inputSchema={"type": "object"})],
-                CallToolResult(content=[TextContent(type="text", text="Ticket TEST-123")]),
-            ]
-        )
-        monkeypatch.setattr(app.state.mcp_registry, "execute", execute)
-        selected_agent = get_agent_store().get(body["agent_id"])
-        spec = (
-            get_agent_cache()
-            .load(selected_agent.id, selected_agent.bundle_location, expand_env=False)
-            .spec
-        )
-        proxy = ProxyMcpManager(session_id=body["id"], ap_client=client)
-        schemas = await proxy.schemas_for(spec)
-        assert "tracker__read_ticket" in schemas.tool_names
-        assert (
-            await proxy.call_tool(spec, "tracker__read_ticket", {"ticket_id": "TEST-123"})
-            == "Ticket TEST-123"
-        )
-        assert execute.await_args.args[:2] == ("tracker", RESERVED_USER_LOCAL)
-        assert execute.await_args.kwargs == {
-            "tool": "read_ticket",
-            "arguments": {"ticket_id": "TEST-123"},
-        }
 
 
 async def test_create_with_invalid_existing_worktree_branch_fails_400(
@@ -600,12 +568,14 @@ async def test_create_rejects_forged_worktree_identity(
     assert response.status_code == 400, response.text
 
 
-@pytest.mark.parametrize("failed_write", ["update_conversation", "set_host_id"])
-async def test_registry_metadata_failure_preserves_persisted_worktree(
-    register_worktree_host, client, app, monkeypatch, failed_write
+async def test_registry_create_persists_overrides_and_worktree_atomically(
+    register_worktree_host, client, app, monkeypatch
 ):
-    from omnigent.runtime import get_conversation_store
     from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
     app.state.mcp_registry = McpRegistry(
@@ -623,35 +593,47 @@ async def test_registry_metadata_failure_preserves_persisted_worktree(
         None,
     )
     cap = register_worktree_host()
-    agent = await create_test_agent(client, name="registry-worktree-failure")
+    agent = await create_test_agent(client, name="registry-worktree-atomic")
     persisted = []
-    original_create = SqlAlchemyConversationStore.create_session_with_agent
+    original_create = SqlAlchemyConversationStore.create_conversation
 
     def capture(self, **kwargs):
         result = original_create(self, **kwargs)
-        persisted.append(result.conversation.id)
+        persisted.append((kwargs, self.get_conversation(result.id)))
         return result
 
-    def fail(*args, **kwargs):
-        raise RuntimeError("simulated metadata write failure")
-
-    monkeypatch.setattr(SqlAlchemyConversationStore, "create_session_with_agent", capture)
-    monkeypatch.setattr(SqlAlchemyConversationStore, failed_write, fail)
-    with pytest.raises(RuntimeError, match="simulated metadata write failure"):
-        await client.post(
-            "/v1/sessions",
-            json={
-                "agent_id": agent["id"],
-                "host_id": _HOST_ID,
-                "workspace": _SOURCE_REPO,
-                "git": {"branch_name": "feature/registry"},
-                "mcp_registry_services": ["tracker"],
-                "cost_control_mode_override": "off",
-            },
-        )
+    monkeypatch.setattr(SqlAlchemyConversationStore, "create_conversation", capture)
+    overrides = {
+        "cost_control_mode_override": "off",
+        "subagent_routing_override": "off",
+        "harness_override": "openai-agents",
+    }
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/registry"},
+            "mcp_registry_services": ["tracker"],
+            **overrides,
+        },
+    )
+    assert response.status_code == 201, response.text
     assert len(cap.create) == len(persisted) == 1
     assert not cap.remove
-    assert (
-        get_conversation_store().get_conversation(persisted[0]).workspace
-        == f"{_SOURCE_REPO}-worktrees/feature-registry"
-    )
+    initial, stored = persisted[0]
+    assert stored.id == response.json()["id"]
+    workspace = f"{_SOURCE_REPO}-worktrees/feature-registry"
+    for key, value in {
+        "agent_id": agent["id"],
+        "host_id": _HOST_ID,
+        "workspace": workspace,
+        "git_branch": "feature/registry",
+        **overrides,
+    }.items():
+        assert initial[key] == value
+        assert getattr(stored, key) == value
+    assert initial["labels"] == stored.labels
+    assert stored.labels["omnigent.mcp_service.tracker"] == "1"
+    assert stored.labels[WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(workspace)

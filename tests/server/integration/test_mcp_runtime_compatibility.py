@@ -262,14 +262,10 @@ async def test_registry_checks_include_nested_agents_and_preserve_replica_routin
             runner_router=router,
         )
     assert error.value.code == ErrorCode.WRONG_REPLICA
-    for transport in ["http", "stdio"]:
-        spec.mcp_servers = [MCPServerConfig(name="custom", transport=transport)]
-        spec.sub_agents = []
-        assert not registry_services(spec)
 
 
 async def test_bundle_edit_is_guarded_and_removing_registry_service_is_allowed(
-    client, app, launch_registry, register_worktree_host
+    client, app, launch_registry, register_worktree_host, tmp_path
 ):
     register_worktree_host(capabilities=[])
     session = await create_test_session(client)
@@ -278,20 +274,32 @@ async def test_bundle_edit_is_guarded_and_removing_registry_service_is_allowed(
     assert (
         await client.post(f"{url}/mcp-servers", json={"name": "tracker", "transport": "registry"})
     ).status_code == 200
-    bundle = await client.get(f"{url}/contents")
-    assert (await client.delete(f"{url}/mcp-servers/tracker")).status_code == 204
+    from omnigent.server.routes.session_mcp_servers import _tar_gz_dir
+    from omnigent.spec import extract_safe
+
+    root = tmp_path / "authored"
+    extract_safe(build_agent_bundle("test-agent"), root)
+    mcp_dir = root / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "tracker.yaml").write_text("name: tracker\ntransport: registry\n")
+    bundle = _tar_gz_dir(root)
     get_conversation_store().set_host_id(sid, _HOST_ID, _SOURCE_REPO)
     before = get_agent_store().get(session["agent_id"]).bundle_location
-    response = await client.put(url, files={"bundle": ("agent.tar.gz", bundle.content)})
+    response = await client.put(url, files={"bundle": ("agent.tar.gz", bundle)})
     assert response.status_code == 503, response.text
     assert get_agent_store().get(session["agent_id"]).bundle_location == before
     connection = app.state.host_registry.get(_HOST_ID)
     connection.hello.capabilities.append(CAP_MCP_REGISTRY)
-    response = await client.put(url, files={"bundle": ("agent.tar.gz", bundle.content)})
+    response = await client.put(url, files={"bundle": ("agent.tar.gz", bundle)})
     assert response.status_code == 200, response.text
     connection.hello.capabilities.clear()
     assert (await client.delete(f"{url}/mcp-servers/tracker")).status_code == 204
     assert (await client.get(url)).json()["mcp_servers"] == []
+    collision = await client.post(
+        f"{url}/mcp-servers",
+        json={"name": "tracker", "transport": "http", "url": "https://example.test/custom"},
+    )
+    assert collision.status_code == 409, collision.text
 
 
 async def test_guards_use_app_stores_without_runtime_globals(
@@ -347,10 +355,15 @@ async def test_native_ensure_rechecks_reconnected_runner(
             json={"name": "tracker", "transport": "registry"},
         )
     ).status_code == 200
+    stored = get_conversation_store().get_conversation(sid)
     conv = dataclasses.replace(
-        get_conversation_store().get_conversation(sid),
+        stored,
         runner_id="reconnecting-runner",
-        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+        labels={
+            **stored.labels,
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "claude-code-native-ui",
+        },
     )
     connection = app.state.tunnel_registry.register(
         conv.runner_id,

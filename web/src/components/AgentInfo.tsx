@@ -89,14 +89,16 @@ export function agentDisplayLabel(name: string): string {
 export function McpServerList({
   servers,
   onDelete,
+  canDelete,
 }: {
   servers: McpServerSummary[];
   onDelete?: (name: string) => void;
+  canDelete?: (server: McpServerSummary) => boolean;
 }) {
   return (
     <div className="flex flex-wrap gap-1">
       {servers.map((srv) =>
-        onDelete ? (
+        onDelete && (canDelete?.(srv) ?? true) ? (
           <Popover key={srv.name}>
             <PopoverTrigger asChild>
               <button
@@ -740,6 +742,8 @@ function validateMcpForm(form: McpFormState): string | null {
 function McpServerManagerDialog({
   sessionId,
   servers,
+  customEditable,
+  registryEditable,
   open,
   onOpenChange,
   dirty,
@@ -747,6 +751,8 @@ function McpServerManagerDialog({
 }: {
   sessionId: string;
   servers: McpServerSummary[];
+  customEditable: boolean;
+  registryEditable: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   dirty: boolean;
@@ -755,7 +761,9 @@ function McpServerManagerDialog({
   const info = useServerInfo();
   const registryEnabled = info !== "loading" && info.enabled_connections?.includes("mcp");
   const [showCustom, setShowCustom] = useState(false);
-  const customServers = servers.filter((server) => server.transport !== "registry");
+  const listedServers = servers.filter(
+    (server) => !registryEnabled || server.transport !== "registry",
+  );
   const [form, setForm] = useState<McpFormState>(EMPTY_MCP_FORM);
   const [formError, setFormError] = useState<string | null>(null);
   const createServer = useCreateMcpServer(sessionId);
@@ -825,8 +833,8 @@ function McpServerManagerDialog({
         {registryEnabled && (
           <McpRegistryPicker
             attached={servers.filter((s) => s.transport === "registry").map((s) => s.name)}
-            reservedNames={customServers.map((s) => s.name)}
-            busy={saving || deleteServer.isPending}
+            reservedNames={listedServers.map((s) => s.name)}
+            busy={!registryEditable || saving || deleteServer.isPending}
             onToggle={(name, enabled) =>
               enabled
                 ? createServer.mutate({ name, transport: "registry" }, { onSuccess: notifyRestart })
@@ -845,7 +853,7 @@ function McpServerManagerDialog({
             Restart the session to apply your changes.
           </div>
         )}
-        {registryEnabled && (
+        {registryEnabled && customEditable && (
           <Button
             type="button"
             variant="ghost"
@@ -855,20 +863,23 @@ function McpServerManagerDialog({
             onClick={() => setShowCustom(!showCustom)}
           >
             {showCustom ? "Hide custom MCP servers" : "Advanced: custom MCP servers"}
-            {customServers.length > 0 && ` (${customServers.length})`}
+            {listedServers.length > 0 && ` (${listedServers.length})`}
           </Button>
         )}
         {(!registryEnabled || showCustom) && (
-          <div className="grid gap-4 pt-1 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+          <div
+            className={`grid gap-4 pt-1 ${customEditable ? "md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]" : ""}`}
+          >
             <div className="flex min-w-0 flex-col gap-1.5">
               <SectionLabel>Servers</SectionLabel>
-              {customServers.length > 0 ? (
+              {listedServers.length > 0 ? (
                 <div className="flex max-h-56 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
-                  {customServers.map((server) => (
+                  {listedServers.map((server) => (
                     <div key={server.name} className="flex min-w-0 items-center gap-1.5 px-2 py-2">
                       <ServerIcon className="size-3.5 shrink-0 text-muted-foreground" />
                       <button
                         type="button"
+                        disabled={!customEditable || server.transport === "registry"}
                         onClick={() => {
                           setForm(mcpFormFromServer(server));
                           setFormError(null);
@@ -877,7 +888,9 @@ function McpServerManagerDialog({
                       >
                         <span className="block truncate font-mono text-sm">{server.name}</span>
                         <span className="block truncate text-sm text-muted-foreground">
-                          {server.transport}
+                          {server.transport === "registry"
+                            ? "No longer available"
+                            : server.transport}
                         </span>
                       </button>
                       <Button
@@ -885,6 +898,7 @@ function McpServerManagerDialog({
                         variant="ghost"
                         size="icon-xs"
                         aria-label={`Edit ${server.name}`}
+                        disabled={!customEditable || server.transport === "registry"}
                         onClick={() => {
                           setForm(mcpFormFromServer(server));
                           setFormError(null);
@@ -900,7 +914,10 @@ function McpServerManagerDialog({
                         onClick={() =>
                           deleteServer.mutate(server.name, { onSuccess: notifyRestart })
                         }
-                        disabled={deleteServer.isPending}
+                        disabled={
+                          deleteServer.isPending ||
+                          !(server.transport === "registry" ? registryEditable : customEditable)
+                        }
                       >
                         <TrashIcon className="size-3 text-destructive" />
                       </Button>
@@ -910,7 +927,7 @@ function McpServerManagerDialog({
               ) : (
                 <p className="py-3 text-sm text-muted-foreground">No MCP servers</p>
               )}
-              {form.originalName && (
+              {customEditable && form.originalName && (
                 <Button type="button" variant="ghost" size="sm" onClick={resetForm}>
                   <PlusIcon className="size-3.5" />
                   New server
@@ -918,7 +935,10 @@ function McpServerManagerDialog({
               )}
             </div>
 
-            <div className="flex min-w-0 flex-col gap-2">
+            <fieldset
+              disabled={!customEditable}
+              className={customEditable ? "flex min-w-0 flex-col gap-2" : "hidden"}
+            >
               <SectionLabel>{form.originalName ? "Edit Server" : "New Server"}</SectionLabel>
               <label className="flex flex-col gap-1 text-sm text-muted-foreground">
                 Name
@@ -1069,7 +1089,7 @@ function McpServerManagerDialog({
                   Save
                 </Button>
               </div>
-            </div>
+            </fieldset>
           </div>
         )}
       </DialogContent>
@@ -1081,6 +1101,7 @@ function McpServersSection({
   sessionId,
   servers,
   editable,
+  registryEditable,
   onManagerOpenChange,
   dirty: controlledDirty,
   onDirtyChange,
@@ -1088,6 +1109,7 @@ function McpServersSection({
   sessionId?: string | null;
   servers: McpServerSummary[];
   editable: boolean;
+  registryEditable: boolean;
   onManagerOpenChange?: (open: boolean) => void;
   dirty?: boolean;
   onDirtyChange?: (dirty: boolean) => void;
@@ -1119,7 +1141,7 @@ function McpServersSection({
   useEffect(() => {
     if (!dirtyControlled) setLocalDirty(false);
   }, [dirtyControlled, sessionId]);
-  const canEdit = !!(sessionId && editable);
+  const canEdit = !!(sessionId && (editable || registryEditable));
   const deleteServer = useDeleteMcpServer(canEdit ? sessionId : "");
   const handleDeleteServer = useCallback(
     (name: string) =>
@@ -1157,7 +1179,11 @@ function McpServersSection({
         </p>
       )}
       {servers.length > 0 ? (
-        <McpServerList servers={servers} onDelete={canEdit ? handleDeleteServer : undefined} />
+        <McpServerList
+          servers={servers}
+          onDelete={canEdit ? handleDeleteServer : undefined}
+          canDelete={(server) => (server.transport === "registry" ? registryEditable : editable)}
+        />
       ) : (
         <p className="text-sm text-muted-foreground">No MCP servers</p>
       )}
@@ -1165,6 +1191,8 @@ function McpServersSection({
         <McpServerManagerDialog
           sessionId={sessionId!}
           servers={servers}
+          customEditable={editable}
+          registryEditable={registryEditable}
           open={managerOpen}
           onOpenChange={setManagerOpenWithCallback}
           dirty={mcpDirty}
@@ -1324,6 +1352,11 @@ export function AgentInfoContent({
   // Either may be absent — the footer renders whatever is known and hides
   // entirely when neither is.
   const serverInfo = useServerInfo();
+  const mcpRegistryEditable =
+    (agent?.mcp_registry_editable ?? agent?.mcp_servers_editable) === true &&
+    isOwnerLevel(permissionLevel) &&
+    ((serverInfo !== "loading" && serverInfo.enabled_connections?.includes("mcp")) ||
+      servers.some((server) => server.transport === "registry"));
   const serverVersion = serverInfo !== "loading" ? serverInfo.server_version : null;
   const hostVersion = useSessionHostVersion(sessionId ?? undefined);
   const versionFooter = [
@@ -1442,6 +1475,7 @@ export function AgentInfoContent({
         sessionId={sessionId}
         servers={servers}
         editable={mcpEditable}
+        registryEditable={mcpRegistryEditable}
         onManagerOpenChange={onSubdialogOpenChange}
         dirty={mcpDirty}
         onDirtyChange={onMcpDirtyChange}

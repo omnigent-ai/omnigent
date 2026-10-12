@@ -1220,6 +1220,103 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("initial_revision", [None, "bundle.zip"])
+@pytest.mark.parametrize("harness_name", ["claude-native", "kiro-native"])
+async def test_native_revision_refreshes_relay_before_turn_without_reset(
+    tmp_path: Path,
+    initial_revision: str | None,
+    harness_name: str,
+) -> None:
+    """Same-agent selection edits replace relay tools before native message delivery."""
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_id = f"bridge_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(bridge_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    tools_at_delivery: list[set[str]] = []
+
+    class GatewayClient(_SwitchableServerClient):
+        async def post(self, url: str, **kwargs: Any) -> _SwitchableServerClient._Response:
+            if kwargs.get("json", {}).get("method") == "tools/list":
+                return self._Response(
+                    {"result": {"tools": [{"name": "status", "inputSchema": {"type": "object"}}]}}
+                )
+            return self._Response({})
+
+    class RecordingHarness(_ScriptedHarnessClient):
+        def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+            tools_at_delivery.append(_relay_tool_names(relay_file))
+            return super().stream(method, url, json=json, timeout=timeout)
+
+    harness = RecordingHarness(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    manager = _FakeProcessManager(harness)
+    base_spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness_name}),
+    )
+    specs: dict[str, AgentSpec | ResolvedSpec] = {
+        "same-agent": ResolvedSpec(spec=base_spec, workdir=tmp_path)
+    }
+    app = _switch_app(
+        tmp_path, GatewayClient("same-agent", bridge_id), specs, process_manager=manager
+    )
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                # Seed the shared relay; native CLI startup is outside this test.
+                await _launch_bridged(client, session_id)
+                for revision, service in (
+                    (initial_revision, None),
+                    ("bundle.zip:mcp:alpha", "alpha"),
+                    (None, "alpha"),
+                    ("bundle.zip:mcp:beta", "beta"),
+                    ("bundle.zip", None),
+                ):
+                    specs["same-agent"] = ResolvedSpec(
+                        spec=AgentSpec(
+                            spec_version=1,
+                            executor=base_spec.executor,
+                            mcp_servers=[MCPServerConfig(name=service, transport="registry")]
+                            if service is not None
+                            else [],
+                        ),
+                        workdir=tmp_path,
+                    )
+                    message: dict[str, Any] = {
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "same-agent",
+                        "content": [{"type": "input_text", "text": "Check status"}],
+                    }
+                    if revision is not None:
+                        message["agent_revision"] = revision
+                    prior_deliveries = len(tools_at_delivery)
+                    response = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+                    assert response.status_code == 202, response.text
+                    turn = app.state.active_turns.get(session_id)
+                    if turn is not None:
+                        await asyncio.wait_for(turn, timeout=5.0)
+                    assert len(tools_at_delivery) == prior_deliveries + 1
+                    names = tools_at_delivery[-1]
+                    assert names & {"alpha__status", "beta__status"} == (
+                        {f"{service}__status"} if service is not None else set()
+                    )
+                    assert "list_comments" in names
+                    assert manager.get_client_calls[-1][1] == harness_name
+                assert manager.released == []
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
 async def test_agent_switch_replaces_relay_in_same_bridge_dir(
     tmp_path: Path,
     terminal_registry_singleton: None,

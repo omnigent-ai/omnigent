@@ -59,7 +59,13 @@ def require_session_registry_mcp_support(
     spec = agent_cache.load(
         agent.id, agent.bundle_location, expand_env=agent.operator_authored
     ).spec
-    require_registry_mcp_support(registry_services(spec), capabilities, component=component)
+    from omnigent.mcp_selection import selected_mcp_spec
+
+    require_registry_mcp_support(
+        registry_services(selected_mcp_spec(spec, conversation.labels)),
+        capabilities,
+        component=component,
+    )
 
 
 def require_registry_mcp_runtime(

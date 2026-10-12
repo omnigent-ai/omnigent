@@ -4800,8 +4800,10 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("agent_revision", [None, "bundle.zip:mcp:selection-v2"])
 async def test_kiro_native_dispatch_forwards_without_persisting(
     caplog: pytest.LogCaptureFixture,
+    agent_revision: str | None,
 ) -> None:
     """Kiro web-chat input is mirrored by Kiro's session forwarder."""
     from omnigent.runtime import pending_inputs
@@ -4830,6 +4832,7 @@ async def test_kiro_native_dispatch_forwards_without_persisting(
             store,  # type: ignore[arg-type]
             client,  # type: ignore[arg-type]
             agent_name="kiro-native-ui",
+            agent_revision=agent_revision,
             file_store=None,
             artifact_store=None,
             created_by="alice@example.com",
@@ -4848,6 +4851,10 @@ async def test_kiro_native_dispatch_forwards_without_persisting(
         assert store.appended_items == []
         forwarded = client.post_json_calls[1][1]
         assert forwarded["agent_id"] == "2c515637c67d0717ad0bebc2747b71bc"
+        if agent_revision is None:
+            assert "agent_revision" not in forwarded
+        else:
+            assert forwarded["agent_revision"] == agent_revision
         assert forwarded["model"] == "kiro-native-ui"
         assert forwarded["input_stable_id"] == "a" * 32
         assert forwarded["pending_id"] == result.pending_id
@@ -4860,6 +4867,7 @@ async def test_kiro_native_dispatch_forwards_without_persisting(
             store,
             client,  # type: ignore[arg-type]
             agent_name="kiro-native-ui",
+            agent_revision=agent_revision,
             file_store=None,
             artifact_store=None,
             created_by="alice@example.com",

@@ -74,6 +74,17 @@ it("closes the popup and cancels polling when the picker unmounts", async () => 
   expect(vi.getTimerCount()).toBe(0);
 });
 
+it("closes the popup and clears timers when authorization times out", async () => {
+  const result = authorizeRegistryService(service, new AbortController().signal);
+  const assertion = expect(result).rejects.toThrow("Sign-in timed out");
+  await vi.advanceTimersByTimeAsync(299_999);
+  expect(popup.close).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(1);
+  await assertion;
+  expect(popup.close).toHaveBeenCalledOnce();
+  expect(vi.getTimerCount()).toBe(0);
+});
+
 it("requires a Databricks workspace and includes it in the existing provider flow", async () => {
   const databricks = { ...service, auth: "databricks" as const, connect_provider: "databricks" };
   const controller = new AbortController();

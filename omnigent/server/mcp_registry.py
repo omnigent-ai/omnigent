@@ -230,7 +230,8 @@ class McpRegistry:
                 tokens = await self.exchange(
                     service, {"grant_type": "refresh_token", "refresh_token": refresh}
                 )
-                tokens.setdefault("refresh_token", refresh)
+                if tokens.get("refresh_token") is None:
+                    tokens["refresh_token"] = refresh
                 try:
                     updated = await asyncio.to_thread(
                         self.store.update_secret,
@@ -383,12 +384,15 @@ class McpOAuthHooks:
         verifier = secrets.token_urlsafe(48)
         nonce = secrets.token_urlsafe(32)
         assert self.registry.store is not None
-        self.registry.store.upsert(
-            user_id,
-            f"mcp-pending:{self.service.id}",
-            secret={"verifier": verifier, "nonce": nonce},
-            metadata={},
-        )
+        try:
+            self.registry.store.upsert(
+                user_id,
+                f"mcp-pending:{self.service.id}",
+                secret={"verifier": verifier, "nonce": nonce},
+                metadata={},
+            )
+        except SecretTooLargeError as exc:
+            raise ConnectionError(str(exc)) from None
         params = {
             "client_id": oauth.client_id,
             "response_type": "code",

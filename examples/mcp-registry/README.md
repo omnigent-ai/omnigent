@@ -57,6 +57,12 @@ local MCP subprocess. Existing direct HTTP and stdio entries retain their behavi
 
 ## Server and execution-host versions
 
+Picker selections preserve ordinary stored bundles. For hand-authored
+`transport: registry` bundles, roll out the [reader prerequisite](https://github.com/omnigent-ai/omnigent/pull/9803)
+to all server replicas before allowing uploads, installs or operator registrations. An old
+server without that reader cannot load the new format. Upgrading only the host
+and runner does not protect server readers.
+
 Install the MCP registry build on both the server and every execution host that
 will run selected registry services. For this prototype, use the same commit on
 both sides, including the Omnigent package baked into sandbox images. Restart the
@@ -93,10 +99,10 @@ capability.
 
 Both JSON `POST /v1/sessions` and multipart creation metadata accept the optional
 field `mcp_registry_services`, for example `["tracker"]`. These IDs **add to**
-the agent's authored tools. A JSON create with selections gets a session-scoped
-copy of the agent bundle; other sessions and the template are unchanged. Trusted
-template environment fields are resolved at launch, including nested agents;
-user uploads never expand against the server environment. Existing
+the agent's authored tools. Selections are stored in the session's existing labels
+alongside launch overrides; other sessions and the original bundle are unchanged.
+Downloads keep literal environment placeholders. Only operator templates expand
+at load time; installed user agents and uploads remain untrusted. Existing
 registry tool restrictions are preserved, custom-name collisions are rejected,
 and unknown or disallowed services fail before session persistence. Named
 sub-agent creates use their authored MCP configuration rather than this picker.
@@ -120,8 +126,8 @@ sequenceDiagram
   UI->>Server: GET registry catalog
   Server-->>UI: Allowed services + connection status (no tokens)
   UI->>Server: Create session + selected registry IDs
-  Server->>Server: Authorize IDs and prepare session bundle
-  Server->>Store: Persist session-scoped agent + session
+  Server->>Server: Authorize IDs and validate selections
+  Server->>Store: Atomically save session, selections and launch overrides
   Server->>Sandbox: Launch with session identity
   UI->>Server: First message
   Server->>Sandbox: Dispatch first turn
@@ -429,7 +435,7 @@ pnpm --dir web exec vitest run src/components/McpRegistry.test.tsx
 The HTTP/OAuth test uses a real local MCP provider and a test cipher. The browser
 regression test intercepts catalog/account APIs. The manual walkthrough additionally
 exercises real Vault encryption, UI OAuth redirects, the Docker host, and a harness.
-Browser launch tests cover local-host and sandbox selections on desktop and mobile;
+Browser launch tests cover desktop/sandbox and mobile/local-host selections;
 the local-host integration also discovers and calls tools through `ProxyMcpManager`.
 Gateway tests exercise both the default backend and an injected backend, including
 request denial, approval, argument transforms, result filtering, authenticated caller

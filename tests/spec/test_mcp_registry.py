@@ -72,3 +72,36 @@ async def test_runner_does_not_start_a_local_transport_for_catalog_services():
     result = await manager.schemas_for(spec)
     assert result.schemas == []
     assert result.failures == {}
+
+
+def test_registry_selection_is_isolated_and_preserves_authored_restrictions():
+    from omnigent.mcp_selection import registry_selection_labels, selected_mcp_spec
+    from omnigent.server.mcp_compatibility import registry_services
+    from omnigent.spec.types import AgentSpec, MCPServerConfig
+
+    source = registry_spec()
+    source.sub_agents = [
+        AgentSpec(
+            spec_version=1,
+            name="child",
+            mcp_servers=[MCPServerConfig(name="nested", transport="registry")],
+        )
+    ]
+    services = ["service" + str(i).zfill(33) for i in range(40)]
+    labels = registry_selection_labels(source, services)
+    assert all(len(k) <= 128 and len(v) <= 256 for k, v in labels.items())
+    selected = selected_mcp_spec(source, labels)
+    assert registry_services(selected) == {"tracker", "nested", *services}
+    assert selected.mcp_servers[0].tools == ["whoami"]
+    assert registry_services(source) == {"tracker", "nested"}
+    assert registry_services(selected_mcp_spec(source, dict.fromkeys(labels, "0"))) == {
+        "tracker",
+        "nested",
+    }
+    for transport in ["http", "stdio"]:
+        plain = AgentSpec(
+            spec_version=1,
+            name="custom",
+            mcp_servers=[MCPServerConfig(name="custom", transport=transport)],
+        )
+        assert not registry_services(plain)
