@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 import pytest
+from starlette.websockets import WebSocketDisconnect
 
 from omnigent.server import tunnel_handshake
 
@@ -29,6 +30,14 @@ class _Socket:
         self.closes.append(kwargs)
 
 
+class _DroppedSocket(_Socket):
+    """A peer that disconnects while the timeout close is being sent."""
+
+    async def close(self, **kwargs: object) -> None:
+        await super().close(**kwargs)
+        raise WebSocketDisconnect(code=1006)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["host", "runner"])
 async def test_timeout_cancels_owned_receive_and_closes(
@@ -52,6 +61,22 @@ async def test_timeout_cancels_owned_receive_and_closes(
     assert rows[0].attributes["timeout_s"] == 0.01
     elapsed_ms = rows[0].attributes["elapsed_ms"]
     assert isinstance(elapsed_ms, int) and elapsed_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_timeout_ignores_close_failure_after_peer_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tunnel_handshake, "HELLO_TIMEOUT_S", 0.01)
+    socket = _DroppedSocket()
+    result = await tunnel_handshake.receive_tunnel_hello(
+        socket,
+        peer_kind="runner",
+        peer_id="synthetic-peer",  # type: ignore[arg-type]
+    )
+    assert result is None
+    assert socket.receive_ended
+    assert socket.closes == [{"code": 1013, "reason": "hello timeout"}]
 
 
 @pytest.mark.asyncio
