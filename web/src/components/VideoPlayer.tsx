@@ -1,13 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
-import {
-  ChevronDownIcon,
-  ChevronUpIcon,
-  DownloadIcon,
-  PanelRightCloseIcon,
-  PanelRightOpenIcon,
-  PlayIcon,
-  VideoIcon,
-} from "lucide-react";
+import { DownloadIcon, PanelRightIcon, PlayIcon, VideoIcon } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import {
   DropdownMenu,
@@ -110,13 +103,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   }, [requested, conversationId, path]);
 
   const loading = requested && !src && !failed;
-  const ActionsIcon = wide
-    ? actionsOpen
-      ? PanelRightCloseIcon
-      : PanelRightOpenIcon
-    : actionsOpen
-      ? ChevronUpIcon
-      : ChevronDownIcon;
+
   return (
     <span
       ref={cardRef}
@@ -208,18 +195,19 @@ function VideoPlayerContent(props: VideoPlayerProps) {
             </button>
           )}
           {chapters.length > 0 && (
-            <button
+            <Button
               type="button"
+              variant="ghost"
+              size="icon-xs"
               aria-label={actionsOpen ? "Hide recording actions" : "Show recording actions"}
               aria-expanded={actionsOpen}
               aria-controls={actionsId}
               title={actionsOpen ? "Hide recording actions" : "Show recording actions"}
-              className="flex shrink-0 items-center gap-1 rounded p-1 hover:bg-accent"
+              className="border-none text-muted-foreground hover:text-foreground"
               onClick={() => setActionsOpen((open) => !open)}
             >
-              <ActionsIcon aria-hidden="true" className="size-4" />
-              {!wide && <span>Actions</span>}
-            </button>
+              <PanelRightIcon aria-hidden="true" className="size-4" />
+            </Button>
           )}
         </span>
       </span>
