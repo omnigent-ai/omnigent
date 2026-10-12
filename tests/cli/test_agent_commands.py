@@ -174,6 +174,23 @@ def test_add_github_repo_list_installs_nothing(fake_repo: object, server: _FakeS
     assert not [r for r in server.seen if r.method == "POST"]
 
 
+def test_add_github_repo_keeps_going_past_a_conflict(
+    fake_repo: object, server: _FakeServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replies = iter([httpx.Response(409, json={"detail": "'orion' is a server agent"})])
+    real = server.__call__
+    monkeypatch.setattr(
+        _FakeServer,
+        "__call__",
+        lambda self, r: next(replies, None) or real(r) if r.method == "POST" else real(r),
+    )
+    result = CliRunner().invoke(cli_mod.cli, ["agent", "add", "acme/agents", "-y"])
+    assert result.exit_code != 0
+    assert "Skipped orion: 409" in result.stderr
+    assert "1 of 2 agent(s) not installed" in result.stderr
+    assert "Installed" in result.output, "vega is still uploaded after orion's conflict"
+
+
 def test_add_github_repo_declined_uploads_nothing(fake_repo: object, server: _FakeServer) -> None:
     result = CliRunner().invoke(cli_mod.cli, ["agent", "add", "acme/agents"], input="n\n")
     assert result.exit_code != 0

@@ -11796,13 +11796,20 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
             click.echo(f"  {n}  ({d.relative_to(checkout).as_posix() or '.'})")
         if list_only:
             return
-        agent_dirs = list(named.values())
         if not yes:
             click.confirm("Install them? Only install agents from repos you trust", abort=True)
-        bundles = [_bundle_untrusted_dir(d) for d in agent_dirs]
+        bundles = {n: _bundle_untrusted_dir(d) for n, d in named.items()}
+        failed: list[str] = []
         with _agent_api_client(server) as client:
-            for bundle_bytes in bundles:
-                _upload_agent(client, bundle_bytes)
+            for n, bundle_bytes in bundles.items():
+                # One conflict (e.g. a built-in's name) shouldn't skip the rest.
+                try:
+                    _upload_agent(client, bundle_bytes)
+                except click.ClickException as exc:
+                    click.echo(f"Skipped {n}: {exc.message}", err=True)
+                    failed.append(n)
+        if failed:
+            raise _agent_cli_error(f"{len(failed)} of {len(bundles)} agent(s) not installed.")
 
 
 def _list_agents(client: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-any]  # httpx.Client + JSON rows
