@@ -663,9 +663,9 @@ Follow these rules for each clip:
   pill. Compare every frame you extract with each screen claim in the caption
   and in the Observed lines of `journey`; where they disagree, describe the
   frame ("the streamed reply text appears, then the turn ends in the
-  'transcript item … rejected' error pill; the reply is never saved") and keep
-  the backend check in `evidence` (see "Finishing a clip" in
-  `dev/recording-lanes.md`).
+  'transcript item … rejected' error pill") and keep the backend check in
+  `evidence` ("the reply was never persisted, per GET /items"), not in the
+  caption (see "Finishing a clip" in `dev/recording-lanes.md`).
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.

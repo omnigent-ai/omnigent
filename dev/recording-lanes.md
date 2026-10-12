@@ -334,12 +334,13 @@ the viewer sees, and the two diverge: the Claude-native forwarder streams each
 while the final transcript item is still in flight, so a reply the server later
 rejects (`transcript item … rejected`) has already been painted on screen when
 the error pill appears. Caption the frames — "the streamed reply text fills the
-chat, then the turn ends in the 'transcript item … rejected' error pill; the
-reply is never saved" — never "no reply bubble appears", and keep the transcript
-check in `evidence`. Read every frame you extract against each screen claim in
-the caption, above all a claim that something is absent: a frame that shows it
-contradicts the caption, so rewrite the caption to the frame or re-record.
-Frames you extracted but never compared with the caption verify nothing.
+chat, then the turn ends in the 'transcript item … rejected' error pill" — never
+"no reply bubble appears", and keep the transcript finding ("the reply was never
+persisted, per GET /items") in `evidence`, not in the caption. Read every frame
+you extract against each screen claim in the caption, above all a claim that
+something is absent: a frame that shows it contradicts the caption, so rewrite
+the caption to the frame or re-record. Frames you extracted but never compared
+with the caption verify nothing.
 
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in

@@ -64,9 +64,11 @@ def test_finishing_a_clip_captions_the_screen_from_screen_evidence() -> None:
     assert "Frames you extracted but never compared with the caption verify nothing" in lanes
 
 
-def test_repro_clip_rules_caption_the_screen_from_screen_evidence() -> None:
-    instructions = _normalized(_REPRO_AGENT / "AGENTS.md")
+def test_repro_agent_loads_the_screen_evidence_caption_rule_as_instructions() -> None:
+    spec = load(_REPRO_AGENT, expand_env=False)
 
+    assert spec.instructions is not None
+    instructions = " ".join(spec.instructions.split())
     assert "Caption the screen from screen evidence" in instructions
     assert "proves what the server stored, not what the frames show" in instructions
     assert (
@@ -82,10 +84,3 @@ def test_repro_clip_rules_caption_the_screen_from_screen_evidence() -> None:
         "Each screen claim comes from screen evidence, not from a transcript or API check"
         in instructions
     )
-
-
-def test_repro_agent_loads_the_screen_evidence_caption_rule_as_instructions() -> None:
-    spec = load(_REPRO_AGENT, expand_env=False)
-
-    assert spec.instructions is not None
-    assert "Caption the screen from screen evidence" in " ".join(spec.instructions.split())
