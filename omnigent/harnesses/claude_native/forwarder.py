@@ -193,6 +193,10 @@ _SUBAGENT_DROPPED_ITEM_REASON = "sub-agent transcript incomplete: an item could 
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
+# A poll that keeps failing (e.g. host credentials unavailable) backs off up to
+# this delay and logs its traceback once per streak, then at most this often.
+_LOOP_FAILURE_MAX_BACKOFF_S = 30.0
+_LOOP_FAILURE_LOG_INTERVAL_S = 300.0
 
 # Claude Code hook event names → Omnigent session-status values
 # published on the per-conversation SSE stream. Unmapped events emit
@@ -1287,6 +1291,8 @@ async def forward_claude_transcript_to_session(
             event_dispatcher=event_dispatcher,
         ) as subagent_client,
     ):
+        loop_failures = 0
+        loop_failure_logged_at = 0.0
         while True:
             try:
                 if subagent_task is not None and subagent_task.done():
@@ -1576,16 +1582,48 @@ async def forward_claude_transcript_to_session(
                     extra={"session_id": session_id},
                 )
             except Exception:
-                _logger.exception(
-                    "Claude transcript forwarder loop failed; session=%s",
-                    session_id,
-                    extra={"session_id": session_id},
-                )
+                loop_failures += 1
+                now = time.monotonic()
+                if (
+                    loop_failures == 1
+                    or now - loop_failure_logged_at >= _LOOP_FAILURE_LOG_INTERVAL_S
+                ):
+                    loop_failure_logged_at = now
+                    _logger.exception(
+                        "Claude transcript forwarder loop failed; session=%s failures=%d",
+                        session_id,
+                        loop_failures,
+                        extra={"session_id": session_id},
+                    )
+            else:
+                if loop_failures:
+                    _logger.info(
+                        "Claude transcript forwarder loop recovered after %d failures; session=%s",
+                        loop_failures,
+                        session_id,
+                        extra={"session_id": session_id},
+                    )
+                loop_failures = 0
             try:
-                await asyncio.sleep(poll_interval_s)
+                await asyncio.sleep(_loop_retry_delay_s(poll_interval_s, loop_failures))
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
                 raise
+
+
+def _loop_retry_delay_s(poll_interval_s: float, consecutive_failures: int) -> float:
+    """
+    Return how long the forwarder loop sleeps before its next poll.
+
+    :param poll_interval_s: The configured delay between healthy polls.
+    :param consecutive_failures: Polls that have failed in a row.
+    :returns: ``poll_interval_s`` while healthy, then doubling per failure
+        up to :data:`_LOOP_FAILURE_MAX_BACKOFF_S`.
+    """
+    if consecutive_failures <= 0:
+        return poll_interval_s
+    backoff_s = poll_interval_s * 2 ** min(consecutive_failures, 16)
+    return min(backoff_s, max(poll_interval_s, _LOOP_FAILURE_MAX_BACKOFF_S))
 
 
 def _subagents_dir_for_transcript(transcript_path: Path) -> Path:
