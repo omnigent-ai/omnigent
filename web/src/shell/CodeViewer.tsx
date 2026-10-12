@@ -1167,7 +1167,7 @@ export function CodeViewer({
             <button
               data-add-comment-btn
               type="button"
-              className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+              className="flex items-center gap-1.5 rounded-md border border-neutral-900 bg-neutral-900 backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-white shadow-md hover:bg-neutral-800 dark:border-border dark:bg-popover dark:text-foreground dark:hover:bg-secondary transition-colors"
               onClick={() => {
                 onSetActiveSelection({
                   start_index: selectionAnchor.start_index,
