@@ -84,6 +84,7 @@ import type {
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
+import { localTimezone } from "@/lib/timezones";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
@@ -2183,6 +2184,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         await postEvent(conversationId, {
           type: "message",
           data: { role: "user", content, stable_id: head.stableId },
+          client_timezone: localTimezone(),
         });
       })()
         .catch(() => {
@@ -2485,6 +2487,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           content: serverContent,
           stable_id: stableId,
         },
+        // The agent reads unqualified times (an automation's "9:00 AM") in
+        // this zone instead of the server's or UTC.
+        client_timezone: localTimezone(),
       });
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so

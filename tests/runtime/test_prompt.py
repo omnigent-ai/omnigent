@@ -18,6 +18,7 @@ from omnigent.runtime.prompt import (
     append_framework_instructions,
     build_instructions,
     build_instructions_nullable,
+    client_timezone_instruction,
     history_to_input_items,
     raw_author_instructions,
 )
@@ -261,6 +262,19 @@ def test_framework_instructions_append_after_custom_prompts() -> None:
         "Agent prompt\n\nRequest prompt\n\n"
         f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
     )
+
+
+def test_client_timezone_instruction_names_the_zone_after_authored_text() -> None:
+    """The user's reported zone rides as a per-turn framework instruction."""
+    instruction = client_timezone_instruction("America/Los_Angeles")
+    assert "America/Los_Angeles" in instruction
+    assert "timezone" in instruction
+
+    result = build_instructions(
+        _spec("Agent prompt"), None, [], framework_instructions=[instruction]
+    )
+
+    assert result == (f"Agent prompt\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{instruction}")
 
 
 def test_empty_framework_instructions_do_not_change_default() -> None:

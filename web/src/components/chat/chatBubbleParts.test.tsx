@@ -290,6 +290,7 @@ describe("AssistantBubble error retry", () => {
     expect(JSON.parse(init.body as string)).toEqual({
       type: "message",
       data: { role: "user", content: [{ type: "input_text", text: continuation }] },
+      client_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     });
     expect(useChatStore.getState().failedSendDraft).toBe(draft);
 
@@ -313,6 +314,7 @@ describe("AssistantBubble error retry", () => {
     expect(JSON.parse(init.body as string)).toEqual({
       type: "message",
       data: { role: "user", content: [{ type: "input_text", text: continuation }] },
+      client_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     });
   });
 
@@ -328,6 +330,7 @@ describe("AssistantBubble error retry", () => {
     expect(JSON.parse(init.body as string)).toEqual({
       type: "message",
       data: { role: "user", content: [{ type: "input_text", text: continuation }] },
+      client_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     });
   });
 

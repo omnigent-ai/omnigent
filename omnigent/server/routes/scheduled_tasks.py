@@ -17,7 +17,6 @@ import asyncio
 import logging
 import uuid
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -41,6 +40,7 @@ from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+from omnigent.util.timezones import is_valid_timezone
 
 _logger = logging.getLogger(__name__)
 
@@ -210,13 +210,11 @@ def _validate_rrule_or_400(rrule: str) -> None:
 
 def _validate_timezone_or_400(timezone: str) -> None:
     """Raise a 400 ``OmnigentError`` if *timezone* is not a valid IANA timezone."""
-    try:
-        ZoneInfo(timezone)
-    except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+    if not is_valid_timezone(timezone):
         raise OmnigentError(
             f"invalid timezone {timezone!r}: must be a valid IANA timezone name",
             code=ErrorCode.INVALID_INPUT,
-        ) from exc
+        )
 
 
 def create_scheduled_tasks_router(

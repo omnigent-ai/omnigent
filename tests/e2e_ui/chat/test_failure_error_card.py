@@ -353,9 +353,13 @@ def test_databricks_rate_limit_is_retryable_live_and_after_reload(
     composer.fill("Keep this unsent draft.")
     pill.get_by_role("button", name="Retry", exact=True).click()
     expect(pill).to_have_count(0)
+    # The continuation send carries the browser's local zone so a scheduled task
+    # created from the resumed turn still defaults to the user's wall clock.
+    browser_zone = page.evaluate("Intl.DateTimeFormat().resolvedOptions().timeZone")
     assert retry_payloads == [
         {
             "type": "message",
+            "client_timezone": browser_zone,
             "data": {
                 "role": "user",
                 "content": [

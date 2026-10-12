@@ -155,7 +155,9 @@ export type SessionStatus = "idle" | "launching" | "running" | "waiting" | "fail
  * Body shape for `POST /v1/sessions/{id}/events`. The `type`
  * discriminator routes the route-layer interpretation of `data`:
  *
- * - `"message"`: `{ role: "user", content: ContentBlock[] }`
+ * - `"message"`: `{ role: "user", content: ContentBlock[] }`, plus the
+ *   sender's `client_timezone` (IANA) so the agent reads unqualified times in
+ *   the user's wall clock
  * - `"function_call_output"`: `{ call_id, output, ... }`
  * - `"approval"`: `{ elicitation_id, ...ElicitResult }`
  * - `"interrupt"`: `{}` (empty data)
@@ -172,7 +174,11 @@ export type SessionStatus = "idle" | "launching" | "running" | "waiting" | "fail
  * Mirrors `omnigent.server.schemas.SessionEventInput`.
  */
 export type SessionEventInput =
-  | { type: "message"; data: { role: "user"; content: ContentBlock[] } }
+  | {
+      type: "message";
+      data: { role: "user"; content: ContentBlock[] };
+      client_timezone?: string;
+    }
   | { type: "function_call_output"; data: Record<string, unknown> }
   | { type: "approval"; data: Record<string, unknown> }
   | { type: "interrupt"; data?: Record<string, unknown> }

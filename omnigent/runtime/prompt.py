@@ -60,6 +60,25 @@ EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
 )
 
 
+def client_timezone_instruction(timezone: str) -> str:
+    """
+    Per-turn framework instruction naming the user's local timezone.
+
+    Added only when the user's client reported a zone (the web app sends its
+    ``Intl`` zone with each message), so the model reads a time the user gives
+    without a zone, such as the schedule of an automation, in the user's own
+    wall clock rather than the host's or UTC.
+
+    :param timezone: IANA zone key, e.g. ``"America/Los_Angeles"``.
+    :returns: The instruction text.
+    """
+    return (
+        f"User timezone: the user's local timezone is {timezone}. When the user "
+        "gives a time or schedule without naming a zone, it is in this timezone; "
+        "pass it as the timezone for any automation or scheduled task you create."
+    )
+
+
 def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     """
     Framework instructions that apply to every turn of ``spec``.

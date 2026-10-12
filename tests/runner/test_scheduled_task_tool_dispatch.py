@@ -17,12 +17,15 @@ import json
 
 import pytest
 
+from omnigent.runner import client_timezone
+from omnigent.runner.client_timezone import remember_client_timezone
 from omnigent.runner.tool_dispatch import (
     _ALL_LOCAL_TOOLS,
     _NATIVE_RELAY_BUILTIN_TOOLS,
     _SCHEDULED_TASK_TOOLS,
     _execute_scheduled_task_tool,
 )
+from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskCreateTool
 
 _ALL_NAMES = {
     "sys_scheduled_task_create",
@@ -88,6 +91,7 @@ async def test_create_posts_payload() -> None:
             }
         ),
         server_client=client,
+        conversation_id=None,
     )
     verb, url, body = client.calls[0]
     assert (verb, url) == ("POST", "/v1/scheduled-tasks")
@@ -102,10 +106,106 @@ async def test_create_posts_payload() -> None:
     assert json.loads(out)["id"] == "t1"
 
 
+@pytest.fixture
+def _client_timezones(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(client_timezone, "_session_client_timezones", {})
+
+
+_CREATE_ARGS = {
+    "name": "Daily inbox summary",
+    "prompt": "Summarize my inbox.",
+    "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    "agent_id": "ag_1",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_client_timezones")
+async def test_create_without_timezone_uses_the_sessions_client_zone() -> None:
+    """ "Every day at 9:00 AM" asked in chat means 9:00 AM where the user is."""
+    remember_client_timezone("conv_1", "America/Los_Angeles")
+    client = _RecordingClient()
+
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps(_CREATE_ARGS),
+        server_client=client,
+        conversation_id="conv_1",
+    )
+
+    _, _, body = client.calls[0]
+    assert body == {**_CREATE_ARGS, "timezone": "America/Los_Angeles"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_client_timezones")
+async def test_create_keeps_an_explicit_timezone_over_the_client_zone() -> None:
+    remember_client_timezone("conv_1", "America/Los_Angeles")
+    client = _RecordingClient()
+
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps({**_CREATE_ARGS, "timezone": "Asia/Tokyo"}),
+        server_client=client,
+        conversation_id="conv_1",
+    )
+
+    assert client.calls[0][2] == {**_CREATE_ARGS, "timezone": "Asia/Tokyo"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_client_timezones")
+@pytest.mark.parametrize("empty_timezone", [None, ""])
+async def test_create_with_a_degenerate_timezone_uses_the_client_zone(
+    empty_timezone: str | None,
+) -> None:
+    """A null/empty explicit zone falls back to the client zone, not a 400."""
+    remember_client_timezone("conv_1", "America/Los_Angeles")
+    client = _RecordingClient()
+
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps({**_CREATE_ARGS, "timezone": empty_timezone}),
+        server_client=client,
+        conversation_id="conv_1",
+    )
+
+    assert client.calls[0][2] == {**_CREATE_ARGS, "timezone": "America/Los_Angeles"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_client_timezones")
+@pytest.mark.parametrize("conversation_id", ["conv_without_client_zone", None])
+async def test_create_without_a_client_zone_leaves_the_server_default(
+    conversation_id: str | None,
+) -> None:
+    """A session whose client never reported a zone keeps the server's UTC default."""
+    remember_client_timezone("conv_other", "America/Los_Angeles")
+    client = _RecordingClient()
+
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps(_CREATE_ARGS),
+        server_client=client,
+        conversation_id=conversation_id,
+    )
+
+    assert client.calls[0][2] == _CREATE_ARGS
+
+
+def test_create_tool_schema_describes_the_client_zone_default() -> None:
+    schema = SysScheduledTaskCreateTool().get_schema()
+    description = schema["function"]["parameters"]["properties"]["timezone"]["description"]
+    assert "user's local timezone" in description
+    assert "UTC" in description
+
+
 @pytest.mark.asyncio
 async def test_list_gets() -> None:
     client = _RecordingClient(_Resp(body={"scheduled_tasks": []}))
-    out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=client)
+    out = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_list", "", server_client=client, conversation_id=None
+    )
     assert client.calls[0] == ("GET", "/v1/scheduled-tasks", None)
     assert json.loads(out) == {"scheduled_tasks": []}
 
@@ -124,6 +224,7 @@ async def test_update_patches_by_id() -> None:
             }
         ),
         server_client=client,
+        conversation_id=None,
     )
     verb, url, body = client.calls[0]
     assert (verb, url) == ("PATCH", f"/v1/scheduled-tasks/{_TASK_ID}")
@@ -153,6 +254,7 @@ async def test_update_forwards_agent_switch_and_cost_cap() -> None:
             }
         ),
         server_client=client,
+        conversation_id=None,
     )
     _, _, body = client.calls[0]
     assert body == {"agent_id": "ag_pi", "max_cost_usd": 2.5}
@@ -165,6 +267,7 @@ async def test_delete_by_id() -> None:
         "sys_scheduled_task_delete",
         json.dumps({"scheduled_task_id": _TASK_ID.upper()}),
         server_client=client,
+        conversation_id=None,
     )
     assert client.calls[0] == ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None)
 
@@ -178,6 +281,7 @@ async def test_update_rejects_path_confusion_task_id() -> None:
             {"scheduled_task_id": "../0123456789abcdef0123456789abcdef", "state": "paused"}
         ),
         server_client=client,
+        conversation_id=None,
     )
     assert "canonical 32-character hex" in json.loads(out)["error"]
     assert client.calls == []
@@ -187,7 +291,10 @@ async def test_update_rejects_path_confusion_task_id() -> None:
 async def test_update_without_id_errors() -> None:
     client = _RecordingClient()
     out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_update", json.dumps({"state": "paused"}), server_client=client
+        "sys_scheduled_task_update",
+        json.dumps({"state": "paused"}),
+        server_client=client,
+        conversation_id=None,
     )
     assert "scheduled_task_id" in json.loads(out)["error"]
     assert client.calls == []  # never hit the server
@@ -200,13 +307,16 @@ async def test_server_error_becomes_clean_json() -> None:
         "sys_scheduled_task_create",
         json.dumps({"name": "x", "prompt": "p", "rrule": "FREQ=SECONDLY", "agent_id": "a"}),
         server_client=client,
+        conversation_id=None,
     )
     assert "server returned 400" in json.loads(out)["error"]
 
 
 @pytest.mark.asyncio
 async def test_no_server_client_errors() -> None:
-    out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=None)
+    out = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_list", "", server_client=None, conversation_id=None
+    )
     assert "requires server access" in json.loads(out)["error"]
 
 
