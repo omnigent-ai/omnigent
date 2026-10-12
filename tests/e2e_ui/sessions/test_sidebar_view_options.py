@@ -96,15 +96,22 @@ def test_status_grouping_and_show_toggles_persist_across_reload(
 ) -> None:
     """Status grouping titles the list by state, Show adds the branch line, and both persist."""
     expect(_section_header(page, "Sessions")).to_be_visible()
+    filter_button = page.get_by_test_id("session-filter")
+    before = filter_button.bounding_box()
 
     _open_view_submenu(page, "session-grouping-menu")
     page.get_by_test_id("session-grouping-status").click()
+    page.keyboard.press("Escape")
     for title in ("Needs attention", "Working", "Done"):
         expect(_section_header(page, title)).to_be_visible()
     expect(_section_header(page, "Sessions")).to_have_count(0)
-    # Projects (with the one filter button) stays put whatever the grouping.
-    projects = page.locator("section").filter(has=_section_header(page, "Projects"))
-    expect(projects.get_by_test_id("session-filter")).to_be_visible()
+    # The first group takes the Projects header's place, so the filter stays put.
+    expect(_section_header(page, "Projects")).to_have_count(0)
+    first_group = page.locator("section").filter(has=_section_header(page, "Needs attention"))
+    expect(first_group.get_by_test_id("session-filter")).to_be_visible()
+    after = filter_button.bounding_box()
+    assert before is not None and after is not None
+    assert abs(after["y"] - before["y"]) < 1
 
     idle_row = page.locator("li").filter(has=page.locator(f'a[href="/c/{_IDLE}"]'))
     expect(idle_row.get_by_test_id("session-row-meta")).to_have_count(0)

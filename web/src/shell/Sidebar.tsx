@@ -260,6 +260,7 @@ import {
   writeLegacyPinnedConversationIds,
   isOwnedByViewer,
   sessionBelongsToProject,
+  sessionsListAcceptsDrop,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
@@ -1893,13 +1894,14 @@ function ConversationList({
     // project name alone, pulling a foreign session into the viewer's folder
     // (and out of the flat Shared list via filedIds). Each folder holds its
     // non-pinned sessions — pinning a project's last one leaves it empty.
+    // Grouped views drop the folders: filed sessions join the groups instead.
     const filedIds = new Set<string>();
     const projectGroups: {
       id: string | null;
       name: string;
       icon?: string | null;
       conversations: Conversation[];
-    }[] = projects.map(({ id, name, icon }) => {
+    }[] = (grouped ? [] : projects).map(({ id, name, icon }) => {
       // Dual-read membership: a session belongs to this folder if it has
       // the first-class id OR the legacy omni_project label of this name,
       // and (filing being owner-only) the viewer owns it.
@@ -1940,8 +1942,11 @@ function ConversationList({
       view.ordering === "status"
         ? groupConversations(byUpdated, statusOf, STATUS_BUCKETS).flatMap((g) => g.conversations)
         : byUpdated;
-    const shared = groupingUi ? allOrdered.filter((c) => !isOwnedByViewer(c, viewerId)) : [];
-    const ordered = groupingUi
+    // Grouped views fold Shared into the groups too, so the first group takes
+    // the Projects header's place.
+    const splitShared = groupingUi && !grouped;
+    const shared = splitShared ? allOrdered.filter((c) => !isOwnedByViewer(c, viewerId)) : [];
+    const ordered = splitShared
       ? allOrdered.filter((c) => isOwnedByViewer(c, viewerId))
       : allOrdered;
     if (!grouped) return { pinned, shared, sessions: ordered, projectGroups, groupTitles: null };
@@ -2432,7 +2437,7 @@ function ConversationList({
   ) : undefined;
   const showShared = activeTab === "shared";
   // The Shared section replaces Sessions on the Shared filter (release-flagged).
-  const sharedListOnly = groupingUi && showShared;
+  const sharedListOnly = groupingUi && !grouped && showShared;
   // The paginated list sections on screen, by collapse key: Shared, then Sessions or its groups.
   const listSectionKeys = [
     ...(sections.shared.length > 0 || sharedListOnly ? ["Shared"] : []),
@@ -2607,9 +2612,10 @@ function ConversationList({
             ungroup target (wrapped below). This top strip is only a FALLBACK
             for when there are no ungrouped chats yet, so the Chats section
             isn't rendered and there'd otherwise be nowhere to drop. */}
-              {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
-                <UngroupDropZone />
-              )}
+              {!showShared &&
+                !grouped &&
+                activeDrag?.project != null &&
+                sections.sessions.length === 0 && <UngroupDropZone />}
               {totalVisible === 0 && searchQuery && !sessionStatus ? (
                 <>
                   <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
@@ -2655,110 +2661,112 @@ function ConversationList({
                       </PinOrderContext.Provider>
                     </PinDropZone>
                   )}
-                  {/* Projects: one collapsible folder per project, always shown and unaffected
-              by the filter so "New project" stays reachable. With sidebar_grouping_ui
-              on, its header holds the one filter menu, which never moves. */}
-                  <SectionGroup
-                    title="Projects"
-                    collapsed={effectiveCollapsedSections.includes("Projects")}
-                    onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                    persistentHeaderAction={groupingUi ? sessionsFilterMenu : undefined}
-                    afterHeader={
-                      projectsSelecting ? (
-                        <BulkActionBar
-                          selectedIds={selectedIds}
-                          allConversations={projectSessionPool}
-                          onDeselectAll={onDeselectAll}
-                          onExit={onExitSelectionMode}
-                          onProjectAssigned={expandProject}
-                        />
-                      ) : undefined
-                    }
-                    headerAction={
-                      !selectionMode ? (
-                        <ProjectHeaderActions
-                          onOrderChange={(manual) => {
-                            const ranks = new Map(
-                              projectOrder.data?.ordered_project_ids?.map((id, index) => [
-                                id,
-                                index,
-                              ]),
-                            );
-                            const restored = [...projects].sort(
-                              (a, b) =>
-                                (ranks.get(a.id ?? "") ?? Infinity) -
-                                (ranks.get(b.id ?? "") ?? Infinity),
-                            );
-                            saveOrder.mutate(manual ? restored : null);
-                          }}
-                          manualOrder={projectOrder.data?.sort_mode === "manual"}
-                          orderDisabled={saveOrder.isPending || !projectOrder.data}
-                          projectNames={sections.projectGroups.map((group) => group.name)}
-                          collapsed={effectiveCollapsedSections.includes("Projects")}
-                          expandedProjects={expandedProjects}
-                          hasProjectSessions={sections.projectGroups.some(
-                            (group) => group.conversations.length > 0,
-                          )}
-                          onExpandAll={expandAllProjects}
-                          onCollapseAll={collapseAllProjects}
-                          onProjectCreated={expandProject}
-                          onEnterSelectionMode={() => onEnterSelectionMode("projects")}
-                        />
-                      ) : undefined
-                    }
-                  >
-                    <SortableContext
-                      items={projects.map((p) => projectDragId(p.name))}
-                      strategy={verticalListSortingStrategy}
+                  {/* Projects: one collapsible folder per project, unaffected by the filter so
+              "New project" stays reachable. With sidebar_grouping_ui on it holds the one
+              filter menu; grouped views hide it and the first group takes its place. */}
+                  {!grouped && (
+                    <SectionGroup
+                      title="Projects"
+                      collapsed={effectiveCollapsedSections.includes("Projects")}
+                      onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
+                      persistentHeaderAction={groupingUi ? sessionsFilterMenu : undefined}
+                      afterHeader={
+                        projectsSelecting ? (
+                          <BulkActionBar
+                            selectedIds={selectedIds}
+                            allConversations={projectSessionPool}
+                            onDeselectAll={onDeselectAll}
+                            onExit={onExitSelectionMode}
+                            onProjectAssigned={expandProject}
+                          />
+                        ) : undefined
+                      }
+                      headerAction={
+                        !selectionMode ? (
+                          <ProjectHeaderActions
+                            onOrderChange={(manual) => {
+                              const ranks = new Map(
+                                projectOrder.data?.ordered_project_ids?.map((id, index) => [
+                                  id,
+                                  index,
+                                ]),
+                              );
+                              const restored = [...projects].sort(
+                                (a, b) =>
+                                  (ranks.get(a.id ?? "") ?? Infinity) -
+                                  (ranks.get(b.id ?? "") ?? Infinity),
+                              );
+                              saveOrder.mutate(manual ? restored : null);
+                            }}
+                            manualOrder={projectOrder.data?.sort_mode === "manual"}
+                            orderDisabled={saveOrder.isPending || !projectOrder.data}
+                            projectNames={sections.projectGroups.map((group) => group.name)}
+                            collapsed={effectiveCollapsedSections.includes("Projects")}
+                            expandedProjects={expandedProjects}
+                            hasProjectSessions={sections.projectGroups.some(
+                              (group) => group.conversations.length > 0,
+                            )}
+                            onExpandAll={expandAllProjects}
+                            onCollapseAll={collapseAllProjects}
+                            onProjectCreated={expandProject}
+                            onEnterSelectionMode={() => onEnterSelectionMode("projects")}
+                          />
+                        ) : undefined
+                      }
                     >
-                      {sections.projectGroups.map((group, index) => (
-                        <ProjectFolder
-                          key={group.name}
-                          ordering={{
-                            disabled:
-                              !projectOrder.data ||
-                              saveOrder.isPending ||
-                              selectionMode ||
-                              editingIds.size > 0,
-                            first: index === 0,
-                            last: index === projects.length - 1,
-                            move: (destination) => moveProject(group.name, destination),
-                            insertion:
-                              overProject === group.name &&
-                              draggedProject !== group.name &&
-                              draggedProject !== null
-                                ? projects.findIndex((p) => p.name === draggedProject) < index
-                                  ? "after"
-                                  : "before"
-                                : undefined,
-                          }}
-                          name={group.name}
-                          projectId={group.id}
-                          icon={group.icon}
-                          windowConversations={group.conversations}
-                          activeConversationId={displayedActiveId}
-                          expanded={expandedProjects.includes(group.name)}
-                          active={newSessionProjectName === group.name}
-                          onToggleCollapsed={() => toggleProjectExpanded(group.name)}
-                          pinnedConversationIds={pinnedConversationIds}
-                          activeOverride={activeOverride}
-                          frozenSortKeys={frozenKeys}
-                          scrollRoot={scrollContainerRef}
-                          onRowClick={onRowClick}
-                          onTogglePinned={onTogglePinned}
-                          selectionMode={projectsSelecting}
-                          selectedIds={selectedIds}
-                          onToggleSelected={onToggleSelected}
-                          onProjectAssigned={expandProject}
-                          onConversationsLoaded={handleFolderConversationsLoaded}
-                        />
-                      ))}
-                    </SortableContext>
-                    {sections.projectGroups.length === 0 &&
-                      !effectiveCollapsedSections.includes("Projects") && (
-                        <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
-                      )}
-                  </SectionGroup>
+                      <SortableContext
+                        items={projects.map((p) => projectDragId(p.name))}
+                        strategy={verticalListSortingStrategy}
+                      >
+                        {sections.projectGroups.map((group, index) => (
+                          <ProjectFolder
+                            key={group.name}
+                            ordering={{
+                              disabled:
+                                !projectOrder.data ||
+                                saveOrder.isPending ||
+                                selectionMode ||
+                                editingIds.size > 0,
+                              first: index === 0,
+                              last: index === projects.length - 1,
+                              move: (destination) => moveProject(group.name, destination),
+                              insertion:
+                                overProject === group.name &&
+                                draggedProject !== group.name &&
+                                draggedProject !== null
+                                  ? projects.findIndex((p) => p.name === draggedProject) < index
+                                    ? "after"
+                                    : "before"
+                                  : undefined,
+                            }}
+                            name={group.name}
+                            projectId={group.id}
+                            icon={group.icon}
+                            windowConversations={group.conversations}
+                            activeConversationId={displayedActiveId}
+                            expanded={expandedProjects.includes(group.name)}
+                            active={newSessionProjectName === group.name}
+                            onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                            pinnedConversationIds={pinnedConversationIds}
+                            activeOverride={activeOverride}
+                            frozenSortKeys={frozenKeys}
+                            scrollRoot={scrollContainerRef}
+                            onRowClick={onRowClick}
+                            onTogglePinned={onTogglePinned}
+                            selectionMode={projectsSelecting}
+                            selectedIds={selectedIds}
+                            onToggleSelected={onToggleSelected}
+                            onProjectAssigned={expandProject}
+                            onConversationsLoaded={handleFolderConversationsLoaded}
+                          />
+                        ))}
+                      </SortableContext>
+                      {sections.projectGroups.length === 0 &&
+                        !effectiveCollapsedSections.includes("Projects") && (
+                          <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
+                        )}
+                    </SectionGroup>
+                  )}
                   {/* Other owners' sessions, above the viewer's own. On the Shared
                     filter it's the only list, so it takes the list controls. */}
                   {(sections.shared.length > 0 || sharedListOnly) && (
@@ -2782,9 +2790,7 @@ function ConversationList({
                     // session (removes it from its project) or a pinned one (unpins
                     // it), since both have somewhere to land here.
                     <ChatsDropZone
-                      active={
-                        activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)
-                      }
+                      active={activeDrag != null && sessionsListAcceptsDrop(activeDrag, grouped)}
                     >
                       {sessionGroups ? (
                         // Grouped: one titled section per group; the first carries
@@ -2802,6 +2808,7 @@ function ConversationList({
                               onToggleCollapsed={() => effectiveToggleSectionCollapsed(group.title)}
                               afterHeader={index === 0 ? sessionsBulkBar : undefined}
                               headerAction={index === 0 ? sessionsHeaderActions : undefined}
+                              persistentHeaderAction={index === 0 ? sessionsFilterMenu : undefined}
                               {...sessionRowProps}
                             />
                           ))}
@@ -2816,7 +2823,9 @@ function ConversationList({
                           onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
                           afterHeader={sessionsBulkBar}
                           headerAction={sessionsHeaderActions}
-                          persistentHeaderAction={groupingUi ? undefined : sessionsFilterMenu}
+                          persistentHeaderAction={
+                            groupingUi && !grouped ? undefined : sessionsFilterMenu
+                          }
                           {...sessionRowProps}
                         />
                       )}

@@ -71,8 +71,9 @@ the header menu), and each place is a separate entry point.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Updated), Display (All / My / Shared / Archived), Ordering
   (Updated / Status) and Show (Updated / Environment / Repo / Branch) submenus,
-  saved per device. Shared sessions get their own section above Sessions;
-  grouped views split the viewer's unfiled sessions into titled groups. Behind
+  saved per device. Shared sessions get their own section above Sessions. A
+  Status or Updated grouping replaces Projects, Shared and Sessions with titled
+  groups; the first group's header takes the Projects header's place. Behind
   the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
   a flat Display filter and the tooltip keeps its plain layout.
 
@@ -103,8 +104,9 @@ you remove them.
 menu, then filter by project.
 
 **Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
-Projects header holds Grouping, Display, Ordering and Show. It stays there in
-every grouping, and project folders keep their sessions. Hovering a row opens
+Projects header holds Grouping, Display, Ordering and Show. In a Status or
+Updated grouping, Projects is hidden and the funnel sits in the same spot on the
+first group's header. Hovering a row opens
 its tooltip; the repo and PR rows load from the session's GitHub info only once
 the tooltip opens. With the flag off, the funnel sits on the Sessions header and
 offers Display only.
@@ -520,6 +522,5 @@ plain `uv run pytest`, which starts a private server for the test.
 - Tests marked "own environment" fail under `verify-env run` with an explicit
   message. That is expected; run them with plain `uv run pytest`.
 - Grouping and ordering apply to the loaded pages only: an older session joins
-  its group once it is paged in. Grouped views keep the Projects folders, and
-  groups hold only unfiled sessions, so dragging a filed session onto the list
-  removes it from its project as in the default view.
+  its group once it is paged in. Grouped views hide Projects, so dragging a
+  session onto the list never removes it from its project there.

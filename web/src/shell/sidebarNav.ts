@@ -522,3 +522,12 @@ export function resolveSidebarDrop(
   // No project label: only meaningful if pinned (unpin → it drops into Chats).
   return source.isPinned ? { kind: "unpin" } : { kind: "none" };
 }
+
+/**
+ * Whether the Sessions list accepts a dragged session: a filed one (ungroup) or
+ * a pinned one (unpin). Grouped views already list filed sessions in place, so
+ * there it only unpins a pin that has no project to lose.
+ */
+export function sessionsListAcceptsDrop(source: SidebarDragSource, grouped: boolean): boolean {
+  return grouped ? source.isPinned && !source.project : !!source.project || source.isPinned;
+}

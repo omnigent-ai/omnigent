@@ -3074,7 +3074,7 @@ describe("Sidebar view options", () => {
       .filter((title) => GROUP_TITLES.has(title));
   const groupSection = (title: string) => screen.getByText(title).closest("section")!;
 
-  it("groups unfiled sessions by status, leaving project sessions in their folders", () => {
+  it("groups sessions by status, folding project sessions into the groups", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_done", "Claude Code", { status: "idle", updated_at: 300 }),
@@ -3100,15 +3100,44 @@ describe("Sidebar view options", () => {
     expect(within(groupSection("Needs attention")).getByText("conv_waiting")).toBeInTheDocument();
     expect(within(groupSection("Working")).getByText("conv_running")).toBeInTheDocument();
     const done = within(groupSection("Done")).getAllByRole("link", { name: /^conv_/ });
-    expect(done.map((link) => link.textContent)).toEqual(["conv_done"]);
-    expect(screen.queryByText("conv_filed")).toBeNull(); // in the collapsed Customer X folder
+    expect(done.map((link) => link.textContent)).toEqual(["conv_done", "conv_filed"]);
+    expect(screen.queryByText("Projects")).toBeNull();
     expect(screen.queryByText("Sessions")).toBeNull();
-    // The filter stays on the Projects row whatever the grouping.
-    expect(within(groupSection("Projects")).getByTestId("session-filter")).toBeTruthy();
-    expect(within(groupSection("Needs attention")).queryByTestId("session-filter")).toBeNull();
+    // The first group takes the Projects header's place, filter included.
+    expect(screen.getAllByTestId("session-filter")).toHaveLength(1);
+    expect(within(groupSection("Needs attention")).getByTestId("session-filter")).toBeTruthy();
     expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
       grouping: "status",
     });
+  });
+
+  it("folds shared sessions into the groups instead of a Shared section", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
+    mockConversations([
+      conv("conv_mine", "Claude Code", { status: "running", updated_at: 200 }),
+      conv("conv_shared", "Claude Code", {
+        status: "idle",
+        owner: "other@example.com",
+        updated_at: 100,
+      }),
+    ]);
+    renderGroupingSidebar();
+    selectSessionFilter("all");
+
+    expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
+    expect(groupHeaders()).toEqual(["Working", "Done"]);
+    expect(within(groupSection("Done")).getByText("conv_shared")).toBeInTheDocument();
+    expect(within(groupSection("Working")).getByTestId("session-filter")).toBeTruthy();
+  });
+
+  it("keeps the filter reachable on the Sessions header when there's nothing to group", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
+    mockConversations([]);
+    renderGroupingSidebar();
+
+    expect(screen.queryByText("Projects")).toBeNull();
+    const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+    expect(within(sessions).getByTestId("session-filter")).toBeTruthy();
   });
 
   it("moves a session out of Unread as soon as it's marked read", () => {
