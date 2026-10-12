@@ -103,6 +103,93 @@ def test_add_uploads_the_whole_directory(tmp_path: Path, server: _FakeServer) ->
     assert {"config.yaml", "agents/worker/config.yaml"} <= names
 
 
+def _posted_tars(server: _FakeServer) -> list[dict[str, bytes]]:
+    """The files of each uploaded bundle, in upload order."""
+    out = []
+    for post in (r for r in server.seen if r.method == "POST"):
+        body = post.read()
+        boundary = post.headers["content-type"].split("boundary=")[1].encode()
+        start = body.index(b"\x1f\x8b")
+        tar_bytes = body[start : body.index(b"\r\n--" + boundary, start)]
+        with tarfile.open(fileobj=io.BytesIO(gzip.decompress(tar_bytes)), mode="r:") as tf:
+            out.append({m.name: tf.extractfile(m).read() for m in tf.getmembers() if m.isfile()})
+    return out
+
+
+@pytest.fixture()
+def fake_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, list[tuple[str, str | None]]]:
+    """A repo with two agents (one with a worker); "cloning" copies it."""
+    import shutil
+
+    repo = tmp_path / "src"
+    (repo / "orion" / "agents" / "worker").mkdir(parents=True)
+    (repo / "orion" / "config.yaml").write_text(
+        "name: orion\nllm: {connection: {api_key: ${SECRET}}}\n"
+    )
+    (repo / "orion" / "agents" / "worker" / "config.yaml").write_text("name: worker\n")
+    (repo / "vega").mkdir()
+    (repo / "vega" / "config.yaml").write_text("name: vega\n")
+    clones: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        cli_mod,
+        "_clone_github_source",
+        lambda url, ref, dest: (
+            clones.append((url, ref)),
+            shutil.copytree(repo, dest, symlinks=True),
+        ),
+    )
+    monkeypatch.setenv("SECRET", "leaked")
+    return repo, clones
+
+
+def test_add_github_repo_installs_each_agent_unexpanded(
+    fake_repo: tuple[Path, list[tuple[str, str | None]]], server: _FakeServer
+) -> None:
+    result = CliRunner().invoke(
+        cli_mod.cli, ["agent", "add", "https://github.com/acme/agents/tree/v1"], input="y\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert fake_repo[1] == [("https://github.com/acme/agents.git", "v1")]
+    assert "Found 2 agent(s)" in result.output
+    orion, vega = _posted_tars(server)
+    assert set(orion) == {"config.yaml", "agents/worker/config.yaml"}, "worker stays in its parent"
+    assert b"${SECRET}" in orion["config.yaml"], "a remote repo must not read this shell's env"
+    assert set(vega) == {"config.yaml"}
+
+
+def test_add_github_repo_at_name_picks_one_agent(fake_repo: object, server: _FakeServer) -> None:
+    result = CliRunner().invoke(cli_mod.cli, ["agent", "add", "acme/agents@Vega", "-y"])
+    assert result.exit_code == 0, result.output
+    assert [set(t) for t in _posted_tars(server)] == [{"config.yaml"}]
+    assert "Found 1 agent(s)" in result.output
+
+
+def test_add_github_repo_list_installs_nothing(fake_repo: object, server: _FakeServer) -> None:
+    result = CliRunner().invoke(cli_mod.cli, ["agent", "add", "acme/agents", "--list"])
+    assert result.exit_code == 0, result.output
+    assert "orion  (orion)" in result.output and "vega  (vega)" in result.output
+    assert not [r for r in server.seen if r.method == "POST"]
+
+
+def test_add_github_repo_declined_uploads_nothing(fake_repo: object, server: _FakeServer) -> None:
+    result = CliRunner().invoke(cli_mod.cli, ["agent", "add", "acme/agents"], input="n\n")
+    assert result.exit_code != 0
+    assert not [r for r in server.seen if r.method == "POST"]
+
+
+def test_add_github_repo_refuses_symlinks(
+    fake_repo: tuple[Path, list[tuple[str, str | None]]], server: _FakeServer
+) -> None:
+    (fake_repo[0] / "vega" / "key").symlink_to(Path.home() / ".ssh" / "id_rsa")
+    result = CliRunner().invoke(cli_mod.cli, ["agent", "add", "acme/agents@vega", "-y"])
+    assert result.exit_code != 0
+    assert "symlink" in result.output
+    assert not [r for r in server.seen if r.method == "POST"]
+
+
 def test_list_pages_through_your_agents(server: _FakeServer) -> None:
     result = CliRunner().invoke(cli_mod.cli, ["agent", "list"])
     assert result.exit_code == 0, result.output

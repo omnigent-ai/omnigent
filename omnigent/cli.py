@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -11639,28 +11640,90 @@ def agent_grp() -> None:
     """
 
 
-@agent_grp.command("add")
-@click.argument("source", type=click.Path(exists=True, path_type=Path))
-@_AGENT_SERVER_OPTION
-def agent_add(source: Path, server: str | None) -> None:
-    """Install SOURCE (an agent directory, YAML file, or .tar.gz bundle).
+_GITHUB_SOURCE_RE = re.compile(
+    r"^(?:github:|https://github\.com/)?"
+    r"(?P<owner>\w[\w.-]*)/(?P<repo>\w[\w.-]*?)(?:\.git)?"
+    r"(?:/tree/(?P<tree_ref>[^/]+))?(?P<subpath>(?:/\w[\w.-]*)*)/?(?:@(?P<name>[\w.-]+))?$"
+)
 
-    Re-adding an agent with the same name replaces your copy in place.
-    Workers, skills, guardrails, and supporting files in the directory are
-    all kept. For a directory, ``${VAR}`` references are resolved from this
-    shell, as ``omnigent run`` does; a YAML file or tarball is uploaded as is.
 
-    \b
-    Examples:
-      omnigent agent add ./orion
-      omnigent agent add ./orion.tar.gz --server https://myserver.com
+def _parse_github_source(source: str) -> tuple[str, str | None, str, str | None] | None:
+    """``(clone_url, ref, subpath, agent_name)`` for ``owner/repo[/path][@agent]`` or a URL.
+
+    As in ``npx skills add``, ``@name`` picks one agent; a ref comes from ``/tree/<ref>``.
     """
-    with _agent_api_client(server) as client:
-        bundle_bytes = _bundle(source)
-        resp = client.post(
-            "/v1/agents",
-            files={"bundle": ("bundle.tar.gz", bundle_bytes, "application/gzip")},
-        )
+    m = _GITHUB_SOURCE_RE.match(source)
+    if m is None:
+        return None
+    url = f"https://github.com/{m['owner']}/{m['repo']}.git"
+    return url, m["tree_ref"], m["subpath"].strip("/"), m["name"]
+
+
+def _find_agent_dirs(root: Path) -> list[Path]:
+    """Outermost directories under ``root`` holding a ``config.yaml`` (nested ones are workers)."""
+    found: list[Path] = []
+    for cfg in sorted(root.rglob("config.yaml"), key=lambda p: len(p.parts)):
+        if ".git" in cfg.parts or any(d in cfg.parents for d in found):
+            continue
+        found.append(cfg.parent)
+    return found
+
+
+def _agent_dir_name(agent_dir: Path) -> str:
+    """The agent's ``name`` from its ``config.yaml``, else the directory name."""
+    try:
+        name = yaml.safe_load((agent_dir / "config.yaml").read_text()).get("name")
+    except (yaml.YAMLError, AttributeError, OSError):
+        name = None
+    return name if isinstance(name, str) and name else agent_dir.name
+
+
+def _bundle_untrusted_dir(source: Path) -> bytes:
+    """Tar an agent directory from a remote repo as is.
+
+    Unlike :func:`_bundle`, ``${VAR}`` references are left unexpanded so a
+    repo can't pull this shell's secrets into its config, and symlinks are
+    refused so it can't pull in files from outside the checkout.
+    """
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for file_path in sorted(source.rglob("*")):
+            if file_path.is_symlink():
+                raise _agent_cli_error(
+                    f"{file_path.relative_to(source)} is a symlink; refusing to install "
+                    "an agent with symlinks from a remote repo."
+                )
+            if file_path.is_file():
+                tf.add(str(file_path), arcname=str(file_path.relative_to(source)))
+    return buf.getvalue()
+
+
+def _clone_github_source(clone_url: str, ref: str | None, dest: Path) -> None:
+    """Shallow-clone without submodules, hooks, or credential prompts."""
+    cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
+           "-c", "protocol.https.allow=always", "clone", "--depth", "1",
+           "--no-recurse-submodules", "--quiet"]  # fmt: skip
+    if ref:
+        cmd += ["--branch", ref]
+    proc = subprocess.run(
+        [*cmd, "--", clone_url, str(dest)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"},
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise _agent_cli_error(f"Could not clone {clone_url}: {proc.stderr.strip()}")
+
+
+def _upload_agent(client: Any, bundle_bytes: bytes) -> None:  # type: ignore[explicit-any]  # httpx.Client
+    resp = client.post(
+        "/v1/agents",
+        files={"bundle": ("bundle.tar.gz", bundle_bytes, "application/gzip")},
+    )
     _raise_for_agent_api(resp)
     agent = resp.json()
     click.echo(f"Installed {agent['name']} (version {agent['version']}, id {agent['id']})")
@@ -11670,6 +11733,76 @@ def agent_add(source: Path, server: str | None) -> None:
             "Sessions using it pick up this version on their next turn; "
             "terminal sessions do when they relaunch."
         )
+
+
+@agent_grp.command("add")
+@click.argument("source")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation for a GitHub repo.")
+@click.option(
+    "--list", "list_only", is_flag=True, help="List a GitHub repo's agents; install none."
+)
+@_AGENT_SERVER_OPTION
+def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> None:
+    """Install SOURCE: an agent directory, YAML file, .tar.gz bundle, or GitHub repo.
+
+    Re-adding an agent with the same name replaces your copy in place.
+    Workers, skills, guardrails, and supporting files in the directory are
+    all kept. For a directory, ``${VAR}`` references are resolved from this
+    shell, as ``omnigent run`` does; a YAML file or tarball is uploaded as is.
+
+    A GitHub repo (``owner/repo[/path][@agent]`` or a github.com URL) is
+    shallow-cloned and every agent directory in it (or just ``@agent``) is
+    installed after you confirm. Its ``${VAR}`` references are not resolved
+    from this shell.
+
+    \b
+    Examples:
+      omnigent agent add ./orion
+      omnigent agent add ./orion.tar.gz --server https://myserver.com
+      omnigent agent add acme/agents --list
+      omnigent agent add acme/agents@orion
+      omnigent agent add https://github.com/acme/agents/tree/main/orion
+    """
+    path = Path(source)
+    github = None if path.exists() else _parse_github_source(source)
+    if github is None:
+        if not path.exists():
+            raise click.BadParameter(
+                f"{source!r} is neither a local path nor a GitHub repo.", param_hint="SOURCE"
+            )
+        with _agent_api_client(server) as client:
+            _upload_agent(client, _bundle(path))
+        return
+
+    clone_url, ref, subpath, wanted = github
+    with tempfile.TemporaryDirectory() as tmpdir:
+        checkout = Path(tmpdir) / "repo"
+        _clone_github_source(clone_url, ref, checkout)
+        root = (checkout / subpath).resolve()
+        if not root.is_relative_to(checkout.resolve()) or not root.is_dir():
+            raise _agent_cli_error(f"{subpath!r} is not a directory in {clone_url}.")
+        named = {_agent_dir_name(d): d for d in _find_agent_dirs(root)}
+        if not named:
+            raise _agent_cli_error(f"No agent (a directory with config.yaml) in {source}.")
+        if wanted and not list_only:
+            match = {n: d for n, d in named.items() if n.lower() == wanted.lower()}
+            if not match:
+                raise _agent_cli_error(
+                    f"No agent named {wanted!r} in {source}; found: {', '.join(named)}."
+                )
+            named = match
+        click.echo(f"Found {len(named)} agent(s) in {source}:")
+        for n, d in named.items():
+            click.echo(f"  {n}  ({d.relative_to(checkout).as_posix() or '.'})")
+        if list_only:
+            return
+        agent_dirs = list(named.values())
+        if not yes:
+            click.confirm("Install them? Only install agents from repos you trust", abort=True)
+        bundles = [_bundle_untrusted_dir(d) for d in agent_dirs]
+        with _agent_api_client(server) as client:
+            for bundle_bytes in bundles:
+                _upload_agent(client, bundle_bytes)
 
 
 def _list_agents(client: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-any]  # httpx.Client + JSON rows
