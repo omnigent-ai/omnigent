@@ -919,9 +919,11 @@ function cancelReconnect(win) {
   reconnectOverlay.hide(win);
 }
 
-/** Setup page for a connection that failed; `url` pre-fills the form. */
+/** Return to setup with a pre-filled server and an optional error message. */
 function showConnectFailure(win, url, message) {
-  const params = new URLSearchParams({ error: message, url });
+  const params = new URLSearchParams({ url });
+  if (message) params.set("error", message);
+  else params.set("step", "server");
   if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
   pinWindow(win, null); // back on the setup page → no trusted origin
   void loadSetupPage(win, params.toString());
@@ -1061,7 +1063,10 @@ function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedRe
     mounted && (!failedReturnUrl || failedReturnUrl === failedUrl) ? mounted : failedReturnUrl;
   const blocked = error.errorCode === IP_ACL_BLOCKED;
   const unreachable = transient && (error.status == null || blocked);
-  let message = "Couldn't sign in to Databricks. Please try again.";
+  let message =
+    error.errorCode === "NO_STORED_TOKEN"
+      ? null
+      : "Couldn't sign in to Databricks. Please try again.";
   if (expired) message = "Session expired. Connect to sign in again.";
   else if (unreachable) message = unreachableMessage(serverUrl, blocked);
   // The page stays under the overlay, but no longer trusted or allowed to navigate.

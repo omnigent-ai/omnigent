@@ -1491,6 +1491,55 @@ describe("Databricks auth mode wiring", () => {
     assert.deepEqual(h.calls.loadURL[1], [`${workspace}/c/deep-linked`]);
   });
 
+  for (const v2 of [false, true]) {
+    it(`opens a clean selector without stored credentials, then signs in on Connect (v2=${v2})`, async (t) => {
+      const origin = new URL(workspace).origin;
+      const workspaceNetwork = createWorkspaceNetwork(origin, {
+        oauth: {
+          getValidStoredToken: async () => {
+            throw Object.assign(new Error("no stored token"), { errorCode: "NO_STORED_TOKEN" });
+          },
+          runInteractiveLogin: async () => {
+            workspaceNetwork.browserSignIns++;
+            return { tokens: { access_token: "token" }, issuerOrigin: origin };
+          },
+        },
+      });
+      const h = loadNavigationHarness({
+        isPackaged: true,
+        env: { OMNIGENT_SERVER_SELECTOR_V2: v2 ? "1" : "0" },
+        savedServerUrl: workspace,
+        serverUrl: workspace,
+        managedServers: v2 ? [workspace] : [],
+        databricksMode: "browser",
+        network: workspaceNetwork,
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      h.api.createWindow();
+      await until(() => h.calls.loadFile.length === 1, "the server selector");
+      const [page, options] = h.calls.loadFile[0];
+      const params = new URLSearchParams(options.search);
+      assert.equal(path.basename(page), v2 ? "server-selector-v2.html" : "index.html");
+      assert.equal(params.get("error"), null);
+      assert.equal(params.get("url"), workspace);
+      assert.equal(params.get("step"), "server");
+      assert.equal(h.api.windows.get(h.win).origin, null);
+      assert.deepEqual(h.calls.loadURL, []);
+      assert.equal(workspaceNetwork.sessionCreates, 0);
+      assert.equal(workspaceNetwork.browserSignIns, 0);
+
+      await h.ipc.get("omnigent:set-server-url")(
+        { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } },
+        workspace,
+      );
+      assert.equal(workspaceNetwork.browserSignIns, 1);
+      assert.equal(workspaceNetwork.sessionCreates, 1);
+      assert.deepEqual(h.calls.loadURL, [[workspace]]);
+      assert.equal(h.api.windows.get(h.win).origin, origin);
+    });
+  }
+
   it("upgrades a saved HTTP workspace before restoring authentication", async (t) => {
     const target = "https://workspace.cloud.databricks.com/omnigent?o=123";
     const h = loadNavigationHarness({
