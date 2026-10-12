@@ -56,9 +56,18 @@ from playwright.async_api import Request, Route, async_playwright, expect
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.start_session.helpers import (
+    close_entry_models as _close_entry_models,
+)
+from tests.e2e_ui.start_session.helpers import (
     commit_landing_workspace_picker,
     open_landing_workspace_picker,
     stub_empty_host_picker_data,
+)
+from tests.e2e_ui.start_session.helpers import (
+    open_entry_models as _open_entry_models,
+)
+from tests.e2e_ui.start_session.helpers import (
+    wait_until as _wait_until,
 )
 
 # Stubbed host the composer auto-selects (the tunneled runner registers no
@@ -77,22 +86,6 @@ _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
 # The worktree-list endpoint the branch combobox queries for the picked repo.
 # Distinct ``/worktrees`` segment, so it never collides with ``/filesystem``.
 _WORKTREES_RE = re.compile(r"/v1/hosts/[^/]+/worktrees")
-
-
-async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
-    """Poll ``predicate`` on the event loop until true or timeout.
-
-    :param predicate: Zero-arg callable returning truthy when satisfied.
-    :param timeout_s: Max seconds to wait before failing the test.
-    :raises AssertionError: If the predicate never becomes truthy.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    while loop.time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"condition not met within {timeout_s:.0f}s")
 
 
 def _agents_body() -> str:
@@ -404,32 +397,6 @@ async def _register_common_routes(
     await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
-
-
-async def _open_entry_models(page, agent_id: str) -> None:
-    """Select a harness and open its primary model and effort picker."""
-    picker = page.get_by_test_id("new-chat-landing-agent-select")
-    await picker.click()
-    await expect(picker).to_have_attribute("aria-expanded", "true")
-    await expect(page.get_by_role("menu").first).to_be_visible()
-    row = page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
-    if await row.count() == 0:
-        await page.get_by_test_id("new-chat-landing-harness-more").click()
-    await (
-        page.get_by_test_id(f"new-chat-landing-agent-config-{agent_id}")
-        .get_by_text("Edit", exact=True)
-        .click()
-    )
-
-
-async def _close_entry_models(page) -> None:
-    """Dismiss the primary picker after immediate selection."""
-    await page.keyboard.press("Escape")
-    if (
-        await page.get_by_test_id("new-chat-landing-agent-select").get_attribute("aria-expanded")
-        == "true"
-    ):
-        await page.keyboard.press("Escape")
 
 
 async def _expect_model_menu_without_advanced_settings(page) -> None:

@@ -46,7 +46,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -125,13 +125,17 @@ def isolated_local_server(
     tmp_path: Path,
     *,
     bootstrap: str = "from omnigent.cli import main\n\nmain()\n",
+    extra_args: Sequence[str] = (),
+    env: Mapping[str, str] | None = None,
     poll_interval: float = 0.5,
     health_timeout: float = 120.0,
 ) -> Iterator[str]:
     """Run this checkout's single-user server; yield its URL and retain server.log.
 
     Supply a bootstrap only when the scenario needs a fault installed before
-    the CLI starts. Existing profile/compatibility tests should use
+    the CLI starts. ``extra_args`` extend the ``server`` command line (for
+    example ``--config``) and ``env`` adds variables to the isolated server
+    environment. Existing profile/compatibility tests should use
     :func:`start_live_server` instead.
     """
     port = find_free_port()
@@ -152,8 +156,9 @@ def isolated_local_server(
                 f"sqlite:///{tmp_path / 'chat.db'}",
                 "--artifact-location",
                 str(tmp_path / "artifacts"),
+                *extra_args,
             ],
-            env=local_server_env({}),
+            env=local_server_env(dict(env or {})),
             stdout=log,
             stderr=subprocess.STDOUT,
         )
