@@ -225,11 +225,8 @@ async def _drive_sdk_readiness(base_url: str, host: dict[str, Any]) -> None:
                     state="visible", timeout=30_000
                 )
 
-                # Normal picker path, exactly as the reported journey did: SDK
-                # needs-auth is advisory (the daemon cannot see agent-level
-                # ``executor.auth`` credentials and never blocks an SDK launch),
-                # so the row must stay enabled and clickable — selecting the
-                # agent must not require a previously persisted pick.
+                # SDK needs-auth is advisory: agent-level credentials are invisible
+                # to the daemon. The row stays selectable without a persisted pick.
                 row = await _reveal_agent_row(page, agent_id)
                 assert await row.is_enabled(), (
                     "the needs-auth SDK agent's picker row must stay selectable "
@@ -238,18 +235,14 @@ async def _drive_sdk_readiness(base_url: str, host: dict[str, Any]) -> None:
                 await row.click()
                 await _dismiss_agent_menu(page)
 
-                # The under-composer readiness notice for the just-selected agent
-                # on the selected host. In the regression state it never appears
-                # for an SDK harness; after the fix it must — it is the advisory
-                # pre-launch warning surface for a selectable SDK row.
+                # The selected SDK harness must show an advisory readiness warning
+                # before launch, even though the picker row remains selectable.
                 warning = page.get_by_test_id("new-chat-landing-harness-warning")
                 await expect(warning).to_be_visible(timeout=15_000)
                 warned_before_launch = True
 
-                # Launch anyway (the readiness signal warns, it does not block) and
-                # watch the first turn. Today it dies with an auth error the picker
-                # never hinted at; post-fix the launch may still fail the same way,
-                # so this is journey evidence, not the regression assertion.
+                # Launch anyway and record the first-turn error as journey evidence;
+                # the readiness warning itself is the regression assertion.
                 await page.get_by_test_id("new-chat-landing-input").fill(
                     "hello from the readiness reproduction"
                 )
