@@ -286,6 +286,7 @@ describe("BubbleView dispatch", () => {
 
     const bubble = screen.getByTestId("message-bubble");
     expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(screen.queryByTestId("turn-worked-fold")).not.toBeInTheDocument();
     expect(bubble).toHaveClass("max-w-full");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(screen.getByTestId("message-timestamp")).toBeInTheDocument();
@@ -349,11 +350,7 @@ describe("BubbleView dispatch", () => {
     continued: true,
   });
 
-  it("gives fold-only turns the same chrome whether or not the hidden trace narrated", () => {
-    // WHY: the copy/fork row keys off ALL the bubble's text, including text
-    // sealed inside the fold — so an otherwise identical collapsed row grew a
-    // row of hover-only chrome purely because its hidden trace happened to
-    // narrate, and consecutive "Worked for" rows sat at two different gaps.
+  it("keeps narration and its actions visible while tool-only turns stay fold-only", () => {
     render(
       <BubbleView
         bubble={foldOnlyBubble([
@@ -363,9 +360,8 @@ describe("BubbleView dispatch", () => {
       />,
     );
     expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
-    // Nothing below the fold: the collapsed row is the bubble's whole height.
-    expect(screen.getByTestId("message-bubble").children).toHaveLength(1);
+    expect(screen.getByText("Let me look at the code.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
     cleanup();
 
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c2"), toolItem("c3")])} />);

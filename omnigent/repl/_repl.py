@@ -8464,6 +8464,10 @@ _SLASH_COMMAND_ALIASES: frozenset[str] = frozenset({"/?", "/exit"})
 # SLASH_COMMAND_RE so the terminal and the menu agree on what is a command.
 _SKILL_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9][\w:-]*$")
 
+# Registered skill commands' display names, e.g. ``{"/asd-ste100": "Simplified
+# Technical English"}``; the completer matches these as well as the command.
+_SKILL_DISPLAY_NAMES: dict[str, str] = {}
+
 
 def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
@@ -8535,7 +8539,11 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
             return _skill_handler
 
         handler = _make_handler(skill)
-        COMMANDS[cmd_name] = (skill.description, handler)
+        # Label the command with its display name, matching the web menu.
+        description = " — ".join(filter(None, (skill.display_name, skill.description)))
+        COMMANDS[cmd_name] = (description, handler)
+        if skill.display_name:
+            _SKILL_DISPLAY_NAMES[cmd_name] = skill.display_name
         registered.append(cmd_name)
         _log.debug("Registered skill slash command: %s", cmd_name)
 
@@ -8546,6 +8554,7 @@ def unregister_skill_commands(names: list[str]) -> None:
     """Remove previously registered skill commands from the global registry."""
     for name in names:
         COMMANDS.pop(name, None)
+        _SKILL_DISPLAY_NAMES.pop(name, None)
 
 
 class _SlashCommandCompleter(Completer):
@@ -8591,9 +8600,8 @@ class _SlashCommandCompleter(Completer):
         # SlashCommandMenu.tsx): a case-insensitive substring of the
         # command name (sans the leading "/"), so a namespaced skill is
         # reachable by its leaf name (``/using-superpowers`` ->
-        # ``/superpowers:using-superpowers``). Name only, not the
-        # description — kept identical to the web menu, which never shows
-        # descriptions inline.
+        # ``/superpowers:using-superpowers``). A skill's display name also
+        # matches, ranked after name hits; the description never does.
         #
         # Prefix matches rank ahead of mid-string matches (mirrors the web
         # menu's ``rankedSlashCommandNames``): ``/e`` surfaces ``/effort``
@@ -8604,6 +8612,7 @@ class _SlashCommandCompleter(Completer):
         query = text_before[1:].lower()
         prefix_hits: list[tuple[str, str]] = []
         substring_hits: list[tuple[str, str]] = []
+        label_hits: list[tuple[str, str]] = []
         for name, (desc, _) in COMMANDS.items():
             if name in _SLASH_COMMAND_ALIASES:
                 continue
@@ -8612,7 +8621,9 @@ class _SlashCommandCompleter(Completer):
                 prefix_hits.append((name, desc))
             elif query in body:
                 substring_hits.append((name, desc))
-        for name, desc in (*prefix_hits, *substring_hits):
+            elif query in _SKILL_DISPLAY_NAMES.get(name, "").lower():
+                label_hits.append((name, desc))
+        for name, desc in (*prefix_hits, *substring_hits, *label_hits):
             yield Completion(
                 text=name,
                 # Replace everything typed so far so the splice

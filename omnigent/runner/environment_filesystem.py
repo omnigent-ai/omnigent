@@ -597,10 +597,17 @@ class CallerProcessFilesystem:
     path validation (traversal checks), not for direct I/O.
 
     :param os_env: The backing OSEnvironment instance.
+    :param follow_outward_links: Admit a relative path whose real target
+        lies outside the root when the environment's reach covers it,
+        exactly as an absolute browse of that target would. Off by
+        default: the server enables it only for a caller who may browse
+        the target by absolute path, since this process cannot see who
+        is asking.
     """
 
-    def __init__(self, os_env: OSEnvironment) -> None:
+    def __init__(self, os_env: OSEnvironment, *, follow_outward_links: bool = False) -> None:
         self._os_env = os_env
+        self._follow_outward_links = follow_outward_links
         self._root = Path(os_env.cwd).resolve()
         self._root_prefix = containment_prefix(self._root)
         policy = getattr(os_env, "sandbox", None)
@@ -628,14 +635,17 @@ class CallerProcessFilesystem:
 
         Relative paths keep the historical contract: normalized, traversal
         rejected, and confined under the environment root. Absolute paths
-        take the browse-authorization route instead.
+        take the browse-authorization route instead, and so does the target
+        of a symlink leading out of the root when outward links are admitted.
 
         :param path: Relative path within the environment, or an absolute
             path elsewhere on the filesystem.
         :param need_write: ``True`` for mutating operations.
         :returns: Resolved absolute path.
-        :raises InvalidPath: If a relative path escapes the root.
-        :raises PathUnreachable: If an absolute path is out of reach.
+        :raises InvalidPath: If a relative path escapes the root and outward
+            links are not admitted.
+        :raises PathUnreachable: If an absolute path, or an admitted outward
+            link's target, is out of reach.
         """
         if self._absolute(path):
             return resolve_browse_target(
@@ -647,10 +657,17 @@ class CallerProcessFilesystem:
         # `_validate_path` rejects absolute paths and "..", but that is a check
         # on the string; this re-checks the RESOLVED path, which is what stops
         # an in-workspace symlink pointing outward.
-        contained = contained_realpath(os.path.join(str(self._root), validated), self._root_prefix)
-        if contained is None:
+        full = os.path.join(str(self._root), validated)
+        contained = contained_realpath(full, self._root_prefix)
+        if contained is not None:
+            return Path(contained)
+        if not self._follow_outward_links:
             raise InvalidPath(f"Path {path!r} escapes the environment root")
-        return Path(contained)
+        # The link's target is authorized like the absolute path it is, so a
+        # confined environment still needs a grant covering it.
+        return resolve_browse_target(
+            os.path.realpath(full), self._roots, unconfined=self._unconfined, need_write=need_write
+        )
 
     def _absolute(self, path: str) -> bool:
         """Whether this request should be handled as an absolute path.
@@ -773,46 +790,76 @@ class CallerProcessFilesystem:
         """
         import json as _json
 
-        from omnigent.entities.pagination import paginate_in_memory
-
         target, prefix = self._target(path)
 
-        # Shell-quote the generated script; target is embedded via json.dumps.
-        # Per-entry try/except handles broken symlinks.
+        # Keep the helper's response below os_env.shell's 100,000-character
+        # stdout cap, even when names are unusually long or need JSON escaping.
         _script = "\n".join(
             [
                 "import os, json",
                 f"d = {_json.dumps(target)}",
+                f"prefix = {_json.dumps(prefix)}",
+                f"after = {after!r}",
+                f"before = {before!r}",
+                f"order = {_json.dumps(order)}",
+                f"limit = {limit}",
+                "names = sorted(os.listdir(d), reverse=order == 'desc')",
+                "def cursor_index(cursor):",
+                "    if cursor is None: return None",
+                "    if prefix:",
+                "        start = prefix + os.sep",
+                "        if not cursor.startswith(start): return None",
+                "        cursor = cursor[len(start):]",
+                "    try: return names.index(cursor)",
+                "    except ValueError: return None",
+                "after_index = cursor_index(after)",
+                "before_index = cursor_index(before)",
+                "start = after_index + 1 if after_index is not None else 0",
+                "end = before_index if before_index is not None else len(names)",
+                "positions = (range(end - 1, start - 1, -1) if before_index is not None",
+                "             else range(start, end))",
                 "es = []",
-                "for e in sorted(os.listdir(d)):",
+                "size = 0",
+                "has_more = False",
+                "for i in positions:",
+                "    e = names[i]",
                 "    p = os.path.join(d, e)",
                 "    try:",
                 "        st = os.stat(p)",
                 "        t = 'd' if os.path.isdir(p) else 'f'",
-                "        es.append({'n': e, 's': st.st_size if t == 'f' else None,",
-                "            'm': int(st.st_mtime), 't': t})",
+                "        item = {'n': e, 's': st.st_size if t == 'f' else None,",
+                "                'm': int(st.st_mtime), 't': t}",
                 "    except OSError:",
                 "        try:",
                 "            ls = os.lstat(p)",
-                "            es.append({'n': e, 's': None, 'm': int(ls.st_mtime), 't': 'f'})",
+                "            item = {'n': e, 's': None, 'm': int(ls.st_mtime), 't': 'f'}",
                 "        except OSError:",
-                "            pass",
-                "print(json.dumps(es))",
+                "            continue",
+                "    item_size = len(json.dumps(item)) + 1",
+                "    if len(es) >= limit or size + item_size > 90000:",
+                "        has_more = True",
+                "        break",
+                "    es.append(item)",
+                "    size += item_size",
+                "if before_index is not None: es.reverse()",
+                "print(json.dumps({'es': es, 'has_more': has_more}))",
             ]
         )
         result = await _run_os_env_async(
             self._os_env.shell,
             f"python3 -c {_shell_quote(_script)}",
         )
-        if "error" in result:
+        if "error" in result or result.get("exit_code") != 0:
             raise FilesystemPathNotFound(f"Directory {path!r} not found or not accessible")
 
         entries: list[FilesystemEntry] = []
         try:
-            raw = _json.loads(result.get("stdout", "[]"))
-        except _json.JSONDecodeError:
-            raw = []
-        for item in raw:
+            raw = _json.loads(result["stdout"])
+            if not isinstance(raw["es"], list) or not isinstance(raw["has_more"], bool):
+                raise ValueError("Invalid directory listing")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid directory listing for {path!r}") from exc
+        for item in raw["es"]:
             name = item["n"]
             rel = os.path.join(prefix, name) if prefix else name
             entry_type: Literal["file", "directory"] = "directory" if item["t"] == "d" else "file"
@@ -827,13 +874,11 @@ class CallerProcessFilesystem:
                 )
             )
 
-        return paginate_in_memory(
-            entries,
-            id_fn=lambda e: e.id,
-            limit=limit,
-            after=after,
-            before=before,
-            order=order,
+        return PagedList(
+            data=entries,
+            first_id=entries[0].id if entries else None,
+            last_id=entries[-1].id if entries else None,
+            has_more=raw["has_more"],
         )
 
     async def search_files(
@@ -1063,9 +1108,12 @@ print(json.dumps({'r': results, 't': truncated}))
     ) -> FileContent:
         """Read file content via the sandboxed helper.
 
-        Uses ``os_env.read()`` so the sandbox enforces read access.
+        Uses ``os_env.read()`` so the sandbox enforces read access. A path
+        admitted only because the environment is unconfined is read
+        in-process instead.
 
-        :param path: Relative file path.
+        :param path: Relative file path, or an absolute path elsewhere on
+            the filesystem.
         :param max_bytes: Maximum bytes to read. Defaults to
             ``_MAX_READ_BYTES`` (10 MiB).
         :param limit: Optional line cap within the byte-limited prefix.
@@ -1076,11 +1124,17 @@ print(json.dumps({'r': results, 't': truncated}))
         """
         byte_cap = max_bytes or _MAX_READ_BYTES
 
-        if self._absolute(path):
+        absolute = self._absolute(path)
+        validated = "" if absolute else _validate_path(path)
+        if not absolute and not validated:
+            raise InvalidPath("Cannot read the environment root")
+        # A workspace path keeps its relative form: the helper runs with cwd at
+        # the root and enforces the environment's reach itself, so a symlink
+        # into a declared grant reads as it always has.
+        target = validated
+        if absolute or self._follow_outward_links:
             resolved = self._resolve(path)
-            if self._within_grants(resolved):
-                target = str(resolved)
-            else:
+            if not self._within_grants(resolved):
                 # Only reachable when the environment is unconfined —
                 # ``_resolve`` rejects out-of-grant paths otherwise — so there
                 # is no sandbox to route around. Runs the same implementation
@@ -1088,10 +1142,8 @@ print(json.dumps({'r': results, 't': truncated}))
                 # agent-tool policy rather than a browsing boundary.
                 direct = await _run_impl_direct(_read_impl, resolved, 1, limit, byte_cap)
                 return self._file_content(path, direct, byte_cap)
-        else:
-            target = _validate_path(path) if path else ""
-            if not target:
-                raise InvalidPath("Cannot read the environment root")
+            if absolute:
+                target = str(resolved)
 
         result = await _run_os_env_async(
             self._os_env.read,

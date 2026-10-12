@@ -87,22 +87,31 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Custom agents](./custom-agents.md) covers Settings listing, creation, summary
+  review, deletion, and capability gating.
+
 - [Composer](./composer.md) covers the session and new-session composers,
   the model/effort pill, the configuration gear, and slash commands.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent
   terminal, shell terminals, and terminal reattachment.
 - [Native harnesses](./native-harnesses.md) is the matrix of every native
   harness against launch, authentication, model and effort selection,
-  approvals, resume, and terminal behavior, with Codex disconnect test boundaries.
+  approvals, resume, and terminal behavior, with native disconnect test boundaries.
 - [Login and host authentication](./login-and-host-auth.md) covers
   `omnigent login`, host daemon credentials, Databricks auth modes, and embedded
   authentication for project writes.
 - [Sessions](./sessions.md) covers the sidebar, whole-session and message forks,
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 
+- [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
+  Canvas links, and native tracking.
+
+- [Azure DevOps pull requests](./azure-devops.md) covers the shared panel,
+  composer, associations, partial results, and Canvas links.
+
 ## Seed scope
 
-The five recipes above are the seed set. Completing this set means checking
+The original five recipes form the seed set. Completing this set means checking
 the listed entry points against current source and recording how to verify
 them, including explicit gaps. It does not mean that every recipe has been
 driven live or that the whole product is mapped. Keep the backlog below
@@ -151,13 +160,18 @@ map an area, remove it here in the same change.
   `omnigent import`
 - Bundled agents and the Copilot harness: `omnigent polly`, `omnigent debby`,
   `omnigent copilot`
+- Installing reusable agents: `omnigent agent`
 - Integrations, extensions, and remote sandboxes: `omnigent integration`,
   `omnigent extensions`, `omnigent sandbox`
 
 **Partly mapped:** embedded authentication covers project writes and supporting
 account-context tests; other resource APIs and real identity-provider journeys
-remain unmapped. Native disconnect recipes cover Codex transport/startup and
-browser stream recovery, not live reconnect across every harness. The
+remain unmapped. Native disconnect recipes cover Codex transport/startup,
+completed Claude children after handoff, and browser stream recovery, not live
+reconnect across every harness. Network
+interruptions for claude-native are tracked as scenario rows in
+`docs/network-resilience.md`, driven by the resilience lab in
+`tests/e2e/resilience/`. The
 header-menu/custom-agent fork combination still needs a manual browser drive.
 
 **No UI test lane yet:** Slack, the iOS and Android apps, policies and cost

@@ -794,7 +794,12 @@ async def test_success_starts_forwarder_without_reporting_startup_failure(
     ) -> AsyncIterator[SimpleNamespace]:
         yield SimpleNamespace(patch=AsyncMock(return_value=SimpleNamespace(status_code=200)))
 
-    supervise = AsyncMock()
+    record_at_forwarding: list[str | None] = []
+    supervise = AsyncMock(
+        side_effect=lambda **_: record_at_forwarding.append(
+            read_bridge_startup_error(startup.bridge_dir)
+        )
+    )
     monkeypatch.setattr(
         forwarder, "wait_for_thread_started", AsyncMock(return_value="thread-ready")
     )
@@ -807,7 +812,8 @@ async def test_success_starts_forwarder_without_reporting_startup_failure(
         await _discover(startup)
 
     assert _failure_records(caplog) == []
-    assert read_bridge_startup_error(startup.bridge_dir) is None
+    # No startup failure is on record once forwarding begins.
+    assert record_at_forwarding == [None]
     state = read_bridge_state(startup.bridge_dir)
     assert state is not None
     assert state.session_id == startup.session_id

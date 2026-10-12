@@ -17,7 +17,7 @@ def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
     ``host:`` section — that last fallback would leak the machine's host_id
     into requests, so any "no slice key on this call" assertion would flake
     depending on where the suite runs. Force the read-only lookup to ``None``
-    and clear the runner env so CLI tests exercise only the host they name.
+    and clear the routing settings so tests exercise only the host they name.
 
     ``autouse=True`` keeps the isolation on by default; tests that need a real
     host identity re-patch ``load_host_identity_if_present`` themselves.
@@ -27,3 +27,4 @@ def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda *a, **k: None,
     )
     monkeypatch.delenv("OMNIGENT_RUNNER_SLICE_KEY", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", raising=False)

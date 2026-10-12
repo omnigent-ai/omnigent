@@ -15,6 +15,12 @@ import httpx
 
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+from tests._helpers.compat import (
+    compat_runner_cwd,
+    compat_runner_python,
+    compat_server_cwd,
+    compat_server_python,
+)
 from tests._helpers.live_server import find_free_port, local_server_env, terminate_process
 
 
@@ -85,6 +91,7 @@ class ServerRunner:
         self._server_cwd = server_cwd
         self.server: subprocess.Popen[bytes] | None = None
         self.runner: subprocess.Popen[bytes] | None = None
+        self.host: subprocess.Popen[bytes] | None = None
 
     def _spawn(
         self,
@@ -96,8 +103,15 @@ class ServerRunner:
         cwd: Path | None = None,
     ) -> subprocess.Popen[bytes]:
         log = self._resources.enter_context(self.log_path(name).open("ab"))
+        pinned_python = compat_server_python() if name == "server" else compat_runner_python()
+        if pinned_python is not None:
+            # Neither the checkout cwd nor PYTHONPATH may shadow the pinned build.
+            env = {**env, "PYTHONPATH": None}
+            neutral_cwd = compat_server_cwd() if name == "server" else compat_runner_cwd()
+            assert neutral_cwd is not None
+            cwd = Path(neutral_cwd)
         proc = subprocess.Popen(
-            [sys.executable, *args],
+            [pinned_python or sys.executable, *args],
             env=_process_env(home, env, self._base_env),
             cwd=cwd,
             stdout=log,
@@ -134,7 +148,7 @@ class ServerRunner:
         deadline = time.monotonic() + self._health_timeout
         last = "not polled"
         while time.monotonic() < deadline:
-            for proc in (self.server, self.runner):
+            for proc in (self.server, self.runner, self.host):
                 assert proc is None or proc.poll() is None, (
                     f"Process exited with code {proc.returncode} before {url} was ready.\n"
                     f"{self.log_tail()}"
@@ -184,6 +198,22 @@ class ServerRunner:
         self.start_server()
         if self.runner is not None:
             self._wait_ready(runner=True)
+
+    def start_host(
+        self,
+        *,
+        env: Mapping[str, str | None] | None = None,
+        cwd: Path | None = None,
+    ) -> None:
+        """Start a host daemon that launches runners through the server's host API."""
+        assert self.host is None, "host already started"
+        self.host = self._spawn(
+            "host",
+            ["-m", "omnigent.host._daemon_entry", "--server", self.base_url],
+            self.runner_home,
+            env or {},
+            cwd=cwd,
+        )
 
     def start_runner(
         self,

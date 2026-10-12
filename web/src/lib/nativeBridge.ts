@@ -119,6 +119,8 @@ interface NativeShellApi {
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
   /** Re-point this window/shell to a server URL returned by the picker. */
   switchServer?: (url: string) => Promise<void>;
+  /** Sign the window's server out. Absent on shells that predate it. */
+  signOutOfServer?: () => Promise<boolean>;
   /** Return to the shell's "connect to server" setup page. */
   openServerSetup?: () => void;
   /**
@@ -212,7 +214,7 @@ interface ElectronDesktopApi extends NativeShellApi {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean },
+    opts?: { force?: boolean; agent?: boolean; sourceHostId?: string },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
@@ -238,6 +240,8 @@ export type HostControlAction = "start" | "stop" | "restart";
 
 /** Result of connecting the Arca instance as a host, from the desktop shell. */
 export interface ArcaConnectResult extends HostActionResult {
+  /** Actual daemon identity captured on Arca for this selected server target. */
+  identity?: { serverUrl: string; hostId: string };
   /**
    * The box's host daemon was already connected to this server (the command
    * reused it) — so no new host will appear in the host list.
@@ -377,6 +381,17 @@ export interface ServerPickerInfo {
   managedServers?: string[];
   /** Display names for managed servers, server URL → name. Absent on older shells. */
   managedServerNames?: Record<string, string>;
+  /**
+   * Whether the shell owns this server's sign-in (Databricks or OIDC browser
+   * sign-in) and can sign it out. Absent on older shells.
+   */
+  canSignOut?: boolean;
+  /**
+   * Names servers gave themselves in their manifest, origin → name. Display
+   * only (a server can call itself anything), so show the host alongside.
+   * Absent on older shells.
+   */
+  serverNames?: Record<string, string>;
   /** Recently-connected server URLs, most recent first. */
   recentServers: string[];
   /**
@@ -540,6 +555,15 @@ export async function cancelBrowserRecentSessionSwitch(): Promise<void> {
  */
 export function isMacElectronShell(): boolean {
   return isElectronShell() && navigator.userAgent.includes("Macintosh");
+}
+
+/**
+ * Mark `<html>` with `data-electron-mac` so the `[data-electron-mac]` rules
+ * reach portals outside AppShell. The shell never changes at runtime, so call
+ * once before first paint.
+ */
+export function applyMacElectronShellAttribute(): void {
+  if (isMacElectronShell()) document.documentElement.dataset.electronMac = "true";
 }
 
 /** True when running inside the iOS WKWebView native shell. */
@@ -872,6 +896,22 @@ export async function switchServer(url: string): Promise<void> {
     await native.switchServer(url);
   } catch (err) {
     console.warn("[nativeBridge] native switchServer failed:", err);
+  }
+}
+
+/**
+ * Ask the native shell to sign this window's server out. Every window on that
+ * server returns to the setup page, and the next Connect signs in through the
+ * browser. Resolves false off-shell or when the shell can't sign it out.
+ */
+export async function signOutOfServer(): Promise<boolean> {
+  const native = nativeApi();
+  if (!native?.signOutOfServer) return false;
+  try {
+    return (await native.signOutOfServer()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] native signOutOfServer failed:", err);
+    return false;
   }
 }
 

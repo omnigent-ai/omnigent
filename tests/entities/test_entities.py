@@ -281,6 +281,24 @@ def test_parse_function_call() -> None:
         {"agent": "a", "name": "fn", "arguments": "{}", "call_id": "c1"},
     )
     assert isinstance(data, FunctionCallData)
+    assert "namespace" not in data.model_dump()
+
+
+def test_parse_function_call_keeps_tool_namespace() -> None:
+    """A call to a tool outside the default namespace round-trips its namespace."""
+    data = parse_item_data(
+        "function_call",
+        {
+            "agent": "a",
+            "name": "sleep",
+            "arguments": "{}",
+            "call_id": "c1",
+            "namespace": "container",
+        },
+    )
+    assert isinstance(data, FunctionCallData)
+    assert data.namespace == "container"
+    assert data.model_dump()["namespace"] == "container"
 
 
 def test_parse_function_call_output() -> None:

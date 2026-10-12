@@ -3,7 +3,7 @@
  * (``/v1/connections/databricks/*``).
  *
  * Lets a signed-in user connect their Databricks workspace so their managed
- * sandboxes reach the Databricks AI Gateway (MCP + model serving) as them. The
+ * sandboxes reach the Databricks Unity Gateway (MCP + model serving) as them. The
  * connect flow is a full-page redirect to the workspace's OAuth endpoint (the
  * server owns the U2M + PKCE handshake); status and disconnect are JSON.
  * Mirrors ``githubIntegration.ts``.

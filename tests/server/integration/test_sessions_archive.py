@@ -13,6 +13,7 @@ pipeline without subprocesses.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import gzip
 import io
 import tarfile
@@ -296,7 +297,7 @@ async def test_archive_tears_down_host_spawned_runner(
         )
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
-        _sessions_common._intentional_stop_sessions.discard(session_id)
+        _sessions_common._intentional_stop_sessions.pop(session_id, None)
 
 
 async def test_failed_archive_leaves_session_running(
@@ -623,6 +624,63 @@ async def test_cancel_cannot_interrupt_teardown_in_flight(
             assert not registered.cancelled()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_delete_worktree_requires_archive(
+    client: httpx.AsyncClient,
+) -> None:
+    """``delete_worktree`` without ``archived=true`` is rejected."""
+    session = await create_test_session(client, name="archive-worktree-invalid")
+    resp = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"title": "x", "delete_worktree": True},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("delete_worktree", [True, False])
+async def test_archive_stop_removes_worktree_when_requested(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    delete_worktree: bool,
+) -> None:
+    """The archive teardown removes the worktree (keeping the branch) only on opt-in."""
+    session = await create_test_session(client, name=f"archive-worktree-{delete_worktree}")
+    session_id = session["id"]
+    await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    real_conv = conv_store.get_conversation(session_id)
+    assert real_conv is not None
+    worktree_conv = dataclasses.replace(
+        real_conv,
+        git_branch="feature/x",
+        workspace="/repo-worktrees/feature-x",
+        host_id="host_1",
+        runner_id=None,
+    )
+    mock_remove = AsyncMock()
+    with (
+        patch.object(conv_store, "get_conversation", return_value=worktree_conv),
+        patch.object(_sessions_facade, "_best_effort_stop", AsyncMock()),
+        patch.object(_sessions_facade, "_remove_session_worktree_best_effort", mock_remove),
+    ):
+        await _sessions_orchestration._archive_stop(
+            session_id,
+            conv_store,
+            runner_router=None,
+            host_registry=None,
+            delete_worktree=delete_worktree,
+        )
+    if not delete_worktree:
+        mock_remove.assert_not_awaited()
+        return
+    mock_remove.assert_awaited_once()
+    kwargs = mock_remove.await_args.kwargs
+    assert kwargs["worktree_path"] == "/repo-worktrees/feature-x"
+    assert kwargs["branch"] == "feature/x"
+    assert kwargs["delete_branch"] is False
+    assert kwargs["exclude_conversation_id"] == session_id
 
 
 # ── Agent contents download ──────────────────────────────

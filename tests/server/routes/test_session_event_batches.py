@@ -1,9 +1,9 @@
 """Tests for the batch path in POST /v1/sessions/{id}/events.
 
 When a batch contains consecutive batchable external_conversation_item entries
-(other than user messages, slash_command items, and entries with created_by or
-tools), the route authorizes once and calls conversation_store.append once per
-run instead of once per item.
+(other than user messages, slash_command items, shell-command inputs, and
+entries with created_by or tools), the route authorizes once and calls
+conversation_store.append once per run instead of once per item.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import omnigent.server.routes.sessions.routes_events as routes_events_mod
 from omnigent.entities import NewConversationItem
 from omnigent.entities.conversation import Conversation, ConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runtime import pending_inputs
 from omnigent.server.routes.sessions import create_sessions_router
 
 _SESSION_ID = "conv_test"
@@ -270,6 +271,25 @@ def _slash_command_event(
                 "arguments": arguments,
             },
             "response_id": response_id,
+        },
+    }
+
+
+def _terminal_command_event(
+    kind: str,
+    *,
+    source_id: str,
+    response_id: str = "resp_shell",
+    **fields: Any,
+) -> dict:
+    """One half of a mirrored ``!cmd`` shell command (``kind`` is ``input`` or ``output``)."""
+    return {
+        "type": "external_conversation_item",
+        "data": {
+            "item_type": "terminal_command",
+            "item_data": {"kind": kind, **fields},
+            "response_id": response_id,
+            "source_id": source_id,
         },
     }
 
@@ -660,6 +680,39 @@ def test_skill_slash_command_item_uses_per_entry_path() -> None:
     assert len(store.append_calls[0]) == 1
     assert store.append_calls[1][0].type == "slash_command"
     assert len(store.append_calls[2]) == 1
+
+
+# ── tests: shell command input stays on the per-entry path ────────────────────
+
+
+def test_shell_command_input_uses_per_entry_path() -> None:
+    """The input half of a ``!cmd`` drains a pending entry, so it leaves the coalesced run.
+
+    Its output half and the items around it stay batchable: only the input
+    needs the pending-input drain the per-entry path performs.
+    """
+    batch = [
+        _assistant_event(source_id="shell_pre"),
+        _terminal_command_event("input", source_id="shell_in", input="pwd"),
+        _terminal_command_event("output", source_id="shell_out", stdout="/tmp", stderr=""),
+        _assistant_event(source_id="shell_post"),
+    ]
+    pending_inputs.reset_for_tests()
+    pending_inputs.record(_SESSION_ID, [{"type": "input_text", "text": "!pwd"}])
+    try:
+        resp, store = _post(batch)
+
+        assert resp.status_code == 202, resp.text
+        assert len(resp.json()) == 4
+        assert [[item.type for item in call] for call in store.append_calls] == [
+            ["message"],
+            ["terminal_command"],
+            ["terminal_command", "message"],
+        ]
+        # Only the per-entry path drains, so the queued ``!pwd`` entry is gone.
+        assert pending_inputs.snapshot_for(_SESSION_ID) == []
+    finally:
+        pending_inputs.reset_for_tests()
 
 
 # ── tests: stable_id only when source_id is present ──────────────────────────

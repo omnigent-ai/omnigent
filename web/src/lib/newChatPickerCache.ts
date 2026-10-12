@@ -37,6 +37,7 @@ const pickerAgentSchema = agentSchema.extend({
   skills: z.array(z.object({ name: z.string(), description: z.string() })),
   builtin: z.boolean().optional(),
   acpHarness: z.boolean().optional(),
+  mine: z.literal(true).optional(),
 });
 const modelOptionSchema = z.object({
   id: z.string(),

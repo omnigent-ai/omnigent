@@ -30,6 +30,13 @@ backend — no real provider creds.
   isolated `userData` dir. `launchDesktop({ serverUrl })` pre-seeds a saved
   server so the app boots straight into the shell (skip connect); omit it to
   film the connect journey.
+- `desktop_oidc_browser_sign_in.e2e.js` — OIDC sign-in through the system
+  browser against an OIDC-mode server and `fixtures/fakeOidcIdp.js`. The
+  "system browser" is `fixtures/fakeSystemBrowser.cjs`, preloaded before
+  `main.js` (`launchDesktop({ preload })`), which replaces `shell.openExternal`
+  with a cookie-carrying redirect follower, so it runs on macOS and Linux. Covers
+  connect, silent renewal, relaunch, and sign-out, and asserts the app window
+  never loads the IdP.
 - `desktop_connect.e2e.js` — the reference test to **copy** for a desktop bug:
   launch → setup page → type URL → Connect → land in the shell. Its `.webm` is
   the desktop journey footage.

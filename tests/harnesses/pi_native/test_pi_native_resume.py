@@ -281,6 +281,73 @@ def test_full_tool_roundtrip_chains_correctly() -> None:
         assert cur["parentId"] == prev["id"]
 
 
+@pytest.mark.parametrize(
+    "call_count,text_index,reasoning",
+    [(2, 0, False), (2, 2, False), (2, 1, True), (1, 1, False)],
+    ids=["text-first", "text-last", "interleaved-reasoning", "single-call"],
+)
+def test_response_keeps_tool_calls_and_results_adjacent(
+    call_count: int, text_index: int, reasoning: bool
+) -> None:
+    call_ids = [f"c{i}" for i in range(call_count)]
+    response = [
+        _function_call_item(name="read", call_id=cid, arguments="{}", item_id=cid)
+        for cid in call_ids
+    ]
+    response.insert(text_index, _assistant_item("Reading files."))
+    if reasoning:
+        response.insert(1, {"type": "reasoning", "id": "thinking", "response_id": "r1"})
+    items = [
+        _user_item("read files"),
+        *response,
+        *[
+            _function_output_item(call_id=cid, output=cid, item_id=f"out-{cid}")
+            for cid in call_ids
+        ],
+        _assistant_item("Done.", item_id="final", response_id="r2"),
+    ]
+    records = pi_session_records_from_session_items(
+        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
+    )
+    entries = records[1:]
+    messages = [entry["message"] for entry in entries]
+    assert [msg["role"] for msg in messages] == [
+        "user",
+        "assistant",
+        *["toolResult"] * call_count,
+        "assistant",
+    ]
+    content = messages[1]["content"]
+    assert [b["type"] for b in content] == (
+        ["toolCall"] * text_index + ["text"] + ["toolCall"] * (call_count - text_index)
+    )
+    assert [b["id"] for b in content if b["type"] == "toolCall"] == call_ids
+    assert content[text_index] == {"type": "text", "text": "Reading files."}
+    assert messages[1]["model"] == "claude-opus-4-8"
+    assert [msg["toolCallId"] for msg in messages[2:-1]] == call_ids
+    assert entries[0]["parentId"] is None
+    for prev, cur in itertools.pairwise(entries):
+        assert cur["parentId"] == prev["id"]
+    again = pi_session_records_from_session_items(
+        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
+    )
+    assert [r["id"] for r in records] == [r["id"] for r in again]
+
+
+@pytest.mark.parametrize("response_ids", [("r1", "r2"), ("", ""), (None, None)])
+def test_distinct_or_missing_response_ids_stay_separate(response_ids: tuple) -> None:
+    items = [_assistant_item("first"), _assistant_item("second", item_id="a2")]
+    for item, response_id in zip(items, response_ids, strict=True):
+        item["response_id"] = response_id
+    records = pi_session_records_from_session_items(
+        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
+    )
+    assert [r["message"]["content"] for r in records[1:]] == [
+        [{"type": "text", "text": "first"}],
+        [{"type": "text", "text": "second"}],
+    ]
+
+
 def test_empty_text_items_are_dropped() -> None:
     items = [
         {"id": "u1", "type": "message", "role": "user", "content": []},

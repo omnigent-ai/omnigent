@@ -765,3 +765,24 @@ def test_log_once_respects_level_and_captures_exc_info(
     assert len(records) == 1  # identical repeat dropped
     assert records[0].levelno == logging.WARNING
     assert records[0].exc_info is not None  # first occurrence keeps its traceback
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("see https://u:p@h.example/x", "see https://[REDACTED]@h.example/x"),
+        ("git clone ssh://git@github.com/o/r", "git clone ssh://[REDACTED]@github.com/o/r"),
+        ("plain https://h.example/p?q=1#f", "plain https://h.example/p?q=1#f"),
+        ("an email a@b.c and a path /x@y", "an email a@b.c and a path /x@y"),
+    ],
+)
+def test_redact_log_text_strips_url_userinfo(text: str, expected: str) -> None:
+    assert redact_log_text(text) == expected
+
+
+def test_redact_log_text_handles_large_url_without_userinfo_in_linear_time() -> None:
+    text = "https://" + "a" * 200_000 + " " + "://" * 50_000
+    started = time.perf_counter()
+    output = redact_log_text(text)
+    assert time.perf_counter() - started < 0.5
+    assert output == text

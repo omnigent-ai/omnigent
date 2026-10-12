@@ -10,10 +10,13 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.harnesses.codex_egress import detect_certificate_failure
 from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     read_bridge_state,
+    read_certificate_failure,
+    record_certificate_failure,
     write_bridge_state,
 )
 from tests.harnesses.codex_native.forwarder._support import (
@@ -243,29 +246,42 @@ async def test_handle_event_surfaces_non_retrying_error_notification(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_handle_event_ignores_retrying_error_notification(tmp_path: Path) -> None:
-    """Retryable Codex errors remain internal while Codex retries the turn."""
+@pytest.mark.parametrize("shape", ["legacy-message-only", "reconnect-without-http-status"])
+async def test_handle_event_ignores_retrying_error_notification(
+    tmp_path: Path, shape: str
+) -> None:
+    """Retryable Codex errors remain internal while Codex retries the turn.
+
+    Without launcher certificate evidence, neither the legacy retry shape nor
+    Codex's reconnect notification posts a status edge or interrupts the turn.
+    """
     client = _RecordingClient()
+    codex_client = _InterruptRecordingCodexClient()
+    _seed_active_turn(tmp_path, "turn_123")
+    params = (
+        {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "willRetry": True,
+            "error": {"message": "connection dropped"},
+        }
+        if shape == "legacy-message-only"
+        else _connection_retry_params()
+    )
 
     await fwd._handle_event(
         client,  # type: ignore[arg-type]
         session_id="conv_x",
         bridge_dir=tmp_path,
-        event={
-            "method": "error",
-            "params": {
-                "threadId": "thread_123",
-                "turnId": "turn_123",
-                "willRetry": True,
-                "error": {"message": "connection dropped"},
-            },
-        },
+        event={"method": "error", "params": params},
         usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
         elicitation_tracker=fwd._CodexElicitationTaskTracker(),
         expected_thread_id="thread_123",
+        codex_client=codex_client,  # type: ignore[arg-type]
     )
 
     assert client.posts == []
+    assert codex_client.requests == []
 
 
 @pytest.mark.asyncio
@@ -614,3 +630,231 @@ async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
     assert data["status"] == "idle"
     assert "output" not in data
     assert "reauth_required" not in data
+
+
+_CERTIFICATE_LINE = (
+    "Failed to fetch safe flags from proxy: [SSL: SSLV3_ALERT_CERTIFICATE_EXPIRED] "
+    "ssl/tls alert certificate expired (_ssl.c:2580)"
+)
+
+
+def _connection_retry_params(*, http_status: int | None = None) -> dict:
+    """The ``error``/``willRetry`` notification codex-cli 0.154 emits per reconnect."""
+    return {
+        "threadId": "thread_123",
+        "turnId": "turn_123",
+        "willRetry": True,
+        "error": {
+            "message": "Reconnecting... waiting for network",
+            "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": http_status}},
+            "additionalDetails": "Connection failed: error sending request",
+        },
+    }
+
+
+class _InterruptRecordingCodexClient:
+    """Codex app-server client stub that records the RPCs the forwarder issues."""
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, dict]] = []
+
+    async def request(self, method: str, params: dict) -> dict:
+        self.requests.append((method, params))
+        return {"result": {}}
+
+
+def _record_launcher_certificate_failure(bridge_dir: Path) -> None:
+    failure = detect_certificate_failure(_CERTIFICATE_LINE)
+    assert failure is not None
+    record_certificate_failure(bridge_dir, failure)
+
+
+@pytest.mark.asyncio
+async def test_handle_event_fails_retrying_turn_on_launcher_certificate_failure(
+    tmp_path: Path,
+) -> None:
+    """A reconnect loop behind a launcher-reported certificate failure fails the turn.
+
+    The failure names the certificate. Codex never ends such a turn on its
+    own, so the forwarder interrupts it, publishes the failure with the next
+    step, and owns the turn's terminal status so the interrupt's own boundary
+    does not flip it back to idle.
+    """
+    client = _RecordingClient()
+    codex_client = _InterruptRecordingCodexClient()
+    _seed_active_turn(tmp_path, "turn_123")
+    _record_launcher_certificate_failure(tmp_path)
+    forwarder_state = fwd._CodexForwarderState(
+        parent_session_id="conv_x",
+        codex_client=codex_client,  # type: ignore[arg-type]
+        model="gpt-5",
+    )
+    usage_coalescer = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={"method": "error", "params": _connection_retry_params()},
+        usage_coalescer=usage_coalescer,
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        codex_client=codex_client,  # type: ignore[arg-type]
+        forwarder_state=forwarder_state,
+    )
+
+    assert codex_client.requests == [
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_123"})
+    ]
+    assert len(client.posts) == 1
+    url, body = client.posts[0]
+    assert url == "/v1/sessions/conv_x/events"
+    assert body["type"] == "external_session_status"
+    assert body["data"]["status"] == "failed"
+    assert body["data"]["response_id"] == "codex_turn_123"
+    assert "reauth_required" not in body["data"]
+    output = body["data"]["output"]
+    assert output.startswith(
+        "Codex could not connect to its model endpoint for gpt-5: the TLS certificate has expired"
+    )
+    assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in output
+    assert "run dbcert" in output
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id is None
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_123",
+                "turn": {"id": "turn_123", "status": "interrupted", "items": []},
+            },
+        },
+        usage_coalescer=usage_coalescer,
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        codex_client=codex_client,  # type: ignore[arg-type]
+        forwarder_state=forwarder_state,
+    )
+
+    # The interrupt's own boundary signals the interruption but never posts a
+    # second status edge that would flip the failure back to idle.
+    status_posts = [
+        body["data"]["status"]
+        for _url, body in client.posts
+        if body["type"] == "external_session_status"
+    ]
+    assert status_posts == ["failed"]
+
+
+@pytest.mark.asyncio
+async def test_handle_event_retry_with_http_status_is_not_blamed_on_certificate(
+    tmp_path: Path,
+) -> None:
+    """A retry that got an HTTP response reached the endpoint over TLS, so Codex keeps retrying."""
+    client = _RecordingClient()
+    codex_client = _InterruptRecordingCodexClient()
+    _seed_active_turn(tmp_path, "turn_123")
+    _record_launcher_certificate_failure(tmp_path)
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={"method": "error", "params": _connection_retry_params(http_status=503)},
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        codex_client=codex_client,  # type: ignore[arg-type]
+    )
+
+    assert client.posts == []
+    assert codex_client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_handle_event_without_turn_state_leaves_retry_to_codex(tmp_path: Path) -> None:
+    """Without per-turn state (child sessions) the forwarder neither interrupts nor posts."""
+    client = _RecordingClient()
+    codex_client = _InterruptRecordingCodexClient()
+    _seed_active_turn(tmp_path, "turn_123")
+    _record_launcher_certificate_failure(tmp_path)
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={"method": "error", "params": _connection_retry_params()},
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        codex_client=codex_client,  # type: ignore[arg-type]
+    )
+
+    assert client.posts == []
+    assert codex_client.requests == []
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_123"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "params",
+    [
+        {
+            "threadId": "thread_123",
+            "turn": {"id": "turn_123", "status": "completed", "items": [{"type": "agentMessage"}]},
+        },
+        {"threadId": "thread_123", "turnId": "turn_123"},
+    ],
+    ids=["status-completed", "legacy-turn-id-only"],
+)
+async def test_completed_turn_clears_launcher_certificate_record(
+    tmp_path: Path, params: dict
+) -> None:
+    """A turn that reaches the model proves the egress works; the launch-time line is forgotten."""
+    client = _RecordingClient()
+    _seed_active_turn(tmp_path, "turn_123")
+    _record_launcher_certificate_failure(tmp_path)
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={"method": "turn/completed", "params": params},
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+    )
+
+    assert read_certificate_failure(tmp_path) is None
+    assert [post[1]["data"]["status"] for post in client.posts] == ["idle"]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_keeps_launcher_certificate_record(tmp_path: Path) -> None:
+    """Stopping a turn that never reached the model is not proof the certificate works."""
+    client = _RecordingClient()
+    _seed_active_turn(tmp_path, "turn_123")
+    _record_launcher_certificate_failure(tmp_path)
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_123",
+                "turn": {"id": "turn_123", "status": "interrupted", "items": []},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+    )
+
+    assert read_certificate_failure(tmp_path) is not None

@@ -150,10 +150,10 @@ def test_reset_button_has_rendered_top_margin(page: Page, appearance_url: str) -
     _open_appearance(page, appearance_url)
     gap = page.get_by_test_id("reset-appearance-button").evaluate(
         """button => {
-            const wrapper = button.closest('div');
-            const controls = wrapper.previousElementSibling;
-            if (!controls) throw new Error('controls column sibling not found');
-            return wrapper.getBoundingClientRect().top - controls.getBoundingClientRect().bottom;
+            const group = button.closest('[data-testid="settings-group-data"]');
+            const controls = group?.previousElementSibling;
+            if (!group || !controls) throw new Error('appearance groups not found');
+            return group.getBoundingClientRect().top - controls.getBoundingClientRect().bottom;
         }"""
     )
     assert gap >= 24, f"Reset button margin is only {gap:.0f}px; expected at least 24px"

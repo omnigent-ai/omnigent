@@ -38,6 +38,7 @@ class _PromptDeliveryTrace:
     stage: str = "lock_wait"
     stage_seconds: dict[str, float] = field(default_factory=dict)
     attempts: list[dict[str, object]] = field(default_factory=list)
+    input_attributes: dict[str, object] = field(default_factory=dict)
 
 
 @_best_effort
@@ -80,6 +81,7 @@ def trace_delivery(
             try:
                 # Hooks import this module on every invocation; keep the sink lazy.
                 from omnigent.debug_logging import current_session_id, debug_event
+                from omnigent.native.input_diagnostics import current_input_attributes
 
                 started = time.monotonic()
                 trace = _PromptDeliveryTrace(
@@ -87,6 +89,7 @@ def trace_delivery(
                     session_id=current_session_id() or session_id_reader(bridge_dir),
                     started=started,
                     stage_started=started,
+                    input_attributes=current_input_attributes(),
                 )
                 token = _prompt_delivery_trace.set(trace)
             except Exception:  # noqa: BLE001 — trace setup must not prevent delivery
@@ -111,6 +114,7 @@ def trace_delivery(
                     if _logger.isEnabledFor(level):
                         normalized = content.replace("\r\n", "\n").replace("\r", "\n")
                         fields = {
+                            **trace.input_attributes,
                             "delivery_id": trace.delivery_id,
                             "stage": trace.stage,
                             "attempt": len(trace.attempts),
@@ -121,6 +125,11 @@ def trace_delivery(
                             and not normalized.split("\n", 1)[0].strip(),
                             "outcome": outcome,
                             "verification": verification,
+                            "delivery_outcome": (
+                                "draft_cleared"
+                                if outcome == "returned" and verification == "draft_absent"
+                                else "unknown"
+                            ),
                             **last_attempt,
                             **{
                                 f"stage_{stage}_ms": round(seconds * 1000)

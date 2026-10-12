@@ -6,6 +6,7 @@
 // field for future compatibility, plus one entry per localStorage key that
 // holds a non-default value.
 
+import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 
 /** localStorage keys that constitute exportable user preferences. */
@@ -23,6 +24,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:hide-unconfigured-harnesses",
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
+  DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY,
   COMPOSER_SEND_SHORTCUT_STORAGE_KEY,
   "web-theme",
 ] as const;

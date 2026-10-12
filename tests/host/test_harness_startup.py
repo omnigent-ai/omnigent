@@ -1,4 +1,4 @@
-"""Launch precedence, env PATH semantics, and privacy at the host boundary."""
+"""Launch precedence, env-wrapper settings, and host defaults."""
 
 import os
 import subprocess
@@ -55,6 +55,10 @@ def test_launch_precedence(
         "command_source": source,
         "resolved_path": str(tmp_path / "tool") if expected == "tool" else None,
         "arg_count": 4,
+        "args": ["--system-prompt", "--SECRET", '{"apiKey":"SECRET"}', "-pSECRET"],
+        "configured_command": command,
+        "configured_args": entry["args"],
+        "environment": {"inherit": True, "variables": {}, "unset": []},
     }
 
 
@@ -84,7 +88,13 @@ def test_env_resolution_matches_real_env(config, tmp_path, prefix, found):
     assert (process.returncode == 0) == found
     assert result.resolved_path == (process.stdout if found else None)
     assert result.command == "tool" and result.arg_count == 1
-    assert "SECRET" not in result.model_dump_json()
+    assert result.args == ["--SECRET"]
+    assert result.configured_command == "/usr/bin/env"
+    assert result.configured_args == args
+    assert result.environment is not None
+    assert result.environment.inherit == (
+        not any(arg in ("-i", "--ignore-environment", "-iuPATH") for arg in prefix)
+    )
 
 
 @pytest.mark.parametrize(
@@ -98,11 +108,56 @@ def test_env_resolution_matches_real_env(config, tmp_path, prefix, found):
         ["-u", "PATH", "-", "tool", "--SECRET"],
     ],
 )
-def test_unsupported_env_syntax_never_exports_arguments(config, args):
+def test_unsupported_env_syntax_retains_the_configured_invocation(config, args):
     config["harness"]["codex-native"] = {"command": "/usr/bin/env", "args": args}
     result = startup.describe_harness_startup("codex-native")
     assert result.command == "/usr/bin/env" and result.arg_count == len(args)
-    assert "SECRET" not in result.model_dump_json()
+    assert result.args == args
+    assert result.configured_args == args
+    assert result.environment is None
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+@pytest.mark.parametrize("command", ["env", "/usr/bin/env"])
+def test_env_settings_preserve_values_and_separate_launch_arguments(config, harness, command):
+    args = [
+        "-i",
+        "-u",
+        "REMOVED",
+        "TOKEN=old",
+        "TOKEN=SECRET=with spaces",
+        "EMPTY=",
+        "tool",
+        "codex",
+        "--",
+        "",
+    ]
+    config["harness"][harness] = {"command": command, "args": args}
+    result = startup.describe_harness_startup(harness)
+    assert result.command == "tool"
+    assert result.args == ["codex", "--", ""]
+    assert result.arg_count == 3
+    assert result.configured_command == command
+    assert result.configured_args == args
+    assert result.environment is not None
+    assert result.environment.model_dump() == {
+        "inherit": False,
+        "variables": {"TOKEN": "SECRET=with spaces", "EMPTY": ""},
+        "unset": ["REMOVED"],
+    }
+    assert "SECRET=with spaces" in result.model_dump_json()
+
+
+def test_no_config_reports_defaults_without_exporting_inherited_values(config, monkeypatch):
+    monkeypatch.setenv("INHERITED_TOKEN", "unrelated-private-value")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "INHERITED_TOKEN")
+    result = startup.describe_harness_startup("claude-native")
+    assert result.command == "claude"
+    assert result.configured_command is None
+    assert result.configured_args == result.args == []
+    assert result.environment is not None
+    assert result.environment.model_dump() == {"inherit": True, "variables": {}, "unset": []}
+    assert "unrelated-private-value" not in result.model_dump_json()
 
 
 @pytest.mark.parametrize(
@@ -111,3 +166,17 @@ def test_unsupported_env_syntax_never_exports_arguments(config, args):
 def test_unsupported_harness(config, harness):
     with pytest.raises(ValueError):
         startup.describe_harness_startup(harness)
+
+
+def test_older_host_payload_without_argument_values_is_accepted():
+    result = startup.HarnessStartup.model_validate(
+        {
+            "command": "claude",
+            "resolved_path": None,
+            "command_source": "default",
+            "arg_count": 2,
+        }
+    )
+    assert result.args is None
+    assert result.configured_args is None
+    assert result.environment is None

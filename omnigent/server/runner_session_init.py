@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -11,11 +12,12 @@ import httpx
 
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
-from omnigent.errors import ErrorCategory
+from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory, ErrorCode, ErrorImpact
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.conversation_store import ConversationStore
     from omnigent.stores.file_store import FileStore
 
@@ -33,6 +35,49 @@ def runner_inference_verified(conversation: Conversation, response: httpx.Respon
     return isinstance(payload, dict) and payload.get("inference_config_verified") is True
 
 
+_BODY_SNIPPET_MAX = 500
+
+# Rejections that mean the runner or session is transiently gone, not a server bug.
+TRANSIENT_REJECTION_STATUSES = frozenset({404, 410, 503})
+
+
+def runner_response_error_body(response: httpx.Response) -> str:
+    """Return a bounded error snippet from a non-2xx runner response.
+
+    Prefers the ``error``, ``detail``, or ``message`` field when the body is
+    JSON, otherwise falls back to the raw text.
+    """
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            for key in ("error", "detail", "message"):
+                val = payload.get(key)
+                if isinstance(val, str) and val:
+                    return val[:_BODY_SNIPPET_MAX]
+    except ValueError:
+        pass
+    return response.text[:_BODY_SNIPPET_MAX]
+
+
+def is_session_agent_removed(response: httpx.Response) -> bool:
+    """
+    Whether *response* is the initializer skipping a session whose agent was removed.
+
+    The runner could only reject that session, and it says so itself on the
+    session's next message, so callers treat this as expected, not a failure.
+
+    :param response: A response from :meth:`RunnerSessionInitializer.initialize`.
+    :returns: ``True`` for the removed-agent response.
+    """
+    if response.status_code != 410:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("error") == ErrorCode.SESSION_AGENT_MISSING
+
+
 _logger = logging.getLogger(__name__)
 
 
@@ -46,16 +91,30 @@ class RunnerSessionInitializer:
         server_version: str,
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
+        agent_store: AgentStore | None = None,
     ) -> None:
         self._registry = registry
         self._server_version = server_version
         self._conversation_store = conversation_store
         self._file_store = file_store
+        self._agent_store = agent_store
         self._tasks: dict[
             tuple[str, int, str, str, str | None, bool],
             asyncio.Task[httpx.Response],
         ] = {}
         self._recovery_ids: dict[tuple[str, int, str, str, str | None, bool], str] = {}
+
+    def generation_for(self, runner_id: str, runner_client: httpx.AsyncClient) -> int:
+        """Identify the current tunnel, or the client for embedded transports."""
+        connection = self._registry.get(runner_id)
+        return connection.generation if connection is not None else id(runner_client)
+
+    def require_generation(
+        self, runner_id: str, runner_client: httpx.AsyncClient, generation: int
+    ) -> None:
+        """Prevent delayed recovery work from following a replacement tunnel."""
+        if self.generation_for(runner_id, runner_client) != generation:
+            raise ConnectionError("runner tunnel changed during session recovery")
 
     async def initialize(
         self,
@@ -65,17 +124,17 @@ class RunnerSessionInitializer:
         timeout: float,
         suppress_recovery_turn: bool = False,
         resume_interrupted_turn: bool = False,
+        generation: int | None = None,
+        store_slots: asyncio.Semaphore | None = None,
     ) -> httpx.Response:
         """Initialize once for the current connection and persisted snapshot."""
         runner_id = conversation.runner_id
         agent_id = conversation.agent_id
         if runner_id is None or agent_id is None:
             raise ValueError("runner session initialization requires runner_id and agent_id")
-        connection = self._registry.get(runner_id)
-        # Production routed clients always have a registry entry. The client
-        # identity fallback keeps embedded/test transports usable without
-        # weakening the real tunnel-generation key.
-        generation = id(connection) if connection is not None else id(runner_client)
+        if generation is None:
+            generation = self.generation_for(runner_id, runner_client)
+        self.require_generation(runner_id, runner_client, generation)
         key = (
             runner_id,
             generation,
@@ -85,6 +144,28 @@ class RunnerSessionInitializer:
             resume_interrupted_turn,
         )
         task = self._tasks.get(key)
+        if task is None and self._agent_store is not None:
+            async with store_slots or nullcontext():
+                agent = await asyncio.to_thread(self._agent_store.get, agent_id)
+            if agent is None:
+                # The user removed the agent (`omnigent agent remove`). The runner
+                # could only reject this init; the session reports the removal on
+                # its next message, so this is expected and not worth a failure.
+                _logger.info(
+                    "Not initializing session %s on its runner: its agent %s was removed",
+                    conversation.id,
+                    agent_id,
+                )
+                return httpx.Response(
+                    410,
+                    json={
+                        "error": ErrorCode.SESSION_AGENT_MISSING,
+                        "detail": SESSION_AGENT_MISSING_MESSAGE,
+                    },
+                    request=httpx.Request("POST", "/v1/sessions"),
+                )
+            # Another caller may have started this initialization during the lookup.
+            task = self._tasks.get(key)
         if task is None:
             recovery_id = (
                 self._recovery_ids.setdefault(key, uuid4().hex)
@@ -106,12 +187,13 @@ class RunnerSessionInitializer:
                         require_filesystem_attachment_runtime,
                     )
 
-                    attachment = await asyncio.to_thread(
-                        _filesystem_attachment_in_history,
-                        conversation.id,
-                        self._conversation_store,
-                        self._file_store,
-                    )
+                    async with store_slots or nullcontext():
+                        attachment = await asyncio.to_thread(
+                            _filesystem_attachment_in_history,
+                            conversation.id,
+                            self._conversation_store,
+                            self._file_store,
+                        )
                     if attachment is not None:
                         require_filesystem_attachment_runtime(
                             host_id=None,
@@ -119,6 +201,7 @@ class RunnerSessionInitializer:
                             host_registry=None,
                             tunnel_registry=self._registry,
                         )
+                self.require_generation(runner_id, runner_client, generation)
                 return await self._post_initialize(
                     runner_client,
                     session_id=conversation.id,
@@ -128,6 +211,7 @@ class RunnerSessionInitializer:
                     resume_interrupted_turn=resume_interrupted_turn,
                     suppress_recovery_turn=suppress_recovery_turn,
                     recovery_id=recovery_id,
+                    generation=generation,
                 )
 
             task = asyncio.create_task(
@@ -137,12 +221,10 @@ class RunnerSessionInitializer:
             self._tasks[key] = task
 
             def _drop_failed(done: asyncio.Task[httpx.Response]) -> None:
+                failed = done.cancelled() or done.exception() is not None
                 if self._tasks.get(key) is not done:
                     return
-                if done.cancelled():
-                    self._tasks.pop(key, None)
-                    return
-                if done.exception() is not None:
+                if failed:
                     self._tasks.pop(key, None)
                     return
                 response = done.result()
@@ -153,11 +235,16 @@ class RunnerSessionInitializer:
         try:
             response = await asyncio.shield(task)
         except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if task.cancelled() and current is not None and not current.cancelling():
+                # Retiring a shared attempt must not cancel its independent callers.
+                raise ConnectionError("runner session initialization was cancelled") from None
             raise
         except Exception:
             if self._tasks.get(key) is task:
                 self._tasks.pop(key, None)
             raise
+        self.require_generation(runner_id, runner_client, generation)
         if not runner_inference_verified(conversation, response):
             response = httpx.Response(
                 409,
@@ -168,12 +255,19 @@ class RunnerSessionInitializer:
             self._tasks.pop(key, None)
         return response
 
-    def invalidate_session(self, session_id: str) -> None:
-        """A new binding needs fresh readiness and a new continuation identity."""
+    def invalidate_session(
+        self, session_id: str, *, runner_id: str | None = None
+    ) -> list[asyncio.Task[httpx.Response]]:
+        """Retire session readiness, optionally only for its former runner binding."""
+        cancelled = []
         for key in list(self._tasks.keys() | self._recovery_ids.keys()):
-            if key[2] == session_id:
-                self._tasks.pop(key, None)
+            if key[2] == session_id and (runner_id is None or key[0] == runner_id):
+                task = self._tasks.pop(key, None)
+                if task is not None and not task.done():
+                    task.cancel()
+                    cancelled.append(task)
                 self._recovery_ids.pop(key, None)
+        return cancelled
 
     async def _post_initialize(
         self,
@@ -186,6 +280,7 @@ class RunnerSessionInitializer:
         resume_interrupted_turn: bool,
         suppress_recovery_turn: bool,
         recovery_id: str | None,
+        generation: int,
     ) -> httpx.Response:
         with runner_log_scope(session_id, runner_id):
             # The flags name the caller: neither set is the tunnel-reconnect
@@ -205,43 +300,81 @@ class RunnerSessionInitializer:
                     "/v1/sessions",
                     json=payload,
                     timeout=timeout,
+                    extensions={"runner_tunnel_generation": generation},
                 )
-            except Exception as exc:
+            except (httpx.TransportError, ConnectionError) as exc:
+                # Tunnel dropped mid-request; both callers recover on the next
+                # runner reconnect, so log without a traceback. The request
+                # rides the runner's tunnel: this is the runner going away.
+                _logger.warning(
+                    "Runner session initialization lost tunnel (%s: %s)",
+                    type(exc).__name__,
+                    exc,
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        exc_type=type(exc).__name__,
+                        error_category=ErrorCategory.RUNNER.value,
+                        error_impact=ErrorImpact.TRANSIENT.value,
+                    ),
+                )
+                raise
+            except Exception:
                 _logger.exception(
                     "Runner session initialization failed",
                     extra=debug_event(
                         "runner_session_init_failed",
                         stage="session_init",
-                        # The request rides the runner's tunnel: a closed tunnel
-                        # (ConnectionError) or offline runner (httpx.ConnectError)
-                        # is the runner going away, not an upstream.
-                        error_category=(
-                            ErrorCategory.RUNNER.value
-                            if isinstance(exc, (ConnectionError, httpx.TransportError))
-                            else None
-                        ),
                     ),
                 )
                 raise
-            failed = not 200 <= response.status_code < 300
-            log = _logger.error if failed else _logger.info
-            log(
-                "Runner session initialization finished",
-                extra=debug_event(
-                    "runner_session_init_failed" if failed else "runner_session_initialized",
-                    stage="session_init",
-                    status_code=response.status_code,
-                ),
-            )
+            if 200 <= response.status_code < 300:
+                _logger.info(
+                    "Runner session initialization finished",
+                    extra=debug_event(
+                        "runner_session_initialized",
+                        stage="session_init",
+                        status_code=response.status_code,
+                    ),
+                )
+            else:
+                body = runner_response_error_body(response)
+                log = (
+                    _logger.warning
+                    if response.status_code in TRANSIENT_REJECTION_STATUSES
+                    else _logger.error
+                )
+                log(
+                    "Runner session initialization rejected with HTTP %d: %s",
+                    response.status_code,
+                    body,
+                    # Keeps the failed event name: launch-success KPIs count it.
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        failure_kind="rejected",
+                        status_code=response.status_code,
+                        response_body=body,
+                    ),
+                )
             return response
 
-    def invalidate_runner(self, runner_id: str) -> None:
-        """Forget completed readiness when a runner tunnel goes away."""
+    def invalidate_runner(
+        self, runner_id: str, *, generation: int | None = None
+    ) -> list[asyncio.Task[httpx.Response]]:
+        """Forget readiness and cancel work belonging to a retired connection."""
         for key in list(self._recovery_ids):
-            if key[0] == runner_id:
+            if key[0] == runner_id and (generation is None or key[1] == generation):
                 self._recovery_ids.pop(key)
-        stale = [key for key in self._tasks if key[0] == runner_id]
+        stale = [
+            key
+            for key in self._tasks
+            if key[0] == runner_id and (generation is None or key[1] == generation)
+        ]
+        cancelled = []
         for key in stale:
             task = self._tasks.pop(key)
             if not task.done():
                 task.cancel()
+                cancelled.append(task)
+        return cancelled

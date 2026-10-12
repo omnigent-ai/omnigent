@@ -15,6 +15,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { PlusIcon, RefreshCwIcon, ShieldCheckIcon, TrashIcon, XIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { ModelValueCombobox } from "@/components/ModelValueCombobox";
+import { SettingsLabel } from "@/components/SettingsLabel";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -238,26 +239,26 @@ function AddDefaultPolicyDialog({
             <div className="space-y-2">
               {paramKeys.map((key) => {
                 const prop = properties[key];
+                const typeLabel =
+                  prop?.type === "array" && prop.items?.enum
+                    ? "multi-select"
+                    : prop?.type === "array"
+                      ? "comma-separated"
+                      : prop?.type;
+                const fieldLabel = typeLabel ? `${key} (${typeLabel})` : key;
                 return (
                   <div key={key}>
-                    <label className="flex items-center gap-1 text-sm text-muted-foreground">
-                      <span className="font-medium text-foreground">{key}</span>
-                      {prop?.type && (
-                        <span>
-                          (
-                          {prop.type === "array" && prop.items?.enum
-                            ? "multi-select"
-                            : prop.type === "array"
-                              ? "comma-separated"
-                              : prop.type}
-                          )
-                        </span>
-                      )}
-                    </label>
-                    {prop?.description && (
-                      <p className="break-words text-sm text-muted-foreground">
-                        {prop.description}
-                      </p>
+                    {prop?.description ? (
+                      <SettingsLabel
+                        label={fieldLabel}
+                        labelClassName="text-sm text-foreground"
+                        description={prop.description}
+                        descriptionClassName="break-words"
+                      />
+                    ) : (
+                      <label className="flex items-center gap-1 text-sm text-muted-foreground">
+                        <span className="font-medium text-foreground">{fieldLabel}</span>
+                      </label>
                     )}
                     {prop?.type === "boolean" ? (
                       <select
@@ -466,8 +467,8 @@ export function PoliciesPage() {
 
   if (!isSingleUser && meIsAdmin === false) {
     return (
-      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
-        <h1 className="mb-2 text-2xl font-semibold">Global Policies</h1>
+      <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
+        <h1 className="settings-page-title mb-2 text-2xl font-semibold">Global Policies</h1>
         <p className="text-ui text-muted-foreground">
           You don't have permission to manage global policies.
         </p>
@@ -492,11 +493,11 @@ export function PoliciesPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+    <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold">Global Policies</h1>
-          <p className="mt-1 text-ui text-muted-foreground">
+          <h1 className="settings-page-title text-2xl font-semibold">Global Policies</h1>
+          <p className="mt-1 text-ui text-muted-foreground max-md:hidden">
             Global policies applied to all sessions.
           </p>
         </div>

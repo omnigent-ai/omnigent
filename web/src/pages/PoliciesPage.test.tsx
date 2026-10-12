@@ -141,6 +141,9 @@ describe("PoliciesPage list", () => {
   it("shows the empty state when no global policies are configured", async () => {
     renderPage();
     expect(await screen.findByText(/No global policies configured/)).toBeInTheDocument();
+    expect(screen.getByText("Global policies applied to all sessions.")).toHaveClass(
+      "max-md:hidden",
+    );
   });
 
   it("renders each policy with its handler, a Disabled badge, and parameters", async () => {

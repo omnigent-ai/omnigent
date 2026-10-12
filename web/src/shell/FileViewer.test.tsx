@@ -987,6 +987,22 @@ describe("classifyAndRemapComments", () => {
     expect(result.open[0].end_index).toBe(5);
   });
 
+  it("keeps a short duplicate anchor at the closest stored occurrence", () => {
+    const fileContent = "foo bar foo baz";
+    const c = makeAnchoredComment({
+      id: "c_short_duplicate",
+      start_index: 8,
+      end_index: 11,
+      anchor_content: "foo",
+    });
+
+    const result = classifyAndRemapComments([c], fileContent);
+
+    expect(result.open).toHaveLength(1);
+    expect(result.open[0].start_index).toBe(8);
+    expect(result.open[0].end_index).toBe(11);
+  });
+
   it("remaps a draft comment's offsets when an edit above the anchor shifts it", () => {
     const anchor = "target text";
     const originalStart = 12;

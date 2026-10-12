@@ -2,7 +2,7 @@
 
 Session PR tracking observes completed shell calls on the runner
 (``omnigent/runner/pr_observer.py``) and surfaces created PRs in the web UI:
-the composer status line's ``#<pr>`` link and the workspace rail's GitHub
+the composer status line's ``#<pr>`` link and the workspace rail's Pull Requests
 tab. Reported bug: when the successful ``gh pr create`` call also contains
 an unrelated ``gh auth switch`` (with or without an intervening ``git
 push``), the observer's mixed-operation guard rejects the whole call and
@@ -231,8 +231,8 @@ def test_created_pr_is_tracked(
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name="GitHub").click()
-    # The created PR must be associated with the session: the GitHub tab's
+    rail.get_by_role("tab", name="Pull Requests").click()
+    # The created PR must be associated with the session: the Pull Requests tab's
     # session-PR picker names it, and the composer status line links it.
     picker = rail.get_by_role("combobox", name="Session pull request")
     expect(picker).to_have_text("example/project #42", timeout=30_000)

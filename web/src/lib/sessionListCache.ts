@@ -38,6 +38,9 @@ export const PROJECT_LABEL_KEY = "omni_project";
  */
 export const PINNED_LABEL_KEY = "omnigent.pinned";
 
+/** Mutation key shared by every pin, unpin, and pinned-reorder write. */
+export const PIN_WRITE_MUTATION_KEY = ["pin-write"] as const;
+
 /**
  * The reserved `conversation_labels` key holding the epoch-SECONDS time a
  * session was archived. Written by the server on the archive transition and

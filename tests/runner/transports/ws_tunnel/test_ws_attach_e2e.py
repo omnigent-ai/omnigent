@@ -72,7 +72,7 @@ async def _drain_session_outbound(registry: TunnelRegistry, runner_id: str) -> N
         data = await session.outbound_queue.get()
         if data is None:
             return
-        await session.ws.send_text(data)
+        await session.ws.send_text(data.data)
 
 
 def _build_echo_app() -> FastAPI:

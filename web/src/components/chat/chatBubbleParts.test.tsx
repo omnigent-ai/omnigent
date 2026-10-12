@@ -1,8 +1,10 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
+import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
@@ -86,6 +88,72 @@ describe("Mermaid diagram width", () => {
         { kind: "text", itemId: "prose", text: "A Mermaid diagram would help.", final: true },
       ]),
     ).toBe(false);
+  });
+});
+
+describe("AssistantBubble fork source", () => {
+  const bubble: Extract<Bubble, { kind: "assistant" }> = {
+    kind: "assistant",
+    responseId: "resp_side_reply",
+    stableId: "side_reply",
+    lifecycle: "completed",
+    error: null,
+    items: [{ kind: "text", itemId: "side_text", text: "Side reply", final: true }],
+  };
+
+  it("disables the message fork without hiding its explanation", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider
+          value={{
+            canFork: true,
+            disabledReason: "Forking this sandbox session is not supported yet.",
+            openForkDialog,
+          }}
+        >
+          <BubbleView bubble={bubble} isLastAssistant={false} />
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+    const fork = screen.getByTestId("fork-from-response");
+    expect(fork).toBeDisabled();
+    expect(fork.parentElement).toHaveAttribute("tabindex", "0");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork.parentElement!, { key: "Enter" });
+    expect(openForkDialog).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "side chat",
+      scope: "conv_side_child",
+      expected: {
+        sourceSessionId: "conv_side_child",
+        upToResponseId: "resp_side_reply",
+      },
+    },
+    {
+      name: "main chat",
+      scope: null,
+      expected: { sourceSessionId: undefined, upToResponseId: "resp_side_reply" },
+    },
+  ])("opens from the $name session", ({ scope, expected }) => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+          <ConversationScopeContext.Provider value={scope}>
+            <BubbleView bubble={bubble} isLastAssistant={false} />
+          </ConversationScopeContext.Provider>
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("fork-from-response"));
+
+    expect(openForkDialog).toHaveBeenCalledOnce();
+    expect(openForkDialog).toHaveBeenCalledWith(expected);
   });
 });
 
@@ -393,6 +461,79 @@ describe("AssistantBubble error retry", () => {
   });
 });
 
+describe("AssistantBubble sealed side-chat recovery", () => {
+  it("removes recovery actions when the side chat is sealed but keeps the error", () => {
+    const view = render(
+      <BubbleView bubble={errorBubble("required_terminal_exited")} recoveryDisabled />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    expect(screen.getByTestId("error-pill")).toHaveTextContent("The agent's terminal exited");
+
+    view.rerender(<BubbleView bubble={errorBubble("required_terminal_exited")} />);
+
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeInTheDocument();
+  });
+
+  it.each([null, "conv_child"])(
+    "refreshes the resumed session's labels (scope=%s)",
+    async (scope) => {
+      const client = new QueryClient();
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({ error: { code: "conflict", message: "This side chat has ended." } }, 409),
+      );
+      render(
+        <QueryClientProvider client={client}>
+          <ConversationScopeContext.Provider value={scope}>
+            <BubbleView bubble={errorBubble("required_terminal_exited")} />
+          </ConversationScopeContext.Provider>
+        </QueryClientProvider>,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+      await waitFor(() =>
+        expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", scope ?? "conv_retry"] }),
+      );
+      expect(fetchMock.mock.calls[0]?.[0]).toBe(`/v1/sessions/${scope ?? "conv_retry"}/events`);
+      expect(screen.getByRole("status")).toHaveTextContent("This side chat has ended.");
+    },
+  );
+
+  it("preserves the error when rendered without a query provider", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ error: { code: "conflict", message: "This side chat has ended." } }, 409),
+    );
+    render(<BubbleView bubble={errorBubble("required_terminal_exited")} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent("This side chat has ended."),
+    );
+  });
+});
+
+describe("UserBubble shell prompts", () => {
+  it("preserves shell syntax and attachment-like text literally", () => {
+    const command = "printf '%s\\n' '**hi**' '[Attached: /tmp/file]' '`pwd`'\necho done";
+    const bubble: Extract<Bubble, { kind: "user" }> = {
+      kind: "user",
+      itemId: "shell-input",
+      content: [{ type: "input_text", text: `!${command}` }],
+      shellCommand: command,
+    };
+    render(<BubbleView bubble={bubble} />);
+
+    const prompt = screen.getByTestId("message-bubble");
+    expect(prompt).toHaveAttribute("data-role", "user");
+    expect(prompt).toHaveAttribute("data-user-message-id", "shell-input");
+    expect(prompt.querySelector("pre")?.textContent).toBe(`!${command}`);
+    expect(screen.getByTestId("copy-message-link")).toBeEnabled();
+  });
+});
+
 describe("UserBubble long-prompt collapse", () => {
   const COLLAPSE_THRESHOLD = 12000;
   const TAIL = "UNIQUE_TAIL";
@@ -467,5 +608,51 @@ describe("UserBubble long-prompt collapse", () => {
     expect(bubble).not.toHaveTextContent("🔥");
     expect(bubble).not.toHaveTextContent(""); // make sure it's not corrupted
     expect(bubble).toHaveTextContent("a".repeat(COLLAPSE_THRESHOLD - 1));
+  });
+});
+
+describe("AssistantBubble copy", () => {
+  const MARKDOWN = "## Findings\n\nA **bold** claim and `code`.";
+
+  function assistantBubble(text: string): Extract<Bubble, { kind: "assistant" }> {
+    return {
+      kind: "assistant",
+      responseId: "resp_copy",
+      stableId: "copy_assistant",
+      lifecycle: "completed",
+      error: null,
+      items: [{ kind: "text", itemId: "copy_text", text, final: true }],
+      createdAtS: 1_700_000_000,
+    };
+  }
+
+  it("offers rendered HTML alongside the markdown so a rich-text paste keeps formatting", async () => {
+    const write = vi.fn().mockResolvedValue(undefined);
+    class FakeClipboardItem {
+      items: Record<string, Blob>;
+
+      constructor(items: Record<string, Blob>) {
+        this.items = items;
+      }
+    }
+
+    vi.stubGlobal("ClipboardItem", FakeClipboardItem);
+    vi.stubGlobal("navigator", { clipboard: { write } });
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView bubble={assistantBubble(MARKDOWN)} isLastAssistant={false} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^copy$/i }));
+
+    await waitFor(() => expect(write).toHaveBeenCalledTimes(1));
+
+    const [item] = write.mock.calls[0][0] as FakeClipboardItem[];
+    expect(await item.items["text/plain"].text()).toBe(MARKDOWN);
+    expect(await item.items["text/html"].text()).toBe(
+      "<h2>Findings</h2>\n<p>A <strong>bold</strong> claim and <code>code</code>.</p>",
+    );
   });
 });

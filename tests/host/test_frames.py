@@ -182,6 +182,17 @@ def test_import_local_frames_round_trip() -> None:
             status="ok",
             skills=[{"name": "toolkit:review", "description": "Review changes"}],
         ),
+        HostSkillsResultFrame(
+            request_id="req_skills",
+            status="ok",
+            skills=[
+                {
+                    "name": "asd-ste100",
+                    "description": "Write in Simplified Technical English",
+                    "display_name": "Simplified Technical English (ASD-STE100)",
+                }
+            ],
+        ),
         HostSkillsFrame(
             request_id="session",
             harness="session",
@@ -207,7 +218,14 @@ def test_skills_frames_round_trip(frame: HostSkillsFrame | HostSkillsResultFrame
 
 
 @pytest.mark.parametrize(
-    "skills", [{}, ["review"], [{"name": "review"}], [{"name": 1, "description": "x"}]]
+    "skills",
+    [
+        {},
+        ["review"],
+        [{"name": "review"}],
+        [{"name": 1, "description": "x"}],
+        [{"name": "review", "description": "x", "display_name": 1}],
+    ],
 )
 def test_skills_result_rejects_malformed_catalog(skills: object) -> None:
     with pytest.raises(ValueError):

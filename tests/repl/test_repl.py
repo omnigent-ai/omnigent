@@ -2230,6 +2230,31 @@ def test_completer_substring_filters_real_registry() -> None:
     assert 0 < len(names) < len(all_names)
 
 
+def test_completer_matches_skill_display_name_after_name_hits() -> None:
+    """A skill is reachable by its display name, ranked after command-name hits."""
+    from omnigent.repl import _repl as repl_mod
+
+    registered = repl_mod.register_skill_commands(
+        [
+            SkillSpec(
+                name="asd-ste100",
+                description="STE",
+                content="c",
+                display_name="Simplified Technical English (ASD-STE100)",
+            ),
+            SkillSpec(name="english-tutor", description="Tutor", content="c"),
+        ]
+    )
+    try:
+        # Completing inserts the command, not the label.
+        assert "/asd-ste100" in [name for name, _, _ in _completions_for("/simplified")]
+        names = [name for name, _, _ in _completions_for("/english")]
+        assert names.index("/english-tutor") < names.index("/asd-ste100")
+    finally:
+        repl_mod.unregister_skill_commands(registered)
+    assert "/asd-ste100" not in repl_mod._SKILL_DISPLAY_NAMES
+
+
 def test_completer_ranks_prefix_before_substring(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Claim: prefix matches surface before mid-string matches (mirrors the
@@ -2510,6 +2535,26 @@ def test_register_skill_commands_skips_invalid_command_names() -> None:
         assert "/etc/hosts" not in registered
         assert "/bad name" not in repl_mod.COMMANDS
         assert "/etc/hosts" not in repl_mod.COMMANDS
+    finally:
+        repl_mod.unregister_skill_commands(registered)
+
+
+def test_register_skill_commands_labels_command_with_display_name() -> None:
+    """A spaced display name labels the ``/<dir>`` command instead of blocking it."""
+    from omnigent.repl import _repl as repl_mod
+
+    skill = SkillSpec(
+        name="asd-ste100",
+        description="Write in STE",
+        content="c",
+        display_name="Simplified Technical English (ASD-STE100)",
+    )
+    registered = repl_mod.register_skill_commands([skill])
+    try:
+        assert registered == ["/asd-ste100"]
+        assert repl_mod.COMMANDS["/asd-ste100"][0] == (
+            "Simplified Technical English (ASD-STE100) — Write in STE"
+        )
     finally:
         repl_mod.unregister_skill_commands(registered)
 

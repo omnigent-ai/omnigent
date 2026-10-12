@@ -49,7 +49,7 @@ describe("QueuedMessagesStrip", () => {
 
     const chip = screen.getByTestId("queued-message-attachments");
     expect(chip).toHaveAttribute("title", expectedNames.join("\n"));
-    expect(screen.getByText(expectedNames[0]!)).toHaveClass("truncate");
+    expect(screen.getByText(expectedNames[0]!)).toHaveClass("min-w-6", "truncate");
     expect(screen.getByText("+2")).toBeInTheDocument();
     if (text) {
       const preview = screen.getByText(text);

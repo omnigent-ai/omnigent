@@ -100,6 +100,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * rejects in the main process).
    */
   switchServer: (url) => ipcRenderer.invoke("omnigent:switch-server", url),
+  /** Sign this window's server out; every window on it returns to the setup page. */
+  signOutOfServer: () => ipcRenderer.invoke("omnigent:sign-out-of-server"),
   /** Return this window to the bundled "connect to server" setup page. */
   openServerSetup: () => {
     ipcRenderer.send("omnigent:open-server-setup");
@@ -471,6 +473,8 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   getManagedServers: () => ipcRenderer.invoke("omnigent:get-managed-servers"),
   /** Display names for those servers, server URL → name. */
   getManagedServerNames: () => ipcRenderer.invoke("omnigent:get-managed-server-names"),
+  /** Names servers gave themselves in their manifest, origin → name (display only). */
+  getServerNames: () => ipcRenderer.invoke("omnigent:get-server-names"),
   /** Wizard capabilities, e.g. `{v2Forced}` — v2Forced disables "Switch to
    *  legacy" because the env var pins the selector on. */
   getSetupCapabilities: () => ipcRenderer.invoke("omnigent:get-setup-capabilities"),

@@ -358,6 +358,17 @@ export interface TerminalCommandBlock {
   stderr: string | null;
 }
 
+export function isTerminalCommandInput(
+  block: AnyBlock,
+): block is TerminalCommandBlock & { kind: "input"; input: string } {
+  return (
+    block.type === "terminal_command" &&
+    block.kind === "input" &&
+    block.input !== null &&
+    block.input.trim().length > 0
+  );
+}
+
 // ── Text ─────────────────────────────────────────────────
 
 /** A flushed chunk of streamed text. */
