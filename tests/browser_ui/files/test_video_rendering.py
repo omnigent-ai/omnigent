@@ -283,9 +283,7 @@ def test_recording_header_size_and_optional_controls(
     plain = page.get_by_role("button", name="Plain", exact=True)
     acard, pcard = annotated.locator("../../.."), plain.locator("../../..")
     assert acard.bounding_box()["width"] == pcard.bounding_box()["width"]
-    if width == 1600:
-        heading = acard.get_by_text("Recording actions", exact=True).bounding_box()
-        assert abs(heading["y"] - annotated.bounding_box()["y"]) < 1
+    expect(acard.get_by_text("Recording actions", exact=True)).to_have_count(0)
     download = acard.get_by_role("button", name="Download recording: Annotated", exact=True)
     db, tb = download.bounding_box(), toggle.bounding_box()
     assert 0 <= tb["x"] - db["x"] - db["width"] <= 8

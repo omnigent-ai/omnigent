@@ -110,12 +110,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
         className,
       )}
     >
-      <span
-        className={cn(
-          "grid min-w-0 grid-cols-[minmax(0,1fr)_auto] border-b border-border",
-          chapters.length > 0 && wide && actionsOpen && "grid-cols-[minmax(0,1fr)_18rem]",
-        )}
-      >
+      <span className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] border-b border-border">
         <span className="flex min-h-12 min-w-0 items-center gap-2 px-3 py-2">
           <VideoIcon className="size-4 shrink-0 text-muted-foreground" />
           {onOpenFile ? (
@@ -133,15 +128,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
             </span>
           )}
         </span>
-        <span
-          className={cn(
-            "flex min-h-12 items-center gap-2 px-3 py-2",
-            chapters.length > 0 && wide && actionsOpen && "border-l border-border",
-          )}
-        >
-          {chapters.length > 0 && wide && actionsOpen && (
-            <span className="min-w-0 flex-1 font-medium">Recording actions</span>
-          )}
+        <span className="flex min-h-12 items-center gap-2 px-3 py-2">
           {remoteSrc ? (
             <a
               href={remoteSrc}
@@ -314,11 +301,6 @@ function VideoPlayerContent(props: VideoPlayerProps) {
             )}
           >
             <span className={cn("flex min-h-0 flex-col", wide && "absolute inset-0")}>
-              {!wide && (
-                <span className="shrink-0 border-b border-border px-3 py-2 font-medium">
-                  Recording actions
-                </span>
-              )}
               <span
                 className={cn(
                   "flex min-h-0 flex-col gap-1 overflow-y-auto overscroll-contain p-2",
