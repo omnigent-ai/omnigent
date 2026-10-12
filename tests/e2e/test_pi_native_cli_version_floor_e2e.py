@@ -100,6 +100,7 @@ class _Recording:
 
 @pytest.mark.parametrize("surface", ["server", "cli"])
 @pytest.mark.parametrize("version_kind", ["old", "current"])
+@pytest.mark.min_runner_version("0.18.0")
 @pytest.mark.timeout(240)
 def test_real_pi_cli_version_floor(
     tmp_path: Path,
