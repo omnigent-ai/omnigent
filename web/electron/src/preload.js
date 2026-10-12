@@ -14,7 +14,19 @@
 
 "use strict";
 
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webFrame } = require("electron");
+
+// Native window controls stay in window pixels while the page zooms.
+if (process.platform === "darwin") {
+  const syncTitlebarZoom = () => {
+    document.documentElement.style.setProperty(
+      "--omnigent-electron-zoom",
+      String(webFrame.getZoomFactor()),
+    );
+  };
+  window.addEventListener("DOMContentLoaded", syncTitlebarZoom, { once: true });
+  window.addEventListener("resize", syncTitlebarZoom);
+}
 
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloading / downloaded / error-security) to `idle` so the server page can

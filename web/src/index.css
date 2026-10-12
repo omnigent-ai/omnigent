@@ -761,8 +761,13 @@ aside[aria-label="Workspace"][data-maximized] {
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-/* macOS native-control clearance uses pixels: embeds inherit the host rem size.
+/* Native clearance uses window pixels, independent of rem and page zoom.
+ * The preload supplies zoom; older shells fall back to 100%.
  * The embed build maps html selectors onto the .omnigent-app scope root. */
+html[data-electron-mac] {
+  --mac-titlebar-height: calc(48px / var(--omnigent-electron-zoom, 1));
+  --mac-traffic-light-width: calc(88px / var(--omnigent-electron-zoom, 1));
+}
 @media (min-width: 48rem) {
   /* Reserve the board's shared sidebar toggle only while navigation is closed. */
   .app-shell:not([data-sidebar-open]) .canvas-page-heading {
@@ -801,7 +806,7 @@ aside[aria-label="Workspace"][data-maximized] {
   /* Reserve the full drag strip so the session list starts below the
    * window furniture and stays outside the drag region. */
   html[data-electron-mac] .sidebar-header-row {
-    height: 48px;
+    height: var(--mac-titlebar-height);
     padding: 0;
   }
   /* The chat header's own open-sidebar button is redundant here: the title-bar
@@ -815,7 +820,7 @@ aside[aria-label="Workspace"][data-maximized] {
   /* Float the peek card below the 48px drag strip, with the same 0.5rem
    * breathing room as its other edges. The docked sidebar is unaffected. */
   html[data-electron-mac] .conversations-sidebar.is-peek {
-    top: calc(48px + 0.5rem);
+    top: calc(var(--mac-titlebar-height) + 0.5rem);
   }
   /* The peek card already clears the drag strip, so it needs no reserved
    * header row above its content. */
@@ -826,27 +831,27 @@ aside[aria-label="Workspace"][data-maximized] {
    * sit under the traffic lights. Push it below them — it has no cluster to
    * align beside the lights, so it clears them vertically instead. */
   html[data-electron-mac] .settings-sidebar-header {
-    padding-top: calc(48px + 0.5rem);
+    padding-top: calc(var(--mac-titlebar-height) + 0.5rem);
   }
 }
 /* Match the full desktop header; controls opt out of dragging below. */
 html[data-electron-mac] .electron-drag-strip {
   position: absolute;
   inset: 0 0 auto 0;
-  height: 48px;
+  height: var(--mac-titlebar-height);
   -webkit-app-region: drag;
 }
 /* Canvas clears the native title bar, including focus
  * and compact conversation states where the board is hidden. */
 [data-electron-mac] .canvas-workspace {
-  margin-top: 48px;
+  margin-top: var(--mac-titlebar-height);
 }
 /* Align to the native lights at y=24px, regardless of the host rem size.
  * Keep the cluster independent of sidebar open, collapsed, and peek states. */
 html[data-electron-mac] .electron-sidebar-header-actions {
   position: absolute;
-  top: 24px;
-  left: 88px;
+  top: calc(var(--mac-titlebar-height) / 2);
+  left: var(--mac-traffic-light-width);
   transform: translateY(-50%);
   /* Above the sidebar, which is a positioned sibling at z-index 50 with an
    * opaque gradient background — at any lower layer it paints straight over
@@ -866,7 +871,7 @@ html[data-electron-mac] .electron-sidebar-header-actions {
 /* Clear the fixed native-control area plus the font-relative action cluster
  * when the collapsed sidebar exposes the chat header at the window edge. */
 html[data-electron-mac] .traffic-light-clearance {
-  padding-left: calc(88px + 5rem);
+  padding-left: calc(var(--mac-traffic-light-width) + 5rem);
 }
 /* A maximized rail reaches the same window corner while the sidebar is closed.
  * Once the sidebar opens, the rail starts to its right and needs no clearance. */
@@ -874,7 +879,7 @@ html[data-electron-mac]
   .app-shell:not([data-sidebar-open])
   aside[aria-label="Workspace"][data-maximized]
   .workspace-tab-strip {
-  padding-left: calc(88px + 5rem);
+  padding-left: calc(var(--mac-traffic-light-width) + 5rem);
 }
 /* Drag regions ignore z-order, so controls and overlays need counter-regions.
  * Scoped from <html> to cover portals outside AppShell on macOS only. */
