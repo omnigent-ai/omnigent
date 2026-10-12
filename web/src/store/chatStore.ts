@@ -1035,6 +1035,8 @@ export interface ConversationState {
  */
 /** One side chat's unsent composer contents. */
 export interface SideChatComposerDraft {
+  starting?: boolean;
+  quotes?: string[];
   text: string;
   files: File[];
 }
@@ -1071,6 +1073,8 @@ export interface AppChatState {
    * tabs.
    */
   sideChatToOpen: { childId: string; parentId: string } | null;
+  /** Visible, writable side chat that receives selections from its parent. */
+  sideChatSelectionTarget: { childId: string; parentId: string } | null;
   /**
    * Initial composer text for a freshly-opened side chat, keyed by its child
    * conversation id. Set when a generic `/side <question>` opens an empty side
@@ -1901,6 +1905,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionHarness: null,
   awaitingSideChatFor: null,
   sideChatToOpen: null,
+  sideChatSelectionTarget: null,
   sideChatDrafts: {},
   sideChatComposers: {},
   subAgentName: null,

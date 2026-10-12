@@ -120,7 +120,10 @@ describe("side-chat working indicator", () => {
         }),
     );
     useChatStore.setState({ blockedOn: "dialog open", backgroundTaskCount: 1 });
-    renderPane(<SideChatPane childId="pending:side" onStart={onStart} />);
+    const pane = (
+      <SideChatPane childId="pending:side" selectionParentId="conv_main" onStart={onStart} />
+    );
+    const view = renderPane(pane);
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "Explain the approach" } });
     fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
@@ -129,12 +132,19 @@ describe("side-chat working indicator", () => {
     expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
     expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
     expect(input).toBeDisabled();
+    expect(useChatStore.getState().sideChatSelectionTarget).toBeNull();
+
+    view.unmount();
+    renderPane(pane);
+    expect(screen.getByTestId("side-chat-input")).toBeDisabled();
+    expect(useChatStore.getState().sideChatSelectionTarget).toBeNull();
 
     await act(async () => rejectStart?.(new Error("Fork creation failed")));
 
     expect(screen.queryByTestId("working-indicator")).toBeNull();
-    expect(input).toBeEnabled();
-    expect(input).toHaveValue("Explain the approach");
+    expect(screen.getByTestId("side-chat-input")).toBeEnabled();
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("Explain the approach");
+    expect(useChatStore.getState().sideChatSelectionTarget?.childId).toBe("pending:side");
     expect(screen.getByRole("button", { name: "Send side question" })).toBeEnabled();
   });
 });
@@ -154,6 +164,39 @@ describe("side chat opened from a text selection", () => {
     await waitFor(() => expect(useChatStore.getState().sideChatDrafts).toEqual({}));
   });
 
+  it("adds quotes to a live draft without sending until the user submits", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: {
+        [childId]: { text: "why?", files: [], quotes: ["first selection", "second selection"] },
+      },
+    });
+    renderPane(<SideChatPane childId={childId} selectionParentId="conv_main" />);
+
+    expect(useChatStore.getState().sideChatSelectionTarget).toEqual({
+      childId,
+      parentId: "conv_main",
+    });
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
+    expect(screen.getByTestId("side-chat-input")).toHaveFocus();
+    expect(send).not.toHaveBeenCalled();
+    fireEvent.click(screen.getAllByRole("button", { name: "Remove quote" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    expect(send).toHaveBeenCalledWith("> second selection\n\nwhy?", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+    expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
+  });
+
+  it("clears the selection target when the pane is hidden or read-only", () => {
+    const view = renderPane(<SideChatPane childId={childId} selectionParentId="conv_main" />);
+    expect(useChatStore.getState().sideChatSelectionTarget?.childId).toBe(childId);
+    view.rerender(<SideChatPane childId={childId} />);
+    expect(useChatStore.getState().sideChatSelectionTarget).toBeNull();
+    view.rerender(<SideChatPane childId={childId} selectionParentId="conv_main" readOnly />);
+    expect(useChatStore.getState().sideChatSelectionTarget).toBeNull();
+  });
+
   it("drops the quote when its card is removed", () => {
     const onStart = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ sideChatDrafts: { "pending:quoted": "restore the row" } });
@@ -165,6 +208,57 @@ describe("side chat opened from a text selection", () => {
 
     expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
     expect(onStart).toHaveBeenCalledExactlyOnceWith("why?");
+  });
+});
+
+describe("side-chat selection reply", () => {
+  function selectText(element: HTMLElement) {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    range.getBoundingClientRect = () => ({ left: 10, top: 30, width: 80 }) as DOMRect;
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    fireEvent(document, new Event("selectionchange"));
+  }
+
+  afterEach(() => window.getSelection()?.removeAllRanges());
+
+  it("quotes selected side-chat text in its own composer and preserves the draft", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: {
+        [childId]: { text: "my follow-up", files: [], quotes: ["existing quote"] },
+      },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    selectText(screen.getByText("Ask a question here without affecting the main conversation."));
+    fireEvent.click(screen.getByRole("button", { name: "Reply ↵" }));
+
+    expect(useChatStore.getState().sideChatComposers[childId]).toEqual({
+      text: "my follow-up",
+      files: [],
+      quotes: ["existing quote", "Ask a question here without affecting the main conversation."],
+    });
+    expect(screen.getByTestId("side-chat-input")).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
+    expect(useChatStore.getState().sideChatToOpen).toBeNull();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("does not offer Reply in a read-only side chat", () => {
+    renderPane(<SideChatPane childId={childId} readOnly />);
+    selectText(screen.getByText("This side chat has ended and can’t be continued."));
+    expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
+  });
+
+  it("does not offer Reply while a side chat is starting", () => {
+    useChatStore.setState({
+      sideChatComposers: { "pending:starting": { text: "Question", files: [], starting: true } },
+    });
+    renderPane(<SideChatPane childId="pending:starting" />);
+    selectText(screen.getByTestId("working-indicator"));
+    expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
   });
 });
 

@@ -408,7 +408,9 @@ class TestConstructor(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.spec.types import RetryPolicy
 
-        executor = ClaudeSDKExecutor()
+        with patch.dict("os.environ"):
+            os.environ.pop("OMNIGENT_CLAUDE_CODE_ENTRYPOINT", None)
+            executor = ClaudeSDKExecutor()
         self.assertFalse(executor._os_env)
         self.assertIsNone(executor._os_env_spec)
         self.assertIsNone(executor._cwd)
@@ -719,7 +721,9 @@ class TestConstructor(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.spec.types import RetryPolicy
 
-        executor = ClaudeSDKExecutor(gateway=False)
+        with patch.dict("os.environ"):
+            os.environ.pop("OMNIGENT_CLAUDE_CODE_ENTRYPOINT", None)
+            executor = ClaudeSDKExecutor(gateway=False)
         # gateway=False → no Databricks env, but Tool Search and RetryPolicy
         # CLI env are always merged in.
         self.assertEqual(
@@ -1116,6 +1120,19 @@ class TestConstructor(unittest.TestCase):
             self.assertFalse({k for k in captured["env"] if k.startswith("ANTHROPIC_DEFAULT_")})
 
         _run(_t())
+
+    def test_claude_code_entrypoint_is_forwarded_when_set(self):
+        """``OMNIGENT_CLAUDE_CODE_ENTRYPOINT`` is sent to the CLI as ``CLAUDE_CODE_ENTRYPOINT``."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        with patch.dict("os.environ", {"OMNIGENT_CLAUDE_CODE_ENTRYPOINT": "cli"}):
+            executor = ClaudeSDKExecutor(model="claude-sonnet-4-5")
+        self.assertEqual(executor._extra_env["CLAUDE_CODE_ENTRYPOINT"], "cli")
+
+        with patch.dict("os.environ"):
+            os.environ.pop("OMNIGENT_CLAUDE_CODE_ENTRYPOINT", None)
+            executor = ClaudeSDKExecutor(model="claude-sonnet-4-5")
+        self.assertNotIn("CLAUDE_CODE_ENTRYPOINT", executor._extra_env)
 
     def test_explicit_family_pins_are_not_overwritten(self):
         """Pre-set ``ANTHROPIC_DEFAULT_*_MODEL`` pins win over the listing.

@@ -3,8 +3,8 @@ sessions start public.
 
 Drives the real SPA on a dedicated multi-user server: the admin picks "All
 sessions public" on Settings > Sharing, the choice survives a reload, and a
-session created afterwards opens its Share dialog with Public access already
-on (backed by a ``__public__`` read grant). The session seeded before the
+session created afterwards opens its Share dialog with General access set to
+Read (backed by a ``__public__`` read grant). The session seeded before the
 change stays private. The data dir is isolated so the admin override file never
 lands in the runner's ``~/.omnigent``.
 """
@@ -71,14 +71,14 @@ def _create_session(base_url: str) -> str:
     return resp.json()["session_id"]
 
 
-def _share_dialog_public_switch(page: Page, url: str) -> Locator:
+def _share_dialog_general_access(page: Page, url: str) -> Locator:
     page.goto(url)
     share = page.get_by_role("button", name="Share session")
     expect(share).to_be_enabled(timeout=60_000)
     share.click()
     dialog = page.get_by_role("dialog")
     expect(dialog.get_by_text("Share this session")).to_be_visible()
-    return dialog.get_by_role("switch")
+    return dialog.get_by_role("combobox", name="General access")
 
 
 def test_admin_default_public_all_makes_new_sessions_public(
@@ -109,9 +109,9 @@ def test_admin_default_public_all_makes_new_sessions_public(
     assert "__public__" not in _permissions(server.base_url, server.session_id)
 
     expect(
-        _share_dialog_public_switch(page, f"{server.public_url}/c/{new_session}")
-    ).to_be_checked()
+        _share_dialog_general_access(page, f"{server.public_url}/c/{new_session}")
+    ).to_have_text("Read")
     expect(
-        _share_dialog_public_switch(page, f"{server.public_url}/c/{server.session_id}")
-    ).not_to_be_checked()
+        _share_dialog_general_access(page, f"{server.public_url}/c/{server.session_id}")
+    ).to_have_text("No access")
     context.close()

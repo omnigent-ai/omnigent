@@ -99,3 +99,22 @@ describe("macOS Electron embed", () => {
     outside.remove();
   });
 });
+
+describe("embed color scheme", () => {
+  // The scope root resolves `color` from the light tokens, so the portal root
+  // must re-apply the foreground color for overlays to read dark-mode text.
+  it.each([
+    ["dark", true],
+    ["light", false],
+  ])("re-applies the foreground color on the %s portal root", (_name, isDarkMode) => {
+    render(
+      <MemoryRouter>
+        <OmnigentApp fetcher={fetcher} isDarkMode={isDarkMode} />
+      </MemoryRouter>,
+    );
+
+    const portalRoot = getEmbedRoot()!;
+    expect(portalRoot).toHaveClass("text-foreground");
+    expect(portalRoot.classList.contains("dark")).toBe(isDarkMode);
+  });
+});

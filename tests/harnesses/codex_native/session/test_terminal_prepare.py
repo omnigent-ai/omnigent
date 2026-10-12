@@ -141,6 +141,68 @@ async def test_prepare_codex_terminal_forwards_profile_to_launch_resolution(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "overrides", "expected_provider"),
+    [
+        ("configured-workspace", [], "omnigent_databricks"),
+        (None, ['model_provider="custom-provider"'], "custom-provider"),
+        (None, ['model_provider="openai"'], "openai"),
+        (None, [], None),
+    ],
+)
+async def test_prepare_codex_terminal_resumes_with_launch_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    profile: str | None,
+    overrides: list[str],
+    expected_provider: str | None,
+) -> None:
+    """CLI cold resume applies the configured provider before attaching the TUI."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.app_server import NativeCodexLaunch
+
+    server = SimpleNamespace(start=AsyncMock(), close=AsyncMock(), codex_cli_version=(0, 156, 1))
+    preload = AsyncMock(side_effect=RuntimeError("stop after resume"))
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        codex_native,
+        "_fetch_codex_session",
+        AsyncMock(
+            return_value={
+                "labels": {codex_native._WRAPPER_LABEL_KEY: codex_native._WRAPPER_LABEL_VALUE},
+                "external_session_id": "thread_test",
+            }
+        ),
+    )
+    monkeypatch.setattr(codex_native, "_find_running_codex_terminal", AsyncMock(return_value=None))
+    monkeypatch.setattr(codex_native, "_ensure_local_codex_resume_rollout", AsyncMock())
+    monkeypatch.setattr(
+        codex_native,
+        "resolve_native_codex_launch",
+        lambda **_kwargs: NativeCodexLaunch(overrides, "test-model", profile),
+    )
+    monkeypatch.setattr(codex_native, "build_codex_native_server", lambda **_kwargs: server)
+    monkeypatch.setattr(codex_native, "preload_codex_thread_for_resume", preload)
+
+    with pytest.raises(RuntimeError, match="stop after resume"):
+        await codex_native._prepare_codex_terminal(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_test",
+            runner_id=None,
+            session_bundle=None,
+            codex_args=(),
+            command="codex",
+            model=None,
+        )
+
+    preload.assert_awaited_once()
+    assert preload.await_args.kwargs["model_provider"] == expected_provider
+    server.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cleanup_failure", [None, "terminal", "client"])
 @pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
 async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupted(

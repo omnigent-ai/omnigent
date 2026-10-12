@@ -10032,6 +10032,86 @@ async def test_retry_session_retries_native_terminal_ensure_after_runner_reconne
         await runner_client.aclose()
 
 
+async def test_native_message_is_refused_with_input_kept_when_host_runner_tunnel_drops(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A send as a host runner's tunnel drops is refused, not recorded as a failed turn."""
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import routes_events
+
+    host_id = "8b9c07bfb42f687d53af44f018adebee"
+    HostStore(db_uri).upsert_on_connect(host_id, "remote-host", "owner@example.com")
+    agent = await create_test_agent(client, name="claude-native-ui")
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(session["id"], host_id=host_id, workspace="/tmp/native")
+    store.replace_runner_id(session["id"], "native-runner")
+    terminals_path = f"/v1/sessions/{session['id']}/resources/terminals"
+    runner_paths: list[str] = []
+    tunnel_up = False
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        runner_paths.append(request.url.path)
+        if request.url.path == terminals_path:
+            if not tunnel_up:
+                # What WSTunnelTransport raises when the tunnel dies under the request.
+                raise ConnectionError("tunnel closed before request completed")
+            return httpx.Response(200, json={})
+        return httpx.Response(202, json={})
+
+    message = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "run the tests"}]},
+    }
+    wait_for_runner = AsyncMock(return_value=False)
+    monkeypatch.setattr(RunnerRouter, "wait_for_runner", wait_for_runner)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    ) as runner_client:
+        monkeypatch.setattr(
+            routes_events, "_get_runner_client", AsyncMock(return_value=runner_client)
+        )
+        monkeypatch.setattr(
+            routes_events, "_ensure_runner_relay_ready", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock()
+        )
+        try:
+            refused = await client.post(f"/v1/sessions/{session['id']}/events", json=message)
+
+            assert refused.status_code == 503, refused.text
+            assert refused.json()["error"]["code"] == "runner_unavailable"
+            wait_for_runner.assert_awaited_once_with(
+                "native-runner",
+                timeout_s=orchestration_module._NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S,
+            )
+            # Only the ensure probe reached the runner; nothing was recorded or queued.
+            assert runner_paths == [terminals_path]
+            snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+            assert snapshot["items"] == []
+            assert snapshot["status"] != "failed"
+            assert not pending_inputs.has_pending(session["id"])
+
+            # Once the tunnel is back the same message goes through.
+            tunnel_up = True
+            resent = await client.post(f"/v1/sessions/{session['id']}/events", json=message)
+
+            assert resent.status_code == 202, resent.text
+            assert runner_paths[-1] == f"/v1/sessions/{session['id']}/events"
+        finally:
+            for pending in pending_inputs.snapshot_for(session["id"]):
+                pending_inputs.resolve(session["id"], pending["pending_id"])
+
+
 async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
     client: httpx.AsyncClient,
 ) -> None:

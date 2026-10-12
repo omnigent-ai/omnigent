@@ -16,6 +16,8 @@ from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_import_e2e"
 
+_SERVER_INFO = {"features": {"import_review": True}}
+
 
 _HOSTS = {
     "hosts": [
@@ -65,6 +67,7 @@ async def _register_routes(page: Page) -> None:
     async def handle_mcp_servers(route: Route) -> None:
         await route.fulfill(json=_MCP_SERVERS)
 
+    await page.route("**/v1/info", lambda route: route.fulfill(json=_SERVER_INFO))
     await page.route("**/v1/hosts", handle_hosts)
     await page.route("**/v1/skills?*", handle_skills)
     await page.route(f"**/v1/hosts/{_HOST_ID}/mcp-servers", handle_mcp_servers)
@@ -137,6 +140,7 @@ async def _drive_empty(base_url: str) -> None:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
         try:
+            await page.route("**/v1/info", lambda route: route.fulfill(json=_SERVER_INFO))
             await page.route("**/v1/hosts", lambda route: route.fulfill(json=_HOSTS))
             await page.route("**/v1/skills?*", lambda route: route.fulfill(json={"skills": []}))
             await page.route(

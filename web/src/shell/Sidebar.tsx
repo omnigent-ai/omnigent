@@ -858,6 +858,21 @@ function SidebarImpl({
   // keyboard inset so every session row can still scroll into view while an
   // inline rename holds the keyboard up. No-op off iOS / keyboard closed.
   const keyboardInset = useIOSNativeKeyboardInset(effectiveOpen);
+  // The iOS shell disables WebKit's focus reveal: while that padding shrinks the list,
+  // center a focused row (an inline rename) when the keyboard opens and on later focus.
+  // Centered rather than nearest so the floating Settings action can't cover it.
+  useLayoutEffect(() => {
+    if (keyboardInset <= 0) return;
+    const reveal = (target: EventTarget | null) => {
+      if (target instanceof HTMLElement && scrollContainerRef.current?.contains(target)) {
+        target.scrollIntoView({ block: "center" });
+      }
+    };
+    reveal(document.activeElement);
+    const onFocusIn = (event: FocusEvent) => reveal(event.target);
+    document.addEventListener("focusin", onFocusIn);
+    return () => document.removeEventListener("focusin", onFocusIn);
+  }, [keyboardInset]);
 
   // While the peek card's entry animation is still fading it in, the card is
   // (nearly) invisible yet already covers the toggle whose hover armed it —
