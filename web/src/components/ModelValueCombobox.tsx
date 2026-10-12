@@ -73,7 +73,7 @@ export function ModelValueCombobox({
           if (e.key === "Enter") {
             e.preventDefault();
             pick(query);
-          } else if (e.key === "Escape") {
+          } else if (e.key === "Escape" && !e.shiftKey) {
             setOpen(false);
           }
         }}

@@ -39,6 +39,7 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
     onOpenChange: vi.fn(),
     onToggleLeftSidebar: vi.fn(),
     onToggleRightSidebar: vi.fn(),
+    onClearAllNotifications: vi.fn(),
     ...overrides,
   };
   render(<CommandPalette {...props} />);
@@ -102,6 +103,7 @@ describe("CommandPalette — sessions", () => {
       onOpenChange: vi.fn(),
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
+      onClearAllNotifications: vi.fn(),
     };
     const { rerender } = render(<CommandPalette {...props} />);
     expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
@@ -430,6 +432,7 @@ describe("CommandPalette — actions", () => {
 
     expect(screen.getByText("New chat")).toBeTruthy();
     expect(screen.getByText("Go to Inbox")).toBeTruthy();
+    expect(screen.getByText("Clear all notifications")).toBeTruthy();
     expect(screen.getByText("Go to Settings")).toBeTruthy();
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Toggle workspace sidebar")).toBeTruthy();
@@ -455,6 +458,17 @@ describe("CommandPalette — actions", () => {
 
     fireEvent.click(screen.getByText("Toggle workspace sidebar"));
     expect(onToggleRightSidebar).toHaveBeenCalledTimes(1);
+  });
+
+  it("invokes the clear-all callback and closes the palette", () => {
+    const onClearAllNotifications = vi.fn();
+    const onOpenChange = vi.fn();
+    renderPalette({ onClearAllNotifications, onOpenChange });
+
+    fireEvent.click(screen.getByText("Clear all notifications"));
+
+    expect(onClearAllNotifications).toHaveBeenCalledOnce();
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
   it("filters actions client-side against the query", () => {

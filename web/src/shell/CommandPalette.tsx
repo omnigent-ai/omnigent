@@ -20,6 +20,7 @@ import type React from "react";
 import { defaultFilter } from "cmdk";
 import { useEffect, useMemo, useState } from "react";
 import {
+  BellOffIcon,
   CalendarClockIcon,
   InboxIcon,
   type LucideIcon,
@@ -53,6 +54,8 @@ export interface CommandPaletteProps {
   onToggleLeftSidebar: () => void;
   /** Flip the right (Workspace) sidebar — owned by AppShell. */
   onToggleRightSidebar: () => void;
+  /** Clear unread sessions, unseen comments, and dismissible toasts. */
+  onClearAllNotifications: () => void;
 }
 
 interface ActionCommand {
@@ -108,6 +111,7 @@ export function CommandPalette({
   onOpenChange,
   onToggleLeftSidebar,
   onToggleRightSidebar,
+  onClearAllNotifications,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
@@ -148,6 +152,13 @@ export function CommandPalette({
         run: () => navigate("/inbox"),
       },
       {
+        id: "clear-all-notifications",
+        label: "Clear all notifications",
+        icon: BellOffIcon,
+        keywords: ["clear", "dismiss", "mark all read", "notifications", "unread"],
+        run: onClearAllNotifications,
+      },
+      {
         id: "go-tasks",
         label: "Go to Automations",
         icon: CalendarClockIcon,
@@ -176,7 +187,7 @@ export function CommandPalette({
         run: onToggleRightSidebar,
       },
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
+    [navigate, onClearAllNotifications, onToggleLeftSidebar, onToggleRightSidebar],
   );
 
   const filteredActions = useMemo(() => {

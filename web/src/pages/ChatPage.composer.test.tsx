@@ -332,6 +332,18 @@ describe("Composer Escape interrupt", () => {
     expect(props.onStop).toHaveBeenCalledTimes(1);
   });
 
+  it("reserves Shift+Escape for clearing notifications", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(activeRow()).not.toBeNull();
+
+    fireEvent.keyDown(textarea(), { key: "Escape", shiftKey: true });
+
+    expect(props.onStop).not.toHaveBeenCalled();
+    expect(activeRow()).not.toBeNull();
+  });
+
   it("leaves Escape to active IME composition", () => {
     const props = composerProps({ isWorking: true });
     render(<Composer {...props} />);

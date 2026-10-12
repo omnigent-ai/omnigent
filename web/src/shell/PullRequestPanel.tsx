@@ -942,7 +942,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
         <form
           className="mt-2 flex gap-2"
           onKeyDown={(event) => {
-            if (event.key === "Escape") {
+            if (event.key === "Escape" && !event.shiftKey) {
               event.preventDefault();
               event.stopPropagation();
               setLinking(false);
@@ -1047,7 +1047,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
                     align="start"
                     className="w-(--radix-select-trigger-width)"
                     onKeyDown={(event) => {
-                      if (event.key === "Escape") setPrPickerOpen(false);
+                      if (event.key === "Escape" && !event.shiftKey) setPrPickerOpen(false);
                     }}
                   >
                     {prs.map((pr) => (

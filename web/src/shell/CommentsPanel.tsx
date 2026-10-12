@@ -443,7 +443,7 @@ function CommentCard({
             onChange={(e) => setEditBody(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) saveEdit();
-              if (e.key === "Escape") setEditing(false);
+              if (e.key === "Escape" && !e.shiftKey) setEditing(false);
             }}
           />
           <div className="flex gap-1.5">

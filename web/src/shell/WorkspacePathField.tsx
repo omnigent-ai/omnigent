@@ -240,7 +240,7 @@ export function WorkspacePathField({
           onCommit?.(trimmed);
         }
       }
-    } else if (e.key === "Escape") {
+    } else if (e.key === "Escape" && !e.shiftKey) {
       if (open) {
         e.preventDefault();
         setOpen(false);

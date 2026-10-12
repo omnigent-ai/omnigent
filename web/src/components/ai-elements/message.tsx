@@ -435,7 +435,7 @@ function ChatTable({ children, className, node: _node, ...props }: ChatTableProp
   useEffect(() => {
     if (!fullscreen) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeFullscreen();
+      if (event.key === "Escape" && !event.shiftKey) closeFullscreen();
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
@@ -640,7 +640,7 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
   useEffect(() => {
     if (svgMarkup == null) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
+      if (e.key === "Escape" && !e.shiftKey) close();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);

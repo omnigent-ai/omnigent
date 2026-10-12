@@ -19,3 +19,16 @@ export function showToast(content: ReactNode, opts?: { duration?: number }): str
     testId: "toast",
   });
 }
+
+/**
+ * Dismiss every user-dismissible toast. Sonner's bare `toast.dismiss()` also
+ * removes `dismissible: false` cards such as the terminal clipboard prompt,
+ * whose owners only re-publish them when their props change, so a pending
+ * decision would vanish with no way back. Those cards stay put.
+ */
+export function dismissAllToasts(): void {
+  for (const active of toast.getToasts()) {
+    if ("dismissible" in active && active.dismissible === false) continue;
+    toast.dismiss(active.id);
+  }
+}

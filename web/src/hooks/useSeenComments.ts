@@ -120,6 +120,11 @@ export function markCommentsSeen(commentIds: string[]): void {
   listeners.forEach((listener) => listener());
 }
 
+/** Mark every currently unseen comment supplied by the inbox as seen. */
+export function markAllSeen(commentIds: string[]): void {
+  markCommentsSeen(commentIds);
+}
+
 /** Reactive set of seen comment ids (current tab + persisted). */
 export function useSeenCommentIds(): ReadonlySet<string> {
   return useSyncExternalStore(subscribe, getSeenCommentIds, getSeenCommentIds);

@@ -95,7 +95,7 @@ export function RecentSessionsSwitcher({
     }
 
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape" && openRef.current) {
+      if (event.key === "Escape" && !event.shiftKey && openRef.current) {
         event.preventDefault();
         event.stopPropagation();
         cancel();

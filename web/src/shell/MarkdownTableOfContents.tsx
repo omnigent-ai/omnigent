@@ -138,7 +138,7 @@ export function MarkdownTableOfContents({
   useEffect(() => {
     if (!open || !onClose) return;
     const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+      if (e.key === "Escape" && !e.shiftKey) {
         onClose();
       }
     };

@@ -88,7 +88,7 @@ function HeaderTitleInput({
       onCommit(value);
       return;
     }
-    if (event.key === "Escape") {
+    if (event.key === "Escape" && !event.shiftKey) {
       event.preventDefault();
       cancelledRef.current = true;
       onCancel();

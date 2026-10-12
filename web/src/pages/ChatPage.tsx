@@ -2288,7 +2288,7 @@ function ComposerImpl(
   useEffect(() => {
     if (!composerLockedByBtw) return;
     const onKeyDown = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape") {
+      if (e.key === "Escape" && !e.shiftKey) {
         e.preventDefault();
         dismissBtwSidechat();
       }
@@ -3405,7 +3405,7 @@ function ComposerImpl(
       return;
     }
     // Esc dismisses the /btw sidechat overlay if open
-    if (e.key === "Escape" && btwSidechat) {
+    if (e.key === "Escape" && !e.shiftKey && btwSidechat) {
       e.preventDefault();
       dismissBtwSidechat();
       return;
@@ -3413,7 +3413,7 @@ function ComposerImpl(
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on
     // Esc destroys typed prompts with no undo (common muscle memory after
     // dismissing autocomplete suggestions).
-    if (e.key === "Escape" && isWorking && !isReadOnly) {
+    if (e.key === "Escape" && !e.shiftKey && isWorking && !isReadOnly) {
       e.preventDefault();
       onStop();
       return;

@@ -461,7 +461,7 @@ export function HeaderConversationMenu({
               value={renameTitle}
               onChange={(event) => setRenameTitle(event.target.value)}
               onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
-                if (event.key === "Escape") setRenameOpen(false);
+                if (event.key === "Escape" && !event.shiftKey) setRenameOpen(false);
               }}
               className="mt-4 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
             />

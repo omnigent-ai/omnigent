@@ -1,6 +1,11 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getSeenCommentIds, markCommentsSeen, useSeenCommentIds } from "./useSeenComments";
+import {
+  getSeenCommentIds,
+  markAllSeen,
+  markCommentsSeen,
+  useSeenCommentIds,
+} from "./useSeenComments";
 
 const STORAGE_KEY = "omnigent:seen-comment-ids";
 
@@ -52,6 +57,15 @@ describe("markCommentsSeen", () => {
     expect(stored["new"]).toBe(9_000);
     expect(stored["c0"]).toBeUndefined();
     expect(stored["c999"]).toBe(1000);
+  });
+});
+
+describe("markAllSeen", () => {
+  it("records every supplied unseen comment in the same registry", () => {
+    markCommentsSeen(["already-seen"]);
+    markAllSeen(["unseen-1", "unseen-2"]);
+
+    expect(getSeenCommentIds()).toEqual(new Set(["already-seen", "unseen-1", "unseen-2"]));
   });
 });
 

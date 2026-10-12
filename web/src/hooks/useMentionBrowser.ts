@@ -147,7 +147,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       attachMention(active.path, active.type === "directory");
       return true;
     }
-    if (e.key === "Escape") {
+    if (e.key === "Escape" && !e.shiftKey) {
       e.preventDefault();
       dismiss();
       return true;

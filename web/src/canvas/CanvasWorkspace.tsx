@@ -106,7 +106,7 @@ export function CanvasWorkspace({
   useEffect(() => {
     if (!focused) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !event.defaultPrevented) showCanvas();
+      if (event.key === "Escape" && !event.shiftKey && !event.defaultPrevented) showCanvas();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);

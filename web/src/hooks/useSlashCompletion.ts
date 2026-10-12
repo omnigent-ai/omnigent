@@ -194,6 +194,7 @@ export function useSlashCompletion({
     if (
       open &&
       e.key === "Escape" &&
+      !e.shiftKey &&
       (!escapeClearsOnlyWithContent || matches.length > 0 || status != null)
     ) {
       e.preventDefault();

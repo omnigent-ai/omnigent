@@ -5544,7 +5544,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
       onCommit(value);
       return;
     }
-    if (e.key === "Escape") {
+    if (e.key === "Escape" && !e.shiftKey) {
       e.preventDefault();
       cancelledRef.current = true;
       onCancel();

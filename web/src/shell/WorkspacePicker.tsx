@@ -800,7 +800,7 @@ export function WorkspacePicker({
                 e.preventDefault();
                 commitPathInput();
                 setPathEditing(false);
-              } else if (e.key === "Escape") {
+              } else if (e.key === "Escape" && !e.shiftKey) {
                 e.preventDefault();
                 userEditedRef.current = false;
                 setPathInput(currentAbsolute);
@@ -889,7 +889,7 @@ export function WorkspacePicker({
                 value={searchInput}
                 onChange={(event) => setSearchInput(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === "Escape" && searchInput !== "") {
+                  if (event.key === "Escape" && !event.shiftKey && searchInput !== "") {
                     event.preventDefault();
                     setSearchInput("");
                   }
@@ -923,7 +923,7 @@ export function WorkspacePicker({
                     if (e.key === "Enter") {
                       e.preventDefault();
                       void commitNewFolder();
-                    } else if (e.key === "Escape") {
+                    } else if (e.key === "Escape" && !e.shiftKey) {
                       e.preventDefault();
                       cancelNewFolder();
                     }

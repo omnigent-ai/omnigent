@@ -62,7 +62,7 @@ function useMenuInteractionProps(configOpen = false) {
     },
     onKeyDownCapture: (event: KeyboardEvent<HTMLElement>) => {
       interaction.onKeyboardInteraction();
-      if (event.key === "Escape") {
+      if (event.key === "Escape" && !event.shiftKey) {
         event.preventDefault();
         event.stopPropagation();
         interaction.closeMenu();

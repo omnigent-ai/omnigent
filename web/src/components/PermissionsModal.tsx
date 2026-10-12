@@ -484,7 +484,7 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
         e.preventDefault();
         commit(activeIndex);
       }
-    } else if (e.key === "Escape") {
+    } else if (e.key === "Escape" && !e.shiftKey) {
       // When the dropdown is open, Escape dismisses only the suggestions.
       // Stop it from bubbling to the enclosing Radix Dialog, which would
       // otherwise close the whole modal in the same keystroke.

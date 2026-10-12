@@ -122,7 +122,7 @@ export function MarkdownSearchBar({
             e.preventDefault();
             if (e.shiftKey) goPrev();
             else goNext();
-          } else if (e.key === "Escape") {
+          } else if (e.key === "Escape" && !e.shiftKey) {
             e.preventDefault();
             close();
           }

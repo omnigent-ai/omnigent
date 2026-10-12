@@ -1,4 +1,4 @@
-import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { useLoadedConversations, useSidebarData } from "@/hooks/useSidebarData";
 import {
   type CSSProperties,
   lazy,
@@ -21,6 +21,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
+import { useClearAllNotificationsHotkey } from "@/hooks/useClearAllNotificationsHotkey";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
@@ -59,6 +60,7 @@ import {
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import { readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
+import { clearAllNotifications } from "@/lib/clearAllNotifications";
 import {
   Dialog,
   DialogContent,
@@ -546,6 +548,7 @@ export function AppShell() {
   const debugMode = useDebugMode();
   // Reuse sidebar rows; the active-session snapshot covers sessions outside its cache.
   const { data: conversationsData, isLoading: conversationsLoading } = useLoadedConversations();
+  const { comments: commentInbox } = useSidebarData();
   const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
   // Surface sessions needing attention as OS notifications + a dock badge.
   // Mounted here (inside the Router) so it can navigate on click and knows
@@ -562,6 +565,13 @@ export function AppShell() {
     [conversationsData],
   );
   useSeedReadState(allConversations);
+  const handleClearAllNotifications = useCallback(() => {
+    clearAllNotifications(
+      allConversations ?? [],
+      commentInbox.items.map((item) => item.comment.id),
+    );
+  }, [allConversations, commentInbox.items]);
+  useClearAllNotificationsHotkey(handleClearAllNotifications);
   const activeConv = useMemo(() => {
     if (!serverConversationId) return null;
     return allConversations?.find((c) => c.id === serverConversationId) ?? null;
@@ -2789,6 +2799,7 @@ export function AppShell() {
             onOpenChange={setCommandPaletteOpen}
             onToggleLeftSidebar={toggleLeftSidebar}
             onToggleRightSidebar={toggleRightPanel}
+            onClearAllNotifications={handleClearAllNotifications}
           />
           <RecentSessionsSwitcher
             conversations={allConversations}

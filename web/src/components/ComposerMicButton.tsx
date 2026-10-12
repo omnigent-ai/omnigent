@@ -484,7 +484,7 @@ export const ComposerMicButton = ({
         e.preventDefault();
         e.stopPropagation();
         toggle();
-      } else if (e.key === "Escape") {
+      } else if (e.key === "Escape" && !e.shiftKey) {
         // Cancel: flag the discard so trailing results are dropped, revert the
         // composer, then tear the take down immediately (no tail flush).
         e.preventDefault();

@@ -658,7 +658,7 @@ function FileViewerBody({
   useEffect(() => {
     if (!open || !onCloseTab) return;
     const handler = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (e.key !== "Escape" || e.shiftKey || e.defaultPrevented) return;
       if (searchOpen) return;
       const target = e.target;
       if (

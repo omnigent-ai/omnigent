@@ -613,7 +613,7 @@ export function CodeViewer({
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
-      } else if (e.key === "Escape" && searchOpen) {
+      } else if (e.key === "Escape" && !e.shiftKey && searchOpen) {
         e.preventDefault();
         setSearchOpen(false);
       }
@@ -646,7 +646,7 @@ export function CodeViewer({
         selection.removeAllRanges();
         selection.addRange(range);
         selectAllPendingRef.current = true;
-      } else if (e.key === "Escape" && searchOpen) {
+      } else if (e.key === "Escape" && !e.shiftKey && searchOpen) {
         e.preventDefault();
         setSearchOpen(false);
         setSearchQuery("");

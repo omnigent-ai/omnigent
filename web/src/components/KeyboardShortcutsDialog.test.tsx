@@ -106,6 +106,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Start a new session")).toBeTruthy();
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
     expect(screen.getByText("Open command palette")).toBeTruthy();
+    expect(keysFor("Clear all notifications")).toEqual(["⇧", "Esc"]);
     expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
