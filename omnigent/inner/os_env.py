@@ -586,6 +586,9 @@ class _HelperProcessClient:
             config_arg = ["--config-fd", str(r_fd)]
         helper_argv = [
             sys.executable,
+            # Load tools from the runtime even when the checkout's package is broken.
+            # Unlike PYTHONSAFEPATH, -P does not change the agent's shell commands.
+            "-P",
             "-m",
             "omnigent.inner.os_env",
             "helper",

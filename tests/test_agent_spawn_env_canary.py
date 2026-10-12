@@ -32,6 +32,8 @@ CANARY_SECRETS = {
     "ANTHROPIC_API_KEY": "canary-anthropic",
     "GEMINI_API_KEY": "canary-gemini",
     "GITHUB_TOKEN": "canary-github",
+    "GLAB_TOKEN": "canary-glab",
+    "GITLAB_TOKEN": "canary-gitlab",
     "SLACK_BOT_TOKEN": "canary-slack",
     "OPENROUTER_API_KEY": "canary-openrouter",
     "PYTHON_KEYRING_BACKEND": "test_keyring_backend.FileKeyring",
@@ -148,6 +150,15 @@ SPAWN_ENV_BUILDERS = {
 def test_every_harness_is_covered_by_a_real_builder():
     """A harness added to the prefix table must also be wired up above."""
     assert set(SPAWN_ENV_BUILDERS) == set(HARNESS_PREFIXES)
+
+
+@pytest.mark.parametrize("harness", sorted(SPAWN_ENV_BUILDERS))
+def test_real_builder_preserves_forge_cli_config_paths(harness, hostile_env, monkeypatch):
+    paths = {"GH_CONFIG_DIR": "/test/gh", "GLAB_CONFIG_DIR": "/test/glab"}
+    monkeypatch.setattr("os.environ", {**hostile_env, **paths})
+    env = SPAWN_ENV_BUILDERS[harness]()
+    assert {name: env.get(name) for name in paths} == paths
+    assert not (set(env) & CANARY_SECRETS.keys())
 
 
 @pytest.mark.parametrize("harness", sorted(SPAWN_ENV_BUILDERS))

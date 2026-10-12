@@ -429,6 +429,23 @@ describe("useFileContent gating", () => {
     // Undefined conversationId gates the enabled flag — no session to fetch from.
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("does not fetch for a temp id while the new session is still being created", async () => {
+    // The file viewer can stay open across a navigate-first new chat; its
+    // `temp:*` id names no server session, so the request could only fail.
+    onlineMock.mockReturnValue(true);
+    hostOnlineMock.mockReturnValue(true);
+    stubChatStore({ conversationId: "temp:0a1b2c3d", sessionStatus: "running" });
+
+    render(
+      <Wrap>
+        <Probe id="temp:0a1b2c3d" path="src/a.txt" />
+      </Wrap>,
+    );
+    await flushMicrotasks();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------

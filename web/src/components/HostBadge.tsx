@@ -1,10 +1,13 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { useHosts } from "@/hooks/useHosts";
 import type { Host } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
 import { sandboxOptionLabel } from "@/lib/capabilities";
+import { DisabledActionTooltip } from "./DisabledActionTooltip";
+import { SessionActionMenuItem } from "./SessionActionMenuItem";
 import { SwitchHostDialog } from "@/shell/SwitchHostDialog";
 import { cn } from "@/lib/utils";
 import { ComposerHostTrigger } from "@/components/composer/ComposerControls";
@@ -128,9 +131,13 @@ export function HostBadge({
       : liveOnline;
 
   const badge = resolveHostBadge({ hostId, host, online });
+  const { switchHostDisabledReason } = useSessionActionRestrictions(sessionId);
+  const canSwitch = host !== undefined && !switchHostDisabledReason && !readOnly;
+  useEffect(() => {
+    if (!canSwitch) setSwitchOpen(false);
+  }, [canSwitch]);
   if (appearance === "composer") {
     const reconnectable = badge?.status === "offline" && !session?.hostResumable && !!onReconnect;
-    const canSwitch = host !== undefined && !host.sandbox_provider && !readOnly;
     const label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
     return (
       <>
@@ -167,8 +174,13 @@ export function HostBadge({
                 Reconnect host
               </DropdownMenuItem>
             )}
-            {canSwitch && (
-              <DropdownMenuItem onSelect={() => setSwitchOpen(true)}>Switch host…</DropdownMenuItem>
+            {!readOnly && (canSwitch || switchHostDisabledReason) && (
+              <SessionActionMenuItem
+                disabledReason={switchHostDisabledReason}
+                onSelect={() => setSwitchOpen(true)}
+              >
+                Switch host…
+              </SessionActionMenuItem>
             )}
             {!badge && (
               <p className="max-w-60 px-2 py-1 text-xs text-muted-foreground">
@@ -195,6 +207,7 @@ export function HostBadge({
   // reconnect dialog hands out) is the wrong instruction for it.
   const reconnectable = badge.status === "offline" && !session?.hostResumable && !!onReconnect;
   const statusWord = reconnectable ? RECONNECT_WORD : STATUS_WORD[badge.status];
+  const title = `Host ${badge.label}, ${statusWord}`;
   // The dot is decorative (aria-hidden), so the status would otherwise be
   // conveyed by color alone. Restate it in sr-only text — read together with
   // the visible label, a screen reader announces "<host>, <status>". `title`
@@ -209,7 +222,6 @@ export function HostBadge({
       <span className="sr-only">, {statusWord}</span>
     </>
   );
-  const title = `Host ${badge.label}, ${statusWord}`;
 
   if (reconnectable) {
     return (
@@ -225,39 +237,42 @@ export function HostBadge({
     );
   }
 
-  // Sandbox-backed hosts are provisioned (and relaunched) by the server, so a
-  // manual move isn't meaningful. An unresolved record — a shared session, or
-  // the list still loading — can't be confirmed non-sandbox, so it stays
-  // passive too rather than offering a switch that may not apply.
-  const canSwitch = host !== undefined && !host.sandbox_provider;
-  if (!canSwitch) {
-    return (
-      // No aria-label: on a non-interactive div it's announced unreliably and
-      // would only duplicate the sr-only text where it is honored.
-      <div
-        data-testid="host-badge"
-        className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
-        title={title}
-      >
-        {content}
-      </div>
-    );
-  }
-
   return (
     <>
-      <button
-        type="button"
-        data-testid="host-badge"
-        onClick={() => setSwitchOpen(true)}
-        className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-        title={`${title} — click to switch`}
+      <DisabledActionTooltip
+        reason={switchHostDisabledReason}
+        label="Switch host"
+        className="min-w-0"
       >
-        {content}
-      </button>
+        {canSwitch ? (
+          <button
+            type="button"
+            data-testid="host-badge"
+            onClick={() => setSwitchOpen(true)}
+            className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            title={`${title} — click to switch`}
+          >
+            {content}
+          </button>
+        ) : (
+          // Avoid a native title competing with the disabled-action tooltip.
+          <div
+            data-testid="host-badge"
+            className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
+            title={switchHostDisabledReason ? undefined : title}
+          >
+            {content}
+            {switchHostDisabledReason && (
+              <button type="button" disabled className="pointer-events-none opacity-50">
+                Switch host…
+              </button>
+            )}
+          </div>
+        )}
+      </DisabledActionTooltip>
       {/* Mounted only while open: the badge renders on every session, and a
           closed dialog would still run its host query and workspace hooks. */}
-      {switchOpen && (
+      {switchOpen && canSwitch && (
         <SwitchHostDialog
           open
           onOpenChange={setSwitchOpen}

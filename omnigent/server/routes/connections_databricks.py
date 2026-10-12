@@ -3,7 +3,7 @@
 Mounted under ``/v1`` so paths are ``/v1/connections/databricks/...``. Only
 mounted when a :class:`DatabricksConfig` is configured. Lets a signed-in user
 authorize their Databricks workspace (OAuth U2M + PKCE) so their managed
-sandboxes reach the Databricks AI Gateway MCP as them. The shared OAuth flow
+sandboxes reach the Databricks Unity Gateway MCP as them. The shared OAuth flow
 lives in :mod:`omnigent.server.routes.connections_base`; this module is the
 Databricks adapter (per-workspace host + PKCE). See
 ``designs/DATABRICKS_CONNECT.md``.

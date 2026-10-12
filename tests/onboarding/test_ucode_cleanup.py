@@ -48,7 +48,7 @@ _LEGACY_UCODE_CONFIG = textwrap.dedent(
     base_url = "https://api.moonshot.ai/v1"
 
     [model_providers.ucode-databricks]
-    name = "Databricks AI Gateway"
+    name = "Databricks Unity Gateway"
     base_url = "https://example.databricks.com/ai-gateway/codex/v1"
     wire_api = "responses"
 

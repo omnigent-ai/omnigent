@@ -790,46 +790,76 @@ class CallerProcessFilesystem:
         """
         import json as _json
 
-        from omnigent.entities.pagination import paginate_in_memory
-
         target, prefix = self._target(path)
 
-        # Shell-quote the generated script; target is embedded via json.dumps.
-        # Per-entry try/except handles broken symlinks.
+        # Keep the helper's response below os_env.shell's 100,000-character
+        # stdout cap, even when names are unusually long or need JSON escaping.
         _script = "\n".join(
             [
                 "import os, json",
                 f"d = {_json.dumps(target)}",
+                f"prefix = {_json.dumps(prefix)}",
+                f"after = {after!r}",
+                f"before = {before!r}",
+                f"order = {_json.dumps(order)}",
+                f"limit = {limit}",
+                "names = sorted(os.listdir(d), reverse=order == 'desc')",
+                "def cursor_index(cursor):",
+                "    if cursor is None: return None",
+                "    if prefix:",
+                "        start = prefix + os.sep",
+                "        if not cursor.startswith(start): return None",
+                "        cursor = cursor[len(start):]",
+                "    try: return names.index(cursor)",
+                "    except ValueError: return None",
+                "after_index = cursor_index(after)",
+                "before_index = cursor_index(before)",
+                "start = after_index + 1 if after_index is not None else 0",
+                "end = before_index if before_index is not None else len(names)",
+                "positions = (range(end - 1, start - 1, -1) if before_index is not None",
+                "             else range(start, end))",
                 "es = []",
-                "for e in sorted(os.listdir(d)):",
+                "size = 0",
+                "has_more = False",
+                "for i in positions:",
+                "    e = names[i]",
                 "    p = os.path.join(d, e)",
                 "    try:",
                 "        st = os.stat(p)",
                 "        t = 'd' if os.path.isdir(p) else 'f'",
-                "        es.append({'n': e, 's': st.st_size if t == 'f' else None,",
-                "            'm': int(st.st_mtime), 't': t})",
+                "        item = {'n': e, 's': st.st_size if t == 'f' else None,",
+                "                'm': int(st.st_mtime), 't': t}",
                 "    except OSError:",
                 "        try:",
                 "            ls = os.lstat(p)",
-                "            es.append({'n': e, 's': None, 'm': int(ls.st_mtime), 't': 'f'})",
+                "            item = {'n': e, 's': None, 'm': int(ls.st_mtime), 't': 'f'}",
                 "        except OSError:",
-                "            pass",
-                "print(json.dumps(es))",
+                "            continue",
+                "    item_size = len(json.dumps(item)) + 1",
+                "    if len(es) >= limit or size + item_size > 90000:",
+                "        has_more = True",
+                "        break",
+                "    es.append(item)",
+                "    size += item_size",
+                "if before_index is not None: es.reverse()",
+                "print(json.dumps({'es': es, 'has_more': has_more}))",
             ]
         )
         result = await _run_os_env_async(
             self._os_env.shell,
             f"python3 -c {_shell_quote(_script)}",
         )
-        if "error" in result:
+        if "error" in result or result.get("exit_code") != 0:
             raise FilesystemPathNotFound(f"Directory {path!r} not found or not accessible")
 
         entries: list[FilesystemEntry] = []
         try:
-            raw = _json.loads(result.get("stdout", "[]"))
-        except _json.JSONDecodeError:
-            raw = []
-        for item in raw:
+            raw = _json.loads(result["stdout"])
+            if not isinstance(raw["es"], list) or not isinstance(raw["has_more"], bool):
+                raise ValueError("Invalid directory listing")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid directory listing for {path!r}") from exc
+        for item in raw["es"]:
             name = item["n"]
             rel = os.path.join(prefix, name) if prefix else name
             entry_type: Literal["file", "directory"] = "directory" if item["t"] == "d" else "file"
@@ -844,13 +874,11 @@ class CallerProcessFilesystem:
                 )
             )
 
-        return paginate_in_memory(
-            entries,
-            id_fn=lambda e: e.id,
-            limit=limit,
-            after=after,
-            before=before,
-            order=order,
+        return PagedList(
+            data=entries,
+            first_id=entries[0].id if entries else None,
+            last_id=entries[-1].id if entries else None,
+            has_more=raw["has_more"],
         )
 
     async def search_files(

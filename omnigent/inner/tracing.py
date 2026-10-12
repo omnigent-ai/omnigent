@@ -78,6 +78,10 @@ _TOOL_NAME = "tool.name"
 # content capture just like input.value / output.value.
 _ERROR_MESSAGE = "error.message"
 
+# Skill name on a Skill / load_skill tool span. Structural, not payload, so it is
+# stamped regardless of content capture.
+_SKILL_NAME = "omnigent.skill.name"
+
 # ---------------------------------------------------------------------------
 # Global enable/disable
 # ---------------------------------------------------------------------------
@@ -306,6 +310,11 @@ class TracingContext:
         span.end()
         if span is self._current_span:
             self._current_span = parent_span
+
+    def set_skill_name(self, span: Span | None, skill_name: str) -> None:
+        """Stamp ``omnigent.skill.name`` on a Skill / load_skill tool span."""
+        if span is not None and skill_name:
+            span.set_attribute(_SKILL_NAME, skill_name)
 
     def start_policy_span(
         self,

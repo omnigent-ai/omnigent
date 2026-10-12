@@ -205,10 +205,13 @@ class RunnerExitReport:
         e.g. ``"alice@example.com"``. ``None`` when auth is disabled.
         Gates visibility: only the owner may read the report (the log
         tail can contain agent output).
+    :param had_connected: Host evidence that the runner connected at least once,
+        or ``None`` when unavailable.
     """
 
     error: str
     owner: str | None
+    had_connected: bool | None = None
 
 
 class RunnerExitReports:
@@ -230,16 +233,31 @@ class RunnerExitReports:
             ttl=_EXIT_REPORT_TTL_S,
         )
 
-    def record(self, runner_id: str, error: str, owner: str | None) -> None:
+    def record(
+        self, runner_id: str, error: str, owner: str | None, *, had_connected: bool | None = None
+    ) -> None:
         """Store a runner exit report.
 
         :param runner_id: The dead runner, e.g. ``"runner_abc123"``.
         :param error: Human-readable cause from the host daemon.
         :param owner: Owner of the reporting host tunnel, or ``None``
             when auth is disabled.
+        :param had_connected: First-connect evidence supplied by the host.
         """
         with self._lock:
-            self._reports[runner_id] = RunnerExitReport(error=error, owner=owner)
+            self._reports[runner_id] = RunnerExitReport(
+                error=error, owner=owner, had_connected=had_connected
+            )
+
+    def was_connected(self, runner_id: str) -> bool:
+        """Return whether the host's exit report proves this runner had connected.
+
+        :param runner_id: Runner whose lifetime evidence is needed.
+        :returns: ``True`` only for a report with affirmative connection evidence.
+        """
+        with self._lock:
+            report = self._reports.get(runner_id)
+        return report is not None and report.had_connected is True
 
     def get(self, runner_id: str) -> str | None:
         """Look up a report's error without owner scoping.

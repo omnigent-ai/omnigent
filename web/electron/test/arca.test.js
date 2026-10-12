@@ -12,6 +12,7 @@ const {
   startArcaConnect,
   startArcaLogin,
 } = require("../src/arca");
+const { IDENTITY_START, IDENTITY_END } = require("../src/arcaIdentity");
 
 /** A fake connect child: an EventEmitter with stdout/stderr stream stubs. */
 function fakeConnectChild() {
@@ -70,7 +71,8 @@ describe("arca connect command", () => {
     assert.equal(buildConnectArgs(server)[7], args[6]);
   });
   it("passes the remote isaac omni host command through ssh", () => {
-    assert.deepEqual(buildConnectArgs("https://workspace.example.com/ml/omnigents"), [
+    const args = buildConnectArgs("https://workspace.example.com/ml/omnigents");
+    assert.deepEqual(args.slice(0, 10), [
       "ssh",
       "-o",
       "ClearAllForwardings=yes",
@@ -82,6 +84,7 @@ describe("arca connect command", () => {
       "--background",
       "--non-interactive",
     ]);
+    assert.match(args.join(" "), /&&.*host status --server.*--json/);
   });
 
   it("quotes the URL for the remote shell so a query's `?` isn't globbed", () => {
@@ -179,6 +182,20 @@ describe("arca connect failures", () => {
 });
 
 describe("startArcaConnect / connectArcaHost", () => {
+  it("reports unavailable identity without changing a successful older connect result", async () => {
+    const child = fakeConnectChild();
+    const reasons = [];
+    const run = startArcaConnect("https://srv.example.com", {
+      resolveArcaPath: () => "/bin/arca",
+      spawn: () => child,
+      onIdentityUnavailable: (reason) => reasons.push(reason),
+    });
+    child.stdout.emit("data", "Host daemon already running: private-output");
+    child.emit("exit", 0);
+    assert.deepEqual(await run.promise, { ok: true, alreadyRunning: true });
+    assert.deepEqual(reasons, ["status markers missing"]);
+  });
+
   it("settles canceled login without waiting for a remote process exit", async () => {
     const child = fakeConnectChild();
     const run = startArcaLogin("https://account.databricks.com/omnigent?o=123", {
@@ -254,10 +271,7 @@ describe("startArcaConnect / connectArcaHost", () => {
       },
       onOutput: (text) => chunks.push(text),
     });
-    assert.equal(
-      run.command,
-      "arca ssh -o ClearAllForwardings=yes isaac omni host --server 'https://srv.example.com/' --background --non-interactive",
-    );
+    assert.equal(run.command, `arca ${buildConnectArgs("https://srv.example.com").join(" ")}`);
     child.stdout.emit("data", "Attempting to start your Arca instance\n");
     child.stderr.emit("data", "synced dbcert\n");
     child.emit("exit", 0);
@@ -277,6 +291,37 @@ describe("startArcaConnect / connectArcaHost", () => {
     child.stdout.emit("data", "Host daemon already running (pid 4242).\n");
     child.emit("exit", 0);
     assert.deepEqual(await run.promise, { ok: true, alreadyRunning: true });
+  });
+
+  it("captures machine-readable identity after an already-running connection", async () => {
+    const child = fakeConnectChild();
+    const run = startArcaConnect("https://srv.example.com/", {
+      resolveArcaPath: () => "/bin/arca",
+      spawn: () => child,
+    });
+    child.stdout.emit("data", "Host daemon already running.\n");
+    child.stdout.emit(
+      "data",
+      `${IDENTITY_START}\n${JSON.stringify({
+        daemons: [
+          {
+            target: "https://srv.example.com",
+            server_url: "https://srv.example.com",
+            mode: "server",
+            process: "online",
+            host_status: "online",
+            host_id: "a".repeat(32),
+            error: null,
+          },
+        ],
+      })}\n${IDENTITY_END}\n`,
+    );
+    child.emit("exit", 0);
+    assert.deepEqual(await run.promise, {
+      ok: true,
+      alreadyRunning: true,
+      identity: { serverUrl: "https://srv.example.com/", hostId: "a".repeat(32) },
+    });
   });
 
   it("maps a failing exit through the captured output and never rejects", async () => {

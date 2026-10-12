@@ -404,6 +404,8 @@ jobs:
           path: |
             test-results/
             playwright-report/
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/trace.zip
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/*.png
           retention-days: 3
           if-no-files-found: ignore
 
@@ -443,6 +445,9 @@ jobs:
             /tmp/pytest-of-runner/**/e2e_ui_mocked_codex_server*/runner.log
             /tmp/pytest-of-runner/**/test_antigravity_survives_prob*/server.log
             /tmp/pytest-of-runner/**/test_antigravity_survives_prob*/runner.log
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/*.log
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/network.json
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/first-response.json
             /tmp/omnigent-*/claude-native/**
             /tmp/claude-home-dump/**
             /tmp/codex-home-dump/**

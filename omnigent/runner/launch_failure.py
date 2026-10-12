@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
+from omnigent.llms.errors import detect_request_size_overflow
 
 __all__ = [
     "FailureDiagnosis",
@@ -247,8 +248,10 @@ def classify_native_turn_error(code: str, message: str) -> str:
     """Refine a native turn's generic code when its text identifies the cause.
 
     Recognizes rate limits and transient upstream model-gateway failures so
-    the web UI can offer a one-click retry instead of a terminal error, and a
-    Claude Code too old for the selected model. Also corrects
+    the web UI can offer a one-click retry instead of a terminal error, a
+    Claude Code too old for the selected model, and a content-length cap
+    rejection (a request carrying an oversized transcript, refused by the
+    deployment's byte cap before the model sees it). Also corrects
     ``codex_reauth_required`` when the message reveals that the real
     cause is a budget/usage-limit exhaustion (older runners misclassify the
     gateway's 403 as auth; the server fixes it on deploy).
@@ -264,6 +267,8 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return code
     if _CLIENT_UPDATE_REQUIRED.search(message):
         return "client_update_required"
+    if detect_request_size_overflow(message) is not None:
+        return "context_length_exceeded"
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
     status = status_match.group(1) if status_match else None
     if status in {"401", "403"}:

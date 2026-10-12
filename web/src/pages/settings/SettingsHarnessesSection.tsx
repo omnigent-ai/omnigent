@@ -583,10 +583,10 @@ function CredentialCard({ gateway }: { gateway: boolean }) {
           <KeyRoundIcon className="size-4 text-muted-foreground" />
         </span>
         <span className="flex min-w-0 flex-col">
-          <span className="text-ui font-medium">{gateway ? "AI Gateway" : "Signed in"}</span>
+          <span className="text-ui font-medium">{gateway ? "Unity Gateway" : "Signed in"}</span>
           <span className="text-xs text-muted-foreground">
             {gateway
-              ? "Managed credential via the Databricks AI Gateway"
+              ? "Managed credential via the Databricks Unity Gateway"
               : "Uses the harness's own login on this host"}
           </span>
         </span>

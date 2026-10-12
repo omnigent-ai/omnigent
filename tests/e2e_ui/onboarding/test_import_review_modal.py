@@ -16,6 +16,8 @@ from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_import_e2e"
 
+_SERVER_INFO = {"features": {"import_review": True}}
+
 
 _HOSTS = {
     "hosts": [
@@ -65,14 +67,15 @@ async def _register_routes(page: Page) -> None:
     async def handle_mcp_servers(route: Route) -> None:
         await route.fulfill(json=_MCP_SERVERS)
 
+    await page.route("**/v1/info", lambda route: route.fulfill(json=_SERVER_INFO))
     await page.route("**/v1/hosts", handle_hosts)
     await page.route("**/v1/skills?*", handle_skills)
     await page.route(f"**/v1/hosts/{_HOST_ID}/mcp-servers", handle_mcp_servers)
     await stub_empty_host_picker_data(page, _HOST_ID)
 
 
-def test_import_modal_opens_once_and_reopens_from_settings(live_server: str) -> None:
-    """A new host's imports show once, stay dismissed on reload, and reopen in Settings."""
+def test_import_modal_opens_once_and_links_to_harnesses(live_server: str) -> None:
+    """A new host's imports link to Harnesses and stay dismissed on reload."""
     _run_in_fresh_loop(_drive(live_server))
 
 
@@ -87,7 +90,7 @@ async def _drive(base_url: str) -> None:
             dialog = page.get_by_role("dialog", name="Your setup is ready")
             await expect(dialog).to_be_visible(timeout=30_000)
             await expect(dialog).to_contain_text("These carry over automatically.")
-            await expect(dialog).to_contain_text("Databricks AI Gateway")
+            await expect(dialog).to_contain_text("Databricks Unity Gateway")
             # Review only: nothing to select.
             await expect(dialog.get_by_role("checkbox")).to_have_count(0)
 
@@ -104,9 +107,11 @@ async def _drive(base_url: str) -> None:
             await expect(assets.get_by_role("tab")).to_have_text(["MCPs 1", "Skills 1"])
             await assets.get_by_role("tab", name="Skills").click()
             await expect(dialog.get_by_role("list", name="Skills")).to_contain_text("fix-ci")
-            await expect(dialog).not_to_contain_text("Databricks AI Gateway")
+            await expect(dialog).not_to_contain_text("Databricks Unity Gateway")
 
-            await dialog.get_by_role("button", name="Confirm").click()
+            await dialog.get_by_role("link", name="See more").click()
+            await expect(page).to_have_url(f"{base_url}/settings/harnesses")
+            await expect(page.get_by_role("heading", name="Harnesses", exact=True)).to_be_visible()
             await expect(dialog).to_be_hidden()
             reviewed = await page.evaluate(
                 f"window.localStorage.getItem('omnigent:imports-reviewed:{_HOST_ID}')"
@@ -114,16 +119,12 @@ async def _drive(base_url: str) -> None:
             assert reviewed is not None
 
             await page.reload()
-            await page.get_by_test_id("new-chat-landing-input").wait_for(
-                state="visible", timeout=30_000
-            )
+            await expect(page.get_by_role("heading", name="Harnesses", exact=True)).to_be_visible()
             await expect(dialog).to_be_hidden()
 
             await page.goto(f"{base_url}/settings/import")
-            await page.get_by_role("button", name="Review imports on import-e2e-host").click()
-            await expect(dialog).to_be_visible()
-            await expect(dialog.get_by_role("list", name="MCPs")).to_contain_text("github")
-            await dialog.get_by_role("button", name="Close").click()
+            await expect(page.get_by_role("heading", name="Import from a machine")).to_be_visible()
+            await expect(page.get_by_role("heading", name="Harness imports")).to_have_count(0)
             await expect(dialog).to_be_hidden()
         finally:
             await browser.close()
@@ -139,6 +140,7 @@ async def _drive_empty(base_url: str) -> None:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
         try:
+            await page.route("**/v1/info", lambda route: route.fulfill(json=_SERVER_INFO))
             await page.route("**/v1/hosts", lambda route: route.fulfill(json=_HOSTS))
             await page.route("**/v1/skills?*", lambda route: route.fulfill(json={"skills": []}))
             await page.route(

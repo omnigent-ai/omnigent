@@ -1589,7 +1589,7 @@ def _fetch_databricks_uc_listing(
     """List LLM model services via the Unity Catalog model-services API.
 
     Returns ``system.ai.*`` model ids directly — the ids that work with the
-    AI Gateway — avoiding the ``databricks-*`` → ``system.ai.*`` translation.
+    Unity Gateway — avoiding the ``databricks-*`` → ``system.ai.*`` translation.
 
     :param provider: A ``kind="databricks"`` provider descriptor.
     :param transport: Optional httpx transport override for tests.

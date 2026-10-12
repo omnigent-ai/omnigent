@@ -266,6 +266,20 @@ describe("useUnseenTick", () => {
     act(() => mod.markConversationUnread("conv-1", 5_000));
     expect(result.current).not.toBe(before);
   });
+
+  it("stays at 0 without re-rendering when disabled", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([]);
+    let renders = 0;
+    const { result } = renderHook(() => {
+      renders += 1;
+      return mod.useUnseenTick(false);
+    });
+    const rendersBefore = renders;
+    act(() => mod.markConversationUnread("conv-1", 5_000));
+    expect(result.current).toBe(0);
+    expect(renders).toBe(rendersBefore);
+  });
 });
 
 describe("useConversationReadState", () => {

@@ -15,33 +15,13 @@ import httpx
 
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
-from tests._helpers.live_server import find_free_port, local_server_env, terminate_process
-
-
-def _process_env(
-    home: Path, overrides: Mapping[str, str | None], base_env: Mapping[str, str] | None
-) -> dict[str, str]:
-    if {"HOME", "OMNIGENT_DATA_DIR"} & overrides.keys():
-        raise ValueError("HOME and OMNIGENT_DATA_DIR are owned by the isolated stack")
-    env = local_server_env({}, base_env=base_env)
-    # A parent runner's identity, zygote FDs and logging paths cannot belong to
-    # this fresh runtime. Tests opt into their required settings explicitly.
-    for name in list(env):
-        if name.startswith("OMNIGENT") or name == "RUNNER_SERVER_URL":
-            env.pop(name)
-    env.update(
-        HOME=str(home),
-        OMNIGENT_DATA_DIR=str(home / ".omnigent"),
-        OMNIGENT_AUTH_PROVIDER="header",
-        OMNIGENT_LOCAL_SINGLE_USER="1",
-        OMNIGENT_DISABLE_CATALOG_LOOKUP="1",
-    )
-    for name, value in overrides.items():
-        if value is None:
-            env.pop(name, None)
-        else:
-            env[name] = value
-    return env
+from tests._helpers.compat import (
+    compat_runner_cwd,
+    compat_runner_python,
+    compat_server_cwd,
+    compat_server_python,
+)
+from tests._helpers.live_server import find_free_port, isolated_process_env, terminate_process
 
 
 class ServerRunner:
@@ -97,9 +77,16 @@ class ServerRunner:
         cwd: Path | None = None,
     ) -> subprocess.Popen[bytes]:
         log = self._resources.enter_context(self.log_path(name).open("ab"))
+        pinned_python = compat_server_python() if name == "server" else compat_runner_python()
+        if pinned_python is not None:
+            # Neither the checkout cwd nor PYTHONPATH may shadow the pinned build.
+            env = {**env, "PYTHONPATH": None}
+            neutral_cwd = compat_server_cwd() if name == "server" else compat_runner_cwd()
+            assert neutral_cwd is not None
+            cwd = Path(neutral_cwd)
         proc = subprocess.Popen(
-            [sys.executable, *args],
-            env=_process_env(home, env, self._base_env),
+            [pinned_python or sys.executable, *args],
+            env=isolated_process_env(home, env, self._base_env),
             cwd=cwd,
             stdout=log,
             stderr=subprocess.STDOUT,

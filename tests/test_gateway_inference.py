@@ -521,7 +521,7 @@ def test_gateway_inference_state_reads_any_spelling_of_the_family(
 
 def test_not_gateway_backed_names_only_the_explicit_false_arms() -> None:
     arms = ("claude-native", "codex-native")
-    # Claude Code on the AI Gateway, Codex on a personal ChatGPT subscription.
+    # Claude Code on the Unity Gateway, Codex on a personal ChatGPT subscription.
     assert not_gateway_backed({"claude-native": True, "codex-native": False}, arms) == [
         "codex-native"
     ]

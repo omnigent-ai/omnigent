@@ -3,7 +3,7 @@
 Unlike codex/claude/pi — which consume ``HARNESS_*_GATEWAY_*`` env vars that
 their CLIs translate into provider config — OpenCode reads its provider/auth
 from its own config file under the per-session ``XDG_CONFIG_HOME``. So routing
-opencode-native through the Databricks AI gateway (or any OpenAI-compatible
+opencode-native through the Databricks Unity Gateway (or any OpenAI-compatible
 endpoint) means writing an ``opencode.json`` into the runner-owned
 ``opencode serve``'s config dir at spawn, declaring a custom
 ``@ai-sdk/openai-compatible`` provider pointed at ``{host}/serving-endpoints``.
@@ -41,7 +41,7 @@ _logger = logging.getLogger(__name__)
 # Provider id used in the synthesized opencode.json for the Databricks gateway.
 # The per-prompt model is pinned as ``{DATABRICKS_GATEWAY_PROVIDER_ID}/<endpoint>``.
 DATABRICKS_GATEWAY_PROVIDER_ID = "databricks-gateway"
-DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks AI Gateway"
+DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks Unity Gateway"
 # Endpoint that exposes the workspace's OpenAI-compatible chat completions.
 _SERVING_ENDPOINTS_PATH = "serving-endpoints"
 # Optional deployment default: a ``databricks-*`` serving-endpoint id used when a
@@ -332,7 +332,7 @@ def resolve_databricks_gateway(
     model_id: str | None = None,
 ) -> OpenCodeGatewayResolution | None:
     """
-    Resolve a Databricks AI gateway for opencode from a ``~/.databrickscfg`` profile.
+    Resolve a Databricks Unity Gateway for opencode from a ``~/.databrickscfg`` profile.
 
     Uses ``databricks-sdk`` (the ``databricks`` extra) to obtain the workspace
     host + a bearer token for *profile*, then targets the workspace's

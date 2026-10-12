@@ -5,6 +5,7 @@ import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   AGENT_BROWSER_TAB_ID,
   browserViewId,
+  browserViewOwnerId,
   openAgentBrowserTab,
   useBrowserTabs,
 } from "./useBrowserTabs";
@@ -13,6 +14,18 @@ afterEach(() => {
   cleanup();
   localStorage.clear();
   Reflect.deleteProperty(window, "omnigentDesktop");
+});
+
+describe("browserViewOwnerId", () => {
+  it("round-trips browserViewId for agent and user-opened tabs", () => {
+    expect(browserViewOwnerId(browserViewId("conv a", AGENT_BROWSER_TAB_ID))).toBe("conv a");
+    expect(browserViewOwnerId(browserViewId("conv a", "tab-two"))).toBe("conv a");
+  });
+
+  it("returns malformed or undecodable view IDs unchanged", () => {
+    expect(browserViewOwnerId("browser-tab:conv")).toBe("browser-tab:conv");
+    expect(browserViewOwnerId("browser-tab:%E0%A4%A:tab")).toBe("browser-tab:%E0%A4%A:tab");
+  });
 });
 
 describe("browser soft tabs", () => {

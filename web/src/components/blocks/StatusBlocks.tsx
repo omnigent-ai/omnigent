@@ -912,8 +912,8 @@ export function RoutingDecisionCard({
         {routerSource === "databricks-aigw" ? (
           <span
             className="text-muted-foreground"
-            title="Routed by the Databricks AI Gateway"
-            aria-label="Routed by the Databricks AI Gateway"
+            title="Routed by the Databricks Unity Gateway"
+            aria-label="Routed by the Databricks Unity Gateway"
             role="img"
             data-testid="routing-decision-source-databricks"
           >

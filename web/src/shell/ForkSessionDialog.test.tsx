@@ -3,6 +3,7 @@ import type * as ReactRouterDomModule from "react-router-dom";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -137,7 +138,7 @@ function renderDialog(
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const invalidateSpy = vi.spyOn(client, "invalidateQueries");
-  const dialog = (
+  const dialog = () => (
     <ForkSessionDialog
       sourceSessionId="conv_src"
       sourceTitle={props.sourceTitle}
@@ -149,22 +150,23 @@ function renderDialog(
       onOpenChange={vi.fn()}
     />
   );
-  const utils = render(
+  const content = () => (
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <MemoryRouter>
           {props.info === undefined ? (
-            dialog
+            dialog()
           ) : (
             <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...props.info }}>
-              {dialog}
+              {dialog()}
             </CapabilitiesProvider>
           )}
         </MemoryRouter>
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
-  return { ...utils, invalidateSpy };
+  const utils = render(content());
+  return { ...utils, invalidateSpy, refresh: () => utils.rerender(content()) };
 }
 
 /** Open the Radix host <Select> (hosts + sandbox rows). */
@@ -228,6 +230,79 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ForkSessionDialog", () => {
+  it.each([
+    ["managed snapshot", null],
+    ["Arclet host", "arclet"],
+    ["Databricks Sandbox host", "lakebox"],
+  ])("blocks the whole form for an unsupported source detected by %s", async (source, provider) => {
+    useSessionMock.mockReturnValue({
+      session: {
+        hostId: "host_1",
+        labels: source === "managed snapshot" ? { "omnigent.host_type": "managed" } : {},
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useSession>);
+    setHosts([host({ sandbox_provider: provider })]);
+    renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo" });
+
+    const submit = screen.getByTestId("fork-session-submit");
+    expect(submit).toBeDisabled();
+    expect(screen.getByRole("group", { name: "Clone session" })).toBe(submit.parentElement);
+    expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
+      "Forking this sandbox session is not supported yet.",
+    );
+    expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-advanced-toggle")).not.toBeInTheDocument();
+    fireEvent.click(submit);
+    fireEvent.focus(submit.parentElement!);
+    fireEvent.keyDown(submit.parentElement!, { key: "Enter" });
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent(
+        "Forking this sandbox session is not supported yet.",
+      ),
+    );
+    expect(submit.parentElement).toHaveAccessibleDescription(
+      "Forking this sandbox session is not supported yet.",
+    );
+    expect(forkSessionMock).not.toHaveBeenCalled();
+    expect(launchRunnerMock).not.toHaveBeenCalled();
+    expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+  });
+
+  it("does not expose an actionable form before the source snapshot resolves", () => {
+    useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo" });
+    expect(screen.getByRole("status")).toHaveTextContent("Checking session capabilities…");
+    expect(screen.queryByTestId("fork-session-submit")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
+  });
+
+  it("moves keyboard focus into the form when source capabilities finish loading", async () => {
+    const user = userEvent.setup();
+    useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    const { refresh } = renderDialog();
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
+
+    useSessionMock.mockReturnValue({
+      session: null,
+      isLoading: false,
+      error: new Error("Session unavailable"),
+    });
+    refresh();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Unable to check session capabilities. Reload to try again.",
+    );
+    expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+
+    useSessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
+    refresh();
+    expect(screen.getByTestId("fork-session-agent-select")).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("listbox")).toBeVisible();
+    expect(forkSessionMock).not.toHaveBeenCalled();
+  });
+
   it("leaves the name optional, suggesting 'Fork of <title>' as the placeholder", () => {
     renderDialog({ sourceTitle: "My session" });
     // Name lives under Advanced now (optional, prefilled-by-placeholder).

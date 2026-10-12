@@ -259,6 +259,8 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: pytest-${{ matrix.group }}-${{ github.run_id }}
+          # A retry must replace the failed attempt's partial coverage.
+          overwrite: true
           path: artifacts/
           retention-days: 14
           include-hidden-files: true  # the per-shard .coverage.<group> dotfile
@@ -558,6 +560,8 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: coverage-summary-${{ github.run_id }}
+          # The status workflow must consume the recomputed summary on retries.
+          overwrite: true
           path: coverage-summary/
           retention-days: 14
           if-no-files-found: ignore

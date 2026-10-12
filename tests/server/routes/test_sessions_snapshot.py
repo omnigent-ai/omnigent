@@ -21,6 +21,7 @@ from omnigent.server.routes.sessions import (
     _publish_subtree_cost_to_ancestors,
     _truncate_label,
 )
+from omnigent.server.schemas import SessionResponse
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
@@ -440,6 +441,81 @@ async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_native_sub_agent_reports_parent_without_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A native sub-agent's CLI-chosen name never resolves in the parent spec.
+
+    Claude Code names its Task sub-agents (``general-purpose``, ``Explore``) and
+    Codex its spawned agents; the parent spec doesn't list them, so the parent's
+    identity is the expected answer and is not worth a warning on every snapshot.
+    """
+    parent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-native-ui",
+        executor=ExecutorSpec(config={"harness": "claude-native"}, model="claude-sonnet"),
+    )
+    conversations = {
+        "conv_parent": Conversation(
+            id="conv_parent",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            agent_id="ag_claude",
+        ),
+        "conv_child": Conversation(
+            id="conv_child",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            parent_conversation_id="conv_parent",
+            agent_id="ag_claude",
+            kind="sub_agent",
+            sub_agent_name="general-purpose",
+            labels={"omnigent.wrapper": "claude-code-native-ui-subagent"},
+        ),
+    }
+    conv_store = _ConversationStore([], conversations=conversations)
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            return type(
+                "StoredAgent",
+                (),
+                {
+                    "id": agent_id,
+                    "name": "claude-native-ui",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                    "operator_authored": False,
+                },
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
+            return type("LoadedAgent", (), {"spec": parent_spec})()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes._sessions.orchestration"):
+        child = await _get_session_snapshot(
+            conv_store,  # type: ignore[arg-type]
+            "conv_child",
+            agent_store=_AgentStore(),  # type: ignore[arg-type]
+            agent_cache=_AgentCache(),  # type: ignore[arg-type]
+        )
+
+    assert "did not resolve" not in caplog.text
+    assert child.agent_name == "claude-native-ui"
+    assert child.llm_model == "claude-sonnet"
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_populates_runner_online_from_session_lookup() -> None:
     """GET /sessions/{id} carries session-scoped runner + host liveness."""
     conv_store = _ConversationStore([_message_item("item_1", "hi")])
@@ -673,6 +749,98 @@ async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     assert snapshot.last_task_error is None
 
 
+_RUNNER_EXIT_ERROR = "runner process exited with code 254"
+
+
+async def _snapshot_after_runner_exit(
+    monkeypatch: pytest.MonkeyPatch, *, live_status: str, connection_source: str = "replica"
+) -> SessionResponse:
+    """Snapshot a session whose runner connected to this server, then reported an exit.
+
+    :param monkeypatch: Used to stamp the runner's liveness and to keep the
+        snapshot from probing a leaked process-wide runner client.
+    :param live_status: The session's persisted ``live_status``, e.g. ``"idle"``.
+    :returns: The session snapshot read while the exit report is still held.
+    """
+    from omnigent.server import session_live_state
+    from omnigent.server.host_registry import RunnerExitReports
+
+    session_id = "2d7a5c9e1b3f4a6c8e0d1f2a3b4c5d6e"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        runner_id="runner_ran",
+        live_status=live_status,
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+    _use_runner_client(monkeypatch, None)
+    if connection_source == "replica":
+        monkeypatch.setitem(session_live_state._last_liveness_stamp, "runner_ran", 1)
+    else:
+        monkeypatch.delitem(session_live_state._last_liveness_stamp, "runner_ran", raising=False)
+    reports = RunnerExitReports()
+    reports.record(
+        "runner_ran",
+        _RUNNER_EXIT_ERROR,
+        owner=None,
+        had_connected=True if connection_source == "host" else None,
+    )
+
+    return await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        runner_exit_reports=reports,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connection_source", ["replica", "host"])
+async def test_session_snapshot_idle_session_of_connected_runner_ignores_exit_report(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_source: str,
+) -> None:
+    """An idle session whose runner connected is not repainted failed by the exit report.
+
+    When the host dies after its runner ran, ``_on_runner_exited`` leaves the
+    idle session idle (no work was lost). The snapshot must agree while the
+    report is held, instead of showing a crash banner on every reload.
+    """
+    snapshot = await _snapshot_after_runner_exit(
+        monkeypatch, live_status="idle", connection_source=connection_source
+    )
+
+    assert snapshot.status == "idle"
+    assert snapshot.last_task_error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_status", ["running", "waiting", "failed"])
+@pytest.mark.parametrize("connection_source", ["replica", "host"])
+async def test_session_snapshot_exit_report_still_fails_non_idle_session_of_connected_runner(
+    monkeypatch: pytest.MonkeyPatch, live_status: str, connection_source: str
+) -> None:
+    """A session caught mid-turn (or already failed) still surfaces the exit report.
+
+    The host dying interrupts in-flight work, so the liveness stamp that spares
+    an idle session must not hide the crash cause from these.
+    """
+    snapshot = await _snapshot_after_runner_exit(
+        monkeypatch, live_status=live_status, connection_source=connection_source
+    )
+
+    assert snapshot.status == "failed"
+    assert snapshot.last_task_error == {
+        "code": "runner_failed_to_start",
+        "message": _RUNNER_EXIT_ERROR,
+    }
+
+
 @pytest.mark.asyncio
 async def test_session_snapshot_queries_runner_on_cache_miss(
     monkeypatch: pytest.MonkeyPatch,
@@ -772,6 +940,47 @@ class _GatedRunnerClient:
 def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -> None:
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_skips_runner_status_probe_when_excluded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``include_live_status=False`` reports cached/persisted status without probing.
+
+    Runner-owned session reads pass the flag because the probe targets the
+    very runner waiting on this response.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "3db1c2a4e5f60718293a4b5c6d7e8f90"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+
+    class _RunningRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+    runner_client = _RunningRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    trimmed = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        include_live_status=False,
+    )
+    assert runner_client.get_calls == []
+    assert trimmed.status == "idle"
+
+    # Same cold cache without the flag: the probe fires and reports.
+    full = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert full.status == "running"
 
 
 @pytest.mark.asyncio

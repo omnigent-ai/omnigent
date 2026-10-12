@@ -23,7 +23,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias, cast
@@ -721,6 +721,61 @@ def _has_utf8_locale(env: dict[str, str]) -> bool:
     if lc_all:
         return _is_utf8_locale_value(lc_all)
     return _is_utf8_locale_value(env.get("LANG"))
+
+
+def terminal_pane_environment(
+    *,
+    inherit_env: bool,
+    env: Mapping[str, str],
+    env_unset: Iterable[str],
+    launch_environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """
+    Build the environment a terminal pane's command starts with.
+
+    Clipboard and sandbox adjustments made later by :meth:`TerminalInstance.launch`
+    are not included.
+
+    :param inherit_env: Whether the pane inherits the current process environment.
+    :param env: Per-terminal overrides, e.g. ``{"CLAUDE_CONFIG_DIR": "/srv/claude"}``.
+    :param env_unset: Names removed after the overrides, e.g. ``["ANTHROPIC_API_KEY"]``.
+    :param launch_environment: This launch's lifecycle identity variables, or
+        ``None`` when there are none.
+    :returns: The pane environment, e.g. ``{"HOME": "/home/user", "LANG": "C.UTF-8"}``.
+    """
+    # Do NOT advertise the tmux control socket path to the
+    # pane. The tmux server runs unsandboxed, so exposing its socket
+    # let pane code run ``tmux -S <sock> run-shell '...'`` to execute
+    # commands outside the sandbox. The host-side control plane
+    # addresses the socket via the instance's ``socket_path`` and never
+    # needs the env var; any inherited value is stripped below too.
+    result: dict[str, str] = os.environ.copy() if inherit_env else {}
+    result.pop("OMNIGENT_TMUX_SOCK", None)
+    # Apply per-terminal env overrides (takes precedence over inherited env).
+    result.update(env)
+    # Apply exclusions last so overrides cannot leak credentials to MCP servers.
+    for key in env_unset:
+        result.pop(key, None)
+    # Never reuse a parent's launch identity if diagnostic initialization fails.
+    for key in (
+        TERMINAL_INSTANCE_ID_ENV,
+        TERMINAL_LAUNCH_ID_ENV,
+        TERMINAL_LAUNCH_SESSION_ID_ENV,
+    ):
+        result.pop(key, None)
+    result.update(launch_environment or {})
+    # Strip the runner-auth secret: native agents run their shell in
+    # this tmux pane, so the binding token must never reach it.
+    # After ``update`` so overrides can't re-admit it.
+    result = strip_runner_auth_secrets(result)
+    # Force a UTF-8 locale into the pane env when the inherited env
+    # carries no UTF-8 signal in the vars the native TUI CLIs actually
+    # read (LC_ALL/LANG). Without it, CLIs that read LC_ALL/LANG directly
+    # (opencode/pi/hermes) instead of calling setlocale fall back to an
+    # ASCII/Latin-1 codeset and re-encode their UTF-8 output byte-by-byte,
+    # rendering multibyte characters as mojibake in the pane (issue #2427).
+    _apply_utf8_locale_default(result)
+    return result
 
 
 def _apply_utf8_locale_default(env: dict[str, str]) -> None:
@@ -1518,44 +1573,17 @@ class TerminalInstance:
         self._last_exit_signal = None
         effective_cwd = str(cwd or self.private_dir)
 
-        # Do NOT advertise the tmux control socket path to the
-        # pane. The tmux server runs unsandboxed, so exposing its socket
-        # let pane code run ``tmux -S <sock> run-shell '...'`` to execute
-        # commands outside the sandbox. The host-side control plane
-        # addresses the socket via ``self.socket_path`` directly and never
-        # needs the env var; any inherited value is stripped below too.
-        if self.inherit_env:
-            env = os.environ.copy()
-        else:
-            env = {}
-        env.pop("OMNIGENT_TMUX_SOCK", None)
-        # Apply per-terminal env overrides (takes precedence over inherited env).
-        env.update(self.env)
-        # Apply exclusions last so overrides cannot leak credentials to MCP servers.
-        for key in self.env_unset:
-            env.pop(key, None)
-        # Never reuse a parent's launch identity if diagnostic initialization fails.
-        for key in (
-            TERMINAL_INSTANCE_ID_ENV,
-            TERMINAL_LAUNCH_ID_ENV,
-            TERMINAL_LAUNCH_SESSION_ID_ENV,
-        ):
-            env.pop(key, None)
         try:
-            env.update(self.lifecycle_trace.launch_environment(self.diagnostic_id))
+            launch_environment = self.lifecycle_trace.launch_environment(self.diagnostic_id)
         except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent launch.
             logger.debug("Terminal lifecycle correlation unavailable (%s)", type(exc).__name__)
-        # Strip the runner-auth secret: native agents run their shell in
-        # this tmux pane, so the binding token must never reach it.
-        # After ``env.update`` so ``self.env`` can't re-admit it.
-        env = strip_runner_auth_secrets(env)
-        # Force a UTF-8 locale into the pane env when the inherited env
-        # carries no UTF-8 signal in the vars the native TUI CLIs actually
-        # read (LC_ALL/LANG). Without it, CLIs that read LC_ALL/LANG directly
-        # (opencode/pi/hermes) instead of calling setlocale fall back to an
-        # ASCII/Latin-1 codeset and re-encode their UTF-8 output byte-by-byte,
-        # rendering multibyte characters as mojibake in the pane (issue #2427).
-        _apply_utf8_locale_default(env)
+            launch_environment = {}
+        env = terminal_pane_environment(
+            inherit_env=self.inherit_env,
+            env=self.env,
+            env_unset=self.env_unset,
+            launch_environment=launch_environment,
+        )
         if self._clipboard_bridge is not None:
             self._clipboard_bridge.prepare_environment(env)
 
