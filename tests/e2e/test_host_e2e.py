@@ -113,6 +113,9 @@ def _spawn_host_daemon(
     env = {
         **os.environ,
         "HOME": str(tmp_path),
+        # Host identity is data-dir-scoped; point the daemon's data dir at the
+        # dir carrying the pre-seeded config.yaml (isolated per test).
+        "OMNIGENT_DATA_DIR": str(omni_dir),
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OPENAI_API_KEY": "mock-key",
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
@@ -414,6 +417,9 @@ def test_host_name_only_config_generates_host_id(
     env = {
         **os.environ,
         "HOME": str(tmp_path),
+        # Host identity is data-dir-scoped; point the daemon's data dir at the
+        # dir carrying the pre-seeded config.yaml (isolated per test).
+        "OMNIGENT_DATA_DIR": str(omni_dir),
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OPENAI_API_KEY": "mock-key",
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
@@ -992,6 +998,9 @@ def _spawn_host_daemon_for_mock_claude(
     env = {
         **os.environ,
         "HOME": str(tmp_path),
+        # Host identity is data-dir-scoped; point the daemon's data dir at the
+        # dir carrying the pre-seeded config.yaml (isolated per test).
+        "OMNIGENT_DATA_DIR": str(omni_dir),
         # ANTHROPIC_BASE_URL is in HARNESS_CREDENTIAL_ENV_VARS so it flows
         # daemon→runner. The Anthropic SDK appends /v1/messages; omit /v1.
         "ANTHROPIC_BASE_URL": mock_llm_server_url,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from omnigent.host.daemon_lifecycle import (
     DaemonLifecycleLock,
     HostDaemonRecord,
     daemon_record_path,
+    loopback_server_port,
     normalize_daemon_target,
     record_flock_is_held,
 )
@@ -48,6 +50,110 @@ def _write_record(path: Path, pid: int) -> None:
 )
 def test_normalize_daemon_target(server_url: str | None, expected: str) -> None:
     assert normalize_daemon_target(server_url) == expected
+
+
+def _track_local_server(base: Path, port: int, pid: int | None = None) -> None:
+    """Write a data-dir pidfile declaring *port* as the tracked local server.
+
+    The recorded pid defaults to this process so the server counts as alive.
+    """
+    owner = os.getpid() if pid is None else pid
+    (base / "local_server.pid").write_text(f"{owner}\n{port}\n")
+
+
+def test_normalize_collapses_tracked_loopback_spellings(tmp_path: Path) -> None:
+    """Every loopback spelling of the tracked server keys to the local record."""
+    _track_local_server(tmp_path, 6767)
+    for spelling in (
+        "http://127.0.0.1:6767",
+        "http://localhost:6767",
+        "http://[::1]:6767",
+        "http://localhost:6767/",
+        "HTTP://LocalHost:6767/",
+    ):
+        assert normalize_daemon_target(spelling, base_dir=tmp_path) == "local"
+
+
+def test_normalize_collapses_tracked_default_port_spelling(tmp_path: Path) -> None:
+    """A loopback URL eliding the scheme-default port still names the instance."""
+    _track_local_server(tmp_path, 80)
+    assert normalize_daemon_target("http://localhost", base_dir=tmp_path) == "local"
+
+
+def test_normalize_keeps_urls_of_other_servers(tmp_path: Path) -> None:
+    """URLs that do not name the tracked instance keep their own key."""
+    _track_local_server(tmp_path, 6767)
+    # Another loopback port may be a forwarded tunnel to a different server.
+    assert (
+        normalize_daemon_target("http://127.0.0.1:9999", base_dir=tmp_path)
+        == "http://127.0.0.1:9999"
+    )
+    assert (
+        normalize_daemon_target("https://x.example.com:6767", base_dir=tmp_path)
+        == "https://x.example.com:6767"
+    )
+    # The local server speaks plain http; an https spelling is a different endpoint.
+    assert (
+        normalize_daemon_target("https://localhost:6767", base_dir=tmp_path)
+        == "https://localhost:6767"
+    )
+
+
+def test_normalize_keeps_loopback_urls_without_a_tracked_server(tmp_path: Path) -> None:
+    assert (
+        normalize_daemon_target("http://127.0.0.1:6767", base_dir=tmp_path)
+        == "http://127.0.0.1:6767"
+    )
+
+
+def test_normalize_keeps_loopback_url_of_a_dead_tracked_server(tmp_path: Path) -> None:
+    """A stale pidfile left by a crashed server must not capture an explicit target."""
+    reaped = subprocess.Popen([sys.executable, "-c", "pass"])
+    reaped.wait()
+    _track_local_server(tmp_path, 6767, pid=reaped.pid)
+
+    assert (
+        normalize_daemon_target("http://127.0.0.1:6767", base_dir=tmp_path)
+        == "http://127.0.0.1:6767"
+    )
+    # The same claim collapses once its server is reported alive.
+    assert (
+        normalize_daemon_target(
+            "http://127.0.0.1:6767", base_dir=tmp_path, pid_alive=lambda pid: True
+        )
+        == "local"
+    )
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [b"pid-and-port-missing\n", b"\xff\xfe\n6767\n", b"not-a-pid\n6767\n", b"4242\nnot-a-port\n"],
+)
+def test_normalize_tolerates_a_malformed_pidfile(tmp_path: Path, contents: bytes) -> None:
+    (tmp_path / "local_server.pid").write_bytes(contents)
+    assert (
+        normalize_daemon_target("http://127.0.0.1:6767", base_dir=tmp_path)
+        == "http://127.0.0.1:6767"
+    )
+
+
+@pytest.mark.parametrize(
+    ("server_url", "expected"),
+    [
+        ("http://127.0.0.1:6767", 6767),
+        ("http://localhost:6767/", 6767),
+        ("HTTP://LocalHost:6767", 6767),
+        ("http://[::1]:6767", 6767),
+        ("http://localhost", 80),
+        ("https://localhost", 443),
+        ("https://x.example.com:6767", None),
+        ("local", None),
+        ("http://localhost:not-a-port", None),
+    ],
+)
+def test_loopback_server_port(server_url: str, expected: int | None) -> None:
+    """Loopback spellings resolve to their port; anything else resolves to ``None``."""
+    assert loopback_server_port(server_url) == expected
 
 
 def test_equivalent_server_urls_share_record_path(tmp_path: Path) -> None:
@@ -253,6 +359,61 @@ def test_background_daemon_claims_record_before_connecting(
     assert record_flock_is_held(daemon_record_path(target, base_dir=tmp_path)) is False
 
 
+def test_adopting_local_daemon_records_the_server_url_it_serves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A daemon spawned for an explicit loopback URL adopts the server and publishes its URL.
+
+    The published URL is what keeps the record reachable by
+    ``host stop --server <url>`` once the server pidfile is gone.
+    """
+    from omnigent import cli
+    from omnigent.host import _daemon_entry, local_server
+    from omnigent.host import identity as identity_module
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
+
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    # The CLI stamps an empty signature when the adopted server has no sidecar.
+    monkeypatch.setenv("OMNIGENT_HOST_DAEMON_CONFIG_SIG", "")
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(sys, "argv", ["omnigent.host._daemon_entry", "--local", "--adopt-server"])
+    monkeypatch.setattr(
+        "omnigent.process_logging.configure_process_logging",
+        lambda *_a, **_kw: tmp_path / "host.log",
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "load_or_create_host_identity",
+        lambda: HostIdentity(host_id="host_adopt", name="adopt"),
+    )
+    ensure_calls: list[dict[str, object]] = []
+
+    def _ensure(**kwargs: object) -> local_server.LocalServerStartup:
+        ensure_calls.append(kwargs)
+        return local_server.LocalServerStartup(
+            url="http://127.0.0.1:6767", spawned=False, log_path=None
+        )
+
+    monkeypatch.setattr(local_server, "ensure_local_omnigent_server", _ensure)
+    monkeypatch.setattr("omnigent.host.connect.run_host_process", lambda **_kw: None)
+
+    _daemon_entry.main()
+
+    assert ensure_calls == [{"replace_on_config_drift": False}]
+    payload = json.loads(daemon_record_path("local", base_dir=tmp_path).read_text())
+    assert payload["mode"] == "local"
+    assert payload["adopted"] is True
+    assert payload["config_sig"] is None
+    assert payload["resolved_server_url"] == "http://127.0.0.1:6767"
+    # No local_server.pid exists here, so the URL keys on itself — and the
+    # published URL is what still leads the lookup to the local record.
+    target = cli._normalize_daemon_target("http://localhost:6767")
+    assert target == "http://localhost:6767"
+    found = cli._find_daemon_record(target)
+    assert found is not None
+    assert found.target == "local"
+
+
 def test_background_daemon_loser_exits_before_connecting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -367,6 +528,43 @@ def test_live_daemon_conflict_probes_legacy_record_lock_path(
 
     assert conflict == existing
     assert probed_paths == [cli._daemon_record_path(legacy_target)]
+
+
+def test_live_daemon_conflict_matches_loopback_spelling_of_local_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A foreground ``--server`` naming the local daemon's port conflicts with it."""
+    from omnigent import cli
+
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    local = HostDaemonRecord(
+        pid=222,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=None,
+        started_at=100,
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    cli._write_daemon_record(local)
+    lock = DaemonLifecycleLock.for_target("local", base_dir=tmp_path, pid=222)
+    assert lock.acquire() is True
+
+    def _claimer(server_url: str) -> HostDaemonRecord:
+        return HostDaemonRecord(
+            pid=111,
+            target=normalize_daemon_target(server_url, base_dir=tmp_path),
+            mode="server",
+            server_url=server_url,
+            log_path=None,
+            started_at=200,
+        )
+
+    try:
+        assert cli._live_daemon_conflict(_claimer("http://localhost:8123")) == local
+        assert cli._live_daemon_conflict(_claimer("http://localhost:9999")) is None
+    finally:
+        lock.release()
 
 
 def _host_with_lock(lock: DaemonLifecycleLock) -> HostProcess:

@@ -99,7 +99,7 @@ def test_host_state_event_carries_deterministic_process_classification(
     monkeypatch.setattr(
         cli,
         "_reuse_existing_daemon_record",
-        lambda _target: cli._DaemonReuseDecision(reuse=True, config_changed=False),
+        lambda _target, **_kwargs: cli._DaemonReuseDecision(reuse=True, config_changed=False),
     )
 
     with startup.native_startup_attempt(harness="claude-native"):

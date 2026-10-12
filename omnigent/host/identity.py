@@ -1,8 +1,11 @@
 """Host identity management for ``omnigent host``.
 
-Reads or creates the ``host`` section in the user-level ``config.yaml``.
-The host identity is auto-generated on first ``omnigent host``
-if the section does not exist.
+Reads or creates the ``host`` section in this instance's ``config.yaml``
+(see :func:`host_config_path`). The host identity is auto-generated on first
+``omnigent host`` if the section does not exist. Identity is scoped to the
+data dir: two instances with separate ``OMNIGENT_DATA_DIR`` values present
+distinct identities instead of colliding on one machine-wide id, while the
+default data dir keeps the legacy user-level ``config.yaml``.
 """
 
 from __future__ import annotations
@@ -54,8 +57,25 @@ class HostIdentity:
 
 
 def host_config_path(path: Path | None = None) -> Path:
-    """Return the effective config path used for host identity."""
-    return path if path is not None else global_config_path(CONFIG_PATH)
+    """Return the effective config path used for host identity.
+
+    A host instance is identified by its data dir: with ``OMNIGENT_DATA_DIR``
+    set, the ``host:`` section lives in that dir's ``config.yaml`` so a
+    separate instance mints its own identity. The default data dir resolves
+    to the user-level config path (honoring ``OMNIGENT_CONFIG_HOME``), so
+    existing installs keep the identity — and host-bound sessions — they
+    already have.
+
+    :param path: Explicit config path override, or ``None`` for the default.
+    :returns: The config file holding the ``host:`` section.
+    """
+    if path is not None:
+        return path
+    from omnigent.process_logging import DATA_DIR_ENV_VAR, data_dir
+
+    if os.environ.get(DATA_DIR_ENV_VAR):
+        return data_dir() / "config.yaml"
+    return global_config_path(CONFIG_PATH)
 
 
 def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:

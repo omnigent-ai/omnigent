@@ -23,10 +23,12 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from omnigent.inner._proc import process_alive
 from omnigent.process_logging import data_dir
 
 try:
@@ -53,6 +55,9 @@ class HostDaemonRecord:
     :param host_id: Stable host id advertised to the server.
     :param resolved_server_url: Concrete URL owned by a local-mode daemon.
     :param config_sig: Signature of server-affecting launch configuration.
+    :param adopted: The daemon connects to a local server it does not own
+        (requested through an explicit loopback URL); ``config_sig`` is then
+        that server's signature, or ``None`` when the server has none.
     """
 
     pid: int
@@ -64,13 +69,32 @@ class HostDaemonRecord:
     host_id: str | None = None
     resolved_server_url: str | None = None
     config_sig: str | None = None
+    adopted: bool = False
 
 
-def normalize_daemon_target(server_url: str | None) -> str:
+def normalize_daemon_target(
+    server_url: str | None,
+    *,
+    base_dir: Path | None = None,
+    pid_alive: Callable[[int], bool] | None = None,
+) -> str:
     """Return the registry key for a daemon target.
 
+    A local server instance is identified by its data dir, so a plain-http
+    loopback URL naming the port tracked in that dir's ``local_server.pid``
+    addresses the same instance as local mode: both collapse to ``"local"``.
+    One instance therefore keeps one record (and one daemon) across
+    ``--server`` spellings such as ``http://127.0.0.1:6767`` vs
+    ``http://localhost:6767``. The pidfile is honored only while its recorded
+    server process is alive, so a stale claim cannot capture an explicit
+    target, and an ``https`` spelling is never rewritten onto the http server.
+
     :param server_url: Requested server URL, or ``None`` / empty for local mode.
-    :returns: ``"local"`` for local mode, else a canonical server URL.
+    :param base_dir: Data-directory override; defaults to :func:`data_dir`.
+    :param pid_alive: Liveness probe for the recorded server pid; defaults to
+        :func:`omnigent.inner._proc.process_alive`.
+    :returns: ``"local"`` for local mode or a loopback spelling of the data
+        dir's live tracked server, else a canonical server URL.
     """
     if not server_url:
         return _LOCAL_DAEMON_MARKER
@@ -87,6 +111,8 @@ def normalize_daemon_target(server_url: str | None) -> str:
 
     scheme = parsed.scheme.lower()
     hostname = hostname.lower()
+    if _is_tracked_local_server(scheme, hostname, port, base_dir=base_dir, pid_alive=pid_alive):
+        return _LOCAL_DAEMON_MARKER
     if ":" in hostname:
         hostname = f"[{hostname}]"
     if port is None or (scheme, port) in {("http", 80), ("https", 443)}:
@@ -99,6 +125,88 @@ def normalize_daemon_target(server_url: str | None) -> str:
     netloc = f"{userinfo}{hostname}{port_suffix}"
     path = parsed.path.rstrip("/")
     return urlunsplit((scheme, netloc, path, parsed.query, parsed.fragment))
+
+
+_LOOPBACK_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+_DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
+
+
+def _loopback_port(scheme: str, hostname: str, port: int | None) -> int | None:
+    """Return the effective port when the URL parts name a loopback host, else ``None``."""
+    if hostname not in _LOOPBACK_HOSTNAMES:
+        return None
+    return port if port is not None else _DEFAULT_SCHEME_PORTS.get(scheme)
+
+
+def loopback_server_port(server_url: str) -> int | None:
+    """Return the effective port of a loopback *server_url*, or ``None`` otherwise.
+
+    Every loopback spelling of one port (``http://127.0.0.1:6767``,
+    ``http://localhost:6767``, ``http://[::1]:6767``) names the same listener,
+    so callers that ask whether a requested URL is the local server compare
+    these ports instead of the raw strings.
+
+    :param server_url: Requested or recorded server URL.
+    :returns: The port, or ``None`` for a non-loopback or unparsable URL.
+    """
+    try:
+        parsed = urlsplit(server_url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not parsed.scheme or hostname is None:
+        return None
+    return _loopback_port(parsed.scheme.lower(), hostname.lower(), port)
+
+
+def _is_tracked_local_server(
+    scheme: str,
+    hostname: str,
+    port: int | None,
+    *,
+    base_dir: Path | None = None,
+    pid_alive: Callable[[int], bool] | None = None,
+) -> bool:
+    """Whether the URL parts name a plain-http loopback spelling of the live tracked server.
+
+    The pidfile is the data dir's declaration of which port its local server
+    owns, trusted only while that server process is alive. HTTP health is not
+    probed, so a live but momentarily unhealthy server keeps a stable key.
+
+    :param scheme: Lowercased URL scheme, e.g. ``"http"``.
+    :param hostname: Lowercased URL hostname, e.g. ``"localhost"``.
+    :param port: Explicit URL port, or ``None`` for the scheme default.
+    :param base_dir: Data-directory override; defaults to :func:`data_dir`.
+    :param pid_alive: Liveness probe for the recorded server pid.
+    :returns: ``True`` when the scheme is ``http``, the host is loopback, and
+        the effective port matches the live tracked local server port.
+    """
+    if scheme != "http":
+        return False
+    effective_port = _loopback_port(scheme, hostname, port)
+    if effective_port is None:
+        return False
+    return effective_port == _tracked_local_server_port(base_dir=base_dir, pid_alive=pid_alive)
+
+
+def _tracked_local_server_port(
+    *, base_dir: Path | None = None, pid_alive: Callable[[int], bool] | None = None
+) -> int | None:
+    """Return the port of the live local server recorded in ``local_server.pid``.
+
+    :param base_dir: Data-directory override; defaults to :func:`data_dir`.
+    :param pid_alive: Liveness probe for the recorded server pid.
+    :returns: The tracked port, or ``None`` when the pidfile is absent or
+        malformed, or its recorded server process is gone.
+    """
+    pid_path = (base_dir if base_dir is not None else data_dir()) / "local_server.pid"
+    try:
+        lines = pid_path.read_text().strip().splitlines()
+        pid, port = int(lines[0]), int(lines[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return port if (pid_alive or process_alive)(pid) else None
 
 
 def _target_digest(target: str) -> str:

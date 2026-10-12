@@ -37,7 +37,7 @@ directly instead of going through `data_dir()`.
 
 | Path | Purpose | Defined in |
 |------|---------|------------|
-| `config.yaml` | User-level config: harness auth references, settings. Overridable with `OMNIGENT_CONFIG_HOME`. | `omnigent/config.py` |
+| `config.yaml` | User-level config: harness auth references, settings. Overridable with `OMNIGENT_CONFIG_HOME`. Also holds the `host:` identity section; with `OMNIGENT_DATA_DIR` set, the host identity lives in that data dir's `config.yaml` instead (`host_config_path()` in `omnigent/host/identity.py`). | `omnigent/config.py` |
 | `chat.db` (+ `-shm`, `-wal`) | Main SQLite runtime DB — conversations, sessions, messages. Machine-global unless a project-local `.omnigent/` is used. | `omnigent/cli.py`, `omnigent/host/local_server.py` |
 | `auth_tokens.json` / `auth_tokens.lock` | Per-server OIDC/session tokens keyed by server URL, written with user-only permissions, plus its lock file (`.json` is replaced by `.lock`, so it is `auth_tokens.lock`, not `auth_tokens.json.lock`). | `omnigent/cli_auth.py` |
 | `local_server.pid` / `local_server.sig` | Recorded pid/port and signature of the running local server. | `omnigent/host/local_server.py` |

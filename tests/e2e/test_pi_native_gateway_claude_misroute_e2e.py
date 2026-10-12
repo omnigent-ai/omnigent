@@ -188,6 +188,9 @@ def test_pi_native_openai_only_gateway_claude_model_fails_loud(
         **os.environ,
         "HOME": str(pi_home),
         "OMNIGENT_CONFIG_HOME": str(pi_home / ".omnigent"),
+        # Host identity is data-dir-scoped; point the daemon's data dir at the
+        # dir carrying the pre-seeded config.yaml (isolated per test).
+        "OMNIGENT_DATA_DIR": str(pi_home / ".omnigent"),
         "OMNIGENT_SKIP_ONBOARD": "1",
         # Resolve omnigent + its in-repo SDK packages to this worktree.
         "PYTHONPATH": os.pathsep.join(

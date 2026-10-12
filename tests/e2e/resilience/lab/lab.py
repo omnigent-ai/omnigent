@@ -693,6 +693,9 @@ class Lab:
         env.update(
             {
                 "OMNIGENT_CONFIG_HOME": str(config_home),
+                # Host identity is data-dir-scoped; point the daemon's data dir
+                # at the dir carrying the pre-seeded config.yaml with the host id.
+                "OMNIGENT_DATA_DIR": str(config_home),
                 # Keep host inventory (skills, credentials, imports) off the
                 # developer's real home directory.
                 "HOME": str(self._host_home()),
