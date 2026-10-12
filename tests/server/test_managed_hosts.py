@@ -2801,12 +2801,11 @@ async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
 
     # The session workspace is the clone directory, named after the repo.
     assert result.workspace == "/root/workspace/myrepo"
-    # The exact clone invocation: branch-pinned, single-branch, `--`
-    # separating options from the user-supplied URL. A drift here means
-    # the sandbox clones the wrong thing (or interprets the URL as a
-    # flag).
+    # The exact clone invocation: branch-pinned, single-branch, blobless by default,
+    # `--` separating options from the user-supplied URL. A drift here means the
+    # sandbox clones the wrong thing (or interprets the URL as a flag).
     clone_cmd = (
-        "git clone --branch release-1.2 --single-branch "
+        "git clone --branch release-1.2 --single-branch --filter=blob:none "
         "-- https://github.com/org/myrepo.git /root/workspace/myrepo"
     )
     assert clone_cmd in fake.commands

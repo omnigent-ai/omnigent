@@ -567,7 +567,7 @@ async def test_managed_session_create_with_repo_workspace_binds_cloned_dir(
 
     # The clone ran in the sandbox with the requested branch pinned…
     assert (
-        "git clone --branch main --single-branch "
+        "git clone --branch main --single-branch --filter=blob:none "
         "-- https://github.com/org/myrepo.git /root/workspace/myrepo"
     ) in fake.commands
     # …and the session is bound to the cloned directory, which is also
