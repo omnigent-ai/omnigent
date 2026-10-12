@@ -62,7 +62,7 @@ it(
         await page.evaluate((size) => {
           document.documentElement.style.fontSize = `${size}px`;
         }, rootSize);
-        for (const zoom of [0.5, 0.67, 0.8, 1, 1.25, 1.5]) {
+        for (const zoom of [0.5, 0.67, 0.8, 1, 1.1, 1.25, 1.5]) {
           await setZoom(zoom);
           await checkClearance(zoom);
           await toolbar.getByRole("button", { name: "Close sidebar", exact: true }).click();
