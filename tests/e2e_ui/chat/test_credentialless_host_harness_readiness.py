@@ -52,6 +52,7 @@ import pytest
 from playwright.async_api import async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.browser import async_user_page
 from tests._helpers.compat import runner_executable
 from tests._helpers.host import isolated_host
 from tests.e2e_ui.conftest import _register_agent_yaml
@@ -213,63 +214,65 @@ async def _drive_sdk_readiness(base_url: str, host: dict[str, Any]) -> None:
     session_id: str | None = None
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page()
         try:
-            await _seed_recent_workspace(page, host["host_id"], host["workspace"])
-            await page.goto(f"{base_url}/")
-            await page.get_by_test_id("new-chat-landing-input").wait_for(
-                state="visible", timeout=30_000
-            )
+            async with (
+                await pw.chromium.launch() as browser,
+                async_user_page(browser, headers={}) as page,
+            ):
+                await _seed_recent_workspace(page, host["host_id"], host["workspace"])
+                await page.goto(f"{base_url}/")
+                await page.get_by_test_id("new-chat-landing-input").wait_for(
+                    state="visible", timeout=30_000
+                )
 
-            # Normal picker path, exactly as the reported journey did: SDK
-            # needs-auth is advisory (the daemon cannot see agent-level
-            # ``executor.auth`` credentials and never blocks an SDK launch),
-            # so the row must stay enabled and clickable — selecting the
-            # agent must not require a previously persisted pick.
-            row = await _reveal_agent_row(page, agent_id)
-            assert await row.is_enabled(), (
-                "the needs-auth SDK agent's picker row must stay selectable "
-                "(advisory warning), not disabled"
-            )
-            await row.click()
-            await _dismiss_agent_menu(page)
+                # Normal picker path, exactly as the reported journey did: SDK
+                # needs-auth is advisory (the daemon cannot see agent-level
+                # ``executor.auth`` credentials and never blocks an SDK launch),
+                # so the row must stay enabled and clickable — selecting the
+                # agent must not require a previously persisted pick.
+                row = await _reveal_agent_row(page, agent_id)
+                assert await row.is_enabled(), (
+                    "the needs-auth SDK agent's picker row must stay selectable "
+                    "(advisory warning), not disabled"
+                )
+                await row.click()
+                await _dismiss_agent_menu(page)
 
-            # The under-composer readiness notice for the just-selected agent
-            # on the selected host. In the regression state it never appears
-            # for an SDK harness; after the fix it must — it is the advisory
-            # pre-launch warning surface for a selectable SDK row.
-            warning = page.get_by_test_id("new-chat-landing-harness-warning")
-            await expect(warning).to_be_visible(timeout=15_000)
-            warned_before_launch = True
+                # The under-composer readiness notice for the just-selected agent
+                # on the selected host. In the regression state it never appears
+                # for an SDK harness; after the fix it must — it is the advisory
+                # pre-launch warning surface for a selectable SDK row.
+                warning = page.get_by_test_id("new-chat-landing-harness-warning")
+                await expect(warning).to_be_visible(timeout=15_000)
+                warned_before_launch = True
 
-            # Launch anyway (the readiness signal warns, it does not block) and
-            # watch the first turn. Today it dies with an auth error the picker
-            # never hinted at; post-fix the launch may still fail the same way,
-            # so this is journey evidence, not the regression assertion.
-            await page.get_by_test_id("new-chat-landing-input").fill(
-                "hello from the readiness reproduction"
-            )
-            await page.get_by_test_id("new-chat-landing-submit").click()
-            await page.wait_for_url(re.compile(r"/c/[0-9a-f]+"), timeout=60_000)
-            match = re.search(r"/c/([0-9a-f]+)", page.url)
-            session_id = match.group(1) if match else None
-            error_pill = page.locator('[data-testid="error-pill"]').first
-            try:
-                await error_pill.wait_for(state="visible", timeout=_FIRST_TURN_ERROR_TIMEOUT_MS)
-                first_turn_error = (await error_pill.inner_text()).strip()
-            except Exception:
-                first_turn_error = None
-            if session_id is not None:
-                items = httpx.get(
-                    f"{base_url}/v1/sessions/{session_id}/items", timeout=10.0
-                ).json()
-                for item in items.get("data", []):
-                    if item.get("type") == "error":
-                        first_turn_error = item.get("message") or first_turn_error
+                # Launch anyway (the readiness signal warns, it does not block) and
+                # watch the first turn. Today it dies with an auth error the picker
+                # never hinted at; post-fix the launch may still fail the same way,
+                # so this is journey evidence, not the regression assertion.
+                await page.get_by_test_id("new-chat-landing-input").fill(
+                    "hello from the readiness reproduction"
+                )
+                await page.get_by_test_id("new-chat-landing-submit").click()
+                await page.wait_for_url(re.compile(r"/c/[0-9a-f]+"), timeout=60_000)
+                match = re.search(r"/c/([0-9a-f]+)", page.url)
+                session_id = match.group(1) if match else None
+                error_pill = page.locator('[data-testid="error-pill"]').first
+                try:
+                    await error_pill.wait_for(
+                        state="visible", timeout=_FIRST_TURN_ERROR_TIMEOUT_MS
+                    )
+                    first_turn_error = (await error_pill.inner_text()).strip()
+                except Exception:
+                    first_turn_error = None
+                if session_id is not None:
+                    items = httpx.get(
+                        f"{base_url}/v1/sessions/{session_id}/items", timeout=10.0
+                    ).json()
+                    for item in items.get("data", []):
+                        if item.get("type") == "error":
+                            first_turn_error = item.get("message") or first_turn_error
         finally:
-            await page.close()
-            await browser.close()
             if session_id is not None:
                 with contextlib.suppress(Exception):
                     httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
@@ -322,9 +325,10 @@ async def _drive_pi_readiness(base_url: str, host: dict[str, Any]) -> None:
     )
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page()
-        try:
+        async with (
+            await pw.chromium.launch() as browser,
+            async_user_page(browser, headers={}) as page,
+        ):
             await _seed_recent_workspace(page, host["host_id"], host["workspace"])
             await _seed_last_agent(page, agent_id)
             await page.goto(f"{base_url}/")
@@ -344,6 +348,3 @@ async def _drive_pi_readiness(base_url: str, host: dict[str, Any]) -> None:
             warning = page.get_by_test_id("new-chat-landing-harness-warning")
             await expect(warning).to_be_visible(timeout=30_000)
             await expect(warning).to_contain_text(host["name"])
-        finally:
-            await page.close()
-            await browser.close()
