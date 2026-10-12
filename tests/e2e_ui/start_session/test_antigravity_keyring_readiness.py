@@ -6,17 +6,15 @@ for the keyring sign-in, which cannot run in CI; the host daemon and the web UI 
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import os
 import shlex
 import subprocess
 import sys
-import threading
 import time
 import uuid
-from collections.abc import Coroutine, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +23,7 @@ import pytest
 from playwright.async_api import async_playwright, expect
 
 from omnigent._platform import resolve_cli_binary
+from tests._helpers.async_thread import run_in_fresh_loop
 from tests.e2e_ui.conftest import _register_agent_yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -49,26 +48,11 @@ exec {real_agy} "$@"
 """
 
 
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, dict[str, Any]]) -> dict[str, Any]:
-    """Run *coro* in a fresh thread; the main thread cannot host a new asyncio loop here."""
-    captured: dict[str, Any] = {}
-
-    def _worker() -> None:
-        try:
-            captured["result"] = asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
-    return captured["result"]
-
-
 def _fetch_host_row(base_url: str, host_name: str) -> dict[str, Any] | None:
-    hosts = httpx.get(f"{base_url}/v1/hosts", timeout=10.0).json().get("hosts", [])
+    try:
+        hosts = httpx.get(f"{base_url}/v1/hosts", timeout=10.0).json().get("hosts", [])
+    except (httpx.HTTPError, ValueError):
+        return None  # not ready yet; the daemon may still be starting
     return next(
         (h for h in hosts if h.get("name") == host_name and h.get("status") == "online"),
         None,
@@ -280,7 +264,12 @@ def test_keyring_login_is_ready_for_antigravity_native(
 ) -> None:
     """A keyring-only agy login reads as ready: host row True, picker row enabled, no badge."""
     agent_id = _antigravity_agent_id(live_server)
-    observed = _run_in_fresh_loop(_drive_picker(live_server, keyring_agy_host, agent_id))
+    observed: dict[str, Any] = {}
+
+    async def _scenario() -> None:
+        observed.update(await _drive_picker(live_server, keyring_agy_host, agent_id))
+
+    run_in_fresh_loop(_scenario())
 
     row = _fetch_host_row(live_server, keyring_agy_host["name"])
     assert row is not None, "keyring-login host dropped offline mid-test"
