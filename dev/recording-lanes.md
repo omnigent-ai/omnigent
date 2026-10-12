@@ -40,6 +40,10 @@ the `cli` section below for setup steps.
 
 - Show the actual product behavior. Tests may drive the interaction and verify
   the result, but the clip must show the product itself.
+- Any text the caption quotes must be legible in the final frame. Detail that
+  lives inside a collapsed disclosure — an error pill's message body, a folded
+  tool card — is in the DOM but not on screen until it is expanded. Expand it
+  during the journey before the clip ends, or leave the quote out of the caption.
 - Do not substitute a video of pytest output, assertions, test source, debug
   logs, or a slide describing what happened. Do not invent a different journey
   just to produce a video.
@@ -199,6 +203,20 @@ pytest-playwright, or Chromium upgrades, rerun
 `tests/e2e_ui/test_recorded_page_clip_screenshots.py` and
 `tests/e2e_ui/test_recording_stops_before_teardown.py` as canaries.
 
+**Expand collapsed detail before the clip ends.** Omnigent's error pill
+(`data-testid="error-pill"`) shows only its headline — "Codex ran into an error
+during this turn", "Something went wrong" — until the user clicks it; the message
+(`error-message-content`) sits inside the collapsed body. A DOM or transcript
+match on that message (`"signed in" in combined`, `to_contain_text` on the pill,
+an `inner_text` probe) is satisfied by the hidden body and says nothing about
+what the viewer sees. To show the message, have the driver click the pill,
+assert the expanded body with
+`expect(pill.get_by_test_id("error-message-content")).to_have_text(...)` (or
+`to_be_visible()`), and hold it before stopping. If the message never renders on
+screen, or you cannot view the final frame to confirm it did, caption only the
+collapsed cards ("three collapsed error cards; the sign-in detail was asserted
+from the DOM, not shown") — never the quoted message.
+
 ## `mobile` facets
 
 The iOS/Android apps are thin native shells that load the *same* server-served SPA
@@ -317,13 +335,9 @@ state, bad output, error) for a `before` recording, or the correct end state for
 are fine otherwise. Recordings are workspace artifacts exactly like the test —
 leave them uncommitted; in CI the artifact bundle collects them.
 
-Check the clip's last frame before captioning it. Every clip must stop on the
-demonstrated state its caption describes — the failure for a `before` clip, the
-healthy state for a `fixed`/`after` clip; a final frame that shows teardown — the
-pane greyed out behind "Bridge closed: terminal session ended", a deleted
-session, a result list emptied by fixture cleanup — means the recording outlived
-the test body. Fix the stop point and re-record; do not caption around it.
+Check the clip's last frame before captioning it. Every clip must stop on the demonstrated state its caption describes — the failure for a `before` clip, the healthy state for a `fixed`/`after` clip. If the final frame shows teardown — the pane greyed out behind "Bridge closed: terminal session ended", a deleted session, a result list emptied by fixture cleanup — the recording outlived the test body; fix the stop point and re-record instead of captioning around it.
 
+Every phrase the caption quotes must also be readable in that final frame. Text established only from the DOM or transcript inside a collapsed element is not visible, and a screenshot you never opened confirms nothing; when you cannot confirm the final frame shows the quoted text, do not quote it. Caption the visible state instead and, if needed, say the detail was established from the DOM rather than shown on screen.
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in
 what the clip shows: e.g. `"start a session → open the model picker → select the
