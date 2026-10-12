@@ -1,5 +1,13 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { ChevronRightIcon, DownloadIcon, ListVideoIcon, PlayIcon, VideoIcon } from "lucide-react";
+import {
+  ChevronDownIcon,
+  ChevronUpIcon,
+  DownloadIcon,
+  PanelRightCloseIcon,
+  PanelRightOpenIcon,
+  PlayIcon,
+  VideoIcon,
+} from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import {
   DropdownMenu,
@@ -102,6 +110,13 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   }, [requested, conversationId, path]);
 
   const loading = requested && !src && !failed;
+  const ActionsIcon = wide
+    ? actionsOpen
+      ? PanelRightCloseIcon
+      : PanelRightOpenIcon
+    : actionsOpen
+      ? ChevronUpIcon
+      : ChevronDownIcon;
   return (
     <span
       ref={cardRef}
@@ -202,11 +217,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
               className="flex shrink-0 items-center gap-1 rounded p-1 hover:bg-accent"
               onClick={() => setActionsOpen((open) => !open)}
             >
-              {actionsOpen ? (
-                <ChevronRightIcon aria-hidden="true" className="size-4" />
-              ) : (
-                <ListVideoIcon aria-hidden="true" className="size-4" />
-              )}
+              <ActionsIcon aria-hidden="true" className="size-4" />
               {!wide && <span>Actions</span>}
             </button>
           )}
