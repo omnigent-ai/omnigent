@@ -25,26 +25,22 @@ headerless writes, so a ``local``-owned session can't be created here anyway).
 
 from __future__ import annotations
 
-import os
 import signal
 import subprocess
-import sys
-import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from tests._helpers.live_server import isolated_local_server
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import (
     _HEALTH_POLL_INTERVAL_S,
     _HEALTH_TIMEOUT_S,
     _PUBLIC_LOOPBACK_HOST,
-    _REPO_ROOT,
     _TEST_AGENT_YAML,
     _build_hello_world_bundle,
-    _find_free_port,
 )
 
 # Admin identity the browser presents via X-Forwarded-Email. Listed in the
@@ -109,11 +105,6 @@ def spawn_multi_user_server(
     :param admin_headers: Admin credentials when testing a different identity header.
     :yields: A :class:`MultiUserServer` handle.
     """
-    port = _find_free_port()
-    log_path = server_tmp / "server.log"
-    db_path = server_tmp / "test.db"
-    artifact_dir = server_tmp / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
     agent_yaml_path = server_tmp / "hello_world.yaml"
     agent_yaml_path.write_text(_TEST_AGENT_YAML)
     # Declare the admin roster via the admin-list file (one identity per line;
@@ -124,19 +115,15 @@ def spawn_multi_user_server(
     admins_path = server_tmp / "admins"
     admins_path.write_text(f"{ADMIN_EMAIL}\n")
 
-    base_url = f"http://127.0.0.1:{port}"
-    pythonpath = f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"
     # Requests authenticated as the admin identity. A multi-user header-auth
     # server 401s headerless requests, so every REST call here carries it.
     if admin_headers is None:
         admin_headers = {"X-Forwarded-Email": ADMIN_EMAIL}
 
     server_env = {
-        **os.environ,
-        "PYTHONPATH": pythonpath,
         # The whole point: NOT single-user. Clear the marker the suite sets so
         # /v1/info reports single_user:false and the Share chrome stays.
-        "OMNIGENT_LOCAL_SINGLE_USER": "",
+        "OMNIGENT_LOCAL_SINGLE_USER": None,
         # A header-identified admin so the browser (X-Forwarded-Email) can
         # manage its session (Share button) and see the admin settings group.
         "OMNIGENT_ADMIN_LIST_PATH": str(admins_path),
@@ -148,53 +135,13 @@ def spawn_multi_user_server(
     if extra_server_env:
         server_env.update(extra_server_env)
 
-    log_handle = open(log_path, "w")  # noqa: SIM115 — lives for the Popen; closed in finally
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "from omnigent.cli import main; main()",
-            "server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{db_path}",
-            "--artifact-location",
-            str(artifact_dir),
-            "--agent",
-            str(agent_yaml_path),
-        ],
+    with isolated_local_server(
+        server_tmp,
         env=server_env,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
-
-    try:
-        # /health is unauthed; wait for it (no runner to poll).
-        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        ready = False
-        last_error = "not polled yet"
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                last_error = f"server exited early with code {proc.returncode}"
-                break
-            try:
-                if httpx.get(f"{base_url}/health", timeout=2).status_code == 200:
-                    ready = True
-                    break
-            except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-            time.sleep(_HEALTH_POLL_INTERVAL_S)
-        if not ready:
-            log_handle.flush()
-            log_text = log_path.read_text() if log_path.exists() else ""
-            raise RuntimeError(
-                f"multi-user server not healthy within {_HEALTH_TIMEOUT_S:.0f}s on "
-                f"{base_url} (last_error={last_error}).\n{log_text[-3000:]}"
-            )
-
+        extra_args=["--agent", str(agent_yaml_path)],
+        health_timeout=_HEALTH_TIMEOUT_S,
+        poll_interval=_HEALTH_POLL_INTERVAL_S,
+    ) as base_url:
         # Create an admin-owned hello_world session (authenticated, so it's
         # owned by ADMIN_EMAIL — headerless would 401 here). No runner bind and
         # no turn: the Share modal / button / settings nav only need a
@@ -211,6 +158,3 @@ def spawn_multi_user_server(
             public_url=public_loopback_url(base_url),
             session_id=session_id,
         )
-    finally:
-        _terminate(proc)
-        log_handle.close()
