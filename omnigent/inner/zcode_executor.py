@@ -293,7 +293,7 @@ class ZCodeExecutor(Executor):
     ) -> AsyncIterator[ExecutorEvent]:
         env = self._build_spawn_env()
         key = self._attachment_keys.get(session_key)
-        cache_roots = [attachment_cache_dir(key)] if attachments and key is not None else []
+        cache_roots = [attachment_cache_dir(key)] if key is not None else []
         try:
             launch_path = self._sandbox_launch_path(tuple(env), cache_roots)
         except ZCodeModelError as exc:
@@ -333,6 +333,7 @@ class ZCodeExecutor(Executor):
             yield ExecutorError(message=f"Failed to spawn ZCode: {exc}", retryable=True)
             return
 
+        _proc.remember_process_group(proc)
         self._proc = proc
         self._active_session_key = session_key
         self._cancel_requested = False
@@ -374,14 +375,7 @@ class ZCodeExecutor(Executor):
         except TimeoutError:
             timed_out = True
         finally:
-            if proc.returncode is None:
-                _proc.terminate_tree(proc)
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=_EXIT_TIMEOUT_S)
-                except TimeoutError:
-                    _proc.kill_tree(proc)
-                    with contextlib.suppress(Exception):
-                        await proc.wait()
+            await self._stop_process(proc)
             try:
                 await asyncio.wait_for(
                     asyncio.shield(stderr_task), timeout=_STDERR_DRAIN_TIMEOUT_S
@@ -428,10 +422,13 @@ class ZCodeExecutor(Executor):
         )
 
     async def _stop_process(self, proc: asyncio.subprocess.Process) -> None:
-        _proc.terminate_tree(proc)
+        if proc.returncode is None:
+            _proc.terminate_tree(proc)
         try:
-            await asyncio.wait_for(proc.wait(), timeout=_EXIT_TIMEOUT_S)
-        except TimeoutError:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=_EXIT_TIMEOUT_S)
+        finally:
+            # The leader may exit on SIGTERM while descendants ignore it.
             _proc.kill_tree(proc)
             with contextlib.suppress(Exception):
                 await proc.wait()

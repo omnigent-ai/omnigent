@@ -5104,6 +5104,11 @@ def _build_model_readout_lines(
         provider_families,
     )
 
+    if harness in {"zcode", "z-code"}:
+        return [
+            "Active:  ZCode's own model and authentication",
+            "ZCode print mode does not support model overrides via /model or executor.model.",
+        ]
     lines: list[str] = []
     if harness and harness_owns_its_credential(harness):
         # The external agent authenticates itself, so there is no Omnigent

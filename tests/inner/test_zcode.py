@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
+import signal
 import stat
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,7 @@ from typing import Any
 import pytest
 
 from omnigent.errors import OmnigentError
+from omnigent.inner import _proc
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     ExecutorConfig,
@@ -41,6 +44,7 @@ def _write_fake_zcode(path: Path) -> None:
         r"""#!/usr/bin/env python3
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -57,6 +61,18 @@ def emit(value):
     print(json.dumps(value, separators=(",", ":")), flush=True)
 
 prompt = flag("-p") or ""
+if "scenario:stubborn-child" in prompt:
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+    subprocess.Popen(
+        [sys.executable, "-c",
+         "import os, signal, sys, time; "
+         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+         "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)",
+         log + ".child"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    while True:
+        time.sleep(1)
 if "scenario:hang" in prompt:
     while True:
         time.sleep(1)
@@ -350,6 +366,57 @@ async def test_local_attachment_must_resolve_inside_cwd(
     assert isinstance(events[0], ExecutorError) and events[0].retryable is False
 
 
+async def test_resumed_text_turn_retains_attachment_cache_read_grant(
+    fake_zcode: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner import sandbox as sandbox_module
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    binary, log = fake_zcode
+    policies: list[SandboxPolicy] = []
+    monkeypatch.setattr(
+        sandbox_module,
+        "resolve_sandbox",
+        lambda _env, cwd: SandboxPolicy(
+            backend_type="darwin_seatbelt",
+            active=True,
+            read_roots=[cwd],
+            write_roots=[cwd],
+            write_files=[],
+            allow_network=True,
+        ),
+    )
+
+    def launcher(target: str, policy: SandboxPolicy) -> str:
+        policies.append(policy)
+        return target
+
+    monkeypatch.setattr(sandbox_module, "create_exec_launcher", launcher)
+    executor = ZCodeExecutor(
+        zcode_path=str(binary),
+        cwd=str(tmp_path),
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+    )
+    try:
+        first = await _events(
+            executor,
+            [{"type": "input_file", "file_data": "data:text/plain;base64,aGVsbG8="}],
+        )
+        second = await _events(executor, "read the previous attachment again")
+        assert isinstance(first[-1], TurnComplete)
+        assert isinstance(second[-1], TurnComplete)
+        calls = _argv(log)
+        cache = Path(calls[0][calls[0].index("--attach") + 1]).parent
+        assert calls[1][calls[1].index("--resume") + 1] == "sess-1"
+        assert "--attach" not in calls[1]
+        assert len(policies) == 2
+        for policy in policies:
+            assert cache in policy.read_roots
+            assert cache not in policy.write_roots
+    finally:
+        await executor.close()
+
+
 async def test_remote_attachment_is_rejected_explicitly(
     fake_zcode: tuple[Path, Path], tmp_path: Path
 ) -> None:
@@ -501,6 +568,55 @@ async def test_stop_process_escalates_to_kill(monkeypatch: pytest.MonkeyPatch) -
     await executor._stop_process(process)  # type: ignore[arg-type]
     assert terminated == [process]
     assert killed == [process]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires POSIX signal handlers")
+@pytest.mark.parametrize("stop", ["interrupt", "timeout"])
+async def test_stop_kills_child_after_parent_exits_promptly(
+    fake_zcode: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stop: str,
+) -> None:
+    from omnigent.inner import zcode_executor as zcode_module
+
+    binary, log = fake_zcode
+    child_file = Path(str(log) + ".child")
+    executor = ZCodeExecutor(zcode_path=str(binary), cwd=str(tmp_path))
+    monkeypatch.setattr(zcode_module, "_TURN_TIMEOUT_S", 0.5 if stop == "timeout" else 5)
+    task = asyncio.create_task(_events(executor, "scenario:stubborn-child"))
+    try:
+        async with asyncio.timeout(2):
+            while not child_file.exists() or not child_file.read_text():
+                await asyncio.sleep(0.01)
+        child_pid = int(child_file.read_text())
+        assert _proc.process_alive(child_pid)
+        if stop == "interrupt":
+            assert await executor.interrupt_session("omni-1") is True
+        events = await asyncio.wait_for(task, timeout=2)
+        terminal = [
+            event
+            for event in events
+            if isinstance(event, (ExecutorError, TurnCancelled, TurnComplete))
+        ]
+        assert len(terminal) == 1
+        if stop == "interrupt":
+            assert isinstance(terminal[0], TurnCancelled)
+        else:
+            assert isinstance(terminal[0], ExecutorError)
+            assert "timed out" in terminal[0].message
+        async with asyncio.timeout(2):
+            while _proc.process_alive(child_pid):
+                await asyncio.sleep(0.01)
+        assert _proc.process_alive(child_pid) is False
+    finally:
+        if child_file.exists() and child_file.read_text():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(child_file.read_text()), signal.SIGKILL)
+        await executor.close()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def test_sandbox_does_not_grant_credentials_or_global_tmp(
