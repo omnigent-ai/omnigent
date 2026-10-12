@@ -1790,7 +1790,9 @@ def _runner_exited_app(db_uri: str, tmp_path: Path) -> tuple[FastAPI, SqlAlchemy
     return app, conv_store
 
 
-async def _report_runner_exited(app: FastAPI, runner_id: str) -> ApplicationCommunicator:
+async def _report_runner_exited(
+    app: FastAPI, runner_id: str, *, had_connected: bool | None = None
+) -> ApplicationCommunicator:
     """Connect a host to ``app`` and send a ``host.runner_exited`` frame.
 
     :param app: The full server app.
@@ -1804,14 +1806,12 @@ async def _report_runner_exited(app: FastAPI, runner_id: str) -> ApplicationComm
     accepted = await comm.receive_output(timeout=5.0)
     assert accepted["type"] == "websocket.accept", f"tunnel refused: {accepted!r}"
     await comm.send_input({"type": "websocket.receive", "text": _make_hello()})
-    await comm.send_input(
-        {
-            "type": "websocket.receive",
-            "text": encode_host_frame(
-                HostRunnerExitedFrame(runner_id=runner_id, error="exited with code 1")
-            ),
-        }
+    report = json.loads(
+        encode_host_frame(HostRunnerExitedFrame(runner_id=runner_id, error="exited with code 1"))
     )
+    if had_connected is not None:
+        report["had_connected"] = had_connected
+    await comm.send_input({"type": "websocket.receive", "text": json.dumps(report)})
     return comm
 
 
@@ -1950,10 +1950,12 @@ def _persisted_task_error(
     return sessions_module._last_task_error_from_labels(refreshed.labels)
 
 
+@pytest.mark.parametrize("connection_source", ["replica", "host"])
 async def test_runner_exited_after_connect_keeps_idle_session_idle(
     db_uri: str,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    connection_source: str,
 ) -> None:
     """
     A host death after its runner connected does not fail the idle session.
@@ -1967,13 +1969,19 @@ async def test_runner_exited_after_connect_keeps_idle_session_idle(
     from omnigent.server import session_live_state
 
     app, conv_store = _runner_exited_app(db_uri, tmp_path)
-    conv = conv_store.create_conversation(agent_id=None, runner_id="runner_ran_idle")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        agent = await create_test_agent(client, name="runner-idle")
+    conv = conv_store.create_conversation(agent_id=agent["id"], runner_id="runner_ran_idle")
     conv_store.set_session_live_status(conv.id, "idle")
-    # The runner tunnel connected on this replica (stamped on connect/ping).
-    session_live_state.touch_runner_liveness(["runner_ran_idle"])
+    if connection_source == "replica":
+        session_live_state.touch_runner_liveness(["runner_ran_idle"])
+    else:
+        assert session_live_state.last_liveness_stamp("runner_ran_idle") is None
 
     caplog.set_level("WARNING", logger="omnigent")
-    _comm = await _report_runner_exited(app, "runner_ran_idle")
+    _comm = await _report_runner_exited(
+        app, "runner_ran_idle", had_connected=True if connection_source == "host" else None
+    )
     async with asyncio.timeout(5.0):
         while not _disconnect_decisions(caplog, conv.id):
             await asyncio.sleep(0.01)
@@ -1989,12 +1997,19 @@ async def test_runner_exited_after_connect_keeps_idle_session_idle(
     assert refreshed is not None
     assert refreshed.live_status == "idle"
     assert _persisted_task_error(conv_store, conv.id) is None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/v1/sessions/{conv.id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "idle"
+    assert response.json()["last_task_error"] is None
 
 
+@pytest.mark.parametrize("had_connected", [None, False])
 async def test_runner_exited_before_connect_fails_idle_session(
     db_uri: str,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    had_connected: bool | None,
 ) -> None:
     """
     A runner that died before connecting still fails its idle session.
@@ -2007,7 +2022,7 @@ async def test_runner_exited_before_connect_fails_idle_session(
     conv_store.set_session_live_status(conv.id, "idle")
 
     caplog.set_level("WARNING", logger="omnigent")
-    _comm = await _report_runner_exited(app, "runner_never_connected")
+    _comm = await _report_runner_exited(app, "runner_never_connected", had_connected=had_connected)
     async with asyncio.timeout(5.0):
         while _persisted_task_error(conv_store, conv.id) is None:
             await asyncio.sleep(0.01)
@@ -2024,10 +2039,12 @@ async def test_runner_exited_before_connect_fails_idle_session(
     assert getattr(failed[0], "attributes", {})["code"] == "runner_failed_to_start"
 
 
+@pytest.mark.parametrize("connection_source", ["replica", "host"])
 async def test_runner_exited_after_connect_fails_mid_turn_session(
     db_uri: str,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    connection_source: str,
 ) -> None:
     """
     A connected runner's death still fails a session that was mid-turn.
@@ -2040,10 +2057,15 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
     app, conv_store = _runner_exited_app(db_uri, tmp_path)
     conv = conv_store.create_conversation(agent_id=None, runner_id="runner_ran_mid_turn")
     conv_store.set_session_live_status(conv.id, "running")
-    session_live_state.touch_runner_liveness(["runner_ran_mid_turn"])
+    if connection_source == "replica":
+        session_live_state.touch_runner_liveness(["runner_ran_mid_turn"])
+    else:
+        assert session_live_state.last_liveness_stamp("runner_ran_mid_turn") is None
 
     caplog.set_level("WARNING", logger="omnigent")
-    _comm = await _report_runner_exited(app, "runner_ran_mid_turn")
+    _comm = await _report_runner_exited(
+        app, "runner_ran_mid_turn", had_connected=True if connection_source == "host" else None
+    )
     async with asyncio.timeout(5.0):
         while _persisted_task_error(conv_store, conv.id) is None:
             await asyncio.sleep(0.01)

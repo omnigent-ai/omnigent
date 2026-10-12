@@ -678,7 +678,7 @@ _RUNNER_EXIT_ERROR = "runner process exited with code 254"
 
 
 async def _snapshot_after_runner_exit(
-    monkeypatch: pytest.MonkeyPatch, *, live_status: str
+    monkeypatch: pytest.MonkeyPatch, *, live_status: str, connection_source: str = "replica"
 ) -> SessionResponse:
     """Snapshot a session whose runner connected to this server, then reported an exit.
 
@@ -705,10 +705,17 @@ async def _snapshot_after_runner_exit(
         conversations={session_id: conv},
     )
     _use_runner_client(monkeypatch, None)
-    # The runner tunnel connected to this server, which stamps it on connect and every ping.
-    monkeypatch.setitem(session_live_state._last_liveness_stamp, "runner_ran", 1)
+    if connection_source == "replica":
+        monkeypatch.setitem(session_live_state._last_liveness_stamp, "runner_ran", 1)
+    else:
+        monkeypatch.delitem(session_live_state._last_liveness_stamp, "runner_ran", raising=False)
     reports = RunnerExitReports()
-    reports.record("runner_ran", _RUNNER_EXIT_ERROR, owner=None)
+    reports.record(
+        "runner_ran",
+        _RUNNER_EXIT_ERROR,
+        owner=None,
+        had_connected=True if connection_source == "host" else None,
+    )
 
     return await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
@@ -718,8 +725,10 @@ async def _snapshot_after_runner_exit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("connection_source", ["replica", "host"])
 async def test_session_snapshot_idle_session_of_connected_runner_ignores_exit_report(
     monkeypatch: pytest.MonkeyPatch,
+    connection_source: str,
 ) -> None:
     """An idle session whose runner connected is not repainted failed by the exit report.
 
@@ -727,7 +736,9 @@ async def test_session_snapshot_idle_session_of_connected_runner_ignores_exit_re
     idle session idle (no work was lost). The snapshot must agree while the
     report is held, instead of showing a crash banner on every reload.
     """
-    snapshot = await _snapshot_after_runner_exit(monkeypatch, live_status="idle")
+    snapshot = await _snapshot_after_runner_exit(
+        monkeypatch, live_status="idle", connection_source=connection_source
+    )
 
     assert snapshot.status == "idle"
     assert snapshot.last_task_error is None
@@ -735,15 +746,18 @@ async def test_session_snapshot_idle_session_of_connected_runner_ignores_exit_re
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("live_status", ["running", "waiting", "failed"])
+@pytest.mark.parametrize("connection_source", ["replica", "host"])
 async def test_session_snapshot_exit_report_still_fails_non_idle_session_of_connected_runner(
-    monkeypatch: pytest.MonkeyPatch, live_status: str
+    monkeypatch: pytest.MonkeyPatch, live_status: str, connection_source: str
 ) -> None:
     """A session caught mid-turn (or already failed) still surfaces the exit report.
 
     The host dying interrupts in-flight work, so the liveness stamp that spares
     an idle session must not hide the crash cause from these.
     """
-    snapshot = await _snapshot_after_runner_exit(monkeypatch, live_status=live_status)
+    snapshot = await _snapshot_after_runner_exit(
+        monkeypatch, live_status=live_status, connection_source=connection_source
+    )
 
     assert snapshot.status == "failed"
     assert snapshot.last_task_error == {

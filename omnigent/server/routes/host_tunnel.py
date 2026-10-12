@@ -703,7 +703,9 @@ async def _receive_loop(
             # the cause so the runner status endpoint can answer "offline, and
             # here is why" to the client still waiting for the runner to connect.
             if runner_exit_reports is not None:
-                runner_exit_reports.record(frame.runner_id, frame.error, conn.owner)
+                runner_exit_reports.record(
+                    frame.runner_id, frame.error, conn.owner, had_connected=frame.had_connected
+                )
             if on_runner_exited is None:
                 log_runner_exited(host_id, frame.runner_id, frame.error)
             else:

@@ -359,10 +359,13 @@ class HostRunnerExitedFrame:
     :param error: Human-readable cause, e.g.
         ``"runner process exited with code 1 (log: ~/...) ..."``,
         including the trailing lines of the runner's log.
+    :param had_connected: Whether the runner touched its first-connect marker.
+        ``None`` when unavailable or reported by an older host.
     """
 
     runner_id: str
     error: str
+    had_connected: bool | None = None
 
 
 @dataclass
@@ -1421,6 +1424,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
                 "error": frame.error,
+                "had_connected": frame.had_connected,
             }
         )
     if isinstance(frame, HostRunnerStatusFrame):
@@ -2333,6 +2337,9 @@ def _decode_runner_exited(msg: _JsonObject) -> HostRunnerExitedFrame:
     return HostRunnerExitedFrame(
         runner_id=_required_str(msg, "runner_id"),
         error=_required_str(msg, "error"),
+        had_connected=(
+            _required_bool(msg, "had_connected") if msg.get("had_connected") is not None else None
+        ),
     )
 
 

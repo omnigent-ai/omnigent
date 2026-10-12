@@ -1611,9 +1611,13 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     assert maintenance_reasons == ["runner_launch_failed"]
 
 
+@pytest.mark.parametrize(
+    "marker_state", ["connected", "not_connected", "unavailable", "unreadable"]
+)
 async def test_watch_runner_reports_unexpected_exit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    marker_state: str,
 ) -> None:
     """A runner that dies after launch is reported via host.runner_exited.
 
@@ -1663,8 +1667,18 @@ async def test_watch_runner_reports_unexpected_exit(
         result = await host._handle_launch(frame)
     assert result.status == "launched", result.error
 
-    # Wait for the watcher to observe the death and send its report
-    # (bounded — a hang means the watcher never fired).
+    handle = host._runners[token_bound_runner_id("tok_watch")]
+    assert handle.connect_marker is not None
+    if marker_state == "connected":
+        handle.connect_marker.touch()
+    elif marker_state == "unavailable":
+        handle.connect_marker = None
+    elif marker_state == "unreadable":
+        handle.connect_marker = SimpleNamespace(  # type: ignore[assignment]
+            exists=Mock(side_effect=[OSError("marker unavailable"), False])
+        )
+
+    # Wait for the watcher to observe the death and send its report.
     await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
 
     # Exactly one report; a second would double-record server-side.
@@ -1675,6 +1689,8 @@ async def test_watch_runner_reports_unexpected_exit(
     # The report carries the exit code and the log tail with the cause.
     assert "code 3" in report.error
     assert "tunnel rejected: crash-cause" in report.error
+    expected = {"connected": True, "not_connected": False}.get(marker_state)
+    assert report.had_connected is expected
     assert maintenance_reasons == ["runner_exited"]
 
 
@@ -2085,8 +2101,12 @@ async def test_connect_watchdog_silent_on_intentional_stop(
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize("had_connected", [None, False, True])
+@pytest.mark.parametrize("send_fails", [False, True])
 async def test_unreported_exit_flushes_after_reconnect(
     capsys: pytest.CaptureFixture[str],
+    had_connected: bool | None,
+    send_fails: bool,
 ) -> None:
     """An exit report that raced a disconnect is sent after the next hello.
 
@@ -2096,7 +2116,14 @@ async def test_unreported_exit_flushes_after_reconnect(
     never reported and the waiting client polls to its timeout.
     """
     host = _make_host_process()
-    host._unreported_exits["runner_parked"] = "runner process exited with code 1"
+    if send_fails:
+        host._ws = SimpleNamespace(  # type: ignore[assignment]
+            send=AsyncMock(side_effect=ConnectionError("tunnel closed"))
+        )
+    await host._report_runner_exit(
+        "runner_parked", "runner process exited with code 1", had_connected=had_connected
+    )
+    assert "runner_parked" in host._unreported_exits
     tunnel = _FakeTunnel()
 
     # _serve_frames sends hello, flushes parked reports, then hits the
@@ -2111,6 +2138,7 @@ async def test_unreported_exit_flushes_after_reconnect(
     assert isinstance(report, HostRunnerExitedFrame)
     assert report.runner_id == "runner_parked"
     assert report.error == "runner process exited with code 1"
+    assert report.had_connected is had_connected
     # The queue drained — a retained entry would re-send on every
     # reconnect forever.
     assert host._unreported_exits == {}

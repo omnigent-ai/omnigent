@@ -12486,16 +12486,18 @@ async def _get_session_snapshot(
     # cause as last_task_error so a reload/late-open still renders the error
     # banner — the live session.status:failed push is gone by then. status
     # reads "failed" from the cache (set by _on_runner_exited), except an idle
-    # session whose runner connected to this server: it lost no work and stays
+    # session whose runner connected: it lost no work and stays
     # idle. The report is keyed by the CURRENT runner_id, so a successful relaunch
     # (new token-bound runner_id) naturally stops matching. Access is gated
     # by the session-snapshot's own authorization, so the unscoped get is
     # correct here (the report is this session's own runner).
     if runner_exit_reports is not None and conv.runner_id is not None:
         exit_error = runner_exit_reports.get(conv.runner_id)
-        if exit_error is not None and (
-            status != "idle" or session_live_state.last_liveness_stamp(conv.runner_id) is None
-        ):
+        runner_ran = (
+            runner_exit_reports.was_connected(conv.runner_id)
+            or session_live_state.last_liveness_stamp(conv.runner_id) is not None
+        )
+        if exit_error is not None and (status != "idle" or not runner_ran):
             last_task_error = {"code": "runner_failed_to_start", "message": exit_error}
             status = "failed"
     llm_model: str | None = None
