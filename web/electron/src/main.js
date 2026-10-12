@@ -2419,12 +2419,8 @@ function createWindow(targetUrl, opts = {}) {
     ...(process.platform === "darwin"
       ? {
           titleBarStyle: "hiddenInset",
-          // Drop the native traffic lights ~4px from their hiddenInset default so
-          // they center in the 2.25rem (36px) title-bar strip, level with the
-          // Search/Settings/toggle cluster and the chat-header icons (both
-          // centered there — see the [data-electron-mac] rules in index.css).
-          // x:19 preserves hiddenInset's horizontal inset; y centers the ~14px
-          // controls ((36-14)/2 ≈ 11). Adjust y by ±1 if it reads off on device.
+          // Center the ~14px native controls at y=24px in the 48px title bar.
+          // Keep the web layer's macOS clearance in index.css aligned with this.
           trafficLightPosition: { x: 16, y: 17 },
         }
       : {}),
