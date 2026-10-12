@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
@@ -36,6 +37,7 @@ from omnigent.runner._entry import (
     _resolve_agent_spec_from_server,
     _run_inactivity_monitor,
     _run_parent_death_killer,
+    _runner_last_activity,
     _runner_parent_pid_from_env,
     _runner_threadpool_max_workers,
     _runner_tunnel_binding_token_from_env,
@@ -48,6 +50,12 @@ from omnigent.runner.identity import (
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
+)
+from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
+from omnigent.runner.transports.ws_tunnel.frames import (
+    EventAckFrame,
+    EventBatchFrame,
+    decode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 
@@ -2138,6 +2146,113 @@ async def test_inactivity_monitor_honors_activity_reset() -> None:
     assert not task.done()
 
     await asyncio.wait_for(task, timeout=0.1)
+    assert shutdowns == ["shutdown"]
+
+
+def test_runner_last_activity_picks_the_newest_clock() -> None:
+    """The combined reader returns the latest non-``None`` activity stamp.
+
+    :returns: None.
+    """
+    assert _runner_last_activity(10.0, None, None) == 10.0
+    assert _runner_last_activity(10.0, 12.5, None) == 12.5
+    assert _runner_last_activity(10.0, None, 30.0) == 30.0
+    assert _runner_last_activity(40.0, 12.5, 30.0) == 40.0
+
+
+@pytest.mark.asyncio
+async def test_inactivity_monitor_counts_forwarder_posts_as_activity() -> None:
+    """A native forwarder still posting holds off the idle shutdown.
+
+    Mirrors the mirrored-sub-agent scenario: the tunnel sees no server→runner
+    traffic, but the in-process forwarder keeps POSTing the child's items.
+    While posts land inside the idle window the monitor waits; one full idle
+    window after the last post it shuts the runner down.
+
+    :returns: None.
+    """
+    loop = asyncio.get_running_loop()
+    dispatcher = RunnerEventDispatcher()
+    tunnel_activity = loop.time()
+    native_forwarder_health.clear()
+    shutdowns: list[str] = []
+
+    def _last_activity() -> float:
+        return _runner_last_activity(
+            tunnel_activity,
+            dispatcher.last_dispatch_at,
+            native_forwarder_health.last_post_at(),
+        )
+
+    task = asyncio.create_task(
+        _run_inactivity_monitor(
+            idle_timeout_s=0.08,
+            get_last_activity=_last_activity,
+            has_active_work=lambda: False,
+            request_shutdown=lambda: shutdowns.append("shutdown"),
+            poll_interval_s=0.005,
+        )
+    )
+    try:
+        # Forwarder posts every ~20ms keep the runner alive past several windows.
+        for _ in range(8):
+            native_forwarder_health.note_post_success()
+            await asyncio.sleep(0.02)
+        assert shutdowns == []
+        assert not task.done()
+        # Once the child stops streaming, the next idle window exits the runner.
+        await asyncio.wait_for(task, timeout=1.0)
+    finally:
+        native_forwarder_health.clear()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    assert shutdowns == ["shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_inactivity_monitor_counts_dispatched_events_as_activity() -> None:
+    """A tunnel-acknowledged event batch also refreshes the activity clock.
+
+    :returns: None.
+    """
+    loop = asyncio.get_running_loop()
+    dispatcher = RunnerEventDispatcher()
+    tunnel_activity = loop.time() - 100.0
+    shutdowns: list[str] = []
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    dispatcher.ready(send)
+    ack = await dispatcher.submit(
+        "session-a",
+        [
+            {
+                "type": "external_conversation_item",
+                "data": {"source_id": "record-1", "item_type": "message", "item_data": {}},
+            }
+        ],
+    )
+    assert ack.applied == 1
+
+    task = asyncio.create_task(
+        _run_inactivity_monitor(
+            idle_timeout_s=0.05,
+            get_last_activity=lambda: _runner_last_activity(
+                tunnel_activity, dispatcher.last_dispatch_at, None
+            ),
+            has_active_work=lambda: False,
+            request_shutdown=lambda: shutdowns.append("shutdown"),
+            poll_interval_s=0.005,
+        )
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.03)
+    assert shutdowns == []
+    await asyncio.wait_for(task, timeout=1.0)
     assert shutdowns == ["shutdown"]
 
 

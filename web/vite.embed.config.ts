@@ -94,7 +94,7 @@ const scopePlugin = (): postcss.Plugin => ({
 });
 scopePlugin.postcss = true;
 
-function scopeCss(css: string): string {
+export function scopeCss(css: string): string {
   return postcss([scopePlugin()]).process(css, { from: undefined }).css;
 }
 

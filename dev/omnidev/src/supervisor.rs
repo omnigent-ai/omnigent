@@ -275,6 +275,8 @@ impl Supervisor {
             });
         }
 
+        // (fixture file name, created session id) for this run's imports.
+        let mut imported = Vec::new();
         while let Some(joined) = imports.join_next().await {
             let Ok((file_name, marker, result)) = joined else {
                 self.event("conversation prefill task failed");
@@ -282,6 +284,12 @@ impl Supervisor {
             };
             match result {
                 Ok(Ok(output)) if output.status.success() => {
+                    match imported_session_id(&String::from_utf8_lossy(&output.stdout)) {
+                        Some(id) => imported.push((file_name.clone(), id.to_string())),
+                        None => self.event(format!(
+                            "prefilled {file_name} but could not read its session id"
+                        )),
+                    }
                     if let Err(error) = std::fs::write(&marker, b"seeded\n") {
                         self.event(format!(
                             "prefilled {file_name} but could not write its marker: {error}"
@@ -309,6 +317,51 @@ impl Supervisor {
                 )),
                 Err(_) => self.event(format!("conversation prefill timed out for {file_name}")),
             }
+        }
+
+        if !imported.is_empty() {
+            // Fixture order, not completion order, so the seeded layout is stable.
+            imported.sort();
+            let ids = imported.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
+            self.seed_sidebar_metadata(&ids).await;
+        }
+    }
+
+    /// Seed sidebar date buckets and repository labels for this run's imported fixtures.
+    async fn seed_sidebar_metadata(&self, session_ids: &[String]) {
+        let script = self
+            .pod
+            .repo_root
+            .join("dev/omnidev/fixtures/seed_sidebar_metadata.py");
+        // Pure stdlib sqlite3 — no omnigent package or uv project env needed.
+        let mut command = Command::new("python3");
+        command
+            .arg(&script)
+            .arg(self.pod.chat_db())
+            .args(session_ids)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        match timeout(Duration::from_secs(30), command.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                self.event(String::from_utf8_lossy(&output.stdout).trim().to_string());
+            }
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let detail = if stderr.trim().is_empty() {
+                    stdout.trim()
+                } else {
+                    stderr.trim()
+                };
+                self.event(format!(
+                    "could not seed sidebar metadata ({}): {detail}",
+                    output.status
+                ));
+            }
+            Ok(Err(error)) => self.event(format!("could not start sidebar metadata seed: {error}")),
+            Err(_) => self.event("sidebar metadata seed timed out"),
         }
     }
 
@@ -658,6 +711,13 @@ async fn http_ok(addr: &str, path: &str, host: &str) -> bool {
     status.starts_with("HTTP/1.") && status.split_whitespace().nth(1) == Some("200")
 }
 
+/// The session id from `omnigent session import` output ("Imported N item(s) into <id>").
+fn imported_session_id(stdout: &str) -> Option<&str> {
+    let (_, id) = stdout.trim().rsplit_once(" into ")?;
+    let id = id.trim();
+    (!id.is_empty() && !id.contains(char::is_whitespace)).then_some(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +725,17 @@ mod tests {
     use crate::profile::Profile;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn reads_the_imported_session_id() {
+        let out = "Imported 12 item(s) into 0123456789abcdef0123456789abcdef\n";
+        assert_eq!(
+            imported_session_id(out),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(imported_session_id("Imported 0 item(s) into \n"), None);
+        assert_eq!(imported_session_id("some other output"), None);
+    }
 
     #[tokio::test]
     async fn manual_server_restart_preserves_host() {

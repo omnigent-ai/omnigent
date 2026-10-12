@@ -20,6 +20,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeSignInPending,
     ClaudeTerminalDialog,
     ClaudeTerminalExited,
+    ClaudeUserPromptPending,
     TmuxSessionNotAdvertised,
     cancellable_injection,
     inject_slash_command,
@@ -298,6 +299,15 @@ class ClaudeNativeExecutor(Executor):
             # queued copy is the only record of the message.
             _logger.warning(
                 "claude-native: terminal surface blocks delivery; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            return
+        except ClaudeUserPromptPending as exc:
+            # A question or permission prompt held the message before its submit
+            # Enter; the pane stays for the person to answer it.
+            _logger.warning(
+                "claude-native: pending Claude prompt blocks delivery; message not delivered",
                 extra={"session_id": self._request_session_id},
             )
             yield ExecutorError(message=describe_exception(exc), undelivered=True)

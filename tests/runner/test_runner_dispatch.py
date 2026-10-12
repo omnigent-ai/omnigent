@@ -8837,7 +8837,8 @@ async def test_sys_session_share_non_public_rejects_public_grant() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_share_public_allows_public_grant() -> None:
+@pytest.mark.parametrize("level,number", [("read", 1), ("edit", 2)])
+async def test_sys_session_share_public_allows_public_grant(level: str, number: int) -> None:
     """
     Under ``agent_session_sharing: public`` a ``__public__`` read grant
     passes the runner gate and PUTs to the permissions endpoint — the
@@ -8853,7 +8854,7 @@ async def test_sys_session_share_public_allows_public_grant() -> None:
         requests.append((request.method, request.url.path, json.loads(request.content)))
         return httpx.Response(
             200,
-            json={"user_id": "__public__", "conversation_id": "conv_caller", "level": 1},
+            json={"user_id": "__public__", "conversation_id": "conv_caller", "level": number},
         )
 
     async with httpx.AsyncClient(
@@ -8862,7 +8863,7 @@ async def test_sys_session_share_public_allows_public_grant() -> None:
     ) as server_client:
         output = await execute_tool(
             tool_name="sys_session_share",
-            arguments=json.dumps({"user_id": "__public__"}),
+            arguments=json.dumps({"user_id": "__public__", "level": level}),
             server_client=server_client,
             conversation_id="conv_caller",
             agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC),
@@ -8870,14 +8871,14 @@ async def test_sys_session_share_public_allows_public_grant() -> None:
 
     # __public__ reached the server as a level-1 (read) grant on the caller.
     assert requests == [
-        ("PUT", "/v1/sessions/conv_caller/permissions", {"user_id": "__public__", "level": 1})
+        ("PUT", "/v1/sessions/conv_caller/permissions", {"user_id": "__public__", "level": number})
     ]
     result = json.loads(output)
     assert result == {
         "shared": True,
         "session_id": "conv_caller",
         "user_id": "__public__",
-        "level": "read",
+        "level": level,
     }
 
 

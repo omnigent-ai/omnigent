@@ -54,16 +54,15 @@ const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
 );
 import {
-  CLAUDE_NATIVE_SUBAGENT_WRAPPER,
+  ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER,
+  CODEX_NATIVE_SUBAGENT_WRAPPER,
   nativeCodingAgentForWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
+import { childPrimaryLabel } from "./subagentLabel";
 import { childStatus, type AgentActivity, type AgentStatus } from "./subagentStatus";
 import { AddAgentDialog } from "./AddAgentDialog";
 
-const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
-const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
-const ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER = "antigravity-native-ui-subagent";
 const CODEX_NATIVE_SUBAGENT_ROLE_LABEL = "omnigent.codex_native.agent_role";
 const ANTIGRAVITY_NATIVE_SUBAGENT_ROLE_LABEL = "omnigent.antigravity_native.agent_role";
 // Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
@@ -339,40 +338,6 @@ function StatusAvatar({ activity, label, details }: AgentStatus) {
         <RunningDot className="size-3.5 text-current" />
       )}
     </span>
-  );
-}
-
-/**
- * Pick the primary label for a child-session row.
- *
- * @param child - One child-session summary from the poll or stream.
- * @returns The label shown beside the child icon.
- */
-function childPrimaryLabel(child: ChildSessionInfo): string {
-  // User-added rows use the reserved "ui:<agent>:<name>" title sentinel;
-  // LLM-spawned titles cannot start with "ui:" because the spec validator
-  // rejects "ui" as a sub-agent name.
-  const isUserAdded = child.title?.startsWith("ui:") ?? false;
-  const childWrapper = child.labels?.[WRAPPER_LABEL_KEY];
-  // agy joins these rather than taking the generic path below: its child title
-  // is ``"<role>:<cascade id>"``, so the first-colon split puts the ROLE in
-  // ``tool`` and the cascade UUID in the suffix — and the generic path returns
-  // ``session_name ?? suffix``, both of which are that UUID.
-  const isNativeSubagent =
-    childWrapper === CODEX_NATIVE_SUBAGENT_WRAPPER ||
-    childWrapper === OPENCODE_NATIVE_SUBAGENT_WRAPPER ||
-    childWrapper === ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER ||
-    childWrapper === CLAUDE_NATIVE_SUBAGENT_WRAPPER;
-  if (isNativeSubagent && !isUserAdded) {
-    return child.tool ?? child.title ?? child.id;
-  }
-  let titleTask: string | null = null;
-  if (child.title?.includes(":")) {
-    const titleSuffix = child.title.split(":").slice(1).join(":");
-    if (titleSuffix) titleTask = titleSuffix;
-  }
-  return (
-    child.task_summary ?? child.session_name ?? titleTask ?? child.title ?? child.tool ?? child.id
   );
 }
 

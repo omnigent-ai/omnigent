@@ -306,6 +306,12 @@ class AgentObject(BaseModel):
     builtin: bool = False
 
 
+class AgentDetailObject(AgentObject):
+    """Agent summary with caller ownership for management actions."""
+
+    user_owned: bool
+
+
 # ── Session Policies ───────────────────────────────────────────
 
 
@@ -2943,7 +2949,7 @@ class GrantPermissionRequest(BaseModel):
 
     :param user_id: The user to grant access to, e.g.
         ``"alice@example.com"`` or ``"__public__"`` for public
-        read access.
+        access subject to the server's public permission ceiling.
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage.
     """

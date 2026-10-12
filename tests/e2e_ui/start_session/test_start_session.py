@@ -1920,10 +1920,12 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             effort = page.locator(
                 '[data-testid^="new-chat-landing-agent-effort-"][aria-checked="true"]'
             )
-            await expect(model).to_contain_text("Harness default")
+            await expect(model).to_contain_text("Default")
             await expect(effort).to_contain_text("Default")
             await expect(
-                page.get_by_role("menuitemcheckbox", name="Default", exact=True)
+                page.get_by_test_id("new-chat-landing-agent-efforts").get_by_role(
+                    "menuitemcheckbox", name="Default", exact=True
+                )
             ).to_have_count(1)
 
             # Model and effort picks commit immediately using the live host catalog.

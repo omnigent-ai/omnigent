@@ -9,6 +9,7 @@ import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -602,6 +603,131 @@ async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_m
     args = captured["spec"].args
     assert "--model" not in args
     assert "--provider" not in args
+
+
+def _pi_launch_test_stubs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probed_version: tuple[int, int, int] | None,
+) -> dict[str, Any]:
+    """Stub the Pi launch environment; return the registry's capture dict.
+
+    :param tmp_path: Pytest-provided temporary directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param probed_version: Version the ``pi --version`` probe reports.
+    :returns: Dict the fake registry fills when a terminal launches.
+    """
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(pi_native, "pi_version", lambda _exe: probed_version)
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, *, session_id: str, spec: Any, **_kwargs: Any
+        ) -> SessionResourceView:
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    captured["registry"] = _FakeResourceRegistry()
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_outdated_cli_fails_with_upgrade_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Pi CLI below the floor fails the launch with the upgrade path named.
+
+    An old ``pi`` exits 1 on ``--provider omnigent``; the launch must refuse
+    before spawning anything and name the installed version, the floor, and
+    the installer's upgrade command instead of a generic start failure.
+    """
+    from omnigent.harnesses.pi_native.main import PiNativeCliOutdatedError
+    from omnigent.onboarding.harness_install import (
+        PI_KEY,
+        harness_install_display,
+        harness_install_spec,
+    )
+
+    captured = _pi_launch_test_stubs(tmp_path, monkeypatch, (0, 83, 0))
+
+    with pytest.raises(PiNativeCliOutdatedError) as excinfo:
+        await _auto_create_pi_terminal(
+            "47f049b9d13df4db397c7f46859b825f",
+            captured["registry"],  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
+
+    message = str(excinfo.value)
+    min_version = harness_install_spec(PI_KEY)
+    assert min_version is not None and min_version.min_version is not None
+    assert "0.83.0" in message
+    assert min_version.min_version in message
+    assert harness_install_display(PI_KEY) in message
+    # The launch was refused before any terminal was spawned.
+    assert "spec" not in captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version_kind", ["at_floor", "unknown"])
+async def test_auto_create_pi_terminal_cli_version_at_floor_or_unknown_proceeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version_kind: str,
+) -> None:
+    """A Pi at the floor — or an unprobeable version — launches as today.
+
+    The floor is inclusive, and an unknown probe result must fail open so a
+    Pi whose ``--version`` output changes shape keeps working.
+    """
+    from omnigent.onboarding.harness_install import PI_KEY, harness_install_spec
+
+    probed: tuple[int, int, int] | None = None
+    if version_kind == "at_floor":
+        spec = harness_install_spec(PI_KEY)
+        assert spec is not None and spec.min_version is not None
+        floor_parts = [int(part) for part in spec.min_version.split(".")]
+        probed = (floor_parts[0], floor_parts[1], floor_parts[2])
+    captured = _pi_launch_test_stubs(tmp_path, monkeypatch, probed)
+
+    await _auto_create_pi_terminal(
+        "47f049b9d13df4db397c7f46859b825f",
+        captured["registry"],  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    assert captured["spec"].command == "pi"
 
 
 @pytest.mark.asyncio
@@ -4011,6 +4137,91 @@ async def test_delete_cancels_recovery_before_same_session_reinitializes(
 
         cleanup_resp = await client.delete(f"/v1/sessions/{session_id}")
         assert cleanup_resp.status_code == 200, cleanup_resp.text
+
+
+class _RecordingCodexRegistry:
+    """Captures the launched Codex terminal spec."""
+
+    terminal_registry = None
+
+    def __init__(self, captured: dict[str, Any]) -> None:
+        self.captured = captured
+
+    async def launch_auxiliary_terminal(
+        self,
+        *,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: Any,
+        resource_role: str | None = None,
+        parent_os_env: Any = None,
+    ) -> SessionResourceView:
+        """Record the spec and return a terminal resource view."""
+        del terminal_name, session_key, resource_role, parent_os_env
+        self.captured["spec"] = spec
+        return SessionResourceView(
+            id="terminal_codex_main", type="terminal", session_id=session_id, name="codex:main"
+        )
+
+
+@pytest.mark.asyncio
+async def test_codex_tui_launch_reads_project_config_from_session_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex TUI relaunch reads the session workspace's config after the runner cwd is gone."""
+    from omnigent.runner.native.orchestration import (
+        _CodexNativeLaunchConfig,
+        _launch_codex_native_tui,
+    )
+
+    workspace = tmp_path / "workspace"
+    (workspace / ".omnigent").mkdir(parents=True)
+    (workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  codex-native:\n    command: workspace-codex\n    args: [--workspace-arg]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+
+    def missing_cwd() -> Path:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(Path, "cwd", missing_cwd)
+
+    captured: dict[str, Any] = {}
+    app_server = SimpleNamespace(
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=[],
+        codex_cli_version=None,
+        codex_path="/opt/codex/bin/codex",
+        codex_home=tmp_path / "codex-home",
+        env={},
+    )
+    await _launch_codex_native_tui(
+        "conv_codex_cwd_gone",
+        _RecordingCodexRegistry(captured),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        app_server=app_server,  # type: ignore[arg-type]
+        launch_config=_CodexNativeLaunchConfig(
+            workspace=workspace,
+            policy_server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            model_override=None,
+            external_session_id=None,
+            fork_source_id=None,
+            fork_source_external_id=None,
+            fork_carry_history=False,
+            bypass_sandbox=False,
+        ),
+        bridge_dir=tmp_path / "bridge",
+        thread_id=None,
+        agent_spec=None,
+    )
+
+    spec = captured["spec"]
+    assert spec.command == "workspace-codex"
+    assert spec.args[0] == "--workspace-arg"
+    assert spec.os_env.cwd == str(workspace)
 
 
 @pytest.mark.asyncio

@@ -1167,7 +1167,8 @@ def test_stop_runner_result_frame_round_trip() -> None:
     assert decoded.error is None
 
 
-def test_runner_exited_frame_round_trip() -> None:
+@pytest.mark.parametrize("had_connected", [None, False, True])
+def test_runner_exited_frame_round_trip(had_connected: bool | None) -> None:
     """
     Verify HostRunnerExitedFrame survives encode → decode.
 
@@ -1178,6 +1179,7 @@ def test_runner_exited_frame_round_trip() -> None:
     """
     original = HostRunnerExitedFrame(
         runner_id="runner_abc123",
+        had_connected=had_connected,
         error=(
             "runner process exited with code 1 (log on host: ~/x.log)\n"
             "--- runner log tail ---\nRuntimeError: boom"
@@ -1188,6 +1190,7 @@ def test_runner_exited_frame_round_trip() -> None:
     assert decoded.runner_id == "runner_abc123"
     # The multi-line error (including the log tail) must survive intact.
     assert decoded.error == original.error
+    assert decoded.had_connected is had_connected
 
 
 def test_runner_exited_frame_missing_error_raises() -> None:
@@ -2423,3 +2426,28 @@ def test_mcp_tools_allow_list_and_correlated_malformed_result():
     frame = decode_host_frame(json.dumps(payload))
     assert isinstance(frame, HostMcpToolsResultFrame)
     assert (frame.request_id, frame.status, frame.tools) == ("m", "failed", [])
+
+
+def test_legacy_runner_exit_has_unknown_connection_history() -> None:
+    """An old host's exit report remains valid without connection evidence."""
+    frame = decode_host_frame(
+        '{"kind":"host.runner_exited","runner_id":"runner_old","error":"exited"}'
+    )
+    assert isinstance(frame, HostRunnerExitedFrame)
+    assert frame.had_connected is None
+
+
+@pytest.mark.parametrize("invalid", ["true", "false", 0, 1, [], {}])
+def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) -> None:
+    """Malformed evidence cannot turn a failed launch into a harmless idle exit."""
+    with pytest.raises(ValueError, match="required bool field"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.runner_exited",
+                    "runner_id": "runner_bad",
+                    "error": "exited",
+                    "had_connected": invalid,
+                }
+            )
+        )

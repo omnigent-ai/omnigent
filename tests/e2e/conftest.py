@@ -821,7 +821,7 @@ def live_server(
                 and status_resp.json()["online"] is True
             ):
                 break
-        except httpx.ConnectError:
+        except httpx.TransportError:
             pass
         time.sleep(POLL_INTERVAL_S)
     else:

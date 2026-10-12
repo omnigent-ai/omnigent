@@ -7,6 +7,7 @@ import contextlib
 import errno
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -16,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import click
 import pytest
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
@@ -261,6 +263,35 @@ async def test_host_skills_distinguishes_empty_and_failure(
     result = host._handle_skills(frame)
     assert result.status == "failed"
     assert result.error_code == "discovery_failed"
+
+
+async def test_skill_bundle_fetch_survives_a_deleted_ssl_cert_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale ``SSL_CERT_FILE`` doesn't break the session skill-bundle fetch.
+
+    httpx builds its env-derived SSL context when the client is constructed, so a
+    deleted CA bundle raised FileNotFoundError before any request went out.
+    """
+    import httpx
+
+    from omnigent.util import tls
+
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "deleted-ca.pem"))
+    monkeypatch.setattr(tls, "_client_ssl_context", None)
+    monkeypatch.setattr(
+        httpx.HTTPTransport,
+        "handle_request",
+        lambda _self, request: httpx.Response(200, content=b"bundle", request=request),
+    )
+    frame = HostSkillsFrame(
+        request_id="r", harness="claude-native", path=str(tmp_path), session_id="conv_abc"
+    )
+
+    response = _make_host_process()._fetch_skill_bundle(frame)
+
+    assert response.status_code == 200
+    assert response.request.url.path == "/v1/sessions/conv_abc/agent/contents"
 
 
 async def test_host_skills_does_not_block_tunnel(
@@ -968,10 +999,12 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
 
 
 @pytest.mark.parametrize("binding_token", ["token_abc", "", "   "])
+@pytest.mark.parametrize("harness", ["codex", "pi-native"])
 async def test_handle_launch_refuses_unconfigured_harness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     binding_token: str,
+    harness: str,
 ) -> None:
     """
     Verify _handle_launch refuses to spawn when the frame's harness is
@@ -993,11 +1026,18 @@ async def test_handle_launch_refuses_unconfigured_harness(
         lambda harness: False,
     )
 
+    if harness == "pi-native":
+
+        def missing_pi() -> str:
+            raise click.ClickException("Pi is not installed")
+
+        monkeypatch.setattr("omnigent.harnesses.pi_native.main.resolve_pi_executable", missing_pi)
+
     frame = HostLaunchRunnerFrame(
         request_id="req_unconfigured",
         binding_token=binding_token,
         workspace=str(workspace),
-        harness="codex",
+        harness=harness,
     )
     result = await host._handle_launch(frame)
 
@@ -1007,7 +1047,7 @@ async def test_handle_launch_refuses_unconfigured_harness(
     assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
     # The message is shown verbatim to the user — it must name the
     # harness, the host, and the remediation command.
-    assert "'codex'" in (result.error or "")
+    assert repr(harness) in (result.error or "")
     assert "test-laptop" in (result.error or "")
     assert "omni setup" in (result.error or "")
     assert result.runner_id is None
@@ -1611,9 +1651,13 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     assert maintenance_reasons == ["runner_launch_failed"]
 
 
+@pytest.mark.parametrize(
+    "marker_state", ["connected", "not_connected", "unavailable", "unreadable"]
+)
 async def test_watch_runner_reports_unexpected_exit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    marker_state: str,
 ) -> None:
     """A runner that dies after launch is reported via host.runner_exited.
 
@@ -1663,8 +1707,18 @@ async def test_watch_runner_reports_unexpected_exit(
         result = await host._handle_launch(frame)
     assert result.status == "launched", result.error
 
-    # Wait for the watcher to observe the death and send its report
-    # (bounded — a hang means the watcher never fired).
+    handle = host._runners[token_bound_runner_id("tok_watch")]
+    assert handle.connect_marker is not None
+    if marker_state == "connected":
+        handle.connect_marker.touch()
+    elif marker_state == "unavailable":
+        handle.connect_marker = None
+    elif marker_state == "unreadable":
+        handle.connect_marker = SimpleNamespace(  # type: ignore[assignment]
+            exists=Mock(side_effect=[OSError("marker unavailable"), False])
+        )
+
+    # Wait for the watcher to observe the death and send its report.
     await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
 
     # Exactly one report; a second would double-record server-side.
@@ -1675,6 +1729,8 @@ async def test_watch_runner_reports_unexpected_exit(
     # The report carries the exit code and the log tail with the cause.
     assert "code 3" in report.error
     assert "tunnel rejected: crash-cause" in report.error
+    expected = {"connected": True, "not_connected": False}.get(marker_state)
+    assert report.had_connected is expected
     assert maintenance_reasons == ["runner_exited"]
 
 
@@ -2085,8 +2141,12 @@ async def test_connect_watchdog_silent_on_intentional_stop(
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize("had_connected", [None, False, True])
+@pytest.mark.parametrize("send_fails", [False, True])
 async def test_unreported_exit_flushes_after_reconnect(
     capsys: pytest.CaptureFixture[str],
+    had_connected: bool | None,
+    send_fails: bool,
 ) -> None:
     """An exit report that raced a disconnect is sent after the next hello.
 
@@ -2096,7 +2156,14 @@ async def test_unreported_exit_flushes_after_reconnect(
     never reported and the waiting client polls to its timeout.
     """
     host = _make_host_process()
-    host._unreported_exits["runner_parked"] = "runner process exited with code 1"
+    if send_fails:
+        host._ws = SimpleNamespace(  # type: ignore[assignment]
+            send=AsyncMock(side_effect=ConnectionError("tunnel closed"))
+        )
+    await host._report_runner_exit(
+        "runner_parked", "runner process exited with code 1", had_connected=had_connected
+    )
+    assert "runner_parked" in host._unreported_exits
     tunnel = _FakeTunnel()
 
     # _serve_frames sends hello, flushes parked reports, then hits the
@@ -2111,6 +2178,7 @@ async def test_unreported_exit_flushes_after_reconnect(
     assert isinstance(report, HostRunnerExitedFrame)
     assert report.runner_id == "runner_parked"
     assert report.error == "runner process exited with code 1"
+    assert report.had_connected is had_connected
     # The queue drained — a retained entry would re-send on every
     # reconnect forever.
     assert host._unreported_exits == {}
@@ -4396,6 +4464,25 @@ def test_handle_list_dir_skips_dangling_symlink_per_entry(
     # Good entry survived; dangling was silently skipped.
     assert "good.txt" in names
     assert "dangling" not in names
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="APFS rejects non-UTF-8 file names")
+def test_handle_list_dir_skips_a_name_that_is_not_utf8(tmp_path: Path) -> None:
+    """
+    A file name with invalid UTF-8 bytes doesn't fail the whole listing.
+
+    ``os.scandir`` surrogate-escapes such a name, which the server can't
+    encode into its JSON response, so every browse of the directory 500'd.
+    """
+    host = _make_host_process()
+    (tmp_path / "good.txt").write_text("ok")
+    (tmp_path / os.fsdecode(b"report-\xb2.txt")).write_text("latin-1 name")
+
+    result = host._handle_list_dir(HostListDirFrame(request_id="r6", path=str(tmp_path)))
+
+    assert result.status == "ok"
+    assert [e.name for e in result.entries] == ["good.txt"]
+    encode_host_frame(result).encode("utf-8")
 
 
 def test_handle_list_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:

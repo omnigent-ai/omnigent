@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
+import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 import { highlightCode } from "@/components/ai-elements/code-block";
@@ -402,6 +403,63 @@ describe("CodeViewer truncated preview", () => {
   it("shows no banner in markdown preview when not truncated", () => {
     renderViewer("# full file", true, "notes.md", { viewMode: "preview", truncated: false });
     expect(screen.queryByText(/too large to load fully/)).toBeNull();
+  });
+});
+
+const previewOpenFile = vi.fn();
+const PREVIEW_FILE_VIEWER = {
+  openFile: previewOpenFile,
+  openGithubTab: () => {},
+  isChangedPath: () => false,
+  conversationId: "conv_1",
+  workspaceRoot: "/ws",
+  workspaceHome: null,
+};
+
+describe("CodeViewer markdown preview links", () => {
+  const renderPreview = (content: string, path: string) => {
+    previewOpenFile.mockClear();
+    render(
+      <FileViewerContext.Provider value={PREVIEW_FILE_VIEWER}>
+        <CodeViewer
+          conversationId="conv_1"
+          path={path}
+          fileQuery={makeFileQuery(content)}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+          panelOpen
+          searchOpen={false}
+          setSearchOpen={() => {}}
+          searchInputRef={noopRef}
+          viewMode="preview"
+        />
+      </FileViewerContext.Provider>,
+    );
+    return previewOpenFile;
+  };
+
+  it("opens a relative link in the FileViewer instead of navigating the app", () => {
+    // As an anchor, `../notes/plan.md` would resolve against `/c/<id>` and load
+    // a session named after the file.
+    const openFile = renderPreview("See [the plan](../notes/plan.md#steps).", "docs/guide.md");
+
+    const link = screen.getByText("the plan");
+    expect(link.getAttribute("href")).toBeNull();
+    fireEvent.click(link);
+
+    expect(openFile).toHaveBeenCalledWith("notes/plan.md");
+  });
+
+  it("keeps URLs and in-page anchors as links", () => {
+    const openFile = renderPreview(
+      "[docs](https://example.com/docs) and [below](#usage)\n\n## Usage",
+      "docs/guide.md",
+    );
+
+    expect(screen.getByText("docs").getAttribute("href")).toBe("https://example.com/docs");
+    expect(screen.getByText("below").getAttribute("href")).toBe("#usage");
+    expect(openFile).not.toHaveBeenCalled();
   });
 });
 
