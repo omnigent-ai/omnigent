@@ -112,7 +112,6 @@ def spawn_multi_user_server(
     extra_server_env: dict[str, str] | None = None,
     admin_headers: dict[str, str] | None = None,
     admin_email: str = ADMIN_EMAIL,
-    session_metadata: Mapping[str, Any] | None = None,
 ) -> Iterator[MultiUserServer]:
     """Spawn a multi-user server + one admin-owned session; yield a handle.
 
@@ -126,6 +125,7 @@ def spawn_multi_user_server(
     :param server_tmp: A per-test temp dir (``tmp_path_factory.mktemp(...)``).
     :param extra_server_env: Extra env vars for the server process.
     :param admin_headers: Admin credentials when testing a different identity header.
+    :param admin_email: Identity to list as admin and use with the default header.
     :yields: A :class:`MultiUserServer` handle.
     """
     agent_yaml_path = server_tmp / "hello_world.yaml"
@@ -133,7 +133,7 @@ def spawn_multi_user_server(
     # Declare the admin roster via the admin-list file (one identity per line;
     # see omnigent/server/admin_list.py). There is no admin *env var* — the
     # roster is the config ``admins:`` list or this file — so point
-    # OMNIGENT_ADMIN_LIST_PATH at it. This makes ADMIN_EMAIL resolve as admin
+    # OMNIGENT_ADMIN_LIST_PATH at it. This makes the supplied admin identity resolve as admin
     # so /v1/me reports is_admin:true and the Settings Admin group renders.
     admins_path = server_tmp / "admins"
     admins_path.write_text(f"{admin_email}\n")
@@ -166,12 +166,10 @@ def spawn_multi_user_server(
         poll_interval=_HEALTH_POLL_INTERVAL_S,
     ) as base_url:
         # Create an admin-owned hello_world session (authenticated, so it's
-        # owned by ADMIN_EMAIL — headerless would 401 here). No runner bind and
+        # owned by the supplied admin identity — headerless would 401 here). No runner bind and
         # no turn: the Share modal / button / settings nav only need a
         # top-level session to exist at manage level, which the owner has.
-        session_id = create_user_session(
-            base_url, headers=admin_headers, metadata=session_metadata
-        )
+        session_id = create_user_session(base_url, headers=admin_headers)
 
         yield MultiUserServer(
             base_url=base_url,
