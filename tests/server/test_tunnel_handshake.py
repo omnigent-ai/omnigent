@@ -38,6 +38,14 @@ class _DroppedSocket(_Socket):
         raise WebSocketDisconnect(code=1006)
 
 
+class _FailingReceiveSocket(_Socket):
+    """A transport whose own read times out before the handshake deadline."""
+
+    async def receive_text(self) -> str:
+        self.receive_ended = True
+        raise TimeoutError("transport read timed out")
+
+
 class _ScriptedClock:
     """Stand-in for the module's ``time`` that returns fixed monotonic readings."""
 
@@ -87,6 +95,18 @@ async def test_timeout_ignores_close_failure_after_peer_drop(
     assert result is None
     assert socket.receive_ended
     assert socket.closes == [{"code": 1013, "reason": "hello timeout"}]
+
+
+@pytest.mark.asyncio
+async def test_receive_timeout_error_is_preserved() -> None:
+    socket = _FailingReceiveSocket()
+    with pytest.raises(TimeoutError, match="transport read timed out"):
+        await tunnel_handshake.receive_tunnel_hello(
+            socket,
+            peer_kind="host",
+            peer_id="synthetic-peer",  # type: ignore[arg-type]
+        )
+    assert socket.closes == []
 
 
 @pytest.mark.asyncio
