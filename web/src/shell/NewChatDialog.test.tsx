@@ -3354,7 +3354,7 @@ describe("NewChatLandingScreen", () => {
       "[&::-webkit-scrollbar]:hidden",
     );
     expect(screen.getByTestId("new-chat-landing-input")).not.toHaveClass("block");
-    expect(screen.getByTestId("new-chat-landing-input").parentElement).toHaveClass(
+    expect(screen.getByTestId("new-chat-landing-input").parentElement?.parentElement).toHaveClass(
       "overflow-hidden",
       "px-3",
       "pt-3",
@@ -3485,7 +3485,9 @@ describe("NewChatLandingScreen", () => {
     const leftControls = screen.getByTestId("new-chat-landing-left-controls");
     const rightControls = screen.getByTestId("new-chat-landing-right-controls");
     const card = screen.getByTestId("new-chat-landing-composer");
-    expect(screen.getByTestId("new-chat-landing-input").parentElement?.parentElement).toBe(card);
+    expect(
+      screen.getByTestId("new-chat-landing-input").parentElement?.parentElement?.parentElement,
+    ).toBe(card);
     expect(actions.parentElement).toBe(card);
     const [widthProbe, ...groups] = Array.from(actions.children);
     expect(widthProbe).toHaveClass("h-0");
