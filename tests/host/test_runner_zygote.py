@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -23,6 +25,7 @@ from pathlib import Path
 import pytest
 
 import omnigent
+from omnigent.debug_logging import record_to_row
 from omnigent.host.runner_zygote import (
     _ZYGOTE_LOST_EXIT_CODE,
     ZygoteManager,
@@ -256,6 +259,136 @@ def test_unreaped_pid_is_none_before_start() -> None:
     """An unstarted manager has no child exit status to protect."""
     mgr = ZygoteManager()
     assert mgr.unreaped_pid is None
+
+
+@pytest.mark.parametrize("parent_exited", [False, True])
+@pytest.mark.parametrize(
+    "failure", ["timeout", "eof", "invalid_json", "invalid_reply", "socket_error"]
+)
+def test_control_failure_logs_parent_status(managed_child, caplog, parent_exited, failure) -> None:
+    mgr, parent = managed_child
+    if parent_exited:
+        parent.kill()
+        parent.wait(timeout=5)
+    client, peer = socket.socketpair()
+    mgr._sock = client
+    client.settimeout(0.02)
+    caplog.set_level(logging.INFO, logger="omnigent.host.runner_zygote")
+    try:
+        if failure == "eof":
+            peer.shutdown(socket.SHUT_WR)
+        elif failure == "invalid_json":
+            peer.sendall(b"private-reply-content\n")
+        elif failure == "invalid_reply":
+            peer.sendall(b'["private-reply-content"]\n')
+        elif failure == "socket_error":
+            peer.close()
+        with pytest.raises(ZygoteUnavailable):
+            mgr._exchange({"cmd": "poll", "pid": 12345})
+    finally:
+        peer.close()
+
+    rows = [
+        record_to_row(record, source="host")
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_zygote_control_failed"
+    ]
+    assert len(rows) == 1
+    attrs = rows[0]["attributes"]
+    assert attrs["telemetry_schema"] == "runner_zygote.v1"
+    assert attrs["operation"] == "poll"
+    assert attrs["failure_kind"] == ("invalid_reply" if failure == "invalid_json" else failure)
+    assert attrs["zygote_pid"] == str(parent.pid)
+    assert attrs["zygote_running"] == str(not parent_exited)
+    assert attrs["runner_pid"] == "12345"
+    assert float(attrs["elapsed_s"]) >= 0
+    if parent_exited:
+        assert attrs["zygote_exit_code"] == str(-signal.SIGKILL)
+    else:
+        assert "zygote_exit_code" not in attrs
+    if failure == "socket_error":
+        assert int(attrs["errno"]) > 0
+    assert "private-reply-content" not in json.dumps(rows)
+
+
+def test_control_diagnostics_are_bounded_and_reset_after_recovery(caplog) -> None:
+    mgr = ZygoteManager()
+    client, peer = socket.socketpair()
+    mgr._sock = client
+    client.settimeout(1)
+    caplog.set_level(logging.INFO, logger="omnigent.host.runner_zygote")
+    private = "private-diagnostic-canary"
+    try:
+        for _ in range(2):
+            peer.sendall(json.dumps([private]).encode() + b"\n")
+            with pytest.raises(ZygoteUnavailable):
+                mgr.fork_runner({"PRIVATE_TOKEN": private}, private, private)
+        for _ in range(2):
+            peer.sendall(b'{"pong":true}\n')
+            assert mgr._exchange({"cmd": "ping"}) == {"pong": True}
+        peer.sendall(json.dumps([private]).encode() + b"\n")
+        with pytest.raises(ZygoteUnavailable):
+            mgr._exchange({"cmd": private, "pid": private})
+    finally:
+        peer.close()
+        mgr.stop()
+
+    rows = [record_to_row(record, source="host") for record in caplog.records]
+    assert [row["event_name"] for row in rows] == [
+        "runner_zygote_control_failed",
+        "runner_zygote_control_recovered",
+        "runner_zygote_control_failed",
+    ]
+    assert rows[0]["attributes"]["operation"] == "fork"
+    assert rows[-1]["attributes"]["operation"] == "unknown"
+    assert "runner_pid" not in rows[-1]["attributes"]
+    assert private not in json.dumps(rows)
+
+
+def test_stop_diagnostics_record_reason_and_real_exit(tmp_path, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.host.runner_zygote")
+    mgr = ZygoteManager(log_path=tmp_path / "zygote.log")
+    try:
+        mgr.start()
+        parent = mgr._proc
+        assert parent is not None
+        mgr.stop(reason="host_shutdown")
+        mgr.stop()
+        rows = [record_to_row(record, source="host") for record in caplog.records]
+        assert [row["event_name"] for row in rows] == [
+            "runner_zygote_ready",
+            "runner_zygote_stop_requested",
+            "runner_zygote_stop_finished",
+        ]
+        assert all(row["attributes"]["zygote_pid"] == str(parent.pid) for row in rows)
+        assert "zygote_exit_code" not in rows[1]["attributes"]
+        assert rows[-1]["attributes"]["stop_reason"] == "host_shutdown"
+        assert rows[-1]["attributes"]["zygote_exit_code"] == str(parent.returncode)
+        assert rows[-1]["attributes"]["kill_escalated"] == "False"
+        assert parent.returncode is not None
+    finally:
+        mgr.stop()
+
+
+def test_restart_diagnostics_preserve_original_parent_exit(tmp_path, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.host.runner_zygote")
+    mgr = ZygoteManager(log_path=tmp_path / "zygote.log")
+    try:
+        mgr.start()
+        parent = mgr._proc
+        assert parent is not None
+        parent.kill()
+        parent.wait(timeout=5)
+        mgr.start()
+        rows = [record_to_row(record, source="host") for record in caplog.records]
+        restarted = next(row for row in rows if row["event_name"] == "runner_zygote_restarting")
+        assert restarted["attributes"]["zygote_pid"] == str(parent.pid)
+        assert restarted["attributes"]["zygote_exit_code"] == str(-signal.SIGKILL)
+        assert rows[-1]["event_name"] == "runner_zygote_ready"
+        assert rows[-1]["attributes"]["zygote_pid"] == str(mgr.pid)
+        assert mgr.pid != parent.pid
+    finally:
+        mgr.stop()
     assert mgr.pid is None
 
 

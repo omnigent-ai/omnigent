@@ -2127,6 +2127,12 @@ class HostProcess:
                         "Forked runner via zygote (zygote pid=%s, runner pid=%s)",
                         zygote.pid,
                         proc.pid,
+                        extra=debug_event(
+                            "runner_zygote_runner_forked",
+                            telemetry_schema="runner_zygote.v1",
+                            zygote_pid=zygote.pid,
+                            runner_pid=proc.pid,
+                        ),
                     )
                     return proc, log_path
                 except ZygoteUnavailable as exc:
@@ -2157,7 +2163,7 @@ class HostProcess:
                             exc,
                         )
                         with contextlib.suppress(Exception):
-                            zygote.stop()
+                            zygote.stop(reason="parent_exited")
 
             with child_logging_popen_kwargs(env) as logging_kwargs:
                 proc = subprocess.Popen(
@@ -2446,7 +2452,13 @@ class HostProcess:
                 "runner_died",
                 session_id=handle.session_id,
                 stage="runner_process",
+                telemetry_schema="runner_zygote.v1",
                 runner_id=runner_id,
+                runner_pid=handle.proc.pid,
+                runner_exit_code=handle.proc.returncode,
+                runner_process_kind=(
+                    "zygote" if isinstance(handle.proc, ZygoteRunnerProc) else "direct"
+                ),
                 error_category=ErrorCategory.RUNNER.value,
                 error_impact=ErrorImpact.BLOCKING.value,
                 error_phase=ErrorPhase.UNKNOWN.value,
@@ -4263,7 +4275,7 @@ class HostProcess:
             # terminated above, and closing its control socket lets it exit.
             if self._zygote is not None:
                 with contextlib.suppress(Exception):
-                    self._zygote.stop()
+                    self._zygote.stop(reason="host_shutdown")
                 self._zygote = None
             # Release ownership only after runner termination. A replacement
             # daemon starts its cleanup after acquiring this lock, making the

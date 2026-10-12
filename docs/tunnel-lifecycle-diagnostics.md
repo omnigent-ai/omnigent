@@ -7,6 +7,32 @@ sink as `event_name` plus string `attributes`; booleans appear as `True` or
 `False`. Deploy both the server and the runner before expecting the fields on
 both ends.
 
+## Host forkserver events (`source = 'host'`)
+
+`telemetry_schema = runner_zygote.v1` identifies hosts with forkserver
+diagnostics. `runner_zygote_ready` records the parent PID after its startup ping;
+`runner_zygote_runner_forked` links that `zygote_pid` to each `runner_pid`.
+`runner_died` includes the child PID, exit code, and process kind (`zygote` or
+`direct`). Correlate PIDs on the same host and within the same process lifetime.
+Runner code `254` means its real exit status was unavailable; inspect the
+parent's observed exit code and liveness to investigate why status was lost.
+
+`runner_zygote_control_failed` records the first failed exchange in a continuous
+failure streak: bounded `operation` and `failure_kind`, exception type, errno,
+elapsed seconds, parent PID, observed parent exit code/liveness, and the child
+PID for a poll. Healthy polls add no events. A successful exchange emits one
+`runner_zygote_control_recovered` and resets the streak. Request environments,
+command arguments, paths, and raw replies are excluded from these diagnostic
+fields.
+
+`runner_zygote_stop_requested` and `runner_zygote_stop_finished` record
+`stop_reason` (`startup_failed`, `parent_exited`, `host_shutdown`, or `requested`),
+parent PID, and the observed exit code before/after stopping. The finished event
+also records `kill_escalated`. A missing final code means exit was not observed.
+`runner_zygote_restarting` retains the previous parent's exit code before a
+replacement starts. A signal exit identifies the signal, not its sender or
+whether the kernel killed the process for memory pressure.
+
 ## Runner events (`source = 'runner'`)
 
 - `runner_connected`: `connection_id`, `reconnect` (an earlier connection on

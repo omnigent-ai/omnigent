@@ -1618,6 +1618,7 @@ async def test_watch_runner_reports_unexpected_exit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     marker_state: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A runner that dies after launch is reported via host.runner_exited.
 
@@ -1692,6 +1693,13 @@ async def test_watch_runner_reports_unexpected_exit(
     expected = {"connected": True, "not_connected": False}.get(marker_state)
     assert report.had_connected is expected
     assert maintenance_reasons == ["runner_exited"]
+    failure = next(
+        record for record in caplog.records if getattr(record, "event_name", None) == "runner_died"
+    )
+    assert failure.attributes["telemetry_schema"] == "runner_zygote.v1"
+    assert failure.attributes["runner_pid"] == handle.proc.pid
+    assert failure.attributes["runner_exit_code"] == 3
+    assert failure.attributes["runner_process_kind"] == "direct"
 
 
 def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
@@ -6793,6 +6801,7 @@ class _FakeZygote:
         self._running = running
         self.start_calls = 0
         self.stop_calls = 0
+        self.stop_reason: str | None = None
 
     @property
     def pid(self) -> int:
@@ -6814,8 +6823,9 @@ class _FakeZygote:
         del env, log_path, workspace
         raise ZygoteUnavailable("scripted fork failure")
 
-    def stop(self) -> None:
+    def stop(self, *, reason: str = "requested") -> None:
         """Record the reap."""
+        self.stop_reason = reason
         self.stop_calls += 1
 
 
@@ -6885,6 +6895,7 @@ def test_dead_zygote_is_reaped_and_respawnable(
 
     assert host._zygote_disabled is False
     assert zygote.stop_calls == 1
+    assert zygote.stop_reason == "parent_exited"
     # This launch still succeeded, via the direct-spawn fallback.
     assert len(popen_argvs) == 1
 

@@ -37,8 +37,9 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Literal
 
+from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.process_logging import child_logging_popen_kwargs
 from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR
@@ -48,6 +49,7 @@ logger = logging.getLogger(__name__)
 # Bound each control round-trip so a wedged zygote can never hang the daemon;
 # fork + reply is sub-millisecond locally, so this is purely a safety net.
 _CONTROL_TIMEOUT_S = 30.0
+_ZYGOTE_TELEMETRY_SCHEMA = "runner_zygote.v1"
 
 # Reported for a forked runner whose real exit code can no longer be recovered
 # because the zygote (its OS parent, the only process that could waitpid it)
@@ -62,6 +64,15 @@ class ZygoteUnavailable(RuntimeError):
 
     The daemon catches this and falls back to a direct ``Popen`` launch.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: Literal["unavailable", "not_running", "eof", "invalid_reply"] = "unavailable",
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class ZygoteRunnerProc:
@@ -149,6 +160,7 @@ class ZygoteManager:
         self._proc: subprocess.Popen[bytes] | None = None
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
+        self._control_failure_logged = False
 
     @property
     def pid(self) -> int | None:
@@ -182,6 +194,16 @@ class ZygoteManager:
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 return
+            if self._proc is not None:
+                logger.info(
+                    "Replacing exited runner zygote",
+                    extra=debug_event(
+                        "runner_zygote_restarting",
+                        telemetry_schema=_ZYGOTE_TELEMETRY_SCHEMA,
+                        zygote_pid=self._proc.pid,
+                        zygote_exit_code=self._proc.returncode,
+                    ),
+                )
             parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 proc = self._spawn_zygote_process(child_sock.fileno())
@@ -194,6 +216,7 @@ class ZygoteManager:
             parent_sock.settimeout(_CONTROL_TIMEOUT_S)
             self._proc = proc
             self._sock = parent_sock
+            self._control_failure_logged = False
 
         # Confirm the zygote is answering before the caller relies on it. Any
         # failure here (bad pong, or the exchange itself raising on a timeout /
@@ -203,11 +226,19 @@ class ZygoteManager:
             reply = self._exchange({"cmd": "ping"})
             answered = bool(reply.get("pong"))
         except ZygoteUnavailable:
-            self.stop()
+            self.stop(reason="startup_failed")
             raise
         if not answered:
-            self.stop()
+            self.stop(reason="startup_failed")
             raise ZygoteUnavailable("runner zygote did not answer ping")
+        logger.info(
+            "Runner zygote ready",
+            extra=debug_event(
+                "runner_zygote_ready",
+                telemetry_schema=_ZYGOTE_TELEMETRY_SCHEMA,
+                zygote_pid=proc.pid,
+            ),
+        )
 
     def _spawn_zygote_process(self, child_fd: int) -> subprocess.Popen[bytes]:
         """Popen the zygote interpreter, handing it *child_fd* as its control fd.
@@ -298,29 +329,62 @@ class ZygoteManager:
         code = reply.get("returncode")
         return code if isinstance(code, int) else None
 
-    def stop(self) -> None:
+    def stop(
+        self,
+        *,
+        reason: Literal[
+            "requested", "startup_failed", "parent_exited", "host_shutdown"
+        ] = "requested",
+    ) -> None:
         """Terminate the zygote and close the control socket.
 
         Its forked runner children reparent and self-terminate via their orphan
         watchdog, so no runner is left stranded.
+
+        :param reason: The lifecycle operation requesting this stop.
         """
         with self._lock:
+            proc = self._proc
+            if proc is not None:
+                logger.info(
+                    "Runner zygote stop requested",
+                    extra=debug_event(
+                        "runner_zygote_stop_requested",
+                        telemetry_schema=_ZYGOTE_TELEMETRY_SCHEMA,
+                        zygote_pid=proc.pid,
+                        stop_reason=reason,
+                        zygote_exit_code=proc.poll(),
+                    ),
+                )
             if self._sock is not None:
                 try:
                     self._sock.close()
                 finally:
                     self._sock = None
             if self._proc is not None:
+                kill_escalated = False
                 if self._proc.poll() is None:
                     self._proc.terminate()
                     try:
                         self._proc.wait(timeout=5.0)
                     except subprocess.TimeoutExpired:
+                        kill_escalated = True
                         self._proc.kill()
                         # Reap after SIGKILL so the zygote doesn't linger as a
                         # zombie until the daemon exits / the Popen is GC'd.
                         with contextlib.suppress(subprocess.TimeoutExpired):
                             self._proc.wait(timeout=5.0)
+                logger.info(
+                    "Runner zygote stop finished",
+                    extra=debug_event(
+                        "runner_zygote_stop_finished",
+                        telemetry_schema=_ZYGOTE_TELEMETRY_SCHEMA,
+                        zygote_pid=self._proc.pid,
+                        stop_reason=reason,
+                        zygote_exit_code=self._proc.returncode,
+                        kill_escalated=kill_escalated,
+                    ),
+                )
                 self._proc = None
 
     def _exchange(self, request: dict[str, object]) -> dict[str, object]:
@@ -333,12 +397,75 @@ class ZygoteManager:
         with self._lock:
             sock = self._sock
             if sock is None:
-                raise ZygoteUnavailable("runner zygote is not running")
+                raise ZygoteUnavailable("runner zygote is not running", reason="not_running")
+            started = time.monotonic()
             try:
                 sock.sendall(json.dumps(request).encode("utf-8") + b"\n")
-                return self._read_reply(sock)
+                reply = self._read_reply(sock)
+            except ZygoteUnavailable as exc:
+                self._log_control_failure(request, exc, started)
+                raise
             except (OSError, ValueError) as exc:
+                self._log_control_failure(request, exc, started)
                 raise ZygoteUnavailable(f"runner zygote control error: {exc}") from exc
+            if self._control_failure_logged:
+                logger.info(
+                    "Runner zygote control channel recovered",
+                    extra=debug_event(
+                        "runner_zygote_control_recovered",
+                        telemetry_schema=_ZYGOTE_TELEMETRY_SCHEMA,
+                        zygote_pid=self.pid,
+                    ),
+                )
+                self._control_failure_logged = False
+            return reply
+
+    def _log_control_failure(
+        self, request: dict[str, object], exc: Exception, started: float
+    ) -> None:
+        """Record the first failed exchange, excluding request and reply contents."""
+        if self._control_failure_logged:
+            return
+        self._control_failure_logged = True
+        operation = request.get("cmd")
+        if operation not in ("ping", "fork", "poll"):
+            operation = "unknown"
+        if isinstance(exc, ZygoteUnavailable):
+            failure_kind = exc.reason
+        elif isinstance(exc, TimeoutError):
+            failure_kind = "timeout"
+        elif isinstance(exc, ValueError):
+            failure_kind = "invalid_reply"
+        else:
+            failure_kind = "socket_error"
+        proc = self._proc
+        exit_code = None
+        running = None
+        if proc is not None:
+            try:
+                exit_code = proc.poll()
+                running = exit_code is None
+            except OSError:
+                pass  # Diagnostics must not replace the original control error.
+        runner_pid = request.get("pid") if operation == "poll" else None
+        if not isinstance(runner_pid, int):
+            runner_pid = None
+        logger.warning(
+            "Runner zygote control exchange failed",
+            extra=debug_event(
+                "runner_zygote_control_failed",
+                telemetry_schema=_ZYGOTE_TELEMETRY_SCHEMA,
+                operation=operation,
+                failure_kind=failure_kind,
+                exception_type=type(exc).__name__,
+                errno=exc.errno if isinstance(exc, OSError) else None,
+                elapsed_s=round(time.monotonic() - started, 3),
+                zygote_pid=proc.pid if proc is not None else None,
+                zygote_exit_code=exit_code,
+                zygote_running=running,
+                runner_pid=runner_pid,
+            ),
+        )
 
     @staticmethod
     def _read_reply(sock: socket.socket) -> dict[str, object]:
@@ -353,10 +480,12 @@ class ZygoteManager:
         while b"\n" not in buf:
             chunk = sock.recv(4096)
             if not chunk:
-                raise ZygoteUnavailable("runner zygote closed the control socket")
+                raise ZygoteUnavailable("runner zygote closed the control socket", reason="eof")
             buf.extend(chunk)
         line, _, _ = bytes(buf).partition(b"\n")
         decoded = json.loads(line)
         if not isinstance(decoded, dict):
-            raise ZygoteUnavailable(f"runner zygote sent a non-object reply: {decoded!r}")
+            raise ZygoteUnavailable(
+                f"runner zygote sent a non-object reply: {decoded!r}", reason="invalid_reply"
+            )
         return decoded
