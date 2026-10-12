@@ -3442,7 +3442,9 @@ def create_app(
         A runner confirmed live on another replica (via
         :func:`_runner_live_on_another_replica_from_conversations`) skips it too: that
         replica's tunnel is authoritative now, and this one's registry
-        only ever knew about its own connections.
+        only ever knew about its own connections. A runner whose tunnel this
+        server retired waits out :data:`RUNNER_REHOME_GRACE_S` before that
+        check, since it is reconnecting to another replica.
 
         :param runner_id: The disconnected runner's id.
         :param reference_stamp: This replica's own last liveness stamp for
@@ -3452,18 +3454,20 @@ def create_app(
         """
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
+            RUNNER_REHOME_GRACE_S,
             _mark_runner_sessions_offline,
             _relinquish_session_live_state,
             _runner_live_on_another_replica_from_conversations,
         )
         from omnigent.server.schemas import ErrorDetail
 
-        # Event-driven: `register` resolves the wait the instant the runner
-        # reconnects here. A non-positive grace collapses to an immediate
-        # registry check, matching the sleep(0) behavior tests pin.
-        reconnected = await tunnel_registry.wait_for_runner(
-            runner_id, timeout_s=RUNNER_DISCONNECT_GRACE_S
+        # Wake immediately on a local reconnect. Server-retired tunnels get a
+        # bounded handoff window; ordinary drops keep the usual grace.
+        grace_s = max(
+            RUNNER_DISCONNECT_GRACE_S,
+            tunnel_registry.retire_window_remaining(runner_id, RUNNER_REHOME_GRACE_S),
         )
+        reconnected = await tunnel_registry.wait_for_runner(runner_id, timeout_s=grace_s)
         if shutdown_state.server_shutting_down():
             _logger.info(
                 "Runner %s dropped because this server is shutting down; skipping offline-marking",

@@ -247,6 +247,9 @@ class TunnelRegistry:
         if max_connect_waiters_total < 1:
             raise ValueError("max_connect_waiters_total must be at least 1")
         self._sessions: dict[str, RunnerSession] = {}
+        # Monotonic time this server retired each runner's live tunnel and asked
+        # it to reconnect; cleared when that runner registers here again.
+        self._retired_at: dict[str, float] = {}
         self._connect_waits: dict[str, RunnerConnectWaitState] = {}
         self._max_connect_waiters_per_runner = max_connect_waiters_per_runner
         self._max_connect_waiters_total = max_connect_waiters_total
@@ -303,6 +306,7 @@ class TunnelRegistry:
                     ),
                 )
             self._sessions[runner_id] = session
+            self._retired_at.pop(runner_id, None)
             wait_state = self._connect_waits.pop(runner_id, None)
             if wait_state is not None:
                 self._connect_waiter_total -= len(wait_state.waiters)
@@ -317,13 +321,17 @@ class TunnelRegistry:
         self,
         runner_id: str,
         session: RunnerSession | None = None,
+        *,
+        retire: bool = True,
     ) -> RunnerSession | None:
         """Remove a session and abort all its in-flight requests.
 
         Called by the WS route handler when the tunnel closes for
-        any reason (clean shutdown, network error, etc.). The abort
-        ensures awaiters of in-flight requests don't hang — they
-        get a ConnectionError and propagate it up.
+        any reason (clean shutdown, network error, etc.), and by
+        server-side callers that retire a live tunnel so the runner
+        reconnects elsewhere (a replica re-home). The abort ensures
+        awaiters of in-flight requests don't hang — they get a
+        ConnectionError and propagate it up.
 
         :param runner_id: Runner id to remove, e.g.
             ``"runner_0123456789abcdef"``.
@@ -331,6 +339,10 @@ class TunnelRegistry:
             deregistration only removes the registry entry if the
             current entry is this exact session object. This prevents
             stale route handlers from deleting a newer tunnel.
+        :param retire: ``True`` when this server retires a live tunnel
+            and expects the runner to reconnect, which
+            :meth:`retire_window_remaining` reports. The tunnel route
+            passes ``False`` for its own cleanup after the socket closed.
         :returns: The removed session, or ``None`` when the runner is
             already offline or the guard did not match.
         """
@@ -340,6 +352,8 @@ class TunnelRegistry:
                 return None
             removed = self._sessions.pop(runner_id)
             self.record_close(removed, code=1001, reason="tunnel retired by server; reconnect")
+            if retire:
+                self._retired_at[runner_id] = time.monotonic()
             in_flight_count = len(removed.in_flight)
             if in_flight_count:
                 _logger.warning(
@@ -365,6 +379,27 @@ class TunnelRegistry:
         # "this server is shutting down".
         _retire_session_writer(removed, code=1001, reason="tunnel retired by server; reconnect")
         return removed
+
+    def retire_window_remaining(self, runner_id: str, window_s: float) -> float:
+        """Return how long a runner this server retired still has to reconnect.
+
+        A runner whose tunnel this server closed on purpose usually reconnects
+        to another replica, which can take longer than an ordinary drop's
+        grace while that replica is busy, e.g. mid-rollout.
+
+        :param runner_id: Runner id, e.g. ``"runner_0123456789abcdef"``.
+        :param window_s: Reconnect window measured from the retirement,
+            e.g. ``180.0``.
+        :returns: Seconds left in the window, or ``0.0`` when this server
+            did not retire the runner's tunnel or the window has passed.
+        """
+        now = time.monotonic()
+        with self._lock:
+            # Prune here: a runner that re-homed for good never re-registers.
+            for expired in [rid for rid, at in self._retired_at.items() if now - at >= window_s]:
+                del self._retired_at[expired]
+            retired_at = self._retired_at.get(runner_id)
+        return 0.0 if retired_at is None else retired_at + window_s - now
 
     def record_close(self, session: RunnerSession, *, code: int, reason: str) -> None:
         """Retain the first server-requested close for one connection.

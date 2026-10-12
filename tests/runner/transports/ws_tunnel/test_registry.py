@@ -15,9 +15,11 @@ import math
 import threading
 import time
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 
+from omnigent.runner.transports.ws_tunnel import registry as registry_module
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     ResponseBodyFrame,
@@ -318,6 +320,66 @@ async def test_stale_deregister_does_not_remove_newest_session() -> None:
 
     assert reg.deregister("r1", new_session) is new_session
     assert reg.get("r1") is None
+
+
+@pytest.mark.asyncio
+async def test_server_retire_opens_reconnect_window() -> None:
+    """A server-side deregister of a live tunnel (a replica re-home) opens the window.
+
+    The guarded call shape is how a rehoming watcher retires a runner.
+    """
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+
+    assert reg.deregister("r1", session) is session
+
+    remaining = reg.retire_window_remaining("r1", 180.0)
+    assert 179.0 < remaining <= 180.0
+
+
+@pytest.mark.asyncio
+async def test_route_cleanup_deregister_opens_no_reconnect_window() -> None:
+    """The tunnel route's own cleanup after the socket closed is not a retirement."""
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+
+    assert reg.deregister("r1", session, retire=False) is session
+
+    assert reg.retire_window_remaining("r1", 180.0) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_reconnect_window_closes_on_register_and_skips_noop_deregister() -> None:
+    """Re-registering here closes the window; deregistering an absent runner opens none."""
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _hello())
+    reg.deregister("r1")
+
+    current = reg.register("r1", _NoopWS(), _hello())
+
+    assert reg.deregister("r1", old) is None
+    assert reg.get("r1") is current
+    assert reg.retire_window_remaining("r1", 180.0) == 0.0
+    assert reg.deregister("ghost") is None
+    assert reg.retire_window_remaining("ghost", 180.0) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_reconnect_window_expires_and_prunes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Past the window the runner reads as not retired, and its record is pruned."""
+    clock = SimpleNamespace(now=1000.0, time=time.time)
+    clock.monotonic = lambda: clock.now
+    monkeypatch.setattr(registry_module, "time", clock)
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    reg.deregister("r1")
+
+    clock.now += 179.0
+    assert reg.retire_window_remaining("r1", 180.0) == pytest.approx(1.0)
+    clock.now += 1.0
+    assert reg.retire_window_remaining("other", 180.0) == 0.0
+
+    assert reg._retired_at == {}
 
 
 @pytest.mark.asyncio

@@ -682,7 +682,7 @@ def create_runner_tunnel_router(
                 task.cancel()
             await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
-                registry.deregister(runner_id, session)
+                registry.deregister(runner_id, session, retire=False)
                 if on_runner_disconnect is not None:
                     try:
                         await on_runner_disconnect(runner_id, session)

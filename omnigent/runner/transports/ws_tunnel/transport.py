@@ -129,6 +129,15 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             await self._registry.wait_for_runner(self._runner_id, timeout_s=timeout_s) is not None
         )
 
+    def retire_window_remaining(self, window_s: float) -> float:
+        """
+        Return how long this runner still has to reconnect after this server retired it.
+
+        :param window_s: Reconnect window measured from the retirement, e.g. ``180.0``.
+        :returns: Seconds left, or ``0.0`` when the tunnel was not retired by this server.
+        """
+        return self._registry.retire_window_remaining(self._runner_id, window_s)
+
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         session = self._registry.get(self._runner_id)
         if session is None:
