@@ -1110,24 +1110,6 @@ async def test_ws_tunnel_rejects_non_hello_first_frame(app: FastAPI) -> None:
         await communicator.wait(timeout=budget(1.0))
 
 
-async def _await_close(
-    communicator: ApplicationCommunicator, *, timeout: float
-) -> dict[str, object]:
-    """Return the first ``websocket.close`` the route sends within ``timeout`` seconds."""
-    deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        try:
-            message = await communicator.receive_output(timeout=max(remaining, 0.0))
-        except asyncio.TimeoutError:
-            pytest.fail(
-                f"runner tunnel was still open {timeout:.0f}s after accept without a "
-                "hello frame; expected the server to close it"
-            )
-        if message["type"] == "websocket.close":
-            return message
-
-
 async def test_ws_tunnel_closes_silent_peer_within_handshake_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1136,7 +1118,7 @@ async def test_ws_tunnel_closes_silent_peer_within_handshake_bound(
     route_app = _tunnel_route_app()
     communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
     try:
-        close = await _await_close(communicator, timeout=budget(5.0))
+        close = await communicator.receive_output(timeout=budget(5.0))
         assert close == {"type": "websocket.close", "code": 1013, "reason": "hello timeout"}
         assert route_app.registry.get(_RUNNER_ID) is None
         await asyncio.wait_for(communicator.future, budget(1.0))

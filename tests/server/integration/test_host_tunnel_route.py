@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import logging
 import threading
-import time
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
@@ -766,24 +765,6 @@ async def test_host_tunnel_rejects_non_hello_first_frame(
     assert close.get("code") == 4001
 
 
-async def _await_close(
-    communicator: ApplicationCommunicator, *, timeout: float
-) -> dict[str, object]:
-    """Return the first ``websocket.close`` the route sends within ``timeout`` seconds."""
-    deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        try:
-            message = await communicator.receive_output(timeout=max(remaining, 0.0))
-        except asyncio.TimeoutError:
-            pytest.fail(
-                f"host tunnel was still open {timeout:.0f}s after accept without a "
-                "host.hello frame; expected the server to close it"
-            )
-        if message["type"] == "websocket.close":
-            return message
-
-
 async def test_host_tunnel_closes_silent_peer_within_handshake_bound(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     monkeypatch: pytest.MonkeyPatch,
@@ -793,7 +774,8 @@ async def test_host_tunnel_closes_silent_peer_within_handshake_bound(
     app, registry, store = host_app
     comm = await _connect_route(app, _TUNNEL_PATH)
     try:
-        close = await _await_close(comm, timeout=budget(5.0))
+        close = await comm.receive_output(timeout=budget(5.0))
+        assert close["type"] == "websocket.close"
         assert close.get("code") == 1013
         assert registry.get(_HOST_ID) is None
         assert await asyncio.to_thread(store.get_host, _HOST_ID) is None

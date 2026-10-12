@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import logging
 import time
-import uuid
 from typing import Literal
 
 from starlette.websockets import WebSocket
@@ -29,19 +28,19 @@ async def receive_tunnel_hello(
     except TimeoutError:
         if not deadline.expired():
             raise
+        _logger.warning(
+            "%s tunnel did not send its hello within %.0fs",
+            peer_kind,
+            HELLO_TIMEOUT_S,
+            extra=debug_event(
+                "tunnel_hello_timeout",
+                peer_kind=peer_kind,
+                peer_id=peer_id,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+                timeout_s=HELLO_TIMEOUT_S,
+            ),
+        )
+        # The peer may drop at the same moment; a failed close has nothing left to report.
         with contextlib.suppress(Exception):
-            _logger.warning(
-                "%s tunnel did not send its hello within %.0fs",
-                peer_kind,
-                HELLO_TIMEOUT_S,
-                extra=debug_event(
-                    "tunnel_hello_timeout",
-                    peer_kind=peer_kind,
-                    peer_id=peer_id,
-                    handshake_id=uuid.uuid4().hex,
-                    elapsed_ms=round((time.monotonic() - started) * 1000),
-                    timeout_s=HELLO_TIMEOUT_S,
-                ),
-            )
-        await ws.close(code=1013, reason="hello timeout")
+            await ws.close(code=1013, reason="hello timeout")
         return None

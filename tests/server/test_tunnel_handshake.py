@@ -49,7 +49,9 @@ async def test_timeout_cancels_owned_receive_and_closes(
     assert len(rows) == 1
     assert rows[0].attributes["peer_kind"] == kind
     assert rows[0].attributes["peer_id"] == "synthetic-peer"
-    assert rows[0].attributes["handshake_id"]
+    assert rows[0].attributes["timeout_s"] == 0.01
+    elapsed_ms = rows[0].attributes["elapsed_ms"]
+    assert isinstance(elapsed_ms, int) and elapsed_ms >= 0
 
 
 @pytest.mark.asyncio
