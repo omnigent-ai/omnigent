@@ -135,6 +135,7 @@ import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/h
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
+  DropdownMenuLabel,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuRadioGroup,
@@ -219,6 +220,7 @@ import {
   writeSessionFilter,
 } from "@/lib/sessionFilterPreferences";
 import {
+  DEFAULT_SIDEBAR_VIEW,
   readSidebarViewPreferences,
   SIDEBAR_SHOW_FIELDS,
   type SidebarGrouping,
@@ -1708,21 +1710,24 @@ function ConversationList({
     () => new Map(hosts.map((host) => [host.host_id, host] as const)),
     [hosts],
   );
-  // Grouping / ordering / show options from the Sessions filter menu, seeded
-  // from the persisted per-device preference.
-  const [view, setView] = useState<SidebarViewPreferences>(readSidebarViewPreferences);
+  // Grouping / ordering / show options from the filter menu, seeded from the
+  // persisted per-device preference. With the release flag off the sidebar
+  // keeps its default layout and ignores any stored choice.
+  const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
+  const [storedView, setView] = useState<SidebarViewPreferences>(readSidebarViewPreferences);
+  const view = groupingUi ? storedView : DEFAULT_SIDEBAR_VIEW;
   const updateView = useCallback(
     (patch: Partial<SidebarViewPreferences>) => {
       // Regrouping swaps which sections (and selection scopes) exist, so leave
       // selection the way a Display switch does.
-      if (patch.grouping !== undefined && patch.grouping !== view.grouping && selectionMode) {
+      if (patch.grouping !== undefined && patch.grouping !== storedView.grouping && selectionMode) {
         onExitSelectionMode();
       }
-      const next = { ...view, ...patch };
+      const next = { ...storedView, ...patch };
       writeSidebarViewPreferences(next);
       setView(next);
     },
-    [view, selectionMode, onExitSelectionMode],
+    [storedView, selectionMode, onExitSelectionMode],
   );
   const grouped = view.grouping !== "default";
   const groupOrder: readonly string[] =
@@ -1935,8 +1940,10 @@ function ConversationList({
       view.ordering === "status"
         ? groupConversations(byUpdated, statusOf, STATUS_BUCKETS).flatMap((g) => g.conversations)
         : byUpdated;
-    const shared = allOrdered.filter((c) => !isOwnedByViewer(c, viewerId));
-    const ordered = allOrdered.filter((c) => isOwnedByViewer(c, viewerId));
+    const shared = groupingUi ? allOrdered.filter((c) => !isOwnedByViewer(c, viewerId)) : [];
+    const ordered = groupingUi
+      ? allOrdered.filter((c) => isOwnedByViewer(c, viewerId))
+      : allOrdered;
     if (!grouped) return { pinned, shared, sessions: ordered, projectGroups, groupTitles: null };
     // Buckets use render-time "now", so a day rollover shows on the next list update.
     const now = new Date();
@@ -1968,6 +1975,7 @@ function ConversationList({
     projects,
     activeTab,
     viewerId,
+    groupingUi,
     grouped,
     groupOrder,
     view.grouping,
@@ -2423,6 +2431,8 @@ function ConversationList({
     </p>
   ) : undefined;
   const showShared = activeTab === "shared";
+  // The Shared section replaces Sessions on the Shared filter (release-flagged).
+  const sharedListOnly = groupingUi && showShared;
   const emptyMessage = searchQuery ? "No matching conversations" : "No sessions";
 
   // List header controls and row props, shared by the Shared, single "Sessions"
@@ -2501,7 +2511,7 @@ function ConversationList({
       value={activeTab}
       onChange={onActiveTabChange}
       multiUser={multiUser}
-      view={view}
+      view={groupingUi ? view : null}
       onViewChange={updateView}
     />
   );
@@ -2652,7 +2662,7 @@ function ConversationList({
                     title="Projects"
                     collapsed={effectiveCollapsedSections.includes("Projects")}
                     onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                    persistentHeaderAction={sessionsFilterMenu}
+                    persistentHeaderAction={groupingUi ? sessionsFilterMenu : undefined}
                     afterHeader={
                       projectsSelecting ? (
                         <BulkActionBar
@@ -2751,22 +2761,22 @@ function ConversationList({
                   </SectionGroup>
                   {/* Other owners' sessions, above the viewer's own. On the Shared
                     filter it's the only list, so it takes the list controls. */}
-                  {(sections.shared.length > 0 || showShared) && (
+                  {(sections.shared.length > 0 || sharedListOnly) && (
                     <ConversationSection
                       title="Shared"
                       conversations={sections.shared}
                       emptyMessage={
-                        showShared && !sessionStatus ? SIDEBAR_FILTER_EMPTY.shared : undefined
+                        sharedListOnly && !sessionStatus ? SIDEBAR_FILTER_EMPTY.shared : undefined
                       }
-                      footer={showShared ? sessionStatus : undefined}
+                      footer={sharedListOnly ? sessionStatus : undefined}
                       collapsed={effectiveCollapsedSections.includes("Shared")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Shared")}
-                      afterHeader={showShared ? sessionsBulkBar : undefined}
-                      headerAction={showShared ? sessionsHeaderActions : undefined}
+                      afterHeader={sharedListOnly ? sessionsBulkBar : undefined}
+                      headerAction={sharedListOnly ? sessionsHeaderActions : undefined}
                       {...sessionRowProps}
                     />
                   )}
-                  {!showShared && (
+                  {!sharedListOnly && (
                     // Drop a session here to send it to the flat "Chats" list — where
                     // unfiled, unpinned sessions live. Active while dragging a filed
                     // session (removes it from its project) or a pinned one (unpins
@@ -2806,6 +2816,7 @@ function ConversationList({
                           onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
                           afterHeader={sessionsBulkBar}
                           headerAction={sessionsHeaderActions}
+                          persistentHeaderAction={groupingUi ? undefined : sessionsFilterMenu}
                           {...sessionRowProps}
                         />
                       )}
@@ -2819,7 +2830,7 @@ function ConversationList({
                   {/* Infinite-scroll sentinel. A new page can land in any group, so
               it hides only when every visible group is collapsed (a loader under
               a collapsed group reads orphaned). */}
-                  {!(showShared
+                  {!(sharedListOnly
                     ? effectiveCollapsedSections.includes("Shared")
                     : sessionGroups
                       ? sessionGroups.every((g) => effectiveCollapsedSections.includes(g.title))
@@ -3209,12 +3220,26 @@ function SessionFilterMenu({
   value: SidebarTab;
   onChange: (value: SidebarTab) => void;
   multiUser: boolean;
-  view: SidebarViewPreferences;
+  /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
+  view: SidebarViewPreferences | null;
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
 }) {
   const filters = multiUser
     ? SIDEBAR_FILTERS
     : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
+  const displayOptions = (
+    <DropdownMenuRadioGroup value={value} onValueChange={(next) => onChange(next as SidebarTab)}>
+      {filters.map((filter) => (
+        <DropdownMenuRadioItem
+          key={filter.value}
+          value={filter.value}
+          data-testid={`session-filter-${filter.value}`}
+        >
+          {filter.label}
+        </DropdownMenuRadioItem>
+      ))}
+    </DropdownMenuRadioGroup>
+  );
   return (
     <DropdownMenu>
       <Tooltip disableHoverableContent>
@@ -3240,89 +3265,84 @@ function SessionFilterMenu({
           Filter sessions
         </TooltipContent>
       </Tooltip>
-      <DropdownMenuContent align="end" className="min-w-56">
-        <FilterMenuSub
-          label="Grouping"
-          value={GROUPING_LABELS[view.grouping]}
-          testId="session-grouping-menu"
-        >
-          <DropdownMenuRadioGroup
-            value={view.grouping}
-            onValueChange={(next) => onViewChange({ grouping: next as SidebarGrouping })}
+      {view === null ? (
+        // Remove with the sidebar_grouping_ui flag (review by 0.19.0).
+        <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
+          <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
+          {displayOptions}
+        </DropdownMenuContent>
+      ) : (
+        <DropdownMenuContent align="end" className="min-w-56">
+          <FilterMenuSub
+            label="Grouping"
+            value={GROUPING_LABELS[view.grouping]}
+            testId="session-grouping-menu"
           >
-            {Object.entries(GROUPING_LABELS).map(([grouping, label]) => (
-              <DropdownMenuRadioItem
-                key={grouping}
-                value={grouping}
-                data-testid={`session-grouping-${grouping}`}
-              >
-                {label}
-              </DropdownMenuRadioItem>
-            ))}
-          </DropdownMenuRadioGroup>
-        </FilterMenuSub>
-        <FilterMenuSub
-          label="Display"
-          value={filters.find((filter) => filter.value === value)?.label}
-          testId="session-display-menu"
-        >
-          <DropdownMenuRadioGroup
-            value={value}
-            onValueChange={(next) => onChange(next as SidebarTab)}
-          >
-            {filters.map((filter) => (
-              <DropdownMenuRadioItem
-                key={filter.value}
-                value={filter.value}
-                data-testid={`session-filter-${filter.value}`}
-              >
-                {filter.label}
-              </DropdownMenuRadioItem>
-            ))}
-          </DropdownMenuRadioGroup>
-        </FilterMenuSub>
-        <FilterMenuSub
-          label="Ordering"
-          value={ORDERING_LABELS[view.ordering]}
-          testId="session-ordering-menu"
-        >
-          <DropdownMenuRadioGroup
-            value={view.ordering}
-            onValueChange={(next) => onViewChange({ ordering: next as SidebarOrdering })}
-          >
-            {Object.entries(ORDERING_LABELS).map(([ordering, label]) => (
-              <DropdownMenuRadioItem
-                key={ordering}
-                value={ordering}
-                data-testid={`session-ordering-${ordering}`}
-              >
-                {label}
-              </DropdownMenuRadioItem>
-            ))}
-          </DropdownMenuRadioGroup>
-        </FilterMenuSub>
-        <DropdownMenuSeparator />
-        <FilterMenuSub label="Show" testId="session-show-menu">
-          {SIDEBAR_SHOW_FIELDS.map((field) => (
-            <DropdownMenuCheckboxItem
-              key={field}
-              checked={view.show.includes(field)}
-              data-testid={`session-show-${field}`}
-              // Keep the menu open so several fields can be toggled in one go.
-              onSelect={(event) => event.preventDefault()}
-              onCheckedChange={(checked) =>
-                onViewChange({
-                  show: SIDEBAR_SHOW_FIELDS.filter((f) =>
-                    f === field ? checked : view.show.includes(f),
-                  ),
-                })
-              }
+            <DropdownMenuRadioGroup
+              value={view.grouping}
+              onValueChange={(next) => onViewChange({ grouping: next as SidebarGrouping })}
             >
-              {SHOW_LABELS[field]}
-            </DropdownMenuCheckboxItem>
-          ))}
-        </FilterMenuSub>
-      </DropdownMenuContent>
+              {Object.entries(GROUPING_LABELS).map(([grouping, label]) => (
+                <DropdownMenuRadioItem
+                  key={grouping}
+                  value={grouping}
+                  data-testid={`session-grouping-${grouping}`}
+                >
+                  {label}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </FilterMenuSub>
+          <FilterMenuSub
+            label="Display"
+            value={filters.find((filter) => filter.value === value)?.label}
+            testId="session-display-menu"
+          >
+            {displayOptions}
+          </FilterMenuSub>
+          <FilterMenuSub
+            label="Ordering"
+            value={ORDERING_LABELS[view.ordering]}
+            testId="session-ordering-menu"
+          >
+            <DropdownMenuRadioGroup
+              value={view.ordering}
+              onValueChange={(next) => onViewChange({ ordering: next as SidebarOrdering })}
+            >
+              {Object.entries(ORDERING_LABELS).map(([ordering, label]) => (
+                <DropdownMenuRadioItem
+                  key={ordering}
+                  value={ordering}
+                  data-testid={`session-ordering-${ordering}`}
+                >
+                  {label}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </FilterMenuSub>
+          <DropdownMenuSeparator />
+          <FilterMenuSub label="Show" testId="session-show-menu">
+            {SIDEBAR_SHOW_FIELDS.map((field) => (
+              <DropdownMenuCheckboxItem
+                key={field}
+                checked={view.show.includes(field)}
+                data-testid={`session-show-${field}`}
+                // Keep the menu open so several fields can be toggled in one go.
+                onSelect={(event) => event.preventDefault()}
+                onCheckedChange={(checked) =>
+                  onViewChange({
+                    show: SIDEBAR_SHOW_FIELDS.filter((f) =>
+                      f === field ? checked : view.show.includes(f),
+                    ),
+                  })
+                }
+              >
+                {SHOW_LABELS[field]}
+              </DropdownMenuCheckboxItem>
+            ))}
+          </FilterMenuSub>
+        </DropdownMenuContent>
+      )}
     </DropdownMenu>
   );
 }
@@ -3464,11 +3484,20 @@ function SectionGroup({
           collapsed={collapsed}
           onToggleCollapsed={onToggleCollapsed}
         />
-        <div
-          data-header-controls
-          className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5"
-        >
-          {headerAction && (
+        {persistentHeaderAction ? (
+          <div
+            data-header-controls
+            className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5"
+          >
+            {headerAction && (
+              <div className="flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100">
+                {headerAction}
+              </div>
+            )}
+            {persistentHeaderAction}
+          </div>
+        ) : (
+          headerAction && (
             // Always visible (and hit-testable) except on md+ displays with a
             // fine, hover-capable primary pointer — phones, touch tablets and
             // coarse-pointer convertibles have no reliable hover, and the "New
@@ -3478,12 +3507,14 @@ function SectionGroup({
             // clicking the button with the mouse doesn't leave it stuck visible:
             // React reuses the same node when it swaps expand↔revert, so the
             // clicked button keeps focus afterward.
-            <div className="flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100">
+            <div
+              data-header-controls
+              className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100"
+            >
               {headerAction}
             </div>
-          )}
-          {persistentHeaderAction}
-        </div>
+          )
+        )}
       </div>
       {afterHeader}
       {!collapsed && <div className="flex flex-col gap-px pt-1">{children}</div>}
@@ -4122,6 +4153,17 @@ function sessionRepoName(conversation: Conversation): string | null {
   return workspace ? deriveRepoName(workspace.split("#")[0]!) : null;
 }
 
+// Its own component so only rows showing Environment subscribe to the desktop host id.
+function SessionEnvironmentLabel({
+  conversation,
+  hostsById,
+}: {
+  conversation: Conversation;
+  hostsById: ReadonlyMap<string, Host>;
+}) {
+  return sessionEnvironmentLabel(conversation, hostsById, useDesktopHostId());
+}
+
 // Its own component so only rows showing the timestamp subscribe to the shared clock.
 function SessionUpdatedLabel({ updatedAt }: { updatedAt: number }) {
   const now = useNow();
@@ -4134,23 +4176,22 @@ function SessionMetaLine({
   repo,
   branch,
 }: {
-  environment: string | null;
+  environment: ReactNode;
   repo: string | null;
   branch: string | null;
 }) {
-  const parts: { icon: LucideIcon; value: string }[] = [
-    environment !== null && { icon: LaptopIcon, value: environment },
-    repo !== null && { icon: FolderGit2Icon, value: repo },
-    branch !== null && { icon: GitBranchIcon, value: branch },
-  ].filter((p): p is { icon: LucideIcon; value: string } => p !== false);
+  const parts: { key: string; icon: LucideIcon; value: ReactNode }[] = [];
+  if (environment != null) parts.push({ key: "environment", icon: LaptopIcon, value: environment });
+  if (repo !== null) parts.push({ key: "repo", icon: FolderGit2Icon, value: repo });
+  if (branch !== null) parts.push({ key: "branch", icon: GitBranchIcon, value: branch });
   if (parts.length === 0) return null;
   return (
     <span
       data-testid="session-row-meta"
       className="flex w-full min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
     >
-      {parts.map(({ icon: Icon, value }, i) => (
-        <Fragment key={value}>
+      {parts.map(({ key, icon: Icon, value }, i) => (
+        <Fragment key={key}>
           {i > 0 && <span aria-hidden>·</span>}
           <span className="flex min-w-0 items-center gap-1">
             <Icon aria-hidden className="size-3.5 shrink-0" />
@@ -4257,6 +4298,55 @@ const TOOLTIP_COLOR_ICONS: Partial<
   Record<NativeCodingAgentIconKind, ComponentType<{ size?: number; className?: string }>>
 > = { antigravity: AntigravityColor, devin: DevinColor, kiro: KiroColor };
 
+// The tooltip before the sidebar_grouping_ui release flag; remove with the flag
+// (review by 0.19.0).
+function LegacySessionTooltipContent({
+  conversation,
+  hostsById,
+  hasError,
+}: {
+  conversation: Conversation;
+  hostsById: ReadonlyMap<string, Host>;
+  hasError: boolean;
+}) {
+  return (
+    <TooltipContent
+      side="right"
+      align="start"
+      sideOffset={8}
+      data-testid="session-tooltip-content"
+      // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
+      // then muted, small-icon metadata lines.
+      className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+    >
+      <p className="sidebar-compact-text line-clamp-3 font-medium">
+        {conversation.title ?? conversation.id}
+        <span className="font-normal text-muted-foreground">
+          {" · "}
+          {relativeTime(conversation.updated_at * 1000)}
+        </span>
+      </p>
+      <p
+        data-testid="session-tooltip-location"
+        className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+      >
+        <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
+        <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
+      </p>
+      {conversation.git_branch && (
+        <p
+          data-testid="session-tooltip-branch"
+          className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+        >
+          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+          <span className="truncate">{conversation.git_branch}</span>
+        </p>
+      )}
+      {hasError && <SessionErrorHint />}
+    </TooltipContent>
+  );
+}
+
 function SessionTooltipContent({
   conversation,
   hostsById,
@@ -4266,6 +4356,16 @@ function SessionTooltipContent({
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
 }) {
+  const serverInfo = useContext(ServerInfoContext);
+  if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
+    return (
+      <LegacySessionTooltipContent
+        conversation={conversation}
+        hostsById={hostsById}
+        hasError={hasError}
+      />
+    );
+  }
   const nativeAgent = nativeCodingAgentForWrapper(conversation.labels?.[WRAPPER_LABEL_KEY]);
   const ColorIcon = nativeAgent ? TOOLTIP_COLOR_ICONS[nativeAgent.iconKind] : undefined;
   const harnessAgent = nativeAgent
@@ -4527,10 +4627,9 @@ function ConversationRowImpl({
   const show = useContext(SidebarShowContext);
   const showUpdated = show.includes("updated") && !hasSessionIndicator;
   const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator || showUpdated;
-  const desktopHostId = useDesktopHostId();
-  const metaEnvironment = show.includes("environment")
-    ? sessionEnvironmentLabel(conversation, hostsById, desktopHostId)
-    : null;
+  const metaEnvironment = show.includes("environment") ? (
+    <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
+  ) : null;
   const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
   const metaBranch = show.includes("branch") ? gitBranch : null;
   // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on

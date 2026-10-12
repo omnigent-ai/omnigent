@@ -72,7 +72,9 @@ the header menu), and each place is a separate entry point.
   (Default / Status / Updated), Display (All / My / Shared / Archived), Ordering
   (Updated / Status) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. Shared sessions get their own section above Sessions;
-  grouped views split the viewer's unfiled sessions into titled groups.
+  grouped views split the viewer's unfiled sessions into titled groups. Behind
+  the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
+  a flat Display filter and the tooltip keeps its plain layout.
 
 ## How to get to it (user POV)
 
@@ -463,6 +465,9 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`view-options`:**
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_status_grouping_and_show_toggles_persist_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`
+  (both enable the flag by patching `GET /v1/info`). Unit tests in
+  `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
+  that the flag-off sidebar ignores stored view options.
 
 ## Gotchas
 

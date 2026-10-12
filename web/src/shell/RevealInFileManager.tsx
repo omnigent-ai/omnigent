@@ -45,8 +45,8 @@ function readLocalHostId() {
   });
 }
 
-function subscribeToHostId(listener: () => void) {
-  if (!watchingHost && isElectronShell()) {
+function watchHostId(shouldWatch: boolean, listener: () => void) {
+  if (!watchingHost && shouldWatch) {
     watchingHost = true;
     readLocalHostId();
     onHostStatusChanged(readLocalHostId);
@@ -57,13 +57,16 @@ function subscribeToHostId(listener: () => void) {
   };
 }
 
+const subscribeToHostId = (listener: () => void) => watchHostId(supportsFileReveal(), listener);
+const subscribeToDesktopHostId = (listener: () => void) => watchHostId(isElectronShell(), listener);
+
 /** This machine's host id from the desktop shell; null in a browser or before its first connect. */
 export function useDesktopHostId(): string | null {
-  return useSyncExternalStore(subscribeToHostId, () => localHostId);
+  return useSyncExternalStore(subscribeToDesktopHostId, () => localHostId);
 }
 
 function useLocalHostId(): string | null {
-  const hostId = useDesktopHostId();
+  const hostId = useSyncExternalStore(subscribeToHostId, () => localHostId);
   return supportsFileReveal() ? hostId : null;
 }
 

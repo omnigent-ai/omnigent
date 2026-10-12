@@ -240,7 +240,7 @@ def test_shared_session_stays_in_flat_list_on_project_name_collision(
     ownership-gated. The viewer owns a session filed under a project, and a
     DIFFERENT owner's session — shared with the viewer — carries the same
     project-name label. That collision must not pull the foreign session into
-    the viewer's folder (which would also drop it from the flat Shared list).
+    the viewer's folder (which would also drop it from the flat Sessions list).
     """
     server = multi_user_server
     uniq = uuid.uuid4().hex[:6]
@@ -264,7 +264,7 @@ def test_shared_session_stays_in_flat_list_on_project_name_collision(
         _set_filter(page, "all")
 
         # The folder exists (the owned session filed it), but the shared session
-        # is NOT filed away: it stays in the flat Shared list, not the folder.
+        # is NOT filed away: it stays in the flat Sessions list, not the folder.
         expect(page.get_by_role("button", name=project, exact=True)).to_be_visible(timeout=30_000)
-        expect(_section(page, "Shared").locator(f'a[href="/c/{shared}"]')).to_be_visible()
+        expect(_section(page, "Sessions").locator(f'a[href="/c/{shared}"]')).to_be_visible()
         expect(_row(page, shared)).to_be_visible()

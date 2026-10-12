@@ -1,4 +1,4 @@
-"""Sidebar view options (Grouping / Show) and the session tooltip's GitHub rows.
+"""Sidebar view options and the session tooltip's GitHub rows, with ``sidebar_grouping_ui`` on.
 
 The session list and GitHub resource are stubbed with ``page.route`` so the
 grouping is deterministic; everything else comes from the live server.
@@ -58,10 +58,23 @@ def _serve_sessions(route: Route) -> None:
     )
 
 
+def _enable_grouping_ui(page: Page) -> None:
+    """Advertise the ``sidebar_grouping_ui`` release flag on the live server's info."""
+
+    def serve_info(route: Route) -> None:
+        response = route.fetch()
+        info = response.json()
+        info["features"] = {**info.get("features", {}), "sidebar_grouping_ui": True}
+        route.fulfill(response=response, json=info)
+
+    page.route("**/v1/info", serve_info)
+
+
 @pytest.fixture
 def stubbed_sidebar(page: Page, request: pytest.FixtureRequest) -> str:
     """Open the home page with the stubbed session list; return the base URL."""
     base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
+    _enable_grouping_ui(page)
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", _serve_sessions)
     page.goto(base_url)
@@ -132,6 +145,7 @@ def test_tooltip_fetches_repo_and_pr_only_when_opened(
 
     # Register every route BEFORE navigating, so an eager fetch during mount is
     # counted — otherwise the empty-request assertion can't detect it.
+    _enable_grouping_ui(page)
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", _serve_sessions)
     page.route("**/v1/sessions/*/resources/github*", serve_github)
