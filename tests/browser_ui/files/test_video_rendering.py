@@ -181,9 +181,9 @@ def test_recording_action_navigation(
     scrolling = actions.get_by_role("button", name=re.compile("Recorded action 20:")).locator("..")
     assert scrolling.evaluate("el => el.scrollHeight > el.clientHeight")
     if width == 1600 and entry == "chat":
-        footer_box = player.locator("..").bounding_box()
-        assert footer_box is not None
-        assert abs(ab["height"] - footer_box["height"]) < 2
+        media_box = player.bounding_box()
+        assert media_box is not None
+        assert abs(ab["height"] - media_box["height"]) < 2
     else:
         assert scrolling.bounding_box()["height"] <= 288
     last = scrolling.get_by_role("button", name=re.compile("Recorded action 20:"))
@@ -200,12 +200,18 @@ def test_recording_action_navigation(
     )
     media = player.element_handle()
     assert media is not None
-    hide = actions.get_by_role("button", name="Hide recording actions", exact=True)
+    card = player.locator("../../..")
+    hide = card.get_by_role("button", name="Hide recording actions", exact=True)
+    assert not hide.evaluate("el => el.closest('[role=group]')")
+    toggle_box = hide.bounding_box()
+    header_offset = toggle_box["y"] - card.bounding_box()["y"]
     expect(hide).to_have_attribute("aria-expanded", "true")
     hide.focus()
     hide.press("Enter")
     expect(actions).not_to_be_visible()
-    show = player.locator("..").get_by_role("button", name="Show recording actions", exact=True)
+    show = card.get_by_role("button", name="Show recording actions", exact=True)
+    assert show.bounding_box()["x"] == toggle_box["x"]
+    assert abs(show.bounding_box()["y"] - card.bounding_box()["y"] - header_offset) < 1
     expect(show).to_be_focused()
     expect(show).to_have_attribute("aria-expanded", "false")
     if width == 1600 and entry == "chat":
@@ -221,6 +227,85 @@ def test_recording_action_navigation(
         "el => el.isConnected && el.paused && Math.abs(el.currentTime - 0.5) < 0.1"
     )
     assert len(reads) == 1, "Collapsing actions must not reload the recording"
+
+
+@pytest.mark.parametrize("width", [1600, 390])
+def test_recording_header_size_and_optional_controls(
+    page: Page, seeded_session: BrowserSession, recording: bytes, width: int
+) -> None:
+    """Shared controls stay aligned; optional chapters do not change card width."""
+    session = seeded_session
+    _seed_video(session, recording)
+    api = f"/v1/sessions/{session.session_id}/resources/environments/default"
+    content = "WEBVTT\n\n00:00.000 --> 00:01.000\nOpen the app\n"
+
+    def annotations(route: Route) -> None:
+        if "download=true" in route.request.url:
+            route.fulfill(
+                status=200,
+                content_type="text/vtt",
+                headers={"Content-Disposition": 'attachment; filename="demo.webm.chapters.vtt"'},
+                body=content,
+            )
+        else:
+            route.fulfill(
+                status=200,
+                json={"encoding": "utf-8", "content": content, "path": "demo.webm.chapters.vtt"},
+            )
+
+    session.contract.route(
+        f"{session.contract.base_url}{api}/filesystem/demo.webm.chapters.vtt*", annotations
+    )
+    session.contract.json(
+        f"{api}/filesystem/plain.webm.chapters.vtt", {"detail": "Not found"}, status=404
+    )
+    session.contract.route(
+        f"{session.contract.base_url}{api}/filesystem/plain.webm?*",
+        lambda route: route.fulfill(status=200, content_type="video/webm", body=recording),
+    )
+    session.contract.json(
+        f"{api}/filesystem",
+        {
+            "object": "list",
+            "has_more": False,
+            "data": [
+                {"path": f, "name": f, "type": "file", "bytes": len(recording)}
+                for f in ["demo.webm", "plain.webm"]
+            ],
+        },
+    )
+    _post_message(session, "[Annotated](demo.webm)\n\n[Plain](plain.webm)")
+    page.set_viewport_size({"width": width, "height": 1000})
+    page.goto(f"{session.contract.base_url}/c/{session.session_id}")
+    toggle = page.get_by_role("button", name="Hide recording actions", exact=True)
+    expect(toggle).to_be_visible()
+    annotated = page.get_by_role("button", name="Annotated", exact=True)
+    plain = page.get_by_role("button", name="Plain", exact=True)
+    acard, pcard = annotated.locator("../../.."), plain.locator("../../..")
+    assert acard.bounding_box()["width"] == pcard.bounding_box()["width"]
+    if width == 1600:
+        heading = acard.get_by_text("Recording actions", exact=True).bounding_box()
+        assert abs(heading["y"] - annotated.bounding_box()["y"]) < 1
+    toggle_box = toggle.bounding_box()
+    toggle.click()
+    show = acard.get_by_role("button", name="Show recording actions", exact=True)
+    assert show.bounding_box() == toggle_box
+    expect(
+        acard.get_by_role("button", name="Download recording actions: Annotated", exact=True)
+    ).to_be_visible()
+    expect(pcard.get_by_role("button", name="Download recording actions: Plain")).to_have_count(0)
+    for title in ["Annotated", "Plain"]:
+        page.get_by_role("button", name=f"Play video: {title}", exact=True).click()
+        _assert_playback(page, page.locator(f'video[aria-label="{title}"]'))
+    avideo, pvideo = acard.locator("video").bounding_box(), pcard.locator("video").bounding_box()
+    assert avideo["width"] == pvideo["width"]
+    assert avideo["height"] == pvideo["height"]
+    assert annotated.bounding_box()["y"] < avideo["y"]
+    assert plain.bounding_box()["y"] < pvideo["y"]
+    assert acard.evaluate("el => el.scrollWidth <= el.clientWidth")
+    show.click()
+    expect(acard.get_by_role("group", name="Recording actions: Annotated")).to_be_visible()
+    assert acard.bounding_box()["width"] == pcard.bounding_box()["width"]
 
 
 @pytest.mark.parametrize("truncated", [False, True])
@@ -268,10 +353,10 @@ def _assert_playback(page: Page, player: Locator) -> None:
 
 
 @pytest.mark.parametrize("width", [1600, 390])
-def test_chat_recording_label_stays_inside_footer(
+def test_chat_recording_label_stays_inside_header(
     page: Page, seeded_session: BrowserSession, recording: bytes, width: int
 ) -> None:
-    """The file action stays below the video at desktop and mobile widths."""
+    """The file action stays above the video at desktop and mobile widths."""
     session = seeded_session
     _seed_video(session, recording)
     _post_message(session, "[Screen recording](demo.webm)")
@@ -284,7 +369,7 @@ def test_chat_recording_label_stays_inside_footer(
     _assert_playback(page, video)
     video_box, label_box = video.bounding_box(), label.bounding_box()
     assert video_box is not None and label_box is not None
-    assert label_box["y"] >= video_box["y"] + video_box["height"]
+    assert label_box["y"] + label_box["height"] <= video_box["y"]
     assert label_box["x"] >= video_box["x"]
     assert label_box["x"] + label_box["width"] <= video_box["x"] + video_box["width"]
     label.focus()

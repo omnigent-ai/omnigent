@@ -83,6 +83,28 @@ describe("VideoPlayer", () => {
     );
   });
 
+  it("downloads the original optional WebVTT without fetching video bytes", async () => {
+    vi.mocked(useFileContent).mockReturnValue({
+      data: { encoding: "utf-8", content: "WEBVTT\n" },
+    } as ReturnType<typeof useFileContent>);
+    vi.mocked(parseVideoChapters).mockResolvedValue([{ time: 0, end: 5, title: "Open the app" }]);
+    vi.mocked(downloadWorkspaceFile).mockResolvedValueOnce();
+    render(<VideoPlayer {...props} />);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Download recording actions: Feature demo",
+      }),
+    );
+    expect(downloadWorkspaceFile).toHaveBeenCalledWith("sess_1", "demo.webm.chapters.vtt");
+    expect(fetchBlob).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Hide recording actions" }));
+    expect(
+      screen.getByRole("button", {
+        name: "Download recording actions: Feature demo",
+      }),
+    ).toBeVisible();
+  });
+
   it("leaves malformed or truncated annotations out of the player", () => {
     vi.mocked(useFileContent).mockReturnValue({
       data: {
@@ -96,7 +118,7 @@ describe("VideoPlayer", () => {
     expect(screen.getByRole("button", { name: "Play video: Feature demo" })).toBeVisible();
   });
 
-  it("opens the file from its footer label", () => {
+  it("opens the file from its header label", () => {
     const onOpenFile = vi.fn();
     render(<VideoPlayer {...props} onOpenFile={onOpenFile} />);
     const label = screen.getByRole("button", { name: "Feature demo" });

@@ -1,12 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import {
-  ChevronRightIcon,
-  ChevronUpIcon,
-  DownloadIcon,
-  ListVideoIcon,
-  PlayIcon,
-  VideoIcon,
-} from "lucide-react";
+import { ChevronRightIcon, DownloadIcon, ListVideoIcon, PlayIcon, VideoIcon } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import {
   downloadWorkspaceFile,
@@ -44,8 +37,6 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   const [wide, setWide] = useState(false);
   const [actionsOpen, setActionsOpen] = useState(true);
   const actionsId = useId();
-  const showActionsRef = useRef<HTMLButtonElement>(null);
-  const hideActionsRef = useRef<HTMLButtonElement>(null);
   const cardRef = useRef<HTMLSpanElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const pendingSeek = useRef<number | null>(null);
@@ -109,11 +100,97 @@ function VideoPlayerContent(props: VideoPlayerProps) {
     <span
       ref={cardRef}
       className={cn(
-        "my-2 inline-flex max-w-full flex-col overflow-hidden rounded-xl border border-border bg-card align-top text-sm text-foreground",
-        chapters.length ? "w-[64rem]" : "w-[36rem]",
+        "my-2 inline-flex w-[64rem] max-w-full flex-col overflow-hidden rounded-xl border border-border bg-card align-top text-sm text-foreground",
         className,
       )}
     >
+      <span
+        className={cn(
+          "grid min-w-0 grid-cols-[minmax(0,1fr)_auto] border-b border-border",
+          chapters.length > 0 && wide && "grid-cols-[minmax(0,1fr)_18rem]",
+        )}
+      >
+        <span className="flex min-h-12 min-w-0 items-center gap-2 px-3 py-2">
+          <VideoIcon className="size-4 shrink-0 text-muted-foreground" />
+          {onOpenFile ? (
+            <button
+              type="button"
+              className="min-w-0 flex-1 truncate text-left underline decoration-dotted underline-offset-2 hover:text-primary"
+              title={title}
+              onClick={onOpenFile}
+            >
+              {title}
+            </button>
+          ) : (
+            <span className="min-w-0 flex-1 truncate" title={title}>
+              {title}
+            </span>
+          )}
+          {remoteSrc ? (
+            <a
+              href={remoteSrc}
+              download
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label={`Download video: ${title}`}
+            >
+              <DownloadIcon className="size-4" />
+            </a>
+          ) : (
+            <button
+              type="button"
+              aria-label={`Download video: ${title}`}
+              className="rounded p-1 hover:bg-accent"
+              onClick={() => {
+                if (conversationId && path) {
+                  void downloadWorkspaceFile(conversationId, path).catch(() =>
+                    showToast("Unable to download video."),
+                  );
+                }
+              }}
+            >
+              <DownloadIcon className="size-4" />
+            </button>
+          )}
+        </span>
+        {chapters.length > 0 && (
+          <span className="flex min-h-12 items-center gap-2 border-l border-border px-3 py-2">
+            {wide && <span className="min-w-0 flex-1 font-medium">Recording actions</span>}
+            <button
+              type="button"
+              aria-label={`Download recording actions: ${title}`}
+              title="Download annotations (.vtt)"
+              className="flex shrink-0 items-center gap-1 rounded p-1 hover:bg-accent"
+              onClick={() => {
+                if (conversationId && path) {
+                  void downloadWorkspaceFile(conversationId, `${path}.chapters.vtt`).catch(() =>
+                    showToast("Unable to download annotations."),
+                  );
+                }
+              }}
+            >
+              <DownloadIcon aria-hidden="true" className="size-4" />
+              <span className="text-xs">VTT</span>
+            </button>
+            <button
+              type="button"
+              aria-label={actionsOpen ? "Hide recording actions" : "Show recording actions"}
+              aria-expanded={actionsOpen}
+              aria-controls={actionsId}
+              title={actionsOpen ? "Hide recording actions" : "Show recording actions"}
+              className="flex shrink-0 items-center gap-1 rounded p-1 hover:bg-accent"
+              onClick={() => setActionsOpen((open) => !open)}
+            >
+              {actionsOpen ? (
+                <ChevronRightIcon aria-hidden="true" className="size-4" />
+              ) : (
+                <ListVideoIcon aria-hidden="true" className="size-4" />
+              )}
+              {!wide && <span>Actions</span>}
+            </button>
+          </span>
+        )}
+      </span>
       <span
         className={cn(
           "grid min-w-0",
@@ -153,7 +230,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
               }}
             />
           ) : (
-            <span className="flex aspect-video w-full flex-col items-center justify-center gap-3 bg-muted p-4 text-muted-foreground">
+            <span className="flex aspect-video max-h-[70vh] w-full flex-col items-center justify-center gap-3 bg-muted p-4 text-muted-foreground">
               {failed ? (
                 <>
                   <VideoIcon className="size-8" />
@@ -189,67 +266,6 @@ function VideoPlayerContent(props: VideoPlayerProps) {
               )}
             </span>
           )}
-          <span className="flex min-w-0 items-center gap-2 px-3 py-2">
-            <VideoIcon className="size-4 shrink-0 text-muted-foreground" />
-            {onOpenFile ? (
-              <button
-                type="button"
-                className="min-w-0 flex-1 truncate text-left underline decoration-dotted underline-offset-2 hover:text-primary"
-                title={title}
-                onClick={onOpenFile}
-              >
-                {title}
-              </button>
-            ) : (
-              <span className="min-w-0 flex-1 truncate" title={title}>
-                {title}
-              </span>
-            )}
-            {chapters.length > 0 && !actionsOpen && (
-              <button
-                ref={showActionsRef}
-                type="button"
-                aria-label="Show recording actions"
-                aria-expanded={false}
-                aria-controls={actionsId}
-                title="Show recording actions"
-                className="flex shrink-0 items-center gap-1 rounded px-2 py-1 hover:bg-accent"
-                onClick={() => {
-                  setActionsOpen(true);
-                  requestAnimationFrame(() => hideActionsRef.current?.focus());
-                }}
-              >
-                <ListVideoIcon aria-hidden="true" className="size-4" />
-                Actions
-              </button>
-            )}
-            {remoteSrc ? (
-              <a
-                href={remoteSrc}
-                download
-                target="_blank"
-                rel="noopener noreferrer"
-                aria-label={`Download video: ${title}`}
-              >
-                <DownloadIcon className="size-4" />
-              </a>
-            ) : (
-              <button
-                type="button"
-                aria-label={`Download video: ${title}`}
-                className="rounded p-1 hover:bg-accent"
-                onClick={() => {
-                  if (conversationId && path) {
-                    void downloadWorkspaceFile(conversationId, path).catch(() =>
-                      showToast("Unable to download video."),
-                    );
-                  }
-                }}
-              >
-                <DownloadIcon className="size-4" />
-              </button>
-            )}
-          </span>
         </span>
         {chapters.length > 0 && (
           <span
@@ -264,28 +280,11 @@ function VideoPlayerContent(props: VideoPlayerProps) {
             )}
           >
             <span className={cn("flex min-h-0 flex-col", wide && "absolute inset-0")}>
-              <span className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-3 py-2 font-medium">
-                <span className="flex-1">Recording actions</span>
-                <button
-                  ref={hideActionsRef}
-                  type="button"
-                  aria-label="Hide recording actions"
-                  aria-expanded={true}
-                  aria-controls={actionsId}
-                  title="Hide recording actions"
-                  className="shrink-0 rounded p-1 hover:bg-accent"
-                  onClick={() => {
-                    setActionsOpen(false);
-                    requestAnimationFrame(() => showActionsRef.current?.focus());
-                  }}
-                >
-                  {wide ? (
-                    <ChevronRightIcon aria-hidden="true" className="size-4" />
-                  ) : (
-                    <ChevronUpIcon aria-hidden="true" className="size-4" />
-                  )}
-                </button>
-              </span>
+              {!wide && (
+                <span className="shrink-0 border-b border-border px-3 py-2 font-medium">
+                  Recording actions
+                </span>
+              )}
               <span
                 className={cn(
                   "flex min-h-0 flex-col gap-1 overflow-y-auto overscroll-contain p-2",

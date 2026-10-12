@@ -51,12 +51,18 @@ Seeking an already loaded video preserves its paused or playing state.
 The highlighted action follows playback and native seeking. Actions beyond a
 known recording duration are disabled.
 
-Hide the panel using the arrow beside **Recording actions**. The video fills
-the card while the panel is hidden. Use **Actions** in the player footer to
-reopen it. Both controls work with the keyboard; toggling preserves playback
-and the selected action. Long action lists scroll within the panel. On wide
-previews, the panel stays as tall as the video and its footer; narrow previews
-limit the list height so the recording does not grow with every annotation.
+The recording title, video download, and action controls share a top toolbar.
+Use its action toggle to hide or reopen the panel. The toggle stays in the same
+place and preserves playback, keyboard focus, and the selected action. Plain
+recordings use the same card width; hiding actions gives annotated recordings
+the same player size as plain recordings.
+
+Click **VTT** in the toolbar to download the original companion file. The
+annotation download stays available while actions are hidden. Long lists
+scroll within the panel. On wide previews, the panel stays as tall as the
+video; narrow previews limit the list height. The toolbar stays outside the
+scrolling list.
+
 
 With no companion file, the player shows its ordinary controls and no action
 panel. Invalid, empty, oversized, or truncated files also leave ordinary video
