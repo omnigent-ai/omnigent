@@ -67,8 +67,6 @@ def test_host_mcp_tools(live_server: str, tmp_path: Path) -> None:
         isolated_host(
             tmp_path,
             live_server,
-            command=[sys.executable, "-m", "omnigent.host._daemon_entry", "--server", live_server],
-            cwd=tmp_path,
             env={
                 "USERPROFILE": str(tmp_path / "home"),
                 "CLAUDE_CONFIG_DIR": str(tmp_path / "claude"),
