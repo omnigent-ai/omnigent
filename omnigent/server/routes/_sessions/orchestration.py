@@ -16,7 +16,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import httpx
@@ -3664,6 +3664,12 @@ def _drive_terminal_resolved_elicitation(session_id: str, persisted: Conversatio
             )
 
 
+# Transport-loss failure codes: the connection dropped, not the task.
+# ``runner_disconnected`` is the whole tunnel going away; ``session_stream_lost``
+# is only this session's stream dropping while the runner stays registered.
+_DISCONNECT_FAILURE_CODES = frozenset({"runner_disconnected", "session_stream_lost"})
+
+
 async def _publish_runner_recovered_status(*args: Any, **kwargs: Any) -> None:
     """Call-time proxy so a facade patch of this symbol is honored here."""
     from omnigent.server.routes import sessions as _facade
@@ -3698,35 +3704,34 @@ async def _publish_runner_recovered_status_impl(
     is live, so it clears any stale ``failed`` state. A *passive* tunnel
     reconnect is weaker: the process merely came back on its own, saying
     nothing about a genuine task error. Callers on that path pass
-    ``require_disconnect_code=True`` so only a ``runner_disconnected``
-    failure is cleared — a genuine task failure (``response.failed`` / a
-    setup error with any other ``last_task_error`` code) survives the
-    reconnect, keeping the red "Failed" pill instead of silently flipping
-    it back to idle and hiding the error.
+    ``require_disconnect_code=True`` so only a disconnect-class failure
+    (``runner_disconnected`` or ``session_stream_lost``) is cleared — a
+    genuine task failure (``response.failed`` / a setup error with any other
+    ``last_task_error`` code) survives the reconnect, keeping the red
+    "Failed" pill instead of silently flipping it back to idle and hiding
+    the error.
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param conversation_store: Store used to read the persisted error
         code and clear the labels on genuine recovery.
     :param require_disconnect_code: When ``True`` (passive-reconnect
-        caller), only clear if the persisted ``last_task_error.code`` is
-        ``runner_disconnected``; when ``False`` (default, explicit
+        caller), only clear if the persisted ``last_task_error.code`` is a
+        disconnect-class code (``runner_disconnected`` or
+        ``session_stream_lost``); when ``False`` (default, explicit
         rebind/handshake), clear any stale ``failed`` state. Labels are
         cleared in both cases.
     :returns: None.
     """
     if _session_status_cache.get(session_id) != "failed":
         return
-    # A passive reconnect must distinguish a benign runner disconnect
-    # from a real task failure: both land the cache on "failed", but only
-    # the disconnect persists a ``runner_disconnected`` label. The
-    # reconnect proves the runner is reachable again, which invalidates a
-    # disconnect failure but says nothing about a genuine task error —
-    # leave that one alone. Explicit rebinds skip this guard.
+    # A passive reconnect only clears a disconnect-class label: it proves the
+    # runner is reachable again, invalidating a transport-loss failure but
+    # saying nothing about a genuine task error. Explicit rebinds skip this.
     if require_disconnect_code:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
-        if last_error is None or last_error.get("code") != "runner_disconnected":
+        if last_error is None or last_error.get("code") not in _DISCONNECT_FAILURE_CODES:
             return
     _session_status_cache[session_id] = "idle"
     session_live_state.persist_live_status(session_id, "idle")
@@ -7854,6 +7859,16 @@ async def _relay_runner_live_elsewhere(
     )
 
 
+def _runner_tunnel_waiter(
+    runner_client: httpx.AsyncClient,
+) -> Callable[[float], Awaitable[bool]] | None:
+    """Return the tunnel-registration waiter, or ``None`` for clients without a
+    tunnel transport (in-process test clients), whose callers fall back to their
+    no-transport behavior."""
+    transport = getattr(runner_client, "_transport", None)
+    return getattr(transport, "wait_for_runner", None)
+
+
 async def _relay_runner_stream(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -7987,23 +8002,43 @@ async def _relay_runner_stream(
                 # reason (an HTTP error), so keep the interval backoff: the
                 # waiter would return at once and spin. A client without a
                 # tunnel transport (in-process tests) also keeps the interval.
-                transport = getattr(runner_client, "_transport", None)
-                wait = getattr(transport, "wait_for_runner", None)
+                wait = _runner_tunnel_waiter(runner_client)
                 if wait is None or await wait(deadline - now):
                     await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
+            # Default the interruption to a runner disconnect; only a session
+            # whose tunnel is still registered overrides it on the failure path.
+            disconnect_error = ErrorDetail(
+                code="runner_disconnected",
+                message="Runner disconnected unexpectedly.",
+            )
+            failure_origin = "runner_disconnected_mid_turn"
             if lost.intentional:
                 decision = "intentional_stop"
             elif shutdown_state.server_shutting_down():
                 decision = "server_shutdown"
             elif await _relay_runner_live_elsewhere(session_id, conversation_store):
                 decision = "live_elsewhere"
-            elif await _runner_disconnect_requires_failure(
-                session_id, conversation_store, origin="runner_disconnected_mid_turn"
-            ):
-                decision = "failed_mid_turn"
             else:
-                decision = "idle_no_failure"
+                # A still-registered tunnel (including a runner that re-registered
+                # within the grace) means only this session's stream dropped, which
+                # recovers like a disconnect; the probe runs only on this path.
+                wait = _runner_tunnel_waiter(runner_client)
+                if wait is not None and await wait(0.0):
+                    disconnect_error = ErrorDetail(
+                        code="session_stream_lost",
+                        message="The live session connection was lost.",
+                    )
+                    failure_origin = "session_stream_lost_mid_turn"
+                if await _runner_disconnect_requires_failure(
+                    session_id,
+                    conversation_store,
+                    origin=failure_origin,
+                    error_code=disconnect_error.code,
+                ):
+                    decision = "failed_mid_turn"
+                else:
+                    decision = "idle_no_failure"
             # One row per outage outcome: which branch below fired, how long the
             # runner was gone against the grace, and how many retries it got.
             _logger.warning(
@@ -8067,31 +8102,20 @@ async def _relay_runner_stream(
                     extra={"session_id": session_id},
                 )
             else:
-                # Publish a failed status so the client's SSE stream sees a
-                # clean error event instead of silent truncation (#1114).
-                disconnect_error = ErrorDetail(
-                    code="runner_disconnected",
-                    message="Runner disconnected unexpectedly.",
-                )
+                # Turn interrupted: publish and persist the cause resolved above.
                 turn_id = _session_active_response_cache.get(session_id)
                 _publish_status(
                     session_id,
                     "failed",
                     disconnect_error,
-                    failure_origin="runner_disconnected_mid_turn",
+                    failure_origin=failure_origin,
                 )
                 await record_subagent_activity(
                     session_id, "returned", conversation_store, turn_id=turn_id, status="failed"
                 )
-                # Persist the disconnect cause as durable labels so the
-                # distinction survives into snapshots and child-session
-                # summaries. Without this the relay-fed cache only carries a
-                # generic ``failed`` and ``last_task_error`` is dropped,
-                # leaving the UI unable to tell a benign runner disconnect
-                # from a real task failure (Option B: render a "Disconnected"
-                # pill, not the red "Failed" pill). Cleared on the next
-                # ``running`` edge by the session.status handler, exactly
-                # like other failure labels.
+                # Persist the cause as durable labels so the distinction survives
+                # into snapshots and child summaries; the relay cache otherwise
+                # carries only a generic ``failed``, cleared on the next running.
                 await _persist_session_status_error_labels(
                     session_id,
                     disconnect_error,
@@ -8336,11 +8360,9 @@ async def _relay_runner_stream_once(
                             # would deliver a premature, lock-out completion.
                             raw_blocked_on = event.get("blocked_on")
                             raw_response_id = event.get("response_id")
-                            # The runner finishing a turn the server had written
-                            # off as a runner drop proves the drop was transient:
-                            # honor the completion and clear the disconnect cause.
-                            # A genuine task failure keeps its sticky ``failed``
-                            # (the guard only clears a ``runner_disconnected`` label).
+                            # A turn completing after a presumed runner drop proves
+                            # it was transient: honor it and clear the disconnect
+                            # label. A genuine task failure keeps its sticky ``failed``.
                             if (
                                 status == "idle"
                                 and _session_status_cache.get(session_id) == "failed"

@@ -103,7 +103,8 @@ def _interrupted(conv: Conversation) -> bool:
     return status in {"running", "waiting"} or (
         status == "failed"
         and error is not None
-        and error.get("code") in {"runner_disconnected", "runner_failed_to_start"}
+        and error.get("code")
+        in {"runner_disconnected", "runner_failed_to_start", "session_stream_lost"}
     )
 
 

@@ -75,6 +75,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   terminal_launch_failed: "The agent's terminal couldn't be started on the host.",
   runner_error: "Something went wrong setting up the turn on the host.",
   runner_disconnected: "The connection to the host dropped unexpectedly.",
+  session_stream_lost: "The live connection to this session dropped; the host is still online.",
   runner_unavailable: "The session's runner isn't connected to the server.",
   connection_error:
     "The connection to the agent dropped mid-turn; retrying usually continues the turn.",
@@ -106,6 +107,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "terminal_launch_failed",
   "runner_disconnected",
   "runner_failed_to_start",
+  "session_stream_lost",
   "runner_unavailable",
   "rate_limit_exceeded",
   "transient_upstream_error",

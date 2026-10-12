@@ -424,6 +424,7 @@ def test_client_update_diagnosis_ignores_unrelated_errors() -> None:
         ("terminal_launch_failed", "couldn't be started"),
         ("runner_error", "setting up the turn"),
         ("runner_disconnected", "host dropped"),
+        ("session_stream_lost", "live connection to this session dropped"),
         ("connection_error", "connection"),
         ("context_length_exceeded", "context window"),
         ("rate_limit_exceeded", "You can retry this turn"),

@@ -28,6 +28,7 @@ describe("structuredErrorFields", () => {
 
   it.each([
     "runner_disconnected",
+    "session_stream_lost",
     "runner_failed_to_start",
     "required_terminal_exited",
     "terminal_launch_failed",

@@ -75,8 +75,9 @@ both ends.
   within the window does not reset it, so it includes that brief connected
   stretch and is not cumulative disconnected time.
 - `runner_disconnect_decision`: a warning explaining the status check in the
-  relay (`origin = runner_disconnected_mid_turn`) or offline sweep
-  (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
+  relay (`origin = runner_disconnected_mid_turn`, or `session_stream_lost_mid_turn`
+  when the tunnel stayed registered and only this session's stream dropped) or
+  offline sweep (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
   `failed_mid_turn`, `failed_before_start`, `intentional_stop`, or
   `subagent_unobserved`.
   Idle subsessions keep their status and emit no `session_turn_failed` event

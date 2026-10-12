@@ -877,6 +877,7 @@ describe("SubagentsPanel", () => {
   it.each([
     ["runner_disconnected", "Runner disconnected unexpectedly."],
     ["runner_failed_to_start", "runner exited before the first turn"],
+    ["session_stream_lost", "The live session connection was lost."],
   ])("renders a neutral disconnected avatar for the runner-disconnect code %s", (code, message) => {
     // Option B: a runner that merely disconnected/exited is NOT a task
     // failure. The child summary still collapses to current_task_status
@@ -941,6 +942,7 @@ describe("SubagentsPanel", () => {
   it.each([
     ["runner_disconnected", "Runner disconnected unexpectedly."],
     ["runner_failed_to_start", "runner exited before the first turn"],
+    ["session_stream_lost", "The live session connection was lost."],
   ])(
     "does not add a status avatar to the main harness for runner-disconnect code %s",
     (code, message) => {

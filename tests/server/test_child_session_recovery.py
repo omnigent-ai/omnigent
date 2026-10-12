@@ -76,6 +76,14 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
             "omnigent.last_task_error_message": "Disconnected",
         },
     )
+    stream_lost = child("failed")
+    store.set_labels(
+        stream_lost.id,
+        {
+            "omnigent.last_task_error_code": "session_stream_lost",
+            "omnigent.last_task_error_message": "The live session connection was lost.",
+        },
+    )
     idle_ancestor = child("idle")
     nested = child(owner=idle_ancestor)
     untouched = [child("idle"), child("failed")]
@@ -93,7 +101,14 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
         await restore_active_children(parent, client, store, initializer)
 
     by_id = {call["session_id"]: call["session_init"] for call in calls}
-    assert set(by_id) == {active.id, waiting.id, disconnected.id, idle_ancestor.id, nested.id}
+    assert set(by_id) == {
+        active.id,
+        waiting.id,
+        disconnected.id,
+        stream_lost.id,
+        idle_ancestor.id,
+        nested.id,
+    }
     assert {sid for sid, envelope in by_id.items() if envelope["suppress_recovery_turn"]} == {
         idle_ancestor.id
     }
@@ -101,11 +116,12 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
         active.id,
         waiting.id,
         disconnected.id,
+        stream_lost.id,
         nested.id,
     }
     ids = list(by_id)
     assert ids.index(idle_ancestor.id) < ids.index(nested.id)
-    assert relay.call_count == 5
+    assert relay.call_count == 6
     recovered.assert_not_awaited()
     assert all(store.get_conversation(row.id).runner_id == "old" for row in untouched)
 

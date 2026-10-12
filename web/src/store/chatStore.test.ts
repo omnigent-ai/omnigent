@@ -4449,6 +4449,31 @@ describe("chatStore — send while streaming (queueing)", () => {
     expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toHaveLength(0);
   });
 
+  it("drops a session_stream_lost error card once the runner reports a live status", () => {
+    // Only this session's live stream dropped while the runner stayed
+    // registered; its next status edge proves the stream is back, so the
+    // stale "connection lost" card must clear just like a tunnel drop.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "running",
+      blocks: [],
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "failed",
+      error: { code: "session_stream_lost", message: "The live session connection was lost." },
+    });
+    expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toHaveLength(1);
+
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "running",
+    });
+    expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toHaveLength(0);
+  });
+
   it("keeps a genuine failure card across a later live status edge", () => {
     useChatStore.setState({
       conversationId: "conv_abc",

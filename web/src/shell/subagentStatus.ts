@@ -22,14 +22,14 @@ export interface AgentStatus {
   details?: string;
 }
 
-// Error codes that mean "the runner went away", not "the task failed".
-// ``runner_disconnected`` is published when the SSE relay's tunnel drops
-// mid-stream; ``runner_failed_to_start`` when a bound runner reports an
-// unexpected exit. Both are surfaced via ``last_task_error.code`` (child
-// rows) / the session snapshot's ``lastTaskError.code`` (main row). A
-// genuine task failure carries any other code (or none), so it still
-// renders the red "Failed" pill.
-const RUNNER_DISCONNECT_CODES = new Set(["runner_disconnected", "runner_failed_to_start"]);
+// Error codes that mean "the connection dropped", not "the task failed", so the row
+// shows a quiet disconnect dot, not the red "Failed" pill. ``session_stream_lost`` is
+// this session's stream dropping while the runner stays registered.
+const RUNNER_DISCONNECT_CODES = new Set([
+  "runner_disconnected",
+  "runner_failed_to_start",
+  "session_stream_lost",
+]);
 
 export function isRunnerDisconnectCode(code: string | null | undefined): boolean {
   return code != null && RUNNER_DISCONNECT_CODES.has(code);
