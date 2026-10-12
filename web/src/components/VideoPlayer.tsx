@@ -155,7 +155,11 @@ function VideoPlayerContent(props: VideoPlayerProps) {
         </span>
         {chapters.length > 0 && (
           <span className="flex min-h-12 items-center gap-2 border-l border-border px-3 py-2">
-            {wide && <span className="min-w-0 flex-1 font-medium">Recording actions</span>}
+            {wide && (
+              <span className="min-w-0 flex-1 font-medium">
+                {actionsOpen && "Recording actions"}
+              </span>
+            )}
             <button
               type="button"
               aria-label={`Download recording actions: ${title}`}
