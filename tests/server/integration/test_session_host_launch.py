@@ -2286,10 +2286,17 @@ async def test_message_relaunch_pre_connect_exit_withholds_log_tail_from_non_own
     real_record = RunnerExitReports.record
 
     def _record_as_host_owner(
-        self: RunnerExitReports, runner_id: str, error: str, owner: str | None
+        self: RunnerExitReports,
+        runner_id: str,
+        error: str,
+        owner: str | None,
+        *,
+        had_connected: bool | None = None,
     ) -> None:
         del owner
-        real_record(self, runner_id, error, owner="host-owner@example.com")
+        real_record(
+            self, runner_id, error, owner="host-owner@example.com", had_connected=had_connected
+        )
 
     monkeypatch.setattr(RunnerExitReports, "record", _record_as_host_owner)
     monkeypatch.setattr(
