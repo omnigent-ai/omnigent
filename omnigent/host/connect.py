@@ -3344,6 +3344,9 @@ class HostProcess:
             f"{self._server_url}/v1/sessions/{path}/agent/contents",
             headers=self._build_connect_headers(),
             timeout=10.0,
+            # httpx's default context reads SSL_CERT_FILE eagerly and fails on a
+            # deleted bundle; verify like the host tunnel does instead.
+            verify=client_ssl_context(),
         )
 
     async def _prewarm_model_options(self) -> bool:
