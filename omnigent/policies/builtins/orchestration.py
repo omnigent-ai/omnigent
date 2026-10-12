@@ -26,6 +26,16 @@ _ALLOW: _Json = {"result": "ALLOW"}
 
 _SPAWN_BOUNDS_STATE_KEY = "_policy_spawn_bounds_dispatches"
 
+# Handler path + parameter name for the sub-agent depth bound. The runner's
+# spawn path (``omnigent/runner/tool_dispatch.py``) reads both when it inherits
+# the bound onto a child session, so the string is stated once here instead of
+# in the policy, the registry entry, and the runner separately.
+SPAWN_DEPTH_HANDLER = "omnigent.policies.builtins.orchestration.spawn_depth_bounds"
+SPAWN_DEPTH_PARAM = "max_depth"
+# Factory default, shared with the runner so the allowance it inherits onto a
+# child matches what a bare ``function: <handler>`` declaration resolves to.
+SPAWN_DEPTH_DEFAULT_MAX_DEPTH = 2
+
 
 def _decision(result: str, reason: str) -> _Json:
     """
@@ -507,6 +517,67 @@ def spawn_bounds(
     return _evaluate
 
 
+def spawn_depth_bounds(
+    *,
+    max_depth: int = SPAWN_DEPTH_DEFAULT_MAX_DEPTH,
+    dispatch_tools: tuple[str, ...] | list[str] = ("sys_session_send",),
+) -> Callable[[_Json], _Json]:
+    """
+    Factory: bound how deep the sub-agent tree may grow below this session.
+
+    ``spawn_bounds`` bounds the *width* of a turn — each child gets its own turn
+    and therefore its own fresh counter, so a chain where every level dispatches
+    is unbounded by it. This bounds *depth*: the parameter is the number of
+    further levels of sub-agents allowed below the session the policy is attached
+    to, so ``max_depth=0`` refuses every dispatch from that session and
+    ``max_depth=2`` allows a child and a grandchild.
+
+    The allowance is inherited one level lower by every child the session
+    dispatches (the runner's spawn path attaches ``max_depth - 1`` to the child,
+    see ``_child_spawn_depth_policy_body`` in
+    :mod:`omnigent.runner.tool_dispatch`), so declaring the bound once on the
+    root — in the root agent spec, or as a session policy — bounds the whole tree
+    however self-similar the delegation is. Deriving depth from the parent chain
+    is not needed for that: the evaluator's parameter *is* the remaining
+    allowance, which is what makes this enforceable in the runner gate, where
+    there is no conversation store and no ``session_state`` to read.
+
+    :param max_depth: Levels of sub-agent descent still allowed below this
+        session, e.g. ``2``. Must be an integer >= 0.
+    :param dispatch_tools: Tool names that count as a dispatch, e.g.
+        ``("sys_session_send",)``. A YAML list is accepted (coerced to a set).
+    :returns: An evaluator ``fn(event)`` returning ALLOW, or DENY once the
+        session's allowance is exhausted.
+    :raises ValueError: If ``max_depth`` is not a non-negative integer.
+    """
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 0:
+        raise ValueError("spawn_depth_bounds requires max_depth to be an integer >= 0")
+    counted = set(dispatch_tools)
+
+    def _evaluate(event: _Json) -> _Json:
+        """
+        Deny a dispatch once this session's depth allowance is exhausted.
+
+        :param event: V0 event; a dispatch is a ``tool_call`` whose
+            ``data["name"]`` is one of *dispatch_tools*.
+        :returns: ALLOW, or DENY when no levels of descent are left below this
+            session.
+        """
+        if _tool_call(event, counted) is None:
+            return _ALLOW
+        if max_depth <= 0:
+            return _decision(
+                "DENY",
+                "Sub-agent depth budget exhausted: this session may not dispatch "
+                "sub-agents, because the tree has already reached the declared "
+                "spawn_depth_bounds max_depth. Finish the work in this session, or "
+                "raise max_depth on the root session to allow deeper delegation.",
+            )
+        return _ALLOW
+
+    return _evaluate
+
+
 def headless_subagent_purpose_guard(
     *,
     allowed_purposes: tuple[str, ...] = ("implement", "review", "explore", "search"),
@@ -730,6 +801,37 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "name": "Limit Sub-Agent Dispatches Per Turn",
         "description": "Limits the number of sub-agent dispatches per turn "
         "to prevent runaway fan-out",
+    },
+    {
+        "handler": SPAWN_DEPTH_HANDLER,
+        "kind": "factory",
+        "name": "Bound Sub-Agent Tree Depth",
+        "description": "Bounds how deep the sub-agent tree may grow below the session that "
+        "declares it (spawn_bounds caps width per turn only, and each child gets a fresh "
+        "per-turn counter). The allowance is inherited by every dispatched child, one level "
+        "lower, so a single declaration on the root bounds the whole tree; a session whose "
+        "allowance reaches 0 may no longer dispatch sub-agents. Declare it in the root agent "
+        "spec or as a session policy — no per-child configuration is needed.",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "max_depth": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Levels of sub-agent descent allowed below the session this "
+                    "policy is attached to. 0 blocks every dispatch from that session. Each "
+                    "dispatched child inherits max_depth - 1.",
+                    "default": SPAWN_DEPTH_DEFAULT_MAX_DEPTH,
+                },
+                "dispatch_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tool names that count as a sub-agent dispatch, e.g. "
+                    '["sys_session_send"].',
+                    "default": ["sys_session_send"],
+                },
+            },
+        },
     },
     {
         "handler": "omnigent.policies.builtins.orchestration.headless_subagent_purpose_guard",

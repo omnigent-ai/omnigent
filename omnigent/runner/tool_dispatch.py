@@ -64,6 +64,11 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
+from omnigent.policies.builtins.orchestration import (
+    SPAWN_DEPTH_DEFAULT_MAX_DEPTH,
+    SPAWN_DEPTH_HANDLER,
+    SPAWN_DEPTH_PARAM,
+)
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
@@ -2225,6 +2230,122 @@ def _subagent_cost_budget_from_args(
     return None
 
 
+async def _fetch_session_policy_payload(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+) -> object | None:
+    """
+    Read a session's policy list, for depth-allowance inheritance.
+
+    ``GET /v1/sessions/{id}/policies`` returns the admin defaults plus the
+    session's own attachments. Only the attachments can carry an allowance the
+    session inherited from its own parent, which is why the spawn path reads
+    them instead of trusting the spec alone.
+
+    :param server_client: httpx client pointed at the Omnigent server.
+    :param session_id: Session to read, e.g. ``"conv_abc123"``.
+    :returns: The decoded response payload, or ``None`` when the read failed
+        (inheritance is best-effort; the dispatch itself already happened).
+    """
+    try:
+        resp = await server_client.get(f"/v1/sessions/{session_id}/policies", timeout=10.0)
+    except httpx.HTTPError:
+        _logger.warning("failed to read policies for session %s", session_id, exc_info=True)
+        return None
+    if resp.status_code >= 400:
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
+def _spawn_depth_budget_from_spec(agent_spec: AgentSpec | None) -> int | None:
+    """
+    Smallest ``spawn_depth_bounds`` allowance declared by *agent_spec*, if any.
+
+    A bundle declaration is the way a root session states the bound once, so this
+    is the seed of the whole inheritance chain. A bare
+    ``function: <handler>`` declaration carries no arguments and therefore means
+    the factory default.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The declared allowance, or ``None`` when the spec declares no
+        depth bound.
+    """
+    guard = getattr(agent_spec, "guardrails", None)
+    budgets: list[int] = []
+    for ps in getattr(guard, "policies", None) or []:
+        ref = getattr(ps, "function", None)
+        if getattr(ref, "path", None) != SPAWN_DEPTH_HANDLER:
+            continue
+        arguments = getattr(ref, "arguments", None)
+        declared = arguments.get(SPAWN_DEPTH_PARAM) if isinstance(arguments, dict) else None
+        budgets.append(
+            declared
+            if isinstance(declared, int) and not isinstance(declared, bool)
+            else SPAWN_DEPTH_DEFAULT_MAX_DEPTH
+        )
+    return min(budgets) if budgets else None
+
+
+def _spawn_depth_budget_from_attachments(payload: object) -> int | None:
+    """
+    Smallest inherited ``spawn_depth_bounds`` allowance in a policy-list payload.
+
+    :param payload: Decoded ``GET /v1/sessions/{id}/policies`` response — either
+        the ``{"object": "list", "data": [...]}`` envelope or a bare list.
+    :returns: The smallest attached allowance, or ``None`` when the session has
+        no depth attachment.
+    """
+    entries = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(entries, list):
+        return None
+    budgets: list[int] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("handler") != SPAWN_DEPTH_HANDLER:
+            continue
+        params = entry.get("factory_params")
+        attached = params.get(SPAWN_DEPTH_PARAM) if isinstance(params, dict) else None
+        if isinstance(attached, int) and not isinstance(attached, bool):
+            budgets.append(attached)
+    return min(budgets) if budgets else None
+
+
+def _child_spawn_depth_policy_body(
+    parent_budgets: list[int | None],
+) -> dict[str, object] | None:
+    """
+    Build the depth allowance a dispatched child inherits, one level lower.
+
+    The child's allowance is the parent's effective allowance — the smallest
+    declaration the parent carries, whether from its spec or from what it
+    inherited — minus one level. Attaching the decremented value is what makes a
+    single declaration on the root bound every generation: each child is a
+    separate session with its own runner gate, so the allowance has to travel
+    with the session rather than be counted inside one evaluator.
+
+    :param parent_budgets: Allowances read off the parent, e.g.
+        ``[3, None]``; ``None`` entries mean "this source declared nothing".
+    :returns: A ``POST /v1/sessions/{child}/policies`` body, or ``None`` when the
+        parent declares no depth bound (the dispatch stays unbounded, which is
+        the pre-existing behaviour).
+    """
+    budgets = [b for b in parent_budgets if isinstance(b, int) and not isinstance(b, bool)]
+    if not budgets:
+        return None
+    # Clamp at 0 rather than going negative: a parent whose own allowance is
+    # exhausted hands the child an exhausted allowance too (both cannot dispatch),
+    # and the policy rejects negative values.
+    return {
+        "name": "__spawn_depth_bounds",
+        "type": "python",
+        "handler": SPAWN_DEPTH_HANDLER,
+        "factory_params": {SPAWN_DEPTH_PARAM: max(0, min(budgets) - 1)},
+        "enabled": True,
+    }
+
+
 def _subagent_allowed_harnesses(
     sub_agent_name: str, agent_spec: AgentSpec | None
 ) -> frozenset[str]:
@@ -2987,6 +3108,45 @@ async def _execute_subagent_tool(
                     child_session_id,
                     exc_info=True,
                 )
+
+        # Inherit the sub-agent depth bound onto the child (#5169). One
+        # declaration on the root has to bound the whole tree, so the child gets
+        # the parent's effective allowance minus one level: read from the parent
+        # agent spec (the bundle declaration) and from the parent session's own
+        # attachments (how an allowance inherited from *its* parent arrives).
+        # Non-fatal: a child without the attachment behaves exactly as it did
+        # before, and the parent's own policy has already refused the dispatch
+        # when its allowance was exhausted.
+        if server_client is not None and conversation_id is not None:
+            parent_policy_payload = await _fetch_session_policy_payload(
+                server_client, conversation_id
+            )
+            depth_body = _child_spawn_depth_policy_body(
+                [
+                    _spawn_depth_budget_from_spec(agent_spec),
+                    _spawn_depth_budget_from_attachments(parent_policy_payload),
+                ]
+            )
+            if depth_body is not None:
+                try:
+                    depth_resp = await server_client.post(
+                        f"/v1/sessions/{child_session_id}/policies",
+                        json=depth_body,
+                        timeout=10.0,
+                    )
+                    if depth_resp.status_code >= 400:
+                        _logger.warning(
+                            "failed to inherit spawn_depth_bounds on child %s: %s %s",
+                            child_session_id,
+                            depth_resp.status_code,
+                            depth_resp.text[:200],
+                        )
+                except httpx.HTTPError:
+                    _logger.warning(
+                        "failed to inherit spawn_depth_bounds on child %s",
+                        child_session_id,
+                        exc_info=True,
+                    )
 
     # Publish session.created on the parent's SSE stream so the
     # REPL debug panel and any client subscribers discover the
