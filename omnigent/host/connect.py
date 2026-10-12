@@ -1881,6 +1881,27 @@ class HostProcess:
                 harness_is_configured, frame.harness
             )
         if not harness_ready:
+            if frame.harness in {"pi", "pi-native"}:
+                from omnigent.harnesses.pi_native.main import (
+                    PiNativeCliOutdatedError,
+                    check_pi_cli_version_floor,
+                    pi_version,
+                    resolve_pi_executable,
+                )
+
+                try:
+                    executable = resolve_pi_executable()
+                except click.ClickException:
+                    version = None
+                else:
+                    version = await asyncio.to_thread(pi_version, executable)
+                if version is not None:
+                    try:
+                        check_pi_cli_version_floor(version)
+                    except PiNativeCliOutdatedError as exc:
+                        return self._launch_failed(
+                            frame, str(exc), error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE
+                        )
             return self._launch_failed(
                 frame,
                 (

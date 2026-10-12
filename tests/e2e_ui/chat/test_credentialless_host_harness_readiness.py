@@ -42,9 +42,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
-import sys
-import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -55,6 +52,8 @@ import pytest
 from playwright.async_api import async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.compat import runner_executable
+from tests._helpers.host import isolated_host
 from tests.e2e_ui.conftest import _register_agent_yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -85,63 +84,34 @@ def credentialless_host(
     a ``workspace`` directory sessions on it can use.
     """
     tmp = tmp_path_factory.mktemp("credentialless_host_home")
-    host_home = tmp / "home"
-    host_home.mkdir()
     workspace = tmp / "workspace"
     workspace.mkdir()
-    host_name = f"credless-{uuid.uuid4().hex[:8]}"
-
-    # Minimal allow-list env: keeps the harness CLIs resolvable but leaves no
-    # path to a credential (no *_API_KEY, no ambient config).
-    env = {
+    # An explicit base replaces ambient credentials while retaining installed CLIs.
+    base_env = {
         "PATH": os.environ["PATH"],
-        "HOME": str(host_home),
-        "PYTHONPATH": os.pathsep.join(
-            [
-                str(_REPO_ROOT),
-                str(_REPO_ROOT / "sdks" / "python-client"),
-                str(_REPO_ROOT / "sdks" / "ui"),
-            ]
-        ),
         "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
-        "OMNIGENT_HOST_NAME": host_name,
-        "OMNIGENT_HOST_ID": uuid.uuid4().hex,
     }
-    log_path = tmp / "host.log"
-    with log_path.open("w") as log_handle:
-        argv = [sys.executable, "-m", "omnigent", "host", "--server", live_server]
-        proc = subprocess.Popen(
-            [*argv, "--non-interactive"],
-            env=env,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-        )
-    try:
-        deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
-        row: dict[str, Any] | None = None
-        while time.monotonic() < deadline:
-            row = _fetch_host_row(live_server, host_name)
-            if row is not None:
-                break
-            if proc.poll() is not None:
-                raise RuntimeError(
-                    f"omnigent host exited early ({proc.returncode}):\n"
-                    f"{log_path.read_text()[-2000:]}"
-                )
-            time.sleep(1.0)
-        if row is None:
-            raise RuntimeError(
-                f"credential-less host never came online:\n{log_path.read_text()[-2000:]}"
-            )
+    with (
+        httpx.Client(base_url=live_server, trust_env=False) as client,
+        isolated_host(
+            tmp,
+            live_server,
+            base_env=base_env,
+            name=f"credless-{uuid.uuid4().hex[:8]}",
+            command=[
+                runner_executable(),
+                "-m",
+                "omnigent",
+                "host",
+                "--server",
+                live_server,
+                "--non-interactive",
+            ],
+        ) as host,
+    ):
+        row = host.wait_online(client, timeout=_HOST_ONLINE_TIMEOUT_S, poll_interval=1)
         yield {**row, "workspace": str(workspace)}
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
 
 
 def _register_harness_agent(base_url: str, name: str, harness: str, model: str) -> str:
