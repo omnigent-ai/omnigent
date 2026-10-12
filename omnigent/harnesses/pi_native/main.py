@@ -72,6 +72,34 @@ class PiNativeCliOutdatedError(RuntimeError):
     """
 
 
+def check_pi_cli_version_floor(version: tuple[int, int, int]) -> None:
+    """Fail the launch when the installed Pi CLI is below Omnigent's floor.
+
+    A Pi older than the installer's ``min_version`` rejects ``--provider
+    omnigent`` and exits 1, which otherwise surfaces as a generic
+    terminal-start failure the person retries unchanged.
+
+    :param version: Probed Pi CLI version, e.g. ``(0, 84, 2)``.
+    :raises PiNativeCliOutdatedError: When *version* is below the floor.
+    """
+    from omnigent.onboarding.harness_install import (
+        PI_KEY,
+        harness_install_display,
+        harness_install_spec,
+    )
+
+    spec = harness_install_spec(PI_KEY)
+    floor = spec.min_version if spec is not None else None
+    if floor is None or version >= tuple(int(part) for part in floor.split(".")):
+        return
+    installed = ".".join(str(part) for part in version)
+    raise PiNativeCliOutdatedError(
+        f"The installed Pi CLI ({installed}) is older than the minimum Omnigent "
+        f"supports ({floor}). Upgrade with: {harness_install_display(PI_KEY)}, "
+        "then start the session again."
+    )
+
+
 @dataclass(frozen=True)
 class NativePiLaunch:
     """Resolved native Pi process launch."""

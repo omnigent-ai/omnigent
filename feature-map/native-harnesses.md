@@ -129,6 +129,15 @@ the extra fields. Resolver and raw-tunnel checks:
 
 Cross-harness journeys:
 
+- **`launch-cli` and `launch-web`, Pi CLI compatibility (own environment):**
+  `tests/e2e/test_pi_native_cli_version_floor_e2e.py::test_real_pi_cli_version_floor`
+  runs real unsupported and supported npm Pi installations through `omnigent pi`
+  and the server's native-terminal launch endpoint. Set
+  `OMNIGENT_E2E_PI_OLD_BINARY` and `OMNIGENT_E2E_PI_CURRENT_BINARY` to their
+  executable paths. The old release must report its version and upgrade command
+  before a terminal starts. The supported release must answer terminal and API
+  input through the real Pi process; only model replies are scripted locally.
+  Each case owns its stack and saves terminal recordings plus API evidence.
 - **`side-chat`, Codex:**
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   uses a real Codex CLI/app-server and the local mock model. It verifies inherited
