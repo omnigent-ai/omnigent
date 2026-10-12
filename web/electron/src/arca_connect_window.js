@@ -25,6 +25,7 @@ const { arcaTarget } = require("./arcaIdentity");
 /**
  * @param {{
  *   BrowserWindow: typeof import("electron").BrowserWindow,
+ *   Menu: typeof import("electron").Menu,
  *   ipcMain: import("electron").IpcMain,
  *   pagePath: string,
  *   preloadPath: string,
@@ -39,6 +40,7 @@ const { arcaTarget } = require("./arcaIdentity");
  */
 function createArcaConnectFlow({
   BrowserWindow,
+  Menu,
   ipcMain,
   pagePath,
   preloadPath,
@@ -122,6 +124,13 @@ function createArcaConnectFlow({
           nodeIntegration: false,
           sandbox: true,
         },
+      });
+
+      // Electron ships no context menu and the shell attaches its own only to
+      // app windows, so offer Copy here over whatever text is selected.
+      win.webContents.on("context-menu", (_event, params) => {
+        if (!params.selectionText?.trim()) return;
+        Menu.buildFromTemplate([{ role: "copy" }]).popup({ window: win });
       });
 
       // Captured now: webContents is unreadable after the window is destroyed,

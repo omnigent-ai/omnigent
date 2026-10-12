@@ -11,7 +11,30 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { saveRecording } = require("../e2e/desktopHarness");
+const {
+  desktopDepsAvailable,
+  launchDesktop,
+  saveRecording,
+  startPrivateDisplay,
+  pollUntil,
+  displaySocketPath,
+  xvfbAvailable,
+} = require("../e2e/desktopHarness");
+
+/** PIDs of Xvfb processes whose parent is this test process (Linux /proc). */
+function ownedXvfbPids() {
+  return fs.readdirSync("/proc").filter((name) => {
+    if (!/^\d+$/.test(name)) return false;
+    try {
+      const match = /^\d+ \((.*)\) \S+ (\d+) /.exec(fs.readFileSync(`/proc/${name}/stat`, "utf8"));
+      return match !== null && match[1] === "Xvfb" && Number(match[2]) === process.pid;
+    } catch {
+      return false; // the process exited between readdir and read
+    }
+  });
+}
+
+const hasXvfb = xvfbAvailable();
 
 describe("saveRecording", () => {
   let dir;
@@ -59,4 +82,83 @@ describe("saveRecording", () => {
   it("returns empty when nothing was recorded", () => {
     assert.deepEqual(saveRecording(dir, "clip"), []);
   });
+});
+
+describe("displaySocketPath", () => {
+  it("maps a display to its socket and ignores a screen suffix", () => {
+    assert.equal(displaySocketPath(":99"), "/tmp/.X11-unix/X99");
+    assert.equal(displaySocketPath(":99.0"), "/tmp/.X11-unix/X99");
+  });
+});
+
+describe("startPrivateDisplay", () => {
+  let savedDisplay;
+
+  beforeEach(() => {
+    savedDisplay = process.env.DISPLAY;
+  });
+
+  afterEach(() => {
+    if (savedDisplay === undefined) delete process.env.DISPLAY;
+    else process.env.DISPLAY = savedDisplay;
+  });
+
+  it("leaves an existing display alone", async () => {
+    process.env.DISPLAY = ":42";
+    assert.equal(await startPrivateDisplay(), null);
+  });
+
+  it(
+    "starts its own Xvfb when Linux has no display and stops it on request",
+    { skip: hasXvfb ? false : "needs Linux with Xvfb installed" },
+    async () => {
+      delete process.env.DISPLAY;
+      const owned = await startPrivateDisplay();
+      const socket = displaySocketPath(owned.display);
+      try {
+        assert.match(owned.display, /^:\d+$/);
+        assert.ok(fs.existsSync(socket), `no X socket at ${socket}`);
+      } finally {
+        await owned.stop();
+      }
+      // Xvfb unlinks its socket on SIGTERM shortly after exiting.
+      assert.ok(await pollUntil(() => !fs.existsSync(socket), 3_000), `X socket left at ${socket}`);
+    },
+  );
+});
+
+describe("launchDesktop setup failure", () => {
+  const deps = desktopDepsAvailable();
+  let savedDisplay;
+  let dir;
+
+  beforeEach(() => {
+    savedDisplay = process.env.DISPLAY;
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-launch-failure-"));
+  });
+
+  afterEach(() => {
+    if (savedDisplay === undefined) delete process.env.DISPLAY;
+    else process.env.DISPLAY = savedDisplay;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it(
+    "releases the owned Xvfb when setup fails before Electron launches",
+    {
+      skip: hasXvfb && deps.ok ? false : "needs Linux with Xvfb, electron and playwright installed",
+    },
+    async () => {
+      delete process.env.DISPLAY;
+      assert.deepEqual(ownedXvfbPids(), [], "an Xvfb child already exists");
+      // A regular file where the record dir must go makes mkdirSync throw.
+      const blocker = path.join(dir, "not-a-directory");
+      fs.writeFileSync(blocker, "");
+      await assert.rejects(launchDesktop({ recordDir: path.join(blocker, "recordings") }));
+      assert.ok(
+        await pollUntil(() => ownedXvfbPids().length === 0, 3_000),
+        `Xvfb still running: ${ownedXvfbPids()}`,
+      );
+    },
+  );
 });
