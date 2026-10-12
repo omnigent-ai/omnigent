@@ -72,13 +72,6 @@ def isolated_host(
     client. Cleanup also runs when the callback or the test raises.
     """
     home = root / "home"
-    home.mkdir(parents=True, exist_ok=True)
-    config = home / ".omnigent"
-    config.mkdir(exist_ok=True)
-    host_id = host_id or uuid.uuid4().hex
-    name = name or f"e2e-host-{host_id[:12]}"
-    with (config / "config.yaml").open("x") as identity:
-        yaml.safe_dump({"host": {"host_id": host_id, "name": name}}, identity)
     overrides = dict(env or {})
     owned = {
         "OMNIGENT_CONFIG_HOME",
@@ -89,6 +82,13 @@ def isolated_host(
     if owned & overrides.keys():
         raise ValueError(f"Host owns these environment keys: {sorted(owned & overrides.keys())}")
     process_env = isolated_process_env(home, overrides, base_env)
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / ".omnigent"
+    config.mkdir(exist_ok=True)
+    host_id = host_id or uuid.uuid4().hex
+    name = name or f"e2e-host-{host_id[:12]}"
+    with (config / "config.yaml").open("x") as identity:
+        yaml.safe_dump({"host": {"host_id": host_id, "name": name}}, identity)
     log_path = root / "host.log"
     process_env.update(
         OMNIGENT_CONFIG_HOME=str(config), OMNIGENT_HOST_ID=host_id, OMNIGENT_HOST_NAME=name

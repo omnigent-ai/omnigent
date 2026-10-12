@@ -97,6 +97,12 @@ def test_host_failed_readiness_reaps_child_and_retains_isolated_diagnostics(
 
     from tests._helpers.host import isolated_host
 
+    for key in ("HOME", "OMNIGENT_HOST_ID"):
+        with pytest.raises(ValueError):
+            with isolated_host(tmp_path, "http://127.0.0.1:1", env={key: "invalid"}):
+                pytest.fail("owned environment must be rejected before starting a host")
+        assert not (tmp_path / "home").exists()
+
     handles = []
 
     def ready(host):
