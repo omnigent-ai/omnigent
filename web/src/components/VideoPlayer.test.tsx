@@ -100,7 +100,7 @@ describe("VideoPlayer", () => {
     fireEvent.click(screen.getByRole("button", { name: "Hide recording actions" }));
     expect(download).toBeVisible();
     fireEvent.keyDown(download, { key: "ArrowDown" });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Download video", exact: true }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Download video" }));
     expect(downloadWorkspaceFile).toHaveBeenLastCalledWith("sess_1", "demo.webm");
   });
 
