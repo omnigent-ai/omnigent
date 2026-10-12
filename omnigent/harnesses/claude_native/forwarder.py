@@ -20,6 +20,7 @@ import httpx
 
 from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
@@ -169,6 +170,17 @@ _HTTP_POST_RETRY_MAX_DELAY_S = 30.0
 # range for any realistic max_delay_s / base_delay_s ratio.
 _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT = 32
 _HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
+_FORWARDER_REJECTION_REASONS = frozenset(
+    {
+        ErrorCode.FORBIDDEN,
+        ErrorCode.INVALID_INPUT,
+        ErrorCode.NOT_FOUND,
+        "event batch exceeds count or size limit",
+        "event type is not allowed on runner tunnel",
+        "source_id required for tunnel replay",
+        "invalid session event",
+    }
+)
 # A 503 ``subagent_delivery_not_confirmed`` means the runner could not deliver a
 # terminal sub-agent result to the parent inbox. It is retried (the work entry can
 # be created slightly after the child reports terminal — a short dispatch race), but
@@ -4269,6 +4281,7 @@ async def _forward_available_status_events(
                         session_id=session_id,
                         reason=f"hook status {status} rejected",
                         source_id=retry_key,
+                        http_error=exc,
                         response_id=response_id,
                     )
                 durable = next_durable
@@ -4808,6 +4821,7 @@ async def _forward_available_items(
                         session_id=session_id,
                         reason=f"transcript item {item.source_id} rejected",
                         source_id=retry_key,
+                        http_error=exc,
                         response_id=current_response_id,
                     )
                 seen.add(item.source_id)
@@ -6256,12 +6270,28 @@ async def _maybe_sync_effort_from_slash_command(
         )
 
 
+def _forwarder_rejection_context(error: httpx.HTTPError) -> FailureContext:
+    """Retain rejection metadata without copying echoed transcript content."""
+    if not isinstance(error, httpx.HTTPStatusError):
+        return {}
+    context: FailureContext = {"http_status": error.response.status_code}
+    try:
+        body = error.response.json()
+    except ValueError:
+        return context
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, str) and detail in _FORWARDER_REJECTION_REASONS:
+        context["forwarder_rejection_reason"] = detail
+    return context
+
+
 async def _post_forwarder_failed_status(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     reason: str,
     source_id: str,
+    http_error: httpx.HTTPError,
     response_id: str | None = None,
 ) -> None:
     """
@@ -6272,6 +6302,7 @@ async def _post_forwarder_failed_status(
     :param reason: Diagnostic reason for the failure event, e.g.
         ``"transcript item item-1 rejected"``.
     :param source_id: Retry key of the rejected hook or transcript item.
+    :param http_error: The rejection that exhausted the delivery retry budget.
     :param response_id: Active turn's response id, so this ``failed``
         edge closes the streaming ``activeResponse`` for the matching
         turn rather than leaving its tool cards spinning. ``None`` when
@@ -6293,6 +6324,7 @@ async def _post_forwarder_failed_status(
                 "detail_source": "forwarder_delivery_error",
                 "failure_decision": "session_failed",
                 "runner_version": VERSION,
+                **_forwarder_rejection_context(http_error),
             },
         )
     except httpx.HTTPError:
