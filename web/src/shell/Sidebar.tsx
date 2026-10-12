@@ -2021,9 +2021,13 @@ function ConversationList({
   }, [loadedSections.groupTitles, sections.sessions, groupOrder]);
 
   // Scope-active flags: which section owns the current selection UI (checkboxes
-  // + bulk-action bar). Only one is ever true at a time.
+  // + bulk-action bar). Only one is true at a time unless the selection is unified.
   const sessionsSelecting = selectionMode && selectionScope === "sessions";
-  const projectsSelecting = selectionMode && selectionScope === "projects";
+  // With sidebar_grouping_ui on, the default grouping's one "Select sessions" (on
+  // the Projects header) selects project folders, Shared and Sessions together.
+  const unifiedSelection = groupingUi && !grouped;
+  const projectsSelecting =
+    selectionMode && (selectionScope === "projects" || (unifiedSelection && sessionsSelecting));
 
   // Collapsed section titles — persisted like pins so the preference
   // survives reloads. Lifted here (not per-section state) because the
@@ -2314,11 +2318,14 @@ function ConversationList({
   useEffect(() => {
     if (!selectionMode || conversationsQuery.isFetching) return;
     const pool =
-      selectionScope === "projects" ? projectSessionPool.length : displayPagination.rows.length;
+      selectionScope === "projects"
+        ? projectSessionPool.length
+        : displayPagination.rows.length + (unifiedSelection ? projectSessionPool.length : 0);
     if (pool === 0) onExitSelectionMode();
   }, [
     selectionMode,
     selectionScope,
+    unifiedSelection,
     displayPagination.rows.length,
     projectSessionPool.length,
     conversationsQuery.isFetching,
@@ -2374,17 +2381,19 @@ function ConversationList({
   // renders — so a shift target the global window hasn't loaded still resolves.
   // Rows outside the active scope have no checkboxes, so they never enter a range.
   getVisibleIdsRef.current = () => {
-    if (selectionScope === "projects") {
+    const projectIds = () => {
       if (effectiveCollapsedSections.includes("Projects")) return [];
       return sections.projectGroups.flatMap((g) => {
         if (!expandedProjects.includes(g.name)) return [];
         const rows = folderConversations.get(g.name) ?? g.conversations;
         return rows.map((c) => c.id);
       });
-    }
+    };
+    if (selectionScope === "projects") return projectIds();
     const visibleIds = (title: string, list: readonly Conversation[]) =>
       effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
     return [
+      ...(unifiedSelection ? projectIds() : []),
       ...visibleIds("Shared", sections.shared),
       ...(sessionGroups
         ? sessionGroups.flatMap((g) => visibleIds(g.title, g.conversations))
@@ -2457,17 +2466,40 @@ function ConversationList({
     onToggleSelected,
     onProjectAssigned: expandProject,
   };
-  const sessionsBulkBar = sessionsSelecting ? (
-    <BulkActionBar
-      selectedIds={selectedIds}
-      allConversations={displayPagination.rows}
-      onDeselectAll={onDeselectAll}
-      onExit={onExitSelectionMode}
-      onProjectAssigned={expandProject}
-    />
-  ) : undefined;
+  const sessionsBulkBar =
+    sessionsSelecting && !unifiedSelection ? (
+      <BulkActionBar
+        selectedIds={selectedIds}
+        allConversations={displayPagination.rows}
+        onDeselectAll={onDeselectAll}
+        onExit={onExitSelectionMode}
+        onProjectAssigned={expandProject}
+      />
+    ) : undefined;
   // The filter stays reachable while bulk-selecting; switching scope just exits
   // selection. Only the "select" entry point hides, being already active.
+  const selectSessionsButton = (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          aria-label="Select sessions"
+          data-testid="toggle-selection-mode"
+          className="text-muted-foreground"
+          onClick={(event) => {
+            event.stopPropagation();
+            onEnterSelectionMode("sessions");
+          }}
+        >
+          <ListChecksIcon className="size-3.5" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">Select sessions</TooltipContent>
+    </Tooltip>
+  );
+  // A unified selection puts "Select sessions" on the Projects header instead.
   const sessionsHeaderActions = !selectionMode ? (
     <div className="flex items-center gap-0.5">
       <Tooltip>
@@ -2495,25 +2527,7 @@ function ConversationList({
         </TooltipTrigger>
         <TooltipContent side="bottom">New session</TooltipContent>
       </Tooltip>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label="Select sessions"
-            data-testid="toggle-selection-mode"
-            className="text-muted-foreground"
-            onClick={(event) => {
-              event.stopPropagation();
-              onEnterSelectionMode("sessions");
-            }}
-          >
-            <ListChecksIcon className="size-3.5" />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">Select sessions</TooltipContent>
-      </Tooltip>
+      {!unifiedSelection && selectSessionsButton}
     </div>
   ) : undefined;
   const sessionsFilterMenu = (
@@ -2674,7 +2688,11 @@ function ConversationList({
                         projectsSelecting ? (
                           <BulkActionBar
                             selectedIds={selectedIds}
-                            allConversations={projectSessionPool}
+                            allConversations={
+                              unifiedSelection
+                                ? [...projectSessionPool, ...displayPagination.rows]
+                                : projectSessionPool
+                            }
                             onDeselectAll={onDeselectAll}
                             onExit={onExitSelectionMode}
                             onProjectAssigned={expandProject}
@@ -2683,34 +2701,41 @@ function ConversationList({
                       }
                       headerAction={
                         !selectionMode ? (
-                          <ProjectHeaderActions
-                            onOrderChange={(manual) => {
-                              const ranks = new Map(
-                                projectOrder.data?.ordered_project_ids?.map((id, index) => [
-                                  id,
-                                  index,
-                                ]),
-                              );
-                              const restored = [...projects].sort(
-                                (a, b) =>
-                                  (ranks.get(a.id ?? "") ?? Infinity) -
-                                  (ranks.get(b.id ?? "") ?? Infinity),
-                              );
-                              saveOrder.mutate(manual ? restored : null);
-                            }}
-                            manualOrder={projectOrder.data?.sort_mode === "manual"}
-                            orderDisabled={saveOrder.isPending || !projectOrder.data}
-                            projectNames={sections.projectGroups.map((group) => group.name)}
-                            collapsed={effectiveCollapsedSections.includes("Projects")}
-                            expandedProjects={expandedProjects}
-                            hasProjectSessions={sections.projectGroups.some(
-                              (group) => group.conversations.length > 0,
-                            )}
-                            onExpandAll={expandAllProjects}
-                            onCollapseAll={collapseAllProjects}
-                            onProjectCreated={expandProject}
-                            onEnterSelectionMode={() => onEnterSelectionMode("projects")}
-                          />
+                          <>
+                            <ProjectHeaderActions
+                              onOrderChange={(manual) => {
+                                const ranks = new Map(
+                                  projectOrder.data?.ordered_project_ids?.map((id, index) => [
+                                    id,
+                                    index,
+                                  ]),
+                                );
+                                const restored = [...projects].sort(
+                                  (a, b) =>
+                                    (ranks.get(a.id ?? "") ?? Infinity) -
+                                    (ranks.get(b.id ?? "") ?? Infinity),
+                                );
+                                saveOrder.mutate(manual ? restored : null);
+                              }}
+                              manualOrder={projectOrder.data?.sort_mode === "manual"}
+                              orderDisabled={saveOrder.isPending || !projectOrder.data}
+                              projectNames={sections.projectGroups.map((group) => group.name)}
+                              collapsed={effectiveCollapsedSections.includes("Projects")}
+                              expandedProjects={expandedProjects}
+                              // A unified selection starts from the header's own button.
+                              hasProjectSessions={
+                                !unifiedSelection &&
+                                sections.projectGroups.some(
+                                  (group) => group.conversations.length > 0,
+                                )
+                              }
+                              onExpandAll={expandAllProjects}
+                              onCollapseAll={collapseAllProjects}
+                              onProjectCreated={expandProject}
+                              onEnterSelectionMode={() => onEnterSelectionMode("projects")}
+                            />
+                            {unifiedSelection && selectSessionsButton}
+                          </>
                         ) : undefined
                       }
                     >
@@ -3495,7 +3520,7 @@ function SectionGroup({
             className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5"
           >
             {headerAction && (
-              <div className="flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100">
+              <div className="flex items-center gap-0.5 transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100">
                 {headerAction}
               </div>
             )}

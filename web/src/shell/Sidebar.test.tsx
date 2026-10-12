@@ -3127,7 +3127,11 @@ describe("Sidebar view options", () => {
     expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
     expect(groupHeaders()).toEqual(["Working", "Done"]);
     expect(within(groupSection("Done")).getByText("conv_shared")).toBeInTheDocument();
-    expect(within(groupSection("Working")).getByTestId("session-filter")).toBeTruthy();
+    // The first group carries every list control: filter, Select and New session.
+    const working = groupSection("Working");
+    expect(within(working).getByTestId("session-filter")).toBeTruthy();
+    expect(within(working).getByTestId("toggle-selection-mode")).toBeTruthy();
+    expect(within(working).getByTestId("sessions-new-session")).toBeTruthy();
   });
 
   it("keeps the filter reachable on the Sessions header when there's nothing to group", () => {
@@ -3207,15 +3211,14 @@ describe("Sidebar view options", () => {
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
   });
 
-  it("leaves project selection when the grouping changes", () => {
+  it("leaves selection when the grouping changes", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     renderGroupingSidebar();
     fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
-    openProjectsMenu();
-    fireEvent.click(screen.getByTestId("projects-select-sessions"));
+    fireEvent.click(screen.getByTestId("toggle-selection-mode"));
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
 
     // Grouped views hide Projects (and its bulk bar), so selection ends.
@@ -3485,22 +3488,51 @@ describe("sidebar_grouping_ui release flag", () => {
     expect(usePullRequestInfoMock).not.toHaveBeenCalled();
   });
 
-  it("puts the one filter on the Projects header, reachable while selecting", () => {
+  it("puts the filter and Select on the Projects header, leaving New session on Sessions", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderGroupingSidebar();
 
     expect(screen.getAllByRole("button", { name: "Filter sessions" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Select sessions" })).toHaveLength(1);
     const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
     expect(within(sessions).queryByTestId("session-filter")).toBeNull();
+    expect(within(sessions).queryByTestId("toggle-selection-mode")).toBeNull();
+    expect(within(sessions).getByTestId("sessions-new-session")).toBeInTheDocument();
     const projects = screen.getByRole("button", { name: "Projects" }).closest("section")!;
     const filter = within(projects).getByTestId("session-filter");
     // Outside the hover-faded wrapper, so it never fades.
     expect(filter.closest("[data-header-controls]")).toHaveClass("absolute", "right-1");
     expect(filter.closest(".md\\:opacity-0")).toBeNull();
 
-    fireEvent.click(within(sessions).getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(within(projects).getByTestId("toggle-selection-mode"));
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
     expect(within(projects).getByTestId("session-filter")).toBe(filter);
+  });
+
+  it("selects project, Shared and Sessions rows together from the Projects header", () => {
+    projectsMock.push("Alpha");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Alpha" } }),
+      conv("conv_mine", "Claude Code"),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
+    ]);
+    renderGroupingSidebar();
+    selectSessionFilter("all");
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+
+    // The Projects menu no longer offers its own, folder-only selection.
+    openProjectsMenu();
+    expect(screen.queryByTestId("projects-select-sessions")).toBeNull();
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+
+    const projects = screen.getByRole("button", { name: "Projects" }).closest("section")!;
+    fireEvent.click(within(projects).getByTestId("toggle-selection-mode"));
+    for (const name of ["conv_filed", "conv_mine", "conv_shared"]) {
+      fireEvent.click(screen.getByRole("link", { name: new RegExp(name) }));
+    }
+    // One bulk bar, under the Projects header, counting all three.
+    expect(screen.getAllByRole("button", { name: "Exit selection mode" })).toHaveLength(1);
+    expect(within(projects).getByText("3 selected")).toBeInTheDocument();
   });
 
   it("lists other owners' sessions in a Shared section above Sessions", () => {
@@ -3547,7 +3579,9 @@ describe("sidebar_grouping_ui release flag", () => {
     renderGroupingSidebar();
     showSharedTab();
 
-    // Shared carries the list controls when Sessions isn't shown.
+    // Shared carries New session when Sessions isn't shown; Select stays on Projects.
+    const shared = screen.getByRole("button", { name: "Shared" }).closest("section")!;
+    expect(within(shared).getByTestId("sessions-new-session")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
     fireEvent.click(screen.getByRole("link", { name: /conv_shared/ }));
     expect(screen.getByText("1 selected")).toBeInTheDocument();

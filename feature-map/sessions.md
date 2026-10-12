@@ -73,7 +73,8 @@ the header menu), and each place is a separate entry point.
   (Updated / Status) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. Shared sessions get their own section above Sessions. A
   Status or Updated grouping replaces Projects, Shared and Sessions with titled
-  groups; the first group's header takes the Projects header's place. Behind
+  groups; the first group's header takes the Projects header's place. Select
+  sessions sits beside the filter and selects every list below it at once. Behind
   the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
   a flat Display filter and the tooltip keeps its plain layout.
 
@@ -106,7 +107,9 @@ menu, then filter by project.
 **Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
 Projects header holds Grouping, Display, Ordering and Show. In a Status or
 Updated grouping, Projects is hidden and the funnel sits in the same spot on the
-first group's header. Hovering a row opens
+first group's header. The Select sessions button sits beside it and selects
+project, Shared and Sessions rows together; the Sessions header keeps only New
+session. Hovering a row opens
 its tooltip; the repo and PR rows load from the session's GitHub info only once
 the tooltip opens. With the flag off, the funnel sits on the Sessions header and
 offers Display only.
