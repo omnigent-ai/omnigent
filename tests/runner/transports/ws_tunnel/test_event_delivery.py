@@ -131,6 +131,184 @@ async def test_lost_ack_replays_after_tunnel_reconnect() -> None:
     assert not dispatcher.has_pending
 
 
+async def test_stalled_session_leaves_a_worker_for_other_sessions() -> None:
+    dispatcher = RunnerEventDispatcher()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    sent: list[str] = []
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        sent.append(frame.session_id)
+        if frame.session_id == "session-a" and not release.is_set():
+            started.set()
+            await release.wait()
+        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    dispatcher.ready(send)
+    first = asyncio.create_task(dispatcher.submit("session-a", [_ITEM]))
+    tasks = [first]
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        second = asyncio.create_task(dispatcher.submit("session-a", [_ITEM]))
+        tasks.append(second)
+        await asyncio.sleep(0)
+        other = asyncio.create_task(dispatcher.submit("session-b", [_ITEM]))
+        tasks.append(other)
+        assert (await asyncio.wait_for(other, timeout=2)).applied == 1
+        assert sent == ["session-a", "session-b"]
+        release.set()
+        assert [ack.applied for ack in await asyncio.gather(first, second)] == [1, 1]
+        assert sent == ["session-a", "session-b", "session-a"]
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+        for worker in dispatcher._workers:
+            worker.cancel()
+        await asyncio.gather(*dispatcher._workers, return_exceptions=True)
+
+
+async def test_cancelled_admission_does_not_send_or_block_a_later_item() -> None:
+    dispatcher = RunnerEventDispatcher()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    sent: list[str] = []
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        source_id = frame.events[0]["data"]["source_id"]
+        sent.append(source_id)
+        if source_id == "first":
+            started.set()
+            await release.wait()
+        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    def item(source_id: str) -> dict[str, Any]:
+        return {**_ITEM, "data": {**_ITEM["data"], "source_id": source_id}}
+
+    dispatcher.ready(send)
+    first = asyncio.create_task(dispatcher.submit("session-a", [item("first")]))
+    tasks = [first]
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        waiting = asyncio.create_task(dispatcher.submit("session-a", [item("cancelled")]))
+        tasks.append(waiting)
+        await asyncio.sleep(0)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        release.set()
+        assert (await asyncio.wait_for(first, timeout=2)).applied == 1
+        assert (
+            await asyncio.wait_for(dispatcher.submit("session-a", [item("fresh")]), 2)
+        ).applied == 1
+        assert sent == ["first", "fresh"]
+        assert not dispatcher.has_pending
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+        for worker in dispatcher._workers:
+            worker.cancel()
+        await asyncio.gather(*dispatcher._workers, return_exceptions=True)
+
+
+async def test_cancelled_delivery_keeps_order_while_another_session_progresses() -> None:
+    dispatcher = RunnerEventDispatcher()
+    started = asyncio.Event()
+    cleaning = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    sent: list[str] = []
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        source_id = frame.events[0]["data"]["source_id"]
+        sent.append(source_id)
+        if source_id == "first":
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.set()
+                await release_cleanup.wait()
+        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    def item(source_id: str) -> dict[str, Any]:
+        return {**_ITEM, "data": {**_ITEM["data"], "source_id": source_id}}
+
+    dispatcher.ready(send)
+    first = asyncio.create_task(dispatcher.submit("session-a", [item("first")]))
+    tasks = [first]
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await asyncio.wait_for(cleaning.wait(), timeout=2)
+        second = asyncio.create_task(dispatcher.submit("session-a", [item("second")]))
+        tasks.append(second)
+        await asyncio.sleep(0)
+        ack = await asyncio.wait_for(dispatcher.submit("session-b", [item("other")]), timeout=2)
+        assert ack.applied == 1
+        assert sent == ["first", "other"]
+        release_cleanup.set()
+        assert (await asyncio.wait_for(second, timeout=2)).applied == 1
+        assert sent == ["first", "other", "second"]
+        assert not dispatcher.has_pending
+    finally:
+        release_cleanup.set()
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+        for worker in dispatcher._workers:
+            worker.cancel()
+        await asyncio.gather(*dispatcher._workers, return_exceptions=True)
+
+
+async def test_cancelled_queue_admission_releases_session_for_later_delivery() -> None:
+    dispatcher = RunnerEventDispatcher()
+    release = asyncio.Event()
+    started = asyncio.Event()
+    sent: list[str] = []
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        sent.append(frame.session_id)
+        if len(sent) == 2:
+            started.set()
+        await release.wait()
+        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    async def wait_for_backpressure() -> None:
+        while not dispatcher._queue.full():
+            await asyncio.sleep(0)
+
+    dispatcher.ready(send)
+    tasks = [asyncio.create_task(dispatcher.submit(f"session-{i}", [_ITEM])) for i in range(35)]
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await asyncio.wait_for(wait_for_backpressure(), timeout=2)
+        # Cancel one queued item and one producer still waiting for queue space.
+        for index in (2, 34):
+            tasks[index].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await tasks[index]
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+        for index in (2, 34):
+            session_id = f"session-{index}"
+            assert session_id not in sent
+            assert (await asyncio.wait_for(dispatcher.submit(session_id, [_ITEM]), 2)).applied == 1
+        assert not dispatcher.has_pending
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+        for worker in dispatcher._workers:
+            worker.cancel()
+        await asyncio.gather(*dispatcher._workers, return_exceptions=True)
+
+
 async def test_single_item_child_array_preserves_http_acknowledgement() -> None:
     dispatcher = RunnerEventDispatcher()
     tunneled: list[str] = []
