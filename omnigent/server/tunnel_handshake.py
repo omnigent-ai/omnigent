@@ -13,6 +13,7 @@ from starlette.websockets import WebSocket
 from omnigent.debug_logging import debug_event
 
 _logger = logging.getLogger(__name__)
+# Hosts spend up to ~25 s on owner lookup and capability discovery before hello.
 HELLO_TIMEOUT_S = 30.0
 
 
