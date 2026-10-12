@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
@@ -40,6 +41,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from omnigent.server import tunnel_handshake
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
@@ -762,6 +764,43 @@ async def test_host_tunnel_rejects_non_hello_first_frame(
     close = await comm.receive_output(timeout=budget(1.0))
     assert close["type"] == "websocket.close"
     assert close.get("code") == 4001
+
+
+async def _await_close(
+    communicator: ApplicationCommunicator, *, timeout: float
+) -> dict[str, object]:
+    """Return the first ``websocket.close`` the route sends within ``timeout`` seconds."""
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        try:
+            message = await communicator.receive_output(timeout=max(remaining, 0.0))
+        except asyncio.TimeoutError:
+            pytest.fail(
+                f"host tunnel was still open {timeout:.0f}s after accept without a "
+                "host.hello frame; expected the server to close it"
+            )
+        if message["type"] == "websocket.close":
+            return message
+
+
+async def test_host_tunnel_closes_silent_peer_within_handshake_bound(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An accepted peer that never sends host.hello is closed with retryable 1013."""
+    monkeypatch.setattr(tunnel_handshake, "HELLO_TIMEOUT_S", 0.2)
+    app, registry, store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        close = await _await_close(comm, timeout=budget(5.0))
+        assert close.get("code") == 1013
+        assert registry.get(_HOST_ID) is None
+        assert await asyncio.to_thread(store.get_host, _HOST_ID) is None
+        await asyncio.wait_for(comm.future, budget(1.0))
+    finally:
+        comm.stop(exceptions=False)
+        await asyncio.gather(comm.future, return_exceptions=True)
 
 
 async def test_host_tunnel_routes_launch_result_to_future(
