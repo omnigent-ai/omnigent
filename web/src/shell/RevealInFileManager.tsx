@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   getHostIdentity,
+  isElectronShell,
   onHostStatusChanged,
   revealFile,
   supportsFileReveal,
@@ -45,7 +46,7 @@ function readLocalHostId() {
 }
 
 function subscribeToHostId(listener: () => void) {
-  if (!watchingHost && supportsFileReveal()) {
+  if (!watchingHost && isElectronShell()) {
     watchingHost = true;
     readLocalHostId();
     onHostStatusChanged(readLocalHostId);
@@ -56,8 +57,13 @@ function subscribeToHostId(listener: () => void) {
   };
 }
 
+/** This machine's host id from the desktop shell; null in a browser or before its first connect. */
+export function useDesktopHostId(): string | null {
+  return useSyncExternalStore(subscribeToHostId, () => localHostId);
+}
+
 function useLocalHostId(): string | null {
-  const hostId = useSyncExternalStore(subscribeToHostId, () => localHostId);
+  const hostId = useDesktopHostId();
   return supportsFileReveal() ? hostId : null;
 }
 

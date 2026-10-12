@@ -89,8 +89,9 @@ def test_status_grouping_and_show_toggles_persist_across_reload(
     for title in ("Needs attention", "Working", "Done"):
         expect(_section_header(page, title)).to_be_visible()
     expect(_section_header(page, "Sessions")).to_have_count(0)
-    # Grouped views fold project sessions into the groups.
-    expect(_section_header(page, "Projects")).to_have_count(0)
+    # Projects (with the one filter button) stays put whatever the grouping.
+    projects = page.locator("section").filter(has=_section_header(page, "Projects"))
+    expect(projects.get_by_test_id("session-filter")).to_be_visible()
 
     idle_row = page.locator("li").filter(has=page.locator(f'a[href="/c/{_IDLE}"]'))
     expect(idle_row.get_by_test_id("session-row-meta")).to_have_count(0)

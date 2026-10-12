@@ -551,7 +551,8 @@ describe("Sidebar session list", () => {
     expect(screen.getByText("pinned-session")).toBe(pinned);
     expect(screen.getByText("filed-session")).toBe(filed);
     expect(screen.getByTestId("session-filter")).toBe(filter);
-    const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+    const listTitle = view === "shared" ? "Shared" : "Sessions";
+    const sessions = screen.getByRole("button", { name: listTitle }).closest("section")!;
     expect(within(sessions).getByRole("status")).toHaveTextContent(
       state === "loading" ? "Loading…" : /could not be loaded|Failed to load/,
     );
@@ -1127,21 +1128,24 @@ describe("Sidebar session list", () => {
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
 
-    const filterSessions = within(sessionsSection!).getByRole("button", {
+    // One filter for every list, on the Projects row (which never moves),
+    // outside the hover-faded wrapper.
+    expect(screen.getAllByRole("button", { name: "Filter sessions" })).toHaveLength(1);
+    expect(within(sessionsSection!).queryByRole("button", { name: "Filter sessions" })).toBeNull();
+    const projectsSection = screen.getByRole("button", { name: "Projects" }).closest("section")!;
+    const filterSessions = within(projectsSection).getByRole("button", {
       name: "Filter sessions",
     });
-    // The filter never fades; its persistent-action wrapper re-enables hit-testing
-    // inside the pointer-events-gated outer box (see the overlay hit-test spec below).
-    const filterTooltipTrigger = filterSessions.parentElement!;
-    const filterPersistentAction = filterTooltipTrigger.parentElement!;
-    expect(filterTooltipTrigger).not.toHaveClass("md:opacity-0");
-    expect(filterPersistentAction).toHaveClass("pointer-events-auto", "flex");
-    expect(filterPersistentAction.parentElement).toHaveClass("absolute", "right-1", "flex");
+    expect(filterSessions.closest("[data-header-controls]")).toHaveClass("absolute", "right-1");
+    expect(filterSessions.closest(".md\\:opacity-0")).toBeNull();
 
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
     expect(within(sessionsSection!).queryByRole("button", { name: "Select sessions" })).toBeNull();
     expect(within(sessionsSection!).queryByRole("link", { name: "New session" })).toBeNull();
+    expect(within(projectsSection).getByRole("button", { name: "Filter sessions" })).toBe(
+      filterSessions,
+    );
   });
 
   it("renders the 'Automations' nav row directly under 'New session' and routes to /tasks", () => {
@@ -1760,9 +1764,14 @@ describe("Sidebar sections", () => {
     // "All sessions": everything the viewer can see.
     selectSessionFilter("all");
     const recentSection = screen.getByText("Sessions").closest("section")!;
+    const sharedSection = screen.getByText("Shared").closest("section")!;
     expect(within(recentSection).getByText("conv_mine_legacy")).toBeInTheDocument();
     expect(within(recentSection).getByText("conv_mine_acl")).toBeInTheDocument();
-    expect(within(recentSection).getByText("conv_shared")).toBeInTheDocument();
+    expect(within(recentSection).queryByText("conv_shared")).toBeNull();
+    expect(within(sharedSection).getByText("conv_shared")).toBeInTheDocument();
+    expect(
+      sharedSection.compareDocumentPosition(recentSection) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
 
     // "My sessions": owned only, no shared one leaking in (which would make the
     // viewer think they own it).
@@ -1770,12 +1779,14 @@ describe("Sidebar sections", () => {
     expect(screen.getByText("conv_mine_legacy")).toBeInTheDocument();
     expect(screen.getByText("conv_mine_acl")).toBeInTheDocument();
     expect(screen.queryByText("conv_shared")).toBeNull();
+    expect(screen.queryByText("Shared")).toBeNull();
 
     // "Shared sessions": only the shared one, owned ones hidden.
     showSharedTab();
-    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+    expect(within(screen.getByText("Shared").closest("section")!).getByText("conv_shared"));
     expect(screen.queryByText("conv_mine_legacy")).toBeNull();
     expect(screen.queryByText("conv_mine_acl")).toBeNull();
+    expect(screen.queryByText("Sessions")).toBeNull();
   });
 
   it("titles the baseline list Sessions even with no sibling group", () => {
@@ -1921,11 +1932,11 @@ describe("Sidebar tabs", () => {
     // The shared session shows on "All sessions" (the default "My sessions" tab
     // scopes it out). The owned session is filed (peeled out of the flat list
     // into its collapsed folder), but the shared collision stays in the flat
-    // Sessions list rather than being pulled into the viewer's folder.
+    // Shared list rather than being pulled into the viewer's folder.
     selectSessionFilter("all");
-    const sessionsSection = screen.getByText("Sessions").closest("section")!;
-    expect(within(sessionsSection).queryByText("conv_owned")).toBeNull();
-    expect(within(sessionsSection).getByText("conv_shared_alpha")).toBeInTheDocument();
+    const sharedSection = screen.getByText("Shared").closest("section")!;
+    expect(screen.queryByText("conv_owned")).toBeNull();
+    expect(within(sharedSection).getByText("conv_shared_alpha")).toBeInTheDocument();
   });
 
   it("keeps paginating when the shared tab is empty on the loaded page but more exist", () => {
@@ -3068,7 +3079,7 @@ describe("Sidebar view options", () => {
       .filter((title) => GROUP_TITLES.has(title));
   const groupSection = (title: string) => screen.getByText(title).closest("section")!;
 
-  it("groups sessions by status, folding project sessions into the groups", () => {
+  it("groups unfiled sessions by status, leaving project sessions in their folders", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_done", "Claude Code", { status: "idle", updated_at: 300 }),
@@ -3093,12 +3104,13 @@ describe("Sidebar view options", () => {
     expect(groupHeaders()).toEqual(["Needs attention", "Working", "Done"]);
     expect(within(groupSection("Needs attention")).getByText("conv_waiting")).toBeInTheDocument();
     expect(within(groupSection("Working")).getByText("conv_running")).toBeInTheDocument();
-    const done = within(groupSection("Done")).getAllByRole("link");
-    expect(done.map((link) => link.textContent)).toEqual(["conv_done", "conv_filed"]);
-    expect(screen.queryByText("Projects")).toBeNull();
+    const done = within(groupSection("Done")).getAllByRole("link", { name: /^conv_/ });
+    expect(done.map((link) => link.textContent)).toEqual(["conv_done"]);
+    expect(screen.queryByText("conv_filed")).toBeNull(); // in the collapsed Customer X folder
     expect(screen.queryByText("Sessions")).toBeNull();
-    // The first group carries the filter menu, so it stays reachable.
-    expect(within(groupSection("Needs attention")).getByTestId("session-filter")).toBeTruthy();
+    // The filter stays on the Projects row whatever the grouping.
+    expect(within(groupSection("Projects")).getByTestId("session-filter")).toBeTruthy();
+    expect(within(groupSection("Needs attention")).queryByTestId("session-filter")).toBeNull();
     expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
       grouping: "status",
     });
@@ -3244,7 +3256,8 @@ describe("Sidebar view options", () => {
     fireEvent.click(screen.getByTestId("session-show-environment"));
     fireEvent.click(screen.getByTestId("session-show-updated"));
 
-    expect(within(row).getByTestId("session-row-meta")).toHaveTextContent("Build Mac·fix/retries");
+    // The row names a host's kind, not the host; the tooltip carries the name.
+    expect(within(row).getByTestId("session-row-meta")).toHaveTextContent("Remote·fix/retries");
     expect(within(row).getByTestId("session-row-updated")).toHaveTextContent("2m");
     // With a second line, the controls and the timestamp stay on the title line.
     expect(controls()).toHaveClass("top-4", "md:top-3.5");
@@ -3257,6 +3270,22 @@ describe("Sidebar view options", () => {
       "environment",
       "branch",
     ]);
+  });
+
+  it("labels this machine's host by device instead of its host name", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ show: ["environment"] }));
+    // A loopback server with one online host: that host is this machine.
+    isServerLocalMock.mockReturnValue(true);
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_here", name: "Build Mac", sandbox_provider: null, status: "online" }],
+    });
+    mockConversations([conv("conv_here", "Codex", { status: "idle", host_id: "host_here" })]);
+    renderSidebar();
+    const meta = within(screen.getByText("conv_here").closest("li")!).getByTestId(
+      "session-row-meta",
+    );
+    expect(meta).toHaveTextContent(/^This /);
+    expect(meta).not.toHaveTextContent("Build Mac");
   });
 
   it("shows a managed-sandbox session's repo name from its label when Show → Repo is on", () => {

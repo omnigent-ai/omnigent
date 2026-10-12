@@ -68,10 +68,11 @@ the header menu), and each place is a separate entry point.
   composer; sending returns to that board with the new session selected.
 - `canvas-session-health`: an opened Canvas session receives host health and
   live updates even before it appears in the loaded sidebar pages.
-- `view-options`: the sidebar filter menu's Grouping (Default / Status /
-  Updated), Display (All / My / Shared / Archived), Ordering (Updated / Status)
-  and Show (Updated / Environment / Branch) submenus, saved per device. Grouped
-  views replace the Projects and Sessions sections with titled groups.
+- `view-options`: the one filter menu, on the Projects header, with Grouping
+  (Default / Status / Updated), Display (All / My / Shared / Archived), Ordering
+  (Updated / Status) and Show (Updated / Environment / Repo / Branch) submenus,
+  saved per device. Shared sessions get their own section above Sessions;
+  grouped views split the viewer's unfiled sessions into titled groups.
 
 ## How to get to it (user POV)
 

@@ -44,7 +44,7 @@ function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => conversationPage(conversations));
 }
 
-/** Pick a scope from the Sessions heading's filter menu. */
+/** Pick a scope from the Projects heading's filter menu. */
 function switchTo(testId: "sidebar-tab-mine" | "sidebar-tab-shared") {
   const value = testId === "sidebar-tab-mine" ? "mine" : "shared";
   fireEvent.pointerDown(screen.getByTestId("session-filter"), {
@@ -126,5 +126,16 @@ describe("scope filter during selection mode", () => {
     fireEvent.click(screen.getByTestId("new-chat-button"));
     expect(screen.queryByRole("button", { name: "Exit selection mode" })).toBeNull();
     expect(screen.queryByText("1 selected")).toBeNull();
+  });
+
+  it("selects from the Shared list when it's the only list", () => {
+    renderSidebar();
+    switchTo("sidebar-tab-shared");
+
+    // Shared carries the list controls when Sessions isn't shown.
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("link", { name: /conv_shared/ }));
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
   });
 });
