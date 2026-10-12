@@ -276,6 +276,8 @@ export interface DesktopFeatures {
    * window's server is Databricks-managed.
    */
   databricksInternalFeatures?: boolean;
+  /** This window may offer one-click Arca extension. */
+  canExtendArca?: boolean;
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */

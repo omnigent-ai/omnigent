@@ -675,7 +675,9 @@ describe("Arca extend IPC", () => {
     t.after(h.cleanup);
     h.api.registerIpc();
     const extend = h.ipc.get("omnigent:arca-extend");
+    const features = h.ipc.get("omnigent:get-desktop-features");
     const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    assert.equal(features(event).canExtendArca, true);
     assert.deepEqual(await extend(event, "overnight"), { ok: true, shutdownAt: null });
     assert.deepEqual(h.calls.arcaExtends, ["overnight"]);
     assert.equal((await extend(event, "default")).ok, false);
@@ -684,6 +686,7 @@ describe("Arca extend IPC", () => {
       extend({ ...event, senderFrame: { url: "https://evil.example" } }, "workweek"),
       /connected server page/,
     );
+    assert.equal(features({ ...event, senderFrame: { url: "https://evil.example" } }), null);
     h.setUrl("https://evil.example");
     await assert.rejects(extend(event, "workweek"), /connected server page/);
     assert.deepEqual(h.calls.arcaExtends, ["overnight"]);
@@ -695,11 +698,20 @@ describe("Arca extend IPC", () => {
     });
     t.after(h.cleanup);
     h.api.registerIpc();
-    const result = await h.ipc.get("omnigent:arca-extend")(
-      { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } },
-      "overnight",
-    );
+    const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+    assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).canExtendArca, false);
+    const result = await h.ipc.get("omnigent:arca-extend")(event, "overnight");
     assert.equal(result.ok, false);
+    assert.deepEqual(h.calls.arcaExtends, []);
+  });
+
+  it("rejects Arca extension on a local server even with internal features", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: "http://localhost:6767", internalFeatures: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+    assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).canExtendArca, false);
+    assert.equal((await h.ipc.get("omnigent:arca-extend")(event, "overnight")).ok, false);
     assert.deepEqual(h.calls.arcaExtends, []);
   });
 });

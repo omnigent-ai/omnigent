@@ -14,14 +14,14 @@ import {
   markWarnedToday,
 } from "@/lib/arcaShutdownWarning";
 import { copyText } from "@/lib/clipboard";
-import { hasArcaExtendBridge } from "@/lib/nativeBridge";
-import { ArcaExtendActions } from "./ArcaExtendActions";
+import { ArcaExtendActions, useCanExtendArca } from "./ArcaExtendActions";
 
 const OVERNIGHT_COMMAND = "arca extend overnight";
 
 export function ArcaShutdownToast() {
   const { data: hosts } = useHosts();
   const now = useNow();
+  const desktopExtend = useCanExtendArca();
   const [visibility, setVisibility] = useState(() => document.visibilityState);
   const [, refresh] = useReducer((value: number) => value + 1, 0);
   const shownToastId = useRef<string | null>(null);
@@ -57,11 +57,10 @@ export function ArcaShutdownToast() {
       shownToastId.current = null;
       return;
     }
-    if (visibility !== "visible" || isWarnedToday(now)) return;
+    if (visibility !== "visible" || isWarnedToday(now) || desktopExtend === null) return;
 
     markWarnedToday(now);
     shownToastId.current = id;
-    const desktopExtend = hasArcaExtendBridge();
     toast("Arca shuts down at about 6 PM", {
       id,
       description: desktopExtend ? (
@@ -116,7 +115,7 @@ export function ArcaShutdownToast() {
           },
       cancel: { label: "Not now", onClick: () => dismissToday(new Date()) },
     });
-  }, [now, hasOnlineArcaHost, dismissedToday, visibility]);
+  }, [now, hasOnlineArcaHost, dismissedToday, visibility, desktopExtend]);
 
   return null;
 }

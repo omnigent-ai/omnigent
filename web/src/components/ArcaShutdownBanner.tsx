@@ -4,8 +4,7 @@ import { useMarkArcaBannerWhenVisible } from "@/hooks/useArcaShutdownBanner";
 import { offersWorkweek } from "@/lib/arcaShutdownWarning";
 import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
-import { hasArcaExtendBridge } from "@/lib/nativeBridge";
-import { ArcaExtendActions } from "./ArcaExtendActions";
+import { ArcaExtendActions, useCanExtendArca } from "./ArcaExtendActions";
 
 function CommandCopyButton({ command }: { command: string }) {
   const [copied, setCopied] = useState(false);
@@ -58,7 +57,7 @@ export function ArcaShutdownBanner({
   useMarkArcaBannerWhenVisible(warning.day);
   const commands = ["arca extend overnight"];
   if (offersWorkweek(new Date(`${warning.day}T12:00:00`))) commands.push("arca extend workweek");
-  const desktopExtend = hasArcaExtendBridge();
+  const desktopExtend = useCanExtendArca();
   const copyCommands = (
     <div className="flex flex-wrap gap-2">
       {commands.map((command) => (
@@ -88,11 +87,11 @@ export function ArcaShutdownBanner({
                 onSuccess={warning.dismissToday}
                 fallback={() => copyCommands}
               />
-            ) : (
+            ) : desktopExtend === false ? (
               copyCommands
-            )}
+            ) : null}
           </div>
-          {!desktopExtend && (
+          {desktopExtend === false && (
             <p className="mt-1.5 text-muted-foreground">
               Run this on your laptop. Already extended? You can ignore this.
             </p>

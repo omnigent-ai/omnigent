@@ -4649,15 +4649,16 @@ function registerIpc() {
   // (a workspace mount or a Databricks App) — internal features must not
   // light up against arbitrary self-hosted servers. Read fresh per call so
   // applying/removing the profile takes effect without a restart.
+  const canExtendArca = (event) =>
+    databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(senderServerUrl(event));
+
   ipcMain.handle("omnigent:get-desktop-features", (event) => {
     if (!isPinnedOriginSender(event)) {
       console.warn("[omnigent] get-desktop-features from untrusted sender dropped");
       return null;
     }
-    return {
-      databricksInternalFeatures:
-        databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(senderServerUrl(event)),
-    };
+    const enabled = canExtendArca(event);
+    return { databricksInternalFeatures: enabled, canExtendArca: enabled };
   });
 
   // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
@@ -4719,10 +4720,7 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) {
       throw new Error("arca-extend is only available to a connected server page");
     }
-    if (
-      !databricksInternalFeaturesEnabled() ||
-      !isDatabricksManagedServerUrl(senderServerUrl(event))
-    ) {
+    if (!canExtendArca(event)) {
       return { ok: false, error: "Arca support is not enabled for this server." };
     }
     if (!arca.ARCA_EXTEND_MODES.includes(mode)) {

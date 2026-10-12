@@ -73,18 +73,31 @@ describe("ArcaShutdownBanner", () => {
     expect(screen.queryByText("arca extend workweek")).toBeNull();
   });
 
-  it("shows only Not now beside desktop extend actions", () => {
+  it("shows only Not now beside desktop extend actions", async () => {
     (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
       kind: "electron",
       extendArca: vi.fn(),
+      getDesktopFeatures: vi.fn().mockResolvedValue({ canExtendArca: true }),
     };
     render(<Banner />);
-    expect(screen.getByRole("button", { name: "Keep running tonight" })).toBeTruthy();
+    await screen.findByRole("button", { name: "Keep running tonight" });
     expect(screen.getByRole("button", { name: "Keep running this week" })).toBeTruthy();
     expect(screen.queryByText("Run this on your laptop.")).toBeNull();
     expect(screen.queryByRole("button", { name: /Copy arca/ })).toBeNull();
     expect(screen.getByRole("button", { name: "Not now" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Don't remind me" })).toBeNull();
+  });
+
+  it("shows copy commands when the desktop gate is disabled", async () => {
+    (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
+      kind: "electron",
+      extendArca: vi.fn(),
+      getDesktopFeatures: vi.fn().mockResolvedValue({ canExtendArca: false }),
+    };
+    render(<Banner />);
+    expect(await screen.findByRole("button", { name: "Copy arca extend overnight" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Keep running tonight" })).toBeNull();
+    expect(screen.getByText(/Run this on your laptop/)).toBeTruthy();
   });
 
   it("disables both desktop actions while extending and hides workweek on Thursday", async () => {
@@ -97,9 +110,10 @@ describe("ArcaShutdownBanner", () => {
     (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
       kind: "electron",
       extendArca,
+      getDesktopFeatures: vi.fn().mockResolvedValue({ canExtendArca: true }),
     };
     render(<Banner />);
-    fireEvent.click(screen.getByRole("button", { name: "Keep running tonight" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep running tonight" }));
     expect(screen.getByRole("button", { name: "Extending Arca…" })).toHaveProperty(
       "disabled",
       true,
@@ -122,12 +136,19 @@ describe("ArcaShutdownBanner", () => {
     (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
       kind: "electron",
       extendArca,
+      getDesktopFeatures: vi.fn().mockResolvedValue({ canExtendArca: true }),
     };
     render(<Banner />);
+    await act(async () => {});
     fireEvent.click(screen.getByRole("button", { name: "Keep running tonight" }));
     expect(extendArca).toHaveBeenCalledWith("overnight");
     await act(async () => {});
-    expect(screen.getByText(/Arca will keep running until/)).toBeTruthy();
+    const shortTime = new Date(Date.UTC(2026, 9, 6, 1)).toLocaleString(undefined, {
+      weekday: "short",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+    expect(screen.getByText(`Arca will keep running until ${shortTime}`)).toBeTruthy();
     act(() => vi.advanceTimersByTime(2000));
     expect(screen.queryByText(/Your Arca will shut down/)).toBeNull();
   });
@@ -137,9 +158,10 @@ describe("ArcaShutdownBanner", () => {
     (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
       kind: "electron",
       extendArca,
+      getDesktopFeatures: vi.fn().mockResolvedValue({ canExtendArca: true }),
     };
     render(<Banner />);
-    fireEvent.click(screen.getByRole("button", { name: "Keep running tonight" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep running tonight" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Arca is offline");
     expect(screen.getByRole("button", { name: "Copy arca extend overnight" })).toBeTruthy();
   });

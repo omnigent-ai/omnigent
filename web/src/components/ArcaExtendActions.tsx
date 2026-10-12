@@ -1,6 +1,30 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { offersWorkweek } from "@/lib/arcaShutdownWarning";
-import { extendArca, type ArcaExtendMode } from "@/lib/nativeBridge";
+import {
+  extendArca,
+  getDesktopFeatures,
+  hasArcaExtendBridge,
+  type ArcaExtendMode,
+} from "@/lib/nativeBridge";
+
+export function useCanExtendArca(): boolean | null {
+  const [available, setAvailable] = useState<boolean | null>(() =>
+    hasArcaExtendBridge() ? null : false,
+  );
+
+  useEffect(() => {
+    if (!hasArcaExtendBridge()) return;
+    let active = true;
+    void getDesktopFeatures().then((features) => {
+      if (active) setAvailable(features?.canExtendArca === true);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  return available;
+}
 
 export function ArcaExtendActions({
   day,
@@ -34,7 +58,9 @@ export function ArcaExtendActions({
       return;
     }
     const until =
-      result.shutdownAt === null ? "" : ` until ${new Date(result.shutdownAt).toLocaleString()}`;
+      result.shutdownAt === null
+        ? ""
+        : ` until ${new Date(result.shutdownAt).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" })}`;
     setConfirmation(`Arca will keep running${until}`);
     timer.current = setTimeout(onSuccess, 2000);
   };

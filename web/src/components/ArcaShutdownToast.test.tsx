@@ -112,6 +112,7 @@ describe("ArcaShutdownToast", () => {
     (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
       kind: "electron",
       extendArca,
+      getDesktopFeatures: vi.fn().mockResolvedValue({ canExtendArca: true }),
     };
     render(<ToastPage />);
     expect(await screen.findByRole("button", { name: "Keep running tonight" })).toBeInTheDocument();
@@ -121,6 +122,18 @@ describe("ArcaShutdownToast", () => {
     expect(extendArca).toHaveBeenCalledWith("workweek");
     expect(await screen.findByRole("alert")).toHaveTextContent("Instance unavailable");
     expect(screen.getByRole("button", { name: "Copy arca extend workweek" })).toBeInTheDocument();
+  });
+
+  it("offers copy commands when the desktop gate is disabled", async () => {
+    (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
+      kind: "electron",
+      extendArca: vi.fn(),
+      getDesktopFeatures: vi.fn().mockResolvedValue({ canExtendArca: false }),
+    };
+    render(<ToastPage />);
+    expect(await screen.findByRole("button", { name: "Copy command" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Keep running tonight" })).toBeNull();
+    expect(screen.getByText(/on your laptop to keep it running/)).toBeInTheDocument();
   });
 
   it("dismisses a shown toast when the host goes offline", async () => {
