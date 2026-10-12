@@ -71,6 +71,7 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.llms.errors import detect_request_size_overflow
+from omnigent.native.failure_telemetry import failure_log_attributes
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -3555,6 +3556,8 @@ def create_runner_app(
                     "runner_turn_failed",
                     session_id=conv_id,
                     harness=harness,
+                    response_id=response_id,
+                    **failure_log_attributes(source.get("failure_context")),
                     **dimensions,
                 ),
             )
