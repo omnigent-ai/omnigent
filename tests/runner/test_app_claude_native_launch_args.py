@@ -155,6 +155,9 @@ def test_build_claude_native_base_args_resume_prefix(
     missing prefix when an id is supplied) would mean a daemon/web-UI
     resume silently starts a fresh Claude session instead of reopening
     the prior transcript.
+
+    ``resume_fork=False`` keeps the in-place resume vector under test;
+    the fork variant is covered separately.
     """
     assert (
         _build_claude_native_base_args(
@@ -162,6 +165,7 @@ def test_build_claude_native_base_args_resume_prefix(
             model_override=model_override,
             terminal_launch_args=terminal_launch_args,
             resume_external_session_id=resume,
+            resume_fork=False,
         )
         == expected
     )
@@ -181,6 +185,7 @@ def test_build_claude_native_base_args_carries_pinned_permission_mode_into_resum
         model_override="claude-opus-5",
         terminal_launch_args=["--permission-mode", "auto"],
         resume_external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        resume_fork=False,
     )
 
     assert args == (
@@ -191,6 +196,56 @@ def test_build_claude_native_base_args_carries_pinned_permission_mode_into_resum
         "--model",
         "claude-opus-5",
     )
+
+
+def test_build_claude_native_base_args_default_resume_forks() -> None:
+    """
+    By default a resume branches a copy via ``--fork-session``.
+
+    Claude's CLI refuses a bare ``--resume <id>`` whenever a separate live
+    process still holds the id (its background-session guard — the reported
+    bug: a resume failing while a local terminal stays attached). When the
+    launcher has not confirmed the id is free, forking is the safe default,
+    so ``--fork-session`` must sit immediately after ``--resume <id>`` and
+    before every other arg.
+    """
+    args = _build_claude_native_base_args(
+        reasoning_effort="high",
+        model_override="claude-opus-5",
+        terminal_launch_args=["--verbose"],
+        resume_external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+    )
+
+    assert args == (
+        "--resume",
+        "02857840-6362-408f-b41f-309e396ed7c6",
+        "--fork-session",
+        "--effort",
+        "high",
+        "--verbose",
+        "--model",
+        "claude-opus-5",
+    )
+
+
+def test_build_claude_native_base_args_resume_fork_only_with_resume_id() -> None:
+    """
+    ``--fork-session`` is never emitted without a resume id.
+
+    ``resume_fork`` defaults to ``True`` but only governs the resume branch;
+    a fresh launch (no ``resume_external_session_id``) must not pick up a
+    stray ``--fork-session``.
+    """
+    args = _build_claude_native_base_args(
+        reasoning_effort=None,
+        model_override=None,
+        terminal_launch_args=["--verbose"],
+        resume_external_session_id=None,
+        resume_fork=True,
+    )
+
+    assert args == ("--verbose",)
+    assert "--fork-session" not in args
 
 
 def test_claude_terminal_env_unset_masks_key_with_api_key_helper() -> None:
