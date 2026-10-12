@@ -11643,7 +11643,7 @@ def agent_grp() -> None:
 _GITHUB_SOURCE_RE = re.compile(
     r"^(?:github:|https://github\.com/)?"
     r"(?P<owner>\w[\w.-]*)/(?P<repo>\w[\w.-]*?)(?:\.git)?"
-    r"(?:/tree/(?P<tree_ref>[^/]+))?(?P<subpath>(?:/\w[\w.-]*)*)/?(?:@(?P<name>[\w.-]+))?$"
+    r"(?:/tree/(?P<tree_ref>[^/@]+))?(?P<subpath>(?:/\w[\w.-]*)*)/?(?:@(?P<name>[\w.-]+))?$"
 )
 
 
@@ -11666,6 +11666,12 @@ def _find_agent_dirs(root: Path) -> list[Path]:
     for cfg in sorted(root.rglob("config.yaml"), key=lambda p: (len(p.parts), p)):
         if ".git" in cfg.parts or any(d in cfg.parents for d in found):
             continue
+        if cfg.is_symlink():
+            # Checked before anything reads it, so even --list can't follow it.
+            raise _agent_cli_error(
+                f"{_printable(cfg.relative_to(root).as_posix())} is a symlink; refusing to "
+                "read an agent config through a symlink from a remote repo."
+            )
         found.append(cfg.parent)
     return found
 
@@ -11674,7 +11680,7 @@ def _agent_dir_name(agent_dir: Path) -> str:
     """The agent's ``name`` from its ``config.yaml``, else the directory name."""
     try:
         name = yaml.safe_load((agent_dir / "config.yaml").read_text()).get("name")
-    except (yaml.YAMLError, AttributeError, OSError):
+    except (yaml.YAMLError, AttributeError, OSError, ValueError):  # ValueError: bad UTF-8
         name = None
     return name if isinstance(name, str) and name else agent_dir.name
 
@@ -11722,24 +11728,31 @@ def _bundle_untrusted_dir(source: Path) -> bytes:
 
 def _clone_github_source(clone_url: str, ref: str | None, dest: Path) -> None:
     """Shallow-clone without submodules, hooks, or credential prompts."""
-    if ref and re.fullmatch(r"[0-9a-f]{7,40}", ref):
-        raise _agent_cli_error(
-            f"{ref!r} looks like a commit SHA; use a branch or tag name in /tree/<ref>."
-        )
     cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
            "-c", "protocol.https.allow=always", "clone", "--depth", "1",
            "--no-recurse-submodules", "--quiet"]  # fmt: skip
     if ref:
         cmd += ["--branch", ref]
-    proc = subprocess.run(
-        [*cmd, "--", clone_url, str(dest)],
-        capture_output=True,
-        text=True,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"},
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [*cmd, "--", clone_url, str(dest)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"},
+            check=False,
+            timeout=300,
+        )
+    except FileNotFoundError:
+        raise _agent_cli_error("Installing from GitHub needs git on your PATH.") from None
+    except subprocess.TimeoutExpired:
+        raise _agent_cli_error(f"Timed out cloning {clone_url}.") from None
     if proc.returncode != 0:
-        raise _agent_cli_error(f"Could not clone {clone_url}: {proc.stderr.strip()}")
+        hint = (
+            "\n(Only branch and tag names work as a ref, not commit SHAs.)"
+            if ref and re.fullmatch(r"[0-9a-f]{7,40}", ref)
+            else ""
+        )
+        raise _agent_cli_error(f"Could not clone {clone_url}: {proc.stderr.strip()}{hint}")
 
 
 def _upload_agent(client: Any, bundle_bytes: bytes) -> None:  # type: ignore[explicit-any]  # httpx.Client
@@ -11749,7 +11762,8 @@ def _upload_agent(client: Any, bundle_bytes: bytes) -> None:  # type: ignore[exp
     )
     _raise_for_agent_api(resp)
     agent = resp.json()
-    click.echo(f"Installed {agent['name']} (version {agent['version']}, id {agent['id']})")
+    name = _printable(str(agent["name"]))
+    click.echo(f"Installed {name} (version {agent['version']}, id {agent['id']})")
     if agent["version"] > 1:
         # Terminal (TUI) harnesses keep the agent they launched with.
         click.echo(
@@ -11776,7 +11790,7 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
     A GitHub repo (``owner/repo[/path][@agent]`` or a github.com URL) is
     shallow-cloned and every agent directory in it (or just ``@agent``) is
     installed after you confirm. Its ``${VAR}`` references are not resolved
-    from this shell.
+    from this shell. A ``/tree/<ref>`` must be a branch or tag without ``/``.
 
     \b
     Examples:
@@ -11852,7 +11866,7 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
                 try:
                     _upload_agent(client, bundle_bytes)
                 except click.ClickException as exc:
-                    click.echo(f"Skipped {_printable(n)}: {exc.message}", err=True)
+                    click.echo(f"Skipped {_printable(n)}: {_printable(exc.message)}", err=True)
                     failed.append(n)
         if failed:
             raise _agent_cli_error(f"{len(failed)} of {len(bundles)} agent(s) not installed.")

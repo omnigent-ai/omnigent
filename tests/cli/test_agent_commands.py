@@ -94,14 +94,8 @@ def test_add_uploads_the_whole_directory(tmp_path: Path, server: _FakeServer) ->
     assert result.exit_code == 0, result.output
     assert "Installed orion (version 3" in result.output
     assert "terminal sessions do when they relaunch" in result.output
-    post = next(r for r in server.seen if r.method == "POST")
-    body = post.read()
-    boundary = post.headers["content-type"].split("boundary=")[1].encode()
-    start = body.index(b"\x1f\x8b")  # the gzip part of the multipart body
-    tar_bytes = body[start : body.index(b"\r\n--" + boundary, start)]
-    with tarfile.open(fileobj=io.BytesIO(gzip.decompress(tar_bytes)), mode="r:") as tf:
-        names = {n.lstrip("./") for n in tf.getnames()}
-    assert {"config.yaml", "agents/worker/config.yaml"} <= names
+    (bundle,) = _posted_tars(server)
+    assert {"config.yaml", "agents/worker/config.yaml"} <= {n.lstrip("./") for n in bundle}
 
 
 def _posted_tars(server: _FakeServer) -> list[dict[str, bytes]]:
@@ -305,6 +299,10 @@ def test_add_github_repo_refuses_a_symlinked_subpath(
             ("https://github.com/acme/agents.git", None, "sub/x", "orion"),
         ),
         (
+            "https://github.com/acme/agents/tree/v1@orion",
+            ("https://github.com/acme/agents.git", "v1", "", "orion"),
+        ),
+        (
             "https://github.com/acme/agents/tree/v1/sub@orion",
             ("https://github.com/acme/agents.git", "v1", "sub", "orion"),
         ),
@@ -332,9 +330,69 @@ def test_clone_github_source_is_hardened(monkeypatch: pytest.MonkeyPatch, tmp_pa
     )
     assert cmd[cmd.index("--branch") + 1] == "v1" and cmd[-3] == "--"
     assert env["GIT_TERMINAL_PROMPT"] == "0" and env["GIT_LFS_SKIP_SMUDGE"] == "1"
-    with pytest.raises(click.ClickException, match="looks like a commit SHA"):
-        cli_mod._clone_github_source("https://github.com/a/b.git", "0a1b2c3d", tmp_path / "r")
-    assert len(seen) == 1
+    # A hex-looking name can be a real branch or tag, so git decides; a failure hints at SHAs.
+    with pytest.raises(click.ClickException, match="not commit SHAs"):
+        cli_mod._clone_github_source("https://github.com/a/b.git", "deadbee", tmp_path / "r")
+    assert seen[1][0][seen[1][0].index("--branch") + 1] == "deadbee"
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (FileNotFoundError("git"), "needs git on your PATH"),
+        (cli_mod.subprocess.TimeoutExpired("git", 300), "Timed out cloning"),
+    ],
+)
+def test_clone_github_source_reports_tool_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception, message: str
+) -> None:
+    def run(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(cli_mod.subprocess, "run", run)
+    with pytest.raises(click.ClickException, match=message):
+        cli_mod._clone_github_source("https://github.com/a/b.git", None, tmp_path / "r")
+
+
+def test_add_github_repo_refuses_a_symlinked_config_before_reading_it(
+    fake_repo: _FakeRepo, server: _FakeServer, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("name: stolen-secret\n")
+    (fake_repo[0] / "vega" / "config.yaml").unlink()
+    (fake_repo[0] / "vega" / "config.yaml").symlink_to(outside)
+    result = CliRunner().invoke(cli_mod.cli, ["agent", "add", "acme/agents", "--list"])
+    assert result.exit_code != 0
+    assert "vega/config.yaml is a symlink" in result.output
+    assert "stolen-secret" not in result.output
+
+
+def test_add_github_repo_tolerates_a_non_utf8_config(
+    fake_repo: _FakeRepo, server: _FakeServer
+) -> None:
+    (fake_repo[0] / "vega" / "config.yaml").write_bytes(b"name: \xff\xfe\n")
+    result = CliRunner().invoke(cli_mod.cli, ["agent", "add", "acme/agents", "--list"])
+    assert result.exit_code == 0, result.output
+    assert "vega  (vega)" in result.output, "falls back to the directory name"
+
+
+def test_add_github_repo_escapes_server_names_and_errors(
+    fake_repo: _FakeRepo, server: _FakeServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replies = iter(
+        [
+            httpx.Response(422, json={"detail": "bad key \x1b]8;;https://x\x07"}),
+            httpx.Response(200, json={"id": "ag_1", "name": "ok\x1b[2K\r", "version": 1}),
+        ]
+    )
+    real = server.__call__
+    monkeypatch.setattr(
+        _FakeServer, "__call__", lambda self, r: next(replies) if r.method == "POST" else real(r)
+    )
+    result = CliRunner().invoke(cli_mod.cli, ["agent", "add", "acme/agents", "-y"])
+    assert "\x1b" not in result.output + result.stderr and "\r" not in result.output
+    assert "Installed ok\\x1b[2K\\r" in result.output
+    assert "bad key \\x1b]8;;" in result.stderr
 
 
 def test_list_pages_through_your_agents(server: _FakeServer) -> None:
