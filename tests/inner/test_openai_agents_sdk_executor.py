@@ -2291,6 +2291,42 @@ def test_run_turn_auth_error_yields_actionable_message(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_run_turn_generic_sdk_error_carries_the_exception():
+    """A provider failure the executor cannot name keeps the SDK exception on the event."""
+    import openai
+
+    rate_limit = openai.RateLimitError(
+        "Error code: 429 - Selected model is at capacity. Please try a different model.",
+        response=httpx.Response(
+            429, request=httpx.Request("POST", "https://model-serving.test/v1/responses")
+        ),
+        body=None,
+    )
+    _FakeRunner.last_calls = []
+    _FakeRunner.next_result = _FakeResult(events=[], exception=rate_limit)
+
+    executor = OpenAIAgentsSDKExecutor(client=object())
+    with patch(
+        "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+        return_value=_fake_agents_sdk(),
+    ):
+        events = _run(
+            _collect(
+                executor.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="",
+                    config=ExecutorConfig(),
+                )
+            )
+        )
+
+    error_events = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(error_events) == 1, f"Expected exactly 1 ExecutorError, got events: {events!r}"
+    assert error_events[0].exception is rate_limit
+    assert "Selected model is at capacity" in error_events[0].message
+
+
 def test_normalize_content_blocks_input_file_data_uri_converted_to_input_text() -> None:
     """``input_file`` blocks with a ``data:`` URI are decoded to ``input_text``.
 
