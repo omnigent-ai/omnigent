@@ -79,3 +79,6 @@ async def test_side_chat_turn_status_settles_without_touching_parent(
     )
     parent_state = read_bridge_state(bridge_dir)
     assert parent_state is not None and parent_state.active_turn_id == "turn_parent"
+    # The runner's cwd is the session workspace: a child's turn state must not
+    # leave bridge files (``state.lock``) there.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["parent"]

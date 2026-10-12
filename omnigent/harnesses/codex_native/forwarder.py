@@ -38,6 +38,7 @@ from omnigent.harnesses.codex_native.bridge import (
     MCP_STARTUP_STATES,
     CodexNativeBridgeState,
     DeveloperInstructionsReadState,
+    bridge_root,
     clear_active_turn_id_if_matches,
     clear_certificate_failure,
     codex_config_revision,
@@ -398,6 +399,8 @@ class _CodexForwarderState:
     :param codex_client: Connected Codex app-server client. Set by
         ``supervise_forwarder`` so child backfill can issue
         ``thread/resume`` requests.
+    :param bridge_dir: The parent session's bridge directory, which child
+        backfill replays a child's items through.
     :param subagents_by_thread: Maps Codex child thread ids to Omnigent child
         session ids, e.g. ``{"thread_child": "conv_child"}``.
     :param pending_child_threads: Codex child thread ids announced by
@@ -466,6 +469,7 @@ class _CodexForwarderState:
     posted_approval_preset: str | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
+    bridge_dir: Path | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
@@ -2135,6 +2139,7 @@ async def supervise_forwarder(
         forwarder_state = _CodexForwarderState(
             parent_session_id=session_id,
             codex_client=client,
+            bridge_dir=bridge_dir,
         )
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
@@ -3110,7 +3115,7 @@ async def _handle_event(
     if await _maybe_handle_turn_event(
         client,
         session_id=route_session_id,
-        bridge_dir=bridge_dir if not is_child else Path(),
+        bridge_dir=bridge_dir if not is_child else _child_thread_bridge_dir(bridge_dir),
         method=method,
         params=params,
         usage_coalescer=(child_coalescer if child_coalescer is not None else usage_coalescer),
@@ -3141,6 +3146,21 @@ async def _handle_event(
             forwarder_state=forwarder_state,
             bridge_dir=bridge_dir,
         )
+
+
+def _child_thread_bridge_dir(parent_bridge_dir: Path | None) -> Path:
+    """
+    Return the bridge directory a Codex child thread's turn events use.
+
+    A child's turns must not move its parent's active turn, so they read and
+    write a directory that never holds bridge state. It can't be ``Path()``:
+    the runner's cwd is the session workspace, where lock files would land.
+
+    :param parent_bridge_dir: The parent session's bridge directory; ``None``
+        falls back to the bridge root.
+    :returns: A ``child-threads`` directory inside it.
+    """
+    return (parent_bridge_dir or bridge_root()) / "child-threads"
 
 
 def _resolve_event_session(
@@ -5766,10 +5786,12 @@ async def _apply_child_resume(
     # because child items do not trigger elicitation requests on the parent.
     child_elicitation_tracker = _CodexElicitationTaskTracker()
     try:
+        # The parent's bridge, as for live child items, so replayed file changes
+        # reach its tool relay. Resume status only touches the bridge's own thread.
         await _replay_resume_response(
             client,
             session_id=child_session_id,
-            bridge_dir=Path(),
+            bridge_dir=forwarder_state.bridge_dir or _child_thread_bridge_dir(None),
             response=response,
             usage_coalescer=usage_coalescer,
             elicitation_tracker=child_elicitation_tracker,

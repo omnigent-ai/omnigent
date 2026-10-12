@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
@@ -190,6 +193,62 @@ async def test_backfill_child_thread_falls_back_to_thread_read_on_unloaded_subag
         for post in client.posts
     )
     assert forwarder_state.needs_child_thread_backfill("thread_child") is False
+
+
+@pytest.mark.asyncio
+async def test_backfill_child_thread_reports_file_changes_through_the_parent_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A replayed child file change reaches the parent's tool relay.
+
+    The replay used to resolve bridge files against the runner's cwd (the session
+    workspace), so the relay lookup failed and bridge lock files could land there.
+    """
+    monkeypatch.chdir(tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "tool_relay.json").write_text(
+        json.dumps({"url": "http://relay.local", "token": "relay-secret"}), encoding="utf-8"
+    )
+    observed: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        fwd,
+        "_post_file_change_observer",
+        lambda url, _token, payload: observed.append((url, payload["tool_input"])),
+    )
+    change = {"path": "src/app.py", "kind": {"type": "update"}}
+    turn = {
+        "id": "turn_child",
+        "status": "completed",
+        "items": [
+            {"type": "fileChange", "id": "fc_1", "status": "completed", "changes": [change]}
+        ],
+    }
+    codex_client = _FakeChildResumeClient(
+        resume_response=_child_resume_response("thread_child", turns=[turn])
+    )
+    forwarder_state = fwd._CodexForwarderState(
+        parent_session_id="conv_parent", bridge_dir=bridge_dir
+    )
+    forwarder_state.note_child_thread("thread_child", "conv_child")
+
+    await fwd._backfill_child_thread(
+        _RecordingClient(),  # type: ignore[arg-type]
+        codex_client,  # type: ignore[arg-type]
+        parent_session_id="conv_parent",
+        child_session_id="conv_child",
+        child_thread_id="thread_child",
+        forwarder_state=forwarder_state,
+    )
+
+    assert observed == [
+        (
+            "http://relay.local/hook/observe-tool",
+            {"changes": [{"path": "src/app.py", "kind": {"type": "update"}}]},
+        )
+    ]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["bridge"]
 
 
 @pytest.mark.asyncio
