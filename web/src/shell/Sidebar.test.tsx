@@ -3144,6 +3144,20 @@ describe("Sidebar view options", () => {
     expect(within(sessions).getByTestId("session-filter")).toBeTruthy();
   });
 
+  it("puts the open session in Working while it starts up, like its spinner", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
+    mockConversations([conv("conv_new", "Codex", { status: "idle", updated_at: 100 })]);
+    renderGroupingSidebar();
+    expect(groupHeaders()).toEqual(["Done"]);
+
+    // The first send is in flight but the server hasn't reported `running` yet.
+    act(() => useChatStore.setState({ conversationId: "conv_new", status: "streaming" }));
+    expect(groupHeaders()).toEqual(["Working"]);
+
+    act(() => useChatStore.setState({ status: "idle" }));
+    expect(groupHeaders()).toEqual(["Done"]);
+  });
+
   it("moves a session out of Unread as soon as it's marked read", () => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
     seedReadState([{ id: "conv_unread", viewer_last_seen: 100 }]);

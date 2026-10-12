@@ -22,6 +22,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -1677,6 +1678,21 @@ interface ConversationListProps {
   getVisibleIdsRef: RefObject<() => string[]>;
 }
 
+const ignoreChatStore = () => () => {};
+
+/**
+ * The open conversation while it starts up — a send in flight or its terminal
+ * launching, before the server reports `running` (the row's `isStartingUp`).
+ * Disabled: null and no subscription.
+ */
+function useStartingConversationId(enabled: boolean): string | null {
+  return useSyncExternalStore(enabled ? useChatStore.subscribe : ignoreChatStore, () => {
+    if (!enabled) return null;
+    const s = useChatStore.getState();
+    return s.status === "streaming" || s.terminalPending ? s.conversationId : null;
+  });
+}
+
 function ConversationList({
   conversationsQuery,
   scrollContainerRef,
@@ -1738,6 +1754,7 @@ function ConversationList({
   const statusView = view.grouping === "status" || view.ordering === "status";
   const unseenTick = useUnseenTick(statusView);
   const draftIds = useSessionDraftIds(statusView);
+  const startingId = useStartingConversationId(statusView);
   // All loaded conversations from the single paginated list (for the flat
   // session list; pinned rows are merged in from the server pinned query).
   const allConversations = useMemo(
@@ -1933,7 +1950,9 @@ function ConversationList({
       const frozen = frozenStatus?.get(c.id);
       if (frozen) return frozen;
       const unseen = isConversationUnseen(c.id, c.updated_at, c.status);
-      const live = statusBucket(c, unseen, hasSessionDraft(c.id));
+      const bucket = statusBucket(c, unseen, hasSessionDraft(c.id));
+      // Like the row's spinner, the open session is Working while it starts up.
+      const live = bucket !== "Needs attention" && c.id === startingId ? "Working" : bucket;
       frozenStatus?.set(c.id, live);
       return live;
     };
@@ -1987,6 +2006,7 @@ function ConversationList({
     view.ordering,
     unseenTick,
     draftIds,
+    startingId,
   ]);
 
   const config = useContext(SidebarConfigContext);
