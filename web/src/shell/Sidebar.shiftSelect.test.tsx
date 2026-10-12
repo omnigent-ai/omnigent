@@ -276,6 +276,33 @@ describe("Sidebar shift-click selection", () => {
     expect([...ids].sort()).toEqual(["p1", "p2", "p3"]);
   });
 
+  it("leaves sessions hidden by a project preview out of a shift-select range", async () => {
+    projectsMock.push("Alpha", "Beta");
+    // Older than the preview window: Alpha shows only its three newest.
+    mockConversations([
+      ...[1, 2, 3, 4, 5].map((n) =>
+        conv(`a${n}`, { labels: { omni_project: "Alpha" }, updated_at: 100 - n }),
+      ),
+      conv("b1", { labels: { omni_project: "Beta" }, updated_at: 50 }),
+    ]);
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha", "Beta"]));
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+
+    // a1 → b1 spans Alpha's displayed rows and Beta's, not the hidden a4 and a5.
+    fireEvent.click(await screen.findByRole("link", { name: "a1" }));
+    fireEvent.click(screen.getByRole("link", { name: "b1" }), { shiftKey: true });
+    await waitFor(() => {
+      expect(screen.getByText("4 selected")).toBeInTheDocument();
+    });
+    expect(screen.queryByRole("link", { name: "a4" })).not.toBeInTheDocument();
+  });
+
   it("labels Delete with the owned count when the selection is mixed-ownership", async () => {
     // The flat "All sessions" list mixes the viewer's own sessions with ones
     // shared to them by other owners. Delete acts only on owned rows, so its
