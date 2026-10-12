@@ -4,6 +4,8 @@ import { useMarkArcaBannerWhenVisible } from "@/hooks/useArcaShutdownBanner";
 import { offersWorkweek } from "@/lib/arcaShutdownWarning";
 import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
+import { hasArcaExtendBridge } from "@/lib/nativeBridge";
+import { ArcaExtendActions } from "./ArcaExtendActions";
 
 function CommandCopyButton({ command }: { command: string }) {
   const [copied, setCopied] = useState(false);
@@ -50,12 +52,20 @@ export function ArcaShutdownBanner({
   warning,
   hasTasks = false,
 }: {
-  warning: { day: string; dismissToday: () => void; optOut: () => void };
+  warning: { day: string; dismissToday: () => void };
   hasTasks?: boolean;
 }) {
   useMarkArcaBannerWhenVisible(warning.day);
   const commands = ["arca extend overnight"];
   if (offersWorkweek(new Date(`${warning.day}T12:00:00`))) commands.push("arca extend workweek");
+  const desktopExtend = hasArcaExtendBridge();
+  const copyCommands = (
+    <div className="flex flex-wrap gap-2">
+      {commands.map((command) => (
+        <CommandCopyButton key={command} command={command} />
+      ))}
+    </div>
+  );
 
   return (
     <div
@@ -72,13 +82,21 @@ export function ArcaShutdownBanner({
             Your Arca will shut down at about 6 PM unless you keep it running.
           </p>
           <div className="mt-1.5 flex flex-wrap gap-2">
-            {commands.map((command) => (
-              <CommandCopyButton key={command} command={command} />
-            ))}
+            {desktopExtend ? (
+              <ArcaExtendActions
+                day={warning.day}
+                onSuccess={warning.dismissToday}
+                fallback={() => copyCommands}
+              />
+            ) : (
+              copyCommands
+            )}
           </div>
-          <p className="mt-1.5 text-muted-foreground">
-            Run this on your laptop. Already extended? You can ignore this.
-          </p>
+          {!desktopExtend && (
+            <p className="mt-1.5 text-muted-foreground">
+              Run this on your laptop. Already extended? You can ignore this.
+            </p>
+          )}
           <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1">
             <button
               type="button"
@@ -86,13 +104,6 @@ export function ArcaShutdownBanner({
               onClick={warning.dismissToday}
             >
               Not now
-            </button>
-            <button
-              type="button"
-              className="underline underline-offset-2 hover:no-underline"
-              onClick={warning.optOut}
-            >
-              Don't remind me
             </button>
           </div>
         </div>

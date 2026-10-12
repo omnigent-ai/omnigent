@@ -4715,6 +4715,22 @@ function registerIpc() {
     return arcaConnectFlow.run(win, arcaServerUrl);
   });
 
+  ipcMain.handle("omnigent:arca-extend", async (event, mode) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("arca-extend is only available to a connected server page");
+    }
+    if (
+      !databricksInternalFeaturesEnabled() ||
+      !isDatabricksManagedServerUrl(senderServerUrl(event))
+    ) {
+      return { ok: false, error: "Arca support is not enabled for this server." };
+    }
+    if (!arca.ARCA_EXTEND_MODES.includes(mode)) {
+      return { ok: false, error: "Unsupported arca extend mode." };
+    }
+    return arca.runArcaExtend(mode);
+  });
+
   // Push a status ping when a host child connects or exits on its own (no
   // polling) — the server-management module owns the subprocess and reports
   // lifecycle changes here.

@@ -8,7 +8,9 @@ const {
   buildLoginArgs,
   connectArcaHost,
   describeConnectFailure,
+  readArcaStatus,
   resolveArcaPath,
+  runArcaExtend,
   startArcaConnect,
   startArcaLogin,
 } = require("../src/arca");
@@ -25,6 +27,80 @@ function fakeConnectChild() {
   };
   return child;
 }
+
+function commandDeps(outputs) {
+  const calls = [];
+  return {
+    calls,
+    resolveArcaPath: () => "/bin/arca",
+    spawn: (_path, args) => {
+      calls.push(args);
+      const child = fakeConnectChild();
+      const output = outputs.shift();
+      queueMicrotask(() => {
+        child.stdout.emit("data", output?.stdout ?? "");
+        child.stderr.emit("data", output?.stderr ?? "");
+        child.emit("close", output?.code ?? 0);
+      });
+      return child;
+    },
+  };
+}
+
+describe("arca extend command", () => {
+  const running = '{"status":"running","instance":{"shutdown_time":"2026-10-06T01:00:00Z"}}';
+  it("checks a running instance first and reports the updated shutdown time", async () => {
+    const updated = '{"status":"running","instance":{"shutdown_time":"2026-10-07T01:00:00Z"}}';
+    const deps = commandDeps([{ stdout: running }, { stdout: "Extended" }, { stdout: updated }]);
+    assert.deepEqual(await runArcaExtend("overnight", deps), {
+      ok: true,
+      shutdownAt: Date.UTC(2026, 9, 7, 1),
+    });
+    assert.deepEqual(deps.calls, [
+      ["status", "--json"],
+      ["extend", "overnight"],
+      ["status", "--json"],
+    ]);
+  });
+
+  it("does not invoke extend when status is stopped or lacks an instance", async () => {
+    await Promise.all(
+      ["stopped", "running"].map(async (status) => {
+        const deps = commandDeps([{ stdout: JSON.stringify({ status, instance: null }) }]);
+        assert.equal((await runArcaExtend("workweek", deps)).ok, false);
+        assert.deepEqual(deps.calls, [["status", "--json"]]);
+      }),
+    );
+  });
+
+  it("rejects every mode outside overnight and workweek before spawning", async () => {
+    const deps = commandDeps([]);
+    assert.equal((await runArcaExtend("default", deps)).ok, false);
+    assert.equal((await runArcaExtend(["overnight"], deps)).ok, false);
+    assert.deepEqual(deps.calls, []);
+  });
+
+  it("times out a stuck status check", async () => {
+    const child = fakeConnectChild();
+    const result = await readArcaStatus({
+      resolveArcaPath: () => "/bin/arca",
+      spawn: () => child,
+      timeoutMs: 5,
+    });
+    assert.equal(result.errorKind, "timeout");
+    assert.equal(child.killed, true);
+  });
+
+  it("times out a stuck extend after the status precheck", async () => {
+    const child = fakeConnectChild();
+    const deps = commandDeps([{ stdout: running }]);
+    const firstSpawn = deps.spawn;
+    deps.spawn = (path, args) => (args[0] === "extend" ? child : firstSpawn(path, args));
+    const result = await runArcaExtend("overnight", { ...deps, timeoutMs: 5 });
+    assert.equal(result.errorKind, "timeout");
+    assert.equal(child.killed, true);
+  });
+});
 
 describe("arca binary resolution", () => {
   it("prefers PATH, then falls back to well-known locations", () => {

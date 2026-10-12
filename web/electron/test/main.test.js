@@ -145,6 +145,7 @@ function loadNavigationHarness({
   realBrowserRegistry = false,
   arcaPath = null,
   arcaResult = { ok: true, alreadyRunning: false },
+  arcaExtendResult = { ok: true, shutdownAt: null },
   arcaLoginResult = { ok: true },
   loadServer = async () => {},
   loadURL = null,
@@ -178,6 +179,7 @@ function loadNavigationHarness({
     loading: [],
     reloads: 0,
     arcaConnects: [],
+    arcaExtends: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
     arcaLogins: [],
@@ -441,6 +443,10 @@ function loadNavigationHarness({
       ...require("../src/arca"),
       resolveArcaPath: () => arcaPath,
       resolveArcaPathAsync: async () => arcaPath,
+      runArcaExtend: async (mode) => {
+        calls.arcaExtends.push(mode);
+        return arcaExtendResult;
+      },
       isExecutableFile: (p) => p === arcaPath,
       startArcaConnect: (url) => {
         calls.arcaConnects.push(url);
@@ -661,6 +667,42 @@ function loadNavigationHarness({
     },
   };
 }
+
+describe("Arca extend IPC", () => {
+  it("accepts only the connected page's pinned origin and managed server", async (t) => {
+    const serverUrl = "https://workspace.cloud.databricks.com/omnigent";
+    const h = loadNavigationHarness({ serverUrl, internalFeatures: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const extend = h.ipc.get("omnigent:arca-extend");
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    assert.deepEqual(await extend(event, "overnight"), { ok: true, shutdownAt: null });
+    assert.deepEqual(h.calls.arcaExtends, ["overnight"]);
+    assert.equal((await extend(event, "default")).ok, false);
+    assert.equal((await extend(event, ["overnight"])).ok, false);
+    await assert.rejects(
+      extend({ ...event, senderFrame: { url: "https://evil.example" } }, "workweek"),
+      /connected server page/,
+    );
+    h.setUrl("https://evil.example");
+    await assert.rejects(extend(event, "workweek"), /connected server page/);
+    assert.deepEqual(h.calls.arcaExtends, ["overnight"]);
+  });
+
+  it("rejects Arca extension when the desktop feature is disabled", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: "https://workspace.cloud.databricks.com/omnigent",
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const result = await h.ipc.get("omnigent:arca-extend")(
+      { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } },
+      "overnight",
+    );
+    assert.equal(result.ok, false);
+    assert.deepEqual(h.calls.arcaExtends, []);
+  });
+});
 
 describe("Arca auto-connect wiring", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";

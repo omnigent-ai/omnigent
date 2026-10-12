@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { ArcaShutdownBanner } from "./ArcaShutdownBanner";
@@ -43,11 +43,13 @@ beforeEach(() => {
   state.hosts = [{ host_id: "arca", name: "jackson's arca", status: "online" }];
   vi.mocked(toast.dismiss).mockClear();
   vi.mocked(copyText).mockReset().mockResolvedValue(undefined);
+  delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
 });
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.useRealTimers();
+  delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
 });
 
 describe("ArcaShutdownBanner", () => {
@@ -69,6 +71,77 @@ describe("ArcaShutdownBanner", () => {
     vi.setSystemTime(THU_5PM);
     view.rerender(<Banner />);
     expect(screen.queryByText("arca extend workweek")).toBeNull();
+  });
+
+  it("shows only Not now beside desktop extend actions", () => {
+    (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
+      kind: "electron",
+      extendArca: vi.fn(),
+    };
+    render(<Banner />);
+    expect(screen.getByRole("button", { name: "Keep running tonight" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Keep running this week" })).toBeTruthy();
+    expect(screen.queryByText("Run this on your laptop.")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Copy arca/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Not now" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Don't remind me" })).toBeNull();
+  });
+
+  it("disables both desktop actions while extending and hides workweek on Thursday", async () => {
+    let finish!: (result: { ok: boolean; shutdownAt: null }) => void;
+    const extendArca = vi.fn().mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
+      kind: "electron",
+      extendArca,
+    };
+    render(<Banner />);
+    fireEvent.click(screen.getByRole("button", { name: "Keep running tonight" }));
+    expect(screen.getByRole("button", { name: "Extending Arca…" })).toHaveProperty(
+      "disabled",
+      true,
+    );
+    expect(screen.getByRole("button", { name: "Keep running this week" })).toHaveProperty(
+      "disabled",
+      true,
+    );
+    await act(async () => finish({ ok: true, shutdownAt: null }));
+    cleanup();
+    state.now = THU_5PM;
+    vi.setSystemTime(THU_5PM);
+    render(<Banner />);
+    expect(screen.queryByRole("button", { name: "Keep running this week" })).toBeNull();
+  });
+
+  it("extends, confirms the new shutdown time, then dismisses today", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const extendArca = vi.fn().mockResolvedValue({ ok: true, shutdownAt: Date.UTC(2026, 9, 6, 1) });
+    (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
+      kind: "electron",
+      extendArca,
+    };
+    render(<Banner />);
+    fireEvent.click(screen.getByRole("button", { name: "Keep running tonight" }));
+    expect(extendArca).toHaveBeenCalledWith("overnight");
+    await act(async () => {});
+    expect(screen.getByText(/Arca will keep running until/)).toBeTruthy();
+    act(() => vi.advanceTimersByTime(2000));
+    expect(screen.queryByText(/Your Arca will shut down/)).toBeNull();
+  });
+
+  it("shows the command after desktop extend fails", async () => {
+    const extendArca = vi.fn().mockResolvedValue({ ok: false, error: "Arca is offline" });
+    (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
+      kind: "electron",
+      extendArca,
+    };
+    render(<Banner />);
+    fireEvent.click(screen.getByRole("button", { name: "Keep running tonight" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Arca is offline");
+    expect(screen.getByRole("button", { name: "Copy arca extend overnight" })).toBeTruthy();
   });
 
   it("marks and dismisses the toast only when the banner becomes visible", async () => {
