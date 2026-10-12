@@ -377,14 +377,9 @@ function MonacoCodeEditorInner({
     [setContentRef],
   );
 
-  // Mirror Monaco's native find widget to the toolbar toggle. Gated on `mounted`
-  // so a Find pressed while the lazy chunk was still loading isn't dropped — when
-  // the editor mounts, `mounted` flips and this re-runs with the current flag.
-  // `searchOpen` true opens find; false closes it (so re-clicking the toolbar
-  // button, which toggles the flag, hides the widget). The controller drives the
-  // close directly rather than the open action so it's a real toggle, not a
-  // second open. `searchFocusNonce` re-runs the action for a Cmd+F pressed
-  // while the widget is already open, which refocuses its input.
+  // Mirror Monaco's find widget to the toolbar toggle once `mounted` (so a Find
+  // pressed during the lazy load isn't dropped): `searchOpen` opens/closes it via
+  // the controller; a bumped `searchFocusNonce` re-runs find to refocus its input.
   useEffect(() => {
     if (!mounted) return;
     const editor = editorInstanceRef.current;

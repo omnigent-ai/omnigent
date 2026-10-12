@@ -228,12 +228,9 @@ export function MonacoDiffViewer({
     [],
   );
 
-  // Mirror the "Find in file" toggle to Monaco's native find widget on the
-  // modified side. Gated on `mounted` so a Cmd+F pressed while the lazy chunk
-  // was still loading isn't dropped. `searchOpen` true opens find; false closes
-  // it. The controller drives the close directly so re-toggling is a real close,
-  // not a second open. `searchFocusNonce` re-runs the action for a Cmd+F
-  // pressed while the widget is already open, which refocuses its input.
+  // Mirror the find toggle to Monaco's find widget on the modified side once
+  // `mounted` (so a Cmd+F during the lazy load isn't dropped): `searchOpen`
+  // opens/closes it via the controller; a bumped `searchFocusNonce` refocuses it.
   useEffect(() => {
     if (!mounted) return;
     const editor = modifiedEditorRef.current;

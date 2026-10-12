@@ -20,7 +20,8 @@ from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+# The hello_world runner writes seeded files into the server's cwd, the repo root.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 _FILE_PATH = "search_target.py"
 _FILE_CONTENT = """\
@@ -98,8 +99,7 @@ def test_cmd_f_refocuses_open_find_widget_on_macos(
     expect(viewer.locator(".find-widget.visible")).to_be_visible()
 
     page.keyboard.press("Meta+f")
-    page.wait_for_timeout(500)
-    page.keyboard.type("zq")
     expect(find_input).to_be_focused()
+    page.keyboard.type("zq")
     expect(find_input).to_have_value(re.compile(r"zq$"))
     expect(code).not_to_contain_text("zq")
