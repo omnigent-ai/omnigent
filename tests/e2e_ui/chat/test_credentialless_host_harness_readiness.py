@@ -42,7 +42,6 @@ import json
 import os
 import re
 import shutil
-import sys
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -53,6 +52,7 @@ import pytest
 from playwright.async_api import async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.compat import runner_executable
 from tests._helpers.host import isolated_host
 from tests.e2e_ui.conftest import _register_agent_yaml
 
@@ -100,7 +100,7 @@ def credentialless_host(
             base_env=base_env,
             name=f"credless-{uuid.uuid4().hex[:8]}",
             command=[
-                sys.executable,
+                runner_executable(),
                 "-m",
                 "omnigent",
                 "host",

@@ -67,6 +67,7 @@ def isolated_host(
     """Start a compat-aware daemon with owned HOME/config/data and a unique identity.
 
     ``command`` can preserve a CLI entry point or install a caller's fault.
+    Use a fresh root for each host; existing identity files are rejected.
     Readiness is explicit: pass a callback or call wait_online with an authenticated
     client. Cleanup also runs when the callback or the test raises.
     """
@@ -76,9 +77,8 @@ def isolated_host(
     config.mkdir(exist_ok=True)
     host_id = host_id or uuid.uuid4().hex
     name = name or f"e2e-host-{host_id[:12]}"
-    (config / "config.yaml").write_text(
-        yaml.safe_dump({"host": {"host_id": host_id, "name": name}})
-    )
+    with (config / "config.yaml").open("x") as identity:
+        yaml.safe_dump({"host": {"host_id": host_id, "name": name}}, identity)
     overrides = dict(env or {})
     owned = {
         "OMNIGENT_CONFIG_HOME",
