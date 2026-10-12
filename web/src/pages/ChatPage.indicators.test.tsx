@@ -373,11 +373,11 @@ describe("BubbleView dispatch", () => {
   it("spans the column for a fold-only turn so the row's hairline draws", () => {
     // WHY: shrink-wrapped to the ~110px summary row, the trailing hairline
     // (a flex-1 span) collapses to zero width and the click target stops
-    // short of the column. The max-w-3xl cap keeps it aligned with the rule
+    // short of the column. The prose cap keeps it aligned with the rule
     // under an answered turn.
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
     const bubble = screen.getByTestId("message-bubble");
-    expect(bubble).toHaveClass("max-w-3xl", "min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]");
+    expect(bubble).toHaveClass("max-w-[var(--chat-prose-width)]");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(bubble.firstElementChild).not.toHaveClass("w-fit");
   });

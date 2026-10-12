@@ -1515,6 +1515,26 @@ html[data-electron-mac] .breadcrumb-folder {
   margin-bottom: 0;
 }
 
+/* Use the usable chat column so side panels and split views keep narrow prose. */
+.chat-conversation-content {
+  container: chat-column / inline-size;
+}
+
+.is-assistant {
+  --chat-prose-width: 80ch;
+}
+
+@container chat-column (min-width: 64rem) {
+  .is-assistant {
+    --chat-prose-width: 120ch;
+  }
+}
+
+/* Prose shares one limit in ordinary replies and replies with wide content. */
+.chat-markdown > :is(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6) {
+  max-width: var(--chat-prose-width, 80ch);
+}
+
 .chat-markdown :is(ul, ol) {
   list-style-position: outside;
   padding-inline-start: 1.5em;
