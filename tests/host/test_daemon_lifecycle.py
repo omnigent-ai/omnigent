@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -251,6 +252,43 @@ def test_background_daemon_claims_record_before_connecting(
     assert payload["config_sig"] == "config-signature"
     assert connected == [f"{target}|{target}"]
     assert record_flock_is_held(daemon_record_path(target, base_dir=tmp_path)) is False
+
+
+def test_background_daemon_raises_open_file_limit_before_spawning_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In --local mode the limit is raised before the local server and the host start."""
+    from omnigent.host import _daemon_entry
+    from omnigent.host import identity as identity_module
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
+
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["omnigent.host._daemon_entry", "--local"])
+    monkeypatch.setattr(
+        "omnigent.process_logging.configure_process_logging",
+        lambda *_a, **_kw: tmp_path / "host.log",
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "load_or_create_host_identity",
+        lambda: HostIdentity(host_id="host_local", name="local"),
+    )
+    order: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.util.open_file_limit.raise_soft_open_file_limit",
+        lambda: order.append("raise"),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.local_server.ensure_local_omnigent_server",
+        lambda: order.append("server") or SimpleNamespace(url="http://127.0.0.1:1"),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process", lambda **_kw: order.append("host")
+    )
+
+    _daemon_entry.main()
+
+    assert order == ["raise", "server", "host"]
 
 
 def test_background_daemon_loser_exits_before_connecting(

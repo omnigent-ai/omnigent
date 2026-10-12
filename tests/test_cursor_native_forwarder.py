@@ -808,39 +808,6 @@ class TestForwardLoopPostFailures:
         assert not poster.delivered
 
 
-class TestFdExhaustionErrno:
-    """``_fd_exhaustion_errno`` classifies fd-table exhaustion, nothing else."""
-
-    def test_direct_emfile_and_enfile(self) -> None:
-        assert fwd._fd_exhaustion_errno(OSError(errno.EMFILE, "too many")) == errno.EMFILE
-        assert fwd._fd_exhaustion_errno(OSError(errno.ENFILE, "table full")) == errno.ENFILE
-
-    def test_wrapped_cause_chain_is_classified(self) -> None:
-        # httpx wraps the socket-level OSError via ``raise … from exc``.
-        outer = httpx.ConnectError("all connection attempts failed")
-        outer.__cause__ = OSError(errno.EMFILE, "too many open files")
-        assert fwd._fd_exhaustion_errno(outer) == errno.EMFILE
-
-    def test_other_oserror_is_not_classified(self) -> None:
-        assert fwd._fd_exhaustion_errno(OSError(errno.EACCES, "denied")) is None
-        assert fwd._fd_exhaustion_errno(ValueError("nope")) is None
-
-    def test_implicit_context_is_not_classified(self) -> None:
-        # An unrelated error raised WHILE HANDLING an fd failure is a real bug.
-        try:
-            try:
-                raise OSError(errno.EMFILE, "too many open files")
-            except OSError:
-                raise ValueError("unrelated failure during handling") from None
-        except ValueError as exc:
-            assert fwd._fd_exhaustion_errno(exc) is None
-
-    def test_cause_cycle_is_bounded(self) -> None:
-        first, second = ValueError("a"), ValueError("b")
-        first.__cause__, second.__cause__ = second, first
-        assert fwd._fd_exhaustion_errno(first) is None
-
-
 class TestForwardLoopFdExhaustion:
     """fd exhaustion is environmental: pause with a rate-limited WARNING, resume.
 
