@@ -8,7 +8,7 @@ retain configuration, fault injection and behavioral assertions.
 | Need | Primitive | Existing example |
 | --- | --- | --- |
 | Bundle bytes and upload with caller metadata/client | `bundle_files`, `post_session_bundle` in [session.py](session.py) | [Headless subagent](../e2e/test_codex_native_headless_subagent_e2e.py) |
-| Successful session for an explicit identity | `create_user_session` in [_multi_user_server.py](../e2e_ui/collaboration/_multi_user_server.py) | [Default-public sessions](../e2e_ui/collaboration/test_default_public_sessions.py) |
+| Browser-suite session for an explicit identity | `create_user_session` in [_multi_user_server.py](../e2e_ui/collaboration/_multi_user_server.py) | [Default-public sessions](../e2e_ui/collaboration/test_default_public_sessions.py) |
 | Isolated local server | `isolated_local_server` in [live_server.py](live_server.py) | [Multi-user server](../e2e_ui/collaboration/_multi_user_server.py) |
 | Server and runner lifecycle | `server_runner` in [server_runner.py](server_runner.py) | [Runner shutdown](../e2e/test_runner_shutdown_mcp_notify_hang_e2e.py) |
 | Real host with isolated identity/home | `isolated_host` in [host.py](host.py) | [Host reconnect](../e2e/test_host_transient_404_restart.py) |
@@ -17,7 +17,7 @@ retain configuration, fault injection and behavioral assertions.
 
 ## Session inputs stay explicit
 
-Given an existing server URL and caller-owned agent bundle:
+For browser-suite tests with an existing server URL and caller-owned agent bundle:
 
 ```python
 from tests.e2e_ui.collaboration._multi_user_server import create_user_session
@@ -30,8 +30,10 @@ session_id = create_user_session(
 )
 ```
 
-This convenience function requires success and returns the session ID. For a
-negative request or an exact response assertion, use `post_session_bundle` with
+This convenience function requires success and returns the session ID. Its module
+imports browser fixtures and Playwright; non-browser callers should use
+`post_session_bundle` and explicitly check success. For a negative request or an
+exact response assertion, also use `post_session_bundle` with
 the caller's client instead. This relative URL requires an `httpx.Client` with
 `base_url` set to the test server (otherwise pass an absolute URL):
 

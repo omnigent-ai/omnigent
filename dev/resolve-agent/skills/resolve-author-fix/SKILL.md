@@ -66,12 +66,9 @@ to make it pass; the *code* must change to satisfy it.
 
 Read `tests/README.md` and `tests/_helpers/README.md` in the product checkout
 before writing setup (or nearby fixtures when that repository has no catalog).
-Reuse the catalog's primitives with explicit caller inputs; leave assertions
-and fault injection in the scenario. In `test_audit`, name the nearest test and
-helper considered, explain any new setup, and report permanent test/support
-additions and deletions including helper changes. Extend a primitive for a
-demonstrated missing capability shared by multiple actual consumers; keep a
-unique lifecycle local. A LOC target never justifies removing required coverage.
+Follow its API examples and the selection policy below. In `test_audit`, name
+the nearest test/helper considered, explain any new setup, and report permanent
+test/support additions and deletions including helper changes.
 
 Choose which tests belong in the final PR. Search existing tests by behavior
 and fixture, and read the nearest scenarios. If one already drives the relevant

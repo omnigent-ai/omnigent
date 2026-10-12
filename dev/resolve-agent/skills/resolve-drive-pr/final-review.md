@@ -16,7 +16,7 @@ its base/head and tested contents still match, all required checks passed, and
 `uncovered_boundaries` is empty. Otherwise follow its blocked/partial verdict
 rules; do not approve or call the PR fully verified.
 
-Check the final test diff against the selection in Step 2B.4 and the product
+Check the final test diff against the coverage selection in `test_audit` and the product
 checkout's `tests/_helpers/README.md` (or nearby fixtures if absent). Settle
 avoidable copied setup; use `test_audit` to explain a helper mismatch or distinct
 E2E boundary. Preserve necessary coverage and the original reproduction evidence;
