@@ -8,7 +8,10 @@ import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { ROW_STATUS_SLOT_CLASS } from "./fileStatusUtils";
 import { FlatFileList } from "./FlatFileList";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 beforeEach(() => copyTextMock.mockClear());
 
 /** Render FlatFileList with sensible defaults, overriding only what a test needs. */
@@ -67,6 +70,27 @@ describe("FlatFileList runner-offline state", () => {
 });
 
 describe("FlatFileList status / download alignment", () => {
+  it("shows compact edited time in the metadata slot for the Last edited sort", () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_700_000_240_000);
+    renderList({
+      sort: "recent",
+      files: [
+        {
+          path: "src/app.ts",
+          name: "app.ts",
+          status: "modified",
+          bytes: 2048,
+          modified_at: 1_700_000_000,
+          lines_added: 1,
+          lines_removed: 0,
+        },
+      ],
+    });
+
+    expect(screen.getByText("4m")).toHaveClass("text-muted-foreground");
+    expect(screen.queryByText("2.0 KB")).not.toBeInTheDocument();
+  });
+
   it("shows file size using the same caption treatment as the Files tree", () => {
     renderList({
       files: [

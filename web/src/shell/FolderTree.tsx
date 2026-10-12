@@ -18,13 +18,14 @@ import {
   ROW_META_SLOT_CLASS,
   ROW_STATUS_SLOT_CLASS,
   formatBytes,
+  formatEditedCompact,
   gitStatusLabel,
   gitStatusLetter,
 } from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { RevealBaseContext, useRevealMenu } from "./RevealInFileManager";
-import { useCursorTooltip } from "./useCursorTooltip";
+import { FileRowTooltip } from "./FileRowTooltip";
 import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
 // VS Code–style indentation: folder chevron and file icon share the same x
@@ -569,8 +570,8 @@ function FolderTreeInner({
   }, [cacheKey, treeFiles]);
 
   // Map from file path → change status, for file-level badges in the tree.
-  const changedFileMap = useMemo<Map<string, WorkspaceChangedFile["status"]>>(() => {
-    return new Map(scopedChangedFiles.map((f) => [f.path, f.status]));
+  const changedFileMap = useMemo<Map<string, WorkspaceChangedFile>>(() => {
+    return new Map(scopedChangedFiles.map((file) => [file.path, file]));
   }, [scopedChangedFiles]);
 
   // Map from directory path → highest-priority change status of any descendant.
@@ -817,6 +818,7 @@ function FolderTreeInner({
               onRevealDir={revealDirectory}
               conversationId={conversationId}
               changedFileMap={changedFileMap}
+              showModifiedAt={sort === "recent"}
             />
           ))}
         </ul>
@@ -899,6 +901,7 @@ function FolderTreeInner({
                   onTogglePath={togglePath}
                   changedFileMap={changedFileMap}
                   dirtyDirMap={dirtyDirMap}
+                  showModifiedAt={sort === "recent"}
                   onNavigateDir={onNavigateDir}
                   highlighted={row.kind === "node" && row.key === revealedPath}
                 />
@@ -943,6 +946,10 @@ function FileRowItem({
   labelIsPath = false,
   depth = 0,
   fileStatus,
+  linesAdded,
+  linesRemoved,
+  modifiedAt,
+  showModifiedAt,
   bytes,
   onFileSelect,
   conversationId,
@@ -958,6 +965,10 @@ function FileRowItem({
    *  same column as a folder's chevron at this depth. */
   depth?: number;
   fileStatus: WorkspaceChangedFile["status"] | undefined;
+  linesAdded?: number | null;
+  linesRemoved?: number | null;
+  modifiedAt: number | null;
+  showModifiedAt: boolean;
   bytes: number | null;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
@@ -969,7 +980,6 @@ function FileRowItem({
       : fileStatus === "modified"
         ? "text-amber-500 dark:text-amber-400"
         : undefined;
-  const { handlers, tooltip } = useCursorTooltip(path);
   const reveal = useRevealMenu(isDeleted ? null : path);
 
   return (
@@ -983,57 +993,72 @@ function FileRowItem({
         style={{ paddingLeft: `${indentFor(depth)}px` }}
       >
         <IndentGuides depth={depth} />
-        <button
-          type="button"
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
-          onClick={() => !isDeleted && onFileSelect(path)}
-          disabled={isDeleted}
+        <FileRowTooltip
+          path={path}
+          status={fileStatus}
+          linesAdded={linesAdded}
+          linesRemoved={linesRemoved}
+          modifiedAt={modifiedAt}
+          bytes={bytes}
         >
-          <WorkspaceFileIcon path={path} />
-          <span
+          <button
+            type="button"
             className={cn(
-              "min-w-0 flex-1 truncate text-ui",
-              labelIsPath && "[direction:rtl]",
-              isDeleted && "line-through",
-              fileColorClass,
+              "flex min-w-0 flex-1 items-center gap-2 text-left",
+              isDeleted ? "cursor-default" : "cursor-pointer",
             )}
-            {...handlers}
+            onClick={() => !isDeleted && onFileSelect(path)}
+            aria-disabled={isDeleted}
           >
-            {labelIsPath ? <bdi>{displayLabel}</bdi> : displayLabel}
-          </span>
-          {fileStatus && (
-            // Centred in the shared status column so the A/M/D badge lands in
-            // the same x as a directory row's dirty dot.
+            <WorkspaceFileIcon path={path} />
             <span
-              className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
+              className={cn(
+                "min-w-0 flex-1 truncate text-ui",
+                labelIsPath && "[direction:rtl]",
+                isDeleted && "line-through",
+                fileColorClass,
+              )}
             >
-              <span
-                className={cn(
-                  "rounded px-1 py-0.5 font-mono text-[10px]",
-                  isDeleted
-                    ? "bg-destructive/10 text-destructive"
-                    : fileStatus === "created"
-                      ? "bg-green-500/10 text-green-600 dark:text-green-400"
-                      : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
-                )}
-                title={gitStatusLabel(fileStatus)}
-              >
-                {gitStatusLetter(fileStatus)}
-              </span>
+              {labelIsPath ? <bdi>{displayLabel}</bdi> : displayLabel}
             </span>
-          )}
-        </button>
+            {fileStatus && (
+              // Centred in the shared status column so the A/M/D badge lands in
+              // the same x as a directory row's dirty dot.
+              <span
+                className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
+              >
+                <span
+                  className={cn(
+                    "rounded px-1 py-0.5 font-mono text-[10px]",
+                    isDeleted
+                      ? "bg-destructive/10 text-destructive"
+                      : fileStatus === "created"
+                        ? "bg-green-500/10 text-green-600 dark:text-green-400"
+                        : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+                  )}
+                  title={gitStatusLabel(fileStatus)}
+                >
+                  {gitStatusLetter(fileStatus)}
+                </span>
+              </span>
+            )}
+          </button>
+        </FileRowTooltip>
         {/* One trailing column, always rendered so every row (directories
             included) shares it: metadata at rest, the copy/download pair on
             hover. */}
         <span
           className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
         >
-          {bytes !== null && !isDeleted && (
+          {showModifiedAt && modifiedAt !== null ? (
+            <span className="text-muted-foreground text-sm group-hover:invisible">
+              {formatEditedCompact(modifiedAt)}
+            </span>
+          ) : bytes !== null && !isDeleted ? (
             <span className="text-muted-foreground text-sm group-hover:invisible">
               {formatBytes(bytes)}
             </span>
-          )}
+          ) : null}
           <span className="absolute inset-0 flex items-center justify-end gap-1">
             {!isDeleted && conversationId ? (
               <FileDownloadButton conversationId={conversationId} path={path} />
@@ -1045,7 +1070,6 @@ function FileRowItem({
         </span>
         {reveal.menu}
       </div>
-      {tooltip}
     </li>
   );
 }
@@ -1060,23 +1084,30 @@ function SearchResultRow({
   onRevealDir,
   conversationId,
   changedFileMap,
+  showModifiedAt,
 }: {
   file: WorkspaceFile;
   onFileSelect: (path: string) => void;
   /** Reveal a matched directory in the tree (expand it + ancestors). */
   onRevealDir: (path: string) => void;
   conversationId: string | undefined;
-  changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
+  changedFileMap: Map<string, WorkspaceChangedFile>;
+  showModifiedAt: boolean;
 }) {
   if (file.type === "directory") {
     return <SearchDirRow file={file} onRevealDir={onRevealDir} />;
   }
+  const changedFile = changedFileMap.get(file.path);
   return (
     <FileRowItem
       path={file.path}
       displayLabel={file.path}
       labelIsPath={true}
-      fileStatus={changedFileMap.get(file.path)}
+      fileStatus={changedFile?.status}
+      linesAdded={changedFile?.lines_added}
+      linesRemoved={changedFile?.lines_removed}
+      modifiedAt={file.modified_at}
+      showModifiedAt={showModifiedAt}
       bytes={file.bytes}
       onFileSelect={onFileSelect}
       conversationId={conversationId}
@@ -1142,12 +1173,16 @@ function TreeFileRow({
   onFileSelect,
   conversationId,
   fileStatus,
+  changedFile,
+  showModifiedAt,
 }: {
   node: FileNode;
   depth: number;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
   fileStatus: WorkspaceChangedFile["status"] | undefined;
+  changedFile: WorkspaceChangedFile | undefined;
+  showModifiedAt: boolean;
 }) {
   return (
     <FileRowItem
@@ -1155,6 +1190,10 @@ function TreeFileRow({
       displayLabel={node.name}
       depth={depth}
       fileStatus={fileStatus}
+      linesAdded={changedFile?.lines_added}
+      linesRemoved={changedFile?.lines_removed}
+      modifiedAt={node.file.modified_at}
+      showModifiedAt={showModifiedAt}
       bytes={node.file.bytes}
       onFileSelect={onFileSelect}
       conversationId={conversationId}
@@ -1182,6 +1221,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
   onTogglePath,
   changedFileMap,
   dirtyDirMap,
+  showModifiedAt,
   onNavigateDir,
   highlighted = false,
 }: {
@@ -1192,21 +1232,25 @@ const TreeNodeRow = memo(function TreeNodeRow({
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
   onTogglePath: (path: string) => void;
-  changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
+  changedFileMap: Map<string, WorkspaceChangedFile>;
   dirtyDirMap: Map<string, WorkspaceChangedFile["status"]>;
+  showModifiedAt: boolean;
   onNavigateDir?: (relativePath: string) => void;
   /** Briefly flash this row — used when a folder is revealed from search. */
   highlighted?: boolean;
 }) {
   const reveal = useRevealMenu(node.type === "file" ? null : node.path, true);
   if (node.type === "file") {
+    const changedFile = changedFileMap.get(node.file.path);
     return (
       <TreeFileRow
         node={node}
         depth={depth}
         onFileSelect={onFileSelect}
         conversationId={conversationId}
-        fileStatus={changedFileMap.get(node.file.path)}
+        fileStatus={changedFile?.status}
+        changedFile={changedFile}
+        showModifiedAt={showModifiedAt}
       />
     );
   }

@@ -7,13 +7,14 @@ import {
   ROW_META_SLOT_CLASS,
   ROW_STATUS_SLOT_CLASS,
   formatBytes,
+  formatEditedCompact,
   gitStatusLabel,
   gitStatusLetter,
 } from "./fileStatusUtils";
 import { CopyPathButton } from "./CopyPathButton";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useRevealMenu } from "./RevealInFileManager";
-import { useCursorTooltip } from "./useCursorTooltip";
+import { FileRowTooltip } from "./FileRowTooltip";
 import { WorkspaceFileIcon } from "./WorkspaceFileIcon";
 
 export type { ChangedSort } from "@/lib/changedSort";
@@ -75,13 +76,14 @@ function FileListItem({
   isDeleted,
   onFileSelect,
   conversationId,
+  showModifiedAt,
 }: {
   file: WorkspaceChangedFile;
   isDeleted: boolean;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
+  showModifiedAt: boolean;
 }) {
-  const { handlers, tooltip } = useCursorTooltip(file.path);
   const reveal = useRevealMenu(isDeleted ? null : file.path);
   const slash = file.path.lastIndexOf("/");
   const dir = slash > 0 ? file.path.slice(0, slash) : "";
@@ -96,21 +98,28 @@ function FileListItem({
           isDeleted ? "opacity-50" : "hover:bg-muted",
         )}
       >
-        <button
-          type="button"
-          className={cn(
-            "flex min-w-0 flex-1 items-baseline gap-1.5 text-left",
-            isDeleted ? "cursor-default" : "cursor-pointer",
-          )}
-          onClick={() => !isDeleted && onFileSelect(file.path)}
-          disabled={isDeleted}
+        <FileRowTooltip
+          path={file.path}
+          status={file.status}
+          linesAdded={file.lines_added}
+          linesRemoved={file.lines_removed}
+          modifiedAt={file.modified_at}
+          bytes={file.bytes}
         >
-          <WorkspaceFileIcon path={file.path} className="self-center" />
-          <span className={cn("truncate text-ui", isDeleted && "line-through")} {...handlers}>
-            {file.name}
-          </span>
-          {dir && <span className="truncate text-muted-foreground text-sm">{dir}</span>}
-        </button>
+          <button
+            type="button"
+            className={cn(
+              "flex min-w-0 flex-1 items-baseline gap-1.5 text-left",
+              isDeleted ? "cursor-default" : "cursor-pointer",
+            )}
+            onClick={() => !isDeleted && onFileSelect(file.path)}
+            aria-disabled={isDeleted}
+          >
+            <WorkspaceFileIcon path={file.path} className="self-center" />
+            <span className={cn("truncate text-ui", isDeleted && "line-through")}>{file.name}</span>
+            {dir && <span className="truncate text-muted-foreground text-sm">{dir}</span>}
+          </button>
+        </FileRowTooltip>
         {/* Fixed-width and always rendered: a variable diffstat ("+7 −1" vs
             "+1204 −318") would otherwise shift the copy button and status
             letter to a different x on every row. */}
@@ -155,11 +164,15 @@ function FileListItem({
         <span
           className={cn("relative flex shrink-0 items-center justify-end", ROW_META_SLOT_CLASS)}
         >
-          {file.bytes !== null && !isDeleted && (
+          {showModifiedAt && file.modified_at !== null ? (
+            <span className="text-muted-foreground text-sm group-hover:invisible">
+              {formatEditedCompact(file.modified_at)}
+            </span>
+          ) : file.bytes !== null && !isDeleted ? (
             <span className="text-muted-foreground text-sm group-hover:invisible">
               {formatBytes(file.bytes)}
             </span>
-          )}
+          ) : null}
           <span className="absolute inset-0 flex items-center justify-end gap-1">
             {hasDownload && conversationId ? (
               <FileDownloadButton conversationId={conversationId} path={file.path} />
@@ -171,7 +184,6 @@ function FileListItem({
         </span>
         {reveal.menu}
       </div>
-      {tooltip}
     </li>
   );
 }
@@ -288,6 +300,7 @@ export function FlatFileList({
                 isDeleted={isDeleted}
                 onFileSelect={onFileSelect}
                 conversationId={conversationId}
+                showModifiedAt={sort === "recent"}
               />
             );
           })}
