@@ -29,6 +29,7 @@ from omnigent.host.runner_zygote import (
     ZygoteRunnerProc,
     ZygoteUnavailable,
 )
+from omnigent.inner import _proc
 from omnigent.runner import _zygote
 from omnigent.runner._zygote import (
     _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR,
@@ -394,6 +395,42 @@ def test_poll_after_stop_reports_live_runner_as_none(manager: ZygoteManager, tmp
         assert proc.poll() is None  # pid still alive -> honestly "still live"
     finally:
         proc.kill()
+
+
+@pytest.mark.parametrize("exit_before_restart", [False, True])
+def test_old_runner_exit_is_detected_after_zygote_restart(
+    manager: ZygoteManager, tmp_path: Path, exit_before_restart: bool
+) -> None:
+    """A new forkserver cannot supply exit status for the old one's children."""
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "old.log"), str(tmp_path))
+    manager.stop()
+    try:
+        if exit_before_restart:
+            proc.kill()
+        manager.start()
+        if not exit_before_restart:
+            assert proc.poll() is None
+            proc.kill()
+
+        deadline = time.monotonic() + 10
+        while _proc.process_alive(proc.pid):
+            assert time.monotonic() < deadline, "old runner did not exit"
+            time.sleep(0.01)
+        assert proc.poll() == _ZYGOTE_LOST_EXIT_CODE
+        assert proc.wait(timeout=1) == _ZYGOTE_LOST_EXIT_CODE
+
+        fresh = manager.fork_runner(_fork_env(7), str(tmp_path / "new.log"), str(tmp_path))
+        assert _wait_exit(fresh) == 7
+    finally:
+        proc.kill()
+
+
+def test_cached_runner_exit_survives_zygote_restart(manager: ZygoteManager, tmp_path) -> None:
+    proc = manager.fork_runner(_fork_env(3), str(tmp_path / "old.log"), str(tmp_path))
+    assert _wait_exit(proc) == 3
+    manager.stop()
+    manager.start()
+    assert proc.poll() == 3
 
 
 def test_fork_after_stop_raises_unavailable(manager: ZygoteManager, tmp_path) -> None:
