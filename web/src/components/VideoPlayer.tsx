@@ -113,7 +113,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
       <span
         className={cn(
           "grid min-w-0 grid-cols-[minmax(0,1fr)_auto] border-b border-border",
-          chapters.length > 0 && wide && "grid-cols-[minmax(0,1fr)_18rem]",
+          chapters.length > 0 && wide && actionsOpen && "grid-cols-[minmax(0,1fr)_18rem]",
         )}
       >
         <span className="flex min-h-12 min-w-0 items-center gap-2 px-3 py-2">
@@ -131,6 +131,16 @@ function VideoPlayerContent(props: VideoPlayerProps) {
             <span className="min-w-0 flex-1 truncate" title={title}>
               {title}
             </span>
+          )}
+        </span>
+        <span
+          className={cn(
+            "flex min-h-12 items-center gap-2 px-3 py-2",
+            chapters.length > 0 && wide && actionsOpen && "border-l border-border",
+          )}
+        >
+          {chapters.length > 0 && wide && actionsOpen && (
+            <span className="min-w-0 flex-1 font-medium">Recording actions</span>
           )}
           {remoteSrc ? (
             <a
@@ -195,14 +205,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
               <DownloadIcon className="size-4" />
             </button>
           )}
-        </span>
-        {chapters.length > 0 && (
-          <span className="flex min-h-12 items-center gap-2 border-l border-border px-3 py-2">
-            {wide && (
-              <span className="min-w-0 flex-1 font-medium">
-                {actionsOpen && "Recording actions"}
-              </span>
-            )}
+          {chapters.length > 0 && (
             <button
               type="button"
               aria-label={actionsOpen ? "Hide recording actions" : "Show recording actions"}
@@ -219,8 +222,8 @@ function VideoPlayerContent(props: VideoPlayerProps) {
               )}
               {!wide && <span>Actions</span>}
             </button>
-          </span>
-        )}
+          )}
+        </span>
       </span>
       <span
         className={cn(

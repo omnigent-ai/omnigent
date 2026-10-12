@@ -286,10 +286,15 @@ def test_recording_header_size_and_optional_controls(
     if width == 1600:
         heading = acard.get_by_text("Recording actions", exact=True).bounding_box()
         assert abs(heading["y"] - annotated.bounding_box()["y"]) < 1
+    download = acard.get_by_role("button", name="Download recording: Annotated", exact=True)
+    db, tb = download.bounding_box(), toggle.bounding_box()
+    assert 0 <= tb["x"] - db["x"] - db["width"] <= 8
     toggle_box = toggle.bounding_box()
     toggle.click()
     show = acard.get_by_role("button", name="Show recording actions", exact=True)
     assert show.bounding_box() == toggle_box
+    db, tb = download.bounding_box(), show.bounding_box()
+    assert 0 <= tb["x"] - db["x"] - db["width"] <= 8
     expect(acard.get_by_text("Recording actions", exact=True)).not_to_be_visible()
     expect(
         acard.get_by_role("button", name="Download recording: Annotated", exact=True)
