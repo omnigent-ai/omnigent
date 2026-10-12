@@ -111,3 +111,7 @@ class RuntimeCaps:
     # Always present so consumers read one value object instead of re-parsing
     # config; the defaults describe an unconfigured deployment.
     routing_settings: RoutingSettings = field(default_factory=_default_routing_settings)
+    # Set by a runner from the server's session-init envelope: the server
+    # process holds the routing backends, so a runner talking to a REMOTE
+    # server has none of its own and would otherwise read routing as off.
+    remote_routing_available: bool = False
