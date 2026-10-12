@@ -49,6 +49,11 @@ function commandDeps(outputs) {
 
 describe("arca extend command", () => {
   const running = '{"status":"running","instance":{"shutdown_time":"2026-10-06T01:00:00Z"}}';
+  it("finds status after many brace-containing CLI notices", async () => {
+    const notices = Array.from({ length: 24 }, (_, index) => `notice {${index}}`).join("\n");
+    const deps = commandDeps([{ stdout: `${notices}\n${running}` }]);
+    assert.equal((await readArcaStatus(deps)).state, "running");
+  });
   it("checks a running instance first and reports the updated shutdown time", async () => {
     const updated = '{"status":"running","instance":{"shutdown_time":"2026-10-07T01:00:00Z"}}';
     const deps = commandDeps([{ stdout: running }, { stdout: "Extended" }, { stdout: updated }]);

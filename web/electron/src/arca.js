@@ -316,8 +316,7 @@ function parseArcaStatus(stdout) {
     let depth = 0;
     let inString = false;
     let escaped = false;
-    let candidates = 0;
-    for (let i = 0; i < stdout.length && candidates < 20; i++) {
+    for (let i = 0; i < stdout.length; i++) {
       const char = stdout[i];
       if (depth === 0) {
         if (char === "{") {
@@ -335,7 +334,6 @@ function parseArcaStatus(stdout) {
       } else if (char === "{") {
         depth++;
       } else if (char === "}" && --depth === 0) {
-        candidates++;
         const candidate = parseObject(stdout.slice(start, i + 1));
         const hasInstance =
           candidate &&
