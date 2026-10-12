@@ -965,6 +965,15 @@ def _write_runner_inference_config(session_id: str, inference_config: dict[str, 
     return path
 
 
+def _is_utf8_encodable(text: str) -> bool:
+    """Return whether ``text`` has no surrogate-escaped bytes, so it encodes as UTF-8."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _paginate_list_dir(
     *,
     entries: list[HostListDirEntry],
@@ -2852,6 +2861,10 @@ class HostProcess:
         # surfaces real entries instead of failing wholesale.
         entries: list[HostListDirEntry] = []
         for de in scanned:
+            if not _is_utf8_encodable(de.path):
+                # A name that isn't valid UTF-8 comes back surrogate-escaped; it
+                # can't be sent as JSON or reopened by path, so skip it too.
+                continue
             try:
                 # follow_symlinks=True so type reflects the target.
                 st = de.stat(follow_symlinks=True)
@@ -3344,6 +3357,9 @@ class HostProcess:
             f"{self._server_url}/v1/sessions/{path}/agent/contents",
             headers=self._build_connect_headers(),
             timeout=10.0,
+            # httpx's default context reads SSL_CERT_FILE eagerly and fails on a
+            # deleted bundle; verify like the host tunnel does instead.
+            verify=client_ssl_context(),
         )
 
     async def _prewarm_model_options(self) -> bool:

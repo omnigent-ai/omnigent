@@ -155,7 +155,7 @@ class ZygoteManager:
         self._proc: subprocess.Popen[bytes] | None = None
         self._sock: socket.socket | None = None
         self._generation = 0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     @property
     def pid(self) -> int | None:
@@ -206,19 +206,18 @@ class ZygoteManager:
             self._proc = proc
             self._sock = parent_sock
 
-        # Confirm the zygote is answering before the caller relies on it. Any
-        # failure here (bad pong, or the exchange itself raising on a timeout /
-        # EOF) must tear down the partially-started zygote so a failed start
-        # never leaks a process + socket.
-        try:
-            reply = self._exchange({"cmd": "ping"})
-            answered = bool(reply.get("pong"))
-        except ZygoteUnavailable:
-            self.stop()
-            raise
-        if not answered:
-            self.stop()
-            raise ZygoteUnavailable("runner zygote did not answer ping")
+            # Prewarming and session launch can race. Keep the readiness check
+            # and failed-start cleanup locked so neither caller can use an
+            # unverified parent that the other caller is about to terminate.
+            try:
+                reply = self._exchange({"cmd": "ping"})
+                answered = bool(reply.get("pong"))
+            except ZygoteUnavailable:
+                self.stop()
+                raise
+            if not answered:
+                self.stop()
+                raise ZygoteUnavailable("runner zygote did not answer ping")
 
     def _spawn_zygote_process(self, child_fd: int) -> subprocess.Popen[bytes]:
         """Popen the zygote interpreter, handing it *child_fd* as its control fd.

@@ -12,6 +12,9 @@ passed. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -21,6 +24,7 @@ from omnigent.harnesses.claude_native.main import (
     build_native_claude_terminal_env,
 )
 from omnigent.runner.app import _build_claude_native_base_args, _claude_terminal_env_unset
+from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 from omnigent.runner.native.orchestration import (
     _ROUTED_SPAWN_ALLOWED_TOOLS,
     _claude_launch_metadata_from_envelope,
@@ -668,14 +672,10 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
     from omnigent.harnesses.claude_native import diagnostics
     from omnigent.runner.native import orchestration
     from omnigent.runner.resource_registry import SessionResourceRegistry
-    from omnigent.runner.session_init_protocol import (
-        SESSION_INIT_PROTOCOL_VERSION,
-        RunnerSessionInitEnvelope,
-        RunnerSessionInitSnapshot,
-    )
 
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", lambda _: None
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr("omnigent.inference_config.load_runtime_inference_config", dict)
     monkeypatch.setattr("omnigent.config.load_effective_config", dict)
@@ -690,13 +690,7 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
     original_error = httpx.ConnectError("original launch transport failure")
     registry = Mock(spec=SessionResourceRegistry)
     registry.launch_required_terminal.side_effect = original_error
-    session_init = RunnerSessionInitEnvelope(
-        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
-        server_version="test",
-        session_id=session_id,
-        agent_id="agent",
-        snapshot=RunnerSessionInitSnapshot(created_at=0, updated_at=0, workspace=str(bridge_dir)),
-    )
+    session_init = _claude_auto_create_session_init(session_id, bridge_dir)
     loop = asyncio.get_running_loop()
     closing = asyncio.Event()
     closed = asyncio.Event()
@@ -753,3 +747,660 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
             await asyncio.wait_for(task, timeout=10)
         if closing.is_set():
             await asyncio.wait_for(closed.wait(), timeout=10)
+
+
+@pytest.mark.parametrize(
+    "command,args,spec_env,env_unset,inherit_env,expected_home,expected_config_dir",
+    [
+        # The pane inherits the runner env, so its selectors apply.
+        ("claude", [], {}, [], True, "/home/runner", "/runner/claude"),
+        # Without inheritance only the spec's explicit overrides remain.
+        ("claude", [], {"HOME": "/home/spec"}, [], False, "/home/spec", None),
+        # Spec overrides and removals are applied before launch.
+        (
+            "claude",
+            [],
+            {"CLAUDE_CONFIG_DIR": "/spec/claude"},
+            [],
+            True,
+            "/home/runner",
+            "/spec/claude",
+        ),
+        ("claude", [], {}, ["CLAUDE_CONFIG_DIR"], True, "/home/runner", None),
+        # An ``env`` wrapper's assignments and -i apply after the spec.
+        (
+            "env",
+            ["CLAUDE_CONFIG_DIR=/wrap/claude", "claude"],
+            {},
+            [],
+            True,
+            "/home/runner",
+            "/wrap/claude",
+        ),
+        ("env", ["-i", "HOME=/home/wrapped", "claude"], {}, [], True, "/home/wrapped", None),
+        # ``-S`` words are scanned for options again. ``tests/host`` checks the
+        # remaining wrapper syntax against the real ``env``.
+        (
+            "env",
+            ["-S", "- HOME=/split-home CLAUDE_CONFIG_DIR=/launch/claude claude"],
+            {},
+            [],
+            True,
+            "/split-home",
+            "/launch/claude",
+        ),
+        # ``-S`` expands ``${NAME}`` from the pre-wrapper environment.
+        (
+            "env",
+            ["-S", "CLAUDE_CONFIG_DIR=${HOME}/claude claude"],
+            {},
+            [],
+            True,
+            "/home/runner",
+            "/home/runner/claude",
+        ),
+    ],
+)
+def test_claude_terminal_launch_env_matches_pane_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    args: list[str],
+    spec_env: dict[str, str],
+    env_unset: list[str],
+    inherit_env: bool,
+    expected_home: str,
+    expected_config_dir: str | None,
+) -> None:
+    """
+    Trust seeding sees the environment the Claude pane process starts with.
+
+    :param command: Launch command, e.g. ``"env"``.
+    :param args: Launch args, e.g. ``["CLAUDE_CONFIG_DIR=/wrap/claude", "claude"]``.
+    :param spec_env: Terminal spec env overrides.
+    :param env_unset: Terminal spec env removals.
+    :param inherit_env: Whether the pane inherits the runner environment.
+    :param expected_home: Expected ``HOME`` in the launch env.
+    :param expected_config_dir: Expected ``CLAUDE_CONFIG_DIR``, or ``None`` when unset.
+    """
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setenv("HOME", "/home/runner")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/runner/claude")
+    spec = TerminalEnvSpec(
+        command=command, args=args, env=spec_env, env_unset=env_unset, inherit_env=inherit_env
+    )
+
+    env = orchestration._claude_terminal_launch_env(spec)
+
+    assert env.get("HOME") == expected_home
+    assert env.get("CLAUDE_CONFIG_DIR") == expected_config_dir
+    if not inherit_env:
+        # Ambient runner selectors must not leak into a non-inheriting pane,
+        # which adds only its UTF-8 locale default.
+        assert {key: value for key, value in env.items() if key not in ("LANG", "LC_ALL")} == (
+            spec_env
+        )
+
+
+def test_claude_terminal_launch_env_expands_the_pane_locale_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``env -S`` sees the UTF-8 locale the pane adds when the runner sets none."""
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.delenv("LANG", raising=False)
+    monkeypatch.delenv("LC_ALL", raising=False)
+    spec = TerminalEnvSpec(command="env", args=["-S", "CLAUDE_CONFIG_DIR=/cfg/${LANG} claude"])
+
+    assert orchestration._claude_terminal_launch_env(spec)["CLAUDE_CONFIG_DIR"] == "/cfg/C.UTF-8"
+
+
+@pytest.mark.parametrize("secret_name", sorted(RUNNER_AUTH_SECRET_ENV_VARS))
+def test_claude_trust_seeding_never_expands_runner_auth_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    secret_name: str,
+) -> None:
+    """
+    Runner-auth secrets are removed before ``env -S`` expansion, as in the pane.
+
+    Neither the runner environment nor a spec override can put the value into
+    the selected config directory or the workspace.
+
+    :param secret_name: A runner-auth secret variable name.
+    """
+    from omnigent.harnesses.claude_native.bridge import ensure_claude_workspace_trusted
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.runner.native import orchestration
+
+    token = "dummy-binding-token"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
+    monkeypatch.setenv(secret_name, token)
+    spec = TerminalEnvSpec(
+        command="env",
+        args=["-S", f"CLAUDE_CONFIG_DIR=cfg${{{secret_name}}} claude"],
+        env={secret_name: token},
+    )
+
+    env = orchestration._claude_terminal_launch_env(spec)
+    ensure_claude_workspace_trusted(workspace, env=env)
+
+    assert secret_name not in env
+    assert env["CLAUDE_CONFIG_DIR"] == "cfg"
+    assert (workspace / "cfg" / ".claude.json").is_file()
+    assert not any(token in str(path) for path in tmp_path.rglob("*"))
+
+
+def test_claude_terminal_launch_cwd_uses_terminal_os_env_resolution(tmp_path: Path) -> None:
+    """
+    Trust seeding resolves the pane cwd the way terminal creation does.
+
+    An explicit ``os_env`` cwd wins, and ``inherit`` takes the parent os_env's
+    cwd, both resolved through symlinks like the launched pane's cwd.
+    """
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.runner.native import orchestration
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(workspace)
+    explicit = TerminalEnvSpec(os_env=OSEnvSpec(type="caller_process", cwd=str(link)))
+    inherited = TerminalEnvSpec(os_env="inherit")
+    parent = OSEnvSpec(type="caller_process", cwd=str(link))
+
+    assert orchestration._claude_terminal_launch_cwd(explicit, None) == workspace.resolve()
+    assert orchestration._claude_terminal_launch_cwd(inherited, parent) == workspace.resolve()
+
+
+def test_claude_terminal_launch_cwd_applies_env_chdir(tmp_path: Path) -> None:
+    """An ``env --chdir`` wrapper moves the seeded cwd to Claude's real cwd."""
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.runner.native import orchestration
+
+    workspace = tmp_path / "workspace"
+    (workspace / "sub").mkdir(parents=True)
+    os_env = OSEnvSpec(type="caller_process", cwd=str(workspace))
+    for args in (["--chdir=sub", "claude"], ["-C", str(workspace / "sub"), "claude"]):
+        spec = TerminalEnvSpec(command="env", args=args, os_env=os_env)
+        assert (
+            orchestration._claude_terminal_launch_cwd(spec, None) == (workspace / "sub").resolve()
+        )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can enter any directory")
+def test_claude_terminal_launch_cwd_rejects_an_unsearchable_env_chdir_target(
+    tmp_path: Path,
+) -> None:
+    """``env -C`` cannot enter a directory without search permission, so seeding stops."""
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.runner.native import orchestration
+
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o600)
+    spec = TerminalEnvSpec(
+        command="env",
+        args=["-C", "locked", "claude"],
+        os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path)),
+    )
+    try:
+        with pytest.raises(OmnigentError) as excinfo:
+            orchestration._claude_terminal_launch_cwd(spec, None)
+    finally:
+        locked.chmod(0o700)
+    assert excinfo.value.code == ErrorCode.WORKSPACE_MISSING
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-v", "CLAUDE_CONFIG_DIR=wrap/claude", "claude"],
+        ["-S", "CLAUDE_CONFIG_DIR='wrap/claude claude"],
+        ["-S", "CLAUDE_CONFIG_DIR=$HOME/claude claude"],
+        ["-S", "CLAUDE_CONFIG_DIR=wrap\\_claude claude"],
+        ["-S", "CLAUDE_CONFIG_DIR=wrap/claude claude #comment"],
+        ["-S", "CLAUDE_CONFIG_DIR=wrap/claude\vclaude"],
+        ["A=1", "env", "CLAUDE_CONFIG_DIR=wrap/claude", "claude"],
+    ],
+    ids=[
+        "unmodeled-option",
+        "unbalanced-quote",
+        "variable-expansion",
+        "escape",
+        "comment",
+        "version-dependent-separator",
+        "nested-env",
+    ],
+)
+def test_claude_terminal_launch_env_keeps_pre_wrapper_env_for_unparsed_env_forms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    args: list[str],
+) -> None:
+    """
+    Unmodeled wrappers use the pre-wrapper environment and log the fallback without values.
+
+    :param args: Wrapper args the parser cannot model.
+    """
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.runner.native import orchestration
+
+    runner_config = tmp_path / "runner-claude"
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(runner_config))
+    monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
+
+    with caplog.at_level(logging.INFO, logger=orchestration._logger.name):
+        env = orchestration._claude_terminal_launch_env(TerminalEnvSpec(command="env", args=args))
+    assert env["CLAUDE_CONFIG_DIR"] == str(runner_config)
+    assert any(
+        record.levelno == logging.INFO and "env wrapper form is not modeled" in record.getMessage()
+        for record in caplog.records
+    )
+    values = [
+        arg.partition("CLAUDE_CONFIG_DIR=")[2] for arg in args if "CLAUDE_CONFIG_DIR=" in arg
+    ]
+    assert values and all(value not in caplog.text for value in values)
+
+
+def test_unparsed_env_wrapper_seeds_the_runner_config_not_a_literal_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Seeding with a fallback launch env writes the runner's selected config.
+
+    The unexpanded ``$HOME`` text must not become a literal directory in the
+    workspace.
+    """
+    from omnigent.harnesses.claude_native.bridge import ensure_claude_workspace_trusted
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.runner.native import orchestration
+
+    runner_config = tmp_path / "runner-claude"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(runner_config))
+    monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
+    spec = TerminalEnvSpec(command="env", args=["-S", "CLAUDE_CONFIG_DIR=$HOME/claude claude"])
+
+    ensure_claude_workspace_trusted(workspace, env=orchestration._claude_terminal_launch_env(spec))
+
+    assert (runner_config / ".claude.json").is_file()
+    assert sorted(path.name for path in workspace.iterdir()) == []
+
+
+def _claude_auto_create_session_init(session_id: str, workspace: Path):
+    """
+    Build the session-init envelope ``_auto_create_claude_terminal`` consumes.
+
+    :param session_id: Session id, e.g. ``"conv_seed_launch_env"``.
+    :param workspace: Session workspace, e.g. the ``bridge_dir`` fixture.
+    :returns: A :class:`RunnerSessionInitEnvelope` rooted at *workspace*.
+    """
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+        RunnerSessionInitSnapshot,
+    )
+
+    return RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id=session_id,
+        agent_id="agent",
+        snapshot=RunnerSessionInitSnapshot(created_at=0, updated_at=0, workspace=str(workspace)),
+    )
+
+
+async def _auto_create_claude_terminal_for_test(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_id: str,
+    workspace: Path,
+    registry: object,
+) -> None:
+    """
+    Run ``_auto_create_claude_terminal`` with host config and diagnostics stubbed.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param session_id: Session id, e.g. ``"conv_seed_launch_env"``.
+    :param workspace: Session workspace, e.g. the ``bridge_dir`` fixture.
+    :param registry: Session resource registry double.
+    :returns: None. Raises whatever the auto-create path raises.
+    """
+    from unittest.mock import AsyncMock, Mock
+
+    import httpx
+
+    from omnigent.harnesses.claude_native import diagnostics
+    from omnigent.runner.native import orchestration
+
+    monkeypatch.setattr("omnigent.inference_config.load_runtime_inference_config", dict)
+    monkeypatch.setattr("omnigent.config.load_effective_config", dict)
+    monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
+    monkeypatch.setattr(diagnostics, "ClaudeDebugLogFollower", lambda _: Mock())
+    await orchestration._auto_create_claude_terminal(
+        session_id,
+        registry,
+        Mock(),
+        server_client=AsyncMock(spec=httpx.AsyncClient),
+        session_init=_claude_auto_create_session_init(session_id, workspace),
+        auth_token_factory=lambda: None,
+        resolve_launch_config=AsyncMock(return_value=None),
+    )
+
+
+async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Terminal auto-create hands the pane's launch env to trust seeding.
+
+    A launch-only ``CLAUDE_CONFIG_DIR`` (here from an ``env`` wrapper) must
+    reach the seeder, and seeding must happen before the terminal launches.
+    """
+    from unittest.mock import Mock
+
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    seeded: list[tuple[Path, dict[str, str] | None]] = []
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
+
+    def record_seed(workspace: Path, env: dict[str, str] | None = None) -> None:
+        registry.launch_required_terminal.assert_not_called()
+        seeded.append((workspace, env))
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/runner/claude")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", record_seed
+    )
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
+    )
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_args",
+        lambda _harness, cli_args, cfg=None: [
+            "CLAUDE_CONFIG_DIR=/launch/claude",
+            "claude",
+            *cli_args,
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="stop after seeding"):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch, session_id="conv_seed_launch_env", workspace=bridge_dir, registry=registry
+        )
+
+    assert len(seeded) == 1
+    workspace, env = seeded[0]
+    assert workspace == Path(bridge_dir).resolve()
+    assert env is not None
+    assert env["CLAUDE_CONFIG_DIR"] == "/launch/claude"
+    registry.launch_required_terminal.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "subagent_started,turn_started",
+    [(True, True), (True, False), (False, True), (False, False)],
+)
+async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fails(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    subagent_started: bool,
+    turn_started: bool,
+) -> None:
+    """
+    A trust-seeding failure releases only the routers this launch started.
+
+    Seeding runs after the subagent and turn routers start but before the
+    forwarder that normally shuts them down exists, so a malformed config must
+    not leave them running. A router this launch did not start is not shut
+    down, because a ``None`` handle would close whichever router a replacement
+    session registered.
+
+    :param subagent_started: Whether this launch started a subagent router.
+    :param turn_started: Whether this launch started a turn router.
+    """
+    from unittest.mock import Mock
+
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    subagent_router = object() if subagent_started else None
+    turn_router = object() if turn_started else None
+    shutdowns: list[tuple[str, object]] = []
+
+    async def record_subagent_shutdown(_session_id: str, router: object) -> None:
+        shutdowns.append(("subagent", router))
+
+    async def record_turn_shutdown(_session_id: str, router: object) -> None:
+        shutdowns.append(("turn", router))
+
+    def failing_seed(_workspace: Path, env: dict[str, str] | None = None) -> None:
+        raise ValueError("config is not a JSON object")
+
+    monkeypatch.setattr(
+        orchestration,
+        "_start_subagent_router_for_native_session",
+        lambda *_a, **_k: (bridge_dir if subagent_started else None, subagent_router),
+    )
+    monkeypatch.setattr(
+        orchestration, "_start_turn_router_for_native_session", lambda *_a, **_k: turn_router
+    )
+    monkeypatch.setattr(orchestration, "_shutdown_session_router_async", record_subagent_shutdown)
+    monkeypatch.setattr(orchestration, "_shutdown_session_turn_router_async", record_turn_shutdown)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", failing_seed
+    )
+    registry = Mock(spec=SessionResourceRegistry)
+
+    with pytest.raises(ValueError, match="config is not a JSON object"):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch,
+            session_id="conv_seed_failure_routers",
+            workspace=bridge_dir,
+            registry=registry,
+        )
+
+    expected = []
+    if subagent_started:
+        expected.append(("subagent", subagent_router))
+    if turn_started:
+        expected.append(("turn", turn_router))
+    assert shutdowns == expected
+    registry.launch_required_terminal.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "shutdown_error,propagated",
+    [
+        (RuntimeError("subagent shutdown failed"), ValueError),
+        (asyncio.CancelledError(), asyncio.CancelledError),
+    ],
+    ids=["failed", "cancelled"],
+)
+async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shutdown_error: BaseException,
+    propagated: type[BaseException],
+) -> None:
+    """
+    A failed or cancelled router shutdown does not skip the other one.
+
+    A shutdown failure is logged and the trust-seeding error propagates. A
+    cancellation propagates after both shutdowns have run.
+
+    :param shutdown_error: What the first shutdown raises.
+    :param propagated: The exception type the launch must raise.
+    """
+    from unittest.mock import Mock
+
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    subagent_router = object()
+    turn_router = object()
+    shutdowns: list[str] = []
+
+    async def failing_subagent_shutdown(_session_id: str, _router: object) -> None:
+        shutdowns.append("subagent")
+        raise shutdown_error
+
+    async def record_turn_shutdown(_session_id: str, _router: object) -> None:
+        shutdowns.append("turn")
+
+    def failing_seed(_workspace: Path, env: dict[str, str] | None = None) -> None:
+        raise ValueError("config is not a JSON object")
+
+    monkeypatch.setattr(
+        orchestration,
+        "_start_subagent_router_for_native_session",
+        lambda *_a, **_k: (bridge_dir, subagent_router),
+    )
+    monkeypatch.setattr(
+        orchestration, "_start_turn_router_for_native_session", lambda *_a, **_k: turn_router
+    )
+    monkeypatch.setattr(orchestration, "_shutdown_session_router_async", failing_subagent_shutdown)
+    monkeypatch.setattr(orchestration, "_shutdown_session_turn_router_async", record_turn_shutdown)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", failing_seed
+    )
+    registry = Mock(spec=SessionResourceRegistry)
+
+    with pytest.raises(propagated):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch, session_id="conv_cleanup_failure", workspace=bridge_dir, registry=registry
+        )
+
+    assert shutdowns == ["subagent", "turn"]
+    registry.launch_required_terminal.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "config_dir,legacy_in_cwd,expected",
+    [("relcfg", False, "sub/relcfg/.claude.json"), ("", True, "sub/.config.json")],
+)
+async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_dir(
+    bridge_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_dir: str,
+    legacy_in_cwd: bool,
+    expected: str,
+) -> None:
+    """
+    ``env -C`` and a relative or empty ``CLAUDE_CONFIG_DIR`` compose in auto-create.
+
+    The wrapper moves Claude's cwd first; the config dir then resolves against
+    that cwd, and the trust key names it. The real seeder writes the file.
+
+    :param config_dir: ``CLAUDE_CONFIG_DIR`` assigned by the wrapper.
+    :param legacy_in_cwd: Whether a legacy ``.config.json`` exists in the cwd.
+    :param expected: Expected config file relative to the workspace.
+    """
+    import json
+    from unittest.mock import Mock
+
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    workspace = tmp_path / "workspace"
+    (workspace / "sub").mkdir(parents=True)
+    if legacy_in_cwd:
+        (workspace / "sub" / ".config.json").write_text("{}")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
+    )
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_args",
+        lambda _harness, cli_args, cfg=None: [
+            "-C",
+            "sub",
+            f"CLAUDE_CONFIG_DIR={config_dir}",
+            "claude",
+            *cli_args,
+        ],
+    )
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
+
+    with pytest.raises(RuntimeError, match="stop after seeding"):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch, session_id="conv_seed_env_chdir", workspace=workspace, registry=registry
+        )
+
+    data = json.loads((workspace / expected).read_text())
+    assert data["projects"][str((workspace / "sub").resolve())]["hasTrustDialogAccepted"] is True
+    assert not (tmp_path / "home" / ".claude.json").exists()
+
+
+@pytest.mark.parametrize(
+    "chdir_args",
+    [["-C", "missing"], ["-C", ""], ["--chdir="]],
+    ids=["missing", "empty", "empty-long"],
+)
+async def test_auto_create_claude_terminal_rejects_missing_env_chdir_target(
+    bridge_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    chdir_args: list[str],
+) -> None:
+    """
+    A missing or empty ``env --chdir`` target fails before seeding and launch.
+
+    The real ``env`` refuses to start in such a directory, so seeding must not
+    create it (and with it a trusted config) and turn the launch into a
+    success.
+
+    :param chdir_args: The wrapper's ``-C``/``--chdir`` arguments.
+    """
+    from unittest.mock import Mock
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # Relative, so a wrongly accepted target would put it under that cwd.
+    config_dir = f"{tmp_path.name}-config"
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
+    )
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_args",
+        lambda _harness, cli_args, cfg=None: [
+            *chdir_args,
+            f"CLAUDE_CONFIG_DIR={config_dir}",
+            "claude",
+            *cli_args,
+        ],
+    )
+    registry = Mock(spec=SessionResourceRegistry)
+
+    with pytest.raises(OmnigentError) as excinfo:
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch, session_id="conv_missing_chdir", workspace=workspace, registry=registry
+        )
+
+    assert excinfo.value.code == ErrorCode.WORKSPACE_MISSING
+    assert sorted(path.name for path in workspace.iterdir()) == []
+    assert not (Path.cwd() / config_dir).exists()
+    registry.launch_required_terminal.assert_not_called()

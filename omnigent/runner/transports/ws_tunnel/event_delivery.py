@@ -271,13 +271,16 @@ class TunnelEventClient(httpx.AsyncClient):
             return await super().post(*args, **kwargs)
         # Child-history callers inspect each item_id in the HTTP batch
         # acknowledgement; even a one-entry array needs a list response.
+        session_id = unquote(match.group(1))
         if (
             (
                 isinstance(value, list)
                 and any(event.get("type") == "external_conversation_item" for event in events)
             )
             or len(events) > _MAX_EVENTS
-            or len(encode_frame(EventBatchFrame("", "", events)).encode("utf-8"))
+            # The dispatcher assigns a 32-character UUID; both IDs count toward
+            # the server's wire limit, even when the event payload alone fits.
+            or len(encode_frame(EventBatchFrame("0" * 32, session_id, events)).encode("utf-8"))
             > _MAX_BATCH_BYTES
         ):
             return await super().post(*args, **kwargs)
@@ -285,7 +288,7 @@ class TunnelEventClient(httpx.AsyncClient):
             return await super().post(*args, **kwargs)
         request = self.build_request("POST", url)
         try:
-            submit = self._event_dispatcher.submit(unquote(match.group(1)), events)
+            submit = self._event_dispatcher.submit(session_id, events)
             if all(event["type"] == "external_output_text_delta" for event in events):
                 ack = await asyncio.wait_for(submit, timeout=2.0)
             else:
