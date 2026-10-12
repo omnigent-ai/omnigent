@@ -11650,7 +11650,8 @@ _GITHUB_SOURCE_RE = re.compile(
 def _parse_github_source(source: str) -> tuple[str, str | None, str, str | None] | None:
     """``(clone_url, ref, subpath, agent_name)`` for ``owner/repo[/path][@agent]`` or a URL.
 
-    As in ``npx skills add``, ``@name`` picks one agent; a ref comes from ``/tree/<ref>``.
+    As in ``npx skills add``, ``@name`` picks one agent; a ref comes from ``/tree/<ref>``
+    (a branch or tag without ``/``; commit SHAs can't be shallow-cloned by name).
     """
     m = _GITHUB_SOURCE_RE.match(source)
     if m is None:
@@ -11662,7 +11663,7 @@ def _parse_github_source(source: str) -> tuple[str, str | None, str, str | None]
 def _find_agent_dirs(root: Path) -> list[Path]:
     """Outermost directories under ``root`` holding a ``config.yaml`` (nested ones are workers)."""
     found: list[Path] = []
-    for cfg in sorted(root.rglob("config.yaml"), key=lambda p: len(p.parts)):
+    for cfg in sorted(root.rglob("config.yaml"), key=lambda p: (len(p.parts), p)):
         if ".git" in cfg.parts or any(d in cfg.parents for d in found):
             continue
         found.append(cfg.parent)
@@ -11678,12 +11679,21 @@ def _agent_dir_name(agent_dir: Path) -> str:
     return name if isinstance(name, str) and name else agent_dir.name
 
 
+def _printable(text: str) -> str:
+    """Escape control characters so repo-supplied text can't rewrite the terminal."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
+
+
+_LFS_POINTER = b"version https://git-lfs.github.com/spec/"
+
+
 def _bundle_untrusted_dir(source: Path) -> bytes:
     """Tar an agent directory from a remote repo as is.
 
     Unlike :func:`_bundle`, ``${VAR}`` references are left unexpanded so a
     repo can't pull this shell's secrets into its config, and symlinks are
-    refused so it can't pull in files from outside the checkout.
+    refused so it can't pull in files from outside the checkout. ``.git`` is
+    skipped, and Git LFS pointers (never downloaded) are refused.
     """
     import io
     import tarfile
@@ -11691,18 +11701,31 @@ def _bundle_untrusted_dir(source: Path) -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for file_path in sorted(source.rglob("*")):
+            rel = file_path.relative_to(source)
+            if ".git" in rel.parts:
+                continue
             if file_path.is_symlink():
                 raise _agent_cli_error(
-                    f"{file_path.relative_to(source)} is a symlink; refusing to install "
+                    f"{_printable(str(rel))} is a symlink; refusing to install "
                     "an agent with symlinks from a remote repo."
                 )
             if file_path.is_file():
-                tf.add(str(file_path), arcname=str(file_path.relative_to(source)))
+                with file_path.open("rb") as fh:
+                    if fh.read(len(_LFS_POINTER)) == _LFS_POINTER:
+                        raise _agent_cli_error(
+                            f"{_printable(str(rel))} is stored in Git LFS, which "
+                            "`omnigent agent add` doesn't download."
+                        )
+                tf.add(str(file_path), arcname=str(rel))
     return buf.getvalue()
 
 
 def _clone_github_source(clone_url: str, ref: str | None, dest: Path) -> None:
     """Shallow-clone without submodules, hooks, or credential prompts."""
+    if ref and re.fullmatch(r"[0-9a-f]{7,40}", ref):
+        raise _agent_cli_error(
+            f"{ref!r} looks like a commit SHA; use a branch or tag name in /tree/<ref>."
+        )
     cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
            "-c", "protocol.https.allow=always", "clone", "--depth", "1",
            "--no-recurse-submodules", "--quiet"]  # fmt: skip
@@ -11770,35 +11793,58 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
             raise click.BadParameter(
                 f"{source!r} is neither a local path nor a GitHub repo.", param_hint="SOURCE"
             )
+        if list_only:
+            raise click.UsageError("--list only applies to a GitHub repo.")
         with _agent_api_client(server) as client:
             _upload_agent(client, _bundle(path))
         return
 
     clone_url, ref, subpath, wanted = github
     with tempfile.TemporaryDirectory() as tmpdir:
+        # Never resolved: a symlinked TMPDIR would make discovered paths disagree with it.
         checkout = Path(tmpdir) / "repo"
-        _clone_github_source(clone_url, ref, checkout)
-        root = (checkout / subpath).resolve()
-        if not root.is_relative_to(checkout.resolve()) or not root.is_dir():
+        try:
+            _clone_github_source(clone_url, ref, checkout)
+        except click.ClickException as exc:
+            if not source.startswith(("github:", "https://")):
+                exc.message += f"\n(If {source!r} is a local path, it doesn't exist.)"
+            raise
+        # The parser rejects `..`, so only a symlinked component can leave the subpath.
+        root = checkout / subpath
+        if any(
+            p.is_symlink()
+            for p in (root, *root.parents)
+            if p != checkout and p.is_relative_to(checkout)
+        ):
+            raise _agent_cli_error(f"{subpath!r} goes through a symlink in {clone_url}.")
+        if not root.is_dir():
             raise _agent_cli_error(f"{subpath!r} is not a directory in {clone_url}.")
-        named = {_agent_dir_name(d): d for d in _find_agent_dirs(root)}
-        if not named:
+        agents = [(_agent_dir_name(d), d) for d in _find_agent_dirs(root)]
+        if not agents:
             raise _agent_cli_error(f"No agent (a directory with config.yaml) in {source}.")
-        if wanted and not list_only:
-            match = {n: d for n, d in named.items() if n.lower() == wanted.lower()}
+        by_name: dict[str, list[Path]] = {}
+        for n, d in agents:
+            by_name.setdefault(n.lower(), []).append(d)
+        dupes = [ds for ds in by_name.values() if len(ds) > 1]
+        if dupes:
+            where = "; ".join(
+                ", ".join(d.relative_to(checkout).as_posix() for d in ds) for ds in dupes
+            )
+            raise _agent_cli_error(f"Agents in {source} share a name: {_printable(where)}.")
+        if wanted:
+            match = [(n, d) for n, d in agents if n.lower() == wanted.lower()]
             if not match:
-                raise _agent_cli_error(
-                    f"No agent named {wanted!r} in {source}; found: {', '.join(named)}."
-                )
-            named = match
-        click.echo(f"Found {len(named)} agent(s) in {source}:")
-        for n, d in named.items():
-            click.echo(f"  {n}  ({d.relative_to(checkout).as_posix() or '.'})")
+                found = _printable(", ".join(n for n, _ in agents))
+                raise _agent_cli_error(f"No agent named {wanted!r} in {source}; found: {found}.")
+            agents = match
+        click.echo(f"Found {len(agents)} agent(s) in {source}:")
+        for n, d in agents:
+            click.echo(f"  {_printable(n)}  ({_printable(d.relative_to(checkout).as_posix())})")
         if list_only:
             return
         if not yes:
             click.confirm("Install them? Only install agents from repos you trust", abort=True)
-        bundles = {n: _bundle_untrusted_dir(d) for n, d in named.items()}
+        bundles = {n: _bundle_untrusted_dir(d) for n, d in agents}
         failed: list[str] = []
         with _agent_api_client(server) as client:
             for n, bundle_bytes in bundles.items():
@@ -11806,7 +11852,7 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
                 try:
                     _upload_agent(client, bundle_bytes)
                 except click.ClickException as exc:
-                    click.echo(f"Skipped {n}: {exc.message}", err=True)
+                    click.echo(f"Skipped {_printable(n)}: {exc.message}", err=True)
                     failed.append(n)
         if failed:
             raise _agent_cli_error(f"{len(failed)} of {len(bundles)} agent(s) not installed.")
