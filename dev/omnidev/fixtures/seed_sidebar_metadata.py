@@ -11,22 +11,26 @@ replaces a label a session already has.
 Usage: seed_sidebar_metadata.py <chat.db path> <session id>...
 """
 
+import itertools
 import sqlite3
 import sys
 import uuid
 from datetime import UTC, datetime, time, timedelta
 
-# (days ago, repo URL or None), assigned to the given sessions in order. Spreads
-# them across Today / Yesterday / Previous 7 days / Previous 30 days / Older and
-# gives three a sandbox repo so Show -> Repo renders a name.
+# (days ago, repo URL or None), assigned to the given sessions in order and
+# repeated past the end. Two per Updated group (Today / Yesterday / Previous 7
+# days / Previous 30 days / Older), and three carry a sandbox repo for Show -> Repo.
 LAYOUT: list[tuple[int, str | None]] = [
     (0, "https://github.com/omnigent-ai/omnigent#main"),
     (0, None),
     (1, "https://github.com/omnigent-ai/web-ui#fix/sidebar"),
+    (1, None),
     (3, None),
-    (5, "https://github.com/omnigent-ai/omnigent-docs#main"),
+    (6, "https://github.com/omnigent-ai/omnigent-docs#main"),
     (12, None),
-    (40, None),
+    (25, None),
+    (45, None),
+    (120, None),
 ]
 REPO_LABEL = "omnigent.sandbox.repo.0"
 
@@ -44,7 +48,7 @@ def seed(db_path: str, session_ids: list[str], now: datetime) -> int:
     conn = sqlite3.connect(db_path)
     seeded = 0
     try:
-        for session_id, (days_ago, repo) in zip(session_ids, LAYOUT, strict=False):
+        for session_id, (days_ago, repo) in zip(session_ids, itertools.cycle(LAYOUT)):
             # API ids are bare 32-char hex (a legacy prefix is tolerated); the
             # column stores the 16 raw bytes.
             cid = uuid.UUID(session_id.rsplit("_", 1)[-1]).bytes

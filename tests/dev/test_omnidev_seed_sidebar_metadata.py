@@ -128,3 +128,26 @@ def test_dates_land_on_their_calendar_day_just_after_midnight() -> None:
     for days_ago, _repo in seeder.LAYOUT:
         stamped = datetime.fromtimestamp(seeder.updated_at(days_ago, now), tz=now.tzinfo)
         assert stamped.date() == now.date() - timedelta(days=days_ago)
+
+
+def test_layout_puts_a_few_sessions_in_every_updated_group() -> None:
+    def group(days_ago: int) -> str:
+        # The sidebar's Updated groups (web/src/shell/sidebarNav.ts updatedBucket).
+        if days_ago == 0:
+            return "Today"
+        if days_ago == 1:
+            return "Yesterday"
+        if days_ago <= 7:
+            return "Previous 7 days"
+        return "Previous 30 days" if days_ago <= 30 else "Older"
+
+    counts: dict[str, int] = {}
+    for days_ago, _repo in _seeder().LAYOUT:
+        counts[group(days_ago)] = counts.get(group(days_ago), 0) + 1
+    assert counts == {
+        "Today": 2,
+        "Yesterday": 2,
+        "Previous 7 days": 2,
+        "Previous 30 days": 2,
+        "Older": 2,
+    }
