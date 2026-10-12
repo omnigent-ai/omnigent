@@ -7640,6 +7640,7 @@ def _native_terminal_start_error_payload(
         if isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES
         else None
     )
+    os_error = _os_error_with_errno(exc)
     extra = debug_event(
         "native_terminal_start_failed",
         session_id=session_id,
@@ -7649,6 +7650,14 @@ def _native_terminal_start_error_payload(
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
         cause_code=exc.code if isinstance(exc, OmnigentError) else None,
+        native_launch_os_errno=os_error.errno if os_error is not None else None,
+        native_launch_os_errno_name=errno.errorcode.get(os_error.errno)
+        if os_error is not None and os_error.errno is not None
+        else None,
+        native_launch_winerror=getattr(os_error, "winerror", None),
+        exception_context_type=type(exc.__context__).__name__
+        if exc.__context__ is not None
+        else None,
         # The warning below carries no exc_info for a missing agent, so the
         # sink cannot derive its category.
         error_category=exc.category.value
