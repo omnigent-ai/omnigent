@@ -288,6 +288,40 @@ async def test_preview_drops_when_negotiated_tunnel_is_down() -> None:
     assert http_posts == []
 
 
+async def test_acknowledged_batch_stamps_last_dispatch_at() -> None:
+    dispatcher = RunnerEventDispatcher()
+    loop = asyncio.get_running_loop()
+    assert dispatcher.last_dispatch_at is None
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    dispatcher.ready(send)
+    async with _client(dispatcher, []) as client:
+        before = loop.time()
+        response = await client.post(_URL, json=_ITEM)
+    assert response.status_code == 202
+    dispatched = dispatcher.last_dispatch_at
+    assert dispatched is not None and before <= dispatched <= loop.time()
+
+
+async def test_unacknowledged_batch_does_not_stamp_last_dispatch_at() -> None:
+    dispatcher = RunnerEventDispatcher()
+
+    async def send(_text: str) -> None:
+        # The tunnel drops before any ACK: nothing reached the server.
+        dispatcher.disconnected()
+
+    dispatcher.ready(send)
+    preview = {"type": "external_output_text_delta", "data": {"delta": "hi"}}
+    async with _client(dispatcher, []) as client:
+        response = await asyncio.wait_for(client.post(_URL, json=preview), timeout=3)
+    assert response.status_code == 503
+    assert dispatcher.last_dispatch_at is None
+
+
 async def test_disconnect_during_failed_send_leaves_no_unretrieved_future_error() -> None:
     dispatcher = RunnerEventDispatcher()
     loop = asyncio.get_running_loop()

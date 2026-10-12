@@ -1913,3 +1913,145 @@ async def test_runner_exited_lookup_failure_logs_event_and_keeps_tunnel(
     assert getattr(events[0], "attributes", {})["runner_id"] == "runner_crashed"
     # The tunnel survived the callback error, so the host is still registered.
     assert app.state.host_registry.get(_HOST_ID) is not None
+
+
+def _disconnect_decisions(
+    caplog: pytest.LogCaptureFixture, session_id: str
+) -> list[logging.LogRecord]:
+    """Return captured ``runner_disconnect_decision`` records for a session."""
+    return [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_disconnect_decision"
+        and getattr(r, "session_id", None) == session_id
+    ]
+
+
+def _turn_failed_events(
+    caplog: pytest.LogCaptureFixture, session_id: str
+) -> list[logging.LogRecord]:
+    """Return captured ``session_turn_failed`` records for a session."""
+    return [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "session_turn_failed"
+        and getattr(r, "session_id", None) == session_id
+    ]
+
+
+def _persisted_task_error(
+    conv_store: SqlAlchemyConversationStore, session_id: str
+) -> dict[str, str] | None:
+    """Return the session's persisted failure-cause labels, if any."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    refreshed = conv_store.get_conversation(session_id)
+    assert refreshed is not None
+    return sessions_module._last_task_error_from_labels(refreshed.labels)
+
+
+async def test_runner_exited_after_connect_keeps_idle_session_idle(
+    db_uri: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A host death after its runner connected does not fail the idle session.
+
+    When a host process dies (e.g. SSH logout), its runners exit with it and
+    the host reports ``host.runner_exited`` for each. A session whose runner
+    had connected and finished its last turn lost no work: failing it as
+    ``failed_before_start`` painted a red crash banner on an idle session.
+    The runner's absence is already surfaced through liveness.
+    """
+    from omnigent.server import session_live_state
+
+    app, conv_store = _runner_exited_app(db_uri, tmp_path)
+    conv = conv_store.create_conversation(agent_id=None, runner_id="runner_ran_idle")
+    conv_store.set_session_live_status(conv.id, "idle")
+    # The runner tunnel connected on this replica (stamped on connect/ping).
+    session_live_state.touch_runner_liveness(["runner_ran_idle"])
+
+    caplog.set_level("WARNING", logger="omnigent")
+    _comm = await _report_runner_exited(app, "runner_ran_idle")
+    async with asyncio.timeout(5.0):
+        while not _disconnect_decisions(caplog, conv.id):
+            await asyncio.sleep(0.01)
+    # Let any (incorrect) failure edge from the same report land before asserting.
+    await asyncio.sleep(0.05)
+
+    decision = _disconnect_decisions(caplog, conv.id)[0]
+    attributes = getattr(decision, "attributes", {})
+    assert attributes["decision"] == "idle_no_failure"
+    assert attributes["fail_idle_top_level"] is False
+    assert not _turn_failed_events(caplog, conv.id)
+    refreshed = conv_store.get_conversation(conv.id)
+    assert refreshed is not None
+    assert refreshed.live_status == "idle"
+    assert _persisted_task_error(conv_store, conv.id) is None
+
+
+async def test_runner_exited_before_connect_fails_idle_session(
+    db_uri: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A runner that died before connecting still fails its idle session.
+
+    That session never reached ``running`` and would otherwise spin on
+    "starting" until a timeout; the crash report is its only failure signal.
+    """
+    app, conv_store = _runner_exited_app(db_uri, tmp_path)
+    conv = conv_store.create_conversation(agent_id=None, runner_id="runner_never_connected")
+    conv_store.set_session_live_status(conv.id, "idle")
+
+    caplog.set_level("WARNING", logger="omnigent")
+    _comm = await _report_runner_exited(app, "runner_never_connected")
+    async with asyncio.timeout(5.0):
+        while _persisted_task_error(conv_store, conv.id) is None:
+            await asyncio.sleep(0.01)
+
+    error = _persisted_task_error(conv_store, conv.id)
+    assert error is not None
+    assert error["code"] == "runner_failed_to_start"
+    decision = _disconnect_decisions(caplog, conv.id)[0]
+    attributes = getattr(decision, "attributes", {})
+    assert attributes["decision"] == "failed_before_start"
+    assert attributes["fail_idle_top_level"] is True
+    failed = _turn_failed_events(caplog, conv.id)
+    assert failed
+    assert getattr(failed[0], "attributes", {})["code"] == "runner_failed_to_start"
+
+
+async def test_runner_exited_after_connect_fails_mid_turn_session(
+    db_uri: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A connected runner's death still fails a session that was mid-turn.
+
+    The host dying interrupts in-flight work, so the turn fails with the
+    daemon-reported crash cause.
+    """
+    from omnigent.server import session_live_state
+
+    app, conv_store = _runner_exited_app(db_uri, tmp_path)
+    conv = conv_store.create_conversation(agent_id=None, runner_id="runner_ran_mid_turn")
+    conv_store.set_session_live_status(conv.id, "running")
+    session_live_state.touch_runner_liveness(["runner_ran_mid_turn"])
+
+    caplog.set_level("WARNING", logger="omnigent")
+    _comm = await _report_runner_exited(app, "runner_ran_mid_turn")
+    async with asyncio.timeout(5.0):
+        while _persisted_task_error(conv_store, conv.id) is None:
+            await asyncio.sleep(0.01)
+
+    error = _persisted_task_error(conv_store, conv.id)
+    assert error is not None
+    assert error["code"] == "runner_failed_to_start"
+    decision = _disconnect_decisions(caplog, conv.id)[0]
+    attributes = getattr(decision, "attributes", {})
+    assert attributes["decision"] == "failed_mid_turn"
+    assert attributes["fail_idle_top_level"] is False

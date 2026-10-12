@@ -317,6 +317,7 @@ interface FilesystemListResponse {
     modified_at: number | null;
   }[];
   has_more: boolean;
+  last_id?: string | null;
   /** True when the server stopped scanning before it covered the tree. */
   truncated?: boolean;
 }
@@ -755,13 +756,15 @@ function hasUnsafeSegments(rel: string): boolean {
   return rel.split("/").some((seg) => seg === "" || seg === "." || seg === "..");
 }
 
-/** One tolerant parent-directory page: its entries plus whether it was cut off. */
+/** A bounded parent-directory listing and whether more entries remain. */
 interface DirListingPage {
   files: WorkspaceFile[];
   /** True when the listing was truncated (`has_more`), so a file missing
    * from `files` may simply live past the page limit — absence unproven. */
   truncated: boolean;
 }
+
+const FILE_EXISTENCE_SCAN_LIMIT = 10_000;
 
 async function fetchDirEntriesTolerant(
   conversationId: string,
@@ -776,32 +779,46 @@ async function fetchDirEntriesTolerant(
   // listing echo back base-relative names, so the listed dir is re-attached
   // below and callers compare full paths uniformly.
   const base = `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem`;
-  const params = new URLSearchParams({ limit: "1000", order: "asc" });
+  const params = new URLSearchParams({ order: "asc" });
   const hostBase = browseLocationBase(dirPath);
   if (hostBase) params.set("base", hostBase);
   const segment = browseLocationSegment(dirPath);
-  const res = await authenticatedFetch(
-    segment === "" ? `${base}?${params}` : `${base}/${segment}?${params}`,
-  );
-  // 404 = the directory (or the whole OS environment) is absent, so the file
-  // can't exist. 403 = the path is outside this session's reach (a confined
-  // sandbox, or a viewer below the owner level absolute browsing requires) —
-  // for this caller that reads the same as "no such openable file". Degrade
-  // both to "no entries" rather than surfacing an error.
-  if (res.status === 404 || res.status === 403) return { files: [], truncated: false };
-  // A parked/unavailable runner can't answer at all — that's "couldn't
-  // check" (null), not a verified-absent empty listing, so a dead-link
-  // affordance never grows out of a runner that's merely offline.
-  if (await isRunnerUnavailable503(res)) return null;
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const body = (await res.json()) as FilesystemListResponse;
-  // Relative listings echo full workspace-relative paths (kept as-is);
-  // host-absolute listings echo names relative to the listed dir, so the
-  // dir is re-attached to make them absolute.
-  return {
-    files: mapFilesystemEntries(body, "", hostBase ? dirPath : ""),
-    truncated: !!body.has_more,
-  };
+  const files: WorkspaceFile[] = [];
+  let after: string | null = null;
+  // Each request needs the cursor returned by the previous page.
+  /* oxlint-disable no-await-in-loop */
+  while (files.length < FILE_EXISTENCE_SCAN_LIMIT) {
+    params.set("limit", String(Math.min(1000, FILE_EXISTENCE_SCAN_LIMIT - files.length)));
+    if (after) params.set("after", after);
+    let body: FilesystemListResponse;
+    let page: WorkspaceFile[];
+    try {
+      const res = await authenticatedFetch(
+        segment === "" ? `${base}?${params}` : `${base}/${segment}?${params}`,
+      );
+      // A missing or inaccessible parent proves absence only before a listing
+      // begins. If it changes between pages, the result is inconclusive.
+      if (res.status === 404 || res.status === 403) {
+        return files.length ? { files, truncated: true } : { files: [], truncated: false };
+      }
+      if (await isRunnerUnavailable503(res))
+        return files.length ? { files, truncated: true } : null;
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      body = (await res.json()) as FilesystemListResponse;
+      page = mapFilesystemEntries(body, "", hostBase ? dirPath : "");
+    } catch (error) {
+      if (files.length) return { files, truncated: true };
+      throw error;
+    }
+    files.push(...page);
+    if (!body.has_more) return { files, truncated: false };
+    if (!page.length || !body.last_id || body.last_id === after) {
+      return { files, truncated: true };
+    }
+    after = body.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return { files, truncated: true };
 }
 
 /** Result of {@link useWorkspaceFileExists}. */
@@ -824,11 +841,10 @@ export interface WorkspaceFileExistence {
 /**
  * Check whether `path` names an existing *file* the session can open.
  *
- * Backed by a listing of the path's PARENT directory — cheap (one stat-level
- * listing, metadata only), shared across sibling files via the React Query
- * cache, and far lighter than a recursive `/search` walk or a full content
- * read. Reports `exists: false` while loading, when `path` is null or not
- * path-shaped, or when the runner has no OS environment for this session.
+ * Backed by a bounded listing of the path's PARENT directory, shared across
+ * sibling files via the React Query cache. A directory beyond the scan limit
+ * cannot prove absence. Reports `exists: false` while loading, when `path` is
+ * null or not path-shaped, or when the runner has no OS environment.
  *
  * A host-absolute `path` (leading slash — a file outside the workspace root)
  * lists its absolute parent via the ``base=host`` wire form; the entries echo

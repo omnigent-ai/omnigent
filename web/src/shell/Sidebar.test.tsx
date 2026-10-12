@@ -1063,6 +1063,20 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it.each(["/canvas", "/canvas/c/conv_one"])(
+    "keeps the Canvas navigation destination on the selected project at %s",
+    (pathname) => {
+      mockConversations(THREE_TYPE_CONVERSATIONS);
+      renderSidebar(true, `${pathname}?canvas=project`, undefined, {
+        ...FALLBACK_SERVER_INFO,
+        features: { canvas: true },
+      });
+
+      expect(screen.getByTestId("canvas-nav")).toHaveAttribute("href", "/canvas?canvas=project");
+      expect(screen.getByTestId("canvas-nav")).toHaveAttribute("aria-current", "page");
+    },
+  );
+
   it("keeps filtering visible while session selection remains hover-revealed", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();

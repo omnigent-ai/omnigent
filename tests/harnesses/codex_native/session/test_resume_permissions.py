@@ -49,9 +49,11 @@ def test_clear_bridge_state_removes_stale_runtime_state(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("retain_client", [False, True])
+@pytest.mark.parametrize("model_provider", [None, "omnigent_databricks"])
 def test_preload_codex_thread_for_resume_manages_subscription(
     monkeypatch: pytest.MonkeyPatch,
     retain_client: bool,
+    model_provider: str | None,
 ) -> None:
     """
     Preloading uses Codex ``thread/resume`` before bridge state is exposed.
@@ -92,6 +94,7 @@ def test_preload_codex_thread_for_resume_manages_subscription(
                 'approvals_reviewer="auto_review"',
             ],
             retain_client=retain_client,
+            model_provider=model_provider,
         )
     )
 
@@ -105,6 +108,7 @@ def test_preload_codex_thread_for_resume_manages_subscription(
                 "permissions": ":danger-full-access",
                 "approvalPolicy": "never",
                 "approvalsReviewer": "auto_review",
+                **({"modelProvider": model_provider} if model_provider is not None else {}),
             },
         )
     ]

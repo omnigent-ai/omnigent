@@ -959,9 +959,9 @@ class ClaudeHookRecord:
         absent, or when no counted entry carried a usable field.
     :param failure_category: ``StopFailure`` error category, e.g.
         ``"rate_limit"``. ``None`` for other events or when absent.
-    :param failure_message: ``StopFailure`` error text Claude Code rendered
-        for the turn (the payload's ``last_assistant_message``), e.g.
-        ``"API Error: 500 Internal server error"``. ``None`` when absent.
+    :param failure_message: ``StopFailure`` raw API error detail from the
+        payload's ``error_details`` field, e.g.
+        ``"prompt is too long: 120000 tokens (limit 100000)"``. ``None`` when absent.
     :param failure_context: Structured evidence supplied by this hook record.
     """
 
@@ -3815,18 +3815,16 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     failure_context: FailureContext | None = None
     if event_name == "StopFailure" and isinstance(payload, dict):
         failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
-        # The CLI renders this text for its own error, so it reads like the
-        # mirrored API-error message.
-        raw_message = _bounded_hook_text(
-            payload.get("last_assistant_message"), _FAILURE_MESSAGE_MAX_CHARS
-        )
-        original_message = payload.get("last_assistant_message")
+        # ``error_details`` is the purpose-built API error field; ``last_assistant_message``
+        # can hold prior-turn prose when the failure fires before any new output.
+        raw_details = _bounded_hook_text(payload.get("error_details"), _FAILURE_MESSAGE_MAX_CHARS)
+        original_details = payload.get("error_details")
         failure_context = claude_failure_context(
             payload,
-            error_text=original_message if isinstance(original_message, str) else None,
+            error_text=original_details if isinstance(original_details, str) else None,
         )
         failure_message = (
-            _display_text(raw_message, is_api_error=True) if raw_message is not None else None
+            _display_text(raw_details, is_api_error=True) if raw_details is not None else None
         )
     return ClaudeHookRecord(
         event_cursor=record.line_number,
@@ -4168,8 +4166,11 @@ def _paste_and_submit(
     :param needle: Draft marker from :func:`_submit_needle`; empty skips
         draft-visibility verification (blind submit).
     :returns: None.
-    :raises RuntimeError: If a ``tmux`` invocation fails, or if the draft
-        never leaves the input box after repeated submit Enters.
+    :raises ClaudeUserPromptPending: If a question or permission prompt is
+        pending before the submit Enter; the message was not sent.
+    :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
+        never leaves the input box after repeated submit Enters, or if a
+        prompt appears after the submit Enter.
     """
     delivery_diagnostics.start_attempt()
     delivery_diagnostics.set_stage("checking_pending_prompt")
@@ -4264,13 +4265,21 @@ def _paste_and_submit(
     # draft is verifiably still present, so a retry can never hit an
     # empty prompt or a permission dialog of the started turn.
     delivery_diagnostics.set_stage("verifying_submit")
-    if _verify_submit_accepted(
-        socket_path,
-        tmux_target,
-        needle=needle,
-        what="submitted message",
-        bridge_dir=bridge_dir,
-    ):
+    try:
+        accepted = _verify_submit_accepted(
+            socket_path,
+            tmux_target,
+            needle=needle,
+            what="submitted message",
+            bridge_dir=bridge_dir,
+        )
+    except ClaudeUserPromptPending as exc:
+        # The Enter already went out, so the prompt may belong to this message's own turn.
+        raise RuntimeError(
+            "Claude is waiting for an explicit answer after the message was submitted; "
+            "it may already have been delivered."
+        ) from exc
+    if accepted:
         return
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "

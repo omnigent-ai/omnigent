@@ -492,7 +492,7 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
     An entry the person cancelled by interrupting (see
     :func:`mark_interrupted`) is never the guess: it would hand its
     attachments and author to a later message, or take the place of the
-    entry a ``/btw`` or ``/clear`` means to settle.
+    entry a ``/clear`` means to settle.
 
     :param conversation_id: Conversation/session id the message was
         persisted on, e.g. ``"conv_abc123"``.

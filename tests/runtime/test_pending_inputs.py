@@ -929,14 +929,13 @@ def test_interrupted_entry_still_answers_a_stable_id_retry() -> None:
 def test_resolve_oldest_skips_interrupted_entries() -> None:
     """A positional drain hands the mirror to a live entry, never to a cancelled one.
 
-    Otherwise a ``/btw`` typed after a cancelled message would settle the
-    cancelled entry and leave its own bubble pending, and a message typed in the
-    TUI would inherit the cancelled entry's attachments and author.
+    Otherwise a message typed in the TUI would inherit the cancelled entry's
+    attachments and author.
     """
     cancelled = pending_inputs.record(
         "conv_a", [_text_block("cancelled")], created_by="alice@example.com"
     )
-    live = pending_inputs.record("conv_a", [_text_block("/btw what is this")])
+    live = pending_inputs.record("conv_a", [_text_block("go on")])
     pending_inputs.mark_interrupted("conv_a", [cancelled])
 
     drained = pending_inputs.resolve_oldest("conv_a", hold=True)

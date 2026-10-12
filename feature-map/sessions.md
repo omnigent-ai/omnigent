@@ -24,6 +24,9 @@ the header menu), and each place is a separate entry point.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
   closing one stops only that chat. Starting one from a stopped generic hosted
   parent relaunches the parent first, then shares its replacement runner.
+- `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
+  writable side chat; Reply on side-chat text quotes it in that chat. Both keep
+  the existing draft and attachments, and quotes can be removed before sending.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
@@ -52,6 +55,19 @@ the header menu), and each place is a separate entry point.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
   per-tab.
+- `canvas-workspace`: Canvas collapses the shared sidebar on entry; clicking a
+  card opens its session beside the project board. Switching cards keeps
+  drafts and board state; resize, focus, and close controls adjust the split.
+- `canvas-mobile`: the board and selected session use the standard top-left
+  hamburger to open navigation. Back to canvas retains the selected project
+  across deep links and reloads.
+- `canvas-navigation`: Canvas uses the same collapsed-sidebar button and hover
+  preview as other pages, including the macOS titlebar controls. Opening it
+  reveals the shared destinations, including Usage when enabled.
+- `canvas-create`: the plus button on Main or a project opens the new-session
+  composer; sending returns to that board with the new session selected.
+- `canvas-session-health`: an opened Canvas session receives host health and
+  live updates even before it appears in the loaded sidebar pages.
 
 ## How to get to it (user POV)
 
@@ -77,6 +93,30 @@ dialog, or uploaded by running a session with their spec) stay available until
 you remove them.
 
 **Archived view:** switch the sidebar to archived sessions and filter by project.
+
+**Canvas:** choose Canvas in the sidebar, select Main or a project, and click
+a session card once. Expand navigation manually to keep it open while switching
+cards. Choosing Canvas in the sidebar returns to the selected board.
+Drag the divider to resize, or focus it and use Left/Right arrows to
+adjust the split and Home/End to reach its limits. Double-click the divider to
+restore the default split. Focus the session to use the full area; Escape
+restores the board. Close the session to return to the board. Opening, closing,
+or maximizing Workspace keeps the canvas visible. Session focus is independent: Show canvas
+restores the board without closing Workspace. Each card remembers whether Workspace is open.
+On mobile, the top-left hamburger opens the sidebar from the board or a selected
+session. Back to canvas returns to the selected project. A Canvas session link
+opens the same layout directly. If a session is replaced, for example after `/clear`,
+its replacement stays beside the same board.
+The plus button starts a new session in the selected canvas. After sending,
+the new session opens beside that board; on narrow screens, Back to canvas
+returns to it. Reloading a temporary session before creation finishes returns to
+the same board. Open sidebar appears on the board or, when the board is hidden,
+in the conversation header. On desktop, hovering previews the sidebar and clicking
+opens it. The macOS app uses its existing titlebar toggle, Search, and Settings.
+On macOS desktop, the board and its controls stay below the window title bar,
+including while focusing a conversation or using a narrow window.
+Open a Canvas session outside the loaded sidebar pages to see its current host
+status and live session updates, including when the app is embedded.
 
 **Reconnect:** in a session whose agent stopped, use the reconnect affordance
 in the chat; the dialog shows the command for this situation (for example
@@ -116,11 +156,19 @@ a separate action that leaves the session connected.
 **Side-chat lifecycle:** use **Workspace → + → Side chat**, type `/side` in the
 parent composer, or choose **Start a new side chat** from the composer's add
 tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
-side chats open in a drawer. A generic hosted parent can start a new side chat
+side chats open in a drawer; the header's **Conversation actions → Side
+chats** reopens it. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
 without choosing a workspace.
+
+**Side-chat quotes:** select text in the parent conversation and choose **Ask in
+side chat**. It appends a removable quote to the visible side-chat tab, including
+an unsent tab, while keeping the draft. With no eligible tab visible, it opens a
+new unsent tab. In the desktop side-chat pane or mobile drawer, select transcript
+text and choose **Reply** to quote it in that chat's composer. Adding a quote
+does not send a message; enter a question and send when ready.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -157,7 +205,10 @@ plain `uv run pytest`, which starts a private server for the test.
   Dropping an unpinned row onto a pinned row has web unit coverage only.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
-  `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`
+  `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`.
+  The iOS drawer rename under the soft keyboard:
+  `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_keeps_sidebar_sessions_reachable`,
+  `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_scrolls_edit_row_into_view_above_keyboard`
 - **`archive`:**
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
@@ -276,6 +327,19 @@ plain `uv run pytest`, which starts a private server for the test.
   mobile side-chat drawer. Its stale-branch scenarios simulate a stopped parent
   runner and verify parent recovery before binding; the hosted lifecycle test
   above proves live-parent reuse with actual runner processes.
+- **`side-chat-quotes`, desktop Ask in side chat and Reply:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_ask_in_side_chat_opens_a_quoted_side_chat_tab`
+  checks pending/live tab reuse, draft preservation, and replies sent only to
+  the child. Hide Workspace and repeat Ask in side chat to verify
+  a new tab opens instead of changing the hidden draft.
+- **`side-chat-quotes`, mobile drawer Reply:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_opens_in_a_drawer_on_mobile`
+  checks that Reply stays on screen and the quoted follow-up reaches only the
+  side chat. Component coverage in `web/src/components/chat/SideChatPane.test.tsx`
+  checks quote removal, preserved text/files, read-only chats, and starting-tab
+  eligibility; `web/src/pages/ChatPage.composer.test.tsx` checks target routing
+  and parent isolation. In an embedded app, repeat text selection in both the
+  parent and side chat and check the popup's theme and button styling.
 - **`side-chat-lifecycle`, direct chat-only URL (browser contract):**
   `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
   opens a runnerless child directly and sends a message without a directory
@@ -321,6 +385,64 @@ plain `uv run pytest`, which starts a private server for the test.
   tab, open it in another tab and the agent browser, and confirm both are signed
   in. Another session should be signed out. Log out and refresh the same-session
   tabs; all should be signed out.
+- **`canvas-workspace` (sidebar entry, project cards, chat, focus, and history):**
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions`.
+  Workspace open/close, independent focus, maximizing, and pane sizing on wide
+  and smaller desktops:
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_stays_visible_when_workspace_opens`.
+  Grouping, feature gating, drag persistence, and live updates also run in
+  `tests/e2e_ui/sessions/test_canvas_page.py`, with selection churn in
+  `tests/e2e_ui/sessions/test_canvas_selected_highlight_persists.py::test_clicked_card_keeps_selected_highlight_across_live_updates`.
+  Unit tests in `web/src/canvas/canvasNavigation.test.ts` distinguish Canvas
+  from similarly named routes under standalone and embedded mount paths.
+  `web/src/canvas/CanvasWorkspace.test.tsx` verifies that dismissing a nested
+  dialog with Escape preserves conversation focus and that resizing respects
+  both panes' minimum widths; double-click restores and saves the default split.
+  It also checks that the sidebar menu stays usable while the board is loading.
+  `web/src/pages/CanvasPage.test.tsx` checks viewport
+  translation across successive resizes, hiding, and restoring the pane,
+  refitting untouched boards after card changes, and preserving queued viewports
+  during rapid project switches and resizes. `web/src/shell/AppShell.test.tsx`
+  verifies Workspace's saved open/closed choice across card changes.
+  `web/src/hooks/useConversationRedirect.test.tsx` delivers session replacement
+  events and checks the same board, query parameters, and replaced history under
+  standalone and embedded routes.
+- **`canvas-session-health` (card selection and direct session links):** component
+  tests in `web/src/hooks/useActiveConversationId.test.tsx` cover standalone and
+  embedded session routes, switching cards, and returning to the board.
+  `web/src/hooks/RunnerHealthProvider.test.tsx` and
+  `web/src/hooks/SessionUpdatesProvider.test.tsx` verify that a Canvas session
+  outside the loaded sidebar pages enters health polling and the live watch
+  set; changing cards updates the watched session and encoded temporary ids
+  are excluded.
+- **`canvas-mobile` (deep link, back button, and reload):**
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_deep_link_and_mobile_return_keep_the_project`.
+  At phone width and just below the desktop breakpoint, the journey compares the
+  hamburger with an ordinary session, opens navigation from both Canvas views,
+  and returns to the selected project.
+- **`canvas-navigation` (collapsed/expanded, Usage enabled/disabled):**
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_uses_standard_sidebar_navigation`.
+  The journey compares the toggle's icon, position, and size with an ordinary
+  session, previews and opens navigation, and checks that split and focused
+  conversations retain one toggle. It compares destinations and returns through
+  Canvas, then reloads to confirm the selected project remains remembered.
+  macOS title-bar clearance, sidebar opening from the titlebar toggle or mobile
+  hamburger, and conversation focus/return at wide and narrow widths run in
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_controls_clear_the_macos_titlebar`.
+  This Chromium journey emulates the macOS preload bridge and user agent; it
+  verifies the app's layout around the title bar, not native traffic-light rendering.
+  `web/src/shell/ChatHeader.test.tsx` checks the shared toggle's desktop/mobile
+  icons, peek cancellation, and hover/keyboard tooltip behavior.
+- **`canvas-create` (Main/project plus button, desktop/mobile):**
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_plus_creates_session_on_the_selected_board`.
+  The composer uses a fixture host; session creation, binding to the isolated
+  runner, and the mock-backed first reply use the real server. Temporary-id
+  replacement, server-first creation, feature gating, and failed-create draft
+  recovery also run in `web/src/shell/NewChatDialog.flow.test.tsx`.
+  Stale temporary routes return to their board in
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_canvas_creation_url_returns_to_its_board`;
+  ordinary sessions still return to the new-session page in
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
 
 ## Gotchas
 
@@ -328,6 +450,20 @@ plain `uv run pytest`, which starts a private server for the test.
   Hostless CLI Stop keeps its existing per-conversation behavior.
 - Starting a side chat after its parent stopped relaunches the parent. The new
   chat shares that replacement runner and stops with the parent again.
+- Ask in side chat reuses only a visible, writable tab belonging to the current
+  parent. Hidden, ended, and currently starting tabs are ineligible; another
+  selection opens a new unsent tab. Ended chats do not offer Reply.
+- A phone-width browser run does not prove the mobile side-chat drawer in the
+  embedded web app or the native apps. Both style the drawer only inside the
+  app's own page area: placed outside it, the drawer stays off screen when
+  embedded and sits under the status bar in the native apps.
+- Canvas is feature-gated, including conversation deep links. Its browser
+  tests enable that flag explicitly; they do not enable it on a deployed app.
+- Canvas entry collapses navigation once. Selecting another card must not
+  collapse navigation that the user has manually expanded. Card dragging must
+  not open a session. Workspace must not hide the canvas or change session
+  focus; both panels resize to leave room for the conversation controls.
+
 - Browser storage sharing is limited to one desktop window and app run;
   restarting the app clears it. Closing an individual tab does not.
 - Archive and unarchive exist on the row, in bulk selection, and in the header

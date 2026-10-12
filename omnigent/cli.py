@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from importlib import import_module, resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias, cast, get_args
 
 import click
 import psutil
@@ -3322,6 +3322,23 @@ def _describe_pid(pid: int) -> str:
         return f"pid={pid}"
 
 
+def _pid_is_foreign(pid: int) -> bool:
+    """Whether *pid* is owned by another user, so this account cannot signal it.
+
+    ``os.kill(pid, 0)`` delivers no signal but runs the same permission check
+    a real signal would: ``PermissionError`` (EPERM) means the process belongs
+    to another user. Any other outcome (delivered, or the pid is gone) is not
+    treated as foreign.
+    """
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _pid_is_recorded_daemon(record: _HostDaemonRecord) -> bool:
     """Whether *record*'s pid still names the recorded daemon, not a recycled pid.
 
@@ -3406,10 +3423,24 @@ def _claim_foreground_daemon_record(
     if conflict is not None:
         # server_url is None in local mode; "" makes the hint say --server "".
         stop_command = _host_stop_command(conflict.server_url or "")
-        raise click.ClickException(
+        detail = (
             "A host daemon is already running for this server "
             f"({_describe_pid(conflict.pid)}, target={conflict.target}). "
-            f"Run `{cli_invocation()} host status` to inspect it or `{stop_command}` "
+        )
+        if _pid_is_foreign(conflict.pid):
+            # Another user owns the daemon: `host stop` on this account can only
+            # clear the shared registry record, not signal the process — and a
+            # service-managed daemon respawns. Point at remedies that work
+            # instead of a stop that cannot.
+            raise click.ClickException(
+                detail + "It is owned by another user, so it cannot be stopped from this "
+                f"account: `{stop_command}` only clears the shared registry record "
+                "(and a service-managed daemon respawns). Ask that user to stop it, "
+                "or set OMNIGENT_DATA_DIR to a directory only you use to run your "
+                "own host."
+            )
+        raise click.ClickException(
+            detail + f"Run `{cli_invocation()} host status` to inspect it or `{stop_command}` "
             "to stop it first."
         )
     previous = _find_daemon_record(record.target)
@@ -7135,6 +7166,12 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
     item authorship is re-attributed to the importing user (original
     ``created_by`` is not carried over).
 
+    A session from a native harness with an import source is labeled as an
+    import, so the unbound copy reads offline and the web UI offers to
+    reconnect it (a host picker for Claude, Codex, Pi, and OpenCode). Harnesses
+    that carry fork history (Claude, Codex, Pi, Qwen, and OpenCode) also keep
+    the conversation on first launch; Kimi and Kiro start fresh.
+
     \b
     Examples:
       omnigent session import -i my_session.jsonl
@@ -7145,7 +7182,11 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
 
     from omnigent.chat import _remote_headers
     from omnigent.db.utils import builtin_agent_id
+    from omnigent.harness_capabilities import ForkHistory
+    from omnigent.harness_plugins import harness_capabilities
     from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+    from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY, ImportSource
+    from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 
     src_path = Path(input_path)
     if not src_path.is_file():
@@ -7196,6 +7237,15 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
     native_agent = native_coding_agent_for_harness(harness)
     if native_agent is not None:
         fallback_agent_id = builtin_agent_id(native_agent.agent_name)
+    # The source label makes the unbound copy read offline so the web UI offers
+    # to reconnect it; carry-history, for harnesses that can carry fork history,
+    # makes the first native launch reuse the copied items instead of starting fresh.
+    labels: dict[str, str] = {}
+    if native_agent is not None and native_agent.key in get_args(ImportSource):
+        labels[IMPORT_SOURCE_LABEL_KEY] = native_agent.key
+        caps = harness_capabilities().get(native_agent.harness)
+        if caps is not None and caps.fork_history is not ForkHistory.NONE:
+            labels[FORK_CARRY_HISTORY_LABEL_KEY] = "1"
 
     cfg = _load_effective_config()
     base_url = _resolve_attach_server(server, cfg.get("server"))
@@ -7220,6 +7270,8 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
         }
         if resolved_title:
             body["title"] = resolved_title
+        if labels:
+            body["labels"] = labels
         for key in (
             "workspace",
             "harness_override",
@@ -9332,6 +9384,30 @@ def _daemon_base_url(record: _HostDaemonRecord) -> str | None:
     return (record.server_url or record.target).rstrip("/")
 
 
+def _local_daemon_serving_remote(server_url: str) -> _HostDaemonRecord | None:
+    """Return the live local-mode daemon serving *server_url*, if any.
+
+    ``host --server <url>`` refuses to start when a local-mode daemon already
+    resolved to serve ``<url>`` (see :func:`_live_daemon_conflict`). ``host
+    stop`` / ``host status --server <url>`` must be able to act on that same
+    daemon, otherwise they report "No matching host daemon found" for the very
+    daemon ``host`` calls "already running".
+
+    :param server_url: Requested remote server URL, e.g.
+        ``"https://example.databricksapps.com"``.
+    :returns: The serving local-mode record, or ``None``.
+    """
+    local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
+    if (
+        local_record is not None
+        and local_record.resolved_server_url is not None
+        and local_record.resolved_server_url.rstrip("/") == server_url.rstrip("/")
+        and _daemon_owner_is_live(local_record)
+    ):
+        return local_record
+    return None
+
+
 def _selected_daemon_records(
     *,
     server: str | None,
@@ -9353,9 +9429,20 @@ def _selected_daemon_records(
         raise click.ClickException("Use either --server or --all, not both.")
     if all_targets or (server is None and default_all):
         return _list_daemon_records()
-    target = _normalize_daemon_target(_resolve_host_server(server))
+    resolved = _resolve_host_server(server)
+    target = _normalize_daemon_target(resolved)
     record = _find_daemon_record(target)
-    return [] if record is None else [record]
+    if record is not None:
+        return [record]
+    # No server-target record — but `host --server <url>` also treats a
+    # local-mode daemon serving <url> as "already running". Match it here so a
+    # user who runs the exact `host stop --server <url>` the start error points
+    # them at is not told "No matching host daemon found".
+    if resolved is not None:
+        local = _local_daemon_serving_remote(resolved)
+        if local is not None:
+            return [local]
+    return []
 
 
 # Per-process header cache keyed on base_url. _remote_headers() resolves
@@ -10480,7 +10567,19 @@ def _stop_daemon_sessions(
     return stopped
 
 
-def _signal_daemon_pid(record: _HostDaemonRecord, sig: int) -> bool:
+# `_signal_daemon_pid` outcomes.
+_SIGNAL_DELIVERED = "delivered"  # the signal reached the process
+_SIGNAL_GONE = "gone"  # the process had already exited — nothing to kill
+_SIGNAL_FOREIGN = "foreign"  # owned by another user (EPERM) — cannot signal it
+
+# `_terminate_daemon` outcomes, so `host stop` reports what actually happened
+# instead of claiming a stop it did not perform.
+_STOP_TERMINATED = "terminated"  # a daemon we own was signalled (or already gone)
+_STOP_DROPPED_STALE = "dropped_stale"  # dead / recycled pid — record dropped
+_STOP_DROPPED_FOREIGN = "dropped_foreign"  # owned by another user — record dropped
+
+
+def _signal_daemon_pid(record: _HostDaemonRecord, sig: int) -> str:
     """
     Signal a daemon's recorded PID, tolerating a stale foreign entry.
 
@@ -10501,16 +10600,17 @@ def _signal_daemon_pid(record: _HostDaemonRecord, sig: int) -> bool:
 
     :param record: Daemon record whose PID should be signalled.
     :param sig: Signal number to send, e.g. ``signal.SIGTERM``.
-    :returns: ``True`` if the record is stale and the caller should drop it
-        and stop (either the PID is not ours, or it already exited); ``False``
-        if the signal was delivered and termination should proceed as usual.
+    :returns: :data:`_SIGNAL_DELIVERED` when the signal reached the process,
+        :data:`_SIGNAL_GONE` when the process had already exited, or
+        :data:`_SIGNAL_FOREIGN` when the PID is owned by another user (EPERM)
+        and cannot be signalled from this account.
     """
     try:
         os.kill(record.pid, sig)
     except ProcessLookupError:
         # The process exited between the liveness check and the signal —
         # nothing left to kill, so the record is stale.
-        return True
+        return _SIGNAL_GONE
     except PermissionError:
         # Not our daemon: the record points at another user's process (PID
         # reuse, or a daemon started under a different account). Drop the
@@ -10520,16 +10620,20 @@ def _signal_daemon_pid(record: _HostDaemonRecord, sig: int) -> bool:
             f"{record.pid} is owned by another user and is not this daemon.",
             err=True,
         )
-        return True
-    return False
+        return _SIGNAL_FOREIGN
+    return _SIGNAL_DELIVERED
 
 
-def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
+def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> str:
     """
     Terminate one local daemon process.
 
     :param record: Daemon record whose process should terminate.
     :param force: Send SIGKILL after the SIGTERM grace period.
+    :returns: :data:`_STOP_TERMINATED` when a daemon we own was stopped (or had
+        already exited), :data:`_STOP_DROPPED_STALE` when only a dead/recycled
+        record was dropped, or :data:`_STOP_DROPPED_FOREIGN` when the record
+        named another user's process that we could not signal.
     :raises click.ClickException: If the process stays alive.
     """
     if not _pid_is_recorded_daemon(record):
@@ -10542,25 +10646,33 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
                 err=True,
             )
         _delete_daemon_record(record)
-        return
-    if _signal_daemon_pid(record, signal.SIGTERM):
+        return _STOP_DROPPED_STALE
+    outcome = _signal_daemon_pid(record, signal.SIGTERM)
+    if outcome == _SIGNAL_FOREIGN:
         _delete_daemon_record(record)
-        return
+        return _STOP_DROPPED_FOREIGN
+    if outcome == _SIGNAL_GONE:
+        _delete_daemon_record(record)
+        return _STOP_TERMINATED
     deadline = time.monotonic() + _HOST_DAEMON_STOP_GRACE_S
     while time.monotonic() < deadline:
         if not _pid_alive(record.pid):
             _delete_daemon_record(record)
-            return
+            return _STOP_TERMINATED
         time.sleep(0.1)
     if force:
-        if _signal_daemon_pid(record, getattr(signal, "SIGKILL", signal.SIGTERM)):
+        outcome = _signal_daemon_pid(record, getattr(signal, "SIGKILL", signal.SIGTERM))
+        if outcome == _SIGNAL_FOREIGN:
             _delete_daemon_record(record)
-            return
+            return _STOP_DROPPED_FOREIGN
+        if outcome == _SIGNAL_GONE:
+            _delete_daemon_record(record)
+            return _STOP_TERMINATED
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if not _pid_alive(record.pid):
                 _delete_daemon_record(record)
-                return
+                return _STOP_TERMINATED
             time.sleep(0.1)
     raise click.ClickException(
         f"Daemon {record.pid} for {_host_display_url(record.target)!r} did not exit; "
@@ -10605,14 +10717,35 @@ def host_stop(
     if not records:
         click.echo("No matching host daemon found.")
         return
+    stopped_local_daemon = False
     for record in records:
         stopped = 0
         if not daemon_only and not force:
             stopped = _stop_daemon_sessions(record)
-        _terminate_daemon(record, force=force)
+        outcome = _terminate_daemon(record, force=force)
+        target = _host_display_url(record.target)
+        if outcome == _STOP_DROPPED_FOREIGN:
+            click.echo(
+                f"Cleared the registry record for {target} — pid={record.pid} is owned "
+                f"by another user and could not be stopped from this account; "
+                f"sessions_stopped={stopped}."
+            )
+        elif outcome == _STOP_DROPPED_STALE:
+            click.echo(
+                f"Cleared a stale registry record for {target} — pid={record.pid} was "
+                f"not a live daemon; sessions_stopped={stopped}."
+            )
+        else:
+            click.echo(f"Stopped {target} daemon pid={record.pid}; sessions_stopped={stopped}.")
+        if record.target == _LOCAL_DAEMON_MARKER and outcome != _STOP_DROPPED_FOREIGN:
+            stopped_local_daemon = True
+    if stopped_local_daemon:
+        # `host stop` only stops hosting; the local server keeps running (so its
+        # web UI / history survive). Point users at the full stop so a wedged
+        # server doesn't look like it survived a restart.
         click.echo(
-            f"Stopped {_host_display_url(record.target)} daemon "
-            f"pid={record.pid}; sessions_stopped={stopped}."
+            "This stops hosting only — the local Omnigent server (web UI / history) "
+            f"stays up. Run `{cli_invocation()} stop` to stop it too."
         )
 
 

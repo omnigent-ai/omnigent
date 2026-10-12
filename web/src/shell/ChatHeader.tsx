@@ -9,7 +9,7 @@ import {
   GitPullRequestIcon,
   InfoIcon,
   ListIcon,
-  MenuIcon,
+  Maximize2Icon,
   MessagesSquareIcon,
   PanelLeftIcon,
   PanelRightCloseIcon,
@@ -17,7 +17,9 @@ import {
   ShareIcon,
   TerminalIcon,
   UserPlusIcon,
+  XIcon,
 } from "lucide-react";
+import { useCanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -45,7 +47,7 @@ import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { SidebarOpenButton } from "./SidebarOpenButton";
 
 const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 
@@ -349,42 +351,9 @@ export function ChatHeader({
   pending = false,
   mobileMenu,
 }: ChatHeaderProps) {
-  // Dwell on the toggle for 400ms to peek the sidebar; leaving before then cancels
-  // the pending peek so a quick pass-over never opens it. Peek is a desktop
-  // hover affordance — on mobile the toggle just opens the full-screen overlay,
-  // so a tap's synthetic pointerenter must not trigger it.
   const isMobile = useIsMobileViewport();
+  const canvas = useCanvasWorkspace();
   const { trackClick } = useOmnigentAnalytics();
-  const peekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const peekRequest = useRef(0);
-  // Once the dwell fires the peek, the card fades in click-through, so the
-  // pointer keeps resting on the toggle — long enough to trip the hover
-  // tooltip's own (longer) delay. The peek is the intended hover reveal, so
-  // suppress the tooltip when the peek fires. Pointer-armed only: keyboard
-  // focus never arms a peek, so the focus tooltip still works.
-  const suppressTooltip = useRef(false);
-  const [tooltipOpen, setTooltipOpen] = useState(false);
-  const cancelPeek = useCallback(() => {
-    peekRequest.current += 1;
-    if (peekTimer.current) {
-      clearTimeout(peekTimer.current);
-      peekTimer.current = null;
-    }
-    suppressTooltip.current = false;
-  }, []);
-  const onPeekSidebar = useCallback(() => {
-    if (isMobile) return;
-    cancelPeek();
-    const request = peekRequest.current;
-    peekTimer.current = setTimeout(() => {
-      peekTimer.current = null;
-      if (peekRequest.current !== request) return;
-      suppressTooltip.current = true;
-      setTooltipOpen(false);
-      onOpenSidebar(true);
-    }, 400);
-  }, [isMobile, onOpenSidebar, cancelPeek]);
-  useEffect(() => cancelPeek, [cancelPeek]);
   // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
   // opening the matching rail tab as a full-screen drawer. Mobile only: they
   // ride in the header's single kebab rather than a second trigger of their
@@ -588,55 +557,27 @@ export function ChatHeader({
       <div
         className={cn(
           "flex min-w-0 items-center gap-1 md:gap-6",
-          !sidebarOpen && "traffic-light-clearance",
+          !sidebarOpen && !canvas && "traffic-light-clearance",
         )}
       >
-        {!sidebarOpen && (
-          <Tooltip
-            open={tooltipOpen}
-            onOpenChange={(next) => {
-              if (next && suppressTooltip.current) return;
-              setTooltipOpen(next);
-            }}
+        {!sidebarOpen && (!canvas || canvas.compact || canvas.focused) && (
+          <SidebarOpenButton
+            onOpenSidebar={onOpenSidebar}
+            settingsMode={settingsMode}
+            componentId="chat.header.open_sidebar"
+          />
+        )}
+        {canvas?.compact && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={canvas.closeConversation}
+            aria-label="Back to canvas"
+            className="shrink-0 gap-1 px-1.5 text-ui"
           >
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                // Match the right-panel toggle's 24px icon-xs geometry on
-                // desktop; mobile keeps its larger touch target below.
-                size="icon-xs"
-                aria-label={settingsMode ? "Back to settings menu" : "Open sidebar"}
-                componentId="chat.header.open_sidebar"
-                onClick={() => {
-                  cancelPeek();
-                  onOpenSidebar(false);
-                }}
-                // chat-header-sidebar-toggle is hidden on the macOS shell, where
-                // the title-bar cluster carries an always-present toggle (with
-                // the same dwell-to-peek) and this would be a second, offset
-                // copy of it. Kept everywhere else, where it is the ONLY way to
-                // reopen a collapsed sidebar.
-                className="chat-header-sidebar-toggle border-none text-muted-foreground hover:text-foreground max-md:size-11"
-                onPointerEnter={onPeekSidebar}
-                onPointerDown={cancelPeek}
-                onPointerLeave={cancelPeek}
-              >
-                {settingsMode ? (
-                  <ArrowLeftIcon className="size-4 max-md:size-5" />
-                ) : isMobile ? (
-                  <MenuIcon className="size-5" />
-                ) : (
-                  <PanelLeftIcon className="size-4" />
-                )}
-              </Button>
-            </TooltipTrigger>
-            {/* Bottom placement keeps the tooltip clear of the macOS
-                Electron shell's traffic lights at the window's top edge. */}
-            <TooltipContent side="bottom">
-              {settingsMode ? "Back to settings menu" : "Open sidebar"}
-            </TooltipContent>
-          </Tooltip>
+            <ArrowLeftIcon className="size-4" />
+            Canvas
+          </Button>
         )}
         {/* Conversation breadcrumb (see ConversationBreadcrumb). Empty on the
             landing composer. A resolved title is enough; so is titleLinkTo —
@@ -866,6 +807,34 @@ export function ChatHeader({
         {/* Mobile-only session-actions kebab, rightmost in the cluster. Same
             menu the desktop breadcrumb hangs off its title. */}
         {isMobile && conversationMenu}
+        {canvas && !canvas.compact && (
+          <>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label={canvas.focused ? "Show canvas beside conversation" : "Focus conversation"}
+              title={canvas.focused ? "Show canvas" : "Focus conversation"}
+              onClick={canvas.toggleFocus}
+              className="shrink-0 text-muted-foreground"
+            >
+              {canvas.focused ? (
+                <PanelLeftIcon className="size-4" />
+              ) : (
+                <Maximize2Icon className="size-4" />
+              )}
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Close conversation pane"
+              title="Close conversation pane"
+              onClick={canvas.closeConversation}
+              className="shrink-0 text-muted-foreground"
+            >
+              <XIcon className="size-4" />
+            </Button>
+          </>
+        )}
       </div>
     </header>
   );

@@ -20,6 +20,7 @@ import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nat
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
   theme: "system" as string,
+  isEmbedded: false,
   archiveMutate: vi.fn(),
   deleteMutate: vi.fn(),
   bulkArchiveMutate: vi.fn(),
@@ -50,7 +51,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("next-themes", () => ({
   useTheme: () => ({ theme: mocks.theme, systemTheme: "light", setTheme: mocks.setTheme }),
 }));
-vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => false }));
+vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => mocks.isEmbedded }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     accounts_enabled: mocks.accountsEnabled,
@@ -227,6 +228,7 @@ beforeEach(() => {
   mocks.fetchNextPage.mockReset();
   mocks.conversationQuery.mockReset();
   mocks.theme = "system";
+  mocks.isEmbedded = false;
   mocks.accountsEnabled = true;
   mocks.importSessionsPanel.mockClear();
   mocks.loginUrl = "/login";
@@ -485,6 +487,24 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("theme-system")).toHaveAttribute("aria-checked", "true");
     fireEvent.click(screen.getByTestId("theme-dark"));
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("opens the embedded host's theme settings in a new tab", () => {
+    mocks.isEmbedded = true;
+    const url = "https://workspace.example.com/settings/user/preferences";
+    vi.spyOn(host, "getOmnigentThemeSettingsUrl").mockReturnValue(url);
+    renderPage("/settings/appearance");
+
+    expect(screen.queryByTestId("theme-system")).not.toBeInTheDocument();
+    for (const name of [
+      "Click to open Databricks user preferences page.",
+      "Open Databricks preferences",
+    ]) {
+      const link = screen.getByRole("link", { name });
+      expect(link).toHaveAttribute("href", url);
+      expect(link).toHaveAttribute("target", "_blank");
+      expect(link).toHaveAttribute("rel", "noreferrer");
+    }
   });
 
   it("renders the Terminal theme radiogroup with auto selected by default", () => {

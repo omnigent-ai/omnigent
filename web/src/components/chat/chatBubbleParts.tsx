@@ -1075,12 +1075,9 @@ function AssistantBubble({
         data-role="assistant"
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
-        className={
-          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
-        }
+        className={spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]"}
       >
-        {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap rather
-            than shrink-wrapping to the summary row's ~110px. */}
+        {/* Fold-only rows fill the prose width so their hairlines remain visible. */}
         <MessageContent
           className={cn(
             (spansFullColumn || foldOnly) && "w-full",

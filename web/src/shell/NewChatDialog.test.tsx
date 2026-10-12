@@ -3011,7 +3011,7 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     const row = await screen.findByTestId("new-chat-landing-host-arca-1");
     expect(row.textContent).toContain("Arca instance");
     expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
-      "Reconnect to Arca",
+      "Run on Arca",
     );
     fireEvent.click(row);
     await waitFor(() => expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1"));
@@ -3027,7 +3027,7 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     });
     renderLanding();
     await openHostMenu();
-    fireEvent.click(await screen.findByText("Reconnect to Arca"));
+    fireEvent.click(await screen.findByText("Run on Arca"));
     await waitFor(() =>
       expect(localStorage.getItem("omnigent:last-host-choice")).toBe("actual-arca"),
     );
@@ -3046,20 +3046,38 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     });
     renderLanding();
     await openHostMenu();
-    fireEvent.click(await screen.findByText("Reconnect to Arca"));
+    fireEvent.click(await screen.findByText("Run on Arca"));
     await waitFor(() => expect(connectArcaHost).toHaveBeenCalledTimes(1));
     await openHostMenu();
-    fireEvent.click(await screen.findByText("Reconnect to Arca"));
+    fireEvent.click(await screen.findByText("Run on Arca"));
     await waitFor(() => expect(connectArcaHost).toHaveBeenCalledTimes(2));
     expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1");
   });
+
+  it.each(["missing", "offline", "online"] as const)(
+    "uses the same connect label when the remembered Arca host is %s",
+    async (status) => {
+      localStorage.setItem("omnigent:arca-host-id", "arca-1");
+      mockHosts(
+        status === "missing"
+          ? []
+          : [{ host_id: "arca-1", name: "remote-box", owner: "me", status }],
+      );
+      renderLanding();
+      await openHostMenu();
+
+      expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
+        /^Run on Arca$/,
+      );
+    },
+  );
 
   it("shows a plain Run on Arca item (no status line) while not connected", async () => {
     renderLanding();
     await openHostMenu();
 
     const item = await screen.findByTestId("new-chat-landing-run-on-arca");
-    expect(item.textContent).toContain("Run on Arca");
+    expect(item).toHaveTextContent(/^Run on Arca$/);
     expect(screen.queryByTestId("new-chat-landing-arca-subtitle")).toBeNull();
   });
 

@@ -227,6 +227,15 @@ Cross-harness journeys:
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
+- **`resume`, Claude and Pi provider selection after a runner restart:**
+  `tests/e2e/test_native_resume_provider_e2e.py::test_connected_native_resume_routes_to_configured_provider`
+  (own environment, real server, runner, native CLI and tmux with local model
+  endpoints) changes the configured default and restarts the runner. Web/API
+  and terminal turns must reach the expected endpoint with the same session
+  identity and history. Unchanged defaults, Claude agent provider pins, and
+  Pi per-harness provider bindings are control cases. Claude requires an
+  environment without machine-wide managed settings; its test config and
+  onboarding state are isolated.
 - **`resume`, Codex persisted effort after a runner restart:**
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_resume_clamps_persisted_effort`
   (own environment, real Codex with mock model replies).
@@ -234,6 +243,14 @@ Cross-harness journeys:
   checks that a stalled settings connection, write, or close cannot block resume;
   `tests/harnesses/codex_native/app_server/test_reasoning_effort.py::test_resume_records_an_effort_its_config_write_lost`
   keeps a resumed effort whose config write failed for later updates.
+- **`resume`, Codex provider selection after a runner restart:**
+  `tests/e2e/test_codex_native_resume_provider_e2e.py::test_connected_codex_resume_routes_to_configured_provider`
+  (own environment, real server, runner, Codex and tmux with local model endpoints)
+  changes the configured default, restarts the runner, and checks routing from
+  chat and the terminal. Unchanged defaults and agent-specific provider choices
+  retain their endpoint; history, model, effort and permissions survive.
+  `tests/harnesses/codex_native/session/test_terminal_prepare.py::test_prepare_codex_terminal_resumes_with_launch_provider`
+  covers the CLI resume call site with configured and unpinned launches.
 - **`chat-render`, `steer`, per harness:** use the matrix.
 - **`chat-render`, Claude shell commands from the web composer:**
   `tests/browser_ui/chat/test_native_shell_settlement.py::test_shell_mirror_settles_its_bubble_before_the_next_prompt`

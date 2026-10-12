@@ -431,6 +431,126 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen create flow", () => {
+  it.each([
+    { query: "canvas=main", canvasId: "main", project: undefined },
+    {
+      query: "canvas=proj_alpha&project=Alpha",
+      canvasId: "proj_alpha",
+      project: { id: "proj_alpha", name: "Alpha" },
+    },
+  ])(
+    "keeps a Canvas create on its board through temporary and real routes ($canvasId)",
+    async ({ query, canvasId, project }) => {
+      searchParams = new URLSearchParams(query);
+      projects = project ? [project] : [];
+      const tempConvId = "temp:1234567890abcdef1234567890abcdef";
+      beginLocalConversationMock.mockReturnValue({
+        tempConvId,
+        pendingMsgTempId: "pend_canvas",
+        createToken: "1234567890abcdef1234567890abcdef",
+      });
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      renderLanding([], { features: { canvas: true } });
+      await waitForWorkspaceSeed();
+      typeMessage("Create a session from Canvas");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+      const search = canvasId === "main" ? "" : `?canvas=${canvasId}`;
+      await waitFor(() =>
+        expect(navigateMock).toHaveBeenCalledWith({
+          pathname: `/canvas/c/${encodeURIComponent(tempConvId)}`,
+          search,
+        }),
+      );
+      await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalledOnce());
+      const hydrateNavigate = hydrateLocalConversationMock.mock.calls[0][7];
+      hydrateNavigate("/c/conv_new", { replace: true });
+      expect(navigateMock).toHaveBeenLastCalledWith(
+        { pathname: "/canvas/c/conv_new", search },
+        { replace: true },
+      );
+      const stillViewing = hydrateLocalConversationMock.mock.calls[0][8];
+      const previousUrl = window.location.href;
+      try {
+        window.history.replaceState({}, "", `/canvas/c/${encodeURIComponent(tempConvId)}${search}`);
+        expect(stillViewing()).toBe(true);
+        window.history.replaceState({}, "", "/canvas");
+        expect(stillViewing()).toBe(false);
+      } finally {
+        window.history.replaceState({}, "", previousUrl);
+      }
+    },
+  );
+
+  it("returns a server-first Canvas create to its project", async () => {
+    searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding([], { features: { canvas: true } });
+    await waitForWorkspaceSeed();
+    typeMessage("Create from the project board");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith({
+        pathname: "/canvas/c/conv_new",
+        search: "?canvas=proj_alpha",
+      }),
+    );
+  });
+
+  it("ignores a Canvas return parameter when the feature is off", async () => {
+    searchParams = new URLSearchParams("canvas=main");
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("Create a regular session");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("keeps the Canvas project and draft when a temporary create fails", async () => {
+    searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    const previousUrl = window.location.href;
+    navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
+      window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
+    });
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      pendingMsgTempId: "pend_canvas",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    removeLocalConversationMock.mockReturnValue(true);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "Host unavailable" }), { status: 503 }),
+    );
+    try {
+      renderLanding([], { features: { canvas: true } });
+      await waitForWorkspaceSeed();
+      typeMessage("Keep this Canvas draft");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() =>
+        expect(navigateMock).toHaveBeenLastCalledWith({
+          pathname: "/",
+          search: "?canvas=proj_alpha&project=Alpha",
+        }),
+      );
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this Canvas draft");
+      expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+    } finally {
+      window.history.replaceState({}, "", previousUrl);
+    }
+  });
+
   it("keeps project placement on the provisional and rekeyed conversation", async () => {
     searchParams = new URLSearchParams("project=Alpha");
     projects = [{ id: "proj_alpha", name: "Alpha" }];
