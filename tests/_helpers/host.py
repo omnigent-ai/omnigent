@@ -40,7 +40,7 @@ class Host:
                 last = f"HTTP {response.status_code}"
                 if response.status_code == 200:
                     for row in response.json().get("hosts", []):
-                        if row["host_id"] == self.host_id and row["status"] == "online":
+                        if row.get("host_id") == self.host_id and row.get("status") == "online":
                             return row
             except httpx.HTTPError as exc:
                 last = str(exc)
@@ -99,7 +99,9 @@ def isolated_host(
         if command is not None
         else [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", base_url]
     )
-    with log_path.open("w") as log:
+    # Both stdio and the child logger append; independent offsets must not overwrite.
+    log_path.write_bytes(b"")
+    with log_path.open("ab") as log:
         proc = subprocess.Popen(
             argv,
             env=apply_runner_env(process_env),

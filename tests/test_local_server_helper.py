@@ -111,6 +111,9 @@ assert os.environ['EXPLICIT_TEST_SETTING'] == 'kept'
 assert pathlib.Path(os.environ['HOME']).is_relative_to(pathlib.Path.cwd())
 assert pathlib.Path(os.environ['OMNIGENT_CONFIG_HOME'], 'config.yaml').exists()
 print('isolated-host-startup-marker', flush=True)
+with open(os.environ['OMNIGENT_PROCESS_LOG_FILE'], 'a') as log:
+    print('secondary-writer-marker', file=log)
+print('stdout-after-logger-marker', flush=True)
 """ + ("raise SystemExit(23)" if exit_early else "time.sleep(60)")
     with pytest.raises(AssertionError, match="isolated-host-startup-marker"):
         with isolated_host(
@@ -124,6 +127,8 @@ print('isolated-host-startup-marker', flush=True)
         ):
             pytest.fail("an unready host must not be yielded")
     assert len(handles) == 1
+    log = handles[0].log_path.read_text()
+    assert "secondary-writer-marker" in log and "stdout-after-logger-marker" in log
     assert handles[0].proc.poll() is not None
     if exit_early:
         assert handles[0].proc.returncode == 23
