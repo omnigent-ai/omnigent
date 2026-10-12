@@ -78,7 +78,6 @@ def test_share_dialog_grant_controls_fit_on_phone_viewport(
     multi_user_server: MultiUserServer,
 ) -> None:
     """The add-grant row's controls stay inside the dialog on a phone."""
-    # Keep recording explicit for this sync, manually-created context.
     with user_page(
         browser,
         headers={"X-Forwarded-Email": ADMIN_EMAIL},
@@ -87,7 +86,6 @@ def test_share_dialog_grant_controls_fit_on_phone_viewport(
         is_mobile=True,
         has_touch=True,
         user_agent=_IOS_SAFARI_UA,
-        record_video_dir=os.environ.get("OMNIGENT_E2E_RECORD_DIR"),
     ) as page:
         page.goto(f"{multi_user_server.public_url}/c/{multi_user_server.session_id}")
         dialog = _open_share_dialog(page)
