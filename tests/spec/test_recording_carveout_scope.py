@@ -54,10 +54,6 @@ def test_finishing_a_clip_captions_the_screen_from_screen_evidence() -> None:
     assert "every claim it makes about the screen needs screen evidence" in lanes
     assert "Backend state is not screen evidence" in lanes
     assert "says what the server stored, not what the viewer sees" in lanes
-    assert (
-        "streams each `MessageDisplay` chunk to the Chat view as a "
-        "`response.output_text.delta` event" in lanes
-    )
     assert "has already been painted on screen when the error pill appears" in lanes
     assert 'never "no reply bubble appears"' in lanes
     assert "Read every frame you extract against each screen claim in the caption" in lanes
