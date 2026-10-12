@@ -8,6 +8,7 @@ const {
   SERVER_URLS_KEY,
   excludingManagedServers,
   getDatabricksInternalFeaturesEnabled,
+  getManagedServerNames,
   getManagedServerUrls,
   parseManagedServerUrls,
 } = require("../src/managed_preferences");
@@ -127,6 +128,47 @@ describe("managed server preferences", () => {
       }),
       false,
     );
+  });
+
+  it("reads display names from an omnigentServerName query parameter", () => {
+    const calls = [];
+    const getUserDefault = (...args) => {
+      calls.push(args);
+      return [
+        "https://workspace.example.com/?o=123&omnigentServerName=%20Team%20A%20",
+        "https://other.example.com/ml?omnigentServerName=",
+        "plain.example.com",
+      ];
+    };
+    // The parameter never reaches the server URL.
+    assert.deepEqual(getManagedServerUrls({ platform: "darwin", getUserDefault }), [
+      "https://workspace.example.com/?o=123",
+      "https://other.example.com/ml",
+      "https://plain.example.com/",
+    ]);
+    assert.deepEqual(getManagedServerNames({ platform: "darwin", getUserDefault }), {
+      "https://workspace.example.com/?o=123": "Team A",
+    });
+    assert.deepEqual(calls, [
+      [SERVER_URLS_KEY, "array"],
+      [SERVER_URLS_KEY, "array"],
+    ]);
+  });
+
+  it("names only the servers the list keeps", () => {
+    const getUserDefault = () => [
+      "https://team.example.com/",
+      "https://team.example.com/other?omnigentServerName=Dropped",
+    ];
+    assert.deepEqual(getManagedServerNames({ platform: "darwin", getUserDefault }), {});
+    assert.deepEqual(
+      getManagedServerNames({
+        platform: "darwin",
+        getUserDefault: () => ["https://team.example.com/?omnigentServerName=Team", "http://bad"],
+      }),
+      {},
+    );
+    assert.deepEqual(getManagedServerNames({ platform: "linux", getUserDefault }), {});
   });
 
   it("filters recents already represented by a managed origin", () => {

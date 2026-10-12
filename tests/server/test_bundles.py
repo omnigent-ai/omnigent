@@ -442,3 +442,85 @@ def test_reject_uploaded_callable_tools_recurses_into_sub_agents() -> None:
     root.sub_agents = [sub]
     with pytest.raises(OmnigentError, match=r"may not declare a server-side Python callable tool"):
         _reject_uploaded_callable_tools(root)
+
+
+def _tar(
+    entries: list[tuple[str, bytes | None, int]], *, mtime: int = 0, owner: str = ""
+) -> bytes:
+    """
+    Build a ``.tar.gz`` from ``(path, content, mode)`` in order; ``None`` content is a directory.
+
+    :param mtime: Timestamp for the gzip header and every entry.
+    :param owner: User name recorded on every entry.
+    """
+    import gzip
+
+    buf = io.BytesIO()
+    with (
+        gzip.GzipFile(fileobj=buf, mode="wb", mtime=mtime) as gz,
+        tarfile.open(fileobj=gz, mode="w") as tar,
+    ):
+        for path, content, mode in entries:
+            info = tarfile.TarInfo(path)
+            info.mtime, info.mode, info.uname = mtime, mode, owner
+            if content is None:
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+            else:
+                info.size = len(content)
+                tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+_SPEC = (b"name: codex\nexecutor:\n  harness: codex\n", 0o644)
+
+
+def test_content_digest_ignores_how_the_files_were_tarred() -> None:
+    """The CLI re-tars on every run, so timestamps, owners, order, and ``./`` vary."""
+    from omnigent.server.bundles import bundle_content_digest
+
+    first = _tar([("codex.yaml", *_SPEC), ("tools", None, 0o755)], mtime=1, owner="a")
+    again = _tar(
+        [("./tools/", None, 0o700), ("./codex.yaml", _SPEC[0], 0o600)], mtime=2, owner="b"
+    )
+    assert first != again
+    assert bundle_content_digest(first) == bundle_content_digest(again) is not None
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        [("codex.yaml", b"name: codex\nexecutor:\n  harness: pi\n", 0o644)],
+        [("other.yaml", *_SPEC)],
+        [("codex.yaml", _SPEC[0], 0o755)],
+        [("codex.yaml", *_SPEC), ("tools", None, 0o755)],
+    ],
+    ids=["content", "path", "executable", "extra-entry"],
+)
+def test_content_digest_tells_different_files_apart(changed: list) -> None:
+    from omnigent.server.bundles import bundle_content_digest
+
+    assert bundle_content_digest(_tar(changed)) != bundle_content_digest(
+        _tar([("codex.yaml", *_SPEC)])
+    )
+
+
+def test_content_digest_follows_extraction_when_a_path_repeats() -> None:
+    """Extraction keeps a path's last entry, so the order of repeats matters."""
+    from omnigent.server.bundles import bundle_content_digest
+
+    v1, v2 = (b"name: a\n", 0o644), (b"name: b\n", 0o644)
+    assert bundle_content_digest(
+        _tar([("a.yaml", *v1), ("a.yaml", *v2)])
+    ) == bundle_content_digest(_tar([("a.yaml", *v2)]))
+    assert bundle_content_digest(
+        _tar([("a.yaml", *v2), ("a.yaml", *v1)])
+    ) != bundle_content_digest(_tar([("a.yaml", *v1), ("a.yaml", *v2)]))
+
+
+def test_content_digest_is_none_for_an_unreadable_bundle() -> None:
+    from omnigent.server.bundles import bundle_content_digest, content_bundle_location
+
+    assert bundle_content_digest(b"not a tarball") is None
+    # The location still names the bytes, so nothing is ever stored keyless.
+    assert content_bundle_location("ag", b"not a tarball").startswith("ag/")

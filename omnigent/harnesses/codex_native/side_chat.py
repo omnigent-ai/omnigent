@@ -36,6 +36,7 @@ import contextlib
 import json
 import logging
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -57,6 +58,7 @@ SIDE_REFERENCE_ONLY_INSTRUCTIONS = (
 # Display name stamped on a side-chat child so the web can tell it apart from a
 # Codex-spawned sub-agent (drives the "this is a side chat" banner).
 SIDE_CHAT_DISPLAY_NAME = "Side chat"
+_NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nickname"
 
 _SIDE_PREFIX = "/side "
 
@@ -87,6 +89,11 @@ def side_chat_question_from_text(text: str) -> str | None:
         return None
     question = text[len(_SIDE_PREFIX) :].strip()
     return question or None
+
+
+def is_side_chat_child(labels: Mapping[str, str] | None) -> bool:
+    """Whether a child conversation's labels mark it as a ``/side`` fork, not a sub-agent."""
+    return (labels or {}).get(_NICKNAME_LABEL_KEY) == SIDE_CHAT_DISPLAY_NAME
 
 
 def is_side_chat_command(text: str) -> bool:
@@ -218,6 +225,24 @@ async def open_side_chat_on_client(
         return None
     await submit_side_turn(codex_client, child_thread_id, question)
     return child_thread_id
+
+
+async def interrupt_side_turn(
+    codex_client: CodexAppServerClient, child_thread_id: str, turn_id: str
+) -> None:
+    """Interrupt the observed child turn without cancelling a newer turn or its parent."""
+    from omnigent.harnesses.codex_native.app_server import (
+        CodexAppServerResponseError,
+        is_stale_active_turn_error,
+    )
+
+    try:
+        await codex_client.request(
+            "turn/interrupt", {"threadId": child_thread_id, "turnId": turn_id}
+        )
+    except CodexAppServerResponseError as exc:
+        if not is_stale_active_turn_error(exc):
+            raise
 
 
 def is_omnigent_side_fork(event: _JsonObject) -> bool:

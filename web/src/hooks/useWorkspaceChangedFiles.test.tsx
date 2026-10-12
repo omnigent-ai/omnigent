@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEffect } from "react";
 import type { ReactNode } from "react";
@@ -169,6 +169,15 @@ function FileSearchProbe({
 }) {
   useWorkspaceFileSearch(id, query, include, exclude, { enabled });
   return null;
+}
+
+function FileSearchTruncatedProbe({ id, query }: { id: string; query: string }) {
+  const { data } = useWorkspaceFileSearch(id, query);
+  return (
+    <output data-testid="truncated">
+      {data === undefined ? "pending" : String(data.truncated)}
+    </output>
+  );
 }
 
 function AllFilesPathsProbe({
@@ -691,6 +700,25 @@ describe("useWorkspaceFileSearch gating", () => {
   });
 });
 
+describe("useWorkspaceFileSearch truncation", () => {
+  it("surfaces the server's truncated flag so a miss is not shown as definitive", async () => {
+    // The server already reported that its scan budget ran out; the hook used
+    // to drop that and hand the panel a bare empty list.
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(
+      jsonResponse({ object: "list", data: [], has_more: false, truncated: true }),
+    );
+
+    render(
+      <Wrap>
+        <FileSearchTruncatedProbe id="conv_live" query="reyden" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("truncated")).toHaveTextContent("true"));
+  });
+});
+
 describe("useWorkspaceChangedFiles trailing-edge invalidate", () => {
   it("refetches once when the focused session transitions running → idle", async () => {
     // Repro: a prior change cut polling on idle, but the agent's last writes
@@ -982,6 +1010,95 @@ describe("useWorkspaceFileExists", () => {
     expect(fetchMock.mock.calls[0][0]).toContain(
       "/resources/environments/default/filesystem/projects/out?",
     );
+  });
+
+  it("finds a file on a later page of a large parent directory", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          object: "list",
+          data: [dirEntry("docs/first.md")],
+          last_id: "docs/first.md",
+          has_more: true,
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          object: "list",
+          data: [dirEntry("docs/target.md")],
+          last_id: "docs/target.md",
+          has_more: false,
+        }),
+      );
+    const results: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_1" path="docs/target.md" onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(results.at(-1)).toEqual({ exists: true, settled: true }));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toContain("after=docs%2Ffirst.md");
+  });
+
+  it.each(["HTTP 500", "malformed JSON"])(
+    "keeps confirmed files when a later page fails with %s",
+    async (failure) => {
+      const failedPage =
+        failure === "HTTP 500"
+          ? jsonResponse({ error: {} }, 500)
+          : Object.assign(jsonResponse({}), {
+              json: async () => {
+                throw new SyntaxError("Invalid JSON");
+              },
+            });
+      fetchMock
+        .mockResolvedValueOnce(
+          jsonResponse({
+            object: "list",
+            data: [dirEntry("docs/target.md")],
+            last_id: "docs/target.md",
+            has_more: true,
+          }),
+        )
+        .mockResolvedValueOnce(failedPage);
+      const found: { exists: boolean; settled: boolean }[] = [];
+      const missing: { exists: boolean; settled: boolean }[] = [];
+      render(
+        <Wrap>
+          <FileExistenceProbe id="conv_1" path="docs/target.md" onResult={(r) => found.push(r)} />
+          <FileExistenceProbe id="conv_1" path="docs/unseen.md" onResult={(r) => missing.push(r)} />
+        </Wrap>,
+      );
+
+      await waitFor(() => expect(found.at(-1)).toEqual({ exists: true, settled: true }));
+      expect(missing.at(-1)).toEqual({ exists: false, settled: false });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("leaves absence unverified after scanning 10,000 entries", async () => {
+    let pageIndex = 0;
+    fetchMock.mockImplementation(() => {
+      const index = pageIndex++;
+      const data = Array.from({ length: 1000 }, (_, i) =>
+        dirEntry(`docs/${String(index * 1000 + i).padStart(5, "0")}.md`),
+      );
+      return Promise.resolve(
+        jsonResponse({ object: "list", data, last_id: data.at(-1)?.id, has_more: true }),
+      );
+    });
+    const results: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_1" path="docs/target.md" onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(10));
+    await flushMicrotasks();
+    expect(results.at(-1)).toEqual({ exists: false, settled: false });
   });
 
   it("reports false when the file is absent from the parent listing", async () => {

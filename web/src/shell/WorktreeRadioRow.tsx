@@ -8,19 +8,27 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { MenuItem } from "@/components/ui/menu-item";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { CopyIcon, EllipsisIcon, FolderOpenIcon } from "lucide-react";
+import {
+  CircleCheckIcon,
+  CircleDashedIcon,
+  CopyIcon,
+  EllipsisIcon,
+  FolderIcon,
+  FolderOpenIcon,
+  GitBranchIcon,
+} from "lucide-react";
 
-export const WORKTREE_RADIO_SPACIOUS_ROW_CLASS =
-  "min-h-9 rounded-lg px-3 py-1 text-base leading-[1.6]";
+export const WORKTREE_RADIO_SPACIOUS_ROW_CLASS = "h-7 rounded-md px-2 py-[3px] text-ui leading-4";
 
 export const WORKTREE_RADIO_SPACIOUS_INPUT_CLASS =
   "appearance-none rounded-full border border-muted-foreground/60 bg-background checked:border-[5px] checked:border-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2";
 
 export const WORKTREE_RADIO_SELECTOR_ROW_CLASS =
-  "h-7 shrink-0 rounded-md px-2 py-0 text-base leading-5";
+  "h-7 shrink-0 rounded-md px-2 py-[3px] text-ui leading-4";
 
-export const WORKTREE_RADIO_SELECTOR_INPUT_CLASS = "sr-only";
+export const WORKTREE_RADIO_SELECTOR_INPUT_CLASS = WORKTREE_RADIO_SPACIOUS_INPUT_CLASS;
 
 export function worktreeDisplayName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
@@ -56,12 +64,14 @@ export function WorktreeRadioRow({
   const updatedLabel = worktreeUpdatedLabel(worktree.updated_at);
   const branchLabel = worktree.branch ?? "Detached HEAD";
   const statusLabel = worktree.detached ? "Detached" : "Checked out";
+  const StatusIcon = worktree.detached ? CircleDashedIcon : CircleCheckIcon;
 
   return (
-    <div
+    <MenuItem
+      active={checked}
+      density={spacious || selector ? "compact" : "none"}
       className={cn(
-        "flex min-w-0 items-center rounded-md text-sm transition-colors hover:bg-muted focus-within:bg-muted",
-        checked && "bg-muted",
+        variant === "default" && "text-sm",
         spacious && WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
         selector && WORKTREE_RADIO_SELECTOR_ROW_CLASS,
         className,
@@ -86,8 +96,8 @@ export function WorktreeRadioRow({
             <span
               className={cn(
                 "min-w-0 flex-1 truncate font-medium text-foreground",
-                spacious && "leading-4",
-                selector && "leading-5",
+                spacious && "font-normal leading-4",
+                selector && "font-normal leading-4",
               )}
             >
               {displayName}
@@ -95,8 +105,8 @@ export function WorktreeRadioRow({
             <span
               className={cn(
                 "shrink-0 text-xs text-muted-foreground",
-                spacious && "text-base leading-[1.6]",
-                selector && "text-base leading-5",
+                spacious && "leading-4",
+                selector && "leading-4",
               )}
             >
               {updatedLabel}
@@ -105,18 +115,40 @@ export function WorktreeRadioRow({
         </TooltipTrigger>
         <TooltipContent
           side="right"
-          className="max-w-sm flex-col items-start border border-border bg-popover text-popover-foreground shadow-menu ring-1 ring-foreground/10"
+          align="start"
+          alignOffset={spacious || selector ? -6 : 0}
+          sideOffset={spacious ? 38 : selector ? 14 : 8}
+          className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
           data-testid={`${testId}-tooltip`}
         >
-          <span className="break-all">
-            <span className="font-semibold">Path:</span> {worktree.path}
-          </span>
-          <span>
-            <span className="font-semibold">Branch:</span> {branchLabel}
-          </span>
-          <span>
-            <span className="font-semibold">Status:</span> {statusLabel}
-          </span>
+          <p className="sidebar-compact-text font-medium" data-testid={`${testId}-tooltip-title`}>
+            {displayName}
+            <span className="font-normal text-muted-foreground">
+              {" · "}
+              {updatedLabel}
+            </span>
+          </p>
+          <p
+            className="mt-1 flex items-start gap-1.5 text-sm text-muted-foreground"
+            data-testid={`${testId}-tooltip-path`}
+          >
+            <FolderIcon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+            <span className="break-all">{worktree.path}</span>
+          </p>
+          <p
+            className="mt-1 flex items-start gap-1.5 text-sm text-muted-foreground"
+            data-testid={`${testId}-tooltip-branch`}
+          >
+            <GitBranchIcon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+            <span className="break-all">{branchLabel}</span>
+          </p>
+          <p
+            className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+            data-testid={`${testId}-tooltip-status`}
+          >
+            <StatusIcon aria-hidden className="size-3.5 shrink-0" />
+            <span>{statusLabel}</span>
+          </p>
         </TooltipContent>
       </Tooltip>
       {spacious && onOpen && (
@@ -124,7 +156,7 @@ export function WorktreeRadioRow({
           <DropdownMenuTrigger asChild>
             <button
               type="button"
-              className="-mr-1 ml-1 flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="ml-1 flex size-5 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               aria-label={`Worktree actions for ${displayName}`}
               data-testid={`${testId}-actions`}
             >
@@ -143,6 +175,6 @@ export function WorktreeRadioRow({
           </DropdownMenuContent>
         </DropdownMenu>
       )}
-    </div>
+    </MenuItem>
   );
 }

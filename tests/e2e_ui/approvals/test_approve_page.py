@@ -4,9 +4,10 @@ A policy ASK can be answered three ways: the in-chat ``ApprovalCard``
 (``test_approval_card.py``), the ``/inbox`` page (``test_inbox_approval.py``),
 and the standalone approval page (``pages/ApprovePage.tsx``) — the URL the REPL
 prints when a policy returns ASK in URL mode, openable by anyone with the link
-and no surrounding app shell. This suite covers that third surface: park a real
-gated-push ASK, navigate straight to ``/approve/<sid>/<eid>``, and resolve it
-there.
+and no surrounding app shell. This suite covers that third surface with one
+representative real boundary journey: park a gated-push ASK, navigate straight
+to ``/approve/<sid>/<eid>``, and resolve it there. Fast component coverage owns
+the reject and already-resolved presentation variants.
 
 The page fetches the elicitation from ``GET /v1/sessions/<sid>/elicitations/<eid>``
 and posts the verdict to the matching ``/resolve`` endpoint — the same backing
@@ -15,8 +16,8 @@ calls the inline card uses, just on a bare route. Driven by the same
 ``git push``), so it carries a generous per-test timeout.
 
 The load-bearing assertion is that the server's parked prompt drains after the
-page's Approve / Reject — proof the standalone route resolves the *same*
-server-side elicitation the chat would, not a detached copy.
+page's approval — proof the standalone route resolves the *same* server-side
+elicitation the chat would, not a detached copy.
 """
 
 from __future__ import annotations
@@ -98,40 +99,3 @@ def test_approve_page_approves(
     expect(page.get_by_text("Approved", exact=False).first).to_be_visible(timeout=30_000)
     expect(page.get_by_text("You can close this page.")).to_be_visible()
     _wait_for(lambda: not _pending_elicitations(base_url, session_id))
-
-
-@pytest.mark.timeout(600)
-def test_approve_page_rejects(
-    page: Page,
-    approval_session: tuple[str, str],
-) -> None:
-    """Reject on the standalone page also drains the parked prompt."""
-    base_url, session_id = approval_session
-    elicitation_id = _park_elicitation(page, base_url, session_id)
-
-    page.goto(f"{base_url}/approve/{session_id}/{elicitation_id}")
-    expect(page.get_by_text("Approval required")).to_be_visible(timeout=30_000)
-
-    page.get_by_role("button", name="Reject").click()
-
-    expect(page.get_by_text("Rejected", exact=False).first).to_be_visible(timeout=30_000)
-    expect(page.get_by_text("You can close this page.")).to_be_visible()
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
-
-
-@pytest.mark.timeout(600)
-def test_approve_page_resolved_for_unknown_elicitation(
-    page: Page,
-    approval_session: tuple[str, str],
-) -> None:
-    """An already-resolved / unknown elicitation id shows the resolved state.
-
-    Reuses the fixture only for a live session id; no turn is sent. The page
-    must not present approve/reject controls for an id the server has no parked
-    prompt for — it renders the terminal "resolved" alert instead.
-    """
-    base_url, session_id = approval_session
-    page.goto(f"{base_url}/approve/{session_id}/elicit_does_not_exist")
-
-    expect(page.get_by_text("Elicitation resolved")).to_be_visible(timeout=30_000)
-    expect(page.get_by_role("button", name="Approve")).to_have_count(0)

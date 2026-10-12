@@ -20,8 +20,7 @@ the blocked indicator itself mentions the terminal (e.g. "open the terminal
 to respond"), or the dialog is surfaced as an inline chat elicitation.
 
 Drives the ``blocked_on: "dialog open"`` status edge through the Sessions
-events route — the same path a native status forwarder posts to (see
-``test_working_indicator_blocked_reason.py``) — so the parked state is
+events route — the same path a native status forwarder posts — so the parked state is
 deterministic; a live TUI turn's timing would make the assertion flaky. The
 edge's production is covered separately: Claude's session status file
 (``waitingFor: "dialog open"``) → runner status watcher → SSE is exercised by

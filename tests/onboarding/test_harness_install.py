@@ -320,6 +320,52 @@ def test_version_probe_caches_by_binary_signature(
     assert len(runs) == 3
 
 
+@pytest.mark.parametrize("returncode", [1, -15])
+@pytest.mark.parametrize("output_stream", ["stdout", "stderr"])
+def test_failed_version_probe_does_not_admit_or_cache_a_broken_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    returncode: int,
+    output_stream: str,
+) -> None:
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(OPENAI_FAMILY)
+    assert spec is not None and spec.min_version is not None
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    runs = 0
+    repaired = False
+
+    def run_probe(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal runs
+        runs += 1
+        if repaired:
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"codex-cli {spec.min_version}\n", stderr=""
+            )
+        diagnostic = "Error: missing optional dependency\nNode.js v22.18.0\n"
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=returncode,
+            stdout=diagnostic if output_stream == "stdout" else "",
+            stderr=diagnostic if output_stream == "stderr" else "",
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", run_probe)
+
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.missing_harness_cli("codex-native") == spec
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] is None
+    assert runs == 3
+
+    # Repairing a dependency need not change the launcher's file signature.
+    repaired = True
+    assert hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.missing_harness_cli("codex-native") is None
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] == spec.min_version
+    assert runs == 4
+
+
 def test_cursor_install_spec_is_login_only_no_npm() -> None:
     """Cursor ships via a curl installer (no npm package) and authenticates
     through its own CLI login, so it carries an ``install_hint`` + status JSON

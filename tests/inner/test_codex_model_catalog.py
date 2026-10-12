@@ -20,6 +20,7 @@ from omnigent.inner.codex_executor import (
     extended_model_catalog,
     set_codex_model_catalog_path,
     write_codex_model_catalog,
+    write_required_brokered_model_catalog,
 )
 from omnigent.models.codex_model_vocabulary import EXTENDED_CATALOG_MODELS
 
@@ -377,3 +378,142 @@ def test_a_users_own_catalog_choice_wins(tmp_path: Path) -> None:
 
     assert set_codex_model_catalog_path(config, tmp_path / "ours.json") is False
     assert config.read_text() == 'model_catalog_json = "/mine.json"\n'
+
+
+def test_required_brokered_catalog_is_bundled_private_and_credential_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _Completed:
+        returncode = 0
+        stdout = json.dumps(_catalog()).encode()
+        stderr = b""
+
+    def _run(argv: list[str], **kwargs: object) -> _Completed:
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return _Completed()
+
+    monkeypatch.setattr(codex_executor.subprocess, "run", _run)
+
+    catalog_path = write_required_brokered_model_catalog(tmp_path, codex_path="/bin/codex")
+
+    assert captured["argv"] == ["/bin/codex", "debug", "models", "--bundled"]
+    assert captured["timeout"] == 10.0
+    assert captured["check"] is False
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["HOME"] == str(tmp_path)
+    assert env["CODEX_HOME"] == str(tmp_path)
+    assert "DATABRICKS_TOKEN" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert "HTTP_PROXY" not in env
+    assert "HTTPS_PROXY" not in env
+    assert json.loads(catalog_path.read_text()) == _catalog()
+    assert catalog_path.stat().st_mode & 0o777 == 0o600
+
+    import tomllib
+
+    config = tomllib.loads((tmp_path / "config.toml").read_text())
+    assert config["model_catalog_json"] == str(catalog_path)
+    assert (tmp_path / "config.toml").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [
+        (1, b""),
+        (0, b"not-json"),
+        (0, b'{"models": []}'),
+        (0, b'{"models": [{"display_name": "missing slug"}]}'),
+        (0, b'{"models": [{"slug": "model\\nname"}]}'),
+    ],
+)
+def test_required_brokered_catalog_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    stdout: bytes,
+) -> None:
+    class _Completed:
+        stderr = b"must not leak"
+
+        def __init__(self) -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+
+    monkeypatch.setattr(
+        codex_executor.subprocess,
+        "run",
+        lambda *args, **kwargs: _Completed(),
+    )
+
+    with pytest.raises(RuntimeError, match="valid bundled model catalog"):
+        write_required_brokered_model_catalog(tmp_path, codex_path="/bin/codex")
+
+    assert not (tmp_path / "model_catalog.json").exists()
+    assert not (tmp_path / "config.toml").exists()
+
+
+def test_required_brokered_catalog_timeout_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _timeout(*args: object, **kwargs: object) -> None:
+        raise codex_executor.subprocess.TimeoutExpired("/bin/codex", 10.0)
+
+    monkeypatch.setattr(codex_executor.subprocess, "run", _timeout)
+
+    with pytest.raises(RuntimeError, match="valid bundled model catalog"):
+        write_required_brokered_model_catalog(tmp_path, codex_path="/bin/codex")
+
+    assert not (tmp_path / "model_catalog.json").exists()
+
+
+def test_required_brokered_catalog_oversized_output_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Completed:
+        returncode = 0
+        stderr = b""
+        stdout = b"x" * (codex_executor._BROKERED_MODEL_CATALOG_MAX_BYTES + 1)
+
+    monkeypatch.setattr(
+        codex_executor.subprocess,
+        "run",
+        lambda *args, **kwargs: _Completed(),
+    )
+
+    with pytest.raises(RuntimeError, match="valid bundled model catalog"):
+        write_required_brokered_model_catalog(tmp_path, codex_path="/bin/codex")
+
+    assert not (tmp_path / "model_catalog.json").exists()
+
+
+def test_required_brokered_catalog_write_failure_leaves_no_partial_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Completed:
+        returncode = 0
+        stderr = b""
+        stdout = json.dumps(_catalog()).encode()
+
+    real_replace = codex_executor.os.replace
+
+    def _replace(source: str, destination: str | Path) -> None:
+        if Path(destination).name == "model_catalog.json":
+            raise OSError("disk full")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(codex_executor.subprocess, "run", lambda *args, **kwargs: _Completed())
+    monkeypatch.setattr(codex_executor.os, "replace", _replace)
+
+    with pytest.raises(RuntimeError, match="valid bundled model catalog"):
+        write_required_brokered_model_catalog(tmp_path, codex_path="/bin/codex")
+
+    assert not (tmp_path / "model_catalog.json").exists()
+    assert not list(tmp_path.glob("model_catalog.json.*"))

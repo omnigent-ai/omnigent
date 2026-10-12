@@ -15,6 +15,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -122,6 +123,101 @@ def test_import_graph_is_single_threaded() -> None:
     lines = result.stdout.strip().splitlines()
     assert lines[0] == "1", result.stdout
     assert lines[-1] == "True", result.stdout
+
+
+def test_deferred_graph_keeps_the_zygote_single_threaded() -> None:
+    """The deferred graph (optional Databricks SDK) also starts no threads.
+
+    The zygote loads it after it starts serving, then keeps forking, so the
+    same fork-safety invariant applies. Checked in a fresh interpreter like
+    the eager graph above.
+    """
+    probe = "\n".join(
+        [
+            "import importlib.util",
+            "import sys",
+            "import threading",
+            "from omnigent.runner._zygote import _import_deferred_graph, _import_runner_graph",
+            "_import_runner_graph()",
+            "_import_deferred_graph()",
+            "print(threading.active_count())",
+            "has_sdk = importlib.util.find_spec('databricks.sdk') is not None",
+            "print(not has_sdk or 'databricks.sdk.config' in sys.modules)",
+        ]
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == "1", result.stdout
+    assert lines[-1] == "True", result.stdout
+
+
+def test_zygote_loads_the_deferred_graph_once_nothing_is_pending(monkeypatch) -> None:
+    """A request already waiting is answered first; the deferred import runs once after."""
+    order: list[str] = []
+    real_send = _zygote._send
+
+    def _record_send(conn: socket.socket, payload: dict) -> None:
+        order.append("reply")
+        real_send(conn, payload)
+
+    imported = threading.Event()
+
+    def _record_import() -> None:
+        order.append("import")
+
+    monkeypatch.setattr(_zygote, "_send", _record_send)
+    monkeypatch.setattr(_zygote, "_import_deferred_graph", _record_import)
+
+    def _record_thread_check() -> None:
+        order.append("thread-check")
+        imported.set()
+
+    monkeypatch.setattr(_zygote, "_exit_unless_single_threaded", _record_thread_check)
+    monkeypatch.setattr(_zygote.gc, "freeze", lambda: order.append("freeze"))
+
+    daemon_side, zygote_side = socket.socketpair()
+    daemon_side.sendall(b'{"cmd": "ping"}\n')
+    server = _ZygoteServer(zygote_side)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    replies = daemon_side.makefile("r")
+    try:
+        assert json.loads(replies.readline()) == {"pong": True}
+        # A ping sent before the import finishes is (correctly) served first;
+        # wait so the second request deterministically lands after it.
+        assert imported.wait(timeout=5)
+        daemon_side.sendall(b'{"cmd": "ping"}\n')
+        assert json.loads(replies.readline()) == {"pong": True}
+    finally:
+        replies.close()
+        daemon_side.close()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    # The refreeze and fork-safety check run after the import, before any later fork.
+    assert order == ["reply", "import", "freeze", "thread-check", "reply"]
+
+
+def test_failed_deferred_preload_does_not_stop_the_zygote(monkeypatch) -> None:
+    """An optional preload that raises (e.g. an SDK OSError) leaves the zygote serving."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _failing_import(name: str, *args, **kwargs):
+        if name == "databricks.sdk.config":
+            raise OSError("credential probe failed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _failing_import)
+
+    _zygote._import_deferred_graph()  # must not raise
 
 
 def test_manager_starts_and_pings(manager: ZygoteManager) -> None:
@@ -1043,3 +1139,145 @@ def test_polled_harness_pid_is_released_from_its_owner(manager: ZygoteManager, t
     # Re-polling is None (code popped) and the zygote is still healthy.
     assert _control_exchange(manager, {"cmd": "poll", "pid": pid})["returncode"] is None
     assert _control_exchange(manager, {"cmd": "ping"}).get("pong") is True
+
+
+class _ChildExited(Exception):
+    """Raised by the stubbed ``os._exit`` so the guard can be driven in-process."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@pytest.fixture
+def child_sink(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, object]]]:
+    """Attach a capturing debug-log sink to the runner logger, as a child would.
+
+    Delivery is slowed to model a real upload in flight, so rows only arrive
+    by the time the guard returns if it drained the sink before ``os._exit``.
+
+    :param monkeypatch: Restores the process-wide sink and excepthook.
+    :returns: Rows delivered by the sink.
+    """
+    import logging
+
+    from omnigent import debug_logging as dl
+    from omnigent.runner._entry import _install_crash_logging
+
+    rows: list[dict[str, object]] = []
+
+    def _slow_send(batch: list[dict[str, object]]) -> None:
+        time.sleep(0.2)
+        rows.extend(batch)
+
+    monkeypatch.setattr(dl, "_active_sink", None)
+    monkeypatch.setattr(sys, "excepthook", sys.__excepthook__)
+    monkeypatch.setattr(_zygote.os, "_exit", _raise_child_exited)
+    runner_logger = logging.getLogger("omnigent.runner._entry")
+    dl.attach_debug_log_sink([runner_logger], source="runner", level=logging.INFO, send=_slow_send)
+    sink = dl._active_sink
+    assert sink is not None
+    _install_crash_logging()
+    try:
+        yield rows
+    finally:
+        sink.close()
+        for name in ("omnigent.runner._entry", dl.SSE_LOGGER_NAME, dl.AUDIT_LOGGER_NAME):
+            logging.getLogger(name).removeHandler(sink)
+
+
+def _raise_child_exited(code: int) -> None:
+    """Stand-in for ``os._exit`` that unwinds instead of killing the test.
+
+    :param code: Exit code the guard requested.
+    :raises _ChildExited: Always.
+    """
+    raise _ChildExited(code)
+
+
+def test_child_guard_logs_uncaught_exception_before_exit(
+    child_sink: list[dict[str, object]],
+) -> None:
+    """An uncaught runner exception reaches the crash hook and its row ships.
+
+    The guard previously printed the traceback itself and hard-exited, so the
+    runner's excepthook never ran and no crash row reached the table.
+
+    :param child_sink: Rows delivered by the child's debug-log sink.
+    """
+
+    def _crash() -> None:
+        raise RuntimeError("boom")
+
+    with pytest.raises(_ChildExited) as exited:
+        _ZygoteServer._exit_child(_crash)
+
+    assert exited.value.code == 1
+    crash_rows = [row for row in child_sink if row.get("level") == "CRITICAL"]
+    assert [row["message"] for row in crash_rows] == [
+        "runner exiting: uncaught RuntimeError: boom"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("body_exit", "expected_code"),
+    [(None, 0), (SystemExit(3), 3)],
+    ids=["normal-return", "system-exit"],
+)
+def test_child_guard_drains_final_rows_before_exit(
+    child_sink: list[dict[str, object]],
+    body_exit: SystemExit | None,
+    expected_code: int,
+) -> None:
+    """Rows logged just before the child exits are drained, not dropped.
+
+    :param child_sink: Rows delivered by the child's debug-log sink.
+    :param body_exit: Exception the body ends with, or ``None`` to return.
+    :param expected_code: Exit code the guard must preserve.
+    """
+    import logging
+
+    def _body() -> None:
+        logging.getLogger("omnigent.runner._entry").info("runner exiting: idle timeout reached")
+        if body_exit is not None:
+            raise body_exit
+
+    with pytest.raises(_ChildExited) as exited:
+        _ZygoteServer._exit_child(_body)
+
+    assert exited.value.code == expected_code
+    assert [row["message"] for row in child_sink] == ["runner exiting: idle timeout reached"]
+
+
+def test_child_guard_exits_even_if_flush_is_interrupted(
+    child_sink: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted flush must not let the child return into the zygote loop.
+
+    :param child_sink: Installs the stubbed ``os._exit``.
+    :param monkeypatch: Replaces the flush with one that is interrupted.
+    """
+
+    def _interrupted_flush() -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_zygote, "_flush_child_telemetry", _interrupted_flush)
+
+    with pytest.raises(_ChildExited) as exited:
+        _ZygoteServer._exit_child(lambda: None)
+
+    assert exited.value.code == 0
+
+
+def test_child_telemetry_flush_swallows_interrupts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flush helper absorbs BaseException so the guard reaches os._exit.
+
+    :param monkeypatch: Makes the sink drain raise KeyboardInterrupt.
+    """
+    from omnigent import debug_logging as dl
+
+    def _interrupted_close(timeout: float = 5.0) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(dl, "close_debug_log_sink", _interrupted_close)
+    _zygote._flush_child_telemetry()

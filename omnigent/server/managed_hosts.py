@@ -189,7 +189,7 @@ from omnigent.onboarding.sandboxes.base import SandboxGoneError
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
-from omnigent.onboarding.sandboxes.types import RepoWorkspace
+from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -620,6 +620,8 @@ class ManagedSandboxConfig:
         replace the current template's providers and bindings on restore.
     :param model_discovery: Server-only catalog endpoints and credential references,
         keyed by inference provider name. Never installed in the sandbox.
+    :param git_clone: Admin clone policy for fresh or missing repo checkouts.
+        Existing retained checkouts are not reconfigured.
     """
 
     server_url: str
@@ -629,6 +631,7 @@ class ManagedSandboxConfig:
     provider: str | None = None
     host_config: dict[str, object] | None = None
     model_discovery: dict[str, object] = dataclass_field(default_factory=dict)
+    git_clone: GitCloneOptions = dataclass_field(default_factory=GitCloneOptions)
 
 
 @dataclass(frozen=True)
@@ -1423,6 +1426,16 @@ def _parse_multi_provider_sandbox_config(
     return ManagedSandboxDeployment(configs=tuple(parsed), reaper=reaper)
 
 
+def _parse_git_clone_options(raw: object) -> GitCloneOptions:
+    if raw is None:
+        return GitCloneOptions()
+    if not isinstance(raw, dict):
+        raise ValueError("server config 'sandbox.git_clone' must be a mapping")
+    if raw.keys() - {"depth", "single_branch", "filter", "tags"}:
+        raise ValueError("sandbox.git_clone only accepts depth, single_branch, filter, and tags")
+    return GitCloneOptions(**raw)
+
+
 def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSandboxConfig:
     """
     Parse one provider's ``sandbox`` mapping (the scalar ``provider:`` shape).
@@ -1441,6 +1454,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             f"server config 'sandbox.provider' must be one of: {supported} (got {provider!r})"
         )
     warm_pool = _parse_agent_sandbox_warm_pool(raw)
+    git_clone = _parse_git_clone_options(raw.get("git_clone"))
     server_url = raw.get("server_url")
     if not isinstance(server_url, str) or not server_url.strip():
         raise ValueError(
@@ -1692,6 +1706,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         provider=provider,
         host_config=host_config,
         model_discovery=model_discovery,
+        git_clone=git_clone,
     )
 
 
@@ -3479,6 +3494,7 @@ async def launch_managed_host(
     """
     entry = _select_provider_config(config, provider)
     launcher = entry.launcher_factory()
+    repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     host_id = uuid.uuid4().hex
     # Visible label in the host picker; (owner, name) is the hosts
     # table PK, so embed the host_id's leading hex for uniqueness
@@ -3565,6 +3581,7 @@ async def relaunch_managed_host(
     # Stay on the host's provider so the new generation is armed with ITS
     # token TTL, not the deployment default's.
     entry = config.recorded(host.sandbox_provider)
+    repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.
@@ -3604,6 +3621,25 @@ async def relaunch_managed_host(
             detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
         ) from exc
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
+
+
+def _apply_git_clone_options(
+    launcher: SandboxHostLauncher,
+    repos: Sequence[RepoWorkspace],
+    options: GitCloneOptions,
+) -> Sequence[RepoWorkspace]:
+    """Apply admin clone policy before provisioning or replacing any sandbox."""
+    if options == GitCloneOptions():
+        return repos
+    if not launcher.capabilities.git_clone_options:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"sandbox provider '{launcher.provider}' does not support sandbox.git_clone "
+                "options; remove the block or use a provider that supports them"
+            ),
+        )
+    return [replace(repo, git_clone=options) for repo in repos]
 
 
 async def _start_sandbox_host(
@@ -4028,6 +4064,7 @@ async def resume_managed_host(
         # providers retain their filesystem and do not need workspace prep.
         workspace_repos = repos if launcher.provider == "agent_sandbox" else ()
         entry = config.recorded(host.sandbox_provider)
+        workspace_repos = _apply_git_clone_options(launcher, workspace_repos, entry.git_clone)
         sandbox_id = host.sandbox_id
         _logger.info(
             "Waking dormant managed host %s (sandbox %s, provider %s)",

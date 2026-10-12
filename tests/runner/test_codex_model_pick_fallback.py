@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -104,8 +104,12 @@ async def codex_launch_harness(
     )
 
     def resolve_launch(
-        *, model: str | None, spec: AgentSpec | None = None
+        *,
+        model: str | None,
+        spec: AgentSpec | None = None,
+        terminal_launch_args: Sequence[str] = (),
     ) -> codex_app.NativeCodexLaunch:
+        del terminal_launch_args
         return codex_app.NativeCodexLaunch(
             config_overrides=[],
             model=model or _PROVIDER_DEFAULT,
@@ -416,9 +420,12 @@ async def test_generic_provider_fallback_rebuilds_model_config_overrides(
     pick = harness.snapshot["model_override"]
 
     def resolve_launch(
-        *, model: str | None, spec: AgentSpec | None = None
+        *,
+        model: str | None,
+        spec: AgentSpec | None = None,
+        terminal_launch_args: Sequence[str] = (),
     ) -> codex_app.NativeCodexLaunch:
-        del spec
+        del spec, terminal_launch_args
         model = model or _PROVIDER_DEFAULT
         return codex_app.NativeCodexLaunch(
             config_overrides=[
@@ -519,9 +526,12 @@ async def test_subscription_fallback_pins_only_fresh_account_default(
     harness = codex_launch_harness
 
     def resolve_launch(
-        *, model: str | None, spec: AgentSpec | None = None
+        *,
+        model: str | None,
+        spec: AgentSpec | None = None,
+        terminal_launch_args: Sequence[str] = (),
     ) -> codex_app.NativeCodexLaunch:
-        del spec
+        del spec, terminal_launch_args
         return codex_app.NativeCodexLaunch(
             config_overrides=['model_provider="openai"'], model=model, profile=None
         )

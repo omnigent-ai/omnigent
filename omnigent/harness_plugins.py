@@ -97,6 +97,10 @@ class NativeHarnessProvider:
     key: str  # matches NativeCodingAgent.key
     run_native: str  # CLI + resume launch entry point
     auto_create_terminal: str  # runner terminal builder
+    # ``(session_id, instance) -> bool`` polled by the runner's terminal watcher
+    # until the native TUI accepts input, which then logs ``native_input_ready``.
+    # Required so no native harness can ship without input-readiness logging.
+    input_ready_probe: str
     spawn_env_builder: str | None = None
     # Session-label key carrying this harness's bridge id, when its spawn-env
     # builder takes a ``bridge_id=`` kwarg resolved from session labels
@@ -296,6 +300,7 @@ def _builtin_native_provider(key: str) -> NativeHarnessProvider:
             f"omnigent.{key}_native.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None
         ),
         materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",
+        input_ready_probe=f"{pkg}.bridge:native_input_ready",
     )
 
 

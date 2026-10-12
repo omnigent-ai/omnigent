@@ -1,7 +1,7 @@
 """Browser e2e for the sidebar's owner-vs-not row gating and scope filters.
 
-This is the end-to-end companion to the mocked ``Sidebar`` unit tests, and the
-coverage the ``E2E UI Required`` gate asks for: the sidebar derives ownership
+This is the end-to-end companion to the mocked ``Sidebar`` unit tests.
+The sidebar derives ownership
 (and every owner-only row action) from the session's ``owner`` — the creator's
 user id carried on each list row — NOT from an effective ``permission_level``.
 The behavior under test:

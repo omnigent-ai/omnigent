@@ -585,10 +585,15 @@ def _render_workspace_prep_command(
         for repo, dirname, staging in zip(repos, dirnames, staging_names, strict=True):
             clone_dir = f"{workspace}/{dirname}"
             staging_dir = f"{workspace}/{staging}"
-            branch = (
-                f"--branch {shlex.quote(repo.branch)} --single-branch "
-                if repo.branch is not None
-                else ""
+            clone = shlex.join(
+                [
+                    "git",
+                    "clone",
+                    *repo.git_clone.clone_args(repo.branch),
+                    "--",
+                    repo.url,
+                    f"{staging_dir}/clone",
+                ]
             )
             target = shlex.quote(clone_dir)
             gitfile = shlex.quote(f"{clone_dir}/.git")
@@ -627,7 +632,7 @@ def _render_workspace_prep_command(
             script += f"  mkdir -- {target}\n  mkdir -- {temporary}\n  touch -- {marker}\n"
             script += '  if [ -z "$wired" ]; then wire_credentials; wired=1; fi\n'
             script += (
-                f"  (git clone {branch}-- {shlex.quote(repo.url)} {staged_clone} "
+                f"  ({clone} "
                 f"&& replace_empty_dir {staged_clone} {target} "
                 f"&& rm -f -- {marker} && rmdir -- {temporary} "
                 f"|| {{ rmdir -- {target} 2>/dev/null || true; exit 1; }}) "
@@ -1255,6 +1260,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             # are on the exec-model branch and stay single-repo until they
             # opt in themselves.
             multi_repo=True,
+            git_clone_options=True,
         )
 
     def __init__(

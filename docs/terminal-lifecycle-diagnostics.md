@@ -31,12 +31,25 @@ exit does not by itself prove an agent failure. A required terminal exiting whil
 idle differs from losing it during a turn. Check the subsequent turn-status
 event for the actual user-visible outcome.
 
-The new attributes contain no pane contents, command arguments, or filesystem
-paths, with one scoped exception: the Codex terminal's `terminal_exit_observed`
-event carries `terminal_last_output`, a bounded, redacted excerpt of its final
-screen (terminal control sequences stripped and known credential patterns
-redacted). No other terminal records pane contents. Existing human-readable
-errors remain unchanged. No extra tmux probes are introduced for diagnostics.
+Lifecycle metadata excludes command arguments and filesystem paths. Codex
+terminal-text excerpts can include either, along with other user content.
+Pane text is limited to Codex `terminal_exit_observed` records: registered
+terminals export `terminal_last_output`, a bounded excerpt of the final screen
+with terminal control sequences stripped and known credential patterns redacted.
+This existing excerpt is exported independently of
+`OMNIGENT_HARNESS_STDERR_ENABLED`.
+
+A terminal that exits before registration also emits `terminal_exit_observed`,
+with `before_observation=True`. Available exit metadata is always included;
+only Codex with the flag enabled includes a sanitized recent-output tail. Other
+terminals' lifecycle-event attributes contain no pane text.
+
+Exit handling can retain recent scrollback in memory before tmux cleanup, even
+with the flag disabled. The flag gates the new diagnostic consumers' reads and
+exports of this history, including Codex startup-error excerpts; it is not a
+switch for all terminal text retention or existing logging. See
+[Native harness diagnostics](harness-diagnostics.md) for the capture bounds,
+startup-failure fields, and app-server logging controls.
 
 ## Verification
 

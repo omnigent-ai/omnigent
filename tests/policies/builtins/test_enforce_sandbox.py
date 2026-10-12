@@ -286,3 +286,12 @@ def test_enforce_sandbox_parametrized(
     sandbox = result["data"]["arguments"]["sandbox"]
     for key, value in expected_sandbox.items():
         assert sandbox[key] == value, f"sandbox[{key!r}] = {sandbox[key]!r}, expected {value!r}"
+
+
+def test_enforce_sandbox_accepts_copy_on_write_grants() -> None:
+    paths: list[str | dict[str, object]] = [
+        "./artifacts",
+        {"path": "./dependencies", "copy_on_write": True},
+    ]
+    result = enforce_sandbox(write_paths=paths)(_agent_start_event(sandbox={"type": "none"}))
+    assert result["data"]["arguments"]["sandbox"]["write_paths"] == paths

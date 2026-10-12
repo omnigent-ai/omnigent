@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
+import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import { useChatStore } from "@/store/chatStore";
 
 // Mock the policies data layer so SessionPoliciesSection and AddPolicyDialog
@@ -111,14 +112,18 @@ function renderButton(agent: Agent | undefined) {
  * retries off — the policy fetch failing in jsdom is irrelevant to the
  * cost row under test and must not crash the render.
  */
-function renderButtonWithSession(agent: Agent | undefined, sessionId: string) {
+function renderButtonWithSession(
+  agent: Agent | undefined,
+  sessionId: string,
+  permissionLevel: number | null = LEVEL_OWNER,
+) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
-        <AgentInfoButton agent={agent} sessionId={sessionId} />
+        <AgentInfoButton agent={agent} sessionId={sessionId} permissionLevel={permissionLevel} />
       </TooltipProvider>
     </QueryClientProvider>,
   );
@@ -639,14 +644,18 @@ describe("AgentInfoButton per-model usage breakdown", () => {
 // (no popover trigger needed) with the policies data layer mocked.
 // ---------------------------------------------------------------------------
 
-function renderContent(sessionId: string) {
+function renderContent(sessionId: string, permissionLevel: number | null = LEVEL_OWNER) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
-        <AgentInfoContent agent={AGENT_WITH_BOTH} sessionId={sessionId} />
+        <AgentInfoContent
+          agent={AGENT_WITH_BOTH}
+          sessionId={sessionId}
+          permissionLevel={permissionLevel}
+        />
       </TooltipProvider>
     </QueryClientProvider>,
   );
@@ -912,6 +921,24 @@ describe("McpServersSection", () => {
     createMcpMutate.mockClear();
     updateMcpMutate.mockClear();
     deleteMcpMutate.mockClear();
+  });
+
+  it.each([1, 2, 3])("keeps MCP servers read-only at permission level %s", (permissionLevel) => {
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_mcp", permissionLevel);
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    expect(screen.getByText("slack")).toBeInTheDocument();
+    expect(screen.getByText("jira")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Manage MCP servers" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "slack" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "jira" })).toBeNull();
+  });
+
+  it("preserves MCP management when permissions are disabled", () => {
+    renderContent("conv_mcp", null);
+
+    expect(screen.getByRole("button", { name: "Manage MCP servers" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "slack" })).toBeInTheDocument();
   });
 
   it("creates an HTTP MCP server from the manager dialog", () => {

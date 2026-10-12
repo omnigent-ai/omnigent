@@ -34,6 +34,7 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Page, Request, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 
@@ -203,11 +204,8 @@ def test_session_created_elsewhere_appears_via_push(
 
     # Create a brand-new session "elsewhere" — over the API, the way a CLI or
     # another tab would — with no action in this browser.
-    resp = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": "{}"},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-        timeout=30.0,
+    resp = post_session_bundle(
+        httpx.post, f"{base_url}/v1/sessions", _build_hello_world_bundle(), timeout=30.0
     )
     resp.raise_for_status()
     new_id = resp.json()["session_id"]

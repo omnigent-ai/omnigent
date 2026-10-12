@@ -40,6 +40,7 @@ REQUIRED=(
   "E2E UI Tests (shard 7/10)"
   "E2E UI Tests (shard 8/10)"
   "E2E UI Tests (shard 9/10)"
+  "Browser Contract UI"
   "UI Snapshot (visual baselines)"
   "Integration (claude-sdk)"
   "Integration (openai-agents)"
@@ -78,6 +79,7 @@ ALLOW_SKIP=(
   "E2E UI Tests (shard 7/10)"
   "E2E UI Tests (shard 8/10)"
   "E2E UI Tests (shard 9/10)"
+  "Browser Contract UI"
   "UI Snapshot (visual baselines)"
   "Integration (claude-sdk)"
   "Integration (openai-agents)"
@@ -96,6 +98,7 @@ workflow_for() {
     "Pytest ("*)             echo "CI" ;;
     "E2E Tests (shard "*)    echo "E2E Tests" ;;
     "E2E UI Tests (shard "*) echo "E2E UI Tests" ;;
+    "Browser Contract UI")     echo "E2E UI Tests" ;;
     "UI Snapshot (visual baselines)") echo "UI Snapshot" ;;
     "Integration ("*)        echo "Integration Tests" ;;
     *)                       echo "" ;;

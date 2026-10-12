@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.account_authority import require_active_account
-from omnigent.db.compression import decode
+from omnigent.db.compression import decode, encode
 from omnigent.db.db_models import SqlPreference, SqlProject, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -36,6 +36,7 @@ from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
 # still capping abuse.
 _CONFIG_MAX_SERIALIZED_LEN = 64 * 1024
 _PROJECT_ORDER_KEY = "project_order"
+_PREFERENCE_MAX_STORED_BYTES = 65535
 
 
 def _encode_config(config: dict[str, Any] | None) -> str | None:
@@ -92,6 +93,16 @@ def _to_entity(row: SqlProject) -> Project:
         updated_at=row.updated_at,
         config=_decode_config(row.config),
     )
+
+
+def _encode_order(preference: ProjectOrderPreference) -> str:
+    """Serialize an order only if its compressed frame fits a MySQL BLOB."""
+    serialized = json.dumps(preference, separators=(",", ":"))
+    stored = encode(serialized)
+    assert stored is not None
+    if len(stored) > _PREFERENCE_MAX_STORED_BYTES:
+        raise OmnigentError("Project order is too large to save", code=ErrorCode.INVALID_INPUT)
+    return serialized
 
 
 def _decode_order(raw: bytes | str | memoryview | None) -> ProjectOrderPreference:
@@ -355,7 +366,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                         SqlPreference.user_id == preference_user_id,
                         SqlPreference.key == _PROJECT_ORDER_KEY,
                     )
-                    .values(value=json.dumps(preference, separators=(",", ":")))
+                    .values(value=_encode_order(preference))
                 )
                 return preference
             owned = set(
@@ -372,7 +383,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                 "sort_mode": "manual",
                 "ordered_project_ids": ids,
             }
-            encoded = json.dumps(preference, separators=(",", ":"))
+            encoded = _encode_order(preference)
             values = {
                 "workspace_id": workspace_id,
                 "user_id": preference_user_id,

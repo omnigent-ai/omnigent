@@ -40,8 +40,8 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import TYPE_CHECKING, Any
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
@@ -73,6 +73,10 @@ _executor: ThreadPoolExecutor | None = None
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# This process's own last touch_runner_liveness() stamp per runner id.
+# Never erased by clear_runner_liveness — only configure() resets it.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
+_last_liveness_stamp: dict[str, int] = {}
 
 
 def configure(
@@ -93,6 +97,7 @@ def configure(
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
+    _last_liveness_stamp.clear()
 
 
 def conversation_store() -> ConversationStore | None:
@@ -105,7 +110,7 @@ def conversation_store() -> ConversationStore | None:
     return _store
 
 
-def submit(description: str, fn, *args, on_failure=None) -> None:  # type: ignore[no-untyped-def]
+def submit(description: str, fn, *args, on_failure=None) -> Future[Any]:  # type: ignore[no-untyped-def]
     """
     Run one store-backed task on the ordered background worker.
 
@@ -126,6 +131,7 @@ def submit(description: str, fn, *args, on_failure=None) -> None:  # type: ignor
         thread) when the write raises. Used to evict a dedupe entry so a
         dropped write's value can be re-attempted by the next identical
         publish instead of being swallowed.
+    :returns: Future containing the result, or ``None`` after a logged write failure.
     """
     global _executor
     if _executor is None:
@@ -133,15 +139,15 @@ def submit(description: str, fn, *args, on_failure=None) -> None:  # type: ignor
 
     ctx = contextvars.copy_context()
 
-    def _run() -> None:
+    def _run() -> Any:
         try:
-            fn(*args)
+            return fn(*args)
         except Exception:  # noqa: BLE001 — best-effort display state
             _logger.warning("session live-state write failed (%s)", description, exc_info=True)
             if on_failure is not None:
                 on_failure()
 
-    _executor.submit(ctx.run, _run)
+    return _executor.submit(ctx.run, _run)
 
 
 def persist_live_status(session_id: str, status: str) -> None:
@@ -185,6 +191,11 @@ def persist_live_status(session_id: str, status: str) -> None:
             _last_status.pop(session_id, None)
 
     submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+
+
+def forget_live_status(session_id: str) -> None:
+    """Drop this process's dedupe state for a session handed to another replica."""
+    _last_status.pop(session_id, None)
 
 
 def persist_scheduled_run_completion(
@@ -290,11 +301,34 @@ def touch_runner_liveness(runner_ids: list[str]) -> None:
     the owning workspace on a multi-tenant replica. It mirrors how the
     host tunnel refreshes ``host_store.heartbeat`` from its ping loop.
 
+    Also records the stamp in :func:`last_liveness_stamp`, so a later
+    disconnect on this same replica can tell its own writes apart from a
+    fresher one another replica made after the runner re-tunnelled there.
+
     :param runner_ids: Runner ids with a live tunnel. Empty = no-op.
     """
     if _store is None or not runner_ids:
         return
-    submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), int(time.time()))
+    now = int(time.time())
+    for runner_id in runner_ids:
+        _last_liveness_stamp[runner_id] = now
+    submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), now)
+
+
+def last_liveness_stamp(runner_id: str) -> int | None:
+    """
+    Return the last ``runner_last_seen`` value THIS process itself stamped.
+
+    Lets a disconnect handler distinguish a stamp another replica wrote
+    after the runner re-tunnelled there from one this replica wrote
+    itself, without racing the best-effort write's own executor.
+
+    :param runner_id: Runner id to look up.
+    :returns: The epoch-second value from this process's most recent
+        :func:`touch_runner_liveness` call naming *runner_id*, or
+        ``None`` if it never stamped one.
+    """
+    return _last_liveness_stamp.get(runner_id)
 
 
 def clear_runner_liveness(runner_id: str) -> None:
@@ -303,10 +337,18 @@ def clear_runner_liveness(runner_id: str) -> None:
 
     Flips the sidebar offline immediately instead of waiting out the
     freshness TTL. An ungraceful death (host / replica crash) never
-    reaches this — the TTL self-corrects it.
+    reaches this — the TTL self-corrects it. Passes this process's own
+    last stamp as ``not_after``, so the clear can never erase a fresher
+    stamp another replica already wrote for a runner that re-tunnelled
+    there before this disconnect was processed.
 
     :param runner_id: The disconnected runner's id.
     """
     if _store is None:
         return
-    submit("runner_liveness_clear", _store.clear_runner_liveness, runner_id)
+    submit(
+        "runner_liveness_clear",
+        _store.clear_runner_liveness,
+        runner_id,
+        last_liveness_stamp(runner_id),
+    )

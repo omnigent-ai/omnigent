@@ -621,7 +621,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
 
     // ── Native tools ────────────────────────────────
     case "native_tool_call": {
-      adoptResponseIdIfUnset(state, event.responseId);
+      if (event.toolType !== "subagent_activity") adoptResponseIdIfUnset(state, event.responseId);
       yield {
         type: "native_tool",
         ctx: ctx(state, event.itemId || null, event.responseId || null),

@@ -24,6 +24,8 @@ from omnigent.runner.app import _build_claude_native_base_args, _claude_terminal
 from omnigent.runner.native.orchestration import (
     _ROUTED_SPAWN_ALLOWED_TOOLS,
     _claude_launch_metadata_from_envelope,
+    _claude_launch_permission_mode,
+    _load_claude_launch_metadata,
     _load_legacy_claude_launch_metadata,
     _routed_spawn_launch_args,
 )
@@ -373,7 +375,7 @@ def bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     ``augment_claude_args`` validates the bridge dir against the real
     ``$TMPDIR/omnigent-<uid>/claude-native`` root, so a raw ``tmp_path`` is
     rejected. Point the bridge root and its trusted parent at the test's temp
-    dir the way ``tests/test_claude_native_bridge.py`` does.
+    dir the way ``tests/harnesses/claude_native/test_claude_native_bridge.py`` does.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp directory.
@@ -448,6 +450,130 @@ def test_routed_spawn_launch_args_gate_is_off_without_auto_harness() -> None:
     note, allowed = _routed_spawn_launch_args(True)
     assert note
     assert allowed == _ROUTED_SPAWN_ALLOWED_TOOLS
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["--permission-mode", "auto"], "auto"),
+        (["--permission-mode=acceptEdits"], "acceptEdits"),
+        (["--permission-mode", "secret-value"], None),
+        (["--permission-mode"], None),
+        (["--model", "opus"], None),
+        (["--permission-mode", "auto", "--permission-mode="], "auto"),
+        (["--dangerously-skip-permissions"], "bypassPermissions"),
+    ],
+)
+def test_claude_launch_permission_mode_logs_only_known_values(
+    args: list[str], expected: str | None
+) -> None:
+    assert _claude_launch_permission_mode(args) == expected
+
+
+async def test_claude_launch_metadata_log_includes_permission_mode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+    )
+
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id="conv_auto",
+        agent_id="agent",
+        snapshot={
+            "created_at": 0,
+            "updated_at": 0,
+            "terminal_launch_args": ["--permission-mode", "auto"],
+        },
+    )
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        await _load_claude_launch_metadata(
+            server_client=None,  # type: ignore[arg-type]
+            session_id="conv_auto",
+            session_init=envelope,
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_launch_config_loaded"
+    )
+    assert "permission_mode=auto" in record.getMessage()
+    assert record.attributes == {"permission_mode": "auto"}
+
+
+async def test_claude_launch_metadata_log_excludes_unknown_permission_mode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+    )
+
+    unknown_mode = "secret-value"
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id="conv_unknown",
+        agent_id="agent",
+        snapshot={
+            "created_at": 0,
+            "updated_at": 0,
+            "terminal_launch_args": ["--permission-mode", unknown_mode],
+        },
+    )
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        await _load_claude_launch_metadata(
+            server_client=None,  # type: ignore[arg-type]
+            session_id="conv_unknown",
+            session_init=envelope,
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_launch_config_loaded"
+    )
+    assert unknown_mode not in record.getMessage()
+    assert unknown_mode not in record.attributes.values()
+    assert "permission_mode" not in record.attributes
+
+
+async def test_legacy_claude_launch_metadata_log_includes_permission_mode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"terminal_launch_args": ["--permission-mode=plan"]},
+        )
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://runner"
+        ) as client:
+            await _load_legacy_claude_launch_metadata(client, "conv_plan")
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_launch_config_loaded"
+    )
+    assert "permission_mode=plan" in record.getMessage()
+    assert record.attributes == {"permission_mode": "plan"}
 
 
 @pytest.mark.parametrize(

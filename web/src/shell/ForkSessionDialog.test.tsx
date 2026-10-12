@@ -1,7 +1,9 @@
+import { testAgent } from "@/test/agentFixtures";
 import type * as ReactRouterDomModule from "react-router-dom";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -100,38 +102,16 @@ function setHosts(hosts: Host[]): void {
 // SDK targets plus same-family native (claude-native) and hide the
 // cross-family native target (codex-native).
 const AVAILABLE_AGENTS: AvailableAgent[] = [
-  {
-    id: "ag_claude_sdk",
-    name: "claude",
-    display_name: "Claude",
-    description: null,
-    harness: "claude-sdk",
-    skills: [],
-  },
-  {
-    id: "ag_claude_native",
-    name: "claude-native-ui",
+  testAgent("ag_claude_sdk", "claude", { display_name: "Claude", harness: "claude-sdk" }),
+  testAgent("ag_claude_native", "claude-native-ui", {
     display_name: "Claude Code",
-    description: null,
     harness: "claude-native",
-    skills: [],
-  },
-  {
-    id: "ag_codex_native",
-    name: "codex-native-ui",
+  }),
+  testAgent("ag_codex_native", "codex-native-ui", {
     display_name: "Codex",
-    description: null,
     harness: "codex-native",
-    skills: [],
-  },
-  {
-    id: "ag_openai",
-    name: "gpt",
-    display_name: "GPT",
-    description: null,
-    harness: "openai-agents",
-    skills: [],
-  },
+  }),
+  testAgent("ag_openai", "gpt", { display_name: "GPT", harness: "openai-agents" }),
 ];
 
 function setAgents(available: AvailableAgent[], sourceHarness: string | null): void {
@@ -158,7 +138,7 @@ function renderDialog(
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const invalidateSpy = vi.spyOn(client, "invalidateQueries");
-  const dialog = (
+  const dialog = () => (
     <ForkSessionDialog
       sourceSessionId="conv_src"
       sourceTitle={props.sourceTitle}
@@ -170,22 +150,23 @@ function renderDialog(
       onOpenChange={vi.fn()}
     />
   );
-  const utils = render(
+  const content = () => (
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <MemoryRouter>
           {props.info === undefined ? (
-            dialog
+            dialog()
           ) : (
             <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...props.info }}>
-              {dialog}
+              {dialog()}
             </CapabilitiesProvider>
           )}
         </MemoryRouter>
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
-  return { ...utils, invalidateSpy };
+  const utils = render(content());
+  return { ...utils, invalidateSpy, refresh: () => utils.rerender(content()) };
 }
 
 /** Open the Radix host <Select> (hosts + sandbox rows). */
@@ -249,6 +230,79 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ForkSessionDialog", () => {
+  it.each([
+    ["managed snapshot", null],
+    ["Arclet host", "arclet"],
+    ["Databricks Sandbox host", "lakebox"],
+  ])("blocks the whole form for an unsupported source detected by %s", async (source, provider) => {
+    useSessionMock.mockReturnValue({
+      session: {
+        hostId: "host_1",
+        labels: source === "managed snapshot" ? { "omnigent.host_type": "managed" } : {},
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useSession>);
+    setHosts([host({ sandbox_provider: provider })]);
+    renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo" });
+
+    const submit = screen.getByTestId("fork-session-submit");
+    expect(submit).toBeDisabled();
+    expect(screen.getByRole("group", { name: "Clone session" })).toBe(submit.parentElement);
+    expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
+      "Forking this sandbox session is not supported yet.",
+    );
+    expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-advanced-toggle")).not.toBeInTheDocument();
+    fireEvent.click(submit);
+    fireEvent.focus(submit.parentElement!);
+    fireEvent.keyDown(submit.parentElement!, { key: "Enter" });
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent(
+        "Forking this sandbox session is not supported yet.",
+      ),
+    );
+    expect(submit.parentElement).toHaveAccessibleDescription(
+      "Forking this sandbox session is not supported yet.",
+    );
+    expect(forkSessionMock).not.toHaveBeenCalled();
+    expect(launchRunnerMock).not.toHaveBeenCalled();
+    expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+  });
+
+  it("does not expose an actionable form before the source snapshot resolves", () => {
+    useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo" });
+    expect(screen.getByRole("status")).toHaveTextContent("Checking session capabilities…");
+    expect(screen.queryByTestId("fork-session-submit")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
+  });
+
+  it("moves keyboard focus into the form when source capabilities finish loading", async () => {
+    const user = userEvent.setup();
+    useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    const { refresh } = renderDialog();
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
+
+    useSessionMock.mockReturnValue({
+      session: null,
+      isLoading: false,
+      error: new Error("Session unavailable"),
+    });
+    refresh();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Unable to check session capabilities. Reload to try again.",
+    );
+    expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+
+    useSessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
+    refresh();
+    expect(screen.getByTestId("fork-session-agent-select")).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("listbox")).toBeVisible();
+    expect(forkSessionMock).not.toHaveBeenCalled();
+  });
+
   it("leaves the name optional, suggesting 'Fork of <title>' as the placeholder", () => {
     renderDialog({ sourceTitle: "My session" });
     // Name lives under Advanced now (optional, prefilled-by-placeholder).
@@ -447,14 +501,10 @@ describe("ForkSessionDialog", () => {
     // source"). Source here is databricks_coding_agent (openai-agents).
     const agents = [
       ...AVAILABLE_AGENTS,
-      {
-        id: "ag_dbx",
-        name: "databricks_coding_agent",
+      testAgent("ag_dbx", "databricks_coding_agent", {
         display_name: "databricks_coding_agent",
-        description: null,
         harness: "openai-agents",
-        skills: [],
-      },
+      }),
     ];
     setAgents(agents, "openai-agents");
     useSessionAgentMock.mockReturnValue({
@@ -531,22 +581,14 @@ describe("ForkSessionDialog", () => {
     // where the fork-only preamble target (opencode) is hidden.
     setAgents(
       [
-        {
-          id: "ag_opencode",
-          name: "opencode-native-ui",
+        testAgent("ag_opencode", "opencode-native-ui", {
           display_name: "OpenCode",
-          description: null,
           harness: "opencode-native",
-          skills: [],
-        },
-        {
-          id: "ag_hermes",
-          name: "hermes-native-ui",
+        }),
+        testAgent("ag_hermes", "hermes-native-ui", {
           display_name: "Hermes",
-          description: null,
           harness: "hermes-native",
-          skills: [],
-        },
+        }),
       ],
       "claude-sdk",
     );
@@ -561,15 +603,11 @@ describe("ForkSessionDialog", () => {
     // Custom agents discovered from session scans start with harness=null and
     // a sessionId. Without eager prefetch, forkTargetCarriesHistory(null)
     // returns false and they never appear in the fork picker.
-    const customAgent: AvailableAgent = {
-      id: "ag_custom",
-      name: "my-agent",
+    const customAgent: AvailableAgent = testAgent("ag_custom", "my-agent", {
       display_name: "My Agent",
-      description: null,
       harness: null,
-      skills: [],
       sessionId: "conv_custom",
-    };
+    });
     setAgents([...AVAILABLE_AGENTS, customAgent], "claude-sdk");
 
     renderDialog();

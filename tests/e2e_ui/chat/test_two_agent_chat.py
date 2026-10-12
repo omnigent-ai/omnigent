@@ -82,7 +82,7 @@ _COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
-_SUBAGENT_STATUS_DOT = '[data-testid="subagent-status-dot"]'
+_SUBAGENT_STATUS_AVATAR = '[data-testid="subagent-status-avatar"]'
 
 # One relay = dispatch turn + sub-agent turn + auto-wake continuation,
 # three serial LLM calls, so nonce assertions get a generous budget.
@@ -165,7 +165,7 @@ def _expect_single_deep_thought_row(page: Page) -> str:
     rows = rail.locator(_SUBAGENT_ROW)
     expect(rows).to_have_count(1, timeout=30_000)
     expect(rows.first).to_contain_text("deep_thought")
-    expect(rows.first.locator(_SUBAGENT_STATUS_DOT)).to_be_visible()
+    expect(rows.first.locator(_SUBAGENT_STATUS_AVATAR)).to_be_visible()
     child_session_id = rows.first.get_attribute("data-child-session-id")
     assert child_session_id, "subagent row is missing data-child-session-id"
     return child_session_id

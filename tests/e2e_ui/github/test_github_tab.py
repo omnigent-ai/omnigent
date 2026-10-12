@@ -1,6 +1,6 @@
-"""E2E: the read-only GitHub rail tab, driven entirely from stubbed responses.
+"""E2E: the read-only Pull Requests rail tab, driven entirely from stubbed responses.
 
-The GitHub tab's data comes from the runner-backed resource endpoints
+The tab's data comes from the runner-backed resource endpoints
 (``/v1/sessions/{id}/resources/github*``), which normally shell out to ``gh``
 and ``git`` in the workspace. Here every one of those endpoints is intercepted
 with ``page.route`` and answered with canned JSON, so the test exercises the
@@ -9,11 +9,11 @@ without a real ``gh``/``git`` (which a CI workspace has no PR for anyway).
 
 Three behaviours are pinned:
 
-1. Opening the GitHub rail tab renders the associated PR (title + number), its
+1. Opening the Pull Requests rail tab renders the associated PR (title + number), its
    CI checks as labeled pills, and the branch-vs-base file tree — with a
    single-child directory chain (``src`` → ``app``) compacted into one row.
 2. Composer metadata stays aligned and visually grouped, and its PR link opens
-   GitHub on desktop and mobile with one or several PRs at different text sizes.
+   the tab on desktop and mobile with one or several PRs at different text sizes.
 3. A host predating the ``/resources/github`` route 404s "Resource 'github'
    not found", which the panel renders as an actionable "update your host"
    empty state rather than the generic "unavailable" one.
@@ -167,19 +167,25 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The GitHub tab lands on Summary; Changes shows the compacted file tree."""
+    """The Pull Requests tab lands on Summary; Changes shows the compacted file tree."""
     base_url, session_id = seeded_session
     _stub_github(page)
     page.goto(f"{base_url}/c/{session_id}")
 
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name="GitHub").click()
+    rail.get_by_role("tab", name="Pull Requests").click()
 
     # PR header (shared across both inner tabs): title, number, and state.
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
     expect(rail.get_by_text(f"#{_PR_NUMBER}")).to_be_visible()
     expect(rail.get_by_label("Pull request status: Open")).to_be_visible()
+
+    # A host without tracking controls puts the provider beside the repo.
+    icon = rail.get_by_role("heading", name="GitHub", exact=True).bounding_box()
+    repository = rail.get_by_text("acme/app ·", exact=False).bounding_box()
+    assert icon is not None and repository is not None
+    assert abs(icon["y"] - repository["y"]) < 10
 
     # CI checks on their own line as labeled pills; a zero bucket shows nothing.
     expect(rail.get_by_text("Checks")).to_be_visible()
@@ -332,7 +338,7 @@ def test_composer_pr_link_opens_github_tab(
         if is_mobile:
             expect(panel).to_have_attribute("data-state", "open")
         else:
-            expect(panel.get_by_role("tab", name="GitHub")).to_have_attribute(
+            expect(panel.get_by_role("tab", name="Pull Requests")).to_have_attribute(
                 "aria-selected", "true"
             )
         expect(panel.get_by_text("Add the GitHub tab", exact=True)).to_be_visible(timeout=30_000)
@@ -350,14 +356,16 @@ def test_composer_pr_link_opens_github_tab(
         expect(panel).to_have_attribute("data-state", "closed")
         expect(pr_link).to_be_in_viewport()
 
-    expected_font_size = font_size * 0.9 * (14 / 13 if is_mobile else 1)
+    expected_font_size = font_size * 0.9
     for test_id, actual_font_size in font_sizes.items():
         assert actual_font_size == pytest.approx(expected_font_size, abs=0.01), (
             f"{test_id} should use the caption size at {font_size}px preference: {font_sizes}"
         )
     reference_center = centers["composer-workspace-dir.icon"]
-    assert bar_bounds["height"] == pytest.approx(37, abs=0.1)
-    assert reference_center == pytest.approx(bar_bounds["y"] + 19, abs=0.5)
+    expected_bar_height = 28 if is_mobile else 37
+    expected_center_offset = 14 if is_mobile else 19
+    assert bar_bounds["height"] == pytest.approx(expected_bar_height, abs=0.1)
+    assert reference_center == pytest.approx(bar_bounds["y"] + expected_center_offset, abs=0.5)
     for name, center in centers.items():
         assert center == pytest.approx(reference_center, abs=0.5), (name, centers)
     for name, pair_gap in pair_gaps.items():
@@ -406,7 +414,7 @@ def test_github_tab_prompts_to_update_outdated_host(
 
     Pins the full old-host chain end to end: the 404 body → ``githubNotFoundReason``
     → the ``host_outdated`` state → the actionable empty state, rather than the
-    generic "GitHub isn't available" one.
+    generic "Pull requests aren't available" one.
     """
     base_url, session_id = seeded_session
     _stub_github_outdated_host(page)
@@ -414,8 +422,37 @@ def test_github_tab_prompts_to_update_outdated_host(
 
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name="GitHub").click()
+    rail.get_by_role("tab", name="Pull Requests").click()
 
-    expect(rail.get_by_text("Update your host to use GitHub")).to_be_visible(timeout=30_000)
+    expect(rail.get_by_text("Update your host to use the Pull Requests tab")).to_be_visible(
+        timeout=30_000
+    )
     # The hint names the version floor so the user knows what to update to.
     expect(rail.get_by_text(re.compile(r"0\.13\.0 or later"))).to_be_visible()
+
+
+def test_no_pr_keeps_linking_when_another_provider_discovery_fails(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A secondary remote's warning leaves the GitHub empty state actionable."""
+    base_url, session_id = seeded_session
+    page.route(
+        re.compile(r"/resources/github(?:\?|$)"),
+        lambda route: route.fulfill(
+            json={
+                **_INFO,
+                "pr": None,
+                "prs": [],
+                "tracking_available": True,
+                "discovery_warnings": ["GitLab discovery failed. Refresh to retry."],
+            }
+        ),
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name="Pull Requests").click()
+    expect(rail.get_by_text("No open PR for", exact=False)).to_be_visible(timeout=30_000)
+    expect(rail.get_by_role("status")).to_have_text("GitLab discovery failed. Refresh to retry.")
+    rail.get_by_role("button", name="Link a PR", exact=True).click()
+    expect(rail.get_by_role("textbox", name="Pull request URL")).to_be_visible()

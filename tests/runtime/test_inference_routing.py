@@ -537,3 +537,33 @@ def test_pi_mixed_shortlist_registers_each_models_wire() -> None:
     assert [row["id"] for row in rendered["omnigent"]["models"]] == ["claude-primary"]
     assert rendered["omnigent-openai"]["api"] == "openai-responses"
     assert [row["id"] for row in rendered["omnigent-openai"]["models"]] == ["gpt-primary"]
+
+
+def test_acp_override_uses_selected_agents_inference_binding(tmp_path: Path) -> None:
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {"name": "Other", "command": "other acp"},
+                        {"name": "Custom", "command": "custom acp"},
+                    ]
+                }
+            }
+        )
+    )
+    spec = _spec("acp:other")
+    with inference_config_scope(_profile()):
+        env = _build_spawn_env_from_spec(spec, "acp:custom")
+        assert env is not None
+        assert env["HARNESS_ACP_COMMAND"] == "custom acp"
+        assert env["HARNESS_ACP_MODEL"] == "model-a"
+        assert env["HARNESS_ACP_MODEL_LIST"].split(",") == [
+            "model-a",
+            "databricks-literal/model-b",
+        ]
+        with pytest.raises(OmnigentError, match="configured model list"):
+            _build_spawn_env_from_spec(spec, "acp:custom", model_override="unlisted")
+    assert spec.executor.config["harness"] == "acp:other"

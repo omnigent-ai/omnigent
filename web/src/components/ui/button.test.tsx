@@ -76,6 +76,14 @@ describe("buttonVariants translate/transform composition", () => {
 });
 
 describe("buttonVariants icon geometry", () => {
+  it("uses regular-weight labels for every button size", () => {
+    for (const size of SIZES) {
+      const classes = buttonVariants({ size });
+      expect(classes).toContain("font-normal");
+      expect(classes).not.toContain("font-medium");
+    }
+  });
+
   it("keeps default button icons at a fixed 14px glyph inside a 16px box", () => {
     const classes = buttonVariants({});
     // index.css owns the fixed geometry through this semantic hook; callers can

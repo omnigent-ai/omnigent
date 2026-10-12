@@ -22,11 +22,12 @@ import type {
   AnyBlock,
   ErrorBlock,
   MessageContentBlock,
+  NativeToolBlock,
   RoutingDecisionBlock,
   ToolExecution,
   ToolResultBlock,
 } from "./blocks";
-import { LIVE_ITEM_PREFIX } from "./blocks";
+import { isTerminalCommandInput, LIVE_ITEM_PREFIX } from "./blocks";
 import { isUserInputElicitation } from "./askUserQuestion";
 import {
   type RoutingDecisionExtras,
@@ -67,7 +68,13 @@ export interface RelatedRenderError extends RenderErrorDetails {
 }
 
 export type RenderItem =
-  | { kind: "text"; itemId: string | null; text: string; final: boolean }
+  | {
+      kind: "text";
+      itemId: string | null;
+      text: string;
+      final: boolean;
+      previewInterrupted?: boolean;
+    }
   | {
       kind: "reasoning";
       itemId: string | null;
@@ -160,6 +167,8 @@ export type Bubble =
       /** Queued input that does not yet have a persisted transcript item. */
       pending?: boolean;
       content: MessageContentBlock[];
+      /** Shell input is literal command text, not Markdown or attachment markers. */
+      shellCommand?: string;
       /** Human author email, when known. */
       createdBy?: string;
       /** Epoch seconds of this message, when known — server-stamped from
@@ -218,6 +227,7 @@ export type Bubble =
     }
   | { kind: "compaction_loading"; itemId: string; createdAtS?: number }
   | { kind: "compaction"; itemId: string }
+  | { kind: "subagent_activity"; itemId: string; data: Record<string, unknown> }
   | {
       kind: "routing_decision";
       itemId: string;
@@ -317,13 +327,14 @@ function newestAssistantTurnId(blocks: AnyBlock[]): string | null {
     const b = blocks[i]!;
     if (
       b.type === "user_message" ||
+      isTerminalCommandInput(b) ||
       b.type === "compaction" ||
       b.type === "compaction_loading" ||
       b.type === "routing_decision"
     ) {
       return null;
     }
-    if (isNonRenderingBlock(b) || b.type === "tool_result") continue;
+    if (isNonRenderingBlock(b) || b.type === "tool_result" || isSubagentActivityBlock(b)) continue;
     if (isAnonymousRid(b.ctx.responseId)) continue;
     return b.ctx.responseId;
   }
@@ -822,13 +833,26 @@ function walkBubbles(
       continue;
     }
 
-    if (b.type === "user_message") {
+    if (isSubagentActivityBlock(b)) {
+      lastBubbleStart = i;
+      lastBubbleCount = 1;
+      bubbles.push({
+        kind: "subagent_activity",
+        itemId: b.ctx.itemId ?? `subagent_activity_${i}`,
+        data: b.data,
+      });
+      i += 1;
+      continue;
+    }
+
+    if (b.type === "user_message" || isTerminalCommandInput(b)) {
       // A native harness can accept a steering message without ending the
       // response already in progress. In persisted history that user message
       // has the same response id as assistant work immediately before it.
       // The answer and the resumed work then share one assistant bubble; do
       // not hide the answer merely because more work followed it.
-      expandNextAssistantResponseId = midResponseUserMessageId(blocks, i);
+      expandNextAssistantResponseId =
+        b.type === "user_message" ? midResponseUserMessageId(blocks, i) : null;
       const chipIndexes = deferred.byMessage.get(i);
       const firstChip = chipIndexes?.[0];
       // The pair's region starts at whichever block came first, so an
@@ -842,7 +866,9 @@ function walkBubbles(
       bubbles.push({
         kind: "user",
         itemId: b.ctx.itemId ?? `user_${i}`,
-        content: b.content,
+        content:
+          b.type === "user_message" ? b.content : [{ type: "input_text", text: `!${b.input}` }],
+        ...(b.type === "terminal_command" ? { shellCommand: b.input } : {}),
         ...(b.ctx.createdBy !== undefined ? { createdBy: b.ctx.createdBy } : {}),
         // Server stamp on cold load, client stamp while live — display
         // only, so either clock is correct here.
@@ -851,7 +877,7 @@ function walkBubbles(
           : {}),
         // Carry the optimistic temp id (when promoted) so bubbleKey holds
         // steady across the optimistic→committed swap — no remount/flink.
-        stableKey: b.stableKey,
+        stableKey: b.type === "user_message" ? b.stableKey : undefined,
       });
       if (chipIndexes !== undefined) {
         for (const chipIndex of chipIndexes) {
@@ -977,9 +1003,11 @@ function walkBubbles(
       // carries `state.responseId` into `ctx()` for all events).
       if (
         cur.type === "user_message" ||
+        isTerminalCommandInput(cur) ||
         cur.type === "compaction" ||
         cur.type === "compaction_loading" ||
-        cur.type === "routing_decision"
+        cur.type === "routing_decision" ||
+        isSubagentActivityBlock(cur)
       )
         break;
       if (isNonRenderingBlock(cur)) {
@@ -1392,10 +1420,18 @@ function turnWorkedForS(groupBlocks: AnyBlock[]): number | undefined {
   return undefined;
 }
 
+function isSubagentActivityBlock(
+  b: AnyBlock,
+): b is NativeToolBlock & { toolType: "subagent_activity" } {
+  return b.type === "native_tool" && b.toolType === "subagent_activity";
+}
+
 /** Filter to blocks that participate in assistant rendering. */
 function isAssistantSideBlock(b: AnyBlock): boolean {
   return (
+    !isSubagentActivityBlock(b) &&
     b.type !== "user_message" &&
+    !isTerminalCommandInput(b) &&
     b.type !== "compaction" &&
     // compaction_loading has its own top-level bubble slot and must not
     // end up in an assistant bubble's item list.
@@ -1415,8 +1451,8 @@ function isAssistantSideBlock(b: AnyBlock): boolean {
  * Native harnesses persist a steered message with the active response id. A
  * normal next-turn message has a new response id, so comparing it with the
  * preceding assistant work distinguishes the two without inspecting message
- * wording. Runtime system messages may record an interruption in between and are
- * skipped; lifecycle markers remain hard boundaries. Empty ids are provisional
+ * wording. Runtime system messages and subagent activity are skipped; response
+ * lifecycle markers remain hard boundaries. Empty ids are provisional
  * live-stream values, not durable turn identity, and are deliberately ignored.
  */
 function midResponseUserMessageId(blocks: AnyBlock[], index: number): string | null {
@@ -1431,6 +1467,7 @@ function midResponseUserMessageId(blocks: AnyBlock[], index: number): string | n
   for (let previousIndex = index - 1; previousIndex >= 0; previousIndex -= 1) {
     const previous = blocks[previousIndex]!;
     if (isNonRenderingBlock(previous)) return null;
+    if (isSubagentActivityBlock(previous)) continue;
     if (previous.type === "user_message" && isSystemUserContent(previous.content)) continue;
     return isAssistantSideBlock(previous) && previous.ctx.responseId === user.ctx.responseId
       ? user.ctx.responseId
@@ -1692,6 +1729,7 @@ function textItem(run: AnyBlock[]): RenderItem {
         itemId: b.ctx.itemId,
         text: b.fullText,
         final: true,
+        ...(b.previewInterrupted ? { previewInterrupted: true } : {}),
       };
     }
   }
@@ -1824,6 +1862,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
+      a.shellCommand !== b.shellCommand ||
       a.content.length !== b.content.length
     )
       return false;
@@ -1838,6 +1877,9 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind === "routing_decision" && b.kind === "routing_decision") {
     // Verdict fields are immutable per item, so the id alone identifies it.
     return a.itemId === b.itemId;
+  }
+  if (a.kind === "subagent_activity" && b.kind === "subagent_activity") {
+    return a.itemId === b.itemId && a.data === b.data;
   }
   return false;
 }

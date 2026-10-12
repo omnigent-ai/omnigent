@@ -809,13 +809,14 @@ class HarnessProcessManager:
                     },
                 )
                 await self._close_entry(entry)
+                # The retired process cannot emit its terminal stream edge.
+                self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
             if entry is not None and harness != "any" and entry.harness != harness:
                 # The harness is fixed at spawn time (it selects which runner
                 # module the subprocess loads), but the socket is keyed by
-                # conversation only — so after an in-place agent switch
-                # (``POST /v1/sessions/{id}/switch-agent``) a later turn
-                # resolves a DIFFERENT harness and must respawn, otherwise the
+                # conversation only, so if the session's agent binding changes,
+                # a later turn resolves a DIFFERENT harness and must respawn, otherwise the
                 # cached subprocess keeps serving the old harness. Mirrors the
                 # model-change respawn below.
                 #
@@ -833,6 +834,7 @@ class HarnessProcessManager:
                 )
                 replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                 await self._close_entry(entry)
+                self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
             if (
@@ -847,6 +849,7 @@ class HarnessProcessManager:
                 )
                 replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                 await self._close_entry(entry)
+                self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
             if entry is not None and not (
@@ -867,6 +870,7 @@ class HarnessProcessManager:
                     )
                     replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                     await self._close_entry(entry)
+                    self._in_flight_response_ids.pop(conversation_id, None)
                     entry = None
                     respawn_reason = "harness_respawn_model_switch"
             if entry is None:
@@ -1150,6 +1154,7 @@ class HarnessProcessManager:
                     self._release_generations.get(conversation_id, 0) + 1
                 )
                 entry = self._entries.pop(conversation_id, None)
+                self._in_flight_response_ids.pop(conversation_id, None)
                 # NOTE: ``_spawn_locks[conversation_id]`` intentionally
                 # NOT popped — see this method's docstring for the
                 # per-conv lock-identity invariant rationale.
@@ -1421,12 +1426,20 @@ class HarnessProcessManager:
 
         :param entry: The bookkeeping record to tear down.
         """
+        cancellation: asyncio.CancelledError | None = None
         try:
             await entry.client.aclose()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
         except Exception:
             # A broken transport must not skip the subprocess kill below.
             _logger.exception("error closing harness client during teardown; continuing")
-        finally:
+
+        async def _force_kill_and_wait() -> None:
+            _proc.kill_tree(entry.process)
+            await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+
+        try:
             if entry.process.returncode is None:
                 try:
                     # Tree-aware backstop: this process parents the sandbox
@@ -1434,14 +1447,27 @@ class HarnessProcessManager:
                     # handle strands both when an executor close() never runs.
                     _proc.terminate_tree(entry.process)
                     await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+                except asyncio.CancelledError as exc:
+                    # Cancellation during either wait must not abandon the child.
+                    cancellation = exc
+                    try:
+                        await _force_kill_and_wait()
+                    except asyncio.CancelledError as exc:
+                        cancellation = exc
+                    except Exception:
+                        pass
                 except Exception:
                     # Graceful SIGTERM didn't complete — it timed out, or
                     # send_signal/wait raised (e.g. the process vanished
                     # mid-teardown). Force-kill best-effort; a process that
                     # is already gone is already done.
-                    with contextlib.suppress(Exception):
-                        _proc.kill_tree(entry.process)
-                        await entry.process.wait()
+                    try:
+                        await _force_kill_and_wait()
+                    except asyncio.CancelledError as exc:
+                        cancellation = exc
+                    except Exception:
+                        pass
+        finally:
             with contextlib.suppress(Exception):
                 close_subprocess_transport(entry.process)
             # Best-effort socket cleanup. uvicorn's atexit usually
@@ -1449,6 +1475,8 @@ class HarnessProcessManager:
             # hard-killed runner won't. No-op for TCP endpoints.
             with contextlib.suppress(Exception):
                 entry.endpoint.cleanup()
+        if cancellation is not None:
+            raise cancellation
 
     async def _idle_reaper_loop(self) -> None:
         """
@@ -1550,13 +1578,40 @@ async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) ->
     :returns: None.
     """
     root = tmp_parent if tmp_parent is not None else _default_tmp_parent()
-    if not root.exists():
+    try:
+        if not root.exists():
+            return
+    except OSError as exc:
+        _logger.warning(
+            "cannot access %s for the orphan sweep: %s; skipping sweep",
+            root,
+            exc,
+        )
         return
-    for child in root.iterdir():
-        if not child.is_dir() or not child.name.startswith("ap-"):
-            continue
-        sentinel = child / _AP_PID_FILE
-        if not sentinel.exists():
+    try:
+        children = list(root.iterdir())
+    except OSError as exc:
+        _logger.warning(
+            "cannot enumerate %s for the orphan sweep: %s; skipping sweep",
+            root,
+            exc,
+        )
+        return
+    for child in children:
+        try:
+            if not child.is_dir() or not child.name.startswith("ap-"):
+                continue
+            sentinel = child / _AP_PID_FILE
+            if not sentinel.exists():
+                # No sentinel: directory either pre-dates the
+                # convention or is mid-creation. Leave alone.
+                continue
+        except OSError as exc:
+            _logger.warning(
+                "cannot inspect %s during the orphan sweep: %s; skipping",
+                child,
+                exc,
+            )
             continue
         try:
             pid = int(sentinel.read_text(encoding="utf-8").strip())

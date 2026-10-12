@@ -26,10 +26,9 @@ TUI prompt remains the source of truth and the benign fallback if store
 detection ever fails. Sessions launched with ``--yolo`` / ``--force`` / ``-f``
 auto-accept lingering tool gates in-pane (no web card) because cursor's Run
 Everything mode still sometimes leaves a pending marker long enough to stall a
-piloted parent. That accept is deliberately fail-closed: it only fires while
-the pane is live and actually showing cursor's accept hint, it is capped at a
-few attempts, and anything it does not clear falls back to the ordinary web
-card rather than typing ``y`` into the composer forever. See
+piloted parent. The accept only fires while the pane shows cursor's accept
+hint, with bounded retries before a still-visible gate falls back to a web
+card. Stale markers without a visible gate never produce a yolo approval. See
 ``docs/cursor-native-elicitation.md`` (and the
 superseded ``docs/cursor-native-tui-mirror-plan.md`` for the original pane-scrape
 design and why the transcript channel replaced it).
@@ -324,23 +323,17 @@ _QUESTION_TOOL_NAMES = frozenset({"askquestion"})
 # Auto-review retry) still surfaces a card rather than being suppressed.
 _ELICITATION_SETTLE_S = 0.5
 
-# When a session launched with ``--yolo`` / ``--force`` / ``-f``, cursor still
-# sometimes leaves a pending marker long enough for Omnigent to mirror a card.
-# Auto-accept sends ``y`` into the pane instead of parking a web elicitation.
-# Retry if the call stays pending (keystroke dropped by a TUI re-render), but
-# only a few times: a gate still pending after that is not one ``y`` answers
-# (a stale marker with no prompt on screen, or a prompt needing a different
-# key), so fall back to the ordinary card instead of typing into the composer
-# for the life of the session.
+# Give visible gates time to render and handle keystrokes under load. Pending
+# checkpoint markers alone do not mean that Cursor is awaiting approval.
 _YOLO_ACCEPT_RETRY_S = 2.0
-_YOLO_ACCEPT_MAX_ATTEMPTS = 3
+_YOLO_ACCEPT_MAX_RETRY_S = 5.0
+_YOLO_ACCEPT_TIMEOUT_S = 30.0
 
 # Cursor's approval block advertises its accept key as a parenthesised hint on
 # the chosen option line, e.g. ``→ Run (once) (y)``. Auto-accept requires that
 # hint to be on screen before it sends anything, so a stale pending marker with
 # no prompt rendered never types a literal ``y`` into cursor's composer. A
-# wording change therefore degrades to the visible card, not to a stray
-# keystroke.
+# wording change leaves the native prompt available in the embedded terminal.
 _ACCEPT_KEY_HINT_RE = re.compile(
     rf"\(\s*{re.escape(_TRANSCRIPT_ACCEPT_KEY)}\s*(?:/[^)\n]*)?\)", re.IGNORECASE
 )
@@ -712,44 +705,37 @@ class _YoloAccept(enum.Enum):
     """Auto-accept is not clearing this gate; fall back to the web card."""
 
 
+@dataclass
+class _YoloAcceptRetry:
+    started_at: float
+    last_attempt_at: float
+    retry_s: float
+    attempts: int
+
+
 async def _yolo_auto_accept(
     call: CursorPendingToolCall,
     *,
     bridge_dir: Path,
     session_id: str,
     now: float,
-    attempts_by_call: dict[str, tuple[float, int]],
+    attempts_by_call: dict[str, _YoloAcceptRetry],
     allow_send: bool,
 ) -> _YoloAccept:
     """Try to answer one gated call in-pane, or hand it back to the card path.
 
-    Fail-closed on every uncertainty: the accept key goes out only while the
-    pane is live *and* rendering cursor's accept hint, at most
-    :data:`_YOLO_ACCEPT_MAX_ATTEMPTS` times. A gate that survives that budget —
-    a stale marker with no prompt on screen, a prompt ``y`` cannot answer, or a
-    pane that has gone away — returns :attr:`_YoloAccept.SURFACE_CARD` so it
-    ends up visible in the parent instead of drawing a keystroke every couple of
-    seconds for the life of the session.
+    Retry visible prompts with backoff for ``_YOLO_ACCEPT_TIMEOUT_S`` after
+    the first send, allowing the final send its full backoff interval. A pending
+    checkpoint without an on-screen prompt can be stale or still rendering;
+    it neither consumes retries nor surfaces a card.
 
-    :param attempts_by_call: tool_call_id → (loop-time of last attempt, count).
-        Mutated in place; in-memory only, so a runner restart re-tries a call
-        that is still pending.
-    :param allow_send: False once another call has been answered this pass.
+    :param attempts_by_call: In-memory retry state, keyed by tool_call_id.
+    :param allow_send: Whether the pane is available for another approval.
     """
-    last_attempt_at, attempts = attempts_by_call.get(call.tool_call_id, (None, 0))
-    if attempts >= _YOLO_ACCEPT_MAX_ATTEMPTS:
-        _logger.warning(
-            "cursor elicitation: yolo auto-accept did not clear %s after %d attempts; "
-            "surfacing a card; session=%s tool_call_id=%s",
-            call.tool_name,
-            attempts,
-            session_id,
-            call.tool_call_id.splitlines()[0],
-        )
-        return _YoloAccept.SURFACE_CARD
-    if last_attempt_at is not None and (now - last_attempt_at) < _YOLO_ACCEPT_RETRY_S:
-        return _YoloAccept.SKIP
     if not allow_send:
+        return _YoloAccept.SKIP
+    retry = attempts_by_call.get(call.tool_call_id)
+    if retry is not None and now - retry.last_attempt_at < retry.retry_s:
         return _YoloAccept.SKIP
     pane = await asyncio.to_thread(capture_cursor_pane, bridge_dir)
     if pane is None:
@@ -762,39 +748,46 @@ async def _yolo_auto_accept(
             session_id,
             call.tool_call_id.splitlines()[0],
         )
-        attempts_by_call[call.tool_call_id] = (now, _YOLO_ACCEPT_MAX_ATTEMPTS)
         return _YoloAccept.SURFACE_CARD
+    if not pane.strip():
+        # Capture failures return an empty frame; only a usable capture can
+        # confirm that the prompt disappeared and reset its retry deadline.
+        return _YoloAccept.SKIP
     if not _pane_shows_accept_prompt(pane):
-        # The store says pending but nothing on screen takes the accept key —
-        # a prompt still painting, or a stale marker. Sending now would type a
-        # literal ``y`` into cursor's composer.
-        attempts_by_call[call.tool_call_id] = (now, attempts + 1)
-        _logger.debug(
-            "cursor elicitation: no accept prompt on screen for %s (attempt %d/%d); "
-            "session=%s tool_call_id=%s",
+        attempts_by_call.pop(call.tool_call_id, None)
+        return _YoloAccept.SKIP
+    if retry is not None and now - retry.started_at >= _YOLO_ACCEPT_TIMEOUT_S:
+        _logger.warning(
+            "cursor elicitation: yolo auto-accept did not clear visible %s after %.1fs "
+            "and %d attempts; surfacing a card; session=%s tool_call_id=%s",
             call.tool_name,
-            attempts + 1,
-            _YOLO_ACCEPT_MAX_ATTEMPTS,
+            now - retry.started_at,
+            retry.attempts,
             session_id,
             call.tool_call_id.splitlines()[0],
         )
-        return _YoloAccept.SKIP
+        return _YoloAccept.SURFACE_CARD
     # A call nobody ever sees needs its arguments in the record, or an operator
     # has no way to tell an auto-approved ``ls`` from an auto-approved ``rm``.
     _logger.info(
-        "cursor elicitation: auto-accepting %s under yolo (attempt %d/%d); "
+        "cursor elicitation: auto-accepting %s under yolo (attempt %d); "
         "session=%s tool_call_id=%s preview=%s",
         call.tool_name,
-        attempts + 1,
-        _YOLO_ACCEPT_MAX_ATTEMPTS,
+        retry.attempts + 1 if retry is not None else 1,
         session_id,
         call.tool_call_id.splitlines()[0],
         _preview_for_args(call.args),
     )
     if not await _send_cursor_keys(bridge_dir, session_id, _TRANSCRIPT_ACCEPT_KEY):
-        attempts_by_call[call.tool_call_id] = (now, _YOLO_ACCEPT_MAX_ATTEMPTS)
         return _YoloAccept.SURFACE_CARD
-    attempts_by_call[call.tool_call_id] = (now, attempts + 1)
+    attempts_by_call[call.tool_call_id] = _YoloAcceptRetry(
+        started_at=retry.started_at if retry is not None else now,
+        last_attempt_at=now,
+        retry_s=min(retry.retry_s * 2, _YOLO_ACCEPT_MAX_RETRY_S)
+        if retry is not None
+        else _YOLO_ACCEPT_RETRY_S,
+        attempts=retry.attempts + 1 if retry is not None else 1,
+    )
     return _YoloAccept.SENT
 
 
@@ -831,9 +824,8 @@ async def supervise_cursor_transcript_elicitations(
     web card. Cursor's Run Everything mode still sometimes leaves a pending
     marker long enough to otherwise stall a piloted parent on mirrored
     ApprovalCards. ``AskQuestion`` still surfaces — that is intentional human
-    input, not a tool gate. The accept is bounded and fail-closed (see
-    :func:`_yolo_auto_accept`): a gate it does not clear falls back to the same
-    card the non-yolo path would have shown.
+    input, not a tool gate. A visible gate that survives bounded retries falls
+    back to the usual card; stale markers without a prompt remain silent.
 
     Store discovery reuses the forwarder's logic, so this binds to the same chat
     the forwarder mirrors. Detection is keyed by ``toolCallId`` (stable across
@@ -857,8 +849,8 @@ async def supervise_cursor_transcript_elicitations(
     # still inside the settle window (not yet surfaced).
     active: dict[str, dict[str, object]] = {}
     first_seen: dict[str, float] = {}
-    # tool_call_id → (loop-time of last auto-accept attempt, attempts) — yolo only.
-    auto_accept_attempts: dict[str, tuple[float, int]] = {}
+    auto_accept_attempts: dict[str, _YoloAcceptRetry] = {}
+    next_auto_accept_at = 0.0
     store_path: Path | None = None
     loop = asyncio.get_running_loop()
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
@@ -902,9 +894,13 @@ async def supervise_cursor_transcript_elicitations(
                     tcid for tcid in auto_accept_attempts if tcid not in seen_ids
                 ]:
                     auto_accept_attempts.pop(tool_call_id, None)
-                # Cursor renders one approval prompt at a time, so at most one
-                # accept key goes out per pass however many calls are pending.
-                auto_accepted_this_pass = False
+                # The pane renders one prompt at a time, even when several
+                # checkpoint markers remain pending across polls.
+                approval_waiting = any(
+                    isinstance(task := entry["task"], asyncio.Task) and not task.done()
+                    for entry in active.values()
+                )
+                auto_accept_available = not approval_waiting and now >= next_auto_accept_at
                 # Surface calls that have now stayed pending past the settle window.
                 for call in pending_calls:
                     if call.tool_call_id in active:
@@ -932,10 +928,15 @@ async def supervise_cursor_transcript_elicitations(
                             session_id=session_id,
                             now=now,
                             attempts_by_call=auto_accept_attempts,
-                            allow_send=not auto_accepted_this_pass,
+                            allow_send=auto_accept_available,
                         )
+                        if outcome is not _YoloAccept.SKIP:
+                            auto_accept_available = False
+                        if outcome is _YoloAccept.SENT:
+                            next_auto_accept_at = (
+                                loop.time() + auto_accept_attempts[call.tool_call_id].retry_s
+                            )
                         if outcome is not _YoloAccept.SURFACE_CARD:
-                            auto_accepted_this_pass |= outcome is _YoloAccept.SENT
                             continue
                     elicitation_id = cursor_tool_call_elicitation_id(session_id, call.tool_call_id)
                     _logger.debug(
@@ -965,6 +966,7 @@ async def supervise_cursor_transcript_elicitations(
                         "elicitation_id": elicitation_id,
                         "task": task,
                     }
+                    auto_accept_available = False
                     first_seen.pop(call.tool_call_id, None)
             except asyncio.CancelledError:
                 raise

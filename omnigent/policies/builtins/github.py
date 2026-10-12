@@ -890,7 +890,15 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
         an ``"unparseable"`` op so the caller can ASK rather than silently allow.
     """
     if _depth > MAX_SHELL_NESTING:
-        return []
+        return [
+            _ShellOp(
+                kind="unparseable",
+                repo=None,
+                branches=frozenset(),
+                branch_targeted=False,
+                detail="shell command exceeds the nesting limit",
+            )
+        ]
     ops: list[_ShellOp] = []
     for segment in split_command_segments(command):
         unreadable = False

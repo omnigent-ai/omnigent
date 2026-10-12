@@ -3,7 +3,7 @@
 #
 # Always main, never the PR head SHA: otherwise a PR could edit
 # MAINTAINER to grant itself a maintainer-gated waiver (e.g.
-# skip-security-scan, skip-e2e-ui-test) without being merged.
+# skip-security-scan) without being merged.
 # Defense-in-depth: a PR could still edit *this* workflow to drop
 # `?ref=main`, so the remaining defense is `required_pull_request_reviews`
 # in branch protection.

@@ -151,20 +151,68 @@ def test_create_worktree_places_sibling_of_repo_root(git_repo: Path) -> None:
     # Path proves the sibling layout + slash->dash dir sanitization;
     # a regression in _resolve_worktree_path would change this.
     assert created.worktree_path == str(expected)
+    assert created.workspace == str(expected)
     assert Path(created.worktree_path).is_dir()
     # The branch is actually checked out in the worktree (not just the dir made).
     assert _current_branch(Path(created.worktree_path)) == "feature/login"
     assert isinstance(created, CreatedWorktree)
 
 
-def test_create_worktree_resolves_repo_root_from_subdir(git_repo: Path) -> None:
-    """Picking a subdir still anchors the worktree at the repo root's sibling."""
-    sub = git_repo / "src"
-    sub.mkdir()
+@pytest.mark.parametrize("linked", [False, True])
+def test_create_worktree_resolves_repo_root_from_subdir(git_repo: Path, linked: bool) -> None:
+    """Preserve a nested workspace from either the main checkout or a linked worktree."""
+    relative = Path("packages") / "my app"
+    sub = git_repo / relative
+    sub.mkdir(parents=True)
+    (sub / "README.md").write_text("nested project")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-qm", "add nested project")
+    if linked:
+        first = create_worktree(repo_path=str(git_repo), branch_name="first")
+        sub = Path(first.worktree_path) / relative
     created = create_worktree(repo_path=str(sub), branch_name="wip")
-    # Sibling of the repo ROOT, not of the picked subdir — proves
-    # rev-parse --show-toplevel is used rather than the raw repo_path.
+    # Worktree placement stays anchored at the main repository.
     assert created.worktree_path == str(git_repo.parent / "myrepo-worktrees" / "wip")
+    assert created.workspace == str(Path(created.worktree_path) / relative)
+    assert (Path(created.workspace) / "README.md").read_text() == "nested project"
+    assert _current_branch(Path(created.workspace)) == "wip"
+
+    with pytest.raises(WorktreeError, match="expected worktree root"):
+        remove_worktree(worktree_path=created.workspace, branch="wip", delete_branch=True)
+    remove_worktree(worktree_path=created.worktree_path, branch="wip", delete_branch=True)
+    assert not Path(created.worktree_path).exists()
+    assert not _branch_exists(git_repo, "wip")
+
+
+@pytest.mark.parametrize("existing_branch", [False, True])
+@pytest.mark.parametrize("base_path_kind", ["missing", "file"])
+def test_create_worktree_missing_subdir_leaves_no_worktree(
+    git_repo: Path, existing_branch: bool, base_path_kind: str
+) -> None:
+    """A directory missing from the target revision fails before creating a worktree."""
+    sub = git_repo / "new-project"
+    if base_path_kind == "file":
+        sub.write_text("a file in the old revision")
+        _git(git_repo, "add", ".")
+        _git(git_repo, "commit", "-qm", "add file")
+    _git(git_repo, "branch", "old-base")
+    if base_path_kind == "file":
+        sub.unlink()
+    sub.mkdir()
+    (sub / "README.md").write_text("new project")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-qm", "add project")
+    message = "does not exist" if base_path_kind == "missing" else "is not a directory"
+    with pytest.raises(WorktreeError, match=message):
+        create_worktree(
+            repo_path=str(sub),
+            branch_name="old-base" if existing_branch else "new-worktree",
+            base_branch=None if existing_branch else "old-base",
+            existing_branch=existing_branch,
+        )
+    assert _worktree_count(git_repo) == 1
+    assert not _branch_exists(git_repo, "new-worktree")
+    assert _branch_exists(git_repo, "old-base")
 
 
 def test_create_worktree_from_linked_worktree_anchors_at_main_repo(git_repo: Path) -> None:
@@ -533,3 +581,153 @@ def test_validate_branch_name_rejects_bad(bad: str) -> None:
 def test_validate_branch_name_accepts_good(good: str) -> None:
     """Well-formed branch names pass validation."""
     validate_branch_name(good)  # must not raise
+
+
+@pytest.mark.parametrize("branch_has_directory", [True, False])
+def test_existing_branch_directory_probe_ignores_same_named_tag(
+    git_repo: Path, branch_has_directory: bool
+) -> None:
+    """Directory validation must inspect the branch that worktree add checks out."""
+    before = _rev_parse(git_repo)
+    source = git_repo / "web"
+    source.mkdir()
+    (source / "index.txt").write_text("tracked")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "add web")
+    after = _rev_parse(git_repo)
+    _git(git_repo, "branch", "feature", after if branch_has_directory else before)
+    _git(git_repo, "tag", "feature", before if branch_has_directory else after)
+    if branch_has_directory:
+        created = create_worktree(
+            repo_path=str(source), branch_name="feature", existing_branch=True
+        )
+        assert Path(created.workspace).is_dir()
+        assert (
+            next(
+                tree.branch
+                for tree in list_worktrees(repo_path=created.worktree_path)
+                if tree.path == created.worktree_path
+            )
+            == "feature"
+        )
+    else:
+        with pytest.raises(WorktreeError, match="does not exist"):
+            create_worktree(repo_path=str(source), branch_name="feature", existing_branch=True)
+
+
+@pytest.mark.parametrize("replacement", ["file", "symlink"])
+def test_remove_worktree_rejects_replaced_root(git_repo: Path, replacement: str) -> None:
+    """A stale cleanup path must not remove a symlink target or raise an unhandled OS error."""
+    original = create_worktree(repo_path=str(git_repo), branch_name="original")
+    target = create_worktree(repo_path=str(git_repo), branch_name="target")
+    remove_worktree(worktree_path=original.worktree_path)
+    path = Path(original.worktree_path)
+    if replacement == "file":
+        path.write_text("replacement")
+    else:
+        path.symlink_to(target.worktree_path, target_is_directory=True)
+    with pytest.raises(WorktreeError):
+        remove_worktree(worktree_path=str(path), branch="original", delete_branch=True)
+    assert Path(target.worktree_path).is_dir()
+    assert _branch_exists(git_repo, "original")
+    assert _branch_exists(git_repo, "target")
+
+
+def test_worktree_picker_accepts_symlinked_prefix(git_repo: Path) -> None:
+    """Picker paths may include a legitimate symlink such as macOS /tmp."""
+    alias = git_repo.parent / "alias"
+    alias.symlink_to(git_repo.parent, target_is_directory=True)
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature")
+    trees = list_worktrees(repo_path=str(alias / git_repo.name))
+    assert [tree.path for tree in trees] == [str(git_repo), created.worktree_path]
+
+
+@pytest.mark.parametrize("mode", ["base", "head", "existing"])
+def test_directory_validation_survives_revision_moving(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Ref movement cannot make creation succeed with a missing session directory."""
+    before = _rev_parse(git_repo)
+    source = git_repo / "web"
+    source.mkdir()
+    (source / "index.txt").write_text("tracked")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "web")
+    validated = _rev_parse(git_repo)
+    _git(git_repo, "branch", "moving")
+    real_run = git_worktree_module._run_git
+    moved = False
+
+    def move_after_validation(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+        nonlocal moved
+        result = real_run(args, cwd=cwd)
+        if args[:2] == ["cat-file", "-t"] and not moved:
+            ref = "main" if mode == "head" else "moving"
+            _git(git_repo, "update-ref", f"refs/heads/{ref}", before)
+            moved = True
+        return result
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", move_after_validation)
+    if mode == "existing":
+        with pytest.raises(WorktreeError, match="changed during worktree creation"):
+            create_worktree(repo_path=str(source), branch_name="moving", existing_branch=True)
+        assert len(list_worktrees(repo_path=str(git_repo))) == 1
+        assert _rev_parse(git_repo, "refs/heads/moving") == before
+    else:
+        created = create_worktree(
+            repo_path=str(source),
+            branch_name="new",
+            base_branch="moving" if mode == "base" else None,
+        )
+        assert Path(created.workspace).is_dir()
+        assert _rev_parse(Path(created.worktree_path)) == validated
+    assert moved
+
+
+@pytest.mark.parametrize("auto_track", ["true", "false", "always", "simple", "inherit"])
+def test_subdirectory_creation_preserves_remote_tracking(git_repo: Path, auto_track: str) -> None:
+    """Pinned checkouts retain Git's native tracking policy for the requested start ref."""
+    source = git_repo / "web"
+    source.mkdir()
+    (source / "index.txt").write_text("tracked")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "web")
+    _git(git_repo, "remote", "add", "origin", str(git_repo))
+    _git(git_repo, "fetch", "origin")
+    _git(git_repo, "config", "branch.autoSetupMerge", auto_track)
+    root_created = create_worktree(
+        repo_path=str(git_repo), branch_name="root-pick", base_branch="origin/main"
+    )
+    nested_created = create_worktree(
+        repo_path=str(source), branch_name="nested-pick", base_branch="origin/main"
+    )
+    root_upstream = _rev_parse(Path(root_created.worktree_path), "@{upstream}")
+    nested_upstream = _rev_parse(Path(nested_created.worktree_path), "@{upstream}")
+    assert nested_upstream == root_upstream
+    assert Path(nested_created.workspace).is_dir()
+
+
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_failed_pinned_checkout_rolls_back_without_hiding_original_error(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, rollback_fails: bool
+) -> None:
+    """Checkout errors remain visible even when rollback also fails."""
+    source = git_repo / "web"
+    source.mkdir()
+    (source / "index.txt").write_text("tracked")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "web")
+    real_run = git_worktree_module._run_git
+
+    def fail_checkout(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ["checkout", "--force"]:
+            return subprocess.CompletedProcess(args, 1, "", "checkout failed")
+        if rollback_fails and args[:2] == ["worktree", "remove"]:
+            return subprocess.CompletedProcess(args, 1, "", "rollback failed")
+        return real_run(args, cwd=cwd)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", fail_checkout)
+    with pytest.raises(WorktreeError, match="could not check out validated"):
+        create_worktree(repo_path=str(source), branch_name="new")
+    assert _branch_exists(git_repo, "new") is rollback_fails
+    assert len(list_worktrees(repo_path=str(git_repo))) == (2 if rollback_fails else 1)

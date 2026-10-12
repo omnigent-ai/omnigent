@@ -30,7 +30,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, TextIO
+from typing import TYPE_CHECKING, Literal, Protocol, TextIO
 
 if TYPE_CHECKING:
     from omnigent_client import OmnigentClient
@@ -911,6 +911,7 @@ async def _list_sessions_with_retry(
     agent_id: str | None = None,
     agent_name: str | None = None,
     order: str = "desc",
+    kind: Literal["default", "sub_agent", "any"] | None = None,
 ) -> list[SessionListItem]:
     """List the caller's own sessions with bounded retries on 429.
 
@@ -926,6 +927,7 @@ async def _list_sessions_with_retry(
     :param agent_id: Scope to this agent; ``None`` lists across agents.
     :param agent_name: Scope to sessions whose bound agent has this name.
     :param order: Sort order forwarded to ``list``.
+    :param kind: Session kind filter; ``None`` keeps the server default.
     :returns: The session rows.
     :raises omnigent_client.RateLimitedError: When every attempt was
         rate-limited.
@@ -940,11 +942,17 @@ async def _list_sessions_with_retry(
                 agent_name=agent_name,
                 order=order,
                 visibility="mine",
+                kind=kind,
             )
         except RateLimitedError:
             await asyncio.sleep(delay_s)
     return await client.sessions.list(
-        limit=limit, agent_id=agent_id, agent_name=agent_name, order=order, visibility="mine"
+        limit=limit,
+        agent_id=agent_id,
+        agent_name=agent_name,
+        order=order,
+        visibility="mine",
+        kind=kind,
     )
 
 
@@ -993,7 +1001,10 @@ async def pick_conversation_by_wrapper_label_from_sdk(
     Wrapper invocations (claude-native today) upload a fresh agent
     bundle per session, so ``agents.get_by_name`` returns no canonical
     record — agent-id filtering can't be used. List the caller's own
-    sessions and filter by the wrapper label client-side.
+    sessions and filter by the wrapper label client-side. Native children
+    are listed too, but only for callers that pass ``host_id``: a child's
+    resumable host is inherited from its ancestry, so without a host to
+    compare against the picker keeps its top-level-only listing.
 
     Renders workspace metadata so the user can see which cwd each
     session was launched from -- claude --resume requires cwd parity
@@ -1003,11 +1014,13 @@ async def pick_conversation_by_wrapper_label_from_sdk(
     (``~/.omnigent/claude-native/``); sessions created on a
     different machine will show as having no recorded cwd.
 
-    :param host_id: When set, keep only rows bound to this host (the
+    :param host_id: When set, keep only rows running on this host (the
         invoking machine). Native transcript and workspace state are
         host-local, so a wrapper session bound to another host is a
-        dead end in this picker — resuming it cannot work here. Rows
-        without a recorded ``host_id`` (never bound, or an older
+        dead end in this picker — resuming it cannot work here. A native
+        child inherits the host of its nearest bound ancestor; a child whose
+        ancestry is not fully listed is dropped because its host is unknown.
+        Rows without a recorded host (never bound, or an older
         server that predates the field) are kept: dropping them would
         hide resumable local sessions. ``None`` disables host
         filtering (explicit ``--resume <id>`` stays unrestricted for
@@ -1015,12 +1028,41 @@ async def pick_conversation_by_wrapper_label_from_sdk(
         this picker).
     """
     all_convos = await _list_sessions_with_retry(client, limit=200, agent_id=None, order="desc")
+    if host_id is not None:
+        # Children get their own page so they never displace top-level rows, and
+        # only host-scoped callers see them: their host comes from their ancestry.
+        children = await _list_sessions_with_retry(
+            client, limit=200, agent_id=None, order="desc", kind="sub_agent"
+        )
+        listed = {c.id for c in all_convos}
+        all_convos = sorted(
+            [*all_convos, *(c for c in children if c.id not in listed)],
+            key=lambda c: getattr(c, "created_at", 0),
+            reverse=True,
+        )
+    rows_by_id = {c.id: c for c in all_convos}
+
+    def _resumable_here(c: SessionListItem) -> bool:
+        # A native child runs on the host of its nearest bound ancestor. The walk
+        # is bounded by the page size, so a corrupt parent cycle cannot hang it.
+        node: SessionListItem | None = c
+        for _ in range(len(rows_by_id)):
+            if node is None:
+                return False  # an ancestor is off-page, so ownership is unknown
+            if getattr(node, "host_id", None) is not None:
+                return node.host_id == host_id
+            parent_id = getattr(node, "parent_session_id", None)
+            if parent_id is None:
+                return True  # unbound root: never bound, or an older server
+            node = rows_by_id.get(parent_id)
+        return False
+
     convos = [
         c
         for c in all_convos
         if getattr(c, "labels", None)
         and c.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) == wrapper_value
-        and (host_id is None or getattr(c, "host_id", None) is None or c.host_id == host_id)
+        and (host_id is None or _resumable_here(c))
     ]
     previews = await _collect_previews_async(client, convos)
     return pick_conversation(

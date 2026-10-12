@@ -22,7 +22,6 @@ the sidebar.
 
 from __future__ import annotations
 
-import json
 import subprocess
 import uuid
 from collections.abc import Iterator
@@ -32,6 +31,7 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, BrowserContext, Page, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import (
     _build_hello_world_bundle,
     _ensure_runner_online,
@@ -100,11 +100,7 @@ def shared(
         timeout=30.0,
         limits=no_pool,
     )
-    create_resp = owner.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-    )
+    create_resp = post_session_bundle(owner.post, "/v1/sessions", _build_hello_world_bundle())
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
     owner.patch(

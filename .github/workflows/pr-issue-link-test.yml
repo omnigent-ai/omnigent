@@ -8,6 +8,7 @@ name: PR Issue-Link Test
 on:
   pull_request:
     paths:
+      - '.github/workflows/pr-issue-link-test.yml'
       - .github/workflows/pr-issue-link.js
       - .github/workflows/pr-issue-link.test.js
   workflow_dispatch:

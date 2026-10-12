@@ -22,7 +22,6 @@ observable (rows drop *out*, rather than merely staying put).
 
 from __future__ import annotations
 
-import json
 import uuid
 from collections.abc import Iterator
 
@@ -30,6 +29,7 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
@@ -55,10 +55,10 @@ def _create_session(server: MultiUserServer, *, owner_email: str, title: str) ->
     the row easy to spot among other tests' sessions on the shared server.
     """
     headers = {"X-Forwarded-Email": owner_email}
-    create = httpx.post(
+    create = post_session_bundle(
+        httpx.post,
         f"{server.base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
+        _build_hello_world_bundle(),
         headers=headers,
         timeout=30.0,
     )

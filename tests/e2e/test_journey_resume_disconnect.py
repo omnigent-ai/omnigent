@@ -15,7 +15,6 @@ Usage::
 from __future__ import annotations
 
 import uuid
-from typing import Any
 
 import httpx
 
@@ -29,23 +28,6 @@ from tests.e2e.conftest import (
 )
 
 _CODEWORD = "crystal-panda-99"
-
-
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """Concatenate all assistant output_text blocks from a response body.
-
-    :param body: The terminal response body from
-        :func:`poll_session_until_terminal`.
-    :returns: All assistant text joined by newlines.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
 
 
 def test_resume_session_after_disconnect(

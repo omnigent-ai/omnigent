@@ -13,14 +13,12 @@ Design reference: ``designs/SESSION_RESOURCES_API_DESIGN.md``
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import secrets
 import signal
 import socket
 import subprocess
-import tarfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -28,6 +26,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 
 _BOOT_TIMEOUT = 30.0
 _API_TIMEOUT = 15.0
@@ -213,12 +213,7 @@ def _bundle_yaml(yaml_path: Path) -> bytes:
         ``POST /v1/sessions``.
     """
     config_bytes = yaml_path.read_bytes()
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(config_bytes)
-        archive.addfile(info, io.BytesIO(config_bytes))
-    return buffer.getvalue()
+    return bundle_files({"config.yaml": config_bytes})
 
 
 def _create_session(client: httpx.Client, yaml_path: Path, runner_id: str) -> str:
@@ -230,24 +225,11 @@ def _create_session(client: httpx.Client, yaml_path: Path, runner_id: str) -> st
         ``"runner_e2e"``.
     :returns: The session id.
     """
-    session_resp = client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={
-            "bundle": (
-                "agent.tar.gz",
-                _bundle_yaml(yaml_path),
-                "application/gzip",
-            )
-        },
-    )
+    session_resp = post_session_bundle(client.post, "/v1/sessions", _bundle_yaml(yaml_path))
     assert session_resp.status_code == 201, session_resp.text
     session_id = session_resp.json()["session_id"]
-    bind_resp = client.patch(
-        f"/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-    )
-    bind_resp.raise_for_status()
+    # The client already owns the base URL; keep the PATCH path relative.
+    bind_session_runner(client.patch, "", session_id, runner_id)
     return session_id
 
 

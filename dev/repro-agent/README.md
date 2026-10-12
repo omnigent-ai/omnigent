@@ -1,7 +1,9 @@
 # repro-agent
 
 Reproduce a bug **live in your running Omnigent app** and capture it as a
-durable end-to-end test. It runs against whatever server you already have (the
+minimal reliable regression test. Search existing tests and fixtures first;
+reuse or extend them when sufficient. Keep e2e coverage for a boundary that
+lower-level checks miss. It runs against whatever server you already have (the
 server `omnigent run` spins up, or one you pass with `--server`) and authors the
 reproduction test into **this** checkout.
 
@@ -13,11 +15,11 @@ reproduction test into **this** checkout.
 - `gh` authenticated (`gh auth login`) if your `bug_url` is a GitHub issue, so
   the agent can read the report.
 - Run it **from the root of your `omnigent-ai/omnigent` checkout** so the agent's
-  working directory is this repo and it can author tests into `tests/e2e_ui/` or
-  `tests/e2e/`.
+  working directory is this repo and it can reuse or extend the appropriate
+  existing test suite.
 - Optional, for reproduction recordings (skipped gracefully when absent):
-  Playwright browsers (`playwright install chromium`) so the authored e2e_ui
-  test can run with `--video on`, [`vhs`](https://github.com/charmbracelet/vhs)
+  Playwright browsers (`playwright install chromium`) for browser journey
+  recordings, [`vhs`](https://github.com/charmbracelet/vhs)
   for CLI-journey tapes, and `ffmpeg` for `.mp4` conversion.
 
 ## Usage
@@ -59,18 +61,30 @@ with `git worktree remove <path>` when done.
 
 ## What it does
 
+An automated launcher may optionally supply a report snapshot and a coordinated
+planning protocol. In that mode the agent submits a plan, waits for the
+coordinator's automatic continuation, and produces a requirement-by-requirement
+account alongside its handoff. The coordinator owns record validation and
+storage; an independent reviewer still judges the journey and evidence. Normal
+invocations below do not pause for registration or require those records.
+
 1. Reconstructs the user journey from the linked bug report.
 2. Drives the running app through that journey — Playwright `tests/e2e_ui/` for
    headless web UI runs (including CI), embedded-browser tools for local sessions
    with a connected desktop, and `sys_session_*` / HTTP for backend bugs — until
    it observes the failure. Headless CI does not probe or use desktop browser
    tools, even when they appear in the tool list.
-3. Authors a durable e2e test (`tests/e2e_ui/` for UI, PTY/pexpect for CLI
-   journeys, `tests/e2e/` for backend) keyed to the concrete failure, so a fix
-   has a fail→pass regression guard.
+3. Identifies the smallest reliable regression coverage for the observed
+   failure: an existing test, a small extension, a focused lower-level check,
+   or a necessary e2e. It records the selection rationale and original evidence
+   so Resolve can decide which tests ship. The final report cites test paths,
+   revisions, commands, results, and source locations instead of repeating full
+   test files. Complete files remain in the Repro worktree or CI bundle; uploads
+   are labeled pending until confirmed. Two new test layers are not required.
 4. Records each settled facet on its user-facing surface under `recordings/<slug>/`
-   — the e2e_ui test run with `--video on` for web/terminal facets, a rendered VHS
-   tape for CLI facets. A reproduced facet is filmed failing (before-fix footage
+   — a suitable journey driver with `OMNIGENT_E2E_RECORD_DIR` for web/terminal
+   facets, a rendered VHS tape for CLI facets. The driver may be temporary and
+   separate from the selected regression test. A reproduced facet is filmed failing (before-fix footage
    the fix step pairs with its after-fix re-recording); an already-fixed facet is
    filmed passing (proof-it-works footage). Best-effort: skipped (and noted) when
    the recorders aren't installed.

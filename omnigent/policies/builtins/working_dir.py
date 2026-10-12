@@ -352,7 +352,7 @@ def block_working_dir_changes(
             when nothing in the command is gated.
         """
         if _depth > MAX_SHELL_NESTING:
-            return None
+            return _violation("Blocked: shell command exceeds the nesting limit.")
         worst: PolicyResponse | None = None
         for segment in split_command_segments(command):
             unreadable = False

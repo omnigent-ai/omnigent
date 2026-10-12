@@ -113,7 +113,7 @@ def test_share_dialog_grant_controls_fit_on_phone_viewport(
         content_right = dialog_right - padding_right
 
         grant_button = dialog.get_by_role("button", name="Grant")
-        level_select = dialog.get_by_role("combobox").filter(has_text="Read")
+        level_select = dialog.get_by_role("combobox", name="New user permission")
         user_field = dialog.get_by_placeholder("alice@example.com")
         expect(grant_button).to_be_visible()
         expect(level_select).to_be_visible()

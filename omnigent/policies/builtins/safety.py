@@ -518,7 +518,7 @@ _SANDBOX_OVERRIDE_KEYS = frozenset(
 def enforce_sandbox(
     sandbox_type: str = "linux_bwrap",
     allow_network: bool = True,
-    write_paths: list[str] | None = None,
+    write_paths: list[str | dict[str, object]] | None = None,
     read_paths: list[str] | None = None,
     env_passthrough: list[str] | None = None,
 ) -> PolicyCallable:
@@ -823,7 +823,20 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 },
                 "write_paths": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string", "minLength": 1},
+                                    "copy_on_write": {"type": "boolean", "default": False},
+                                },
+                                "required": ["path"],
+                                "additionalProperties": False,
+                            },
+                        ],
+                    },
                     "description": "Writable paths to enforce (null inherits agent's config)",
                 },
                 "read_paths": {

@@ -575,7 +575,7 @@ def candidate_models(
         isn't treated as unservable; the static table fills any harness the
         catalog has no row for.
     :param allow_static_fallback: Whether the static :func:`infer_models` table
-        may fill a harness the catalog has no row for. Off the AI Gateway it may
+        may fill a harness the catalog has no row for. Off the Unity Gateway it may
         not: every id in that table is a ``databricks-*`` endpoint the spawn
         could not reach, so the catalog is the only provider-accurate source.
     :returns: Harness → model ids, cheapest first, empty entries dropped.

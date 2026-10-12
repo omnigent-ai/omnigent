@@ -17,7 +17,12 @@ import {
   isTerminalClipboardWritePending,
   queueTerminalClipboardWrite,
 } from "@/lib/terminalClipboardWriter";
-import { getOmnigentServerIdentity, isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
+import {
+  getOmnigentServerIdentity,
+  isDatabricksWorkspace,
+  isHostRoutingEnabled,
+  resolveWebSocketUrl,
+} from "@/lib/host";
 import {
   canRememberTerminalClipboardPreference,
   readTerminalClipboardPreference,
@@ -48,6 +53,7 @@ import {
   isUnexpectedTerminalClose,
   resolveTerminalWorkspaceFileLink,
   TerminalSession,
+  terminalTheme,
   WS_CLOSE_WRONG_REPLICA,
 } from "./TerminalSession";
 
@@ -86,6 +92,12 @@ export const RECONNECT_BACKOFF_MS = [
  * plain reset-on-connect, a connect→drop hot loop would retry forever.
  */
 export const RECONNECT_STABLE_MS = 30_000;
+
+function isReconnectableTerminalClose(code: number): boolean {
+  return (
+    isUnexpectedTerminalClose(code) || (code === WS_CLOSE_WRONG_REPLICA && !isDatabricksWorkspace())
+  );
+}
 
 interface TerminalClipboardRequest {
   scope: string;
@@ -266,6 +278,7 @@ export function TerminalView({
   );
   useEffect(() => subscribeTerminalTheme(setTerminalMode), []);
   const isDark = resolveTerminalIsDark(terminalMode, resolvedMode === "dark");
+  const terminalBackground = terminalTheme(isDark).background;
   // Stable ref so the theme-update effect can reach the live session
   // without adding isDark to the attachSession deps (which would
   // reconnect the WebSocket on every theme change).
@@ -539,16 +552,14 @@ export function TerminalView({
         // every await.
         await Promise.resolve();
         if (superseded()) return;
-        // Route this WS to the replica holding the session's runner tunnel
-        // (key = the session's host_id). A browser WS can't set request
-        // headers, so the key rides the query string. Only against a
-        // Databricks workspace-hosted server — an unsharded server needs no key,
-        // and a hostless session yields none. The direct URL needs no key: it
-        // bypasses the server entirely.
+        // Browser WebSockets carry the host ID in the query string so they
+        // reach the replica holding the runner tunnel. Hostless sessions
+        // and direct connections need no routing key.
         const computedHostId = (() => {
-          if (keylessRef.current || !isDatabricksWorkspace()) return undefined;
+          if (!isHostRoutingEnabled()) return undefined;
+          if (isDatabricksWorkspace() && keylessRef.current) return undefined;
           const h = getSessionHost(sessionId);
-          return h && !isHostKeyless(h) ? h : undefined;
+          return h && (!isDatabricksWorkspace() || !isHostKeyless(h)) ? h : undefined;
         })();
         const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId);
         const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
@@ -630,7 +641,7 @@ export function TerminalView({
     if (active && !wasActiveRef.current) {
       sessionRef.current?.focus();
       const current = stateRef.current;
-      if (current.kind === "closed" && isUnexpectedTerminalClose(current.code)) {
+      if (current.kind === "closed" && isReconnectableTerminalClose(current.code)) {
         reconnectAttemptsRef.current = 0;
         disposeActiveSession();
         setConnectAttempt((attempt) => attempt + 1);
@@ -672,7 +683,7 @@ export function TerminalView({
     // immediately without backoff (the correct route is one handshake away).
     // One-shot: if we're ALREADY keyless and still get 4400, the host is
     // genuinely unreachable from here — stop, don't loop.
-    if (state.code === WS_CLOSE_WRONG_REPLICA) {
+    if (state.code === WS_CLOSE_WRONG_REPLICA && isDatabricksWorkspace()) {
       if (keylessRef.current) {
         setReconnectPending(false);
         return;
@@ -685,7 +696,7 @@ export function TerminalView({
       setConnectAttempt((attempt) => attempt + 1);
       return;
     }
-    if (!isUnexpectedTerminalClose(state.code)) {
+    if (!isReconnectableTerminalClose(state.code)) {
       setReconnectPending(false);
       return;
     }
@@ -728,13 +739,15 @@ export function TerminalView({
     };
   }, [state, disposeActiveSession, sessionId]);
 
+  // `isolate` scopes the status overlay's z-index to this surface so it
+  // can't paint over body-portaled UI such as the header's session menu.
   return (
     <div
       data-testid="terminal-view"
       data-state={state.kind}
       data-terminal-id={terminalId}
       data-terminal-theme={isDark ? "dark" : "light"}
-      className="relative flex min-h-0 flex-1 flex-col"
+      className="relative isolate flex min-h-0 flex-1 flex-col"
     >
       {visibleClipboardPrompt !== null && (
         <TerminalClipboardPrompt
@@ -746,11 +759,10 @@ export function TerminalView({
           onDismiss={dismissClipboardPrompt}
         />
       )}
-      {/* `p-1` lives on the wrapper, not the xterm mount node: FitAddon
-          reads the parent's border-box height but only subtracts the xterm
-          element's own padding, so padding on the mount node oversizes the
-          grid by a row and `overflow-hidden` clips the footer. */}
-      <div className="relative min-h-0 flex-1 overflow-hidden p-1">
+      <div
+        className="relative min-h-0 flex-1 overflow-hidden p-3"
+        style={{ backgroundColor: terminalBackground }}
+      >
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
         {state.kind !== "connected" && (
           <StatusOverlay

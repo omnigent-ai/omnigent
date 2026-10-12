@@ -68,7 +68,9 @@ def _drop_routes(page: Page) -> Iterator[None]:
     :returns: Iterator yielding once, then unrouting.
     """
     yield
-    page.unroute_all(behavior="ignoreErrors")
+    # A recording run closes the page when the test body ends.
+    if not page.is_closed():
+        page.unroute_all(behavior="ignoreErrors")
 
 
 def _patch_host_view(

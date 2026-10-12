@@ -381,6 +381,11 @@ async def test_stream_local_sessions_yields_each_then_stops_on_done() -> None:
 
     class _Reg:
         def send_text(self, host_conn: object, frame: str) -> None:
+            from omnigent.host.frames import HostImportLocalFrame, decode_host_frame
+
+            decoded = decode_host_frame(frame)
+            assert isinstance(decoded, HostImportLocalFrame)
+            assert decoded.allow_session_chunks is True
             (queue,) = conn.pending_import_local.values()
             for session in canned:
                 queue.put_nowait(("session", session))
@@ -398,6 +403,30 @@ async def test_stream_local_sessions_yields_each_then_stops_on_done() -> None:
 
     assert [s["external_session_id"] for s in got] == ["c1", "c2"]
     # The per-request queue is removed once the stream ends.
+    assert conn.pending_import_local == {}
+
+
+async def test_stream_local_sessions_treats_chunk_progress_as_liveness() -> None:
+    """Chunk heartbeats reset the wait without yielding malformed sessions."""
+    conn = SimpleNamespace(host_id="h1", pending_import_local={})
+
+    class _Reg:
+        def send_text(self, host_conn: object, frame: str) -> None:
+            (queue,) = conn.pending_import_local.values()
+            queue.put_nowait(("progress", {}))
+            queue.put_nowait(("done", {"status": "ok", "error": None}))
+
+    got = [
+        session
+        async for session in _stream_local_sessions_from_host(
+            host_registry=_Reg(),  # type: ignore[arg-type]
+            host_conn=conn,  # type: ignore[arg-type]
+            source="claude",
+            limit=1,
+        )
+    ]
+
+    assert got == []
     assert conn.pending_import_local == {}
 
 
@@ -430,6 +459,7 @@ async def test_stream_local_sessions_sends_exact_session_id() -> None:
     assert got == []
     assert sent[0].source == "codex"
     assert sent[0].session_id == "session-exact"
+    assert sent[0].allow_session_chunks is True
 
 
 async def test_stream_local_sessions_surfaces_host_failed_count() -> None:

@@ -47,8 +47,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import io
-import json
 import os
 import secrets
 import shutil
@@ -56,8 +54,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tarfile
-import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -67,6 +63,8 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.native_session import create_native_session
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -522,48 +520,13 @@ def _create_unbound_cursor_session(base_url: str) -> str:
     :param base_url: Real (non-proxied) server base URL.
     :returns: The new session/conversation id.
     """
-    from omnigent._wrapper_labels import (
-        CURSOR_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
+    created = create_native_session(
+        _client,
+        base_url,
+        harness="cursor",
+        metadata={"workspace": str(_REPO_ROOT), "terminal_launch_args": ["-f"]},
     )
-    from omnigent.harnesses.cursor_native.main import _materialize_cursor_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        spec_path = _materialize_cursor_agent_spec(Path(tmp))
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname -> omnigent compat translator (the spec has
-        # no spec_version), matching the conftest native session factories.
-        info = tarfile.TarInfo("cursor-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CURSOR_NATIVE_WRAPPER_VALUE,
-    }
-    # Cursor keys its chat store on md5(cwd) and needs a concrete launch cwd;
-    # the repo root is a valid dir on the runner. ``-f`` trusts the dir +
-    # auto-approves tools so the unattended pane never blocks on a prompt (only
-    # relevant on the fixed path, where the pane actually launches).
-    metadata = {
-        "labels": labels,
-        "workspace": str(_REPO_ROOT),
-        "terminal_launch_args": ["-f"],
-    }
-    create = _client.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps(metadata)},
-        files={"bundle": ("cursor-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    return str(create.json()["session_id"])
+    return str(created["session_id"])
 
 
 def _real_runner_log(work: Path) -> str:

@@ -12,10 +12,10 @@ ai.omnigent.desktop
 
 ## Keys
 
-| Key                                 | Type             | Required | Default | Description                                                                                                                                                                                     |
-| ----------------------------------- | ---------------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `serverUrls`                        | Array of strings | No       | `[]`    | Server URLs to offer, most-preferred first. Each must use `https://`. At most 10.                                                                                                               |
-| `databricksInternalFeaturesEnabled` | Boolean          | No       | `false` | Enables Databricks-internal features (e.g. the Arca host option) on windows connected to a Databricks-managed server. Fails closed — anything but an explicit boolean `true` reads as disabled. |
+| Key                                 | Type             | Required | Default | Description                                                                                                                                     |
+| ----------------------------------- | ---------------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `serverUrls`                        | Array of strings | No       | `[]`    | Server URLs to offer, most-preferred first. Each must use `https://`. At most 10.                                                               |
+| `databricksInternalFeaturesEnabled` | Boolean          | No       | `false` | Defaults macOS apps to V2 onboarding and enables Databricks-internal features on supported servers. Only an explicit boolean `true` enables it. |
 
 A schemeless host is accepted and interpreted as `https://`. Paths are
 preserved, so an administrator can provide a workspace mount directly:
@@ -26,6 +26,18 @@ https://my-workspace.cloud.databricks.com/ml/omnigents
 
 Entries with the same origin are collapsed, keeping the first. An invalid type,
 an insecure or malformed entry, or more than 10 entries rejects the whole list.
+
+To give a server a display name, add an `omnigentServerName` query parameter
+to its entry. Omnigent removes the parameter before connecting:
+
+```text
+https://my-workspace.cloud.databricks.com/?o=123&omnigentServerName=Engineering
+```
+
+Encode spaces as `%20`, and write `&` as `&amp;` inside a plist. Unnamed servers
+show their host. The first managed server's name labels the connect screen's
+**Join your team** button; names also label the organization's servers in its
+dropdown and in the in-app server switcher.
 
 ## Behavior
 
@@ -44,12 +56,19 @@ is opened or the connect screen is loaded.
 
 ## Databricks-internal features
 
+When `databricksInternalFeaturesEnabled` is `true`, macOS apps, including unpackaged
+development, default to V2 onboarding for new and existing profiles. This does not require
+`serverUrls` or a connected server. An explicit selector choice still wins,
+and saved servers still reconnect on launch. Other platforms
+keep the legacy default; `OMNIGENT_SERVER_SELECTOR_V2=1` still
+forces V2.
+
 When `databricksInternalFeaturesEnabled` is `true` **and** the window is
 connected to a Databricks-managed server (a workspace mount on
 `*.databricks.com` / `*.azuredatabricks.net`, or a Databricks App on
 `*.databricksapps.com`, https only), the new-session host picker offers
 **Run on Arca**: connecting the user's Arca dev instance to the current
-server as a host. On any other server the flag reads as disabled. Selecting it
+server as a host. On any other server the Arca option is disabled. Selecting it
 opens a shell-owned connect console that shows the exact command — `arca ssh`
 with a remote `isaac omni host --background --non-interactive` — and, after
 confirmation, streams the command's live output into an embedded terminal
@@ -61,6 +80,23 @@ keeps its own outbound tunnel from the Arca box. Once connected, the option
 disappears and the box's host row is tagged **Arca instance** (recognized by
 the host id remembered at connect time). Like the server list, the flag is read from
 macOS on demand, so profile changes apply without a restart.
+
+Remote hosts need their own renewable **Omnigent** OAuth grant. Desktop browser
+sign-in and generic Arca credentials do not replace it. During explicit runner
+setup, an authentication-required result starts `isaac omni login <server-url>`
+on Arca and retries the noninteractive host command once after sign-in. The
+manual connect console asks **Sign in and retry** before doing the same.
+Arca Companion opens the browser and routes its callback to the remote CLI;
+tokens and login output are not forwarded to the desktop renderer. Closing
+the sign-in console cancels the command. Passive auto-connect never starts login.
+
+Use an Isaac release that supports Omnigent-app login and the
+`OMNIGENT_AUTH_REQUIRED` startup diagnostic before deploying this flow.
+SPOG entries can include `/omnigent?o=<workspace-id>` to select the workspace;
+the same full server URL is used for remote login and host startup.
+Connection status and overlapping setup sign-ins are shared only for the same
+full target, including `?o=`. Closing one setup window leaves a shared sign-in
+running for the others; closing the last waiting window cancels it.
 
 ## MDM profile example
 
@@ -88,7 +124,7 @@ this as a custom settings or managed preferences payload.
               <dict>
                 <key>serverUrls</key>
                 <array>
-                  <string>https://omnigent.corp.example.com</string>
+                  <string>https://omnigent.corp.example.com/?omnigentServerName=Engineering</string>
                   <string>https://my-workspace.cloud.databricks.com/ml/omnigents</string>
                 </array>
                 <key>databricksInternalFeaturesEnabled</key>
@@ -130,14 +166,16 @@ Replace the example organization identifiers and UUIDs before deployment.
 
 ## Local verification
 
-For development only, the effective preference can be simulated with
-`defaults` while a **packaged Omnigent app** is closed. An unpackaged
-`electron .` / `just electron-dev` process uses Electron's development bundle
-identifier, not `ai.omnigent.desktop`, so it will not see this value:
+For local verification, set the preference in the domain for the app you run.
+Packaged release builds use `ai.omnigent.desktop`; packaged local builds and
+`just electron-dev` use `ai.omnigent.desktop-dev`. The unpackaged Electron
+binary retains Electron's bundle identifier, so the shell reads the dev domain
+explicitly via `defaults` (packaged builds use Electron's native user defaults
+API). For example, with a release build closed:
 
 ```bash
 defaults write ai.omnigent.desktop serverUrls -array \
-  "https://omnigent.corp.example.com" \
+  "https://omnigent.corp.example.com/?omnigentServerName=Engineering" \
   "https://my-workspace.cloud.databricks.com/ml/omnigents"
 defaults write ai.omnigent.desktop databricksInternalFeaturesEnabled -bool true
 ```
@@ -148,6 +186,30 @@ Remove the test values with:
 defaults delete ai.omnigent.desktop serverUrls
 defaults delete ai.omnigent.desktop databricksInternalFeaturesEnabled
 ```
+
+For development, substitute `ai.omnigent.desktop-dev` in the commands above.
+A profile for `ai.omnigent.desktop` doesn't apply to local builds, so they can
+be tested on a machine that already has one. `just electron-mdm` manages the
+development values:
+
+```bash
+just electron-mdm set "https://omnigent.corp.example.com/?omnigentServerName=Engineering" --internal
+just electron-mdm import   # copy this Mac's managed values for the release app
+just electron-mdm show
+just electron-mdm clear
+```
+
+To test the onboarding flows with a local build:
+
+| Scenario                     | Commands                                                                        |
+| ---------------------------- | ------------------------------------------------------------------------------- |
+| New user, no managed servers | `just electron-mdm clear`, then `just electron-run --v2-flow --reset-state`     |
+| New user, managed servers    | `just electron-mdm set <url>`, then `just electron-run --v2-flow --reset-state` |
+| This Mac's managed setup     | `just electron-mdm import`, then `just electron-run --v2-flow --reset-state`    |
+| Returning user               | `just electron-run --v2-flow` after any of the above                            |
+
+`--reset-state` uninstalls the CLI and removes the local build's app data, so
+the next launch starts as a new user.
 
 Production deployment should use an MDM-forced preference rather than a local
 user default.

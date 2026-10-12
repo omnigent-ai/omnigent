@@ -24,6 +24,7 @@ import pytest
 
 from omnigent.runtime import pending_elicitations, session_stream
 from tests.server.helpers import create_test_agent
+from tests.server.helpers import policy_tool_call_request as _tool_call_request
 
 pytestmark = pytest.mark.asyncio
 
@@ -118,30 +119,6 @@ async def _drain_elicitation_id(
                 assert isinstance(eid, str) and eid, f"missing id: {event!r}"
                 return eid
     raise AssertionError("subscribe loop ended without an elicitation event")
-
-
-def _tool_call_request(
-    tool_name: str = "Bash",
-    arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    Build a ``PHASE_TOOL_CALL`` policy-evaluate request body.
-
-    :param tool_name: Tool name, e.g. ``"Bash"``.
-    :param arguments: Tool arguments dict.
-    :returns: JSON body for ``POST /policies/evaluate``.
-    """
-    return {
-        "event": {
-            "type": "PHASE_TOOL_CALL",
-            "target": "",
-            "data": {
-                "name": tool_name,
-                "arguments": arguments or {},
-            },
-            "context": {},
-        },
-    }
 
 
 # ── Test 1: ASK on INPUT from YAML -> approve ───────────

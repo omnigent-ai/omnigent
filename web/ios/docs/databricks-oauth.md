@@ -2,8 +2,9 @@
 
 Workspace-hosted Omnigent uses native OAuth, Keychain credentials, and session-cookie
 bootstrap before loading its WebView. Each workspace context has an isolated,
-persistent WebKit data store. Databricks Apps keep inline platform sign-in, and
-generic OIDC is unchanged.
+persistent WebKit data store. Databricks Apps keep inline platform sign-in. Other
+servers follow [OIDC sign-in](../README.md#oidc-sign-in), which reuses the same
+sign-in sheet and "Sign in again?" prompt but never reads Databricks credentials.
 
 A workspace connection requires the build configuration and HTTPS callback
 association below. Missing configuration returns to setup with an error; it does
@@ -305,7 +306,8 @@ are authorized to access:
 7. Sign out using the native menu, relaunch, and confirm setup remains visible.
    Explicitly reconnect and verify a fresh native sign-in occurs without old web
    state. Verify the other workspace still works.
-8. Check a Databricks Apps URL and a generic OIDC server for unchanged behavior.
+8. Check a Databricks Apps URL for unchanged behavior, and a generic OIDC server per
+   [OIDC sign-in](../README.md#oidc-sign-in).
 
 Do not put private hosts, IDs, tokens, cookies, callback URLs, or unredacted network
 captures in issues, PRs, screenshots, or maintained examples.
