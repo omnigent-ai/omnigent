@@ -156,7 +156,6 @@ async def test_subscribe_reserves_delivery_order_before_post_resume_sync(
     monkeypatch.setattr(fwd, "_sync_model_change", blocking_model_sync)
     monkeypatch.setattr(fwd, "_sync_codex_approval_mode_change", AsyncMock())
     monkeypatch.setattr(fwd, "_refresh_model_from_config", MagicMock())
-    monkeypatch.setattr(fwd, "_refresh_developer_instructions_from_config", MagicMock())
 
     client = _RecordingClient()
     state = fwd._CodexForwarderState()

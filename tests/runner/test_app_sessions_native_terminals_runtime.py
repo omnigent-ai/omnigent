@@ -498,6 +498,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         model_override="gpt-5.4-mini",
         reasoning_effort="high",
         external_session_id=thread_id,
+        labels={"omnigent.codex_native.collaboration_mode": "plan"},
     ).model_dump(mode="json")
     session_init = (
         RunnerSessionInitEnvelope.model_validate(
@@ -682,6 +683,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             assert effort_calls == [(thread_id, "high", None)], (
                 "settings controls must not see the bridge until resume effort is applied"
             )
+            assert plan_calls == [(thread_id, "plan", "gpt-5.4-mini", "high", None)], (
+                "a resumed thread must be back in the persisted Plan mode before the "
+                "bridge state lets turns through"
+            )
             preloaded_state = codex_native_bridge.read_bridge_state(bridge_dir)
             assert preloaded_state is not None
             assert preloaded_state.thread_id == thread_id
@@ -700,11 +705,31 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     preload_calls: list[tuple[str, str, list[str] | None, str | None]] = []
     effort_calls: list[tuple[str, str, object]] = []
 
+    plan_calls: list[tuple[str, str, str, str | None, object]] = []
+
     async def _fake_apply_effort(
         transport: str, loaded_thread_id: str, effort: str, **kwargs: Any
     ) -> None:
         effort_calls.append(
             (loaded_thread_id, effort, codex_native_bridge.read_bridge_state(bridge_dir))
+        )
+
+    async def _fake_apply_plan(
+        transport: str,
+        loaded_thread_id: str,
+        mode: str,
+        *,
+        model: str,
+        effort: str | None = None,
+    ) -> None:
+        plan_calls.append(
+            (
+                loaded_thread_id,
+                mode,
+                model,
+                effort,
+                codex_native_bridge.read_bridge_state(bridge_dir),
+            )
         )
 
     async def _fake_preload_thread(
@@ -749,6 +774,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(codex_app_mod, "apply_codex_thread_effort", _fake_apply_effort)
+    monkeypatch.setattr(codex_app_mod, "apply_codex_thread_collaboration_mode", _fake_apply_plan)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
     monkeypatch.setattr(
         startup_config_mod,
@@ -5084,3 +5110,243 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
             await forwarder
         native._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         native._AUTO_FORWARDER_TASKS.pop(session_id, None)
+
+
+def _capture_runner_server_writes(
+    monkeypatch: pytest.MonkeyPatch, events: list[str]
+) -> list[tuple[str, str, Any]]:
+    """Serve the runner's short-lived server clients from memory, logging each write."""
+    import omnigent.cli_auth as cli_auth
+
+    writes: list[tuple[str, str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        writes.append((request.method, request.url.path, body))
+        if request.url.path.endswith("/events"):
+            events.append("collaboration_mode_reported")
+        return httpx.Response(200, json={})
+
+    def _open(server_url: str, **_kwargs: Any) -> httpx.AsyncClient:
+        return httpx.AsyncClient(base_url=server_url, transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(cli_auth, "open_server_client", _open)
+    return writes
+
+
+class _ClosableStub:
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_source", ["launch", "config"])
+async def test_codex_discover_thread_applies_plan_mode_before_bridge_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    model_source: str,
+) -> None:
+    """A create-time Plan pick reaches the fresh thread BEFORE turns can: discovery
+    applies the seeded label as a ``thread/settings/update`` with
+    ``developer_instructions: null`` (else it replaces Codex's Plan Mode prompt). The
+    model comes from the launch, or from the private config's pin when Codex's own
+    default won the launch."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from omnigent.runner.native import orchestration as native
+
+    thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936c"
+    events: list[str] = []
+    settings_requests: list[tuple[str, dict[str, Any]]] = []
+
+    async def _fake_wait(*_args: object, **_kwargs: object) -> str:
+        return thread_id
+
+    async def _fake_supervise(**_kwargs: object) -> None:
+        return None
+
+    class _SettingsClient:
+        def __init__(self, transport: str, *, client_name: str = "omnigent") -> None:
+            assert transport == "ws://127.0.0.1:1"
+            assert client_name == "omnigent-codex-native-runner"
+
+        async def connect(self) -> None:
+            return None
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            events.append("settings_update")
+            settings_requests.append((method, params))
+            return {"result": {}}
+
+        async def close(self) -> None:
+            return None
+
+    real_write = codex_native_bridge.write_bridge_state
+
+    def _spy_write(bridge_dir: Path, state: Any) -> None:
+        events.append("bridge_state_written")
+        real_write(bridge_dir, state)
+
+    writes = _capture_runner_server_writes(monkeypatch, events)
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", _SettingsClient)
+    monkeypatch.setattr(codex_native_bridge, "write_bridge_state", _spy_write)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    codex_home = tmp_path / "codex-home"
+    if model_source == "config":
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text('model = "gpt-test"\n')
+
+    session_id = "7d2e6f0a1b2c3d4e5f60718293a4b5c6"
+    native._AUTO_CODEX_APP_SERVERS[session_id] = _ClosableStub()  # type: ignore[assignment]
+    try:
+        await native._codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=codex_home,
+            workspace=str(tmp_path / "workspace"),
+            event_client=_ClosableStub(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
+            plan_mode=True,
+            launch_model="gpt-test" if model_source == "launch" else None,
+            launch_effort="high",
+        )
+    finally:
+        native._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    assert events[:2] == ["settings_update", "bridge_state_written"], events
+    assert settings_requests == [
+        (
+            "thread/settings/update",
+            {
+                "threadId": thread_id,
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-test",
+                        "reasoning_effort": "high",
+                        "developer_instructions": None,
+                    },
+                },
+            },
+        ),
+    ], settings_requests
+    # The label already says Plan and the thread now runs it: nothing to reconcile.
+    assert [write for write in writes if write[1].endswith("/events")] == [], writes
+    state = codex_native_bridge.read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.thread_id == thread_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["update_rejected", "update_hangs", "model_unknown"])
+async def test_codex_discover_thread_reports_default_when_plan_mode_is_not_applied(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    """A Plan pick the runner cannot apply (rejected, unanswered, or without a known
+    model) is reported back as Default before the bridge state goes live, so the
+    session label (and the UI's Plan badge) never claim a mode the thread does not
+    run. The session still launches: the bridge state is written and the forwarder
+    runs, so chat keeps working in Default."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
+    from omnigent.runner.native import orchestration as native
+
+    monkeypatch.setattr(codex_native_app_server, "_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS", 0.05)
+    thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936d"
+    events: list[str] = []
+    settings_requests: list[tuple[str, dict[str, Any]]] = []
+    supervised: list[str] = []
+
+    async def _fake_wait(*_args: object, **_kwargs: object) -> str:
+        return thread_id
+
+    async def _fake_supervise(**_kwargs: object) -> None:
+        supervised.append("forwarder")
+
+    class _SettingsClient:
+        def __init__(self, transport: str, *, client_name: str = "omnigent") -> None:
+            del transport, client_name
+
+        async def connect(self) -> None:
+            if failure == "update_rejected":
+                raise RuntimeError("app-server unreachable")
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if failure == "update_hangs":
+                await asyncio.Event().wait()
+            settings_requests.append((method, params))
+            return {"result": {}}
+
+        async def close(self) -> None:
+            return None
+
+    real_write = codex_native_bridge.write_bridge_state
+
+    def _spy_write(bridge_dir: Path, state: Any) -> None:
+        events.append("bridge_state_written")
+        real_write(bridge_dir, state)
+
+    writes = _capture_runner_server_writes(monkeypatch, events)
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", _SettingsClient)
+    monkeypatch.setattr(codex_native_bridge, "write_bridge_state", _spy_write)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    session_id = "8e3f7a1b2c3d4e5f60718293a4b5c6d7"
+    native._AUTO_CODEX_APP_SERVERS[session_id] = _ClosableStub()  # type: ignore[assignment]
+    try:
+        await native._codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            # No config.toml under this home: no pinned model to fall back to.
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
+            event_client=_ClosableStub(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
+            plan_mode=True,
+            launch_model=None if failure == "model_unknown" else "gpt-test",
+        )
+    finally:
+        native._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    assert settings_requests == [], settings_requests
+    assert events[:2] == ["collaboration_mode_reported", "bridge_state_written"], events
+    assert [write for write in writes if write[1].endswith("/events")] == [
+        (
+            "POST",
+            f"/v1/sessions/{session_id}/events",
+            {"type": "external_codex_collaboration_mode_change", "data": {"mode": "default"}},
+        ),
+    ], writes
+    state = codex_native_bridge.read_bridge_state(tmp_path)
+    assert state is not None, "bridge state must be written despite a failed plan switch"
+    assert state.thread_id == thread_id
+    assert supervised == ["forwarder"]
+
+
+@pytest.mark.asyncio
+async def test_report_codex_collaboration_mode_is_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A reporter failure (here: no server URL to report to) logs and returns; it
+    runs before the bridge state is published and must never abort the launch."""
+    from omnigent.runner.native import orchestration as native
+
+    monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    caplog.set_level(logging.WARNING, logger="omnigent.runner.native.orchestration")
+
+    await native._report_codex_collaboration_mode("9f1e2d3c4b5a69788796a5b4c3d2e1f0", "default")
+
+    assert any("could not report collaboration mode" in r.getMessage() for r in caplog.records)

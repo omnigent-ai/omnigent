@@ -551,30 +551,9 @@ def build_native_controls(
                     "detail": "Codex-native plan-mode update requires a current model.",
                 },
             )
-        from omnigent.harnesses.codex_native.bridge import (
-            DeveloperInstructionsReadState,
-            read_codex_config_developer_instructions_state_from_home,
-        )
-
-        _di_read = read_codex_config_developer_instructions_state_from_home(Path(state.codex_home))
-        if _di_read.state is DeveloperInstructionsReadState.UNREADABLE:
-            _logger.warning(
-                "Codex-native plan-mode update skipped for %s: developer_instructions "
-                "config unreadable — refusing to guess and risk wiping live state.",
-                conv_id,
-                extra={"session_id": conv_id},
-            )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "codex_native_settings_update_failed",
-                    "detail": (
-                        "Codex-native plan-mode update requires reading the current "
-                        "developer_instructions config; it could not be read."
-                    ),
-                },
-            )
-        developer_instructions = _di_read.value
+        # A non-null collaboration-mode ``developer_instructions`` replaces the
+        # mode's built-in prompt (Codex's Plan Mode instructions); the agent's
+        # authored instructions already ride the additive top-level config key.
         return await _handle_codex_native_settings_update(
             conv_id,
             {
@@ -583,7 +562,7 @@ def build_native_controls(
                     "settings": {
                         "model": model,
                         "reasoning_effort": effort,
-                        "developer_instructions": developer_instructions,
+                        "developer_instructions": None,
                     },
                 },
             },

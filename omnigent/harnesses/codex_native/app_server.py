@@ -109,6 +109,7 @@ from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
     EFFORT_ORDER,
     clamp_effort_for_model,
+    effort_for_model_switch,
 )
 
 _logger = logging.getLogger(__name__)
@@ -4553,6 +4554,44 @@ async def apply_codex_thread_effort(
                 thread_id,
                 bridge_dir,
             )
+    finally:
+        # A wedged server can stall the closing handshake; it must not mask the result.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(client.close(), timeout=_EFFORT_CLOSE_TIMEOUT_SECONDS)
+
+
+async def apply_codex_thread_collaboration_mode(
+    transport: str,
+    thread_id: str,
+    mode: str,
+    *,
+    model: str,
+    effort: str | None = None,
+) -> None:
+    """Switch a loaded thread's collaboration mode via ``thread/settings/update``,
+    keeping ``settings.developer_instructions`` null so a value there cannot replace
+    Codex's built-in Plan Mode prompt. ``effort`` is clamped to what ``model``
+    accepts; with none requested, a capped model gets its supported fallback."""
+    client = client_for_transport(transport, client_name="omnigent-codex-native-runner")
+    try:
+        await asyncio.wait_for(client.connect(), timeout=_EFFORT_CONNECT_TIMEOUT_SECONDS)
+        await asyncio.wait_for(
+            client.request(
+                "thread/settings/update",
+                {
+                    "threadId": thread_id,
+                    "collaborationMode": {
+                        "mode": mode,
+                        "settings": {
+                            "model": model,
+                            "reasoning_effort": effort_for_model_switch(effort, model),
+                            "developer_instructions": None,
+                        },
+                    },
+                },
+            ),
+            timeout=_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS,
+        )
     finally:
         # A wedged server can stall the closing handshake; it must not mask the result.
         with contextlib.suppress(Exception):

@@ -10240,6 +10240,80 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
+_CODEX_PRELAUNCH_PLAN_MIN_RUNNER_VERSION = (0, 18, 0)
+
+
+def _require_codex_prelaunch_plan_target_support(
+    *,
+    labels: dict[str, str] | None,
+    host_id: str | None,
+    host_registry: HostRegistry | None,
+    inherited_runner_id: str | None,
+    parent_host_id: str | None = None,
+    runner_router: RunnerRouter | None,
+) -> None:
+    """
+    Refuse a Plan-armed create whose runner would predate launch-time Plan mode.
+
+    Such a runner ignores the seeded label and starts the thread in Default
+    while the composer, which reads the label, shows Plan. Call this after the
+    host and parent-session authorization checks and before any row is
+    written: the error names the target's version, so it must never run for a
+    target the caller may not reach. A host that is offline here, or an
+    unparseable version, is left to the launch step like the harness-setup
+    floor; a parent runner that is live on another replica is a
+    ``WRONG_REPLICA`` landing like the other create guards, and one that is
+    not connected anywhere cannot be checked and is refused.
+
+    :param labels: Client-supplied create labels, or ``None``.
+    :param host_id: Caller-supplied, already authorized host, or ``None``.
+    :param host_registry: Live host connections, or ``None`` in minimal wirings.
+    :param inherited_runner_id: Runner a child inherits from its parent, or ``None``.
+    :param parent_host_id: The parent session's host, used to tell a runner on
+        another replica from an offline one.
+    :param runner_router: Live runner connections, or ``None`` in minimal wirings.
+    :raises OmnigentError: ``CONFLICT`` with an update hint, or ``WRONG_REPLICA``.
+    """
+    if not labels or labels.get(_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY) != "plan":
+        return
+    from omnigent.server.routes.hosts import _release_tuple
+
+    if host_id is not None:
+        conn = host_registry.get(host_id) if host_registry is not None else None
+        if conn is None:
+            return
+        target, version = f"host '{conn.hello.name}'", conn.hello.version
+    elif inherited_runner_id is not None:
+        version = runner_router.runner_version(inherited_runner_id) if runner_router else None
+        if version is None:
+            if (
+                runner_router is not None
+                and runner_router.absent_runner_code(parent_host_id) == ErrorCode.WRONG_REPLICA
+            ):
+                raise OmnigentError(
+                    "the parent session's runner is on another replica",
+                    code=ErrorCode.WRONG_REPLICA,
+                )
+            raise OmnigentError(
+                "the parent session's runner is not connected, so it cannot be confirmed to "
+                "start a session in Plan mode — create the session without Plan mode and turn "
+                "it on from the composer",
+                code=ErrorCode.CONFLICT,
+            )
+        target = "the parent session's runner"
+    else:
+        return
+    release = _release_tuple(version)
+    if release is None or release >= _CODEX_PRELAUNCH_PLAN_MIN_RUNNER_VERSION:
+        return
+    raise OmnigentError(
+        f"{target} runs omnigent {version}, which cannot start a session in Plan mode — "
+        "update omnigent there, or create the session without Plan mode and turn it on "
+        "from the composer",
+        code=ErrorCode.CONFLICT,
+    )
+
+
 def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     Reject a client-supplied label map that touches server-internal keys.
@@ -11957,6 +12031,7 @@ __all__ = [
     "_repl_terminal_ui_labels",
     "_replace_text_in_message_body",
     "_require_codex_approval_mode_forward",
+    "_require_codex_prelaunch_plan_target_support",
     "_require_collaboration_mode_forward",
     "_require_cost_control_label_authority",
     "_require_declared_subagent",

@@ -326,6 +326,7 @@ from omnigent.server.routes._sessions.helpers import (
     _relay_persist_error_once,
     _remove_session_worktree_best_effort,
     _repl_terminal_ui_labels,
+    _require_codex_prelaunch_plan_target_support,
     _require_declared_subagent,
     _require_external_status_forward,
     _resolve_harness,
@@ -10789,6 +10790,15 @@ async def _create_session_from_existing_agent(
         conversation_store=conversation_store,
         host_store=getattr(request.app.state, "host_store", None),
         parent=_parent_for_routing,
+    )
+    # After host/parent authorization, before any row: the check names the target.
+    _require_codex_prelaunch_plan_target_support(
+        labels=body.labels,
+        host_id=body.host_id,
+        host_registry=getattr(request.app.state, "host_registry", None),
+        inherited_runner_id=inherited_runner_id,
+        parent_host_id=_parent_for_routing.host_id if _parent_for_routing is not None else None,
+        runner_router=runner_router,
     )
 
     # Git worktree options (optional). Two modes on body.git:

@@ -52,6 +52,7 @@ import {
   FolderGit2Icon,
   FolderIcon,
   FolderOpenIcon,
+  FileTextIcon,
   PlusIcon,
   ShuffleIcon,
   WandSparklesIcon,
@@ -181,6 +182,11 @@ import {
   writeLastSandboxRepos,
 } from "@/lib/repoPreferences";
 import { readHarnessOptions, writeHarnessOption, type HarnessOptions } from "@/lib/modePreferences";
+import {
+  CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+  CODEX_PRELAUNCH_PLAN_MIN_SERVER_VERSION,
+  serverSupportsCodexPrelaunchPlanMode,
+} from "@/lib/codexPlanMode";
 import {
   getNewChatPickerCacheKey,
   readNewChatPermissionCache,
@@ -2080,6 +2086,7 @@ interface LandingDraft {
   permissionMode: string;
   approvalMode: string;
   bypassSandbox: boolean;
+  planMode: boolean;
   cursorExecMode: string;
   agySkipMode: string;
   devinPermissionMode: string;
@@ -2541,6 +2548,9 @@ export function NewChatLandingScreen() {
   const [bypassSandbox, setBypassSandbox] = useState<boolean>(
     () => restoredDraft?.bypassSandbox ?? false,
   );
+  // Codex Plan mode armed before the first prompt. A per-session pick like
+  // the TUI's shift+tab, so it is never remembered per harness.
+  const [planMode, setPlanMode] = useState<boolean>(() => restoredDraft?.planMode ?? false);
   // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
   // for the cursor-native wrapper; ignored otherwise.
   const [cursorExecMode, setCursorExecMode] = useState<string>(
@@ -2645,6 +2655,7 @@ export function NewChatLandingScreen() {
     permissionMode,
     approvalMode,
     bypassSandbox,
+    planMode,
     cursorExecMode,
     agySkipMode,
     devinPermissionMode,
@@ -3265,6 +3276,15 @@ export function NewChatLandingScreen() {
   // picks native Claude Code or Codex per task. It rides a placeholder wrapper
   // agent for the create call, so the pick lives in pickedHarness alone.
   const smartRoutingHarnessSelected = pickedHarness === AUTO_NATIVE_HARNESS_ID;
+  // Codex Plan mode is a collaboration mode, not an approval preset, so the
+  // add menu arms it directly; Smart Routing may not land on Codex at all.
+  const codexPlanModeSelectable =
+    !smartRoutingHarnessSelected && selectedNativeHarness === "codex-native";
+  // Older servers, and the runners they manage, ignore the seeded label: a
+  // pre-launch pick would launch Default under a Plan badge.
+  const codexPrelaunchPlanSupported =
+    codexPlanModeSelectable &&
+    serverSupportsCodexPrelaunchPlanMode(info === "loading" ? null : info.server_version);
   const selectedAgentHasAdvancedSettings = agentHasAdvancedSettings(
     selectedAgent,
     brainHarnessLabelsAll,
@@ -3398,6 +3418,7 @@ export function NewChatLandingScreen() {
         ...modelRows,
         ...effortRows,
         { label: "Permission mode", value: approvalValue },
+        ...(codexPrelaunchPlanSupported && planMode ? [{ label: "Plan mode", value: "On" }] : []),
         ...(isCodex ? sourceRows(codexModelOptions) : []),
       ];
     }
@@ -3445,6 +3466,8 @@ export function NewChatLandingScreen() {
     permissionMode,
     approvalMode,
     bypassSandbox,
+    planMode,
+    codexPrelaunchPlanSupported,
     cursorExecMode,
     agySkipMode,
     pickedHarness,
@@ -4004,6 +4027,21 @@ export function NewChatLandingScreen() {
     else if (supportsDevinPermission) setDevinPermissionMode(mode);
     rememberPickerOptions(selectedNativeHarness, { mode });
   };
+  // The add menu's Plan entry: Codex arms a collaboration mode, other harnesses
+  // pick their "plan" permission preset.
+  let landingPlanHandler: (() => void) | undefined;
+  let landingPlanLabel: string | undefined;
+  let landingPlanDisabledReason: string | undefined;
+  if (codexPrelaunchPlanSupported) {
+    landingPlanHandler = () => setPlanMode((armed) => !armed);
+    landingPlanLabel = planMode ? "Exit Plan mode" : "Enter Plan mode";
+  } else if (codexPlanModeSelectable) {
+    landingPlanDisabledReason =
+      `Plan mode before the first prompt needs omnigent ${CODEX_PRELAUNCH_PLAN_MIN_SERVER_VERSION}` +
+      " or newer on the server; start the session and turn it on from the composer";
+  } else if (directModeOptions.some((mode) => mode.value === "plan")) {
+    landingPlanHandler = () => selectDirectMode("plan");
+  }
   // Clear shared state on agent changes; the harness seed restores its own
   // saved options. Initial agent resolution must preserve the landing draft.
   const prevAgentIdRef = useRef<string | null | undefined>(undefined);
@@ -4018,6 +4056,7 @@ export function NewChatLandingScreen() {
     if (prev === undefined || prev === null || prev === effectiveAgentId) return;
     userPickedModelRef.current = false;
     setBypassSandbox(false);
+    setPlanMode(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
   // A project-configured default model (Project settings) outranks the user's
@@ -5364,9 +5403,18 @@ export function NewChatLandingScreen() {
       // when the toggle is armed for a codex-native agent) so the runner
       // launches with --dangerously-bypass-approvals-and-sandbox and the choice
       // survives reload.
+      const codexCreateLabels = {
+        ...(agentSupportsApprovalMode && bypassSandbox
+          ? { [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+          : {}),
+        // A pre-launch Plan pick rides the label the in-session toggle persists.
+        ...(codexPrelaunchPlanSupported && planMode
+          ? { [CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY]: "plan" }
+          : {}),
+      };
       const baseLabels =
-        agentSupportsApprovalMode && bypassSandbox
-          ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+        Object.keys(codexCreateLabels).length > 0
+          ? { ...(nativeLabels ?? {}), ...codexCreateLabels }
           : nativeLabels;
       // First-class project filing: a project-driven visit whose `?project=`
       // name resolved to a real project id sends `project_id` so the server
@@ -6533,15 +6581,15 @@ export function NewChatLandingScreen() {
                         testIdPrefix="new-chat-landing"
                         disabled={creating}
                         onAttach={() => fileInputRef.current?.click()}
-                        onPlan={
-                          directModeOptions.some((mode) => mode.value === "plan")
-                            ? () => selectDirectMode("plan")
-                            : undefined
-                        }
+                        onPlan={landingPlanHandler}
+                        planDisabled={landingPlanDisabledReason !== undefined}
+                        planDisabledReason={landingPlanDisabledReason}
                         planActive={
                           (supportsPermissionMode && permissionMode === "plan") ||
-                          (supportsCursorMode && cursorExecMode === "plan")
+                          (supportsCursorMode && cursorExecMode === "plan") ||
+                          (codexPrelaunchPlanSupported && planMode)
                         }
+                        planLabel={landingPlanLabel}
                         projects={projectList ?? []}
                         onProjectSelect={(name) => {
                           const params = new URLSearchParams(searchParams);
@@ -6769,6 +6817,16 @@ export function NewChatLandingScreen() {
                         testIdPrefix="new-chat-landing"
                       />
                     ) : null}
+                    {/* Mirrors the in-session composer's Plan-mode marker. */}
+                    {codexPrelaunchPlanSupported && planMode && (
+                      <span
+                        data-testid="new-chat-landing-plan-mode"
+                        className="inline-flex shrink-0 items-center gap-1 px-1 text-sm font-medium text-foreground"
+                      >
+                        <FileTextIcon className="ui-icon" />
+                        <span>Plan mode</span>
+                      </span>
+                    )}
 
                     {/* The session's project membership (from a `?project=` landing)
                 is shown in the hero heading instead of a tray chip; filing on

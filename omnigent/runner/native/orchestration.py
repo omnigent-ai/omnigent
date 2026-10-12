@@ -589,6 +589,11 @@ class _CodexNativeLaunchConfig:
         ``--dangerously-bypass-approvals-and-sandbox`` and aligns the
         app-server threads (no approval prompts, no command sandbox). Default
         ``False``. See issue #657.
+    :param plan_mode: ``True`` when the session's
+        ``omnigent.codex_native.collaboration_mode`` label is ``"plan"`` (the
+        New Session screen seeds it; the in-session toggle persists it). The
+        runner then switches the Codex thread into Plan mode before web turns
+        can reach it. Default ``False``.
     :param auto_harness: ``True`` when the session started in Smart Routing's
         auto-harness mode (``omnigent.routing.auto_harness`` label or a
         ``harness_override`` of ``"auto"``), so the router may re-route its
@@ -621,6 +626,7 @@ class _CodexNativeLaunchConfig:
     fork_source_external_id: str | None
     fork_carry_history: bool
     bypass_sandbox: bool
+    plan_mode: bool = False
     auto_harness: bool = False
     routing_enabled: bool = False
     turn_routing: bool = False
@@ -1356,6 +1362,7 @@ async def _codex_native_launch_config(
     from omnigent.runner.subagent_routing import routing_class_from_snapshot
     from omnigent.stores.conversation_store import (
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+        CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
         FORK_SOURCE_LABEL_KEY,
@@ -1370,6 +1377,7 @@ async def _codex_native_launch_config(
     # conversation label ("1" to enable). Read here so the runner applies
     # it at launch; any other value (incl. absent) leaves the normal stance.
     bypass_sandbox = False
+    plan_mode = False
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
         _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
@@ -1380,6 +1388,7 @@ async def _codex_native_launch_config(
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+        plan_mode = labels.get(CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY) == "plan"
     # One derivation of the session's Smart Routing class, shared with the SDK
     # codex path, so "pinned" and "auto-harness" mean the same on both.
     routing_class = routing_class_from_snapshot(
@@ -1397,6 +1406,7 @@ async def _codex_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         bypass_sandbox=bypass_sandbox,
+        plan_mode=plan_mode,
         auto_harness=routing_class.auto_harness,
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
@@ -5478,6 +5488,17 @@ async def _auto_create_codex_terminal(
                         exc_info=True,
                         extra={"session_id": session_id},
                     )
+            if launch_config.plan_mode:
+                # A resumed thread comes back in Default mode; the session's
+                # persisted Plan mode has to be re-applied like its effort.
+                await _apply_codex_prelaunch_plan_mode(
+                    session_id=session_id,
+                    codex_ws_url=codex_ws_url,
+                    codex_home=codex_home,
+                    thread_id=launch_config.external_session_id,
+                    launch_model=_codex_launch.model,
+                    launch_effort=launch_config.reasoning_effort,
+                )
             # Publish after resume repair so live settings cannot interleave it.
             write_bridge_state(
                 bridge_dir,
@@ -5550,6 +5571,9 @@ async def _auto_create_codex_terminal(
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
                 thread_start_timeout_seconds=thread_start_timeout_seconds,
+                plan_mode=launch_config.plan_mode,
+                launch_model=_codex_launch.model,
+                launch_effort=launch_config.reasoning_effort,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -5779,6 +5803,107 @@ async def _record_agent_startup_pending(
     )
 
 
+async def _apply_codex_prelaunch_plan_mode(
+    *,
+    session_id: str,
+    codex_ws_url: str,
+    codex_home: Path,
+    thread_id: str,
+    launch_model: str | None,
+    launch_effort: str | None,
+) -> bool:
+    """Switch the session's Codex thread into Plan mode at launch.
+
+    The label is persisted before the runner can act on it, so a failed switch
+    is reported back as Default rather than leaving the UI claiming Plan.
+
+    :returns: Whether the thread now runs in Plan mode.
+    """
+    from omnigent.harnesses.codex_native.app_server import apply_codex_thread_collaboration_mode
+    from omnigent.harnesses.codex_native.bridge import read_codex_home_config_model
+
+    model = launch_model or await asyncio.to_thread(read_codex_home_config_model, codex_home)
+    if not model:
+        _logger.warning(
+            "codex-native: Plan mode not applied to thread %s for session %s: no launch "
+            "model and none pinned in the private config; the session starts in Default mode",
+            thread_id,
+            session_id,
+            extra={"session_id": session_id},
+        )
+    else:
+        try:
+            await apply_codex_thread_collaboration_mode(
+                codex_ws_url, thread_id, "plan", model=model, effort=launch_effort
+            )
+        except Exception:  # noqa: BLE001 — a failed switch must not sink the launch
+            _logger.warning(
+                "codex-native: could not apply Plan mode to thread %s for session %s; the "
+                "session starts in Default mode",
+                thread_id,
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        else:
+            _logger.info(
+                "codex-native: Plan mode applied to thread %s for session %s (model=%s)",
+                thread_id,
+                session_id,
+                model,
+                extra={"session_id": session_id},
+            )
+            return True
+    await _report_codex_collaboration_mode(session_id, "default")
+    return False
+
+
+async def _report_codex_collaboration_mode(session_id: str, mode: str) -> None:
+    """Record the mode the thread actually runs, via the forwarder's event type.
+
+    The server rewrites the session label and notifies the UI. Best-effort.
+    """
+    from omnigent.cli_auth import open_server_client
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    try:
+        auth_factory = _make_auth_token_factory()
+        auth_token = auth_factory() if auth_factory is not None else None
+        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+        async with open_server_client(
+            _required_runner_env("RUNNER_SERVER_URL"),
+            headers=headers,
+            auth=_RunnerDatabricksAuth(auth_factory),
+            timeout=httpx.Timeout(10.0),
+        ) as client:
+            response = await client.post(
+                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+                json={
+                    "type": "external_codex_collaboration_mode_change",
+                    "data": {"mode": mode},
+                },
+            )
+    except Exception:  # noqa: BLE001 — a failed best-effort report must not sink the launch
+        _logger.warning(
+            "codex-native: could not report collaboration mode %r for session %s; the "
+            "session label may still claim a mode the thread does not run",
+            mode,
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    if response.status_code >= 400:
+        _logger.warning(
+            "codex-native: server rejected collaboration mode %r for session %s (%s); the "
+            "session label may still claim a mode the thread does not run",
+            mode,
+            session_id,
+            response.status_code,
+            extra={"session_id": session_id},
+        )
+
+
 async def _codex_discover_thread_and_forward(
     *,
     session_id: str,
@@ -5792,6 +5917,9 @@ async def _codex_discover_thread_and_forward(
     terminal_instance: TerminalInstance | None = None,
     login_required: bool = False,
     thread_start_timeout_seconds: float | None = None,
+    plan_mode: bool = False,
+    launch_model: str | None = None,
+    launch_effort: str | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -5839,6 +5967,15 @@ async def _codex_discover_thread_and_forward(
         cause (see :func:`_record_agent_startup_pending`) and the wait
         continues without a deadline; only a pane exit or an ended event
         stream tears down.
+    :param plan_mode: ``True`` when the session's collaboration-mode label is
+        ``"plan"``. The fresh thread is switched into Plan mode before the
+        bridge state is written, because the executor gates the first queued
+        web turn on that state, so the very first turn already plans.
+    :param launch_model: Model this launch resolved for the app-server, e.g.
+        ``"gpt-5.4"``, or ``None`` when Codex's own default won; the Plan-mode
+        switch then falls back to the private config's pinned model.
+    :param launch_effort: Session-persisted reasoning effort the Plan-mode
+        switch keeps on the thread, or ``None``.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -6085,6 +6222,17 @@ async def _codex_discover_thread_and_forward(
             # The user signed in (or the TUI otherwise started a thread):
             # the pre-recorded fail-fast cause no longer applies.
             clear_bridge_startup_error(bridge_dir)
+        if plan_mode:
+            # Before the bridge state goes live: the first queued web turn is
+            # gated on that state and must already run in Plan mode.
+            await _apply_codex_prelaunch_plan_mode(
+                session_id=session_id,
+                codex_ws_url=codex_ws_url,
+                codex_home=codex_home,
+                thread_id=thread_id,
+                launch_model=launch_model,
+                launch_effort=launch_effort,
+            )
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(

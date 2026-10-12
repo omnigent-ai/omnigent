@@ -108,13 +108,14 @@ class _NoopRunnerWS:
         return await asyncio.Future()
 
 
-def _runner_hello() -> HelloFrame:
+def _runner_hello(version: str = "0.1.0-test") -> HelloFrame:
     """Build a runner hello frame for test tunnel registrations.
 
+    :param version: The omnigent version the runner announces.
     :returns: Hello frame with generic native harness capabilities.
     """
     return HelloFrame(
-        runner_version="0.1.0-test",
+        runner_version=version,
         frame_protocol_version=1,
         harnesses=[
             "claude-native",
@@ -157,12 +158,13 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
     )
 
 
-async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
+async def _connect_host(app: FastAPI, *, version: str = "0.1.0-test") -> ApplicationCommunicator:
     """Connect a mock host over the WebSocket tunnel and wait for it
     to register in the app's host registry.
 
     :param app: The FastAPI app under test (its ``state.host_registry``
         is the same instance the session-create launch path reads).
+    :param version: The omnigent version the host's hello reports.
     :returns: The connected ASGI communicator, ready to exchange frames.
     """
     path = f"/v1/hosts/{_HOST_ID}/tunnel"
@@ -172,7 +174,7 @@ async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
     assert accepted["type"] == "websocket.accept"
 
     hello = encode_host_frame(
-        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+        HostHelloFrame(version=version, frame_protocol_version=1, name="laptop")
     )
     await comm.send_input({"type": "websocket.receive", "text": hello})
     registry = app.state.host_registry
@@ -276,6 +278,37 @@ async def _serve_one_launch(
             )
             return frame
     raise AssertionError("host never received a launch frame from the inline path")
+
+
+async def _serve_one_stat(comm: ApplicationCommunicator) -> None:
+    """Answer the inline path's ``host.stat`` only, leaving any launch unserved.
+
+    For creates that must stop between workspace validation and the launch:
+    the stat gets an "exists/directory" reply and the helper returns.
+    """
+    deadline = Deadline(30.0)
+    for _ in range(40):
+        output = await comm.receive_output(timeout=deadline.next_wait(30.0))
+        if output["type"] != "websocket.send":
+            continue
+        frame = decode_host_frame(output["text"])
+        if isinstance(frame, HostStatFrame):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostStatResultFrame(
+                            request_id=frame.request_id,
+                            status="ok",
+                            exists=True,
+                            type="directory",
+                            canonical_path=frame.path,
+                        )
+                    ),
+                }
+            )
+            return
+    raise AssertionError("host never received a stat frame from the inline path")
 
 
 async def _serve_one_stop(comm: ApplicationCommunicator) -> str:
@@ -3992,3 +4025,177 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
             f"host refusal: {item!r}"
         )
         assert "omnigent setup" in item["message"], item
+
+
+@pytest.mark.parametrize(
+    ("host_version", "accepted"),
+    [("0.17.3", False), ("0.18.0.dev0", True), ("0.1.0-test", True)],
+    ids=["predates-plan-mode", "supports-plan-mode", "unparseable-stays-permissive"],
+)
+async def test_plan_armed_create_needs_a_host_that_starts_in_plan_mode(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    host_version: str,
+    accepted: bool,
+) -> None:
+    """A create that seeds the Plan label is refused before anything is written
+    when the host's runner predates launch-time Plan mode: such a runner would
+    start the thread in Default while the composer, reading the label, shows
+    Plan. Newer and unparseable versions take the normal launch path."""
+    comm = await _connect_host(app, version=host_version)
+    agent = await create_test_agent(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    rows_before = {conv.id for conv in store.list_conversations(limit=50).data}
+    responder = asyncio.create_task(
+        _serve_one_launch(comm, launch_status="launched") if accepted else _serve_one_stat(comm)
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _WORKSPACE,
+            "labels": {"omnigent.codex_native.collaboration_mode": "plan"},
+        },
+    )
+    await responder
+    if accepted:
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["runner_id"] is not None
+        conv = store.get_conversation(body["id"])
+        assert conv is not None
+        assert conv.labels["omnigent.codex_native.collaboration_mode"] == "plan"
+        return
+    assert resp.status_code == 409, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "conflict"
+    assert "Plan mode" in error["message"]
+    assert "update omnigent there" in error["message"]
+    assert not await _expect_no_launch(comm, budget_s=0.5)
+    # Refused before any write: no unbound row carrying a Plan label is left behind.
+    assert {conv.id for conv in store.list_conversations(limit=50).data} == rows_before
+
+
+@pytest.mark.parametrize(
+    ("runner_version", "outcome"),
+    [
+        ("0.17.3", "refused"),
+        (None, "offline"),
+        ("elsewhere", "wrong_replica"),
+        ("0.18.0.dev0", "accepted"),
+    ],
+    ids=[
+        "parent-runner-predates-plan-mode",
+        "parent-runner-offline",
+        "parent-runner-on-another-replica",
+        "parent-runner-supports-plan-mode",
+    ],
+)
+async def test_plan_armed_child_create_needs_an_inherited_runner_that_starts_in_plan_mode(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_version: str | None,
+    outcome: str,
+) -> None:
+    """A child created without ``host_id`` inherits its parent's runner, so the
+    Plan label is checked against that runner's announced version before any row
+    is written; an older runner would start the thread in Default under a Plan
+    badge. A runner missing here but whose host is live elsewhere is a
+    wrong-replica landing (the client re-addresses); one connected nowhere cannot
+    be checked and is refused."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    async def _no_runner_client(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    # The fake tunnel never answers; skip the post-create runner notification.
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _no_runner_client)
+    agent = await create_test_agent(client)
+    parent = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert parent.status_code == 201, parent.text
+    parent_id = parent.json()["id"]
+    runner_id = token_bound_runner_id("parent-binding-token")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_runner_id(parent_id, runner_id)
+    if outcome == "wrong_replica":
+        # The parent's host is online per the store but has no tunnel on this
+        # replica, which is how the router recognizes a runner living elsewhere.
+        other_host = "0f6b2d7e9a1c4b3d8e5f6a7b8c9d0e1f"
+        app.state.host_store.upsert_on_connect(
+            host_id=other_host, name="elsewhere", user_id="local"
+        )
+        store.set_host_id(parent_id, other_host, workspace=_WORKSPACE)
+    elif runner_version is not None:
+        app.state.tunnel_registry.register(
+            runner_id, _NoopRunnerWS(), _runner_hello(runner_version)
+        )
+    rows_before = {conv.id for conv in store.list_conversations(limit=50).data}
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "labels": {"omnigent.codex_native.collaboration_mode": "plan"},
+        },
+    )
+
+    if outcome == "accepted":
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["runner_id"] == runner_id
+        conv = store.get_conversation(body["id"])
+        assert conv is not None
+        assert conv.labels["omnigent.codex_native.collaboration_mode"] == "plan"
+        return
+    error = resp.json()["error"]
+    if outcome == "wrong_replica":
+        assert resp.status_code == 400, resp.text
+        assert error["code"] == "wrong_replica"
+    else:
+        assert resp.status_code == 409, resp.text
+        assert error["code"] == "conflict"
+        assert "parent session's runner" in error["message"]
+        if outcome == "offline":
+            assert "not connected" in error["message"]
+    assert {conv.id for conv in store.list_conversations(limit=50).data} == rows_before
+
+
+async def test_plan_armed_bundled_create_is_refused_on_a_host_predating_plan_mode(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """The multipart (bundled) create applies the same floor after its own host
+    authorization and workspace probe, before the session row exists."""
+    from tests.server.helpers import build_agent_bundle
+
+    comm = await _connect_host(app, version="0.17.3")
+    store = SqlAlchemyConversationStore(db_uri)
+    rows_before = {conv.id for conv in store.list_conversations(limit=50).data}
+    responder = asyncio.create_task(_serve_one_stat(comm))
+    resp = await client.post(
+        "/v1/sessions",
+        data={
+            "metadata": json.dumps(
+                {
+                    "host_id": _HOST_ID,
+                    "workspace": _WORKSPACE,
+                    "labels": {"omnigent.codex_native.collaboration_mode": "plan"},
+                }
+            )
+        },
+        files={"bundle": ("agent.tar.gz", build_agent_bundle(name="planner"), "application/gzip")},
+    )
+    await responder
+
+    assert resp.status_code == 409, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "conflict"
+    assert "Plan mode" in error["message"]
+    assert not await _expect_no_launch(comm, budget_s=0.5)
+    assert {conv.id for conv in store.list_conversations(limit=50).data} == rows_before

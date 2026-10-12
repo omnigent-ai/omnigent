@@ -320,6 +320,19 @@ class RunnerRouter:
         """
         return self._registry.runner_owner(runner_id)
 
+    def runner_version(self, runner_id: str) -> str | None:
+        """The omnigent version a connected runner announced in its hello.
+
+        :returns: The version string, or ``None`` when the runner is not
+            connected to this replica.
+        """
+        session = self._registry.get(runner_id)
+        return None if session is None else session.hello.runner_version
+
+    def absent_runner_code(self, host_id: str | None) -> str:
+        """Classify a bound runner missing from this replica; see ``_runner_absent_code``."""
+        return self._runner_absent_code(host_id)
+
     async def aclose(self) -> None:
         """
         Close cached runner clients.

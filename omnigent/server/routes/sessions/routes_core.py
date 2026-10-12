@@ -153,6 +153,7 @@ from omnigent.server.routes._sessions.helpers import (
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
     _require_codex_approval_mode_forward,
+    _require_codex_prelaunch_plan_target_support,
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
     _require_permission_mode_forward,
@@ -1050,6 +1051,15 @@ def register_core_routes(
                 host_registry=getattr(request.app.state, "host_registry", None),
             )
             parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
+        # After host/parent authorization, before any row: the check names the target.
+        _require_codex_prelaunch_plan_target_support(
+            labels=parsed_metadata.labels,
+            host_id=parsed_metadata.host_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            inherited_runner_id=inherited_runner_id,
+            parent_host_id=parent_conv.host_id if parent_conv is not None else None,
+            runner_router=runner_router,
+        )
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 

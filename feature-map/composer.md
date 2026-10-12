@@ -26,6 +26,13 @@ and steers messages while the agent is busy.
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
   marked and the choice persists.
+- `codex-plan-mode`: **+ → Plan** for a Codex (codex-native) agent. On the
+  landing page it arms Plan mode before the first prompt (a "Plan mode" badge
+  appears; switching agents clears it) and the created session starts in Plan
+  mode; in-session it toggles Plan mode for the running thread. Codex then
+  plans instead of editing. If the runner cannot apply an armed Plan mode, it
+  reports Default so the badge does not claim an inactive mode (best-effort;
+  see the driving notes below).
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
@@ -58,6 +65,8 @@ and steers messages while the agent is busy.
   mode menu.
 - For a Codex session, open the Terminal view and change effort there, then
   return to Chat.
+- For a Codex session, choose **+ → Plan** ("Enter Plan mode"); the "Plan mode"
+  badge appears and the next request is planned rather than implemented.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
 - Send while the agent is working to queue a message, then steer it.
@@ -77,6 +86,9 @@ and steers messages while the agent is busy.
 - Hover the model/effort pill to see the tooltip.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
   Pi), and permission mode before the session exists.
+- Pick a Codex agent, then choose **+ → Plan** to arm Plan mode before the
+  first send; the "Plan mode" badge shows it is armed and the session opens in
+  Plan mode.
 - Attach files or type `/` before the first send.
 - Open the agent picker's custom agents, then Create custom agent → Import
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
@@ -123,6 +135,22 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/start_session/test_composer_transition.py::test_selected_model_survives_delayed_create`
 - **`effort-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`
+- **`codex-plan-mode`, new-session composer:**
+  `tests/e2e_ui/start_session/test_codex_plan_mode_prelaunch_create.py::test_new_codex_session_arms_plan_mode_and_seeds_create_label`
+  (arm, badge, create label, Plan still offered in the session) and
+  `tests/e2e_ui/chat/test_codex_plan_mode_prelaunch_turn.py::test_prelaunch_plan_mode_governs_the_first_turn`
+  (real Codex: the first turn carries Codex's Plan Mode preset). Manually, pick
+  a Codex agent, choose **+ → Plan**, send "Add a hello.txt file with a
+  greeting." and expect a plan, not a file; on a server older than 0.18 the
+  entry is disabled with the reason.
+- **`codex-plan-mode`, in-session:**
+  `tests/e2e_ui/chat/test_codex_plan_mode_respected.py::test_codex_plan_mode_reaches_the_model`.
+  A failed launch-time switch is reported back as Default before the first
+  turn (`tests/runner/test_app_sessions_native_terminals_runtime.py`,
+  `test_codex_discover_thread_reports_default_when_plan_mode_is_not_applied`),
+  so the badge shows Default rather than an inactive Plan. The report is
+  best-effort: if it cannot reach the server, the badge keeps the armed Plan
+  until the next toggle, and the runner log records the failure.
 - **`model-picker`, `effort-picker`, refused change:** the rollback cases in
   `web/src/store/chatStore.test.ts` and the composer case in
   `web/src/pages/ChatPage.composer.test.tsx` (`pnpm --dir web test`). Manually,
