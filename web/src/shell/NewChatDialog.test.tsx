@@ -10682,7 +10682,7 @@ describe("managed sandbox gateway preview", () => {
     return renderLanding({
       managed_sandboxes_enabled: true,
       sandbox_provider: "arclet",
-      sandbox_provider_capabilities: { arclet: { gateway_models: true } },
+      sandbox_provider_capabilities: { arclet: { default_models: true } },
     });
   }
 
@@ -10904,7 +10904,7 @@ describe("managed sandbox gateway preview", () => {
     renderLanding({
       managed_sandboxes_enabled: true,
       sandbox_provider: "arclet",
-      sandbox_provider_capabilities: { arclet: { gateway_models: true } },
+      sandbox_provider_capabilities: { arclet: { default_models: true } },
       smart_routing_enabled: true,
       smart_routing_sources: { external: true, oss: true },
     });

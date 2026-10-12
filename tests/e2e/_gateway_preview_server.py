@@ -91,7 +91,7 @@ def main() -> None:
             launcher_factory=lambda: launcher,
             provider=launcher.provider,
             token_ttl_s=3600,
-            gateway_model_options=_models,
+            default_model_options=_models,
         )
     )
     real_create_app = server_app.create_app

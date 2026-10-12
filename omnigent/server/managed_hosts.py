@@ -622,9 +622,9 @@ class ManagedSandboxConfig:
         keyed by inference provider name. Never installed in the sandbox.
     :param git_clone: Admin clone policy for fresh or missing repo checkouts.
         Existing retained checkouts are not reconfigured.
-    :param gateway_model_options: Optional, request-scoped catalog preview for
-        the selected harness and authenticated user. Does not provision a host
-        or bind an inference profile; failure leaves harness defaults usable.
+    :param default_model_options: Optional, request-scoped provider catalog used
+        when no host catalog is available for the selected harness and user.
+        Supplies choices without selecting a default or provisioning a host.
     """
 
     server_url: str
@@ -635,7 +635,7 @@ class ManagedSandboxConfig:
     host_config: dict[str, object] | None = None
     model_discovery: dict[str, object] = dataclass_field(default_factory=dict)
     git_clone: GitCloneOptions = dataclass_field(default_factory=GitCloneOptions)
-    gateway_model_options: Callable[[str, str | None], Awaitable[list[dict[str, Any]]]] | None = (
+    default_model_options: Callable[[str, str | None], Awaitable[list[dict[str, Any]]]] | None = (
         None
     )
 
@@ -816,10 +816,10 @@ class ManagedSandboxDeployment:
                     bound = False
                 if bound:
                     caps[config.provider]["inference_models"] = True
-                elif config.gateway_model_options is not None or ambient_gateway_providers(
+                elif config.default_model_options is not None or ambient_gateway_providers(
                     config.host_config, config.model_discovery
                 ):
-                    caps[config.provider]["gateway_models"] = True
+                    caps[config.provider]["default_models"] = True
         return caps
 
 

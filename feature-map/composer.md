@@ -78,11 +78,11 @@ and steers messages while the agent is busy.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
   Pi), and permission mode before the session exists.
 - With a managed sandbox selected and no connected host, the model picker lists
-  the sandbox's gateway catalog when `/v1/info` advertises `gateway_models` (an
+  the sandbox's default catalog when `/v1/info` advertises `default_models` (an
   unbound gateway with `sandbox.model_discovery`, or a provider hook): rows under
-  the provider's label plus a "Harness default" row, for native and SDK agents.
-  A failed listing shows its error and keeps Harness default launchable; a
-  harness the gateway cannot serve keeps its ordinary list. This is distinct
+  the provider's label plus a "Default" row, for native and SDK agents.
+  A failed listing shows its error and keeps Default launchable; a
+  harness the catalog cannot serve keeps its ordinary list. This is distinct
   from a connected host's own catalog and from a bound (`inference_models`)
   target. Covered by
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`

@@ -2198,7 +2198,7 @@ def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -
     }
 
 
-def test_provider_ui_capabilities_advertise_gateway_models_for_unbound_discovery() -> None:
+def test_provider_ui_capabilities_advertise_default_models_for_unbound_discovery() -> None:
     launcher = FakeSandboxLauncher()
     gateway = {
         "providers": {
@@ -2229,7 +2229,7 @@ def test_provider_ui_capabilities_advertise_gateway_models_for_unbound_discovery
 
     deployment = ManagedSandboxDeployment(
         configs=(
-            config("hooked", gateway_model_options=hook),
+            config("hooked", default_model_options=hook),
             config("discovered", host_config=gateway, model_discovery=discovery),
             config("static", host_config=gateway),
             config("bound", host_config=bound, model_discovery=discovery),
@@ -2246,8 +2246,8 @@ def test_provider_ui_capabilities_advertise_gateway_models_for_unbound_discovery
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "hooked": {"multi_repo": False, "gateway_models": True},
-        "discovered": {"multi_repo": False, "gateway_models": True},
+        "hooked": {"multi_repo": False, "default_models": True},
+        "discovered": {"multi_repo": False, "default_models": True},
         "static": {"multi_repo": False},
         "bound": {"multi_repo": False, "inference_models": True},
         "malformed": {"multi_repo": False},

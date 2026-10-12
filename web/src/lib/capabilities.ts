@@ -122,7 +122,7 @@ export interface ServerInfo {
    */
   sandbox_provider_capabilities?: Record<
     string,
-    { multi_repo?: boolean; inference_models?: boolean; gateway_models?: boolean }
+    { multi_repo?: boolean; inference_models?: boolean; default_models?: boolean }
   >;
   /**
    * Connection providers this deploy has wired (config + store present),

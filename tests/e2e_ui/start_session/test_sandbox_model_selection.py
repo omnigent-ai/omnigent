@@ -49,7 +49,7 @@ async def _drive_gateway(
             info = json.loads(_managed_info_body())
             info.update(
                 sandbox_provider="arclet",
-                sandbox_provider_capabilities={"arclet": {"gateway_models": True}},
+                sandbox_provider_capabilities={"arclet": {"default_models": True}},
             )
             await page.route("**/v1/info", lambda route: route.fulfill(json=info))
             await page.route("**/v1/hosts", lambda route: route.fulfill(json={"hosts": []}))

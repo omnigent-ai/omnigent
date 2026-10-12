@@ -22,7 +22,7 @@ from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._session_create_validation import validate_session_agent
 
 _logger = logging.getLogger(__name__)
-_GATEWAY_HOOK_TIMEOUT_S = 10.0
+_DEFAULT_MODEL_OPTIONS_TIMEOUT_S = 10.0
 
 
 def inference_service(request: Request) -> Any:
@@ -229,7 +229,7 @@ def create_sandbox_inference_router(
         }
         deployment = getattr(request.app.state, "sandbox_config", None)
         target = deployment.for_provider(provider) if deployment is not None else None
-        # An agent's own provider takes precedence over the sandbox's ambient gateway.
+        # An agent's own provider takes precedence over the sandbox's default catalog.
         if target is None or not target.managed_launch_supported or auth is not None:
             return result
         if spec is not None and (spec.executor.config.get("profile") or spec.executor.profile):
@@ -237,14 +237,15 @@ def create_sandbox_inference_router(
         ambient = await inference_service(request).ambient_catalog(provider, harness, user_id)
         if ambient is not None:
             return ambient
-        if target.gateway_model_options is not None:
+        if target.default_model_options is not None:
             result["provider_label"] = "AI Gateway"
             try:
                 rows = await asyncio.wait_for(
-                    target.gateway_model_options(harness, user_id), timeout=_GATEWAY_HOOK_TIMEOUT_S
+                    target.default_model_options(harness, user_id),
+                    timeout=_DEFAULT_MODEL_OPTIONS_TIMEOUT_S,
                 )
                 if not all(isinstance(row.get("id"), str) and row["id"] for row in rows):
-                    raise ValueError("gateway_model_options rows must carry a model id")
+                    raise ValueError("default_model_options rows must carry a model id")
                 # Advisory rows never carry a default marker; Default stays a separate row.
                 models = [{**row, "isDefault": False} for row in rows]
                 result.update(models=models, status="ready" if models else "empty")

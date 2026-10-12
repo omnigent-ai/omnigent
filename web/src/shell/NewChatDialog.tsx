@@ -3146,16 +3146,16 @@ export function NewChatLandingScreen() {
     info !== "loading" && previewSandboxProvider !== null
       ? info.sandbox_provider_capabilities?.[previewSandboxProvider]
       : undefined;
-  const sandboxGatewayPreviewOffered =
+  const sandboxDefaultModelsOffered =
     sandboxSelected &&
-    sandboxModelCapabilities?.gateway_models === true &&
+    sandboxModelCapabilities?.default_models === true &&
     sandboxModelCapabilities.inference_models !== true;
   const sandboxPreviewEnabled =
     sandboxSelected &&
     previewSandboxProvider !== null &&
     previewHarness !== null &&
     info !== "loading" &&
-    (sandboxModelCapabilities?.inference_models === true || sandboxGatewayPreviewOffered);
+    (sandboxModelCapabilities?.inference_models === true || sandboxDefaultModelsOffered);
   const sandboxModels = useSandboxModelOptions(
     previewSandboxProvider,
     previewHarness,
@@ -3163,22 +3163,22 @@ export function NewChatLandingScreen() {
     cacheUser,
     sandboxPreviewEnabled,
   );
-  // A harness the gateway cannot serve keeps its ordinary picker.
-  const sandboxGatewayPreviewEnabled =
-    sandboxGatewayPreviewOffered && sandboxModels.data?.status !== "unconfigured";
+  // A harness the default catalog cannot serve keeps its ordinary picker.
+  const sandboxDefaultModelsEnabled =
+    sandboxDefaultModelsOffered && sandboxModels.data?.status !== "unconfigured";
   const sandboxInferenceConfigured =
     sandboxPreviewEnabled && sandboxModels.data?.configured === true;
-  const sandboxHasModelCatalog = sandboxInferenceConfigured || sandboxGatewayPreviewEnabled;
+  const sandboxHasModelCatalog = sandboxInferenceConfigured || sandboxDefaultModelsEnabled;
   const sandboxCatalogPending =
     sandboxPreviewEnabled && sandboxModels.data === undefined && sandboxModels.isLoading;
   const sandboxCatalogError =
-    sandboxPreviewEnabled && !sandboxGatewayPreviewEnabled
+    sandboxPreviewEnabled && !sandboxDefaultModelsEnabled
       ? (sandboxModels.error?.message ??
         (sandboxModels.data?.configured && sandboxModels.data.status !== "ready"
           ? (sandboxModels.data.error ?? "No usable models are available for this harness.")
           : null))
       : null;
-  const sandboxGatewayCatalogError = sandboxGatewayPreviewEnabled
+  const sandboxDefaultCatalogError = sandboxDefaultModelsEnabled
     ? (sandboxModels.error?.message ??
       (sandboxModels.data !== undefined &&
       ["unavailable", "empty"].includes(sandboxModels.data.status)
@@ -3187,16 +3187,16 @@ export function NewChatLandingScreen() {
     : null;
   const sandboxCatalog = useMemo(
     () =>
-      sandboxGatewayPreviewEnabled
-        ? sandboxGatewayCatalogError
+      sandboxDefaultModelsEnabled
+        ? sandboxDefaultCatalogError
           ? []
           : (sandboxModels.data?.models ?? [])
         : sandboxInferenceConfigured
           ? sandboxModels.data!.models
           : undefined,
     [
-      sandboxGatewayPreviewEnabled,
-      sandboxGatewayCatalogError,
+      sandboxDefaultModelsEnabled,
+      sandboxDefaultCatalogError,
       sandboxInferenceConfigured,
       sandboxModels.data,
     ],
@@ -3503,8 +3503,8 @@ export function NewChatLandingScreen() {
               ? hostDevinModelsLoading
               : false));
   const pickerModelsError = sandboxSelected
-    ? sandboxCatalogError || sandboxGatewayCatalogError
-      ? new Error((sandboxCatalogError ?? sandboxGatewayCatalogError)!)
+    ? sandboxCatalogError || sandboxDefaultCatalogError
+      ? new Error((sandboxCatalogError ?? sandboxDefaultCatalogError)!)
       : null
     : selectedNativeHarness === "claude-native"
       ? hostClaudeModelsError
@@ -3613,7 +3613,7 @@ export function NewChatLandingScreen() {
   const visiblePermissionRow =
     pickerLoading && !interactiveWhileLoading ? cachedPermission?.row : permissionConfigRow;
   useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
-  const pickerEffortOptions = sandboxGatewayPreviewEnabled
+  const pickerEffortOptions = sandboxDefaultModelsEnabled
     ? codexEffortLevelsForModel(pickerModelOptions, pickedModel).map((value) => ({
         value,
         label: normalizeEffortLabel(value),
@@ -3680,13 +3680,13 @@ export function NewChatLandingScreen() {
     }
     const picked = model === MODEL_SELECT_DEFAULT ? "" : model;
     // Gateway catalogs carry no default row, so Harness default keeps no effort.
-    const effortModel = sandboxGatewayPreviewEnabled
+    const effortModel = sandboxDefaultModelsEnabled
       ? picked
       : picked || codexModelOptions.find((option) => option.isDefault)?.id;
     const effort =
-      (sandboxGatewayPreviewEnabled || selectedNativeHarness === "codex-native") &&
+      (sandboxDefaultModelsEnabled || selectedNativeHarness === "codex-native") &&
       !codexEffortLevelsForModel(
-        sandboxGatewayPreviewEnabled ? pickerModelOptions : codexModelOptions,
+        sandboxDefaultModelsEnabled ? pickerModelOptions : codexModelOptions,
         effortModel,
       ).includes(pickedEffort)
         ? ""
@@ -3844,7 +3844,7 @@ export function NewChatLandingScreen() {
                     </>
                   ),
                   choices: [
-                    ...(sandboxGatewayPreviewEnabled ||
+                    ...(sandboxDefaultModelsEnabled ||
                     (!sandboxInferenceConfigured &&
                       pickerModelOptions.length > 0 &&
                       !pickerModelOptions.some((option) => option.isDefault))
@@ -4201,7 +4201,7 @@ export function NewChatLandingScreen() {
     projectDefaultModel,
   ]);
   useEffect(() => {
-    if (!sandboxGatewayPreviewEnabled || !previewHarness) return;
+    if (!sandboxDefaultModelsEnabled || !previewHarness) return;
     const edited =
       pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === previewHarness
         ? pickerEdits.options
@@ -4220,7 +4220,7 @@ export function NewChatLandingScreen() {
         : "",
     );
   }, [
-    sandboxGatewayPreviewEnabled,
+    sandboxDefaultModelsEnabled,
     previewHarness,
     effectiveAgentId,
     sandboxCatalog,
@@ -4892,7 +4892,7 @@ export function NewChatLandingScreen() {
   const visibleWorktreeHeader = cachedWorkspace ?? worktreeHeader;
 
   const pickerSelectionError =
-    sandboxGatewayPreviewEnabled &&
+    sandboxDefaultModelsEnabled &&
     !pickerLoading &&
     pickerEdits?.agentId === effectiveAgentId &&
     pickerEdits.harness === previewHarness &&
@@ -5375,7 +5375,7 @@ export function NewChatLandingScreen() {
       const normalizedReasoningEffort =
         !smartRoutingHarnessSelected &&
         !routingOwnsModel &&
-        (sandboxGatewayPreviewEnabled ||
+        (sandboxDefaultModelsEnabled ||
           agentSupportsPermissionMode ||
           selectedNativeHarness === "pi-native" ||
           nativeAgent?.harness === "codex-native" ||

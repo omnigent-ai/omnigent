@@ -118,7 +118,7 @@ def test_gateway_choice_reaches_managed_codex_first_turn(
         ) as client,
     ):
         info = client.get("/v1/info")
-        assert info.json()["sandbox_provider_capabilities"]["test-gateway"]["gateway_models"]
+        assert info.json()["sandbox_provider_capabilities"]["test-gateway"]["default_models"]
         assert client.get("/v1/hosts").json()["hosts"] == []
         preview = client.get(
             "/v1/sandbox-providers/test-gateway/harnesses/codex-native/model-options"

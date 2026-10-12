@@ -259,7 +259,7 @@ async def test_gateway_preview_needs_no_host_or_inference_binding(env: _Env, row
 
     target = env.app.state.sandbox_config.default
     target.host_config = None
-    target.gateway_model_options = AsyncMock(return_value=rows)
+    target.default_model_options = AsyncMock(return_value=rows)
     env.app.state.inference_catalog = SandboxInferenceService(env.app.state)
     before = env.persisted()
     response = await env.client.get(
@@ -278,7 +278,7 @@ async def test_gateway_preview_needs_no_host_or_inference_binding(env: _Env, row
         expected["error"] = "The gateway lists no usable models for this harness."
     assert response.json() == expected
     assert response.headers["cache-control"] == "private, no-store"
-    target.gateway_model_options.assert_awaited_once_with("codex-native", None)
+    target.default_model_options.assert_awaited_once_with("codex-native", None)
     assert env.persisted() == before
     env.launch.assert_not_called()
 
@@ -297,12 +297,12 @@ async def test_gateway_failure_keeps_launch_selection_and_default_usable(
     target = env.app.state.sandbox_config.default
     target.host_config = None
     if failure == "timeout":
-        monkeypatch.setattr(sandbox_inference_routes, "_GATEWAY_HOOK_TIMEOUT_S", 0.05)
-        target.gateway_model_options = AsyncMock(side_effect=stalled)
+        monkeypatch.setattr(sandbox_inference_routes, "_DEFAULT_MODEL_OPTIONS_TIMEOUT_S", 0.05)
+        target.default_model_options = AsyncMock(side_effect=stalled)
     elif failure == "invalid-rows":
-        target.gateway_model_options = AsyncMock(return_value=[{"displayName": "No id"}])
+        target.default_model_options = AsyncMock(return_value=[{"displayName": "No id"}])
     else:
-        target.gateway_model_options = AsyncMock(
+        target.default_model_options = AsyncMock(
             side_effect=RuntimeError("private upstream error")
         )
     env.app.state.inference_catalog = SandboxInferenceService(env.app.state)
@@ -338,7 +338,7 @@ async def test_gateway_failure_keeps_launch_selection_and_default_usable(
     assert saved.inference_snapshot is None
     env.launch.assert_awaited_once()
     # Optional discovery is never a dependency of session provisioning.
-    assert target.gateway_model_options.await_count == 1
+    assert target.default_model_options.await_count == 1
 
 
 _UNBOUND_GATEWAY = {
@@ -453,7 +453,7 @@ async def test_configured_discovery_takes_precedence_over_the_provider_hook(
 ):
     requests: list[Request] = []
     target = _discoverable_gateway(env, monkeypatch, requests)
-    target.gateway_model_options = AsyncMock(return_value=[{"id": "hook/model"}])
+    target.default_model_options = AsyncMock(return_value=[{"id": "hook/model"}])
     response = await env.client.get(
         "/v1/sandbox-providers/agent_sandbox/harnesses/codex-native/model-options"
     )
@@ -461,7 +461,7 @@ async def test_configured_discovery_takes_precedence_over_the_provider_hook(
     assert response.json()["provider_label"] == "Team AI Gateway"
     assert [row["id"] for row in response.json()["models"]] == ["gpt-5.5", "gpt-5.5-mini"]
     assert len(requests) == 1
-    target.gateway_model_options.assert_not_called()
+    target.default_model_options.assert_not_called()
 
 
 async def test_malformed_providers_leave_the_unbound_preview_unconfigured(
@@ -492,7 +492,7 @@ async def test_agent_provider_does_not_inherit_ambient_gateway_preview(
 ):
     requests: list[Request] = []
     target = _discoverable_gateway(env, monkeypatch, requests)
-    target.gateway_model_options = AsyncMock()
+    target.default_model_options = AsyncMock()
     agent = await create_test_agent(
         env.client,
         executor={
@@ -510,7 +510,7 @@ async def test_agent_provider_does_not_inherit_ambient_gateway_preview(
     assert response.json()["status"] == "unconfigured"
     assert response.json()["models"] == []
     assert requests == []
-    target.gateway_model_options.assert_not_called()
+    target.default_model_options.assert_not_called()
 
 
 @pytest.mark.parametrize(
