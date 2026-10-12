@@ -43,3 +43,20 @@ def test_repro_recording_rules_match_the_shared_guide() -> None:
     assert "Text-only CLI output is not a reason to skip recording" in instructions
     assert "name the specific blocker in `recording_unavailable_reason`" in instructions
     assert "Do not block the verdict because footage is missing or rejected" in instructions
+
+
+def test_lane_unreachable_state_skip_requires_a_tried_fault_injection() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+
+    assert "is a claim you test, not a conclusion you reason to" in lanes
+    assert "a state you can describe how to reach is reachable" in lanes
+    assert "kill the pane's tmux server" in lanes
+    assert (
+        "A journey you can write into a validation prompt must be tried with the recorder first"
+        in lanes
+    )
+    assert (
+        'Reasoning that the state has "no user action or product hook" is not a blocker' in lanes
+    )
+    assert "name the fault injection you actually ran and its observed result" in lanes
+    assert "say in the clip's caption what stood in for the user action" in lanes

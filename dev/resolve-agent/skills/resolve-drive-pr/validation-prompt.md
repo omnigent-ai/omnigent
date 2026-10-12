@@ -39,6 +39,15 @@ enough not to repeat the whole Test Plan. After editing the saved body, rerun
 the target's template validator and advisory hygiene checker when available.
 If a later push changes the evidence, repeat this review before the handoff.
 
+**Cross-check the prompt against your recordings.** If the prompt tells a human
+how to reach a state you declared unrecordable — kill the pane's tmux server,
+bind the rotation session, watch the pane appear — that declaration was wrong:
+you have just written the fault injection. Drive those same steps with the
+recorder running (2A.3 on the review path, 2B.5 on the author path) before the
+handoff, and either attach the clip or replace `recording_unavailable_reason`
+with the injection you ran and its observed failure. A recipe you can hand to a
+maintainer is never a journey you could not attempt.
+
 **Lead with the one command that runs it — and pick it by `validation_surface`
 (4.1).** The command shape differs by which side your fix runs on:
 
