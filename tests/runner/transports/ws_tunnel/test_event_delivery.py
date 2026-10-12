@@ -6,6 +6,7 @@ import asyncio
 import gc
 import json
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -100,6 +101,51 @@ async def test_acknowledged_item_uses_tunnel_not_http() -> None:
     assert frames[0].session_id == "session-a"
     assert frames[0].events == [_ITEM]
     assert http_posts == []
+
+
+@pytest.mark.parametrize("bytes_over_limit", [-1, 0, 1])
+@pytest.mark.parametrize("path_session_id", ["session-a", "session%2Dwith%2Descaped%2Didentifier"])
+async def test_full_wire_frame_size_selects_http_fallback(
+    bytes_over_limit: int, path_session_id: str
+) -> None:
+    dispatcher = RunnerEventDispatcher()
+    http_posts: list[object] = []
+    frames: list[EventBatchFrame] = []
+    session_id = unquote(path_session_id)
+    item = {
+        **_ITEM,
+        "data": {
+            **_ITEM["data"],
+            "item_data": {"role": "assistant", "content": [{"type": "output_text", "text": ""}]},
+        },
+    }
+    frame_bytes = len(encode_frame(EventBatchFrame("0" * 32, session_id, [item])).encode())
+    item["data"]["item_data"]["content"][0]["text"] = "x" * (
+        256 * 1024 - frame_bytes + bytes_over_limit
+    )
+
+    async def send(text: str) -> None:
+        # This is the limit enforced by the receiving server, including the envelope.
+        assert len(text.encode()) <= 256 * 1024
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        frames.append(frame)
+        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    dispatcher.ready(send)
+    async with _client(dispatcher, http_posts) as client:
+        response = await asyncio.wait_for(
+            client.post(f"/v1/sessions/{path_session_id}/events", json=item), timeout=2
+        )
+    assert response.status_code == 202
+    if bytes_over_limit > 0:
+        assert http_posts == [item]
+        assert frames == []
+    else:
+        assert http_posts == []
+        assert len(frames) == 1
+        assert frames[0].session_id == session_id
+        assert frames[0].events == [item]
 
 
 async def test_lost_ack_replays_after_tunnel_reconnect() -> None:
