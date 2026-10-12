@@ -8670,6 +8670,36 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
 
 
 @pytest.mark.parametrize(
+    "title",
+    [
+        " Retry failed webhook deliveries with exponential backoff and jitter(… ─",
+        " 修复回调的重试路径并加入指数退避与抖动以及每小时上限… ─",
+    ],
+)
+def test_prompt_ready_under_title_truncated_to_pane_width(title: str) -> None:
+    pane = "\n".join(
+        [
+            "● Background task finished",
+            title,
+            "❯",
+            "─" * 80,
+            "  auto mode on · 2 shells",
+            "  ● main",
+            "  ◯ fork  Waiting for a build",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_draft_continuation_ending_in_truncated_rule_does_not_hide_prompt() -> None:
+    rule = "─" * 80
+    pane = "\n".join(
+        [rule, "❯ review this output", "  the captured title ends like this… ─", rule]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+@pytest.mark.parametrize(
     "line",
     [
         "─" * 40,  # plain rule
@@ -8683,6 +8713,7 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
         # 46-char title on a browser terminal only 50 columns wide.
         "── " + "t" * 75 + " ─",
         "─ fix-the-billing-webhook-retry-backoff-path-now ─",
+        " Retry failed webhook deliveries with exponential backoff … ─",
     ],
 )
 def test_is_box_rule_accepts_rules(line: str) -> None:
@@ -8707,6 +8738,11 @@ def test_is_box_rule_accepts_rules(line: str) -> None:
         "│   │   │",  # deeper nesting, same shape
         "│   ├── src",  # a ``tree`` row
         "─" * 40 + " a │ b ─",  # a rule glyph inside the label
+        "a sentence that ends in a box glyph ─",
+        " a truncated sentence without the separator…─",
+        " … " + "─" * 30,
+        "  a draft continuation that trails off… ─",
+        "- an output line that trails off… ─",
     ],
 )
 def test_is_box_rule_rejects_non_rules(line: str) -> None:
