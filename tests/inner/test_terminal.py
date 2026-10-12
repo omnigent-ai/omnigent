@@ -6,6 +6,7 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
+from omnigent._platform import IS_LINUX
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import (
@@ -3546,3 +3548,149 @@ async def test_read_join_wrapped_asks_tmux_to_join_wrapped_rows(tmp_path: Path) 
     assert calls[1] == ("capture-pane", "-t", instance.tmux_target, "-p", "-J")
     assert plain["screen"] == joined["screen"]
     assert "https://signin.example.com/device?user_code=ABCDEFGH" in joined["screen"]
+
+
+def test_null_device_problem_accepts_the_real_null_device() -> None:
+    assert terminal_mod._null_device_problem() is None
+
+
+@pytest.mark.skipif(not IS_LINUX, reason="the /dev/null diagnosis is Linux-only")
+def test_null_device_problem_names_what_replaced_the_device(tmp_path: Path) -> None:
+    regular = tmp_path / "null"
+    regular.write_text("runner-host\n")
+    assert terminal_mod._null_device_problem(str(regular)) == (
+        f"{regular} is a regular file instead of the null character device",
+        f"rm -f {regular} && mknod -m 666 {regular} c 1 3",
+    )
+    # A directory is removed with rmdir, never recursively.
+    assert terminal_mod._null_device_problem(str(tmp_path)) == (
+        f"{tmp_path} is a directory instead of the null character device "
+        "(move its contents elsewhere first if rmdir refuses)",
+        f"rmdir {tmp_path} && mknod -m 666 {tmp_path} c 1 3",
+    )
+    missing = tmp_path / "gone"
+    assert terminal_mod._null_device_problem(str(missing)) == (
+        f"{missing} is missing",
+        f"mknod -m 666 {missing} c 1 3",
+    )
+    spaced = tmp_path / "dev null"
+    spaced.write_text("")
+    assert terminal_mod._null_device_problem(str(spaced)) == (
+        f"{spaced} is a regular file instead of the null character device",
+        f"rm -f '{spaced}' && mknod -m 666 '{spaced}' c 1 3",
+    )
+
+
+@pytest.mark.skipif(not IS_LINUX, reason="the /dev/null diagnosis is Linux-only")
+def test_null_device_problem_inspects_symlinks_as_entries(tmp_path: Path) -> None:
+    """A link to the real device works; any other link is removed as a link, not its target."""
+    to_device = tmp_path / "link-to-device"
+    to_device.symlink_to(os.devnull)
+    assert terminal_mod._null_device_problem(str(to_device)) is None
+
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "nowhere")
+    assert terminal_mod._null_device_problem(str(dangling)) == (
+        f"{dangling} is a dangling symbolic link",
+        f"rm -f {dangling} && mknod -m 666 {dangling} c 1 3",
+    )
+
+    to_dir = tmp_path / "link-to-dir"
+    to_dir.symlink_to(tmp_path)
+    assert terminal_mod._null_device_problem(str(to_dir)) == (
+        f"{to_dir} is a symbolic link to a directory instead of the null character device",
+        f"rm -f {to_dir} && mknod -m 666 {to_dir} c 1 3",
+    )
+
+
+@pytest.mark.skipif(not IS_LINUX, reason="the /dev/null diagnosis is Linux-only")
+def test_null_device_problem_stays_silent_when_the_entry_cannot_be_inspected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    denied = str(tmp_path / "null")
+    real_lstat = os.lstat
+
+    def lstat_denied(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if path == denied:
+            raise PermissionError(errno.EACCES, "Permission denied", denied)
+        return real_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "lstat", lstat_denied)
+
+    assert terminal_mod._null_device_problem(denied) is None
+
+
+def test_null_device_problem_is_linux_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """glibc's daemon() check and the mknod numbers do not apply elsewhere."""
+    regular = tmp_path / "null"
+    regular.write_text("")
+    monkeypatch.setattr(terminal_mod, "IS_LINUX", False)
+
+    assert terminal_mod._null_device_problem(str(regular)) is None
+
+
+@pytest.mark.parametrize(
+    ("null_device_broken", "stderr"),
+    [
+        (False, b"server exited unexpectedly"),
+        (True, b"server exited unexpectedly"),
+        (True, b"unknown option: -Z"),
+    ],
+    ids=["healthy-device", "broken-device", "broken-device-unrelated-tmux-error"],
+)
+async def test_launch_failure_explains_a_broken_null_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, null_device_broken: bool, stderr: bytes
+) -> None:
+    """tmux's bare "server exited unexpectedly" is explained when /dev/null is broken.
+
+    glibc's ``daemon()`` refuses to start the tmux server unless /dev/null is the
+    null device, and tmux reports nothing about why. A healthy device, or a tmux
+    error other than the dying server, keeps the plain launch error so the real
+    diagnostic is never replaced by a /dev/null repair hint.
+    """
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+
+    async def spawn(*_args: object, **_kwargs: object) -> _ProcessWithStdout:
+        return _ProcessWithStdout(returncode=1, stderr=stderr)
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "asyncio",
+        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+    )
+    problem = (
+        terminal_mod._NullDeviceProblem(
+            "/dev/null is a regular file instead of the null character device",
+            "rm -f /dev/null && mknod -m 666 /dev/null c 1 3",
+        )
+        if null_device_broken
+        else None
+    )
+    monkeypatch.setattr(terminal_mod, "_null_device_problem", lambda path="/dev/null": problem)
+
+    with pytest.raises(RuntimeError) as info:
+        await instance.launch(cwd=tmp_path)
+
+    assert not instance.running
+    launch_error = f"tmux launch failed (rc=1): {stderr.decode()}"
+    if not null_device_broken or stderr != b"server exited unexpectedly":
+        assert not isinstance(info.value, terminal_mod.TerminalLaunchPrerequisiteError)
+        assert str(info.value) == launch_error
+        return
+    assert isinstance(info.value, terminal_mod.TerminalLaunchPrerequisiteError)
+    message = str(info.value)
+    assert message == (
+        "tmux cannot start its server because /dev/null is a regular file instead of the "
+        "null character device. Recreate the device with `rm -f /dev/null && mknod -m 666 "
+        "/dev/null c 1 3` (as root) or restart the container, then retry."
+    )
+    assert str(tmp_path) not in message
+    assert isinstance(info.value.__cause__, RuntimeError)
+    assert str(info.value.__cause__) == launch_error

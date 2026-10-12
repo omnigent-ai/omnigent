@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -22,8 +23,8 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
     write_tmux_target,
 )
-from omnigent.inner.terminal import TerminalInstance
-from omnigent.runner import create_runner_app, native_controls
+from omnigent.inner.terminal import TerminalInstance, TerminalLaunchPrerequisiteError
+from omnigent.runner import create_runner_app, native_controls, resource_routes
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
@@ -679,3 +680,252 @@ async def test_failed_recreate_does_not_wait(
         f"a recreate that made no pane must not be polled; got {pane_ready_calls!r}"
     )
     assert elapsed < 5.0, f"failed recreate stalled {elapsed:.1f}s instead of failing fast"
+
+
+_BROKEN_NULL_DEVICE = (
+    "tmux cannot start its server because /dev/null is a regular file "
+    "(repair text omitted; this suite proves propagation, not wording)"
+)
+
+
+def _break_claude_terminal_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every Claude terminal re-create fail the way a broken ``/dev/null`` does."""
+
+    async def _launch_fails(*_args: object, **_kwargs: object) -> SessionResourceView:
+        raise TerminalLaunchPrerequisiteError(_BROKEN_NULL_DEVICE) from RuntimeError(
+            "tmux launch failed (rc=1): server exited unexpectedly"
+        )
+
+    for target in (
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal",
+        "omnigent.runner.native._auto_create_claude_terminal",
+        "omnigent.runner.native.orchestration._launch_claude",
+        "omnigent.runner.native._launch_claude",
+    ):
+        monkeypatch.setattr(target, _launch_fails)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("conv_id", "event", "error_code"),
+    [
+        (
+            "c3d4e5f60718293a4b5c6d7e8f901a2b",
+            {"type": "permission_mode_change", "permission_mode": "acceptEdits"},
+            "claude_native_permission_mode_failed",
+        ),
+        (
+            "d4e5f60718293a4b5c6d7e8f901a2b3c",
+            {"type": "effort_change", "effort": "high"},
+            "claude_native_effort_failed",
+        ),
+        (
+            "e5f60718293a4b5c6d7e8f901a2b3c4d",
+            {"type": "model_change", "model": "claude-opus-4-7"},
+            "claude_native_model_failed",
+        ),
+        (
+            "f60718293a4b5c6d7e8f901a2b3c4d5e",
+            {"type": "compact"},
+            "claude_native_compact_failed",
+        ),
+    ],
+    ids=["permission_mode_change", "effort_change", "model_change", "compact"],
+)
+async def test_failed_recreate_reports_the_terminal_start_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    conv_id: str,
+    event: dict[str, Any],
+    error_code: str,
+) -> None:
+    """A failed re-create returns the terminal-start error in the 503.
+
+    Waiting for the unregistered pane would only end in "tmux target is not
+    advertised yet" and the generic log pointer; nothing is typed into it.
+    """
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    _break_claude_terminal_start(monkeypatch)
+
+    def _never_typed(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("nothing may be typed into a pane that never started")
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _never_typed)
+    monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _never_typed)
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", _never_typed)
+
+    async with _runner_client(app) as client:
+        resp = await client.post(f"/v1/sessions/{conv_id}/events", json=event)
+
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["error"] == error_code, body
+    detail = body["detail"]
+    assert detail.startswith(
+        "Native Claude terminal failed to start: tmux cannot start its server because "
+        "/dev/null is a regular file"
+    ), detail
+    assert _BROKEN_NULL_DEVICE in detail
+    assert "not advertised" not in detail
+    assert "see the runner log" not in detail
+
+
+@pytest.mark.asyncio
+async def test_failed_recreate_with_stale_entry_reports_the_start_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A dead entry whose close failed must not hide the start error behind the poll.
+
+    ``_ensure_native_terminal_for_turn`` swallows a failed close of the stale
+    pane and still re-creates. When that re-create fails too, the dead instance
+    is still registered, so the heal must return the start error instead of
+    polling ``claude_pane_ready`` for the whole budget and failing generically.
+    """
+    conv_id = "0718293a4b5c6d7e8f901a2b3c4d5e6f"
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    _break_claude_terminal_start(monkeypatch)
+    # Budget the shipped value: a regression shows up as a 30s test.
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_TIMEOUT_S", 30.0)
+
+    async def _close_fails(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("tmux kill-server failed")
+
+    monkeypatch.setattr(registry, "close", _close_fails)
+
+    def _never_polled(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a failed re-create must not be polled or typed into")
+
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", _never_polled)
+    monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _never_polled)
+
+    started = time.monotonic()
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "permission_mode_change", "permission_mode": "acceptEdits"},
+        )
+    elapsed = time.monotonic() - started
+
+    assert resp.status_code == 503, resp.text
+    assert "/dev/null is a regular file" in resp.json()["detail"]
+    assert registry.get(conv_id, "claude", "main") is not None, "the stale entry stays registered"
+    # Far below the 30 s readiness budget; the real guard is the never-polled stub.
+    assert elapsed < 20.0, f"stale entry stalled the control {elapsed:.1f}s"
+
+
+@pytest.mark.asyncio
+async def test_failed_recreate_without_a_readable_error_still_fails_fast(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed re-create whose body has no readable message still gets a safe detail."""
+    conv_id = "18293a4b5c6d7e8f901a2b3c4d5e6f07"
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    _break_claude_terminal_start(monkeypatch)
+    monkeypatch.setattr(resource_routes, "_terminal_start_error_message", lambda _resp: None)
+
+    def _never_polled(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a failed re-create must not be polled or typed into")
+
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", _never_polled)
+    monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _never_polled)
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "permission_mode_change", "permission_mode": "acceptEdits"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"] == resource_routes._NATIVE_PANE_RECREATE_FAILED
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (
+            b'{"error": {"code": "x", "error_id": "err_1", "message": "the start error"}}',
+            "the start error",
+        ),
+        (b"not json", None),
+        (b'["error"]', None),
+        (b'{"error": "flat string"}', None),
+        (b'{"error": {"code": "x"}}', None),
+        (b'{"error": {"message": ""}}', None),
+        (b'{"error": {"message": 7}}', None),
+        (b"", None),
+    ],
+)
+def test_terminal_start_error_message_reads_only_the_runner_envelope(
+    body: bytes, expected: str | None
+) -> None:
+    assert resource_routes._terminal_start_error_message(SimpleNamespace(body=body)) == expected
+
+
+def test_terminal_start_error_message_without_a_body() -> None:
+    assert resource_routes._terminal_start_error_message(object()) is None
+
+
+@pytest.mark.asyncio
+async def test_repaired_prerequisite_lets_the_next_control_recreate_the_pane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Once the host is repaired, the next control re-creates the pane and applies."""
+    conv_id = "293a4b5c6d7e8f901a2b3c4d5e6f0718"
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    auto_create_calls.clear()
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    _break_claude_terminal_start(monkeypatch)
+    captured: list[str] = []
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "inject_slash_command",
+        lambda _bridge_dir, *, command, **_kwargs: captured.append(command),
+    )
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", lambda _bridge_dir: True)
+
+    async def _launch_succeeds(
+        first: object = None, *_args: object, **_kwargs: object
+    ) -> SessionResourceView:
+        session_id = first if isinstance(first, str) else getattr(first, "session_id", conv_id)
+        auto_create_calls.append(session_id)
+        return SessionResourceView(
+            id="terminal_claude_main", type="terminal", session_id=session_id, name="claude"
+        )
+
+    async with _runner_client(app) as client:
+        event = {"type": "effort_change", "effort": "high"}
+        failed = await client.post(f"/v1/sessions/{conv_id}/events", json=event)
+        assert failed.status_code == 503, failed.text
+        assert captured == []
+        # The operator recreates /dev/null; nothing is restarted.
+        for target in (
+            "omnigent.runner.native.orchestration._auto_create_claude_terminal",
+            "omnigent.runner.native._auto_create_claude_terminal",
+            "omnigent.runner.native.orchestration._launch_claude",
+            "omnigent.runner.native._launch_claude",
+        ):
+            monkeypatch.setattr(target, _launch_succeeds)
+        repaired = await client.post(f"/v1/sessions/{conv_id}/events", json=event)
+
+    assert repaired.status_code == 204, repaired.text
+    assert auto_create_calls == [conv_id], "the repaired host must be re-created once"
+    assert captured == ["/effort high"]

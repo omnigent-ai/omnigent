@@ -220,6 +220,15 @@ class NativeControls:
     teardown_session_terminals: Callable[[str], Coroutine[Any, Any, None]]
 
 
+def _pane_start_failure_response(error: str, detail: str) -> JSONResponse:
+    """503 for a control whose Claude pane could not be re-created.
+
+    *detail* is the terminal-start error already published to the client, so it
+    is safe to relay as-is.
+    """
+    return JSONResponse(status_code=503, content={"error": error, "detail": detail})
+
+
 def build_native_controls(
     *,
     _active_turns: dict[str, asyncio.Task[None] | None],
@@ -228,7 +237,7 @@ def build_native_controls(
     _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]],
     _codex_native_bridge_state_for_session: _CodexNativeBridgeStateForSessionFn,
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
-    _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]],
+    _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, str | None]],
     _fetch_session_model_override: Callable[[str], Coroutine[Any, Any, str | None]],
     _ingest_cond: dict[str, asyncio.Condition],
     _ingest_next_seq: dict[str, int],
@@ -877,7 +886,11 @@ def build_native_controls(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        start_failure = await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        if start_failure is not None:
+            return _pane_start_failure_response(
+                "claude_native_permission_mode_failed", start_failure
+            )
         try:
             settled = await asyncio.to_thread(
                 set_permission_mode,
@@ -928,7 +941,7 @@ def build_native_controls(
     async def _prepare_claude_native_pane_for_injection(
         conv_id: str,
         bridge_dir: Path,
-    ) -> None:
+    ) -> str | None:
         """Heal a dead-but-registered Claude pane before typing into it.
 
         Registry membership is not liveness: a pane whose tmux server died
@@ -948,32 +961,36 @@ def build_native_controls(
         case inject already handles for the whole budget, then inject anyway.
 
         No terminal registry means there is nothing to heal, and a recreate that
-        produced no pane is not waited on either (inject keeps its own short
-        advertisement timeout in both cases).
+        produced no pane is not waited on either. Returns that recreate's
+        client-safe start error, when the ensure reported one, so the control
+        can explain why the pane is missing instead of waiting for it; ``None``
+        otherwise (inject keeps its own short advertisement timeout).
         """
         from omnigent.harnesses.claude_native.bridge import claude_pane_ready
 
         terminal_registry = resource_registry.terminal_registry if resource_registry else None
         if terminal_registry is None:
-            return
+            return None
         terminal_name = native_terminal_name("claude-native")
         if terminal_name is None:
-            return
+            return None
         # This probe duplicates the ensure path's own detection on purpose: its
         # only job is to decide whether the readiness poll below runs at all.
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None and await instance.is_alive():
-            return
-        await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+            return None
+        start_failure = await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+        if start_failure is not None:
+            # No pane was created, even if a dead entry whose close failed is
+            # still registered; polling for readiness cannot help.
+            return start_failure
         if terminal_registry.get(conv_id, terminal_name, "main") is None:
-            # The ensure swallows its own failures, so an unregistered pane here
-            # means nothing was created and nothing is booting. Waiting cannot
-            # help; let the injection fail fast as it did before.
-            return
+            # Nothing was created or is booting, so the injection should fail fast.
+            return None
         deadline = time.monotonic() + _CLAUDE_PANE_READY_TIMEOUT_S
         while True:
             if await asyncio.to_thread(claude_pane_ready, bridge_dir):
-                return
+                return None
             if time.monotonic() >= deadline:
                 break
             await asyncio.sleep(_CLAUDE_PANE_READY_POLL_S)
@@ -986,6 +1003,7 @@ def build_native_controls(
             conv_id,
             extra={"session_id": conv_id},
         )
+        return None
 
     async def _handle_claude_native_effort_change(
         conv_id: str,
@@ -1005,7 +1023,9 @@ def build_native_controls(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        start_failure = await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        if start_failure is not None:
+            return _pane_start_failure_response("claude_native_effort_failed", start_failure)
         command = f"/effort {effort}"
         try:
             # An effort switch invalidates the prompt cache on a session with
@@ -1112,7 +1132,9 @@ def build_native_controls(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        start_failure = await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        if start_failure is not None:
+            return _pane_start_failure_response("claude_native_model_failed", start_failure)
         selected_model = model.strip()
         claude_config = await _resolve_session_claude_launch_config(conv_id)
         resolved_model = (
@@ -1466,7 +1488,9 @@ def build_native_controls(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        start_failure = await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        if start_failure is not None:
+            return _pane_start_failure_response("claude_native_compact_failed", start_failure)
         try:
             await asyncio.to_thread(
                 inject_slash_command,

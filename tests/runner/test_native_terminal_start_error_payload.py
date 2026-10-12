@@ -21,7 +21,7 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.inner.terminal import TerminalInstance, TerminalLaunchPrerequisiteError
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
     _NATIVE_TERMINAL_START_FAILED_CODE,
@@ -102,6 +102,7 @@ def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> Non
             OmnigentError("workspace gone", code=ErrorCode.WORKSPACE_MISSING),
             "user",
         ),
+        (TerminalLaunchPrerequisiteError("/dev/null is a regular file"), "host"),
     ],
 )
 def test_start_failure_log_row_is_blocking_with_derived_category(
@@ -140,6 +141,34 @@ def test_generic_cause_names_errno_without_free_form_text() -> None:
         "see the runner log for details:"
     ) in payload["message"]
     assert "No space left on device" not in payload["message"]
+
+
+def test_broken_null_device_surfaces_its_repair_instead_of_the_log_pointer() -> None:
+    """A tmux server that cannot start because ``/dev/null`` was replaced names the cause.
+
+    The raise site composes a client-safe message, so it is shown verbatim with
+    the repair; the raw tmux output stays in the runner log via ``__cause__``.
+    """
+    exc = TerminalLaunchPrerequisiteError(
+        "tmux cannot start its server because /dev/null is a regular file instead of the "
+        "null character device. Recreate the device with `rm -f /dev/null && mknod -m 666 "
+        "/dev/null c 1 3` (as root) or restart the container, then retry."
+    )
+    exc.__cause__ = RuntimeError("tmux launch failed (rc=1): server exited unexpectedly")
+
+    payload = _native_terminal_start_error_payload(exc, "Claude", session_id="conv_1")
+
+    assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
+    message = payload["message"]
+    assert message.startswith(
+        "Native Claude terminal failed to start: tmux cannot start its server because "
+        "/dev/null is a regular file instead of the null character device."
+    )
+    assert "rm -f /dev/null && mknod -m 666 /dev/null c 1 3" in message
+    assert "see the runner log" not in message
+    assert "(RuntimeError)" not in message
+    assert "server exited unexpectedly" not in message
+    assert _ERROR_ID_RE.search(message) is not None
 
 
 def test_cause_includes_errno_name_for_os_errors() -> None:

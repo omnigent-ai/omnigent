@@ -7634,12 +7634,23 @@ def _native_terminal_start_error_payload(
         JSON error responses. Known actionable configuration errors surface
         their safe message directly; other causes point to the runner log.
     """
+    from omnigent.inner.terminal import TerminalLaunchPrerequisiteError
+
     error_id = f"err_{uuid.uuid4().hex}"
     lifecycle_code = (
         exc.code
         if isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES
         else None
     )
+    if isinstance(exc, OmnigentError) and lifecycle_code is not None:
+        # The warning below carries no exc_info for a missing agent, so the
+        # sink cannot derive its category.
+        error_category: str | None = exc.category.value
+    elif isinstance(exc, TerminalLaunchPrerequisiteError):
+        # A broken /dev/null is the host machine's fault, like a full disk.
+        error_category = ErrorCategory.HOST.value
+    else:
+        error_category = None
     extra = debug_event(
         "native_terminal_start_failed",
         session_id=session_id,
@@ -7649,11 +7660,7 @@ def _native_terminal_start_error_payload(
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
         cause_code=exc.code if isinstance(exc, OmnigentError) else None,
-        # The warning below carries no exc_info for a missing agent, so the
-        # sink cannot derive its category.
-        error_category=exc.category.value
-        if isinstance(exc, OmnigentError) and lifecycle_code is not None
-        else None,
+        error_category=error_category,
         error_impact=ErrorImpact.BLOCKING.value,
     )
     if lifecycle_code is not None:
@@ -7719,6 +7726,10 @@ def _native_terminal_start_error_payload(
             message = _terminal_exit_summary(exc.instance, runtime_name, before_thread=False)
             if output:
                 message += f"\n{runtime_name} startup terminal output:\n{output}"
+    elif isinstance(exc, TerminalLaunchPrerequisiteError):
+        # The raise site composes a client-safe message naming the broken host
+        # prerequisite and its repair.
+        message = f"Native {runtime_name} terminal failed to start: {exc}"
     elif isinstance(exc, ClaudeNativeHookInterpreterMismatchError):
         message = (
             "Claude Code is Windows-native, but Omnigent is running under WSL. "
