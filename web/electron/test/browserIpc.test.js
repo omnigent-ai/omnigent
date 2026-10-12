@@ -55,7 +55,7 @@ describe("browser IPC Arca context", () => {
       }),
       getAgentNavigationHintForEvent: () => {
         hints++;
-        return "Reconnect to Arca";
+        return "Run on Arca";
       },
     });
     const invoke = (agent) =>
@@ -64,7 +64,7 @@ describe("browser IPC Arca context", () => {
         {},
         { conversationId: "source", url: "http://localhost", opts: { agent } },
       );
-    assert.equal(invoke(true).error, "blocked Reconnect to Arca");
+    assert.equal(invoke(true).error, "blocked Run on Arca");
     assert.equal(invoke(false).error, "blocked");
     allowed = true;
     assert.equal(invoke(true).ok, true);

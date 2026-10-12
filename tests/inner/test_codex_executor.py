@@ -4812,13 +4812,15 @@ async def test_codex_cli_version_times_out_and_kills_proc(
         b"codex-cli 0.140.0-alpha.19\n",
         b"codex-cli 0.140.0\n",
         b"codex-cli 0.141.0\n",
+        b"codex-cli 0.145.9\n",
         b"codex-cli 0.146.1-alpha.1\n",
-        b"codex-cli 0.146.1\n",
-        b"codex-cli 1.0.0\n",
+        b"codex-cli 0.159.2-alpha.1\n",
+        b"codex-cli 0.159.2-dev.1\n",
+        b"codex-cli 0.146.0.post1\n",
         b"dependency 0.146.0 codex-cli 0.146.0\n",
     ],
 )
-async def test_brokered_codex_version_gate_rejects_unknown_wire_versions_before_launch(
+async def test_brokered_codex_version_gate_rejects_old_and_unstable_versions_before_launch(
     monkeypatch: pytest.MonkeyPatch,
     output: bytes,
 ) -> None:
@@ -4831,11 +4833,22 @@ async def test_brokered_codex_version_gate_rejects_unknown_wire_versions_before_
         await _require_brokered_codex_version("/usr/local/bin/codex")
 
 
-async def test_brokered_codex_version_gate_accepts_tested_1460(
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"codex-cli 0.146.0\n",
+        b"codex-cli 0.146.1\n",
+        b"codex-cli 0.154.0\n",
+        b"codex-cli 0.159.2\n",
+        b"codex-cli 1.0.0\n",
+    ],
+)
+async def test_brokered_codex_version_gate_accepts_stable_releases_from_0146(
     monkeypatch: pytest.MonkeyPatch,
+    output: bytes,
 ) -> None:
     async def _fake_exec(*_args: Any, **_kwargs: Any) -> _FakeVersionProcess:
-        return _FakeVersionProcess(stdout=b"codex-cli 0.146.0\n")
+        return _FakeVersionProcess(stdout=output)
 
     monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
 

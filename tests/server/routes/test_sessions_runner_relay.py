@@ -3304,6 +3304,8 @@ async def test_relay_persist_error_once_emits_debug_row() -> None:
     assert row["session_id"] == "conv_test"
     assert row["attributes"]["code"] == "pi_credentials_unresolved"
     assert row["attributes"]["source"] == "execution"
+    assert row["attributes"]["item_id"] == "item_test"
+    assert row["attributes"]["response_id"] == "resp_test"
     # level is None for a destructive error; it must not appear in attributes.
     assert "level" not in row["attributes"] or row["attributes"]["level"] is None
     # message text must never reach the debug table

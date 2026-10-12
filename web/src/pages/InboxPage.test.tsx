@@ -40,15 +40,22 @@ vi.mock("@/components/blocks/ApprovalCard", () => ({
     status,
     allowAutoMode,
     onSubmit,
+    requester,
   }: {
     elicitationId: string;
     message: string;
     status: string;
     allowAutoMode?: boolean;
     onSubmit: (id: string, action: "accept" | "decline", content?: Record<string, unknown>) => void;
+    requester?: { sessionId: string; ancestorSessionId: string } | null;
   }) => (
     <div data-testid="approval-card" data-status={status}>
       <span>{message}</span>
+      {requester && (
+        <span data-testid="approval-card-requester">
+          {requester.sessionId} under {requester.ancestorSessionId}
+        </span>
+      )}
       <button type="button" onClick={() => onSubmit(elicitationId, "accept")}>
         Stub Accept
       </button>
@@ -267,7 +274,7 @@ describe("InboxPage approval items", () => {
     const row = conversation({ id: "sess_1" });
     vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
     vi.mocked(sessionsApi.getSession).mockResolvedValue({
-      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+      pendingElicitations: [rawElicitation("eli_1", "Claude wants to call **Bash**")],
     } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
     renderPage();
 
@@ -277,6 +284,29 @@ describe("InboxPage approval items", () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(item).toHaveAttribute("data-expanded", "false"));
     expect(screen.queryByTestId("approval-card")).not.toBeInTheDocument();
+    // The collapsed row previews the same gating message with its bold tool
+    // name, not the raw `**Bash**` markers.
+    expect(within(toggle).getByText("Bash", { selector: "strong" })).toBeInTheDocument();
+    expect(toggle.textContent).not.toContain("**");
+  });
+
+  it("previews a policy prompt's command verbatim in the collapsed row", async () => {
+    // WHY: only the bridges' `**<tool>**` message is formatted; a balanced `**`
+    // inside a command the user is approving must not be read as emphasis.
+    const message = "Agent wants to call sys_os_shell('ls **/vendor/**'). Approve?";
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", message)],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-item");
+    const toggle = within(item).getByRole("button", { name: /My Session/ });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(item).toHaveAttribute("data-expanded", "false"));
+    expect(toggle.textContent).toContain(message);
+    expect(toggle.querySelector("strong")).toBeNull();
   });
 
   it("submits an approve verdict via approve() and flips the card to responded", async () => {
@@ -410,6 +440,22 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_child", { action: "accept" }),
     );
+    // The card names the child, since the row it surfaced under is the parent.
+    expect(screen.getByTestId("approval-card-requester")).toHaveTextContent("child under parent");
+  });
+
+  it("does not attribute a session's own prompt to a sub-agent", async () => {
+    // WHY: only mirrored prompts carry a requester; a row's own prompt must
+    // not read as coming from a sub-agent.
+    const row = conversation({ id: "parent" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_own", "Own approval?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    expect(await screen.findByRole("button", { name: "Stub Accept" })).toBeInTheDocument();
+    expect(screen.queryByTestId("approval-card-requester")).toBeNull();
   });
 });
 

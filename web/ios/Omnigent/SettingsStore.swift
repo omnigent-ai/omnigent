@@ -3,7 +3,20 @@ import Foundation
 @MainActor
 final class SettingsStore: ObservableObject {
   @Published var serverURL: String? {
-    didSet { defaults.set(serverURL, forKey: Keys.serverURL) }
+    didSet {
+      defaults.set(serverURL, forKey: Keys.serverURL)
+      // Choosing another server ends a refused server's suppression.
+      if let suppressed = autoOpenSuppressedServer, suppressed != serverURL {
+        autoOpenSuppressedServer = nil
+      }
+    }
+  }
+
+  /// The saved server whose last sign-in was refused: still the Connect prefill, but not
+  /// reopened on launch until it connects successfully or another server is chosen.
+  private var autoOpenSuppressedServer: String? {
+    get { defaults.string(forKey: Keys.autoOpenSuppressedServer) }
+    set { defaults.set(newValue, forKey: Keys.autoOpenSuppressedServer) }
   }
 
   @Published private(set) var recentServers: [String] {
@@ -20,7 +33,9 @@ final class SettingsStore: ObservableObject {
       // saved/recent server, so a deep link to `localhost:8000` always hits the
       // unknown-server consent path (not the in-place route for a known server).
       if ProcessInfo.processInfo.arguments.contains("--omnigent-reset-state") {
-        for key in [Keys.serverURL, Keys.recentServers, Keys.allowedProtocols] {
+        for key in [
+          Keys.serverURL, Keys.recentServers, Keys.allowedProtocols, Keys.autoOpenSuppressedServer,
+        ] {
           defaults.removeObject(forKey: key)
         }
       }
@@ -41,6 +56,35 @@ final class SettingsStore: ObservableObject {
       scope == context.scope
     else { return }
     serverURL = nil
+  }
+
+  /// After signing out of an OIDC server, don't reconnect to it on relaunch. Its grant is per
+  /// origin, so any saved URL on that origin stops; recents stay for an explicit reconnect.
+  func stopAutoOpening(oidcServer url: URL) {
+    guard let saved = serverURL,
+      URL(string: saved)?.omnigentOriginIdentity == url.omnigentOriginIdentity
+    else { return }
+    serverURL = nil
+  }
+
+  /// After an OIDC server refuses a sign-in, keep it as the Connect prefill but don't reopen it
+  /// on launch, which would only show the refusal again.
+  func suppressAutoOpening(oidcServer url: URL) {
+    guard let saved = serverURL,
+      URL(string: saved)?.omnigentOriginIdentity == url.omnigentOriginIdentity
+    else { return }
+    autoOpenSuppressedServer = saved
+  }
+
+  /// The saved server to open on launch; nil when there is none or its sign-in was refused.
+  var autoOpenServerURL: String? {
+    guard let saved = serverURL, saved != autoOpenSuppressedServer else { return nil }
+    return saved
+  }
+
+  /// A server loaded: a refusal recorded for it no longer applies.
+  func connectionSucceeded() {
+    autoOpenSuppressedServer = nil
   }
 
   func rememberRecentServer(_ url: URL) {
@@ -86,6 +130,7 @@ final class SettingsStore: ObservableObject {
     static let serverURL = "omnigent.serverURL"
     static let recentServers = "omnigent.recentServers"
     static let allowedProtocols = "omnigent.allowedProtocols"
+    static let autoOpenSuppressedServer = "omnigent.autoOpenSuppressedServer"
   }
 }
 

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   Dialog,
@@ -8,6 +8,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { quoteShellArgument } from "@/lib/shell";
 import { CliCommandBlock } from "./CliCommandBlock";
@@ -26,8 +29,7 @@ const HOST_OWNER_ARCA_DESCRIPTION =
   "This session's Arca host is offline. Reconnect it below, or run the command from a terminal.";
 
 const HOST_VIEWER_DESCRIPTION =
-  "This session's host machine is offline and only its owner can reconnect it. " +
-  "Clone the session to continue in a copy you own.";
+  "This session's host machine is offline and only its owner can reconnect it.";
 
 const RUN_DESCRIPTION =
   "Run the command below from the machine where you started this session to reconnect.";
@@ -181,6 +183,22 @@ export function ReconnectSessionDialog({
   };
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
+  const [selectedTab, setSelectedTab] = useState<string>();
+  const { forkDisabledReason, switchHostDisabledReason } = useSessionActionRestrictions(
+    conversationId,
+    { hostId: sourceHostId },
+  );
+  // Loading never disables Clone: a disabled trigger would hand initial focus
+  // to Reconnect and activate it before the capability check finishes.
+  const forkRestriction =
+    forkDisabledReason === SESSION_ACTIONS_LOADING ? undefined : forkDisabledReason;
+  useEffect(() => {
+    if (!open) setSelectedTab(undefined);
+    else if (forkRestriction) setSelectedTab("reconnect");
+  }, [open, forkRestriction]);
+  // Loading stays out of the guidance, but the disabled action's tooltip explains the wait.
+  const switchHostRestriction =
+    switchHostDisabledReason === SESSION_ACTIONS_LOADING ? undefined : switchHostDisabledReason;
   const isHostReconnect = state === "host_offline";
   const canReconnectThisMachine = isHostReconnect && isOwner && localReconnect != null;
   const canReconnectArca = isHostReconnect && isOwner && arcaReconnect != null;
@@ -189,6 +207,8 @@ export function ReconnectSessionDialog({
   // CLI command is useless to them. Owners of both states, and anyone
   // on a local_stranded session, get a command.
   const showCommand = isOwner || !isHostReconnect;
+  const defaultTab = showCommand ? "reconnect" : "clone";
+  const resolvedTab = forkRestriction ? "reconnect" : (selectedTab ?? defaultTab);
   const command = buildReconnectCommand({ conversationId, serverUrl, wrapper, harness, state });
   // Titles mirror the unreachable banner's wording ("Host is offline —
   // click to reconnect" / "Agent disconnected — click to reconnect").
@@ -200,7 +220,7 @@ export function ReconnectSessionDialog({
         : canReconnectThisMachine
           ? HOST_OWNER_THIS_MACHINE_DESCRIPTION
           : HOST_OWNER_DESCRIPTION
-      : HOST_VIEWER_DESCRIPTION
+      : `${HOST_VIEWER_DESCRIPTION} ${forkRestriction ?? "Clone the session to continue in a copy you own."}`
     : RUN_DESCRIPTION;
   return (
     <>
@@ -215,10 +235,11 @@ export function ReconnectSessionDialog({
               keeps the dialog described for screen readers. */}
             <DialogDescription className="sr-only">{description}</DialogDescription>
           </DialogHeader>
-          {/* Uncontrolled tabs: DialogContent unmounts on close, so the
-            default re-applies on every open. */}
+          {/* Restrictions can arrive after opening Clone; preserve the form
+            while moving the user to Reconnect. Closing resets the selection. */}
           <Tabs
-            defaultValue={showCommand ? "reconnect" : "clone"}
+            value={resolvedTab}
+            onValueChange={setSelectedTab}
             className="flex min-h-0 flex-1 flex-col gap-4"
             componentId="reconnect.tabs"
           >
@@ -226,9 +247,19 @@ export function ReconnectSessionDialog({
               <TabsTrigger value="reconnect" data-testid="reconnect-session-tab-reconnect">
                 Reconnect
               </TabsTrigger>
-              <TabsTrigger value="clone" data-testid="reconnect-session-tab-clone">
-                Clone
-              </TabsTrigger>
+              <DisabledActionTooltip
+                reason={forkRestriction}
+                label="Clone session"
+                className="h-full flex-1 items-center"
+              >
+                <TabsTrigger
+                  value="clone"
+                  data-testid="reconnect-session-tab-clone"
+                  disabled={!!forkRestriction}
+                >
+                  Clone
+                </TabsTrigger>
+              </DisabledActionTooltip>
             </TabsList>
             <TabsContent value="reconnect" className="flex flex-col gap-4">
               <p
@@ -290,19 +321,27 @@ export function ReconnectSessionDialog({
               {isHostReconnect && isOwner && (
                 <div className="flex flex-col gap-2 border-t pt-4">
                   <p className="text-ui text-muted-foreground">
-                    Can't bring that machine back? Move the session to another one instead.
+                    {switchHostRestriction ??
+                      "Can't bring that machine back? Move the session to another one instead."}
                   </p>
-                  <Button
-                    variant="outline"
+                  <DisabledActionTooltip
+                    reason={switchHostDisabledReason}
+                    label="Switch host"
                     className="self-start"
-                    data-testid="reconnect-session-switch-host"
-                    onClick={() => {
-                      setSwitchOpen(true);
-                      onOpenChange(false);
-                    }}
                   >
-                    Switch host
-                  </Button>
+                    <Button
+                      variant="outline"
+                      className="self-start"
+                      data-testid="reconnect-session-switch-host"
+                      disabled={!!switchHostDisabledReason}
+                      onClick={() => {
+                        setSwitchOpen(true);
+                        onOpenChange(false);
+                      }}
+                    >
+                      Switch host
+                    </Button>
+                  </DisabledActionTooltip>
                 </div>
               )}
             </TabsContent>

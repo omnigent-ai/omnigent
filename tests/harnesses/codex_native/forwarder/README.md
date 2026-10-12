@@ -8,6 +8,7 @@ parameterization produces additional collected cases.
 | --- | --- | ---: |
 | [test_compaction.py](test_compaction.py) | Compaction | 8 |
 | [test_delivery.py](test_delivery.py) | Delivery | 15 |
+| [test_delivery_limits.py](test_delivery_limits.py) | Upload limits and completion after oversized events | 3 |
 | [test_deltas.py](test_deltas.py) | Deltas | 14 |
 | [test_elicitation.py](test_elicitation.py) | Elicitation | 5 |
 | [test_health.py](test_health.py) | Health | 4 |
@@ -28,3 +29,9 @@ module stay beside their tests. Search a retained test name to find an old failu
 rg 'def test_name' tests/harnesses/codex_native/forwarder
 uv run --no-sync pytest tests/harnesses/codex_native/forwarder --reruns 0 -n 4 --dist loadfile
 ```
+
+The delivery-limit tests use real HTTPX encoding with a transport that models an
+early body rejection as a read error. They verify that tool output is capped
+before upload, other events over the 10 MiB wire limit are preserved in the
+bridge's `dead_letter.jsonl`, and later completion clears the active turn and
+publishes idle. They also cover UTF-8, JSON escaping, and the exact byte boundary.

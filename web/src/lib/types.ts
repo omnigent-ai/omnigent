@@ -379,7 +379,7 @@ export interface Session {
   subagentRoutingOverride?: "on" | "off" | null;
   /**
    * Whether the owner opted into letting people with *view* (read-only)
-   * access browse this session's workspace files (the Files/Changes/GitHub
+   * access browse this session's workspace files (the Files/Changes/Pull Requests
    * surfaces and the file contents behind them). `false` by default — a
    * read grant shares the conversation, not the raw filesystem. Owner-set
    * from the share dialog; the rail reads it to decide whether to mount the

@@ -956,6 +956,81 @@ def _wrap_client_for_reasoning_models(client: AsyncOpenAIClient) -> AsyncOpenAIC
     return client
 
 
+def _is_plain_json(value: object) -> bool:
+    """Return whether *value* is acyclic JSON: scalars, lists, and str-keyed dicts.
+
+    A cycle returns ``False``, so the caller falls back to the client's normal
+    path; a node shared by two parents is fine, as it is for ``json.dumps``.
+    """
+    on_path: set[int] = set()
+    stack: list[tuple[object, bool]] = [(value, False)]
+    while stack:
+        node, leaving = stack.pop()
+        if leaving:
+            on_path.discard(id(node))
+            continue
+        if isinstance(node, (dict, list)):
+            if id(node) in on_path:
+                return False
+            on_path.add(id(node))
+            stack.append((node, True))
+            if isinstance(node, dict):
+                if not all(isinstance(key, str) for key in node):
+                    return False
+                stack.extend((item, False) for item in node.values())
+            else:
+                stack.extend((item, False) for item in node)
+        elif node is not None and not isinstance(node, (str, int, float, bool)):
+            return False
+    return True
+
+
+def _history_via_extra_body(kwargs: dict[str, Any], field: str) -> dict[str, Any]:
+    """Move the plain-JSON history list *field* into ``extra_body``.
+
+    The client merges ``extra_body`` into the request body as-is, after its
+    type-driven param transform, so the request JSON is unchanged.
+
+    :param kwargs: Keyword arguments for a ``create`` call.
+    :param field: History parameter, ``"input"`` or ``"messages"``.
+    :returns: Rewritten kwargs, or *kwargs* itself when the value is not a
+        plain-JSON list or ``extra_body`` already sets *field*.
+    """
+    value = kwargs.get(field)
+    extra = kwargs.get("extra_body")
+    if not isinstance(value, list) or not value:
+        return kwargs
+    if extra is not None and (not isinstance(extra, dict) or field in extra):
+        return kwargs
+    if not _is_plain_json(value):
+        return kwargs
+    return {**kwargs, field: [], "extra_body": {**(extra or {}), field: value}}
+
+
+def _skip_history_transform(resource: object, field: str) -> None:
+    """Route *resource*'s ``create`` history list around the client's param transform.
+
+    The openai client walks every request param through ``transform`` on each
+    call, ~0.2 ms per history item, so a 400-item session spends ~85 ms per
+    turn before the request is sent. The Responses and Chat Completions param
+    types declare no aliases or formats, so for the plain JSON the Agents SDK
+    builds that walk changes nothing. Shadowing ``create`` on the instance also
+    covers ``with_streaming_response`` / ``with_raw_response``, which wrap it.
+
+    :param resource: ``client.responses`` or ``client.chat.completions``.
+    :param field: History parameter, ``"input"`` or ``"messages"``.
+    """
+    create = getattr(resource, "create", None)
+    if not callable(create) or getattr(create, "_skips_history_transform", False):
+        return
+
+    def _create(*args: Any, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        return create(*args, **_history_via_extra_body(kwargs, field))
+
+    _create._skips_history_transform = True  # type: ignore[attr-defined]
+    object.__setattr__(resource, "create", _create)
+
+
 def _count_output_items(new_items: Sequence[object]) -> int:
     """Count run items that represent user-visible output.
 
@@ -1098,6 +1173,11 @@ class OpenAIAgentsSDKExecutor(Executor):
                 model=model,
             )
         )
+        if client is None:
+            # An injected client stays as the caller built it.
+            _skip_history_transform(getattr(raw_client, "responses", None), "input")
+            _chat = getattr(raw_client, "chat", None)
+            _skip_history_transform(getattr(_chat, "completions", None), "messages")
         # Wrap the chat.completions path to strip list-type delta.content
         # (reasoning blocks emitted by models like Kimi K2).  The SDK's
         # ChatCmplStreamHandler validates delta as str; list input raises

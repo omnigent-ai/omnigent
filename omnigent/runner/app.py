@@ -71,6 +71,8 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.llms.errors import detect_request_size_overflow
+from omnigent.native.failure_telemetry import failure_log_attributes
+from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
 )
@@ -929,7 +931,8 @@ def _side_chat_text_from_content(content: object) -> str:
 
     :param content: A message body's ``content`` list, e.g.
         ``[{"type": "input_text", "text": "and why?"}]``.
-    :returns: The concatenated text, or ``""`` when there is none.
+    :returns: The concatenated text with leading indentation preserved, or
+        ``""`` when there is none.
     """
     if not isinstance(content, list):
         return ""
@@ -939,7 +942,7 @@ def _side_chat_text_from_content(content: object) -> str:
             text = block.get("text")
             if isinstance(text, str) and text:
                 parts.append(text)
-    return "\n".join(parts).strip()
+    return "\n".join(parts).rstrip()
 
 
 def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
@@ -3554,6 +3557,8 @@ def create_runner_app(
                     "runner_turn_failed",
                     session_id=conv_id,
                     harness=harness,
+                    response_id=response_id,
+                    **failure_log_attributes(source.get("failure_context")),
                     **dimensions,
                 ),
             )
@@ -3562,12 +3567,15 @@ def create_runner_app(
     def _is_native_harness(conv_id: str) -> bool:
         return is_native_harness(_session_harness_name(conv_id))
 
-    async def _codex_native_bridge_state_for_session(
+    async def _codex_native_bridge_state_and_dir_for_session(
         conv_id: str,
         *,
         action: str,
         missing_state_log_level: int = logging.WARNING,
-    ) -> CodexNativeBridgeState | None:
+    ) -> tuple[CodexNativeBridgeState | None, Path]:
+        # Resolve the directory and read its state from one label lookup, so a
+        # caller clearing or idling the bridge acts on the same one the state
+        # came from; a second lookup can fall back to conv id and pick another.
         from omnigent.harnesses.codex_native.bridge import (
             CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
@@ -3579,7 +3587,8 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
-        state = read_bridge_state(bridge_dir_for_bridge_id(bridge_id))
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        state = read_bridge_state(bridge_dir)
         if state is None:
             _logger.log(
                 missing_state_log_level,
@@ -3587,7 +3596,7 @@ def create_runner_app(
                 action,
                 conv_id,
             )
-            return None
+            return None, bridge_dir
         if state.session_id != conv_id:
             _logger.warning(
                 "Codex-native %s skipped for %s: bridge belongs to %s.",
@@ -3595,7 +3604,18 @@ def create_runner_app(
                 conv_id,
                 state.session_id,
             )
-            return None
+            return None, bridge_dir
+        return state, bridge_dir
+
+    async def _codex_native_bridge_state_for_session(
+        conv_id: str,
+        *,
+        action: str,
+        missing_state_log_level: int = logging.WARNING,
+    ) -> CodexNativeBridgeState | None:
+        state, _ = await _codex_native_bridge_state_and_dir_for_session(
+            conv_id, action=action, missing_state_log_level=missing_state_log_level
+        )
         return state
 
     async def _codex_native_bridge_dir_for_session(conv_id: str) -> Path:
@@ -3667,6 +3687,7 @@ def create_runner_app(
         harness = _session_harness_name(conv_id)
         if harness not in ("claude-native", "codex-native", "opencode-native"):
             return
+        from omnigent.inner.databricks_executor import DatabricksAuthError
         from omnigent.native.native_cost_popup import launch_cost_popup, wait_for_tmux_client
 
         attached = await asyncio.to_thread(
@@ -3679,6 +3700,10 @@ def create_runner_app(
                 f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=10.0
             )
         except httpx.HTTPError:
+            return
+        except DatabricksAuthError as exc:
+            # Best-effort: the host credential service may be unable to sign the request.
+            _logger.warning("Skipping cost popup repopulation for %s: %s", conv_id, exc)
             return
         if resp.status_code != 200:
             return
@@ -4529,7 +4554,7 @@ def create_runner_app(
         publish_event=_publish_event,
         mark_subagent_terminal_and_wake=_mark_subagent_terminal_and_wake,
         session_sub_agent_names=_session_sub_agent_names,
-        codex_bridge_state_for_session=_codex_native_bridge_state_for_session,
+        codex_bridge_state_for_session=_codex_native_bridge_state_and_dir_for_session,
         client_safe_error_detail=_client_safe_error_detail,
         logger=_logger,
         subagent_work_id_for_session=_subagent_work_id_for_session,
@@ -5009,6 +5034,7 @@ def create_runner_app(
                 _model_override,
                 extra={"session_id": conv},
             )
+        harness_body.update(input_attributes(msg_body))
         # Resolve the effort for this turn — an explicit per-event value, else
         # the session's remembered one — then deliver only what this harness can
         # accept. The persisted effort is validated at create against the union
@@ -6169,8 +6195,13 @@ def create_runner_app(
         if _side_thread_id:
             # Side-chat controls use the parent's bridge but target the child's
             # thread, leaving the parent's turn and message buffer untouched.
+            from websockets.exceptions import WebSocketException
+
             from omnigent.harnesses.codex_native import side_chat
-            from omnigent.harnesses.codex_native.app_server import client_for_transport
+            from omnigent.harnesses.codex_native.app_server import (
+                CodexAppServerResponseError,
+                client_for_transport,
+            )
 
             _side_turn_id = body.get("codex_side_turn_id")
             _side_text = ""
@@ -6219,6 +6250,42 @@ def create_runner_app(
                     await side_chat.submit_side_turn(
                         _side_client, str(_side_thread_id), _side_text
                     )
+            except CodexAppServerResponseError as exc:
+                # Codex refused the turn (e.g. typing into a multi-agent-v2
+                # sub-agent, or a thread that no longer exists).
+                _rpc_message = exc.message or str(exc)
+                _missing = "thread not found" in _rpc_message.casefold()
+                _logger.warning(
+                    "Codex side-chat turn rejected: conv=%s thread=%s error=%s",
+                    conversation_id,
+                    _side_thread_id,
+                    exc,
+                    extra={"session_id": conversation_id},
+                )
+                return JSONResponse(
+                    status_code=404 if _missing else 409,
+                    content={
+                        "error": "codex_side_chat_not_found"
+                        if _missing
+                        else "codex_side_chat_rejected",
+                        "detail": _rpc_message,
+                    },
+                )
+            except (ConnectionError, OSError, TimeoutError, WebSocketException) as exc:
+                _logger.warning(
+                    "Codex side-chat app-server unreachable: conv=%s thread=%s error=%r",
+                    conversation_id,
+                    _side_thread_id,
+                    exc,
+                    extra={"session_id": conversation_id},
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "codex_side_chat_unavailable",
+                        "detail": "The Codex app-server connection was lost; try again.",
+                    },
+                )
             finally:
                 await _side_client.close()
             return Response(status_code=202)
@@ -6231,7 +6298,7 @@ def create_runner_app(
             from omnigent.harnesses.codex_native import side_chat as _side_chat
 
             _side_question = _side_chat.side_chat_question_from_text(
-                _side_chat_text_from_content(body.get("content"))
+                _side_chat_text_from_content(body.get("content")).lstrip()
             )
             if (
                 _side_question is not None
