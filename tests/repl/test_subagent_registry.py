@@ -7,8 +7,8 @@ Covers the two testable seams of the ``↓`` sub-agents feature:
   ``session.child_session.updated`` SSE events onto the host registry,
   filtered by the active conversation id.
 * :func:`_refresh_subagent_tree` — fetches the tree via the shared SDK
-  recursion (``client.sessions.child_sessions_tree``) and seeds the host
-  registry (the deeper-level poll).
+  helper (``client.sessions.child_sessions_tree``, one subtree listing) and
+  seeds the host registry (the deeper-level poll).
 
 The live triggers live in the ``_render_session_event`` closure inside
 ``run_repl`` (not callable in isolation), so a source-inspection guard
@@ -22,7 +22,6 @@ import inspect
 from typing import Any
 
 import pytest
-from omnigent_client._sessions import SessionsNamespace
 from omnigent_ui_sdk.terminal._host import TerminalHost
 
 from omnigent.repl import _repl
@@ -135,30 +134,38 @@ def test_child_terminal_status_settles_out_of_count() -> None:
 
 
 class _FakeSessions:
-    """Minimal stand-in for ``client.sessions`` exposing ``child_sessions``.
+    """Minimal stand-in for ``client.sessions`` exposing ``child_sessions_tree``.
 
-    The recursion + parent tagging now live in the SDK's
-    :meth:`SessionsNamespace.child_sessions_tree`, so the fake reuses that real
-    implementation (bound to this fake's ``child_sessions``) — the REPL→SDK
-    path is exercised end-to-end and ``calls`` still records each level fetched.
+    Flattens an in-memory parent→children map breadth-first the way
+    ``child_sessions_tree`` returns the ``…/descendants`` listing — each row
+    tagged with its ``parent_id`` — and records every call's arguments.
     """
 
     def __init__(self, by_parent: dict[str, list[dict[str, Any]]]) -> None:
         self._by_parent = by_parent
-        self.calls: list[str] = []
-
-    async def child_sessions(self, session_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
-        self.calls.append(session_id)
-        return list(self._by_parent.get(session_id, []))
+        self.calls: list[tuple[str, int, int, bool]] = []
 
     async def child_sessions_tree(
-        self, session_id: str, *, max_depth: int = 3, limit: int = 100
+        self,
+        session_id: str,
+        *,
+        max_depth: int = 3,
+        limit: int = 100,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
-        # Delegate to the real SDK recursion — it only depends on
-        # ``self.child_sessions`` — so we test the actual shared helper.
-        return await SessionsNamespace.child_sessions_tree(
-            self, session_id, max_depth=max_depth, limit=limit
-        )
+        self.calls.append((session_id, max_depth, limit, include_archived))
+        nodes: list[dict[str, Any]] = []
+        frontier = [session_id]
+        depth = 0
+        while frontier and depth < max_depth:
+            depth += 1
+            next_frontier: list[str] = []
+            for parent_id in frontier:
+                for row in self._by_parent.get(parent_id, []):
+                    nodes.append({**row, "parent_id": parent_id, "depth": depth})
+                    next_frontier.append(row["id"])
+            frontier = next_frontier
+        return nodes
 
 
 class _FakeClient:
@@ -167,8 +174,8 @@ class _FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_refresh_subagent_tree_recurses_to_grandchildren() -> None:
-    """The recursive fetch assembles a 2-level tree with correct parents —
+async def test_refresh_subagent_tree_seeds_grandchildren_from_one_fetch() -> None:
+    """One subtree fetch assembles a 2-level tree with correct parents —
     the mechanism that keeps grandchildren live (the SSE stream only carries
     the active session's direct children)."""
     client = _FakeClient(
@@ -200,9 +207,8 @@ async def test_refresh_subagent_tree_recurses_to_grandchildren() -> None:
         ("conv_grand", "conv_child", 2),
     ]
     assert host.active_subagent_count() == 2
-    # Both the root and the discovered child were queried (recursion).
-    assert "conv_main" in client.sessions.calls
-    assert "conv_child" in client.sessions.calls
+    # The whole tree came from a single root-scoped request.
+    assert client.sessions.calls == [("conv_main", _repl._MAX_SUBAGENT_TREE_DEPTH, 100, False)]
 
 
 @pytest.mark.asyncio
@@ -218,8 +224,10 @@ async def test_refresh_subagent_tree_respects_depth_cap() -> None:
     host = _host()
     await _refresh_subagent_tree(client, host, "conv_main", max_depth=1)  # type: ignore[arg-type]
     ids = {n.session_id for n, _ in host.subagent_tree()}
-    assert ids == {"c1"}  # only depth-1 children fetched
-    assert "c1" not in client.sessions.calls  # never recursed into c1
+    assert ids == {"c1"}  # only depth-1 children surfaced
+    assert client.sessions.calls == [
+        ("conv_main", 1, 100, False)
+    ]  # the cap travels with the request
 
 
 def test_run_repl_wires_subagent_plumbing() -> None:

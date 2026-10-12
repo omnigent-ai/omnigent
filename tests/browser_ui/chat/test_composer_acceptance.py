@@ -72,6 +72,24 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     page.add_init_script("localStorage.setItem('omnigent:default-workspace-panel', 'open')")
     is_mobile = viewport_width < 768
     chat.contract.json("/v1/sessions/acceptance-child/child_sessions", {"data": []})
+    acceptance_child = {
+        "id": "acceptance-child",
+        "busy": True,
+        "title": "Review changes",
+        "task_summary": "Review changes",
+        "tool": "agent",
+        "labels": {},
+    }
+    # The Agents panel loads the whole subtree in one request; the composer
+    # pill still reads the root's own child list.
+    chat.contract.json(
+        f"/v1/sessions/{session_id}/descendants",
+        {
+            "data": [{**acceptance_child, "parent_session_id": session_id, "depth": 1}],
+            "has_more": False,
+            "last_id": "acceptance-child",
+        },
+    )
     chat.contract.json(
         f"/v1/sessions/{session_id}/resources/environments/default",
         {
@@ -133,20 +151,7 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     )
     page.route(
         f"**/v1/sessions/{session_id}/child_sessions",
-        lambda route: route.fulfill(
-            json={
-                "data": [
-                    {
-                        "id": "acceptance-child",
-                        "busy": True,
-                        "title": "Review changes",
-                        "task_summary": "Review changes",
-                        "tool": "agent",
-                        "labels": {},
-                    }
-                ]
-            }
-        ),
+        lambda route: route.fulfill(json={"data": [acceptance_child]}),
     )
     page.emulate_media(color_scheme=theme)
     page.add_init_script(f"localStorage.setItem('web-theme', '{theme}')")

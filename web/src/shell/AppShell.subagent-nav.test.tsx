@@ -62,13 +62,22 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
-vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
-  // Keep the real module — childSessionsQueryKey, MAX_TREE_DEPTH, and
-  // cachedTreeContains (which reads the query cache seeded below) stay
-  // genuine; only the hook is replaced.
-  ...(await importOriginal<typeof UseChildSessionsModule>()),
-  useChildSessions: vi.fn(() => ({ children: [], isLoading: false, error: null })),
-}));
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => {
+  const useChildSessions = vi.fn((_id: string | null, _pollMs?: number | null) => ({
+    children: [] as UseChildSessionsModule.ChildSessionInfo[],
+    isLoading: false,
+    error: null as Error | null,
+  }));
+  return {
+    // Keep the real module — childSessionsQueryKey, MAX_TREE_DEPTH, and
+    // cachedTreeContains (which reads the query cache seeded below) stay
+    // genuine; only the hooks are replaced.
+    ...(await importOriginal<typeof UseChildSessionsModule>()),
+    useChildSessions,
+    // The panel's root hook answers from the same per-id map as the row hook.
+    useSubagentTree: vi.fn((id: string | null) => ({ ...useChildSessions(id), fromTree: false })),
+  };
+});
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   // useRootSessionId stays real: with the snapshot mocked to a
   // top-level session it resolves without fetching, and during the

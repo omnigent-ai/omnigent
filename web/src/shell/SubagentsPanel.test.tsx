@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
+import { type ChildSessionInfo, useChildSessions, useSubagentTree } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
@@ -22,6 +22,7 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // hook itself is replaced.
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
+  useSubagentTree: vi.fn(),
 }));
 
 vi.mock("@/hooks/useSession", () => ({
@@ -49,6 +50,7 @@ vi.mock("@/components/icons/PiIcon", () => ({
 }));
 // Brand icon modules are stubbed below; generic sub-agents use Lucide's bot.
 const useChildSessionsMock = vi.mocked(useChildSessions);
+const useSubagentTreeMock = vi.mocked(useSubagentTree);
 const useSessionMock = vi.mocked(useSession);
 
 interface RenderOptions {
@@ -134,6 +136,10 @@ const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
 
 beforeEach(() => {
   useChildSessionsMock.mockReset();
+  useSubagentTreeMock.mockReset();
+  // The root's subtree hook answers from the same id-keyed map as the
+  // per-row hook, so each case states its tree once.
+  useSubagentTreeMock.mockImplementation((id) => ({ ...useChildSessionsMock(id), fromTree: true }));
   useSessionMock.mockReset();
   // Default: parent's status is idle. Tests override per-case.
   useSessionMock.mockReturnValue({
@@ -758,12 +764,12 @@ describe("SubagentsPanel", () => {
     expect(row.querySelector('[data-harness-icon="pi"]')).toBeNull();
   });
 
-  it("fetches child sessions without polling (push-driven via watch-set)", () => {
+  it("loads the root through the one-shot subtree fetch, without polling", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
 
     renderPanel({ rootSessionId: "conv_root" });
 
-    expect(useChildSessionsMock).toHaveBeenCalledWith("conv_root");
+    expect(useSubagentTreeMock).toHaveBeenCalledWith("conv_root");
     expect(useChildSessionsMock).not.toHaveBeenCalledWith("conv_root", expect.any(Number));
   });
 

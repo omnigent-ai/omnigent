@@ -95,7 +95,11 @@ import {
   type SseStreamResult,
 } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
-import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import {
+  childSessionsQueryKey,
+  invalidateChildSessions,
+  type ChildSessionInfo,
+} from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
@@ -2852,10 +2856,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Mirror the session.status handler: a sub-agent's row lives in its parent's
     // child-sessions list, not the sidebar, so refresh the rail in lockstep.
     const snapshot = queryClient?.getQueryData<Session>(["session", sessionId]);
-    if (snapshot?.parentSessionId) {
-      queryClient?.invalidateQueries({
-        queryKey: childSessionsQueryKey(snapshot.parentSessionId),
-      });
+    if (queryClient && snapshot?.parentSessionId) {
+      void invalidateChildSessions(queryClient, snapshot.parentSessionId);
     }
   },
 
@@ -7484,12 +7486,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // server-computed preview lands without a manual navigate-away.
       if (event.status === "idle" || event.status === "failed") {
         const snapshot = queryClient?.getQueryData<Session>(["session", event.conversationId]);
-        if (snapshot?.parentSessionId) {
+        if (queryClient && snapshot?.parentSessionId) {
           // A child finished: refetch its parent's child list for the row's
           // fresh, server-computed preview.
-          queryClient?.invalidateQueries({
-            queryKey: childSessionsQueryKey(snapshot.parentSessionId),
-          });
+          void invalidateChildSessions(queryClient, snapshot.parentSessionId);
         } else {
           // Root (or cold-cache) session: its own snapshot carries the
           // rail's "main" preview text.
@@ -7749,10 +7749,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Sub-agent spawn signal. Invalidate the parent's child-sessions
       // query so the execution-log panel re-fetches and renders the
       // new child without waiting for the next poll or manual refresh.
-      if (event.conversationId) {
-        queryClient?.invalidateQueries({
-          queryKey: childSessionsQueryKey(event.conversationId),
-        });
+      if (queryClient && event.conversationId) {
+        void invalidateChildSessions(queryClient, event.conversationId);
       }
       return;
     case "session_superseded":
@@ -7812,10 +7810,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // last_message_preview (its reply lives in the tmux pane, not the
       // runner's in-process history). Refetch the parent's child list so the
       // server-computed preview lands instead of staying stale.
-      if (event.child.busy === false && event.child.last_message_preview === undefined) {
-        queryClient?.invalidateQueries({
-          queryKey: childSessionsQueryKey(event.conversationId),
-        });
+      if (
+        queryClient &&
+        event.child.busy === false &&
+        event.child.last_message_preview === undefined
+      ) {
+        void invalidateChildSessions(queryClient, event.conversationId);
       }
       return;
     case "session_changed_files_invalidated":

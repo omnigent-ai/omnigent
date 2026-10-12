@@ -358,6 +358,7 @@ from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ChildSessionSummary,
     CreatedSessionResponse,
+    DescendantSessionSummary,
     ElicitationRequestEvent,
     ElicitationRequestParams,
     ElicitationResult,
@@ -11414,16 +11415,7 @@ async def _child_session_summaries_from_conversations(
     """
     if not children:
         return []
-    child_ids = [child.id for child in children]
-    message_items_by_child = await asyncio.to_thread(
-        conv_store.list_latest_message_items_for_conversations,
-        child_ids,
-        10,
-    )
-    previews = {
-        child_id: _latest_message_preview(message_items)
-        for child_id, message_items in message_items_by_child.items()
-    }
+    previews = await _latest_message_previews(conv_store, [child.id for child in children])
     return [
         _child_session_summary_from_conversation(
             child,
@@ -11432,6 +11424,57 @@ async def _child_session_summaries_from_conversations(
         )
         for child in children
     ]
+
+
+async def _latest_message_previews(
+    conv_store: ConversationStore,
+    conversation_ids: list[str],
+) -> dict[str, str | None]:
+    """
+    Read the newest message preview of each conversation in one batched query.
+
+    :param conv_store: Conversation store used for the batched message read.
+    :param conversation_ids: Conversations to preview.
+    :returns: Preview text (or ``None``) keyed by conversation id.
+    """
+    message_items_by_child = await asyncio.to_thread(
+        conv_store.list_latest_message_items_for_conversations,
+        conversation_ids,
+        10,
+    )
+    return {
+        child_id: _latest_message_preview(message_items)
+        for child_id, message_items in message_items_by_child.items()
+    }
+
+
+async def _descendant_session_summaries_from_conversations(
+    rows: list[tuple[Conversation, str, int]],
+    conv_store: ConversationStore,
+) -> list[DescendantSessionSummary]:
+    """
+    Build subtree summaries with one batched message-preview lookup.
+
+    The subtree counterpart of
+    :func:`_child_session_summaries_from_conversations`: each row names its
+    own parent and depth, so one page can span several parents.
+
+    :param rows: ``(conversation, parent_id, depth)`` triples in listing
+        order, from ``GET /v1/sessions/{id}/descendants``.
+    :param conv_store: Conversation store used for the batched message read.
+    :returns: One :class:`DescendantSessionSummary` per input row, preserving
+        input order.
+    """
+    if not rows:
+        return []
+    previews = await _latest_message_previews(conv_store, [conv.id for conv, _, _ in rows])
+    summaries: list[DescendantSessionSummary] = []
+    for conv, parent_id, depth in rows:
+        summary = _child_session_summary_from_conversation(conv, parent_id, previews.get(conv.id))
+        summaries.append(
+            DescendantSessionSummary(**dict(summary), depth=depth, archived=conv.archived)
+        )
+    return summaries
 
 
 async def _handle_mcp_tools_call(

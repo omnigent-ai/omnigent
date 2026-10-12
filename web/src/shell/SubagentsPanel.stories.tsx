@@ -1,6 +1,10 @@
 import type { Decorator, Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent } from "storybook/test";
-import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import {
+  childSessionsQueryKey,
+  subagentTreeQueryKey,
+  type ChildSessionInfo,
+} from "@/hooks/useChildSessions";
 import type { Session } from "@/lib/types";
 import { StoryQueryRouter } from "@/storybook/StoryProviders";
 import { SubagentsPanel } from "./SubagentsPanel";
@@ -58,6 +62,8 @@ function panelEnvironment({
       route={`/c/${activeId}`}
       seed={(queryClient) => {
         queryClient.setQueryData(["session", session.id], session);
+        // A settled subtree query keeps the panel from fetching in Storybook.
+        queryClient.setQueryData(subagentTreeQueryKey(session.id), tree[session.id] ?? []);
         for (const [id, children] of Object.entries(tree)) {
           queryClient.setQueryData(childSessionsQueryKey(id), children);
         }

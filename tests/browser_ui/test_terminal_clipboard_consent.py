@@ -292,10 +292,9 @@ def clipboard_browser(
             "terminals": [],
         },
     )
+    any_session = "|".join(map(re.escape, session_ids))
     browser_contract.json(
-        re.compile(
-            rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/child_sessions(?:\?.*)?$"
-        ),
+        re.compile(rf"/v1/sessions/({any_session})/(?:child_sessions|descendants)(?:\?.*)?$"),
         empty_list,
     )
     browser_contract.json(

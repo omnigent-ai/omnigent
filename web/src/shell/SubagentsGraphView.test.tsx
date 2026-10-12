@@ -3,7 +3,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
+import { type ChildSessionInfo, useChildSessions, useSubagentTree } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import {
   buildTree,
@@ -35,6 +35,7 @@ vi.mock("./SubagentsGraphView", () => ({
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
+  useSubagentTree: vi.fn(),
 }));
 
 vi.mock("@/hooks/useSession", () => ({
@@ -58,6 +59,7 @@ vi.mock("@/components/icons/OttoIcon", () => ({
 }));
 
 const useChildSessionsMock = vi.mocked(useChildSessions);
+const useSubagentTreeMock = vi.mocked(useSubagentTree);
 const useSessionMock = vi.mocked(useSession);
 
 // ---------------------------------------------------------------------------
@@ -138,6 +140,10 @@ function leaf(id: string, overrides: Partial<TreeNode> = {}): TreeNode {
 
 beforeEach(() => {
   useChildSessionsMock.mockReset();
+  useSubagentTreeMock.mockReset();
+  // The root's subtree hook answers from the same id-keyed map as the
+  // per-node collector, so each case states its tree once.
+  useSubagentTreeMock.mockImplementation((id) => ({ ...useChildSessionsMock(id), fromTree: true }));
   useSessionMock.mockReset();
   useSessionMock.mockReturnValue(defaultSession());
 });

@@ -11,7 +11,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { AgentCard } from "@/components/AgentCard";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { childSessionsQueryKey } from "@/hooks/useChildSessions";
+import { invalidateChildSessions } from "@/hooks/useChildSessions";
 import { createSession } from "@/lib/sessionsApi";
 
 // Title sentinel marking a user-added agent. Mirrors the server's
@@ -90,9 +90,7 @@ export function AddAgentDialog({
       });
       // Refresh the rail so the new child appears immediately, then jump
       // into it for the first message.
-      await queryClient.invalidateQueries({
-        queryKey: childSessionsQueryKey(parentSessionId),
-      });
+      await invalidateChildSessions(queryClient, parentSessionId);
       handleOpenChange(false);
       navigate(`/c/${session.id}`);
     } catch (e) {

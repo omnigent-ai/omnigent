@@ -6580,8 +6580,8 @@ def _apply_child_session_event(
     ``session.child_session.updated`` (merge the partial summary), but only
     when the event's carrier ``conversation_id`` is the active session — so a
     relayed grandchild event riding an ancestor stream doesn't get attached
-    to the wrong parent. Deeper tree levels are populated by the recursive
-    ``child_sessions`` poll (:func:`_refresh_subagent_tree`), not these events.
+    to the wrong parent. Deeper tree levels are populated by the subtree
+    poll (:func:`_refresh_subagent_tree`), not these events.
 
     :param event: The decoded SSE event from the stream pump.
     :param active_conversation_id: The session the REPL is currently
@@ -6624,16 +6624,17 @@ async def _refresh_subagent_tree(
     max_depth: int = _MAX_SUBAGENT_TREE_DEPTH,
     generation: int | None = None,
 ) -> None:
-    """Recursively fetch the sub-agent tree under *root_id* and push it into
-    the host registry.
+    """Fetch the sub-agent tree under *root_id* and push it into the host
+    registry.
 
-    Delegates the recursion to :meth:`SessionsNamespace.child_sessions_tree`
-    (the same helper the SDK ``subtree_busy`` rollup uses), which walks
-    ``GET …/child_sessions`` breadth-first capped at ``MAX_TREE_DEPTH`` and tags
-    each row with the parent it was queried under so the host can reconstruct
-    the hierarchy. The SSE stream only delivers the active session's direct
-    children, so this poll is what keeps grandchildren live. A failed fetch is
-    swallowed, leaving the prior tree in place rather than crashing the REPL.
+    Delegates to :meth:`SessionsNamespace.child_sessions_tree` (the same
+    helper the SDK ``subtree_busy`` rollup uses), which reads
+    ``GET …/descendants`` page by page — one request per page, not per node —
+    capped at ``MAX_TREE_DEPTH``, with each row tagged with its parent so the
+    host can reconstruct the hierarchy. The SSE stream only delivers the
+    active session's direct children, so this poll is what keeps grandchildren
+    live. A failed fetch is swallowed, leaving the prior tree in place rather
+    than crashing the REPL.
 
     :param generation: :attr:`TerminalHost.subagent_generation` captured before
         the fetch began. Passed through to :meth:`TerminalHost.seed_subagent_tree`
@@ -6641,8 +6642,6 @@ async def _refresh_subagent_tree(
         mid-fetch is dropped instead of resurrecting the cleared nodes.
     """
     try:
-        # Recursion + parent_id tagging now live in the shared SDK helper so the
-        # CLI tree and the SDK rollup (subtree_busy) walk identical data.
         nodes = await client.sessions.child_sessions_tree(root_id, max_depth=max_depth)
     except Exception:  # noqa: BLE001 — best-effort poll: a failed fetch leaves the prior tree in place rather than crashing the REPL
         return

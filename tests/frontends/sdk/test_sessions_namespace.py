@@ -1182,22 +1182,64 @@ async def test_fork_404_raises() -> None:
 # ── child_sessions_tree() / subtree_busy() ───────────────────────────
 
 
+def _flatten_tree(
+    tree: dict[str, list[dict[str, Any]]], root: str, *, max_depth: int
+) -> list[dict[str, Any]]:
+    """Breadth-first ``DescendantSessionSummary`` rows for a parent→children map."""
+    rows: list[dict[str, Any]] = []
+    frontier = [root]
+    depth = 0
+    while frontier and depth < max_depth:
+        depth += 1
+        next_frontier: list[str] = []
+        for parent_id in frontier:
+            for child in tree.get(parent_id, []):
+                rows.append({**child, "parent_session_id": parent_id, "depth": depth})
+                next_frontier.append(child["id"])
+        frontier = next_frontier
+    return rows
+
+
 def _tree_handler(
     tree: dict[str, list[dict[str, Any]]],
+    *,
+    page_size: int | None = None,
+    requests: list[httpx.Request] | None = None,
 ) -> Callable[[httpx.Request], httpx.Response]:
-    """Serve ``GET …/{id}/child_sessions`` from an in-memory parent→children map.
+    """Serve ``GET …/{id}/descendants`` from an in-memory parent→children map.
 
-    The recursion helper queries each node's children with a fresh request, so
-    the map keys are parent ids and the values are the ``ChildSessionSummary``
-    rows that parent returns. Unknown parents return an empty page.
+    Flattens the map breadth-first from the requested session, honouring
+    ``max_depth``, and pages the rows via ``after`` — ``page_size`` rows at a
+    time when set, else the request's ``limit``. Every request is appended to
+    ``requests`` when given, so tests can count calls and inspect params.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if requests is not None:
+            requests.append(request)
         parts = request.url.path.split("/")
-        # …/v1/sessions/<id>/child_sessions
-        assert parts[-1] == "child_sessions"
-        parent_id = parts[-2]
-        return httpx.Response(200, json={"data": tree.get(parent_id, [])})
+        # …/v1/sessions/<id>/descendants
+        assert parts[-1] == "descendants"
+        max_depth = int(request.url.params.get("max_depth", "99"))
+        rows = _flatten_tree(tree, parts[-2], max_depth=max_depth)
+        start = 0
+        after = request.url.params.get("after")
+        if after is not None:
+            position = next((i for i, row in enumerate(rows) if row["id"] == after), None)
+            assert position is not None, f"unknown after cursor: {after!r}"
+            start = position + 1
+        limit = page_size or int(request.url.params.get("limit", "100"))
+        page = rows[start : start + limit]
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": page,
+                "first_id": page[0]["id"] if page else None,
+                "last_id": page[-1]["id"] if page else None,
+                "has_more": start + limit < len(rows),
+            },
+        )
 
     return handler
 
@@ -1207,11 +1249,12 @@ def _child(sid: str, **fields: Any) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_child_sessions_tree_recurses_and_tags_parent() -> None:
-    """The tree helper walks every level and stamps each row with its parent.
+async def test_child_sessions_tree_reads_the_subtree_in_one_request() -> None:
+    """The whole subtree arrives flat from ``…/descendants`` — one request, not
+    one per node — with every row tagged with its parent.
 
-    Failure means the SDK rollup (and the CLI tree it now feeds) loses
-    grandchildren or mis-attaches the hierarchy.
+    Failure means the SDK rollup (and the CLI tree it feeds) loses
+    grandchildren, mis-attaches the hierarchy, or is back to walking per node.
     """
     tree = {
         "root": [_child("a"), _child("b")],
@@ -1219,7 +1262,8 @@ async def test_child_sessions_tree_recurses_and_tags_parent() -> None:
         "a1": [_child("a1x")],
         "b": [],
     }
-    ns, client = _make_namespace(_tree_handler(tree))
+    requests: list[httpx.Request] = []
+    ns, client = _make_namespace(_tree_handler(tree, requests=requests))
     try:
         nodes = await ns.child_sessions_tree("root")
     finally:
@@ -1230,39 +1274,363 @@ async def test_child_sessions_tree_recurses_and_tags_parent() -> None:
     assert by_id["a"]["parent_id"] == "root"
     assert by_id["a1"]["parent_id"] == "a"
     assert by_id["a1x"]["parent_id"] == "a1"
+    assert by_id["a1x"]["depth"] == 3
+    assert len(requests) == 1
+    assert requests[0].url.params["max_depth"] == "3"
+    assert "include_archived" not in requests[0].url.params
 
 
 @pytest.mark.asyncio
 async def test_child_sessions_tree_respects_max_depth() -> None:
-    """``max_depth`` caps descent — depth 1 returns direct children only."""
+    """``max_depth`` is sent to the server and caps descent — depth 1 returns
+    direct children only."""
     tree = {
         "root": [_child("a")],
         "a": [_child("a1")],
     }
-    ns, client = _make_namespace(_tree_handler(tree))
+    requests: list[httpx.Request] = []
+    ns, client = _make_namespace(_tree_handler(tree, requests=requests))
     try:
         nodes = await ns.child_sessions_tree("root", max_depth=1)
     finally:
         await client.aclose()
 
     assert [n["id"] for n in nodes] == ["a"]  # a1 is one level too deep
+    assert requests[0].url.params["max_depth"] == "1"
 
 
 @pytest.mark.asyncio
-async def test_child_sessions_tree_cycle_guard() -> None:
-    """A child pointing back at an ancestor is visited once, not forever."""
-    tree = {
-        "root": [_child("a")],
-        "a": [_child("root"), _child("a1")],  # 'root' is a back-edge
-    }
-    ns, client = _make_namespace(_tree_handler(tree))
+async def test_child_sessions_tree_follows_the_page_cursor() -> None:
+    """A subtree wider than one page is read to its end, not truncated."""
+    tree = {"root": [_child(f"c{i}") for i in range(5)]}
+    requests: list[httpx.Request] = []
+    ns, client = _make_namespace(_tree_handler(tree, page_size=2, requests=requests))
+    try:
+        nodes = await ns.child_sessions_tree("root", limit=2)
+    finally:
+        await client.aclose()
+
+    # Rows without timestamps tie, so siblings fall back to descending id.
+    assert [n["id"] for n in nodes] == [f"c{i}" for i in range(4, -1, -1)]
+    assert [r.url.params.get("after") for r in requests] == [None, "c1", "c3"]
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_walks_past_an_empty_page_that_continues() -> None:
+    """A page whose rows were all filtered out still advances the cursor: the
+    walk follows ``last_id`` instead of treating the empty page as the end."""
+    pages = [
+        {"data": [], "last_id": "filtered", "has_more": True},
+        {
+            "data": [
+                _child("a", parent_session_id="root", depth=1, created_at=10),
+                _child("b", parent_session_id="root", depth=1, created_at=20),
+            ],
+            "last_id": "b",
+            "has_more": False,
+        },
+    ]
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=pages.pop(0))
+
+    ns, client = _make_namespace(handler)
     try:
         nodes = await ns.child_sessions_tree("root")
     finally:
         await client.aclose()
 
-    # 'root' is the seed (already seen) so the back-edge is dropped; 'a1' stays.
-    assert [n["id"] for n in nodes] == ["a", "a1"]
+    # Siblings come back newest-first, whatever order the pages used.
+    assert [n["id"] for n in nodes] == ["b", "a"]
+    assert [r.url.params.get("after") for r in requests] == [None, "filtered"]
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_orders_same_second_siblings_by_descending_id() -> None:
+    """Timestamps have whole-second precision, so a same-second fan-out falls
+    back to descending id for a stable sibling order."""
+    rows = [
+        _child("b", parent_session_id="root", depth=1, created_at=7),
+        _child("c", parent_session_id="root", depth=1, created_at=7),
+        _child("a", parent_session_id="root", depth=1, created_at=7),
+        _child("z", parent_session_id="root", depth=1, created_at=6),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": rows, "last_id": "z", "has_more": False})
+
+    ns, client = _make_namespace(handler)
+    try:
+        nodes = await ns.child_sessions_tree("root")
+    finally:
+        await client.aclose()
+
+    assert [n["id"] for n in nodes] == ["c", "b", "a", "z"]
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_fallback_stops_at_a_back_edge() -> None:
+    """On an older server the per-node walk never re-enters a session it has
+    already listed, so a child that lists its own ancestor terminates."""
+    tree = {
+        "root": [_child("a")],
+        "a": [_child("root"), _child("a1")],
+        "a1": [_child("a")],
+    }
+    requests: list[httpx.Request] = []
+    ns, client = _make_namespace(_legacy_handler(tree, page_size=5, requests=requests))
+    try:
+        nodes = await ns.child_sessions_tree("root")
+    finally:
+        await client.aclose()
+
+    assert [(n["id"], n["parent_id"]) for n in nodes] == [("a", "root"), ("a1", "a")]
+    assert [r.url.path.split("/")[-2] for r in requests[1:]] == ["root", "a", "a1"]
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_hides_settled_archived_rows_unless_asked() -> None:
+    """The server lists archived descendants flagged; by default the walk keeps an
+    archived node only while live work sits beneath it, so the tree the REPL
+    renders stays connected without resurfacing settled archived sub-agents."""
+    tree = {
+        "root": [
+            _child("mid", archived=True),
+            _child("settled", archived=True),
+            _child("working", archived=True, busy=True),
+        ],
+        "mid": [_child("leaf", archived=False)],
+    }
+    requests: list[httpx.Request] = []
+    ns, client = _make_namespace(_tree_handler(tree, requests=requests))
+    try:
+        pruned = await ns.child_sessions_tree("root")
+        everything = await ns.child_sessions_tree("root", include_archived=True)
+        busy = await ns.subtree_busy("root")
+    finally:
+        await client.aclose()
+
+    # Archiving does not end a session's work: a busy archived leaf stays, so
+    # the rollup still reports the subtree busy.
+    assert [n["id"] for n in pruned] == ["working", "mid", "leaf"]
+    assert [n["id"] for n in everything] == ["working", "settled", "mid", "leaf"]
+    assert busy is True
+    assert all("include_archived" not in r.url.params for r in requests)
+
+
+def _legacy_handler(
+    tree: dict[str, list[dict[str, Any]]],
+    *,
+    page_size: int,
+    requests: list[httpx.Request],
+    missing_session: str | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Serve a server that predates ``…/descendants``: that path is an unknown
+    route (FastAPI's bare 404) while ``…/child_sessions`` pages per node."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        parts = request.url.path.split("/")
+        if parts[-1] == "descendants":
+            return httpx.Response(404, json={"detail": "Not Found"})
+        assert parts[-1] == "child_sessions"
+        parent = parts[-2]
+        if parent == missing_session:
+            return httpx.Response(
+                404, json={"error": {"code": "not_found", "message": "Session not found"}}
+            )
+        rows = tree.get(parent, [])
+        start = 0
+        after = request.url.params.get("after")
+        if after is not None:
+            position = next((i for i, row in enumerate(rows) if row["id"] == after), None)
+            assert position is not None, f"unknown after cursor: {after!r}"
+            start = position + 1
+        page = rows[start : start + page_size]
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": page,
+                "first_id": page[0]["id"] if page else None,
+                "last_id": page[-1]["id"] if page else None,
+                "has_more": start + page_size < len(rows),
+            },
+        )
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_falls_back_to_paged_child_lists_on_an_older_server() -> None:
+    """Against a server without ``…/descendants`` the walk still assembles the
+    tree from ``…/child_sessions``, following each node's cursor rather than
+    stopping at its first page."""
+    tree = {
+        "root": [_child("a"), _child("b"), _child("c")],
+        "a": [_child("a1")],
+        "a1": [_child("a1x")],
+    }
+    requests: list[httpx.Request] = []
+    ns, client = _make_namespace(_legacy_handler(tree, page_size=2, requests=requests))
+    try:
+        nodes = await ns.child_sessions_tree("root", limit=2)
+    finally:
+        await client.aclose()
+
+    assert [(n["id"], n["parent_id"], n["depth"]) for n in nodes] == [
+        ("a", "root", 1),
+        ("b", "root", 1),
+        ("c", "root", 1),
+        ("a1", "a", 2),
+        ("a1x", "a1", 3),
+    ]
+    assert [r.url.path.rsplit("/", 1)[1] for r in requests[:1]] == ["descendants"]
+    # Depth-3 rows are leaves of the capped walk, so a1x is never expanded.
+    legacy = [(r.url.path.split("/")[-2], r.url.params.get("after")) for r in requests[1:]]
+    assert legacy == [
+        ("root", None),
+        ("root", "b"),
+        ("a", None),
+        ("b", None),
+        ("c", None),
+        ("a1", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_keeps_a_missing_session_404() -> None:
+    """A 404 carrying the server's not_found code is the session being gone, not
+    a missing route: it is raised as is, without a per-node fallback walk."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            404, json={"error": {"code": "not_found", "message": "Session not found"}}
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(OmnigentError) as excinfo:
+            await ns.child_sessions_tree("gone")
+    finally:
+        await client.aclose()
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    assert [r.url.path.rsplit("/", 1)[1] for r in requests] == ["descendants"]
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_fallback_still_raises_a_missing_session() -> None:
+    """On an older server the fallback walk raises the genuine not-found error."""
+    requests: list[httpx.Request] = []
+    ns, client = _make_namespace(
+        _legacy_handler({}, page_size=5, requests=requests, missing_session="gone")
+    )
+    try:
+        with pytest.raises(OmnigentError) as excinfo:
+            await ns.child_sessions_tree("gone")
+    finally:
+        await client.aclose()
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_stops_on_a_cursor_that_does_not_advance() -> None:
+    """A server that keeps answering ``has_more`` with the same ``last_id`` must
+    not spin the walk forever."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "data": [_child("a", parent_session_id="root", depth=1)],
+                "last_id": "a",
+                "has_more": True,
+            },
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        nodes = await ns.child_sessions_tree("root")
+    finally:
+        await client.aclose()
+
+    assert [n["id"] for n in nodes] == ["a"]
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_stops_on_cursors_that_alternate() -> None:
+    """A server bouncing between two cursors while reporting ``has_more`` is
+    caught by the set of cursors already followed, not just the last one."""
+    pages = [
+        {
+            "data": [_child("a", parent_session_id="root", depth=1)],
+            "last_id": "x",
+            "has_more": True,
+        },
+        {"data": [], "last_id": "y", "has_more": True},
+        {"data": [], "last_id": "x", "has_more": True},
+        {"data": [], "last_id": "y", "has_more": True},
+    ]
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=pages[min(calls - 1, len(pages) - 1)])
+
+    ns, client = _make_namespace(handler)
+    try:
+        nodes = await ns.child_sessions_tree("root")
+    finally:
+        await client.aclose()
+
+    assert [n["id"] for n in nodes] == ["a"]
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_child_sessions_tree_keeps_a_row_repeated_across_pages_once() -> None:
+    """A sibling created mid-walk can push a row onto the next page too; the
+    walk keeps it once and never re-adds the root."""
+    pages = [
+        {
+            "data": [_child("a", parent_session_id="root", depth=1)],
+            "last_id": "a",
+            "has_more": True,
+        },
+        {
+            "data": [
+                _child("a", parent_session_id="root", depth=1),
+                _child("root", parent_session_id="a", depth=2),
+                _child("b", parent_session_id="root", depth=1),
+            ],
+            "last_id": "b",
+            "has_more": False,
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=pages.pop(0))
+
+    ns, client = _make_namespace(handler)
+    try:
+        nodes = await ns.child_sessions_tree("root")
+    finally:
+        await client.aclose()
+
+    assert [n["id"] for n in nodes] == ["b", "a"]
 
 
 @pytest.mark.asyncio

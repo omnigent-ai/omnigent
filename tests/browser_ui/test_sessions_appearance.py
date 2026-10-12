@@ -120,6 +120,7 @@ def sessions_url(appearance_url: str, browser_contract: BrowserContract) -> tupl
             },
         )
         browser_contract.json(f"/v1/sessions/{session_id}/child_sessions", empty_list)
+        browser_contract.json(f"/v1/sessions/{session_id}/descendants", empty_list)
         browser_contract.json(f"/v1/sessions/{session_id}/resources/terminals", empty_list)
         browser_contract.response(f"/v1/sessions/{session_id}/read-state", method="PUT")
         for resource in ("environments/default", "github"):

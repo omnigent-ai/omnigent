@@ -835,8 +835,10 @@ class ConversationStore(ABC):
             filter is disabled. Powers the ``GET /v1/sessions``
             list endpoint.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"`` or
-            ``"updated_at"``.
+        :param sort_by: Column to sort on, ``"created_at"``,
+            ``"updated_at"`` or ``"id"``. Sorting by ``"id"`` pages in
+            primary-key order, which the ``root_conversation_id`` index
+            serves as one range scan; the cursor is then the id itself.
         :param search_query: Case-insensitive substring filter on
             the conversation title OR conversation item content
             (``search_text``). ``None`` or empty string disables

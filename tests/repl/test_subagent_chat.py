@@ -26,7 +26,6 @@ from typing import Any
 import pytest
 from omnigent_client import OmnigentError
 from omnigent_client._sessions import Session as SessionSnapshot
-from omnigent_client._sessions import SessionsNamespace
 from omnigent_ui_sdk.terminal._host import TerminalHost
 
 from omnigent.repl._repl import (
@@ -189,22 +188,35 @@ def test_should_discover_runs_discovery_on_root_change() -> None:
 
 
 class _DiscoverySessions:
-    """``client.sessions`` stub serving a fixed child-session snapshot."""
+    """``client.sessions`` stub serving a fixed child-session snapshot.
+
+    Flattens the parent→children map breadth-first with ``parent_id`` tags —
+    the shape ``child_sessions_tree`` returns from one ``…/descendants`` walk.
+    """
 
     def __init__(self, by_parent: dict[str, list[dict[str, Any]]]) -> None:
         self._by_parent = by_parent
 
-    async def child_sessions(self, session_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
-        return list(self._by_parent.get(session_id, []))
-
     async def child_sessions_tree(
-        self, session_id: str, *, max_depth: int = 3, limit: int = 100
+        self,
+        session_id: str,
+        *,
+        max_depth: int = 3,
+        limit: int = 100,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
-        # The recursion now lives in the SDK; reuse the real implementation
-        # (it only needs this stub's ``child_sessions``).
-        return await SessionsNamespace.child_sessions_tree(
-            self, session_id, max_depth=max_depth, limit=limit
-        )
+        nodes: list[dict[str, Any]] = []
+        frontier = [session_id]
+        depth = 0
+        while frontier and depth < max_depth:
+            depth += 1
+            next_frontier: list[str] = []
+            for parent_id in frontier:
+                for row in self._by_parent.get(parent_id, []):
+                    nodes.append({**row, "parent_id": parent_id, "depth": depth})
+                    next_frontier.append(row["id"])
+            frontier = next_frontier
+        return nodes
 
 
 class _DiscoveryClient:

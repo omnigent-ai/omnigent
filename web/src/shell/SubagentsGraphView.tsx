@@ -5,7 +5,13 @@ import { useLocation, useNavigate } from "@/lib/routing";
 import { RunningDot } from "@/components/RunningDot";
 import { Badge } from "@/components/ui/badge";
 import { ZoomInIcon, ZoomOutIcon, Maximize2Icon } from "lucide-react";
-import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import {
+  MAX_TREE_DEPTH,
+  SubagentTreeContext,
+  useChildSessions,
+  useSubagentTree,
+  type ChildSessionInfo,
+} from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { cn } from "@/lib/utils";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
@@ -163,7 +169,7 @@ interface SubagentsGraphViewProps {
 
 export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsGraphViewProps) {
   const { session } = useSession(rootSessionId);
-  const { children: rootChildren } = useChildSessions(rootSessionId);
+  const { children: rootChildren, fromTree } = useSubagentTree(rootSessionId);
 
   const [childrenMap, setChildrenMap] = useState<Map<string, ChildSessionInfo[]>>(() => new Map());
 
@@ -251,14 +257,16 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
           <ZoomControls />
         </ReactFlow>
       </div>
-      {rootChildren.map((child) => (
-        <ChildCollector
-          key={child.id}
-          parentId={child.id}
-          depth={1}
-          onCollected={handleCollected}
-        />
-      ))}
+      <SubagentTreeContext.Provider value={fromTree}>
+        {rootChildren.map((child) => (
+          <ChildCollector
+            key={child.id}
+            parentId={child.id}
+            depth={1}
+            onCollected={handleCollected}
+          />
+        ))}
+      </SubagentTreeContext.Provider>
     </div>
   );
 }

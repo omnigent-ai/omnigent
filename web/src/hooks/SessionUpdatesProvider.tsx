@@ -21,7 +21,7 @@ import { type ReactNode, useCallback, useContext, useEffect, useRef } from "reac
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
-import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { invalidateChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import {
   isSessionArchiving,
   isSessionDeleting,
@@ -415,7 +415,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             if (item.parent_session_id) parentIds.add(item.parent_session_id);
           }
           for (const parentId of parentIds) {
-            void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(parentId) });
+            void invalidateChildSessions(queryClient, parentId);
           }
           const { missingIds, needsRefetch } = applyItemsToCache(
             queryClient,

@@ -125,6 +125,7 @@ def test_side_chat_resume_conflict_refetches_metadata_and_seals_pane(
     contract.json(f"{child_path}/items", lambda _request: list_payload(child_items))
     contract.json(f"{child_path}/agent", lambda _request: chat._agent())
     contract.json(f"{child_path}/child_sessions", list_payload([]))
+    contract.json(f"{child_path}/descendants", list_payload([]))
     contract.json(f"{child_path}/resources/terminals", list_payload([]))
     contract.response(f"{child_path}/read-state", method="PUT")
     contract.sse(f"{child_path}/stream")

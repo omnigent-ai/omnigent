@@ -3123,30 +3123,40 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     )
                 )
-            if after:
-                stmt = self._apply_cursor(
-                    session,
-                    stmt,
-                    after,
-                    sort_col,
-                    is_desc,
-                    tiebreaker_col=self._tiebreaker_col,
-                    forward=True,
-                )
-            if before:
-                stmt = self._apply_cursor(
-                    session,
-                    stmt,
-                    before,
-                    sort_col,
-                    is_desc,
-                    tiebreaker_col=self._tiebreaker_col,
-                    forward=False,
-                )
-            stmt = stmt.order_by(
-                sort_fn(sort_col),
-                sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker for timestamp ties
-            ).limit(limit + 1)
+            if sort_by == "id":
+                # The id is unique, so it needs no tiebreaker and the cursor is
+                # the id itself; a (root_conversation_id, id) index then serves
+                # the whole page as one range scan.
+                if after:
+                    stmt = self._apply_id_cursor(session, stmt, after, is_desc, forward=True)
+                if before:
+                    stmt = self._apply_id_cursor(session, stmt, before, is_desc, forward=False)
+                stmt = stmt.order_by(sort_fn(SqlConversation.id)).limit(limit + 1)
+            else:
+                if after:
+                    stmt = self._apply_cursor(
+                        session,
+                        stmt,
+                        after,
+                        sort_col,
+                        is_desc,
+                        tiebreaker_col=self._tiebreaker_col,
+                        forward=True,
+                    )
+                if before:
+                    stmt = self._apply_cursor(
+                        session,
+                        stmt,
+                        before,
+                        sort_col,
+                        is_desc,
+                        tiebreaker_col=self._tiebreaker_col,
+                        forward=False,
+                    )
+                stmt = stmt.order_by(
+                    sort_fn(sort_col),
+                    sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker for timestamp ties
+                ).limit(limit + 1)
             rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
             if has_more:
@@ -3198,12 +3208,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
 
     @staticmethod
-    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[int]:
+    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[Any]:
         """
         Map a ``sort_by`` string to the corresponding
         :class:`SqlConversation` column.
 
-        :param sort_by: ``"created_at"`` or ``"updated_at"``.
+        :param sort_by: ``"created_at"``, ``"updated_at"`` or ``"id"``.
         :returns: The mapped column attribute.
         :raises ValueError: If ``sort_by`` is not a valid column
             name.
@@ -3211,11 +3221,50 @@ class SqlAlchemyConversationStore(ConversationStore):
         allowed = {
             "created_at": SqlConversation.created_at,
             "updated_at": SqlConversation.updated_at,
+            "id": SqlConversation.id,
         }
         col = allowed.get(sort_by)
         if col is None:
             raise ValueError(f"invalid sort_by: {sort_by!r}")
         return col
+
+    @staticmethod
+    def _apply_id_cursor(
+        session: Session,
+        stmt: Select[tuple[SqlConversation]],
+        cursor_id: str,
+        is_desc: bool,
+        forward: bool,
+    ) -> Select[tuple[SqlConversation]]:
+        """
+        Add the cursor WHERE clause for an ``id``-ordered listing.
+
+        The cursor id is its own sort position, so no lookup is needed to
+        page; the existence check only keeps a vanished cursor row raising
+        like every other listing instead of silently paging on.
+
+        :param session: Open conversation-DB session for the existence check.
+        :param stmt: The current SELECT statement to augment.
+        :param cursor_id: The conversation ID acting as the page cursor.
+        :param is_desc: ``True`` for descending, ``False`` for ascending.
+        :param forward: ``True`` for ``after`` cursors, ``False`` for
+            ``before`` cursors.
+        :returns: The statement with the cursor WHERE clause applied.
+        :raises StaleCursorError: If the cursor row no longer exists.
+        """
+        exists = session.execute(
+            select(SqlConversation.id).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == cursor_id,
+            )
+        ).first()
+        if exists is None:
+            raise StaleCursorError(cursor_id)
+        bound = literal(cursor_id, SqlConversation.id.type)
+        descending_scan = is_desc if forward else not is_desc
+        return stmt.where(
+            SqlConversation.id < bound if descending_scan else SqlConversation.id > bound
+        )
 
     @staticmethod
     def _apply_cursor(

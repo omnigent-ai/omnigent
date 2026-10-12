@@ -2840,6 +2840,58 @@ def test_runner_host_rebind_does_not_bump_updated_at(
     )
 
 
+# ── sort_by=id ────────────────────────────────────────
+
+
+def test_list_conversations_sort_by_id_pages_a_tree_in_key_order(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``sort_by="id"`` pages a spawn tree in primary-key order with the id as
+    the cursor, the order the ``root_conversation_id`` index serves without a
+    sort; an unknown cursor still raises like every other listing.
+    """
+    root = conversation_store.create_conversation()
+    children = [
+        conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=root.id)
+        for _ in range(5)
+    ]
+
+    seen: list[str] = []
+    after: str | None = None
+    for _ in range(10):
+        page = conversation_store.list_conversations(
+            limit=2,
+            after=after,
+            kind="sub_agent",
+            root_conversation_id=root.id,
+            sort_by="id",
+            include_archived=True,
+        )
+        seen.extend(conv.id for conv in page.data)
+        if not page.has_more:
+            break
+        after = page.last_id
+
+    assert seen == sorted((conv.id for conv in children), reverse=True)
+
+    ascending = conversation_store.list_conversations(
+        limit=10, kind="sub_agent", root_conversation_id=root.id, sort_by="id", order="asc"
+    )
+    assert [conv.id for conv in ascending.data] == sorted(conv.id for conv in children)
+
+    # ``before`` pages back toward the start of the same order.
+    previous = conversation_store.list_conversations(
+        limit=10, before=seen[2], kind="sub_agent", root_conversation_id=root.id, sort_by="id"
+    )
+    assert [conv.id for conv in previous.data] == seen[:2]
+
+    with pytest.raises(StaleCursorError):
+        conversation_store.list_conversations(
+            limit=2, after="0" * 32, kind="sub_agent", root_conversation_id=root.id, sort_by="id"
+        )
+
+
 # ── sort_by=updated_at ────────────────────────────────
 
 
