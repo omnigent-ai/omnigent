@@ -2609,6 +2609,22 @@ def register_events_routes(
                     and not relaunched_launch_refused
                     and await _session_host_offline(conv, request.app.state)
                 )
+                if (
+                    conv.host_id is not None
+                    and conv.kind != "sub_agent"
+                    and not exit_cause
+                    and not host_offline
+                    and not relaunched_launch_acknowledged
+                    and not relaunched_launch_refused
+                ):
+                    # A connected host that never took the launch shows no runner failed
+                    # to start. Refuse the send so the client keeps the message, as for a
+                    # dropped tunnel, instead of consuming it into a failed turn.
+                    raise OmnigentError(
+                        "The host for this session is not responding. "
+                        "Wait for it to reconnect and send the message again.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
                 if exit_cause:
                     failure_message = exit_cause
                 elif host_offline:

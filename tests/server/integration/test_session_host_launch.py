@@ -2155,7 +2155,11 @@ async def test_native_message_relaunch_unanswered_launch_is_not_host_offline_whi
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A launch the host never answered is not called offline while the host is connected."""
+    """A launch the connected host never answered refuses the send instead of failing the turn.
+
+    Nothing shows a runner failed to start, so the message is not consumed and the
+    host is not called offline; the client keeps the message to resend.
+    """
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import helpers as sessions_helpers
     from omnigent.server.routes.sessions import routes_events
@@ -2174,11 +2178,12 @@ async def test_native_message_relaunch_unanswered_launch_is_not_host_offline_whi
         with contextlib.suppress(asyncio.CancelledError, Exception):
             _ = await responder
 
-    assert response.status_code == 202, response.text
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "runner_unavailable"
     assert app.state.host_registry.get(_HOST_ID) is not None
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
-    errors = [item for item in items if item["type"] == "error"]
-    assert [item["message"] for item in errors] == [_RUNNER_NOT_AVAILABLE]
+    assert [item for item in items if item["type"] in ("error", "message")] == []
+    assert (await client.get(f"/v1/sessions/{session_id}")).json()["status"] != "failed"
     assert [e.attributes["outcome"] for e in _runner_client_wait_events(caplog)] == [
         "never_connected"
     ]
