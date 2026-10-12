@@ -38,12 +38,23 @@ class _DroppedSocket(_Socket):
         raise WebSocketDisconnect(code=1006)
 
 
+class _ScriptedClock:
+    """Stand-in for the module's ``time`` that returns fixed monotonic readings."""
+
+    def __init__(self, *readings: float) -> None:
+        self._readings = iter(readings)
+
+    def monotonic(self) -> float:
+        return next(self._readings)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["host", "runner"])
 async def test_timeout_cancels_owned_receive_and_closes(
     kind: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setattr(tunnel_handshake, "HELLO_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(tunnel_handshake, "time", _ScriptedClock(100.0, 100.25))
     socket = _Socket()
     with caplog.at_level(logging.WARNING):
         result = await tunnel_handshake.receive_tunnel_hello(
@@ -59,8 +70,7 @@ async def test_timeout_cancels_owned_receive_and_closes(
     assert rows[0].attributes["peer_kind"] == kind
     assert rows[0].attributes["peer_id"] == "synthetic-peer"
     assert rows[0].attributes["timeout_s"] == 0.01
-    elapsed_ms = rows[0].attributes["elapsed_ms"]
-    assert isinstance(elapsed_ms, int) and elapsed_ms >= 0
+    assert rows[0].attributes["elapsed_ms"] == 250
 
 
 @pytest.mark.asyncio
