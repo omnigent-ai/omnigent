@@ -131,7 +131,7 @@ export function useHasSessionDraft(conversationId: string): boolean {
 const ignoreDrafts = () => () => {};
 
 function draftIdsKey(): string {
-  return [...sessionDrafts.keys()].filter(hasSessionDraft).sort().join(" ");
+  return [...sessionDrafts.keys()].filter(hasSessionDraft).sort().join("\n");
 }
 
 /**

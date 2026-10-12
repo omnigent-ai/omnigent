@@ -115,13 +115,13 @@ def test_status_grouping_and_show_toggles_persist_across_reload(
     page.get_by_test_id("session-show-repo").click()
     page.keyboard.press("Escape")
     # Environment · Repo (from the sandbox label) · Branch.
-    expect(idle_row.get_by_test_id("session-row-meta")).to_have_text(
-        "Local machine·omnigent·fix/payment-retries"
-    )
+    meta = "Local machine·omnigent·fix/payment-retries"
+    expect(idle_row.get_by_test_id("session-row-meta")).to_have_text(meta)
 
     page.reload()
     expect(_section_header(page, "Needs attention")).to_be_visible(timeout=30_000)
-    expect(idle_row.get_by_test_id("session-row-meta")).to_be_visible()
+    # Every selected field survives the reload, not just some metadata.
+    expect(idle_row.get_by_test_id("session-row-meta")).to_have_text(meta)
 
 
 def test_tooltip_fetches_repo_and_pr_only_when_opened(
@@ -161,4 +161,5 @@ def test_tooltip_fetches_repo_and_pr_only_when_opened(
     expect(tooltip.get_by_test_id("session-tooltip-branch")).to_have_text(
         "Branchfix/payment-retries"
     )
+    assert github_requests
     assert all(f"/v1/sessions/{_IDLE}/" in url for url in github_requests)

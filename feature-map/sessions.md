@@ -102,10 +102,12 @@ you remove them.
 **Archived view:** choose Display → Archived sessions in the sidebar filter
 menu, then filter by project.
 
-**Sidebar filter menu:** the funnel on the Sessions header (on the first group
-header when grouped) holds Grouping, Display, Ordering and Show. Hovering a row
-opens its tooltip; the repo and PR rows load from the session's GitHub info
-only once the tooltip opens.
+**Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
+Projects header holds Grouping, Display, Ordering and Show. It stays there in
+every grouping, and project folders keep their sessions. Hovering a row opens
+its tooltip; the repo and PR rows load from the session's GitHub info only once
+the tooltip opens. With the flag off, the funnel sits on the Sessions header and
+offers Display only.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
@@ -518,5 +520,6 @@ plain `uv run pytest`, which starts a private server for the test.
 - Tests marked "own environment" fail under `verify-env run` with an explicit
   message. That is expected; run them with plain `uv run pytest`.
 - Grouping and ordering apply to the loaded pages only: an older session joins
-  its group once it is paged in. Grouped views hide Projects, so dragging a
-  session onto the list never removes it from its project there.
+  its group once it is paged in. Grouped views keep the Projects folders, and
+  groups hold only unfiled sessions, so dragging a filed session onto the list
+  removes it from its project as in the default view.

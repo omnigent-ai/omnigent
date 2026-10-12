@@ -3525,6 +3525,40 @@ describe("sidebar_grouping_ui release flag", () => {
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
   });
 
+  it("keeps Load more while the Shared section is expanded", () => {
+    useConvMock.mockImplementation(
+      () =>
+        ({
+          data: {
+            pages: [
+              {
+                data: SHARED_AND_OWNED,
+                first_id: SHARED_AND_OWNED[0]!.id,
+                last_id: SHARED_AND_OWNED[1]!.id,
+                has_more: true,
+              },
+            ],
+            pageParams: [undefined],
+          },
+          isLoading: false,
+          isError: false,
+          error: null,
+          fetchNextPage: vi.fn(),
+          hasNextPage: true,
+          isFetchingNextPage: false,
+        }) as unknown as ReturnType<typeof useConversations>,
+    );
+    renderGroupingSidebar();
+    selectSessionFilter("all");
+
+    // A next page can add shared rows too, so a collapsed Sessions list alone
+    // mustn't stall pagination; collapsing Shared as well does.
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Shared" }));
+    expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+  });
+
   it("keeps a shared session with a colliding project label in the Shared list", () => {
     projectsMock.push("Alpha");
     mockConversations([

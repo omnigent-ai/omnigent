@@ -10,6 +10,7 @@ describe("session drafts", () => {
     sessionStorage.clear();
   });
   afterEach(() => sessionStorage.clear());
+  afterEach(cleanup);
 
   it("loads legacy string drafts as plain text without inferring cards", async () => {
     const text = "\nintro\n> quote\nlazy continuation\n\n";
@@ -122,7 +123,6 @@ describe("session drafts", () => {
 
     act(() => setSessionDraft("a", { text: "", files: [] }));
     expect(result.current).toBe("");
-    cleanup();
   });
 
   it("returns an empty snapshot without subscribing when disabled", async () => {
@@ -137,6 +137,5 @@ describe("session drafts", () => {
     act(() => setSessionDraft("a", { text: "hi", files: [] }));
     expect(result.current).toBe("");
     expect(renders).toBe(before);
-    cleanup();
   });
 });

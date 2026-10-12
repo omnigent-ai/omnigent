@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Back-date imported fixture sessions and tag a few with a sandbox repo.
+"""Back-date the fixture sessions omnidev just imported and tag a few with a repo.
 
 `omnigent session import` stamps every seeded session idle / now / no-labels, so
 the sidebar's Updated grouping and Repo toggle have nothing to show. This dev-only
-step rewrites the pod DB directly (the only way to backdate `updated_at` — the
-server always stamps it to now on any mutation) so omnidev's conversation list
-spans several day-buckets and some rows carry a repo name.
+step rewrites the pod DB directly (the server stamps `updated_at` to now on every
+mutation, so it can't be back-dated through the API). It touches only the session
+ids it's given — the ones the supervisor imported in this run — and never
+replaces a label a session already has.
 
-Usage: seed_sidebar_metadata.py <chat.db path>. Idempotent: re-running just
-re-applies the same fixed layout to the newest sessions.
+Usage: seed_sidebar_metadata.py <chat.db path> <session id>...
 """
 
 import sqlite3
 import sys
-import time
+import uuid
+from datetime import UTC, datetime, time, timedelta
 
-# (days-ago, repo URL or None) for the newest sessions, newest first. Spreads
+# (days ago, repo URL or None), assigned to the given sessions in order. Spreads
 # them across Today / Yesterday / Previous 7 days / Previous 30 days / Older and
 # gives three a sandbox repo so Show -> Repo renders a name.
 LAYOUT: list[tuple[int, str | None]] = [
@@ -30,50 +31,49 @@ LAYOUT: list[tuple[int, str | None]] = [
 REPO_LABEL = "omnigent.sandbox.repo.0"
 
 
-def main(db_path: str) -> int:
-    now = int(time.time())
+def updated_at(days_ago: int, now: datetime) -> int:
+    """Unix seconds for noon `days_ago` calendar days before `now`, in its zone; today is `now`."""
+    if days_ago == 0:
+        return int(now.timestamp())
+    day = now.date() - timedelta(days=days_ago)
+    return int(datetime.combine(day, time(12), tzinfo=now.tzinfo).timestamp())
+
+
+def seed(db_path: str, session_ids: list[str], now: datetime) -> int:
+    """Apply LAYOUT to `session_ids` in order; returns how many sessions were found."""
     conn = sqlite3.connect(db_path)
+    seeded = 0
     try:
-        # Top-level sessions only (sub-agent conversations have a parent), newest
-        # first — on a fresh pod these are exactly the just-imported fixtures.
-        rows = conn.execute(
-            "SELECT workspace_id, id FROM conversations "
-            "WHERE agent_id IS NOT NULL AND parent_conversation_id IS NULL "
-            "ORDER BY created_at DESC, rowid DESC LIMIT ?",
-            (len(LAYOUT),),
-        ).fetchall()
-        # Re-running picks the same rows (created_at is import-stable, unlike the
-        # updated_at we rewrite) and clears their old repo labels first, so the
-        # layout converges instead of accumulating.
-        conn.execute(
-            f"DELETE FROM conversation_labels WHERE key = '{REPO_LABEL}'",
-        )
-        # Fewer rows than LAYOUT on a small DB is fine — zip stops at the shorter.
-        for (workspace_id, cid), (days_ago, repo) in zip(rows, LAYOUT, strict=False):
-            # 12:00 local, days_ago back — lands mid-day so it can't drift buckets.
-            ts = now - days_ago * 86400 - 3600
-            conn.execute(
-                "UPDATE conversations SET updated_at = ? WHERE workspace_id = ? AND id = ?",
-                (ts, workspace_id, cid),
-            )
+        for session_id, (days_ago, repo) in zip(session_ids, LAYOUT, strict=False):
+            # API ids are bare 32-char hex (a legacy prefix is tolerated); the
+            # column stores the 16 raw bytes.
+            cid = uuid.UUID(session_id.rsplit("_", 1)[-1]).bytes
+            row = conn.execute(
+                "SELECT workspace_id FROM conversations WHERE id = ?", (cid,)
+            ).fetchone()
+            if row is None:
+                continue
+            ts = updated_at(days_ago, now)
+            conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (ts, cid))
             if repo is not None:
                 conn.execute(
                     "INSERT INTO conversation_labels "
                     "(workspace_id, conversation_id, key, value, updated_at) "
                     "VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT(workspace_id, conversation_id, key) "
-                    "DO UPDATE SET value = excluded.value",
-                    (workspace_id, cid, REPO_LABEL, repo, ts),
+                    "ON CONFLICT(workspace_id, conversation_id, key) DO NOTHING",
+                    (row[0], cid, REPO_LABEL, repo, ts),
                 )
+            seeded += 1
         conn.commit()
-        print(f"seeded sidebar metadata on {len(rows)} session(s)")
     finally:
         conn.close()
-    return 0
+    return seeded
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("usage: seed_sidebar_metadata.py <chat.db>", file=sys.stderr)
+    if len(sys.argv) < 3:
+        print("usage: seed_sidebar_metadata.py <chat.db> <session id>...", file=sys.stderr)
         sys.exit(2)
-    sys.exit(main(sys.argv[1]))
+    # Local time: the sidebar buckets sessions by the viewer's calendar day.
+    count = seed(sys.argv[1], sys.argv[2:], datetime.now(UTC).astimezone())
+    print(f"seeded sidebar metadata on {count} session(s)")

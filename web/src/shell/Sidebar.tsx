@@ -2433,6 +2433,11 @@ function ConversationList({
   const showShared = activeTab === "shared";
   // The Shared section replaces Sessions on the Shared filter (release-flagged).
   const sharedListOnly = groupingUi && showShared;
+  // The paginated list sections on screen, by collapse key: Shared, then Sessions or its groups.
+  const listSectionKeys = [
+    ...(sections.shared.length > 0 || sharedListOnly ? ["Shared"] : []),
+    ...(sharedListOnly ? [] : (sessionGroups?.map((g) => g.title) ?? ["Chats"])),
+  ];
   const emptyMessage = searchQuery ? "No matching conversations" : "No sessions";
 
   // List header controls and row props, shared by the Shared, single "Sessions"
@@ -2650,14 +2655,9 @@ function ConversationList({
                       </PinOrderContext.Provider>
                     </PinDropZone>
                   )}
-                  {/* Projects: a "Projects" group header, with each project rendered as
-              a collapsible folder row nested beneath it. Folders default
-              collapsed; an empty folder shows "No sessions". The folder icon marks
-              a project row; the group/section headers carry no icon or count.
-              Always shown (even with zero projects), unaffected by the filter, so
-              "New project" (create-empty) stays discoverable and folders don't
-              vanish when switching to Shared or Archived. Its header holds the one
-              filter menu: the row never moves, whatever the grouping below. */}
+                  {/* Projects: one collapsible folder per project, always shown and unaffected
+              by the filter so "New project" stays reachable. With sidebar_grouping_ui
+              on, its header holds the one filter menu, which never moves. */}
                   <SectionGroup
                     title="Projects"
                     collapsed={effectiveCollapsedSections.includes("Projects")}
@@ -2827,14 +2827,10 @@ function ConversationList({
               and Projects is empty for Shared and Archived. */}
                   {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
-                  {/* Infinite-scroll sentinel. A new page can land in any group, so
-              it hides only when every visible group is collapsed (a loader under
-              a collapsed group reads orphaned). */}
-                  {!(sharedListOnly
-                    ? effectiveCollapsedSections.includes("Shared")
-                    : sessionGroups
-                      ? sessionGroups.every((g) => effectiveCollapsedSections.includes(g.title))
-                      : effectiveCollapsedSections.includes("Chats")) && (
+                  {/* Infinite-scroll sentinel. A new page can land in any list section,
+              so it hides only when all of them are collapsed (a loader under a
+              collapsed group reads orphaned). */}
+                  {!listSectionKeys.every((key) => effectiveCollapsedSections.includes(key)) && (
                     <InfiniteScrollSentinel
                       scopeKey={activeTab}
                       budgetRef={autoLoadBudget}
