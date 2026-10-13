@@ -587,3 +587,17 @@ def test_unsent_invalid_frame_preserves_helper(helper: UploadHelperClient, overs
     assert rejected["code"] == "invalid_request"
     assert helper._proc is process and process.poll() is None
     assert helper.call({"op": "append", "id": UID, "offset": 0}, b"abc")["offset"] == 3
+
+
+@pytest.mark.parametrize("field", ["name", "dir"])
+def test_helper_rejects_control_character_paths(
+    helper: UploadHelperClient, tmp_path: Path, field: str
+) -> None:
+    for codepoint in [*range(32), 127]:
+        value = "entry" + chr(codepoint)
+        if field == "dir" and codepoint != 0:
+            (tmp_path / value).mkdir()
+        result = begin(helper, **{field: value})
+        assert result["code"] == ("invalid_name" if field == "name" else "invalid_path")
+    assert not list(tmp_path.rglob("*.part"))
+    assert "error" not in begin(helper)
