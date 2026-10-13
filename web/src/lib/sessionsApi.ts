@@ -396,12 +396,67 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string | null;
-  constructor(message: string, status: number, code: string | null) {
+  /**
+   * Import routes' finer-grained `error.import_code` (e.g. ``host_offline``);
+   * null elsewhere and from servers that predate import codes.
+   */
+  readonly importCode: string | null;
+  /** The server's `error.retryable` hint; null when it sent none. */
+  readonly retryable: boolean | null;
+  /** The `error` object's other fields (e.g. ``host_name``, ``error_id``). */
+  readonly details: Readonly<Record<string, unknown>>;
+  constructor(
+    message: string,
+    status: number,
+    code: string | null,
+    extra: {
+      importCode?: string | null;
+      retryable?: boolean | null;
+      details?: Record<string, unknown>;
+    } = {},
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.importCode = extra.importCode ?? null;
+    this.retryable = extra.retryable ?? null;
+    this.details = extra.details ?? {};
   }
+}
+
+// Keys of the AP `error` envelope that ApiError exposes as named fields; the
+// rest of the object is passed through as `details`.
+const API_ERROR_ENVELOPE_KEYS = new Set(["code", "message", "import_code", "retryable"]);
+
+// Pydantic prefixes custom-validator messages with the error kind, which reads
+// as noise next to the sentence the validator wrote.
+const PYDANTIC_MESSAGE_PREFIX_RE = /^(?:Value error|Assertion failed), /;
+
+// Request sections FastAPI puts first in `loc`; they say where, not what.
+const VALIDATION_LOC_SECTIONS = new Set(["body", "query", "path", "header", "cookie"]);
+
+// A field path longer than this (deeply nested) is dropped rather than shown.
+const MAX_VALIDATION_PATH_CHARS = 32;
+
+/**
+ * The first readable message of a FastAPI 422 `detail: [{loc, msg}, ...]`
+ * list, prefixed with its field path when that is short (``limit: Input
+ * should be less than or equal to 100``). Null when no entry has a message.
+ */
+export function validationDetailMessage(detail: unknown): string | null {
+  if (!Array.isArray(detail)) return null;
+  for (const entry of detail) {
+    if (entry === null || typeof entry !== "object") continue;
+    const { msg, loc } = entry as { msg?: unknown; loc?: unknown };
+    if (typeof msg !== "string" || !msg.trim()) continue;
+    const text = msg.trim().replace(PYDANTIC_MESSAGE_PREFIX_RE, "");
+    const parts = Array.isArray(loc) ? loc.map(String) : [];
+    if (parts.length > 0 && VALIDATION_LOC_SECTIONS.has(parts[0])) parts.shift();
+    const path = parts.join(".");
+    return path && path.length <= MAX_VALIDATION_PATH_CHARS ? `${path}: ${text}` : text;
+  }
+  return null;
 }
 
 /**
@@ -419,28 +474,47 @@ export class ApiError extends Error {
  * Databricks-backed stores propagate rejections as a top-level
  * `{"error_code": "…", "message": "…"}` envelope (e.g. a title the
  * workspace storage refuses), so that shape is read as well.
+ *
+ * A 422 request-validation error (`detail: [{loc, msg}, ...]`) reads as its
+ * first message (see {@link validationDetailMessage}) instead of the bare
+ * "422 Unprocessable Entity". Import routes add `import_code` / `retryable`
+ * and per-code fields to the `error` object; those land on the ApiError.
  */
 export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`.trim();
   let code: string | null = null;
+  let importCode: string | null = null;
+  let retryable: boolean | null = null;
+  const details: Record<string, unknown> = {};
   try {
     const body = (await res.json()) as {
-      error?: { code?: string; message?: string };
+      error?: { code?: string; message?: string; import_code?: unknown; retryable?: unknown };
       detail?: unknown;
       message?: unknown;
       error_code?: unknown;
     };
-    // FastAPI's validation errors put a list in `detail`; only a plain
-    // string is a message meant for the user.
+    if (body.error !== null && typeof body.error === "object") {
+      if (typeof body.error.import_code === "string" && body.error.import_code) {
+        importCode = body.error.import_code;
+      }
+      if (typeof body.error.retryable === "boolean") retryable = body.error.retryable;
+      for (const [key, value] of Object.entries(body.error)) {
+        if (!API_ERROR_ENVELOPE_KEYS.has(key)) details[key] = value;
+      }
+    }
+    // FastAPI request validation: only a 422 list is a validation error, so
+    // other statuses keep ignoring list-shaped details.
+    const validationMessage = res.status === 422 ? validationDetailMessage(body.detail) : null;
     if (body.error?.message) message = body.error.message;
     else if (typeof body.detail === "string" && body.detail) message = body.detail;
+    else if (validationMessage !== null) message = validationMessage;
     else if (typeof body.message === "string" && body.message) message = body.message;
     if (body.error?.code) code = body.error.code;
     else if (typeof body.error_code === "string" && body.error_code) code = body.error_code;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
   }
-  return new ApiError(message, res.status, code);
+  return new ApiError(message, res.status, code, { importCode, retryable, details });
 }
 
 function postEventResponseFromWire(wire: {
@@ -547,9 +621,45 @@ export interface ImportFailureRef {
   externalSessionId: string | null;
   source: string | null;
   reason: string;
+  /** Stable import code (e.g. ``session_too_large``); null from a server that predates codes. */
+  code: string | null;
+  /** Whether re-running the import can succeed without the user changing anything. */
+  retryable: boolean;
+  /** Server log correlation id, when the server reported one. */
+  errorId: string | null;
 }
 
-/** Result of a batch local import (`POST /v1/imports/local`). */
+/**
+ * A failure of the import as a whole — a stream `error` event, a pre-stream
+ * HTTP error, or the response body breaking before its terminal `done`
+ * (client-side ``stream_interrupted``).
+ */
+export interface ImportErrorInfo {
+  /** Stable import code; null when an older server sent none. */
+  code: string | null;
+  message: string;
+  retryable: boolean;
+  errorId: string | null;
+  /** Shell commands that fix the problem (e.g. rebuilding Python with SQLite). */
+  fixCommands: ImportFixCommand[];
+  hostName: string | null;
+}
+
+/** One way to fix an import failure: when it applies, and what to paste into a shell. */
+export interface ImportFixCommand {
+  /** e.g. "macOS"; null from a server that sent bare strings. */
+  label: string | null;
+  /** Exactly what the copy button copies. */
+  command: string;
+}
+
+/** One `progress` event: sessions processed so far, out of `total` when known. */
+export interface ImportProgress {
+  done: number;
+  total: number | null;
+}
+
+/** Result of a batch local import (`POST /v1/imports/local[/stream]`). */
 export interface LocalImportResult {
   imported: number;
   alreadyImported: number;
@@ -557,14 +667,222 @@ export interface LocalImportResult {
   sessions: ImportedSessionRef[];
   /** One entry per failed session, with a reason; length equals `failed`. */
   failures: ImportFailureRef[];
+  /**
+   * Sessions not imported because there was nothing to import (code
+   * `session_empty`: no history). Not failures: nothing was lost.
+   */
+  skipped: number;
+  /** One entry per skipped session; length equals `skipped`. */
+  skippedSessions: ImportFailureRef[];
+  /** How many sessions the host found; null when it didn't say. */
+  total: number | null;
+  /** False when the import stopped early (`error` set) — the tally is partial. */
+  complete: boolean;
+  /** Why the import stopped early; null when it ran to completion. */
+  error: ImportErrorInfo | null;
+}
+
+/** Client-side code for a response body that broke before its `done` event. */
+export const STREAM_INTERRUPTED_IMPORT_CODE = "stream_interrupted";
+
+// Retry semantics per import code (mirrors omnigent/session_import/errors.py).
+// A code missing here is a newer peer's: treat it as retryable, since offering
+// a retry that fails again costs less than hiding one that would have worked.
+const IMPORT_CODE_RETRYABLE: Readonly<Record<string, boolean>> = {
+  session_too_large: false,
+  already_imported: false,
+  host_python_missing_sqlite: false,
+  host_offline: true,
+  host_unreachable: true,
+  host_disconnected: true,
+  host_unresponsive: true,
+  session_unreadable: false,
+  session_empty: false,
+  session_save_timeout: true,
+  host_read_failed: false,
+  encryption_unavailable: true,
+  time_limit_reached: true,
+  stream_interrupted: true,
+  invalid_request: false,
+  internal: true,
+};
+
+// Codes for sessions that weren't imported because there was nothing to import.
+const SKIPPED_IMPORT_CODES: ReadonlySet<string> = new Set(["session_empty"]);
+
+/**
+ * Move skip-coded entries out of `failures` into `skippedSessions`, for a
+ * server that reports an empty session as a failure, and fix both counts.
+ */
+function separateSkipped(
+  failed: number,
+  failures: ImportFailureRef[],
+  skipped: number,
+  skippedSessions: ImportFailureRef[],
+): Pick<LocalImportResult, "failed" | "failures" | "skipped" | "skippedSessions"> {
+  const moved = failures.filter((f) => f.code !== null && SKIPPED_IMPORT_CODES.has(f.code));
+  if (moved.length === 0) return { failed, failures, skipped, skippedSessions };
+  return {
+    failed: Math.max(0, failed - moved.length),
+    failures: failures.filter((f) => !moved.includes(f)),
+    skipped: skipped + moved.length,
+    skippedSessions: [...skippedSessions, ...moved],
+  };
+}
+
+/** Whether an import that failed with `code` can succeed when simply re-run. */
+export function importCodeIsRetryable(code: string | null): boolean {
+  return code === null ? true : (IMPORT_CODE_RETRYABLE[code] ?? true);
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value ? value : null;
+}
+
+/** `fix_commands` entries: `{label, command}` objects, or bare strings from older servers. */
+function fixCommandsFrom(value: unknown): ImportFixCommand[] {
+  if (!Array.isArray(value)) return [];
+  const fixes: ImportFixCommand[] = [];
+  for (const entry of value) {
+    if (typeof entry === "string") {
+      if (entry.trim().length > 0) fixes.push({ label: null, command: entry });
+    } else if (entry !== null && typeof entry === "object") {
+      const { label, command } = entry as Record<string, unknown>;
+      if (typeof command === "string" && command.trim().length > 0) {
+        fixes.push({ label: stringOrNull(label), command });
+      }
+    }
+  }
+  return fixes;
+}
+
+// "… Error ID: err_0123abcd." at the end of a message: older servers put the id
+// inline; the UI shows it under Details instead.
+const INLINE_ERROR_ID_RE = /\s*Error ID: (err_[0-9a-f]+)\.?$/;
+
+/** Split a trailing inline error id off `text`, keeping `errorId` when one was sent. */
+function splitInlineErrorId(
+  text: string,
+  errorId: string | null,
+): { text: string; errorId: string | null } {
+  const match = INLINE_ERROR_ID_RE.exec(text);
+  if (match === null || (errorId !== null && match[1] !== errorId)) return { text, errorId };
+  return { text: text.slice(0, match.index), errorId: match[1] };
 }
 
 /** Map one `failed`/`failures[]` wire record to an {@link ImportFailureRef}. */
 function toImportFailureRef(evt: Record<string, unknown>): ImportFailureRef {
+  const code = stringOrNull(evt.code);
+  const { text: reason, errorId } = splitInlineErrorId(
+    typeof evt.reason === "string" ? evt.reason : "This session could not be imported.",
+    stringOrNull(evt.error_id),
+  );
   return {
     externalSessionId: typeof evt.external_session_id === "string" ? evt.external_session_id : null,
     source: typeof evt.source === "string" ? evt.source : null,
-    reason: typeof evt.reason === "string" ? evt.reason : "This session could not be imported.",
+    reason,
+    code,
+    retryable: typeof evt.retryable === "boolean" ? evt.retryable : importCodeIsRetryable(code),
+    errorId,
+  };
+}
+
+/** Map a stream `error` event to an {@link ImportErrorInfo}. */
+function importErrorFromEvent(evt: Record<string, unknown>): ImportErrorInfo {
+  const code = stringOrNull(evt.code);
+  const { text: message, errorId } = splitInlineErrorId(
+    stringOrNull(evt.message) ?? "Import failed. Try again.",
+    stringOrNull(evt.error_id),
+  );
+  return {
+    code,
+    message,
+    retryable: typeof evt.retryable === "boolean" ? evt.retryable : importCodeIsRetryable(code),
+    errorId,
+    fixCommands: fixCommandsFrom(evt.fix_commands),
+    hostName: stringOrNull(evt.host_name),
+  };
+}
+
+/** The client-side error for a response body that ended before `done`. */
+function streamInterruptedError(processed: number): ImportErrorInfo {
+  const unit = processed === 1 ? "session" : "sessions";
+  return {
+    code: STREAM_INTERRUPTED_IMPORT_CODE,
+    message:
+      processed > 0
+        ? `The connection to Omnigent dropped after ${processed} ${unit}. Import again to continue — sessions already imported are skipped.`
+        : "The connection to Omnigent dropped before any sessions were imported. Import again — sessions already imported are skipped.",
+    retryable: true,
+    errorId: null,
+    fixCommands: [],
+    hostName: null,
+  };
+}
+
+// Global error code of a host whose tunnel lives on another replica.
+const WRONG_REPLICA_ERROR_CODE = "wrong_replica";
+
+// HTTP statuses whose request can succeed as-is when re-sent, for an error from
+// a server that predates `import_code`/`retryable` (409 was its "host is offline").
+const LEGACY_RETRYABLE_STATUSES = new Set([408, 409, 429]);
+
+/** The friendly text for a host whose tunnel is on another replica. */
+function wrongReplicaMessage(hostName: string | null): string {
+  const whose = hostName !== null ? `“${hostName}”'s` : "your machine's";
+  return `Couldn't reach ${whose} connection. Try again in a few seconds.`;
+}
+
+/**
+ * Describe whatever {@link importLocalSessions} threw (a pre-stream HTTP
+ * {@link ApiError}, or an unexpected error) as an {@link ImportErrorInfo}, so
+ * callers render every import failure the same way. `hostName` names the
+ * machine for errors from servers that don't.
+ */
+export function importErrorFromException(
+  e: unknown,
+  options: { hostName?: string | null } = {},
+): ImportErrorInfo {
+  if (e instanceof ApiError) {
+    const hostName = stringOrNull(e.details.host_name) ?? options.hostName ?? null;
+    // A wrong_replica that survived the keyed/keyless re-address: the tunnel is
+    // moving between replicas. Older servers send only "host is on another replica".
+    if (e.code === WRONG_REPLICA_ERROR_CODE && e.importCode === null) {
+      return {
+        code: "host_unreachable",
+        message: wrongReplicaMessage(hostName),
+        retryable: true,
+        errorId: null,
+        fixCommands: [],
+        hostName,
+      };
+    }
+    const code = e.importCode ?? (e.status === 422 ? "invalid_request" : null);
+    const retryable =
+      e.retryable ??
+      (code !== null
+        ? importCodeIsRetryable(code)
+        : e.status >= 500 || LEGACY_RETRYABLE_STATUSES.has(e.status));
+    const { text: message, errorId } = splitInlineErrorId(
+      e.message,
+      stringOrNull(e.details.error_id),
+    );
+    return {
+      code,
+      message,
+      retryable,
+      errorId,
+      fixCommands: fixCommandsFrom(e.details.fix_commands),
+      hostName,
+    };
+  }
+  return {
+    code: null,
+    message: e instanceof Error && e.message ? e.message : "Import failed. Try again.",
+    retryable: true,
+    errorId: null,
+    fixCommands: [],
+    hostName: null,
   };
 }
 
@@ -577,13 +895,16 @@ function toImportFailureRef(evt: Record<string, unknown>): ImportFailureRef {
  *
  * Prefers the streaming endpoint `POST /v1/imports/local/stream` (NDJSON):
  * `onSession` fires for each newly imported session as its frame lands, so
- * callers list sessions live instead of waiting out the whole batch. A
- * mid-stream host failure throws after the sessions read so far have been
- * delivered through `onSession`. Against a server too old to have the streaming
- * endpoint (404), it falls back to the buffered `POST /v1/imports/local`, which
- * returns the whole tally at once (`onSession` then fires for every session
- * together). Either way the resolved {@link LocalImportResult} carries the
- * final tally.
+ * callers list sessions live instead of waiting out the whole batch, and
+ * `options.onProgress` fires per `progress` event ("7 of 20"). A failure after
+ * the stream started does NOT throw: the result keeps every session and failure
+ * received so far and carries the reason in `error` (`complete: false`) — the
+ * server's `error` event, or ``stream_interrupted`` when the body broke before
+ * its `done` event (network drop, proxy cut, truncated NDJSON). Pre-stream HTTP
+ * errors throw an {@link ApiError} (see {@link importErrorFromException}).
+ * Against a server too old to have the streaming endpoint (404), it falls back
+ * to the buffered `POST /v1/imports/local`, which returns the whole tally at
+ * once (`onSession` then fires for every session together).
  */
 export async function importLocalSessions(
   hostId: string,
@@ -591,13 +912,34 @@ export async function importLocalSessions(
   limit: number,
   onSession?: (session: ImportedSessionRef) => void,
   sessionId?: string,
+  options: { onProgress?: (progress: ImportProgress) => void } = {},
 ): Promise<LocalImportResult> {
   const body = { host_id: hostId, source, limit, session_id: sessionId };
-  const res = await authenticatedFetch("/v1/imports/local/stream", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
-    body: JSON.stringify(body),
-  });
+  let res: Response;
+  try {
+    res = await authenticatedFetch("/v1/imports/local/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    // fetch rejects with a TypeError ("Failed to fetch" / "network error")
+    // when the request never got a response — report it like any other drop
+    // instead of showing the raw browser text.
+    if (!(e instanceof TypeError)) throw e;
+    return {
+      imported: 0,
+      alreadyImported: 0,
+      failed: 0,
+      sessions: [],
+      failures: [],
+      skipped: 0,
+      skippedSessions: [],
+      total: null,
+      complete: false,
+      error: streamInterruptedError(0),
+    };
+  }
   // Older server without the streaming endpoint: fall back to the buffered
   // import so a newer client still works against it.
   if (res.status === 404) {
@@ -611,10 +953,25 @@ export async function importLocalSessions(
 
   const sessions: ImportedSessionRef[] = [];
   const failures: ImportFailureRef[] = [];
-  let imported = 0;
-  let alreadyImported = 0;
-  let failed = 0;
-  let errorMessage: string | null = null;
+  const skippedEvents: ImportFailureRef[] = [];
+  // Assigned from the line handler; an object so the reads after the loop
+  // aren't narrowed to their initial nulls.
+  const stream: {
+    done: Record<string, unknown> | null;
+    // `done.failures` / `done.skipped_sessions` back up the streamed `failed` /
+    // `skipped` events for a server that sends only the terminal lists.
+    doneFailures: ImportFailureRef[];
+    doneSkipped: ImportFailureRef[];
+    error: ImportErrorInfo | null;
+    progress: ImportProgress | null;
+  } = { done: null, doneFailures: [], doneSkipped: [], error: null, progress: null };
+
+  const failureRefs = (value: unknown): ImportFailureRef[] =>
+    Array.isArray(value)
+      ? value
+          .filter((f): f is Record<string, unknown> => f !== null && typeof f === "object")
+          .map(toImportFailureRef)
+      : [];
 
   const handleLine = (line: string): void => {
     let evt: Record<string, unknown>;
@@ -632,27 +989,44 @@ export async function importLocalSessions(
       };
       sessions.push(ref);
       onSession?.(ref);
+    } else if (evt.event === "progress") {
+      if (typeof evt.done !== "number") return;
+      const progress = { done: evt.done, total: typeof evt.total === "number" ? evt.total : null };
+      stream.progress = progress;
+      options.onProgress?.(progress);
     } else if (evt.event === "failed") {
       failures.push(toImportFailureRef(evt));
+    } else if (evt.event === "skipped") {
+      skippedEvents.push(toImportFailureRef(evt));
     } else if (evt.event === "done") {
-      imported = typeof evt.imported === "number" ? evt.imported : sessions.length;
-      alreadyImported = typeof evt.already_imported === "number" ? evt.already_imported : 0;
-      failed = typeof evt.failed === "number" ? evt.failed : failures.length;
+      stream.done = evt;
+      stream.doneFailures = failureRefs(evt.failures);
+      stream.doneSkipped = failureRefs(evt.skipped_sessions);
     } else if (evt.event === "error") {
-      errorMessage = typeof evt.message === "string" ? evt.message : "Import failed. Try again.";
+      stream.error = importErrorFromEvent(evt);
     }
   };
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buf = "";
+  let readFailed = false;
   try {
     for (;;) {
-      // Sequential by design: each read waits for the next NDJSON chunk.
-      // eslint-disable-next-line no-await-in-loop
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        // Sequential by design: each read waits for the next NDJSON chunk.
+        // eslint-disable-next-line no-await-in-loop
+        chunk = await reader.read();
+      } catch {
+        // The body broke mid-read (network drop, proxy cut, tab sleep).
+        // Whatever arrived so far is kept; the missing `done` below turns
+        // this into `stream_interrupted`.
+        readFailed = true;
+        break;
+      }
+      if (chunk.done) break;
+      buf += decoder.decode(chunk.value, { stream: true });
       let idx = buf.indexOf("\n");
       while (idx !== -1) {
         const line = buf.slice(0, idx).trim();
@@ -661,14 +1035,45 @@ export async function importLocalSessions(
         idx = buf.indexOf("\n");
       }
     }
-    const tail = buf.trim();
+    // A partial last line (cut mid-JSON) fails to parse and is dropped.
+    const tail = readFailed ? "" : (buf + decoder.decode()).trim();
     if (tail) handleLine(tail);
   } finally {
     reader.cancel().catch(() => {});
   }
 
-  if (errorMessage !== null) throw new Error(errorMessage);
-  return { imported, alreadyImported, failed, sessions, failures };
+  const { done, progress } = stream;
+  const listedFailures = failures.length > 0 ? failures : stream.doneFailures;
+  const listedSkipped = skippedEvents.length > 0 ? skippedEvents : stream.doneSkipped;
+  // The server always ends with `done` (even after `error`), so a body without
+  // it was cut off. A server `error` that arrived first is the better reason.
+  const error =
+    stream.error ??
+    (done === null
+      ? streamInterruptedError(
+          Math.max(
+            progress?.done ?? 0,
+            sessions.length + listedFailures.length + listedSkipped.length,
+          ),
+        )
+      : null);
+  const num = (value: unknown, fallback: number): number =>
+    typeof value === "number" ? value : fallback;
+  return {
+    imported: num(done?.imported, sessions.length),
+    alreadyImported: num(done?.already_imported, 0),
+    ...separateSkipped(
+      num(done?.failed, listedFailures.length),
+      listedFailures,
+      num(done?.skipped, listedSkipped.length),
+      listedSkipped,
+    ),
+    sessions,
+    total: typeof done?.total === "number" ? done.total : (progress?.total ?? null),
+    // An older server's `done` has no `complete`; then only an error marks it partial.
+    complete: error === null && (typeof done?.complete === "boolean" ? done.complete : true),
+    error,
+  };
 }
 
 /**
@@ -693,26 +1098,28 @@ async function importLocalSessionsBuffered(
     already_imported: number;
     failed: number;
     sessions: { session_id: string; title: string | null }[];
-    failures?: {
-      external_session_id: string | null;
-      source: string | null;
-      reason: string;
-    }[];
+    failures?: Record<string, unknown>[];
+    skipped?: number;
+    skipped_sessions?: Record<string, unknown>[];
   }>(res);
   const sessions = wire.sessions.map((s) => ({ id: s.session_id, title: s.title }));
   for (const s of sessions) onSession?.(s);
+  const skippedSessions = (wire.skipped_sessions ?? []).map(toImportFailureRef);
   return {
     imported: wire.imported,
     alreadyImported: wire.already_imported,
-    failed: wire.failed,
-    sessions,
     // Absent from a server predating failure detail (only a count); default to
     // none so the caller can still render the tally.
-    failures: (wire.failures ?? []).map((f) => ({
-      externalSessionId: f.external_session_id,
-      source: f.source,
-      reason: f.reason,
-    })),
+    ...separateSkipped(
+      wire.failed,
+      (wire.failures ?? []).map(toImportFailureRef),
+      wire.skipped ?? skippedSessions.length,
+      skippedSessions,
+    ),
+    sessions,
+    total: null,
+    complete: true,
+    error: null,
   };
 }
 

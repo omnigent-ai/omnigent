@@ -582,9 +582,19 @@ export async function authenticatedFetch(
   ) {
     // We sent this keyless BECAUSE the host was demoted, yet it still came back
     // wrong_replica — so keying was not the problem (e.g. the host re-registered
-    // keyed after a CLI upgrade). Clear the demotion so the next request
-    // re-evaluates by trying keyed again.
+    // keyed after a CLI upgrade). Clear the demotion so later requests key
+    // again, and re-address THIS one ONCE with the key: wrong_replica means the
+    // request is valid but misrouted, so returning it would fail an action the
+    // keyed route can serve. No further fallback — if the keyed attempt misses
+    // too, that response is returned as-is.
     clearHostKeyless(derivedHostId);
+    const retryHeaders = new Headers(headers);
+    retryHeaders.set(SLICE_KEY_HEADER, derivedHostId);
+    res = await hostFetch(url, {
+      ...init,
+      headers: retryHeaders,
+      cache: "no-store",
+    });
   }
 
   if (
