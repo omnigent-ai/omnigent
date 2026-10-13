@@ -93,6 +93,18 @@ async def _reply(ws: ClientConnection, req_id: str) -> None:
     await ws.send(encode_frame(ResponseEndFrame(req_id)))
 
 
+def _pause_sender(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    resume = asyncio.Event()
+    original_sender = runner_tunnel._sender_loop
+
+    async def paused_sender(ws, session) -> None:
+        await resume.wait()
+        await original_sender(ws, session)
+
+    monkeypatch.setattr(runner_tunnel, "_sender_loop", paused_sender)
+    return resume
+
+
 @pytest.mark.parametrize(
     ("capable", "enabled", "opted_in", "binary"),
     [
@@ -552,15 +564,10 @@ async def _runner_dispatch(
 async def test_binary_admission_bounds_buffering_and_keeps_pings_flowing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    writer_resume = asyncio.Event()
+    writer_resume = _pause_sender(monkeypatch)
     uploads_started = asyncio.Event()
     uploads_finish = asyncio.Event()
     active_uploads = 0
-    original_sender = runner_tunnel._sender_loop
-
-    async def paused_sender(ws, session) -> None:
-        await writer_resume.wait()
-        await original_sender(ws, session)
 
     async def app(scope, receive, send) -> None:
         nonlocal active_uploads
@@ -577,7 +584,6 @@ async def test_binary_admission_bounds_buffering_and_keeps_pings_flowing(
         await send({"type": "http.response.start", "status": 204, "headers": []})
         await send({"type": "http.response.body", "body": b""})
 
-    monkeypatch.setattr(runner_tunnel, "_sender_loop", paused_sender)
     async with _tunnel([_CAPABILITY]) as (client, ws, registry):
         # Content-Length has the same number of digits at this boundary.
         probe = client.build_request(
@@ -657,7 +663,7 @@ async def test_cancelled_requests_keep_admission_until_runner_finishes(
     queued: bool,
     terminal_error: bool,
 ) -> None:
-    writer_resume = asyncio.Event()
+    writer_resume = _pause_sender(monkeypatch)
     if not queued:
         writer_resume.set()
     uploads_started = asyncio.Event()
@@ -665,11 +671,6 @@ async def test_cancelled_requests_keep_admission_until_runner_finishes(
     active_uploads = 0
     peak_uploads = 0
     cancellations_received = 0
-    original_sender = runner_tunnel._sender_loop
-
-    async def paused_sender(ws, session) -> None:
-        await writer_resume.wait()
-        await original_sender(ws, session)
 
     async def app(scope, receive, send) -> None:
         nonlocal active_uploads, peak_uploads, cancellations_received
@@ -696,7 +697,6 @@ async def test_cancelled_requests_keep_admission_until_runner_finishes(
             await send({"type": "http.response.start", "status": 204, "headers": []})
             await send({"type": "http.response.body", "body": b""})
 
-    monkeypatch.setattr(runner_tunnel, "_sender_loop", paused_sender)
     payload = b"\xff" * (RUNNER_TUNNEL_MAX_MESSAGE_BYTES - 1024)
     async with _tunnel([_CAPABILITY]) as (client, ws, registry):
         session = registry.get(_RUNNER)
