@@ -74,6 +74,7 @@ import {
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { SettingsGroup } from "@/components/SettingsGroup";
+import { SettingsSandboxesSection } from "@/pages/settings/SettingsSandboxesSection";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
@@ -340,6 +341,7 @@ export function SettingsPage() {
       {section === "custom-agents" && <SettingsCustomAgentsSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
+      {section === "sandboxes" && <SettingsSandboxesSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}

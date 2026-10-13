@@ -863,6 +863,7 @@ def create_hosts_router(
             host_registry=host_registry,
             conversation_store=conversation_store,
             permission_store=permission_store,
+            sandbox_profiles=getattr(request.app.state, "sandbox_profiles", None),
         )
         conn = target.conn
         set_current_session_id(body.session_id)
@@ -1079,6 +1080,11 @@ def create_hosts_router(
                     workspace,
                     git_branch,
                 )
+                profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+                if profile_catalog is not None:
+                    await asyncio.to_thread(
+                        profile_catalog.require_session_host, body.session_id, host_id
+                    )
 
             persist_task = asyncio.create_task(persist_binding())
             try:

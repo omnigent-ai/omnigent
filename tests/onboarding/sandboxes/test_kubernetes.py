@@ -16,6 +16,7 @@ import shlex
 import subprocess
 import sys
 import types
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2032,3 +2033,150 @@ def test_provision_reserves_pod_name_and_no_exec_transport() -> None:
     assert not hasattr(launcher, "run")
     assert launcher.capabilities.cli_bootstrap is False
     assert launcher.capabilities.classifies_runner_by_agent is True
+
+
+@pytest.mark.parametrize("provider", ["kubernetes", "agent_sandbox"])
+def test_profile_policy_precedes_workload_and_survives_resume(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+) -> None:
+    from omnigent.onboarding.sandboxes.agent_sandbox import AgentSandboxLauncher
+
+    core, batch = fake_clients
+    policies = {}
+    workloads = []
+    operations = []
+
+    def create_policy(namespace, body, **kwargs):
+        assert not core.created_secrets
+        assert kwargs["field_validation"] == "Strict"
+        operations.append("policy")
+        name = body["metadata"]["name"]
+        if name in policies:
+            raise _FakeApiException(status=409)
+        policies[name] = deepcopy(body)
+        return body
+
+    def record_workload(body):
+        assert core.created_secrets
+        assert operations[-1] == "policy"
+        operations.append("workload")
+        workloads.append(body)
+
+    def create_sandbox(group, version, namespace, plural, body, **kwargs):
+        if workloads:
+            raise _FakeApiException(status=409)
+        record_workload(body)
+
+    client = sys.modules["kubernetes.client"]
+    monkeypatch.setattr(
+        client,
+        "NetworkingV1Api",
+        lambda api: SimpleNamespace(
+            create_namespaced_network_policy=create_policy,
+            read_namespaced_network_policy=lambda name, namespace, **kwargs: policies[name],
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        client.ApiClient, "sanitize_for_serialization", lambda obj: obj, raising=False
+    )
+    monkeypatch.setattr(
+        client,
+        "CustomObjectsApi",
+        lambda api: SimpleNamespace(
+            create_namespaced_custom_object=create_sandbox,
+            get_namespaced_custom_object=lambda *args, **kwargs: {},
+            patch_namespaced_custom_object=lambda *args, **kwargs: record_workload(args[5]),
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        batch, "create_namespaced_job", lambda ns, body, **kwargs: record_workload(body)
+    )
+    launcher_type = KubernetesSandboxLauncher if provider == "kubernetes" else AgentSandboxLauncher
+    launcher = launcher_type(in_cluster=True, namespace="sandboxes", env=())
+    monkeypatch.setattr(launcher, "_wait_for_pod_running", lambda *args: None)
+    launcher.apply_profile({"image": "profile:v1", "egress": []})
+    for launch in range(2):
+        if launch:
+            launcher.resume("sandbox-test")
+            core.created_secrets.clear()
+        launcher.start_host(
+            "sandbox-test",
+            token=_TOKEN,
+            host_id="host",
+            host_name="test",
+            server_url="http://server",
+        )
+    assert operations == ["policy", "workload", "policy", "workload"]
+    assert len(policies) == 1
+    policy = next(iter(policies.values()))
+    assert policy["spec"]["policyTypes"] == ["Egress"]
+    assert policy["spec"]["egress"] == []
+    for workload in workloads:
+        template = workload["spec"]["template" if provider == "kubernetes" else "podTemplate"]
+        label = template["metadata"]["labels"][k8s._EGRESS_POLICY_LABEL]
+        assert policy["spec"]["podSelector"]["matchLabels"] == {k8s._EGRESS_POLICY_LABEL: label}
+        assert template["spec"]["containers"][0]["image"] == "profile:v1"
+
+
+@pytest.mark.parametrize("failure", ["denied", "mismatch", "existing_mismatch"])
+def test_profile_policy_failure_never_launches_workload(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    core, batch = fake_clients
+    observed = {}
+
+    def create_policy(namespace, body, **kwargs):
+        if failure == "denied":
+            raise _FakeApiException(status=403, reason="Forbidden")
+        observed.update(body)
+        body["spec"]["egress"] = [{}]
+        if failure == "existing_mismatch":
+            raise _FakeApiException(status=409)
+        return body
+
+    client = sys.modules["kubernetes.client"]
+    monkeypatch.setattr(
+        client,
+        "NetworkingV1Api",
+        lambda api: SimpleNamespace(
+            create_namespaced_network_policy=create_policy,
+            read_namespaced_network_policy=lambda *args, **kwargs: observed,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        client.ApiClient, "sanitize_for_serialization", lambda obj: obj, raising=False
+    )
+    launcher = _launcher()
+    launcher.apply_profile({"egress": []})
+    with pytest.raises(click.ClickException):
+        launcher.start_host(
+            "sandbox-test",
+            token=_TOKEN,
+            host_id="host",
+            host_name="test",
+            server_url="http://server",
+        )
+    assert not core.created_secrets
+    assert not batch.created_jobs
+
+
+def test_profile_without_egress_preserves_default_networking(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    launcher = _launcher()
+    launcher.apply_profile({"resources": {"requests": {"cpu": "2"}}})
+    launcher.start_host(
+        "sandbox-test", token=_TOKEN, host_id="host", host_name="test", server_url="http://server"
+    )
+    template = batch.created_jobs[0]["spec"]["template"]
+    assert k8s._EGRESS_POLICY_LABEL not in template["metadata"]["labels"]
+    assert template["spec"]["containers"][0]["resources"]["requests"]["cpu"] == "2"

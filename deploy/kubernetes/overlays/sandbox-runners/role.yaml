@@ -19,6 +19,10 @@ metadata:
     app.kubernetes.io/name: omnigent
     app.kubernetes.io/component: server
 rules:
+  # Immutable egress profiles are installed before their runner Pods start.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get"]
   # Manage the lifecycle of runner Jobs.  The launcher creates a batch/v1 Job
   # (which spawns a child Pod), reads the Job's child Pod to poll start
   # readiness, and deletes the Job (cascading to its Pods) at terminate.

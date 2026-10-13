@@ -74,6 +74,16 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("settingsNavGroups", () => {
+  it("offers Sandboxes only to admins on managed-sandbox deployments", () => {
+    const hasSandboxes = (admin: boolean, managed: boolean) =>
+      settingsNavGroups(false, false, admin, false, false, false, managed)
+        .flatMap((group) => group.items)
+        .some((item) => item.id === "sandboxes");
+    expect(hasSandboxes(true, true)).toBe(true);
+    expect(hasSandboxes(false, true)).toBe(false);
+    expect(hasSandboxes(true, false)).toBe(false);
+  });
+
   it("starts general preferences with a General gear entry", () => {
     const general = settingsNavGroups(false, false).find((group) => group.title === "General");
     expect(general?.items[0]).toMatchObject({

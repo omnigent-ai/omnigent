@@ -46,7 +46,9 @@ Platform notes that shape this launcher:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
+import json
 import logging
 import os
 import posixpath
@@ -69,6 +71,7 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxHostLauncher,
     render_host_config_write_command,
 )
+from omnigent.onboarding.sandboxes.profiles import validate_profile_config
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities, clone_dir_names
 
 if TYPE_CHECKING:
@@ -154,6 +157,7 @@ _ROLE_VALUE: str = "sandbox-host"
 # agent. The value is the server-resolved agent name verbatim — a join key an
 # operator writes into a policy — never a client-supplied labels spec.
 _AGENT_LABEL: str = "omnigent.ai/agent"
+_EGRESS_POLICY_LABEL: str = "omnigent.ai/egress-policy"
 
 # Kubernetes label VALUE grammar: 1–63 chars, starting and ending alphanumeric,
 # with ``-``/``_``/``.`` allowed only in the interior. The agent name is stamped
@@ -725,6 +729,7 @@ def build_job_manifest(
     ttl_seconds_after_finished: int = _JOB_TTL_SECONDS_AFTER_FINISHED,
     runtime_class: str | None = None,
     home_size_limit: str | None = _HOME_SIZE_LIMIT_DEFAULT,
+    egress_policy: str | None = None,
 ) -> dict[str, object]:
     """
     Build the sandbox Job manifest as a plain dict.
@@ -1011,6 +1016,8 @@ def build_job_manifest(
     # never coerced, since a lossy collision would map two agents onto one
     # credential an admission policy injects.
     labels = {_MANAGED_BY_LABEL: _MANAGED_BY_VALUE, _ROLE_LABEL: _ROLE_VALUE}
+    if egress_policy is not None:
+        labels[_EGRESS_POLICY_LABEL] = egress_policy
     if agent_name:
         if _is_valid_label_value(agent_name):
             labels[_AGENT_LABEL] = agent_name
@@ -1310,6 +1317,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._pod_ready_timeout_s = pod_ready_timeout_s
         self._runtime_class = runtime_class
         self._home_size_limit = home_size_limit
+        self._profile_egress: list[dict[str, object]] | None = None
         self._core: k8s_client.CoreV1Api | None = None
         self._batch: k8s_client.BatchV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
@@ -1496,6 +1504,76 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
 
     # ── lifecycle ───────────────────────────────────────────
 
+    def apply_profile(self, config: dict[str, object]) -> None:
+        normalized = validate_profile_config(config)
+        if "image" in normalized:
+            self._image_ref = cast("str", normalized["image"])
+        if "resources" in normalized:
+            resources = cast("dict[str, dict[str, str]]", normalized["resources"])
+            existing = cast("dict[str, dict[str, str]]", self._resources or {})
+            self._resources = {
+                tier: {**existing.get(tier, {}), **resources.get(tier, {})}
+                for tier in ("requests", "limits")
+            }
+        self._profile_egress = cast("list[dict[str, object]] | None", normalized.get("egress"))
+
+    def _egress_policy_id(self) -> str | None:
+        if self._profile_egress is None:
+            return None
+        payload = json.dumps(self._profile_egress, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode()).hexdigest()[:40]
+
+    def _ensure_network_policy(self, namespace: str) -> None:
+        policy_id = self._egress_policy_id()
+        if policy_id is None:
+            return
+        from kubernetes import client
+        from kubernetes.client.rest import ApiException
+
+        self._load_clients()
+        networking = client.NetworkingV1Api(self._api_client)
+        name = f"omnigent-egress-{policy_id}"
+        selector = {"matchLabels": {_EGRESS_POLICY_LABEL: policy_id}}
+        body = {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "labels": {_MANAGED_BY_LABEL: _MANAGED_BY_VALUE},
+            },
+            "spec": {
+                "podSelector": selector,
+                "policyTypes": ["Egress"],
+                "egress": self._profile_egress,
+            },
+        }
+        # ponytail: share immutable policies; admins remove unused profile revisions.
+        try:
+            observed = networking.create_namespaced_network_policy(
+                namespace,
+                body,
+                field_validation="Strict",
+                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+            )
+        except ApiException as exc:
+            if getattr(exc, "status", None) != 409:
+                raise
+            observed = networking.read_namespaced_network_policy(
+                name, namespace, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
+            )
+        spec = client.ApiClient.sanitize_for_serialization(observed)["spec"]
+        egress = validate_profile_config({"egress": spec.get("egress", [])})["egress"]
+        if (
+            spec.get("podSelector") != selector
+            or spec.get("policyTypes") != ["Egress"]
+            or egress != self._profile_egress
+            or spec.get("ingress")
+        ):
+            raise click.ClickException(
+                f"NetworkPolicy {name!r} does not match the selected sandbox profile."
+            )
+
     def prepare(self) -> None:
         """
         Local preflight: verify the Kubernetes client is installed.
@@ -1600,7 +1678,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     agent_name=agent_name,
                     runtime_class=self._runtime_class,
                     home_size_limit=self._home_size_limit,
+                    egress_policy=self._egress_policy_id(),
                 )
+                self._ensure_network_policy(namespace)
                 # Secret before Job so the Pod's secretKeyRef resolves
                 # immediately.
                 core.create_namespaced_secret(
