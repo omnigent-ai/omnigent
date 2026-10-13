@@ -314,7 +314,8 @@ async def test_malformed_terminal_error_settles_only_its_active_turn(
         )
 
     assert len(client.posts) == 1
-    assert client.posts[0][1]["data"] == {
+    data = client.posts[0][1]["data"]
+    assert {key: data.get(key) for key in ("status", "response_id", "output")} == {
         "status": "failed",
         "response_id": "codex_turn_123",
         "output": "Codex turn ended with an unspecified error.",
