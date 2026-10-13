@@ -1,4 +1,4 @@
-"""Usage-telemetry opt-outs shared by emitters and subprocess launchers."""
+"""Usage-telemetry opt-outs shared by the server client and local launcher."""
 
 from __future__ import annotations
 
@@ -31,9 +31,3 @@ def is_disabled_by_env(env: Mapping[str, str]) -> bool:
         if env.get(name, "").strip().lower() in ("1", "true", "yes"):
             return True
     return env.get("DO_NOT_TRACK", "").strip() == "1" or any(name in env for name in CI_ENV_VARS)
-
-
-def propagate_telemetry_opt_out(source: Mapping[str, str], child: dict[str, str]) -> None:
-    """Carry suppression across env filtering without forwarding CI metadata."""
-    if is_disabled_by_env(source):
-        child[DISABLE_TELEMETRY_ENV_VAR] = "1"

@@ -448,84 +448,71 @@ _TELEMETRY_OPTOUTS = [
 ]
 
 
-@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
 @pytest.mark.parametrize(("name", "value"), _TELEMETRY_OPTOUTS)
-def test_usage_telemetry_stays_disabled_across_daemon_and_runner(
+def test_local_daemon_preserves_usage_telemetry_opt_out_for_server(
     monkeypatch: pytest.MonkeyPatch,
-    server_url: str | None,
+    tmp_path: Path,
     name: str,
     value: str,
 ) -> None:
-    """A CI run or opt-out must not start an analytics client in a child."""
+    """The local server reads the original CI marker or opt-out at startup."""
     import omnigent.telemetry.client as telemetry
+    from omnigent.host import local_server
 
-    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
-    source = {"PATH": os.defpath, name: value, "UNRELATED_SECRET": "private-value"}
+    source = {
+        "PATH": os.defpath,
+        "OMNIGENT_DATA_DIR": str(tmp_path / "data"),
+        "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
+        "OMNIGENT_AUTH_PROVIDER": "header",
+        name: value,
+        "UNRELATED_SECRET": "private-value",
+    }
     with patch.dict(os.environ, source, clear=True):
-        daemon_env = _build_host_daemon_env(server_url=server_url)
-    runner_env = _build_runner_env(
-        daemon_env,
-        server_url=server_url or "http://localhost:6767",
-        runner_id="runner_no_analytics",
-        binding_token="synthetic-binding-token",
-        workspace="/tmp/workspace",
-        parent_pid=12345,
-    )
-    for env in (daemon_env, runner_env, strip_runner_auth_secrets(runner_env)):
-        assert env["OMNIGENT_DISABLE_TELEMETRY"] == "1"
-        assert "UNRELATED_SECRET" not in env
-        if not name.startswith("OMNIGENT_"):
-            assert name not in env
-        monkeypatch.setattr(telemetry, "_CLIENT", None)
-        monkeypatch.setattr(telemetry, "_IS_DISABLED_CACHE", [None])
-        with (
-            patch.dict(os.environ, env, clear=True),
-            patch.object(telemetry, "TelemetryClient") as client,
-        ):
-            telemetry.init_client()
-            assert telemetry.get_client() is None
-            client.assert_not_called()
+        daemon_env = _build_host_daemon_env(server_url=None)
+    assert daemon_env[name] == value
+    assert "UNRELATED_SECRET" not in daemon_env
+    if name != "OMNIGENT_DISABLE_TELEMETRY":
+        assert "OMNIGENT_DISABLE_TELEMETRY" not in daemon_env
 
-
-@pytest.mark.parametrize(("name", "value"), _TELEMETRY_OPTOUTS)
-def test_runner_suppresses_usage_telemetry_without_a_daemon(
-    monkeypatch: pytest.MonkeyPatch,
-    name: str,
-    value: str,
-) -> None:
-    """A directly launched host also normalizes suppression for its runner."""
-    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
-    env = _build_runner_env(
-        {"PATH": os.defpath, name: value},
-        server_url=_REMOTE_SERVER_URL,
-        runner_id="runner_direct_no_analytics",
-        binding_token="synthetic-binding-token",
-        workspace="/tmp/workspace",
-        parent_pid=12345,
-    )
-    assert env["OMNIGENT_DISABLE_TELEMETRY"] == "1"
+    with (
+        patch.dict(os.environ, daemon_env, clear=True),
+        patch.object(local_server.subprocess, "Popen") as popen,
+    ):
+        local_server._spawn_local_server(8765, "")
+    popen.assert_called_once()
+    server_env = popen.call_args.kwargs["env"]
+    assert server_env[name] == value
+    monkeypatch.setattr(telemetry, "_CLIENT", None)
+    monkeypatch.setattr(telemetry, "_IS_DISABLED_CACHE", [None])
+    with (
+        patch.dict(os.environ, server_env, clear=True),
+        patch.object(telemetry, "TelemetryClient") as client,
+        patch("omnigent.telemetry.installation_id.get_installation_id") as installation_id,
+    ):
+        telemetry.init_client(config={"telemetry": True})
+        assert telemetry.get_client() is None
+        client.assert_not_called()
+        installation_id.assert_not_called()
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
-def test_daemon_and_runner_do_not_disable_usage_telemetry_without_an_opt_out(
+def test_ci_detection_stays_on_the_local_server(
     monkeypatch: pytest.MonkeyPatch,
     server_url: str | None,
 ) -> None:
-    """Ordinary launches and inactive opt-out flags keep analytics enabled."""
+    """CI markers reach a local server without changing runner suppression."""
     monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
-    with patch.dict(
-        os.environ,
-        {"PATH": os.defpath, "DISABLE_TELEMETRY": "false", "DO_NOT_TRACK": "0"},
-        clear=True,
-    ):
+    with patch.dict(os.environ, {"PATH": os.defpath, "CI": "true"}, clear=True):
         daemon_env = _build_host_daemon_env(server_url=server_url)
+    assert ("CI" in daemon_env) == (server_url is None)
+    assert "OMNIGENT_DISABLE_TELEMETRY" not in daemon_env
     runner_env = _build_runner_env(
         daemon_env,
         server_url=server_url or "http://localhost:6767",
-        runner_id="runner_analytics",
+        runner_id="runner_ci",
         binding_token="synthetic-binding-token",
         workspace="/tmp/workspace",
         parent_pid=12345,
     )
-    assert "OMNIGENT_DISABLE_TELEMETRY" not in daemon_env
+    assert "CI" not in runner_env
     assert "OMNIGENT_DISABLE_TELEMETRY" not in runner_env
