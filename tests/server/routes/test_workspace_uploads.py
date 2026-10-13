@@ -866,7 +866,17 @@ async def test_commit_receipt_publishes_once_from_either_route(scenario, monkeyp
     assert (await scenario.create()).status_code == 201
 
 
-async def test_unexpected_capability_error_does_not_poison_connection(scenario):
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("unexpected transport failure"),
+        AssertionError("unexpected transport failure"),
+        httpx.ReadTimeout("probe deadline exceeded"),
+        asyncio.CancelledError(),
+    ],
+    ids=["runtime-error", "assertion-error", "typed-timeout", "cancellation"],
+)
+async def test_unexpected_capability_error_does_not_poison_connection(scenario, failure):
     probes = 0
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -877,8 +887,8 @@ async def test_unexpected_capability_error_does_not_poison_connection(scenario):
         if probes == 1:
             entered.set()
             await release.wait()
-            raise RuntimeError("unexpected transport failure")
-        return httpx.Response(502)
+            raise failure
+        return await scenario.handle(request)
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handle), base_url="http://runner"
@@ -890,15 +900,29 @@ async def test_unexpected_capability_error_does_not_poison_connection(scenario):
             tasks.append(asyncio.create_task(scenario.client.get(scenario.base)))
             await asyncio.sleep(0.01)
             release.set()
-            with pytest.raises(RuntimeError, match="unexpected transport failure"):
-                await tasks[0]
+            cancelled = isinstance(failure, asyncio.CancelledError)
+            expected_status = 504 if isinstance(failure, httpx.ReadTimeout) else 502
+            expected_code = "timeout" if expected_status == 504 else "upload_relay_failed"
+            leader = await asyncio.wait_for(tasks[0], 0.5)
+            if cancelled:
+                # The app books a cancellation escaping the route as an empty 499.
+                assert leader.status_code == 499
+                assert leader.content == b""
+            else:
+                assert leader.status_code == expected_status
+                assert leader.json()["error"]["code"] == expected_code
+                assert "unexpected transport failure" not in leader.text
             waiter = await asyncio.wait_for(tasks[1], 0.5)
-            assert waiter.status_code == 502
-            assert waiter.json()["error"]["code"] == "upload_relay_failed"
+            assert waiter.status_code == expected_status
+            assert waiter.json()["error"]["code"] == expected_code
+            if not cancelled:
+                assert leader.json() == waiter.json()
             assert probes == 1
             response = await asyncio.wait_for(scenario.client.get(scenario.base), 0.5)
-            assert response.status_code == 502
-            assert response.json()["error"]["code"] == "upload_relay_failed"
+            assert response.status_code == 200
+            assert response.json()["supported"] is True
+            assert probes == 2
+            assert (await scenario.client.get(scenario.base)).json()["supported"] is True
             assert probes == 2
         finally:
             release.set()
