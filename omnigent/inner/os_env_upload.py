@@ -84,7 +84,8 @@ def valid_name(name: str) -> bool:
         bool(name)
         and len(name.encode("utf-8")) <= 255
         and name not in (".", "..")
-        and not any(c in name for c in ("/", "\\", "\0"))
+        and not any(c in name for c in ("/", "\\"))
+        and not re.search(r"[\x00-\x1f\x7f]", name)
         and not is_upload_staging(name)
         and not (
             os.name == "nt"
@@ -297,6 +298,8 @@ class UploadEngine:
         self.mode = 0o666 & ~mask
 
     def _grant(self, directory: str, name: str, staging: str) -> None:
+        if re.search(r"[\x00-\x1f\x7f]", directory):
+            raise UploadError("invalid_path", "Upload path contains control characters")
         for basename in (name, staging):
             path = (self.cwd / directory / basename).resolve()
             _assert_within_reach(self.cwd, self.sandbox, path, need_write=True)
