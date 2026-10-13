@@ -1,6 +1,6 @@
 ---
 name: omnigent-guide
-description: Use when the user asks about Omnigent itself, even in passing - what it can do, how to install, configure, update, or uninstall it, its CLI commands, harnesses (Claude Code, Codex, Pi, and others), agent configs, skills, MCP servers, sub-agents, policies, sandboxes, automations, servers and hosts, or using it from another device. Also use it when Omnigent behaves unexpectedly, or when the user asks what you can do inside Omnigent. It says where to find answers that match the installed version. Not for general coding tasks or for a harness's own configuration.
+description: Use when the user asks about Omnigent itself or this machine's Omnigent setup, including install, CLI, harnesses, agent configs, skills, MCP servers, policies, sandboxes, automations, updates, or what you can do here. Skip it for questions about another tool on its own, or for general coding.
 ---
 
 # Omnigent guide
