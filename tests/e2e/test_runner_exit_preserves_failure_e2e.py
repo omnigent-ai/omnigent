@@ -48,6 +48,9 @@ async def test_runner_exit_preserves_original_failure(tmp_path: Path, restart: b
         if restart:
             stack.close()
             base_url = stack.enter_context(isolated_local_server(server_root, env=server_env))
+            # The early close consumed the store's dispose callback; re-register it
+            # so the recreated SQLite pool is also disposed at exit.
+            stack.callback(store._engine.dispose)
 
         host_id = "89153a620ca447618d15c97bc63e52b6"
         socket_url = base_url.replace("http://", "ws://") + f"/v1/hosts/{host_id}/tunnel"

@@ -7797,9 +7797,11 @@ async def _runner_disconnect_requires_failure(
             cause_conv is None or _last_task_error_from_labels(cause_conv.labels) is None
         ):
             try:
-                cause_conv = await asyncio.to_thread(
-                    conversation_store.get_conversation, session_id
-                )
+                reread = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                # A missing row is as inconclusive as an unreadable one; keep the
+                # prior cause rather than treating absence as proof of no cause.
+                if reread is not None:
+                    cause_conv = reread
             except Exception:  # noqa: BLE001 — an unreadable row cannot prove the cause absent
                 read_failed = True
                 _logger.warning(
