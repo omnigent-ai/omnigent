@@ -5578,15 +5578,9 @@ function ConversationRowImpl({
           style={insertion === "before" ? { top: 0 } : { bottom: 0 }}
         />
       )}
-      {/* Right-click anywhere on the row opens the same actions as the kebab.
-          Suppressed in selection mode (bulk-select owns the row), where the
-          bare link is rendered instead. ContextMenuTrigger preventDefaults the
-          native contextmenu event, so right-click never navigates; asChild
-          merges its handler onto the Link, preserving left-click / double-click.
-          Pinned, project-owned rows nest a HoverCardTrigger around the Link so
-          hovering surfaces the project flyout — the trigger sits innermost so
-          both the context menu and the hover card keep their handlers/refs on
-          the Link. */}
+      {/* Right-click opens row actions; selection mode uses a bare link.
+          With sidebar_grouping_ui off, pinned project rows use HoverCardTrigger
+          for the project flyout. */}
       {selectionMode ? (
         projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
