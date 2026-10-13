@@ -283,3 +283,145 @@ def test_upload_under_real_sandbox_refuses_masked_directory(
     finally:
         client.close()
         env.close()
+
+
+@pytest.mark.parametrize("name", ["a" * 255, "é" * 125 + ".txt"])
+def test_rename_byte_budget(helper: UploadHelperClient, tmp_path: Path, name: str) -> None:
+    original = tmp_path / name
+    original.write_bytes(b"old")
+    assert "error" not in begin(helper, name=name, on_conflict="rename", size=0)
+    result = helper.call({"op": "complete", "id": "a" * 32})
+    assert "error" not in result, result
+    assert len(str(result["final_name"]).encode()) <= 255
+    assert result["outcome"] == "renamed"
+    assert original.read_bytes() == b"old"
+
+
+def test_rename_skips_directory(helper: UploadHelperClient, tmp_path: Path) -> None:
+    (tmp_path / "model.3mf").write_bytes(b"old")
+    (tmp_path / "model (1).3mf").mkdir()
+    begin(helper, on_conflict="rename", size=0)
+    result = helper.call({"op": "complete", "id": "a" * 32})
+    assert result["final_name"] == "model (2).3mf"
+
+
+def test_rename_exhaustion_is_typed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.inner.os_env_upload as upload
+
+    monkeypatch.setattr(upload, "MAX_RENAME_ATTEMPTS", 2, raising=False)
+    env = create_os_environment(
+        OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert isinstance(env, CallerProcessOSEnvironment)
+    engine = upload.UploadEngine(tmp_path, env.sandbox)
+    for name in ["file", "file (1)", "file (2)"]:
+        (tmp_path / name).write_bytes(b"keep")
+    try:
+        assert "error" not in engine.dispatch(
+            {
+                "op": "begin",
+                "id": "a" * 32,
+                "dir": "",
+                "name": "file",
+                "size": 0,
+                "on_conflict": "rename",
+            },
+            b"",
+        )
+        assert engine.dispatch({"op": "complete", "id": "a" * 32}, b"")["code"] == "file_exists"
+    finally:
+        engine.close()
+        env.close()
+
+
+def test_platform_negative_probe(
+    helper: UploadHelperClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    import omnigent.inner.os_env_upload as upload
+
+    engine = upload.UploadEngine(helper.cwd, helper.sandbox)
+    monkeypatch.setattr(upload, "sys", SimpleNamespace(platform="win32"))
+    try:
+        result = engine.dispatch({"op": "probe"}, b"")
+        assert result["raw_upload"] is False
+        assert result["reason"]
+    finally:
+        engine.close()
+
+
+def test_upload_helper_has_no_network_or_credentials(helper: UploadHelperClient) -> None:
+    assert helper.sandbox.allow_network is False
+    assert helper._egress_rules is None
+    assert helper.sandbox.credential_proxy is None
+
+
+def test_real_pipe_is_raw(helper: UploadHelperClient) -> None:
+    import base64
+    from unittest.mock import patch
+
+    payload = bytes(range(256)) * 16
+    begin(helper, size=len(payload))
+    assert helper._proc is not None and helper._proc.stdin is not None
+    original = helper._proc.stdin
+    captured = bytearray()
+
+    class Writer:
+        def write(self, data: bytes):
+            captured.extend(data)
+            return original.buffer.write(data)
+
+        def flush(self):
+            return original.buffer.flush()
+
+    class Stdin:
+        buffer = Writer()
+
+    with patch.object(helper._proc, "stdin", Stdin()):
+        assert helper.call({"op": "append", "id": "a" * 32, "offset": 0}, payload)[
+            "offset"
+        ] == len(payload)
+    assert bytes(captured).endswith(payload)
+    assert base64.b64encode(payload) not in captured
+
+
+def test_stalled_helper_call_is_bounded(helper: UploadHelperClient) -> None:
+    import signal
+    import time
+
+    helper.call({"op": "probe"})
+    assert helper._proc is not None
+    proc = helper._proc
+    os.kill(proc.pid, signal.SIGSTOP)
+
+    def resume() -> None:
+        if proc.poll() is None:
+            os.kill(proc.pid, signal.SIGCONT)
+
+    watchdog = threading.Timer(0.5, resume)
+    watchdog.start()
+    started = time.monotonic()
+    try:
+        result = helper.call({"op": "probe"}, timeout_s=0.1)
+        assert result["code"] == "timeout"
+        assert time.monotonic() - started < 2
+    finally:
+        watchdog.cancel()
+        watchdog.join()
+        helper.interrupt()
+
+
+def test_helper_lock_wait_is_bounded(helper: UploadHelperClient) -> None:
+    import time
+
+    helper._lock.acquire()
+    release = threading.Timer(0.2, helper._lock.release)
+    release.start()
+    try:
+        started = time.monotonic()
+        result = helper.call({"op": "probe"}, timeout_s=0.05)
+        assert result["code"] == "timeout"
+        assert time.monotonic() - started < 0.15
+    finally:
+        release.join()
