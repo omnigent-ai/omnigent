@@ -1,46 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { PlugIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import { useMcpRegistryCatalog } from "@/hooks/useMcpRegistry";
 import { withBasePath } from "@/lib/basePath";
 import { authorizeRegistryService, registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 
-function useCatalog() {
-  const [services, setServices] = useState<RegistryService[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const refresh = useCallback(async () => {
-    try {
-      const entries: RegistryService[] = [];
-      let cursor: string | null = null;
-      do {
-        const result: { data: RegistryService[]; next_cursor?: string | null } =
-          // eslint-disable-next-line no-await-in-loop -- Each page needs the previous cursor.
-          await registryRequest(cursor ? `?after=${encodeURIComponent(cursor)}` : "");
-        entries.push(...result.data);
-        cursor = result.next_cursor ?? null;
-      } while (cursor);
-      setServices(entries);
-      setError(null);
-      return entries;
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not load MCP services");
-      return undefined;
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-  useEffect(() => {
-    void refresh();
-    const onFocus = () => void refresh();
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
-  }, [refresh]);
-  return { services, error, loading, refresh };
-}
-
 export function McpRegistryConnections() {
-  const { services, error, loading, refresh } = useCatalog();
+  const { services, error, loading, refresh } = useMcpRegistryCatalog();
   const callbackFailed = [...new URLSearchParams(window.location.search)].some(
     ([key, value]) => key.startsWith("mcp-") && value === "error",
   );
@@ -233,14 +201,17 @@ export function McpRegistryPicker({
   onToggle,
   busy,
   onAuthorizingChange,
+  catalog,
 }: {
   attached: string[];
   reservedNames?: string[];
   onToggle: (id: string, enabled: boolean) => void;
   busy: boolean;
   onAuthorizingChange?: (pending: boolean) => void;
+  catalog?: ReturnType<typeof useMcpRegistryCatalog>;
 }) {
-  const { services, error, loading, refresh } = useCatalog();
+  const ownCatalog = useMcpRegistryCatalog(!catalog);
+  const { services, error, loading, refresh } = catalog ?? ownCatalog;
   const [authorizing, setAuthorizing] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<{ id: string; message: string } | null>(
     null,
@@ -295,60 +266,54 @@ export function McpRegistryPicker({
 
   const unavailable = attached.filter((id) => !services.some((s) => s.id === id));
   return (
-    <div className="space-y-3">
-      <p className="text-sm text-muted-foreground">
-        Choose the services this session can use. Your administrator manages the catalog. You’ll be
-        asked to sign in when needed.
-      </p>
+    <div className="flex min-h-0 flex-col">
       {error && (
-        <p role="alert" className="text-sm text-destructive">
-          {error}
-        </p>
+        <div className="px-3 py-2 text-xs">
+          <p role="alert" className="text-destructive">
+            {error}
+          </p>
+          <Button size="sm" variant="link" onClick={() => void refresh()}>
+            Retry
+          </Button>
+        </div>
       )}
-      {loading && <p className="text-sm text-muted-foreground">Loading MCP services…</p>}
+      {loading && <p className="px-3 py-2 text-xs text-muted-foreground">Loading MCP services…</p>}
       {!loading && !error && !services.length && (
-        <p className="text-sm text-muted-foreground">
+        <p className="px-3 py-2 text-xs text-muted-foreground">
           No managed services are available for your account.
         </p>
       )}
-      <div className="divide-y divide-border rounded-lg border border-border empty:hidden">
+      <ul className="min-h-0 overflow-y-auto py-1 empty:hidden">
         {services.map((service) => {
           const selected = attached.includes(service.id);
           const tokenNeeded = service.auth === "bearer" && !service.connected;
           const conflict = reservedNames?.includes(service.id);
           return (
-            <div key={service.id} className="px-4 py-3">
-              <label className="flex items-center gap-3">
+            <li key={service.id} className="px-3 py-1.5">
+              <label className="flex items-center gap-3" title={service.description}>
                 <PlugIcon className="size-4 shrink-0 text-muted-foreground" />
                 <span className="min-w-0 flex-1">
-                  <span className="block text-sm font-medium">{service.title}</span>
-                  {service.description && (
-                    <span className="block text-xs text-muted-foreground">
-                      {service.description}
-                    </span>
-                  )}
-                  <span className="mt-1 block text-xs text-muted-foreground">
+                  <span className="block truncate text-sm">{service.title}</span>
+                  <span className="block text-xs text-muted-foreground">
                     {conflict
                       ? "A custom server already uses this name"
                       : authorizing === service.id
-                        ? "Waiting for sign-in…"
+                        ? "Authorizing…"
                         : service.connected
                           ? service.auth === "none"
                             ? "Ready"
                             : "Connected"
                           : tokenNeeded
                             ? "Connect your account in settings"
-                            : "Sign in to connect"}
+                            : "Needs sign-in"}
                   </span>
                 </span>
-                <input
-                  type="checkbox"
+                <Switch
                   aria-label={service.title}
-                  className="size-4 shrink-0 cursor-pointer accent-primary disabled:cursor-not-allowed disabled:opacity-50"
                   checked={selected}
                   disabled={busy || authorizing !== null || conflict || (tokenNeeded && !selected)}
-                  onChange={(e) =>
-                    e.target.checked ? void enable(service) : onToggle(service.id, false)
+                  onCheckedChange={(next) =>
+                    next ? void enable(service) : onToggle(service.id, false)
                   }
                 />
               </label>
@@ -393,32 +358,32 @@ export function McpRegistryPicker({
                   {connectionError.message}
                 </p>
               )}
-            </div>
+            </li>
           );
         })}
         {!loading &&
           !error &&
           unavailable.map((id) => (
-            <label key={id} className="flex items-center justify-between gap-3 px-4 py-3 text-sm">
-              <span>
-                {id}
-                <span className="block text-xs text-muted-foreground">
-                  No longer available · uncheck to remove
+            <li key={id} className="px-3 py-1.5">
+              <label className="flex items-center justify-between gap-3 text-sm">
+                <span className="min-w-0">
+                  <span className="block truncate">{id}</span>
+                  <span className="block text-xs text-muted-foreground">
+                    No longer available · turn off to remove
+                  </span>
                 </span>
-              </span>
-              <input
-                type="checkbox"
-                aria-label={id}
-                checked
-                disabled={busy || authorizing !== null}
-                onChange={() => onToggle(id, false)}
-                className="size-4 accent-primary"
-              />
-            </label>
+                <Switch
+                  aria-label={id}
+                  checked
+                  disabled={busy || authorizing !== null}
+                  onCheckedChange={() => onToggle(id, false)}
+                />
+              </label>
+            </li>
           ))}
-      </div>
+      </ul>
       <a
-        className="text-xs underline"
+        className="shrink-0 border-t border-border px-3 py-2.5 text-xs text-muted-foreground hover:text-foreground hover:underline"
         href={withBasePath("/settings/mcp")}
         target="_blank"
         rel="noopener noreferrer"

@@ -140,7 +140,23 @@ async def _drive_launch(
                                 "connected": connected,
                                 "tools": ["read_ticket"],
                                 "connect_provider": "databricks" if databricks else "mcp-tracker",
-                            }
+                            },
+                            {
+                                "id": "github-demo",
+                                "title": "GitHub",
+                                "auth": "oauth",
+                                "connected": True,
+                                "tools": ["list_repositories"],
+                                "connect_provider": "mcp-github-demo",
+                            },
+                            {
+                                "id": "search-demo",
+                                "title": "Knowledge search",
+                                "auth": "none",
+                                "connected": True,
+                                "tools": ["search"],
+                                "connect_provider": "",
+                            },
                         ]
                     }
                 ),
@@ -165,10 +181,10 @@ async def _drive_launch(
             await async_expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
             chip = page.get_by_test_id("new-chat-landing-mcp-registry-chip")
             await chip.click()
-            checkbox = page.get_by_role("checkbox", name="Demo work tracker")
-            await checkbox.click()
+            toggle = page.get_by_role("switch", name="Demo work tracker")
+            await toggle.click()
             if databricks:
-                await async_expect(checkbox).not_to_be_checked()
+                await async_expect(toggle).not_to_be_checked()
                 await page.get_by_label("Databricks workspace URL").fill(
                     "https://workspace.example.test"
                 )
@@ -178,7 +194,7 @@ async def _drive_launch(
                         animations="disabled",
                     )
                 await page.get_by_role("button", name="Connect workspace").click()
-            await async_expect(checkbox).to_be_checked()
+            await async_expect(toggle).to_be_checked()
             if directory := os.environ.get("E2E_SCREENSHOT_DIR"):
                 await page.screenshot(
                     path=Path(directory)
@@ -186,6 +202,21 @@ async def _drive_launch(
                     animations="disabled",
                 )
             await page.keyboard.press("Escape")
+            if not databricks:
+                await page.reload()
+                await async_expect(chip).to_have_attribute(
+                    "aria-label", "MCP services: 1 selected"
+                )
+                await chip.click()
+                await async_expect(toggle).to_be_checked()
+                await toggle.click()
+                await page.reload()
+                await chip.click()
+                await async_expect(toggle).not_to_be_checked()
+                await toggle.click()
+                await async_expect(toggle).to_be_checked()
+                await page.keyboard.press("Escape")
+                await page.get_by_test_id("new-chat-landing-input").fill("Read the demo ticket")
             await page.get_by_test_id("new-chat-landing-submit").click()
             await page.wait_for_url(f"{base_url}/c/{session_id}")
             assert len(creates) == 1
@@ -246,9 +277,9 @@ async def _check_session_management(page, session_id: str, width: int, info: dic
         ).to_have_count(0)
         await async_expect(dialog.get_by_role("textbox", name="URL", exact=True)).to_have_count(0)
         if enabled:
-            checkbox = dialog.get_by_role("checkbox", name="Demo work tracker")
-            await checkbox.click()
-            await async_expect(checkbox).to_be_checked()
+            toggle = dialog.get_by_role("switch", name="Demo work tracker")
+            await toggle.click()
+            await async_expect(toggle).to_be_checked()
         else:
             await async_expect(dialog.get_by_text("No longer available")).to_be_visible()
             await async_expect(

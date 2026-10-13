@@ -34,7 +34,7 @@ upstream. The backend may be replaced without moving Omnigent policies to the ru
 ```mermaid
 flowchart LR
   subgraph browser[Browser]
-    UI[Account connections and session MCP checkboxes]
+    UI[Account connections and session MCP switches]
   end
   subgraph runner[Execution host: local machine / remote host / sandbox]
     H[Agent harness]
@@ -106,7 +106,7 @@ sequenceDiagram
     S->>O: Exchange code with PKCE verifier
     O-->>S: Access token and optional refresh token
     S->>C: Save encrypted connection
-    S-->>B: Connection complete, select checkbox
+    S-->>B: Connection complete, turn on service
   end
   B->>S: POST /v1/sessions with mcp_registry_services
   S->>S: Authorize service IDs and preserve authored restrictions

@@ -85,10 +85,10 @@ describe("MCP service selection", () => {
     });
     const toggle = vi.fn();
     render(<McpRegistryPicker attached={["attached"]} onToggle={toggle} busy={false} />);
-    const selected = await screen.findByRole("checkbox", { name: "Attached tracker" });
+    const selected = await screen.findByRole("switch", { name: "Attached tracker" });
     expect(selected).toBeChecked();
-    expect(screen.getByRole("checkbox", { name: "Work tracker" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("checkbox", { name: "Connected tracker" }));
+    expect(screen.getByRole("switch", { name: "Work tracker" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("switch", { name: "Connected tracker" }));
     fireEvent.click(selected);
     expect(toggle.mock.calls).toEqual([
       ["connected", true],
@@ -112,10 +112,10 @@ describe("MCP service selection", () => {
     );
     const toggle = vi.fn();
     render(<McpRegistryPicker attached={[]} onToggle={toggle} busy={false} />);
-    fireEvent.click(await screen.findByRole("checkbox", { name: "Work tracker" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Work tracker" }));
     expect(toggle).not.toHaveBeenCalled();
-    expect(screen.getByRole("checkbox")).not.toBeChecked();
-    expect(screen.getByRole("checkbox")).toBeDisabled();
+    expect(screen.getByRole("switch")).not.toBeChecked();
+    expect(screen.getByRole("switch")).toBeDisabled();
     vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...oauth, connected: true }] });
     complete();
     await waitFor(() => expect(toggle).toHaveBeenCalledWith("tracker", true));
@@ -126,10 +126,10 @@ describe("MCP service selection", () => {
     vi.mocked(authorizeRegistryService).mockRejectedValue(new Error("Sign-in cancelled"));
     const toggle = vi.fn();
     render(<McpRegistryPicker attached={[]} onToggle={toggle} busy={false} />);
-    fireEvent.click(await screen.findByRole("checkbox", { name: "Work tracker" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Work tracker" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Sign-in cancelled");
-    expect(screen.getByRole("checkbox")).not.toBeChecked();
-    expect(screen.getByRole("checkbox")).not.toBeDisabled();
+    expect(screen.getByRole("switch")).not.toBeChecked();
+    expect(screen.getByRole("switch")).not.toBeDisabled();
     expect(toggle).not.toHaveBeenCalled();
   });
 
@@ -159,13 +159,13 @@ describe("MCP service selection", () => {
         busy={false}
       />,
     );
-    fireEvent.click(await screen.findByRole("checkbox", { name: "Work tracker" }));
-    fireEvent.click(screen.getByRole("checkbox", { name: "removed" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Work tracker" }));
+    fireEvent.click(screen.getByRole("switch", { name: "removed" }));
     expect(toggle.mock.calls).toEqual([
       ["tracker", false],
       ["removed", false],
     ]);
-    expect(screen.getByRole("checkbox", { name: "Custom conflict" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Custom conflict" })).toBeDisabled();
   });
 });
 
@@ -174,7 +174,7 @@ it("asks for a Databricks workspace before connecting and selecting it", async (
   vi.mocked(registryRequest).mockResolvedValueOnce({ data: [databricks] });
   const toggle = vi.fn();
   render(<McpRegistryPicker attached={[]} onToggle={toggle} busy={false} />);
-  fireEvent.click(await screen.findByRole("checkbox", { name: "Work tracker" }));
+  fireEvent.click(await screen.findByRole("switch", { name: "Work tracker" }));
   expect(authorizeRegistryService).not.toHaveBeenCalled();
   expect(toggle).not.toHaveBeenCalled();
   expect(screen.getByRole("button", { name: "Connect workspace" })).toBeDisabled();
@@ -201,8 +201,8 @@ it("follows catalog cursors before showing the complete selection", async () => 
     });
   const toggle = vi.fn();
   render(<McpRegistryPicker attached={[]} onToggle={toggle} busy={false} />);
-  fireEvent.click(await screen.findByRole("checkbox", { name: "Wiki" }));
+  fireEvent.click(await screen.findByRole("switch", { name: "Wiki" }));
   expect(toggle).toHaveBeenCalledWith("wiki", true);
   expect(registryRequest).toHaveBeenNthCalledWith(2, "?after=tracker");
-  expect(screen.getByRole("checkbox", { name: "Work tracker" })).toBeInTheDocument();
+  expect(screen.getByRole("switch", { name: "Work tracker" })).toBeInTheDocument();
 });

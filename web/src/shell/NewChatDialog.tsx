@@ -99,6 +99,7 @@ import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { McpRegistryLaunchPicker } from "./McpRegistryLaunchPicker";
+import { useMcpRegistrySelection } from "@/hooks/useMcpRegistry";
 import {
   Command,
   CommandEmpty,
@@ -2280,7 +2281,6 @@ export function NewChatLandingScreen() {
           // they are location state too — keeping them would clone another
           // project's repository into this project's sandbox.
           sandboxRepoSelections: [],
-          mcpRegistryServices: [],
           workspace: "",
           branchName: "",
           // The branch may be the worktree-default's auto-seed, generated for
@@ -2290,9 +2290,6 @@ export function NewChatLandingScreen() {
         };
 
   const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
-  const [mcpRegistryServices, setMcpRegistryServices] = useState<string[]>(
-    () => restoredDraft?.mcpRegistryServices ?? [],
-  );
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
@@ -2324,7 +2321,14 @@ export function NewChatLandingScreen() {
   // fails closed (option hidden) until the boot probe resolves.
   const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
-  const mcpRegistryEnabled = info !== "loading" && info.enabled_connections?.includes("mcp");
+  const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
+  const {
+    selected: mcpRegistryServices,
+    toggle: toggleMcpRegistryService,
+    catalog: mcpRegistryCatalog,
+    selectionError: mcpSelectionError,
+    servicesForLaunch: mcpServicesForLaunch,
+  } = useMcpRegistrySelection(restoredDraft?.mcpRegistryServices, mcpRegistryEnabled);
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Which router can answer a pick. The external AI-Gateway router only covers
   // a family the host runs through the gateway; the built-in judge covers any
@@ -4975,6 +4979,7 @@ export function NewChatLandingScreen() {
   const canSubmit =
     (message.trim().length > 0 || files.length > 0) &&
     !mcpAuthorizing &&
+    mcpSelectionError === null &&
     !pickerLoading &&
     !workspaceStartLoading &&
     !worktreeRequestPending &&
@@ -4991,8 +4996,8 @@ export function NewChatLandingScreen() {
   // actionable (submitting, or mid-create).
   const submitDisabledReason = canSubmit
     ? null
-    : mcpAuthorizing
-      ? "Finish signing in to the MCP service…"
+    : mcpAuthorizing || mcpSelectionError
+      ? (mcpSelectionError ?? "Finish signing in to the MCP service…")
       : pendingSkillCompletion
         ? "Loading skills…"
         : pickerLoading || workspaceStartLoading || worktreeRequestPending
@@ -5538,8 +5543,8 @@ export function NewChatLandingScreen() {
         // same way the fork-resume path does.
         const bundle = await buildAgentBundle(pendingAgent);
         const metadata: Record<string, unknown> = { labels: createLabels };
-        if (mcpRegistryEnabled && mcpRegistryServices.length) {
-          metadata.mcp_registry_services = mcpRegistryServices;
+        if (mcpServicesForLaunch.length) {
+          metadata.mcp_registry_services = mcpServicesForLaunch;
         }
         // A config-seeded workspace is omitted on a `project_id` create so the
         // server default-fills it (same field semantics as the JSON path).
@@ -5620,9 +5625,7 @@ export function NewChatLandingScreen() {
             // Config-seeded agent on a `project_id` create: omitted so the
             // server default-fills it from the project config.
             ...(agentFromProjectConfig ? {} : { agent_id: effectiveAgentId }),
-            ...(mcpRegistryEnabled && mcpRegistryServices.length
-              ? { mcp_registry_services: mcpRegistryServices }
-              : {}),
+            ...(mcpServicesForLaunch.length ? { mcp_registry_services: mcpServicesForLaunch } : {}),
             ...(createProjectId !== null ? { project_id: createProjectId } : {}),
             ...(sandboxSelected
               ? {
@@ -6680,15 +6683,10 @@ export function NewChatLandingScreen() {
                     {mcpRegistryEnabled && (
                       <McpRegistryLaunchPicker
                         selected={mcpRegistryServices}
+                        catalog={mcpRegistryCatalog}
                         disabled={creating}
                         onAuthorizingChange={setMcpAuthorizing}
-                        onToggle={(id, enabled) =>
-                          setMcpRegistryServices((current) =>
-                            enabled
-                              ? [...new Set([...current, id])]
-                              : current.filter((service) => service !== id),
-                          )
-                        }
+                        onToggle={toggleMcpRegistryService}
                       />
                     )}
                     <DropdownMenu

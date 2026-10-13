@@ -40,6 +40,7 @@ import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
 import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
+import { readLastMcpServices, writeLastMcpServices } from "@/lib/mcpPreferences";
 
 vi.mock("@/lib/mcpRegistry", () => ({
   authorizeRegistryService: vi.fn(),
@@ -569,8 +570,8 @@ describe("NewChatLandingScreen create flow", () => {
     } as Response);
     renderLanding([], { managed_sandboxes_enabled: true, enabled_connections: ["mcp"] });
     fireEvent.click(screen.getByRole("button", { name: "MCP services: 0 selected" }));
-    fireEvent.click(await screen.findByRole("checkbox", { name: "Tracker" }));
-    await waitFor(() => expect(screen.getByRole("checkbox", { name: "Tracker" })).toBeChecked());
+    fireEvent.click(await screen.findByRole("switch", { name: "Tracker" }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Tracker" })).toBeChecked());
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
@@ -599,23 +600,98 @@ describe("NewChatLandingScreen create flow", () => {
     await waitForWorkspaceSeed();
     typeMessage("use the tracker");
     fireEvent.click(screen.getByRole("button", { name: "MCP services: 0 selected" }));
-    fireEvent.click(await screen.findByRole("checkbox", { name: "Tracker" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Tracker" }));
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
     vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, connected: true }] });
     await act(async () => finish());
-    expect(screen.getByRole("checkbox", { name: "Tracker" })).toBeChecked();
+    expect(screen.getByRole("switch", { name: "Tracker" })).toBeChecked();
+    expect(readLastMcpServices()).toEqual(["tracker"]);
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.getByTestId("new-chat-landing-submit")).not.toBeDisabled();
     cleanup();
+    writeLastMcpServices([]);
     renderLanding([], { enabled_connections: ["mcp"] });
-    expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+    expect(await screen.findByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("use the tracker");
   });
 
-  it("leaves hosts without the registry capability unchanged", () => {
-    renderLanding();
-    expect(screen.queryByTestId("new-chat-landing-mcp-registry-chip")).toBeNull();
-    expect(registryRequest).not.toHaveBeenCalled();
+  it.each([false, true])(
+    "ignores remembered MCPs without the admin opt-in (hosted: %s)",
+    async (managed) => {
+      writeLastMcpServices(["system.ai.github"]);
+      vi.mocked(authenticatedFetch).mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderLanding([], { managed_sandboxes_enabled: managed });
+      if (!managed) await waitForWorkspaceSeed();
+      expect(screen.queryByTestId("new-chat-landing-mcp-registry-chip")).toBeNull();
+      expect(registryRequest).not.toHaveBeenCalled();
+      typeMessage("Start without managed registry");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+      expect(
+        JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
+      ).not.toHaveProperty("mcp_registry_services");
+      expect(readLastMcpServices()).toEqual(["system.ai.github"]);
+    },
+  );
+
+  it("restores remembered MCPs on a fresh draft and launches only available services without opening the picker", async () => {
+    writeLastMcpServices(["tracker", "removed"]);
+    let finish!: (value: unknown) => void;
+    vi.mocked(registryRequest).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    vi.mocked(authenticatedFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderLanding([], { enabled_connections: ["mcp"] });
+    await waitForWorkspaceSeed();
+    typeMessage("Use my remembered tools");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
+    await act(async () => finish({ data: [{ id: "tracker", title: "Tracker", connected: true }] }));
+    expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+    expect(
+      JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
+    ).toMatchObject({ mcp_registry_services: ["tracker"] });
+    expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
+  });
+
+  it("keeps preferences on a catalog failure and allows retry, reconnect and remembering none", async () => {
+    writeLastMcpServices(["tracker"]);
+    vi.mocked(registryRequest).mockRejectedValueOnce(new Error("Catalog unavailable"));
+    renderLanding([], { enabled_connections: ["mcp"] });
+    await waitForWorkspaceSeed();
+    typeMessage("Use my tools");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("new-chat-landing-mcp-registry-chip"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Catalog unavailable");
+    const service = { id: "tracker", title: "Tracker", auth: "oauth", connected: false };
+    vi.mocked(registryRequest).mockResolvedValue({ data: [service] });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByRole("switch", { name: "Tracker" })).toBeChecked();
+    expect(
+      screen.getByRole("button", { name: "MCP services: 1 selected, 1 needs sign-in" }),
+    ).toBeVisible();
+    vi.mocked(authorizeRegistryService).mockResolvedValue();
+    vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, connected: true }] });
+    fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+    await screen.findByText("Connected");
+    expect(readLastMcpServices()).toEqual(["tracker"]);
+    fireEvent.click(screen.getByRole("switch", { name: "Tracker" }));
+    expect(readLastMcpServices()).toEqual([]);
+    cleanup();
+    resetLandingDraft();
+    renderLanding([], { enabled_connections: ["mcp"] });
+    fireEvent.click(screen.getByTestId("new-chat-landing-mcp-registry-chip"));
+    expect(await screen.findByRole("switch", { name: "Tracker" })).not.toBeChecked();
   });
 
   it("keeps project placement on the provisional and rekeyed conversation", async () => {

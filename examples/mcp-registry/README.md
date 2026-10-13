@@ -85,19 +85,28 @@ credentials remain on the server; adding a URL to the reference is not the fix.
 
 ## Choose tools before launch
 
-On **New session**, open **MCPs** in the composer footer and check the services
+On **New session**, open **MCPs** in the composer footer and turn on the services
 to add. The list comes from the administrator's registry. An unconnected OAuth
 service opens a sign-in popup and is selected only after authorization succeeds;
 launch is disabled while sign-in is pending. Connected accounts are reused.
-Bearer-token services must first be connected in Settings. Unchecking a service
+Bearer-token services must first be connected in Settings. Turning a service off
 does not disconnect the account.
 
 Choose a host or a new sandbox, an agent, and your first message, then launch.
 The server saves the references before scheduling the runner, so the first turn
-can use the tools without a second attach/restart step. Selection stays in the
-current in-memory launch draft across navigation; a fresh draft defaults to none.
-The picker is absent when the server does not advertise the `mcp` connection
-capability.
+can use the tools without a second attach/restart step. The composer remembers
+explicit selections in this browser for the next session, including selecting
+none. An unsent draft takes precedence. Preferences apply across projects on the
+same browser origin; they contain service IDs, never credentials. A fresh browser
+starts with none. Existing sessions keep their own selection.
+
+The live catalog filters unavailable IDs from new-session requests without
+clearing the stored preference. Launch waits for the catalog when selections are
+restored; a failed load offers **Retry**. A **needs sign-in** indicator calls out
+restored selections with expired connections. Use **Reconnect** or turn them off.
+The picker and catalog requests stay disabled when the server does not advertise
+the `mcp` connection capability. Working-directory `.mcp.json` files are not read
+for automatic selection.
 
 Both JSON `POST /v1/sessions` and multipart creation metadata accept the optional
 field `mcp_registry_services`, for example `["tracker"]`. These IDs **add to**
@@ -210,7 +219,7 @@ docker compose -f examples/mcp-registry/compose.yaml --profile sandbox up --buil
    workspace `/tmp`, harness **OpenAI Agents**, and model `gpt-4o-mini`.
 2. Open **Agent tools and policies** (the information button), then **+** beside
    **Tools**. Check **Demo work tracker**. Approve `alice@example.test` in the OAuth
-   popup: it closes and the service becomes checked. Cancelling leaves it unchecked.
+   popup: it closes and the service turns on. Cancelling leaves it off.
    The dialog shows the administrator’s catalog; URL/header/command configuration
    is under **Advanced: custom MCP servers**. You can also connect and test accounts
    separately in **Settings → MCP**.
@@ -235,7 +244,7 @@ with `docker compose -f examples/mcp-registry/compose.yaml --profile sandbox up 
 create a session on the new host and add the same service. It works without
 connecting the account again. Requeue the model response before each turn.
 
-Uncheck a service to remove it from this session; its saved account stays connected.
+Turn off a service to remove it from this session; its saved account stays connected.
 Selection is per session, not a sandbox-wide default. A running session must restart
 to load changes, as indicated in the dialog.
 
@@ -380,6 +389,29 @@ metadata and remote gateway. This prototype does not replace embed host capabili
 rewrite session labels or require a hosted provider to adopt the OSS credential store.
 The `registry` transport is specific to services selected from this server's catalog;
 existing hosted connections must not be reinterpreted as registry IDs.
+
+### Syncing into Databricks MAS
+
+The compact switches and browser preference follow the existing MAS picker.
+`web/src/lib/mcpPreferences.ts` preserves MAS's `readLastMcpServices` /
+`writeLastMcpServices` API and `omnigent:last-mcp-services` JSON string-array format.
+Universe currently protects that helper, its tests, `McpConnectionPicker.tsx`, and
+`useMcpConnections.ts` as sync overlays; they can remain unchanged. Removing the
+preference overlays later is optional, after checking parity at the sync target.
+
+Registry selection lives in `useMcpRegistrySelection`; the shared composer does
+not import the preference helper directly, avoiding duplicate imports with MAS's
+composer patch. Keep MAS's host-provided catalog, `selectedMcps` state, OAuth flow
+and `omnigent.sandbox.mcp_services` labels when resolving that patch. The OSS path
+requires the separate `mcp` capability and sends `mcp_registry_services`; syncing
+these UI files does not opt MAS into the OSS registry. Enabling both catalogs on
+one origin would share this preference slot and needs an explicit integration
+decision, rather than interpreting MAS service names as OSS registry IDs.
+
+At a sync, compare patch rejects with the parent registry PR, run the managed
+composer tests with its host capabilities, and check that only the intended MCP
+picker appears. Do not replace the protected picker or regenerate away MAS's
+selection labels just to make a patch apply.
 
 ### Bring your own gateway
 

@@ -989,7 +989,7 @@ describe("McpServersSection", () => {
       fireEvent.click(screen.getByTestId("agent-info-trigger"));
       expect(screen.queryByRole("button", { name: "slack" }) !== null).toBe(customEditable);
       fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
-      const checkbox = await screen.findByRole("checkbox", { name: "Work tracker" });
+      const checkbox = await screen.findByRole("switch", { name: "Work tracker" });
       expect(screen.queryByLabelText("URL")).toBeNull();
       fireEvent.click(checkbox);
       expect(createMcpMutate).toHaveBeenCalledWith(
@@ -1060,7 +1060,7 @@ describe("McpServersSection", () => {
     expect(screen.queryByRole("button", { name: "tracker" })).toBeNull();
     expect(screen.getByRole("button", { name: "slack" })).toBeEnabled();
     fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
-    expect(await screen.findByRole("checkbox", { name: "Work tracker" })).toBeDisabled();
+    expect(await screen.findByRole("switch", { name: "Work tracker" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: /Advanced: custom MCP servers/ }));
     expect(screen.getByRole("button", { name: "Edit slack" })).toBeEnabled();
   });
