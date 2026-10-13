@@ -1247,7 +1247,16 @@ def create_exec_launcher(
     :returns: Path to the launcher script; the caller owns deleting it.
     :raises OSError: If the running interpreter cannot be named in the
         launcher, which would produce an unrunnable script.
+    :raises ValueError: If a write grant includes the launcher directory.
     """
+    launcher_dir = Path(tempfile.gettempdir()).resolve(strict=False)
+    if sandbox.active:
+        for root in [*sandbox.write_roots, *sandbox.write_files]:
+            if launcher_dir.is_relative_to(root.resolve(strict=False)):
+                raise ValueError(
+                    f"Sandbox write grant {root} exposes the host launcher directory. "
+                    "Grant a dedicated scratch directory instead of the host temporary root."
+                )
     inline = _launcher_inline_source(target_path, sandbox, cwd=cwd)
     interpreter = sys.executable
     if not interpreter:
@@ -1261,7 +1270,7 @@ def create_exec_launcher(
         # Windows resolves ``.py`` through PATHEXT; keep the ``#!`` line so
         # the ``py`` launcher (a common .py association) picks the *current*
         # interpreter rather than the machine default.
-        fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".py")
+        fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".py", dir=launcher_dir)
         script = f"#!{interpreter}\n{inline}\n"
     else:
         # ``/bin/sh`` is the only interpreter guaranteed to be a native
@@ -1269,12 +1278,12 @@ def create_exec_launcher(
         # breaks whenever it is a wrapper script, sits behind a path
         # too long for the kernel's shebang buffer, or contains spaces —
         # each of which surfaces as an opaque ENOEXEC from the spawner.
-        fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".sh")
+        fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".sh", dir=launcher_dir)
         script = f'#!/bin/sh\nexec {shlex.quote(interpreter)} -c {shlex.quote(inline)} "$@"\n'
 
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(script)
-    os.chmod(path, 0o755)
+    os.chmod(path, 0o700)
     return path
 
 
