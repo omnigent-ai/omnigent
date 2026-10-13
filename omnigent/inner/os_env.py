@@ -570,7 +570,7 @@ class _HelperProcessClient:
             if self.start_in_scratch:
                 helper_cwd = self._tmpdir
                 env["PWD"] = str(self._tmpdir)
-            if sandbox.credential_proxy is not None:
+            if sandbox.credential_proxy is not None and not self._upload_raw:
                 # Resolve real secrets in the parent. Real secrets stay
                 # here and are attached to outbound requests by the egress
                 # proxy (swap-on-access). Only entries that opted into
@@ -599,7 +599,7 @@ class _HelperProcessClient:
         # listens on a Unix socket in the scratch tmpdir; the helper
         # starts a relay inside the network namespace that bridges
         # loopback TCP to this socket.
-        if self._egress_rules and self._tmpdir is not None:
+        if self._egress_rules and self._tmpdir is not None and not self._upload_raw:
             sandbox = self._start_egress_proxy_locked(
                 sandbox,
                 env,
