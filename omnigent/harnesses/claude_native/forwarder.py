@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -179,6 +180,58 @@ _FORWARDER_REJECTION_REASONS = frozenset(
         "event type is not allowed on runner tunnel",
         "source_id required for tunnel replay",
         "invalid session event",
+    }
+)
+_FORWARDER_REJECTION_BODY_MAX_BYTES = 16 * 1024
+_FORWARDER_REQUEST_ID = re.compile(
+    r"(?:[0-9a-f]{32}|[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})", re.IGNORECASE
+)
+_FORWARDER_VALIDATION_ERROR_TYPES = frozenset(
+    {
+        "missing",
+        "string_type",
+        "dict_type",
+        "list_type",
+        "json_invalid",
+        "value_error",
+        "literal_error",
+        "model_type",
+        "model_attributes_type",
+        "extra_forbidden",
+        "int_type",
+        "int_parsing",
+        "bool_type",
+        "bool_parsing",
+        "none_required",
+        "too_long",
+    }
+)
+_FORWARDER_VALIDATION_LOCATION_PARTS = frozenset(
+    {
+        "body",
+        "query",
+        "path",
+        "header",
+        "type",
+        "data",
+        "model_override",
+        "tools",
+        "created_by",
+        "SessionEventInput",
+        "list[SessionEventInput]",
+        "item_type",
+        "item_data",
+        "response_id",
+        "source_id",
+        "agent",
+        "role",
+        "content",
+        "name",
+        "arguments",
+        "output",
+        "call_id",
+        "text",
+        "status",
     }
 )
 # A 503 ``subagent_delivery_not_confirmed`` means the runner could not deliver a
@@ -4828,7 +4881,15 @@ async def _forward_available_items(
                     item.item_type,
                     decision.attempts,
                     _http_status_for_log(exc),
-                    extra={"session_id": session_id},
+                    extra=debug_event(
+                        "claude_transcript_item_rejected",
+                        session_id=session_id,
+                        forwarder_source_id=retry_key,
+                        response_id=current_response_id,
+                        item_type=item.item_type,
+                        attempts=decision.attempts,
+                        **failure_log_attributes(_forwarder_rejection_context(exc)),
+                    ),
                 )
                 # Dead-letter the dropped item for recovery (#1120; replay #1579).
                 append_dead_letter(
@@ -6313,13 +6374,59 @@ def _forwarder_rejection_context(error: httpx.HTTPError) -> FailureContext:
     if not isinstance(error, httpx.HTTPStatusError):
         return {}
     context: FailureContext = {"http_status": error.response.status_code}
+    for header, field_name in (
+        ("x-request-id", "forwarder_request_id"),
+        ("x-databricks-request-id", "forwarder_databricks_request_id"),
+    ):
+        request_id = error.response.headers.get(header, "")
+        if _FORWARDER_REQUEST_ID.fullmatch(request_id):
+            context[field_name] = request_id
+    try:
+        content = error.response.content
+    except httpx.ResponseNotRead:
+        context["forwarder_rejection_body_kind"] = "unread"
+        return context
+    if len(content) > _FORWARDER_REJECTION_BODY_MAX_BYTES:
+        context["forwarder_rejection_body_kind"] = "too_large"
+        return context
     try:
         body = error.response.json()
-    except ValueError:
+    except (ValueError, RecursionError):
+        context["forwarder_rejection_body_kind"] = "non_json"
         return context
     detail = body.get("detail") if isinstance(body, dict) else None
     if isinstance(detail, str) and detail in _FORWARDER_REJECTION_REASONS:
         context["forwarder_rejection_reason"] = detail
+        context["forwarder_rejection_body_kind"] = "known_detail"
+    elif isinstance(detail, list):
+        context["forwarder_rejection_body_kind"] = "validation_errors"
+        context["forwarder_validation_count"] = len(detail)
+        summaries: list[str] = []
+        for entry in detail[:4]:
+            entry = entry if isinstance(entry, dict) else {}
+            code = entry.get("type")
+            code = (
+                code
+                if isinstance(code, str) and code in _FORWARDER_VALIDATION_ERROR_TYPES
+                else "unknown"
+            )
+            location = entry.get("loc")
+            parts: list[str] = []
+            if isinstance(location, list):
+                for part in location[:8]:
+                    if type(part) is int:
+                        parts.append("[]")
+                    elif isinstance(part, str) and part in _FORWARDER_VALIDATION_LOCATION_PARTS:
+                        parts.append(part)
+                    else:
+                        parts.append("*")
+            summaries.append(f"{code}@{'.'.join(parts) or 'unknown'}")
+        if summaries:
+            context["forwarder_validation_summary"] = ";".join(summaries)[:256]
+    elif isinstance(body, dict) and "error_code" in body:
+        context["forwarder_rejection_body_kind"] = "api_error"
+    else:
+        context["forwarder_rejection_body_kind"] = "other_json"
     return context
 
 

@@ -219,23 +219,122 @@ async def test_forwarder_uses_auth_to_refresh_token_per_request(tmp_path: Path) 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status_code", "response_body", "rejection_reason"),
+    "failed_status_upload", [False, True], ids=["status-accepted", "status-lost"]
+)
+@pytest.mark.parametrize("valid_request_id", [False, True], ids=["unsafe-header", "request-id"])
+@pytest.mark.parametrize(
+    (
+        "status_code",
+        "response_body",
+        "rejection_reason",
+        "body_kind",
+        "validation_summary",
+        "validation_count",
+    ),
     [
         (
             422,
             {"detail": "event batch exceeds count or size limit"},
             "event batch exceeds count or size limit",
+            "known_detail",
+            None,
+            None,
         ),
-        (400, {"detail": "invalid_input"}, "invalid_input"),
-        (422, {"detail": [{"input": "private transcript content"}]}, None),
-        (422, {"detail": "private transcript content"}, None),
+        (400, {"detail": "invalid_input"}, "invalid_input", "known_detail", None, None),
+        (
+            422,
+            {"detail": [{"input": "private transcript content"}]},
+            None,
+            "validation_errors",
+            "unknown@unknown",
+            1,
+        ),
+        (422, {"detail": "private transcript content"}, None, "other_json", None, None),
+        (
+            422,
+            {
+                "detail": [
+                    {
+                        "type": "dict_type",
+                        "loc": ["body", "data"],
+                        "input": "private transcript content",
+                        "msg": "private transcript content",
+                    },
+                    {
+                        "type": "missing",
+                        "loc": ["body", "data", "private transcript content"],
+                        "ctx": {"error": "private transcript content"},
+                    },
+                    {
+                        "type": "private transcript content",
+                        "loc": ["body", {"key": "private transcript content"}, 3],
+                    },
+                ]
+            },
+            None,
+            "validation_errors",
+            "dict_type@body.data;missing@body.data.*;unknown@body.*.[]",
+            3,
+        ),
+        (
+            422,
+            {
+                "detail": [
+                    {
+                        "type": "dict_type",
+                        "loc": ["body", "data"],
+                        "input": "private transcript content" * 1000,
+                    }
+                ]
+            },
+            None,
+            "too_large",
+            None,
+            None,
+        ),
+        (422, b"<html>private transcript content</html>", None, "non_json", None, None),
+        (
+            422,
+            {"error_code": "private transcript content", "message": "private transcript content"},
+            None,
+            "api_error",
+            None,
+            None,
+        ),
+        (422, b"[" * 1100 + b"]" * 1100, None, "other_json", None, None),
+        (
+            422,
+            {"detail": [{"type": "string_type", "loc": ["body", "data"]}] * 20},
+            None,
+            "validation_errors",
+            ";".join(["string_type@body.data"] * 4),
+            20,
+        ),
+    ],
+    ids=[
+        "batch-limit",
+        "known-code",
+        "missing-schema-fields",
+        "private-detail",
+        "schema-fields",
+        "large-body",
+        "html",
+        "api-envelope",
+        "nested-array",
+        "many-errors",
     ],
 )
 async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     tmp_path: Path,
     status_code: int,
-    response_body: dict[str, Any],
+    response_body: dict[str, Any] | bytes,
     rejection_reason: str | None,
+    body_kind: str,
+    validation_summary: str | None,
+    validation_count: int | None,
+    failed_status_upload: bool,
+    valid_request_id: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Permanent item rejections eventually advance the transcript cursor.
@@ -283,8 +382,16 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
         assert isinstance(payload, dict)
         requests.append(payload)
         if payload["type"] == "external_conversation_item":
-            return httpx.Response(status_code, json=response_body)
-        return httpx.Response(202, json={})
+            headers = {
+                "x-request-id": "12345678-1234-1234-1234-123456789abc"
+                if valid_request_id
+                else "private transcript content",
+                "x-databricks-request-id": "0123456789abcdef0123456789abcdef",
+            }
+            if isinstance(response_body, bytes):
+                return httpx.Response(status_code, content=response_body, headers=headers)
+            return httpx.Response(status_code, json=response_body, headers=headers)
+        return httpx.Response(503 if failed_status_upload else 202, json={})
 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -325,10 +432,45 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     assert context["detail_source"] == "forwarder_delivery_error"
     assert context["http_status"] == status_code
     assert context.get("forwarder_rejection_reason") == rejection_reason
+    assert context["forwarder_rejection_body_kind"] == body_kind
+    assert context.get("forwarder_validation_summary") == validation_summary
+    assert context.get("forwarder_validation_count") == validation_count
+    assert context.get("forwarder_request_id") == (
+        "12345678-1234-1234-1234-123456789abc" if valid_request_id else None
+    )
+    assert context["forwarder_databricks_request_id"] == "0123456789abcdef0123456789abcdef"
     attributes = forwarder.failure_log_attributes(context)
     assert attributes["http_status"] == str(status_code)
     assert attributes.get("forwarder_rejection_reason") == rejection_reason
     assert "private transcript content" not in json.dumps(attributes)
+    from omnigent.debug_logging import record_to_row
+
+    [rejection_record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_transcript_item_rejected"
+    ]
+    row = record_to_row(rejection_record, source="runner")
+    assert row["session_id"] == "conv_abc"
+    assert row["attributes"]["forwarder_source_id"] == "item:poison-item:0:message"
+    assert row["attributes"]["http_status"] == str(status_code)
+    assert row["attributes"]["forwarder_rejection_body_kind"] == body_kind
+    assert row["attributes"].get("forwarder_request_id") == context.get("forwarder_request_id")
+    assert (
+        row["attributes"]["forwarder_databricks_request_id"]
+        == context["forwarder_databricks_request_id"]
+    )
+    if validation_summary is not None:
+        assert row["attributes"]["forwarder_validation_summary"] == validation_summary
+        assert row["attributes"]["forwarder_validation_count"] == str(validation_count)
+    assert "private transcript content" not in json.dumps(row)
+    if failed_status_upload:
+        failure_record = next(
+            record
+            for record in caplog.records
+            if "Failed to publish Claude forwarder failure status" in record.message
+        )
+        assert caplog.records.index(rejection_record) < caplog.records.index(failure_record)
     assert context["failure_id"]
     assert "poison-item:0:message" in context["forwarder_source_id"]
     assert requests[-1]["data"] == {

@@ -287,8 +287,26 @@ output, it records `detail_source=missing`.
 
 Claude forwarding failures retain the rejected delivery's `http_status` and,
 when recognized, `forwarder_rejection_reason`. The reason is restricted to
-known tunnel rejection messages and error codes; arbitrary response text and
-validation bodies are omitted because they can echo transcript content.
+known tunnel rejection messages and error codes. `forwarder_rejection_body_kind`
+distinguishes recognized detail, validation errors, API error envelopes, other
+JSON, non-JSON, oversized, and unread bodies. Bodies larger than 16 KiB are not
+parsed for diagnostics.
+
+For validation errors, `forwarder_validation_count` gives the total count and
+`forwarder_validation_summary` contains up to four error types and paths,
+bounded to 256 characters. Types and field names use fixed allowlists; unknown
+names become `*` and numeric indexes become `[]`. Input values, messages,
+validation context, and arbitrary response text are omitted.
+`forwarder_request_id` is a UUID-shaped `x-request-id` from the rejected delivery
+response; it is separate from the event POST that reports failure and from
+native inference request IDs. `forwarder_databricks_request_id` similarly retains
+a UUID-shaped `x-databricks-request-id` from that delivery's gateway response.
+
+An exhausted individual transcript rejection emits
+`claude_transcript_item_rejected` before uploading a failed status, so the
+evidence survives a failure of that upload. Join it by session and
+`forwarder_source_id`; retries and the failed status describe the same dropped
+item, rather than additional failed turns.
 The status can be synthesized from a runner-tunnel acknowledgement, so it does
 not establish that a corresponding HTTP request reached the server.
 
