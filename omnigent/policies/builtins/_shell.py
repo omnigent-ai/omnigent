@@ -252,36 +252,51 @@ def _extract_command_substitutions(command: str) -> tuple[str, list[str]]:
 
 
 def split_command_segments(command: str) -> list[str]:
-    """
-    Split a shell command on chaining operators into individual segments.
-
-    Splits on ``&&``, ``||``, ``;``, ``|``, a single ``&`` (the background
-    operator, also a command separator), and newlines so that
-    ``git add . && git push`` is evaluated as two segments. The ``&&``
-    alternative is matched before the single-``&`` character class, so a
-    ``&&`` is consumed whole rather than split into two empty halves.
-    Command substitutions (``$(...)`` / backticks) are pulled out first and
-    their bodies appended as their own segments, so a command hidden inside one
-    (``x=$(git push <url>)``) is still gated. This is a naive split that does
-    not honor operators appearing inside quotes — acceptable because the
-    commands these policies gate do not embed these operators in quoted args in
-    practice, and a mis-split only ever produces an extra ignored segment.
-
-    Splitting on a lone ``&`` matters for the gate: without it, a benign
-    leading command could hide a gated one behind a background operator
-    (``echo hi & git push`` would be one un-split segment whose head is
-    ``echo``, slipping the ``git push`` past detection).
-
-    :param command: The raw shell command string, e.g.
-        ``"cd /repo && npm test"``.
-    :returns: List of trimmed, non-empty segments, e.g.
-        ``["cd /repo", "npm test"]``.
-    """
+    """Separate commands and nested groups while preserving quoted arguments."""
     outer, bodies = _extract_command_substitutions(command)
-    parts = re.split(r"&&|\|\||[;|\n&]", outer)
-    segments = [seg.strip() for seg in parts if seg.strip()]
+    segments = [seg.strip() for seg in _split_unquoted_operators(outer) if seg.strip()]
     for body in bodies:
         segments.extend(split_command_segments(body))
+    return segments
+
+
+_SEGMENT_OPERATOR_CHARS: frozenset[str] = frozenset(";|&\n(){}")
+
+
+def _split_unquoted_operators(command: str) -> list[str]:
+    """Keep quoted arguments intact when splitting shell operators."""
+    segments: list[str] = []
+    buf: list[str] = []
+    in_single = in_double = False
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            buf.append(ch)
+        elif in_double:
+            if ch == '"':
+                in_double = False
+            buf.append(ch)
+        elif ch == "'":
+            in_single = True
+            buf.append(ch)
+        elif ch == '"':
+            in_double = True
+            buf.append(ch)
+        elif command[i : i + 2] in ("&&", "||"):
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        elif ch in _SEGMENT_OPERATOR_CHARS:
+            segments.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
     return segments
 
 
