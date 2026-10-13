@@ -843,7 +843,7 @@ html[data-electron-mac] .electron-drag-strip {
 }
 /* Canvas clears the native title bar, including focus
  * and compact conversation states where the board is hidden. */
-[data-electron-mac] .canvas-workspace {
+html[data-electron-mac] .canvas-workspace {
   margin-top: var(--mac-titlebar-height);
 }
 /* Align to the native lights at y=24px, regardless of the host rem size.

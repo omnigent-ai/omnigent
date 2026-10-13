@@ -437,6 +437,12 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_controls_clear_the_macos_titlebar`.
   This Chromium journey emulates the macOS preload bridge and user agent; it
   verifies the app's layout around the title bar, not native traffic-light rendering.
+  `web/src/embed.test.tsx` checks that the compiled Canvas clearance selector
+  matches the embedded app's Mac scope root. For an embedded desktop build,
+  enable Canvas only in the isolated test host, enter through the sidebar and a
+  Canvas deep link, then collapse/preview/reopen navigation and focus/restore a
+  session. Check that the Canvas heading and restore control stay below the
+  native title bar at 14px/16px host roots and 80%, 100%, 110%, and 125% page zoom.
   `web/src/shell/ChatHeader.test.tsx` checks the shared toggle's desktop/mobile
   icons, peek cancellation, and hover/keyboard tooltip behavior.
 - **`canvas-create` (Main/project plus button, desktop/mobile):**
