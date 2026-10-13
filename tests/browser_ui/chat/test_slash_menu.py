@@ -21,7 +21,6 @@ def _composer(page: Page):
         ("legacy", "click"),
         ("snapshot", "enter"),
         ("partial", "enter"),
-        ("id", "label-tab-enter"),
     ],
 )
 def test_new_command_opens_landing_in_current_project(
@@ -52,14 +51,13 @@ def test_new_command_opens_landing_in_current_project(
     page.goto(handle.url)
     composer = _composer(page)
     expect(composer).to_be_visible()
-    composer.fill(
-        "/sess" if gesture == "label-tab-enter" else "/n" if gesture == "tab-enter" else "/new"
-    )
+    composer.fill("/n" if gesture == "tab-enter" else "/new")
     command = page.get_by_test_id("slash-menu-item-new")
     expect(command).to_have_attribute("data-active", "true")
-    expect(command).to_contain_text("New session")
+    expect(command).to_contain_text("/new")
+    expect(command).not_to_contain_text("New session")
     expect(command).to_contain_text("Start a blank session in the same project")
-    if gesture in {"tab-enter", "label-tab-enter"}:
+    if gesture == "tab-enter":
         composer.press("Tab")
         expect(composer).to_have_value("/new ")
         expect(page).to_have_url(handle.url)

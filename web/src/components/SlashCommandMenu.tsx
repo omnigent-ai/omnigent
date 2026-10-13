@@ -27,14 +27,6 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
 };
 
 const DEFAULT_BUILTIN_NAMES = new Set(Object.keys(BUILTIN_SLASH_COMMANDS));
-const BUILTIN_SLASH_COMMAND_LABELS: Readonly<Record<string, string>> = {
-  "/new": "New session",
-};
-
-function builtinCommandLabel(name: string): string {
-  return BUILTIN_SLASH_COMMAND_LABELS[name] ?? name;
-}
-
 // First token must read as a command name (`/cross-review`,
 // `/dev-productivity:simplify`) — letters/digits then word chars, `:`, `-`.
 // The leading `/` is the only slash allowed IN THE NAME, so file paths like
@@ -147,13 +139,7 @@ export function rankedSlashCommandNames(
     return group + (body.startsWith(q) ? 0 : body.includes(q) ? 1 : 2);
   };
   return Object.keys(commands)
-    .filter((name) =>
-      slashCommandMatches(
-        name,
-        query,
-        builtinNames.has(name) ? builtinCommandLabel(name) : labels[name],
-      ),
-    )
+    .filter((name) => slashCommandMatches(name, query, labels[name]))
     .sort((a, b) => rank(a) - rank(b));
 }
 
@@ -186,7 +172,6 @@ interface SlashCommandMenuProps {
 interface MenuRow {
   /** Slash-prefixed command name, e.g. ``"/review-pr"``. */
   name: string;
-  label: string;
   /** One-line description shown in the detail card when active. */
   description: string;
   /** Index into the flat ``matches`` list — the caller's keyboard index. */
@@ -233,7 +218,7 @@ function MenuRowButton({
           )}
         />
       </span>
-      <span className="shrink-0">{row.label}</span>
+      <span className="shrink-0">{row.name}</span>
       {/* Description inline (matching the "+" tray), so the menu is
           self-describing without a separate detail card. */}
       {row.description && (
@@ -284,7 +269,6 @@ export function SlashCommandMenu({
   // visual = keyboard order.
   const rows: MenuRow[] = matchedNames.map((name, flatIndex) => ({
     name,
-    label: builtinNames.has(name) ? builtinCommandLabel(name) : name,
     description: commands[name] ?? "",
     flatIndex,
     isBuiltin: builtinNames.has(name),

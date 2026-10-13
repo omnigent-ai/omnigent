@@ -854,7 +854,7 @@ describe("Composer slash-command menu", () => {
     render(<Composer {...composerProps({ onNewSession, onSend })} />);
     fireEvent.change(textarea(), { target: { value: "/n" } });
     expect(screen.getByTestId("slash-menu-item-new")).toHaveTextContent(
-      "New sessionStart a blank session in the same project",
+      "/newStart a blank session in the same project",
     );
     fireEvent.keyDown(textarea(), { key: "Tab" });
     expect(textarea()).toHaveValue("/new ");

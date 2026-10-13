@@ -11,10 +11,10 @@ import {
 
 afterEach(cleanup);
 
-describe("builtin display name matching", () => {
-  it("matches the visible label while preserving skill-only inventory semantics", () => {
-    expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "sess")).toContain("/new");
-    expect(rankedSlashCommandNames({ "/new": "A skill" }, "sess", new Set())).toEqual([]);
+describe("builtin command matching", () => {
+  it("matches /new by its command name rather than a display alias", () => {
+    expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "n")).toContain("/new");
+    expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "sess")).not.toContain("/new");
   });
 });
 

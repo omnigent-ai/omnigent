@@ -71,7 +71,7 @@ and steers messages while the agent is busy.
   dropping them on the transcript.
 - Send while the agent is working to queue a message, then steer it.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
-  page in the same project. Selecting **New session** in Commands also opens it.
+  page in the same project. Selecting **/new** in Commands also opens it.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
