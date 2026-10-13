@@ -12854,6 +12854,29 @@ def test_managed_gateway_rejects_uncataloged_canonical_model(
     assert claude_native.claude_catalog_serves_model(rows, "claude-opus-4-8", None)
 
 
+def test_ambient_passthrough_catalog_serves_canonical_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bare rows in the catalog mean the ambient gateway routes canonical ids.
+
+    The catalog build keeps them only after asking the gateway, so the launch
+    gate folds an uncataloged canonical id onto a listed family the same way
+    it does for Claude's own login; a family the catalog lacks still refuses.
+    """
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.litellm.svc.cluster.local")
+    rows = [
+        {"id": "opus[1m]", "model": "claude-opus-5-5[1m]"},
+        {"id": "sonnet", "model": "claude-sonnet-5"},
+    ]
+
+    assert claude_native.claude_catalog_serves_model(rows, "claude-sonnet-4-20250514", None)
+    assert not claude_native.claude_catalog_serves_model(rows, "claude-haiku-4-5", None)
+    assert not claude_native.claude_catalog_serves_model(
+        [{"id": "opus", "model": "system.ai.claude-opus-5-5[1m]"}], "claude-opus-4-8", None
+    )
+
+
 @pytest.mark.parametrize(
     ("managed_url", "env_url", "is_gateway"),
     [
@@ -13043,10 +13066,11 @@ def test_catalog_fingerprint_includes_ambient_gateway_url(
 async def test_claude_model_catalog_filters_canonical_ids_for_ambient_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When claude_config is None but ANTHROPIC_BASE_URL is a gateway, filter canonical IDs.
+    """With no claude_config and a Databricks gateway ANTHROPIC_BASE_URL, filter canonical IDs.
 
     Managed settings (e.g. Isaac) may set ANTHROPIC_BASE_URL to a Databricks
-    gateway. The catalog must filter canonical claude-* IDs even when
+    Unity Gateway, which routes only its own ids and has no listing credential
+    in the env. The catalog must filter canonical claude-* IDs even when
     claude_config is None.
     """
 
@@ -13067,7 +13091,12 @@ async def test_claude_model_catalog_filters_canonical_ids_for_ambient_gateway(
         )
 
     monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gw.example.com/anthropic")
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    for name in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(
+        "ANTHROPIC_BASE_URL", "https://wkspc.cloud.databricks.com/ai-gateway/anthropic"
+    )
 
     rows = await claude_native.claude_model_catalog(None)
 
