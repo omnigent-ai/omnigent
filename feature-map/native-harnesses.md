@@ -317,6 +317,14 @@ Cross-harness journeys:
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
+- **`disconnect`, Claude startup (plain `uv run pytest`, no vendor CLI):**
+  `tests/harnesses/claude_native/test_claude_native_readiness_exit.py` delivers
+  a web message through the public bridge into a real retained dead tmux pane.
+  It checks prompt budgets equal to the hard cap and early exit detection with
+  longer budgets. `test_claude_native_slow_ready.py` checks successful delivery
+  after slow startup, an early crash, and the live-pane timeout. These tests
+  exercise the injection used by existing-session and first-message composers;
+  CLI typing bypasses the web injection gate. They do not run a vendor model.
 - **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**
   `tests/e2e/test_codex_native_event_stream_disconnect_e2e.py` covers waiting
   consumers, buffered events, explicit close, and startup discovery without a
