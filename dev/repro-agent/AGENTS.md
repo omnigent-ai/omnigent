@@ -655,21 +655,10 @@ Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
 Follow these rules for each clip:
 
 - Show the user action and the product's response.
-- **Caption the screen from screen evidence.** A transcript or API check — a
-  `GET /v1/sessions/{id}/items` read, a persisted-item flag, a runner log —
-  proves what the server stored, not what the frames show: a reply the server
-  rejected may already have streamed into the Chat view, and a sent message
-  the server never committed may still be showing as a pending bubble, each
-  beside the error pill. Compare every frame you extract with each screen
-  claim in the caption and in the Observed lines of `journey`; where they
-  disagree, describe the frame ("the streamed reply text appears, then the
-  turn ends in the 'transcript item … rejected' error pill"; "the sent message
-  stays in the chat as the 'Codex ran into an error during this turn.' pill
-  appears") rather than the backend result ("no reply bubble appears"; "the
-  sent message is dropped from the transcript"), and keep the backend check in
-  `evidence` ("the reply was never persisted, per GET /items"; "the message was
-  never committed, per GET /items"), not in the caption (see "Finishing a
-  clip" in `dev/recording-lanes.md`).
+- **Caption the screen from screen evidence.** Compare claimed outcomes with
+  inspected frames or visible-state assertions from the clip. Backend storage
+  and logs do not establish what the UI displayed; keep those findings in
+  `evidence`. Correct captions that conflict with the frames.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.

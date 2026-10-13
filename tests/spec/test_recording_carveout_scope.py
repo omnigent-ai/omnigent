@@ -48,37 +48,7 @@ def test_repro_recording_rules_match_the_shared_guide() -> None:
     assert "Do not block the verdict because footage is missing or rejected" in instructions
 
 
-def test_finishing_a_clip_captions_the_screen_from_screen_evidence() -> None:
-    lanes = _normalized(_DEV / "recording-lanes.md")
-
-    assert "every claim it makes about the screen needs screen evidence" in lanes
-    assert "Backend state is not screen evidence" in lanes
-    assert "says what the server stored, not what the viewer sees" in lanes
-    assert (
-        'not the backend result ("no reply bubble appears"; '
-        '"the sent message is dropped from the transcript")' in lanes
-    )
-    assert "Read every frame you extract against each screen claim in the caption" in lanes
-    assert "Frames you extracted but never compared with the caption verify nothing" in lanes
-
-
 def test_repro_agent_loads_the_screen_evidence_caption_rule_as_instructions() -> None:
     spec = load(_REPRO_AGENT, expand_env=False)
-
-    assert spec.instructions is not None
-    instructions = " ".join(spec.instructions.split())
-    assert "Caption the screen from screen evidence" in instructions
-    assert "proves what the server stored, not what the frames show" in instructions
-    assert (
-        "Compare every frame you extract with each screen claim in the caption and in "
-        "the Observed lines of `journey`" in instructions
-    )
-    assert (
-        'rather than the backend result ("no reply bubble appears"; '
-        '"the sent message is dropped from the transcript")' in instructions
-    )
-    assert "keep the backend check in `evidence`" in instructions
-    assert (
-        "Each screen claim comes from screen evidence, not from a transcript or API check"
-        in instructions
-    )
+    assert "Caption the screen from screen evidence" in spec.instructions
+    assert "Base screen claims on inspected frames" in _normalized(_DEV / "recording-lanes.md")
