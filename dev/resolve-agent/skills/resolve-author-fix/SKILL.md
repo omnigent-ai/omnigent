@@ -136,6 +136,12 @@ selection and retained evidence instead of reinstating the omitted source.
   pass on both revisions, as the shared impact assessment explains.
 - Cover the **specific behavior the bug got wrong**, plus the obvious adjacent
   edge cases the root cause implies — not just "the function runs."
+- A check that a state never appears during a transition must watch
+  continuously — observe from the trigger until the end state the claim names;
+  a poll supports only a claim qualified by its interval. One assertion after
+  recovery, even an auto-retrying one, cannot see a transient state and does
+  not support a "never" claim in a caption or PR text; if the watch catches
+  the state, report it as a finding about the fix.
 - Put them where the repo keeps tests for that layer, following existing files'
   fixtures and structure. Do not invent a new harness.
 - **Name by the problem, never the ticket.** Test files, test functions, fixtures,
@@ -194,6 +200,11 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
 - Record the user action and the corrected product behavior. Tests may drive
   and verify the interaction, but the clip must show the product, not pytest,
   assertions, debug logs, or test source.
+- Caption from the footage, as "Finishing a clip" in `dev/recording-lanes.md`
+  requires: check each claimed moment against inspected frames or a
+  visible-state check covering it. A claim that a state never appears needs
+  continuous observation through the whole transition; when the clip shows the
+  state even briefly, the caption and PR text say so.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the corrected error message.

@@ -42,6 +42,10 @@ before Step 1.
    - Reject tautologies, over-mocking that replaces the component under test,
      implementation-specific expectations invented by the repro bot, or
      assertions that contradict the intended behavior.
+   - A check that a state never appears during a transition must watch
+     continuously from the trigger to the end state; one check after recovery,
+     even an auto-retrying one, cannot see a transient state. Record that gap in
+     `test_audit` and do not describe the fix or caption a clip from it.
    - Never change correct product behavior merely to satisfy a bad test.
    - Use `resolve-investigate` to check historical rationale and competing
      explanations. Separate observed failure from a proposed policy change;

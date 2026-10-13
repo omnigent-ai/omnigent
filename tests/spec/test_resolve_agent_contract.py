@@ -325,3 +325,28 @@ def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None
     handoff = json.loads(output.split("```json\n", 1)[1].split("```", 1)[0])
     assert handoff["ocr_review"]
     assert set(handoff["review_cycle"]) == {"head_sha", "fingerprint", "dispositions"}
+
+
+def test_absence_claims_need_a_watch_over_the_whole_transition() -> None:
+    instructions = _normalized_resolve_instructions()
+    audit = _shared_repro_audit()
+    coverage = instructions.split("### 2B.4", 1)[1].split("### 2B.5", 1)[0]
+    recording = instructions.split("### 2B.5", 1)[1].split("## Step 3", 1)[0]
+    review = instructions.split("## Step 2A", 1)[1].split("## Step 2B", 1)[0]
+    handoff = instructions.split("- `recordings` —", 1)[1].split(
+        "- `recording_unavailable_reason`", 1
+    )[0]
+
+    assert "cannot see a transient state" in audit
+    assert "Record that gap in `test_audit`" in audit
+    assert "must watch continuously" in coverage
+    assert "a poll supports only a claim qualified by its interval" in coverage
+    assert 'does not support a "never" claim' in coverage
+    assert "report it as a finding about the fix" in coverage
+    for section in (recording, review, handoff):
+        assert "needs continuous observation through the whole transition" in section
+    assert '"Finishing a clip" in `dev/recording-lanes.md`' in recording
+    assert "covering the moment or window it describes" in handoff
+    assert (
+        "when the clip shows the state even briefly, the caption and PR text say so" in recording
+    )

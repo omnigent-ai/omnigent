@@ -52,3 +52,15 @@ def test_repro_agent_loads_the_screen_evidence_caption_rule_as_instructions() ->
     spec = load(_REPRO_AGENT, expand_env=False)
     assert "Caption the screen from screen evidence" in spec.instructions
     assert "Base screen claims on inspected frames" in _normalized(_DEV / "recording-lanes.md")
+
+
+def test_lane_caption_rules_cover_the_whole_window_for_absence_claims() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+
+    assert "covers the whole window from the trigger to the end state the caption names" in lanes
+    assert "watches continuously until that end state" in lanes
+    assert "support only a qualified claim that states the interval" in lanes
+    assert "only shows what the final frame shows" in lanes
+    assert "record how long it showed in `evidence`" in lanes
+    assert "caption the end state and say the window was not checked" in lanes
+    assert "whether a transient state is acceptable is a product question for review" in lanes
