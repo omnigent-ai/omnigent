@@ -20,6 +20,7 @@ import yaml
 from tests._helpers.host import Host, isolated_host
 from tests._helpers.live_server import isolated_local_server
 from tests._helpers.native_session import create_native_session
+from tests.e2e._harness_probes import skip_if_harness_cli_missing
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux",
@@ -81,10 +82,14 @@ def _runner_log(host: Host) -> Path | None:
     return logs[-1] if logs else None
 
 
+# Older hosts predate this forwarding fix; the scheduled compat run pins them
+# and would otherwise fail these cases. ``.devN`` of the floor still runs them.
+@pytest.mark.min_runner_version("0.19.0")
 @pytest.mark.parametrize("spawn", ["zygote", "direct"])
 def test_host_env_idle_timeout_knobs_reach_spawned_runner(
     tmp_path: Path, mock_llm_server_url: str, spawn: str
 ) -> None:
+    skip_if_harness_cli_missing("claude")
     host_env: dict[str, str] = {**_IDLE_KNOBS, **_CONTROL}
     if spawn == "direct":
         # /proc shows exec-time environment; a zygote-forked runner never re-execs.
