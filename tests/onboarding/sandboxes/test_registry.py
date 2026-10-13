@@ -353,3 +353,14 @@ def test_databricks_provider_is_builtin_and_instantiates_without_extras() -> Non
     assert "databricks" in available_providers()
     launcher = instantiate("databricks")
     assert launcher.provider == "databricks"
+
+
+def test_boat_is_builtin_managed_only_provider() -> None:
+    """Boat is a built-in, managed-only provider with no optional SDK."""
+    from omnigent.server.managed_hosts import BOAT_MANAGED_TOKEN_TTL_S
+
+    assert "boat" in available_providers()
+    launcher = instantiate("boat")
+    assert launcher.provider == "boat"
+    assert launcher.supports_cli_bootstrap is False
+    assert get_provider_metadata("boat").managed_token_ttl_s == BOAT_MANAGED_TOKEN_TTL_S
