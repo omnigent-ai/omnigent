@@ -3786,6 +3786,14 @@ def create_runner_app(
         else:
             _message_ingest_inflight.pop(conv_id, None)
 
+    async def _pass_on_ingest_ticket(conv_id: str, cond: asyncio.Condition, seq: int) -> None:
+        """Release ingest ticket ``seq`` once it is served, for a forward that stopped waiting."""
+        async with cond:
+            while _ingest_now_serving.get(conv_id, 0) != seq:
+                await cond.wait()
+            _ingest_now_serving[conv_id] = seq + 1
+            cond.notify_all()
+
     def _release_live_turn_markers(conv_id: str) -> None:
         """Clear ``_live_response_id`` and the process-manager in-flight marker atomically.
 
@@ -6360,6 +6368,13 @@ def create_runner_app(
                         await _cond.wait()
             except BaseException:
                 _end_message_ingest(conversation_id)
+                # A cancelled waiter must not abandon its ordered ingest ticket.
+                _handoff = asyncio.create_task(
+                    _pass_on_ingest_ticket(conversation_id, _cond, _seq),
+                    name=f"ingest-ticket-{conversation_id}",
+                )
+                _background_tasks.add(_handoff)
+                _handoff.add_done_callback(_background_tasks.discard)
                 raise
             try:
                 _raw_content = message_body.get("content")

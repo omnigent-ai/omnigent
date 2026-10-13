@@ -690,3 +690,43 @@ async def test_message_ingest_without_initialization_starts_its_turn() -> None:
     assert len(harness.posted_bodies) == 1
     assert str(harness.posted_bodies[0]["content"]).count("hello from history") == 1
     assert app.state.message_ingest_inflight == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("fresh_session_state")
+async def test_forward_cancelled_while_queued_does_not_stall_later_messages() -> None:
+    """A queued forward cancelled before its ingest turn still lets the next message run."""
+    server = _GatedItemsServer(gates=1)
+    app, _pm, harness = _build_sdk_app(server)
+    async with _runner_client(app) as client:
+        first = asyncio.create_task(
+            client.post(f"/v1/sessions/{SESSION_ID}/events", json=_FORWARDED_MESSAGE)
+        )
+        await asyncio.wait_for(server.entered[0].wait(), timeout=5)
+        queued = asyncio.create_task(
+            client.post(f"/v1/sessions/{SESSION_ID}/events", json=_FORWARDED_MESSAGE)
+        )
+        for _ in range(500):
+            if app.state.message_ingest_inflight.get(SESSION_ID) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert app.state.message_ingest_inflight == {SESSION_ID: 2}
+
+        # The tunnel cancels a request whose caller gave up while it waits its turn.
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        assert app.state.message_ingest_inflight == {SESSION_ID: 1}
+
+        server.release[0].set()
+        assert (await first).status_code == 202
+        await _settle_turns(app)
+
+        later = await asyncio.wait_for(
+            client.post(f"/v1/sessions/{SESSION_ID}/events", json=_FORWARDED_MESSAGE),
+            timeout=5,
+        )
+        assert later.status_code == 202, later.text
+        await _settle_turns(app)
+    assert len(harness.posted_bodies) == 2
+    assert app.state.message_ingest_inflight == {}
