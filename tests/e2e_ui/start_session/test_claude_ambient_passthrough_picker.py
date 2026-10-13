@@ -15,6 +15,7 @@ unset, so a failure in the gateway case is attributable to that variable alone.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -30,6 +31,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
 
 from omnigent.harnesses.claude_native.main import (
@@ -141,6 +143,7 @@ class AmbientGatewayRig:
         deadline = time.monotonic() + _BOOT_PROBE_TIMEOUT_S
         while time.monotonic() < deadline and not self.persisted_catalogs():
             time.sleep(1.0)
+        self.notes["boot_probe_persisted"] = bool(self.persisted_catalogs())
 
     def diagnostics(self) -> str:
         def best_effort(read: Callable[[], object]) -> object:
@@ -205,7 +208,12 @@ def _cli_picker(env: dict[str, str], home: Path) -> tuple[list[dict[str, str]], 
             for model in (event.get("response") or {}).get("response", {}).get("models") or []:
                 alias, resolved = model.get("value"), model.get("resolvedModel")
                 model_id = resolved or alias
-                if alias == "default" or model.get("disabled") is True or model_id in seen:
+                if (
+                    not model_id
+                    or alias == "default"
+                    or model.get("disabled") is True
+                    or model_id in seen
+                ):
                     continue
                 seen.add(model_id)
                 rows.append(
@@ -232,11 +240,35 @@ def ambient_gateway_rig(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     gateway_requests: list[dict[str, object]] = []
-    handler = type("Gateway", (_PassthroughGateway,), {"requests": gateway_requests})
+    with _passthrough_gateway(gateway_requests) as gateway_url:
+        yield from _ambient_gateway_rig(
+            request, live_server, root, out_dir, with_gateway, gateway_url, gateway_requests
+        )
+
+
+@contextlib.contextmanager
+def _passthrough_gateway(requests: list[dict[str, object]]) -> Iterator[str]:
+    """Serve the LiteLLM-shaped listing double on a loopback port for the block's duration."""
+    handler = type("Gateway", (_PassthroughGateway,), {"requests": requests})
     gateway = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=gateway.serve_forever, daemon=True).start()
-    gateway_url = f"http://127.0.0.1:{gateway.server_address[1]}"
+    try:
+        yield f"http://127.0.0.1:{gateway.server_address[1]}"
+    finally:
+        gateway.shutdown()
+        gateway.server_close()
 
+
+def _ambient_gateway_rig(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    root: Path,
+    out_dir: Path,
+    with_gateway: bool,
+    gateway_url: str,
+    gateway_requests: list[dict[str, object]],
+) -> Iterator[AmbientGatewayRig]:
+    """Enumerate the real CLI, attach a real host to the server and yield the rig."""
     # The reported shell: a gateway URL plus Claude Code credentials, nothing in
     # omnigent's config. The control drops only ANTHROPIC_BASE_URL.
     ambient = {
@@ -271,48 +303,44 @@ def ambient_gateway_rig(
         "--non-interactive",
         "--no-open",
     ]
-    try:
-        with (
-            httpx.Client(base_url=live_server, trust_env=False) as client,
-            isolated_host(
-                root, live_server, env=ambient, base_env=base_env, name=host_name, command=command
-            ) as host,
-        ):
-            row = host.wait_online(client, timeout=_HOST_ONLINE_TIMEOUT_S, poll_interval=1)
-            deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
-            while (row.get("configured_harnesses") or {}).get("claude-native") is not True:
-                assert time.monotonic() < deadline, (
-                    f"claude-native never became ready: {row.get('configured_harnesses')}"
-                )
-                time.sleep(2.0)
-                row = next(
-                    (
-                        r
-                        for r in client.get("/v1/hosts").json()["hosts"]
-                        if r["host_id"] == host.host_id
-                    ),
-                    None,
-                )
-                assert row is not None, f"host {host.host_id} vanished from /v1/hosts"
-            rig = AmbientGatewayRig(
-                base_url=live_server,
-                host_id=host.host_id,
-                host_name=host_name,
-                home=home,
-                host_log=host.log_path,
-                with_gateway=with_gateway,
-                gateway_url=gateway_url if with_gateway else None,
-                gateway_requests=gateway_requests,
-                cli_rows=cli_rows,
-                cli_default_model=cli_default,
-                out_dir=out_dir,
+    with (
+        httpx.Client(base_url=live_server, trust_env=False) as client,
+        isolated_host(
+            root, live_server, env=ambient, base_env=base_env, name=host_name, command=command
+        ) as host,
+    ):
+        row = host.wait_online(client, timeout=_HOST_ONLINE_TIMEOUT_S, poll_interval=1)
+        deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
+        while (row.get("configured_harnesses") or {}).get("claude-native") is not True:
+            assert time.monotonic() < deadline, (
+                f"claude-native never became ready: {row.get('configured_harnesses')}"
             )
-            rig.wait_for_boot_probe()
-            yield rig
-            (out_dir / "rig.json").write_text(rig.diagnostics())
-    finally:
-        gateway.shutdown()
-        gateway.server_close()
+            time.sleep(2.0)
+            row = next(
+                (
+                    r
+                    for r in client.get("/v1/hosts").json()["hosts"]
+                    if r["host_id"] == host.host_id
+                ),
+                None,
+            )
+            assert row is not None, f"host {host.host_id} vanished from /v1/hosts"
+        rig = AmbientGatewayRig(
+            base_url=live_server,
+            host_id=host.host_id,
+            host_name=host_name,
+            home=home,
+            host_log=host.log_path,
+            with_gateway=with_gateway,
+            gateway_url=gateway_url if with_gateway else None,
+            gateway_requests=gateway_requests,
+            cli_rows=cli_rows,
+            cli_default_model=cli_default,
+            out_dir=out_dir,
+        )
+        rig.wait_for_boot_probe()
+        yield rig
+        (out_dir / "rig.json").write_text(rig.diagnostics())
 
 
 def _select_host(page: Page, rig: AmbientGatewayRig) -> None:
@@ -344,7 +372,9 @@ def _settled_models_section(page: Page) -> tuple[str, list[dict[str, str]]]:
     while time.monotonic() < deadline:
         _open_agent_menu(page)
         if page.get_by_test_id(_MODELS_SECTION_TESTID).count() == 0:
-            _expand_agent_config(page, _CLAUDE_LABEL)
+            # Menus re-render while queries settle; a miss here just retries.
+            with contextlib.suppress(AssertionError, PlaywrightError):
+                _expand_agent_config(page, _CLAUDE_LABEL)
         page.wait_for_timeout(500)
         section = page.get_by_test_id(_MODELS_SECTION_TESTID)
         if section.count() == 0:
