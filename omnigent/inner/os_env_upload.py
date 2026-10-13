@@ -330,8 +330,6 @@ class UploadEngine:
             return self._begin(uid, m)
         if op == "resume":
             return self._resume(uid, m)
-        if op == "quarantine":
-            return self._quarantine(uid, m)
         if op == "cleanup":
             return self._cleanup(uid, m)
         upload = self.uploads.get(uid)
@@ -630,77 +628,15 @@ class UploadEngine:
         upload.fd = upload.parent_fd = -1
         return upload.result
 
-    def _quarantine(self, uid: str, m: dict[str, object]) -> dict[str, object]:
-        directory, name = str(m["dir"]), str(m["name"])
-        qid = str(m["quarantine_id"])
-        if not valid_name(name) or not re.fullmatch(r"[0-9a-f]{32}", qid):
-            raise UploadError("invalid_request", "Invalid quarantine name")
-        staging, quarantine = staging_basename(name, uid), staging_basename(name, qid)
-        self._grant(directory, name, staging)
-        self._grant(directory, name, quarantine)
-        parent = _parent(self.cwd, directory)
-        try:
-            if _identity(parent) != (m["parent_dev"], m["parent_ino"]):
-                raise UploadError("invalid_path", "Destination directory changed")
-            try:
-                fd = os.open(staging, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-            except FileNotFoundError:
-                try:
-                    fd = os.open(
-                        quarantine, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent
-                    )
-                except FileNotFoundError:
-                    return {"absent": True}
-            try:
-                info = os.fstat(fd)
-                if not stat.S_ISREG(info.st_mode):
-                    raise UploadError("invalid_path", "Intent is not a regular file")
-                with contextlib.suppress(FileExistsError, FileNotFoundError):
-                    os.link(
-                        staging,
-                        quarantine,
-                        src_dir_fd=parent,
-                        dst_dir_fd=parent,
-                        follow_symlinks=False,
-                    )
-                moved = os.stat(quarantine, dir_fd=parent, follow_symlinks=False)
-                if (moved.st_dev, moved.st_ino) != _identity(fd):
-                    raise UploadError("invalid_path", "Quarantine file changed")
-                try:
-                    source = os.stat(staging, dir_fd=parent, follow_symlinks=False)
-                except FileNotFoundError:
-                    pass
-                else:
-                    if (source.st_dev, source.st_ino) != _identity(fd):
-                        raise UploadError("invalid_path", "Intent changed before quarantine")
-                    os.unlink(staging, dir_fd=parent)
-                with contextlib.suppress(OSError):
-                    os.fsync(parent)
-                upload = self.uploads.pop(uid, None)
-                if upload is not None:
-                    if upload.fd >= 0:
-                        os.close(upload.fd)
-                    if upload.parent_fd >= 0:
-                        os.close(upload.parent_fd)
-                return {
-                    "staging_path": str(self.cwd / directory / quarantine),
-                    "staging_dev": info.st_dev,
-                    "staging_ino": info.st_ino,
-                }
-            finally:
-                os.close(fd)
-        finally:
-            os.close(parent)
-
     def _cleanup(self, uid: str, m: dict[str, object]) -> dict[str, object]:
-        if uid in self.uploads and not m.get("quarantine_id"):
+        if uid in self.uploads:
             result = self._dispatch({"op": "abort", "id": uid}, b"")
             self.uploads.pop(uid, None)
             return result
         directory, name = str(m["dir"]), str(m["name"])
         if not valid_name(name):
             raise UploadError("invalid_name", "Invalid basename")
-        staging = staging_basename(name, str(m.get("quarantine_id") or uid))
+        staging = staging_basename(name, uid)
         self._grant(directory, name, staging)
         parent = _parent(self.cwd, directory)
         try:
