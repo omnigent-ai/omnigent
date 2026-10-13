@@ -151,6 +151,7 @@ def _unwrap(result: dict[str, object]) -> dict[str, object]:
         "too_large": 413,
         "gone": 410,
         "parent_gone": 410,
+        "staging_gone": 410,
         "no_space": 507,
         "timeout": 504,
         "busy": 429,
@@ -457,7 +458,7 @@ class UploadManager:
             elif record.staging_dev and record.staging_ino:
                 await self._call(uid, record, "cleanup", **record.model_dump(exclude={"snapshot"}))
         except RouteError as exc:
-            if exc.code != "parent_gone":
+            if exc.code not in ("parent_gone", "staging_gone"):
                 raise
         async with self.lock:
             self._drop(uid, record)
@@ -540,7 +541,7 @@ class UploadManager:
                         or (isinstance(exc, HTTPException) and exc.status_code in (404, 410))
                         or (
                             isinstance(exc, RouteError)
-                            and exc.code in ("unverified_intent", "parent_gone")
+                            and exc.code in ("unverified_intent", "parent_gone", "staging_gone")
                         )
                     ):
                         async with self.lock:
