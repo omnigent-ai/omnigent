@@ -191,6 +191,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     isWorking: false,
     disabled: false,
     onSend: vi.fn(),
+    onNewSession: vi.fn(),
     onStop: vi.fn(),
     agents: undefined,
     selectedAgentId: null,
@@ -845,6 +846,34 @@ describe("Composer slash-command menu", () => {
     cleanup();
     vi.restoreAllMocks();
     setOmnigentHostConfig({});
+  });
+
+  it("completes /new with Tab and navigates on Enter without sending", () => {
+    const onNewSession = vi.fn();
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onNewSession, onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "/n" } });
+    expect(screen.getByTestId("slash-menu-item-new")).toHaveTextContent(
+      "New sessionStart a blank session in the same project",
+    );
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(textarea()).toHaveValue("/new ");
+    expect(onNewSession).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onNewSession).toHaveBeenCalledOnce();
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("");
+  });
+
+  it("rejects /new arguments without navigating or sending", () => {
+    const onNewSession = vi.fn();
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onNewSession, onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "/new unexpected" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(screen.getByText("/new does not accept arguments")).toBeVisible();
+    expect(onNewSession).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
   });
 
   it("highlights the first match as soon as the menu opens", () => {

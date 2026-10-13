@@ -152,6 +152,7 @@ interface SessionResponseWire {
    */
   title?: string | null;
   labels?: Record<string, string>;
+  project_id?: string | null;
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
   /**
@@ -334,6 +335,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,
+    projectId: wire.project_id ?? null,
     workspace: wire.workspace ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,

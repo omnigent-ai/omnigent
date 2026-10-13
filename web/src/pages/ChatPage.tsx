@@ -82,6 +82,8 @@ import {
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
 import { createSideChat, retrySession } from "@/lib/sessionsApi";
+import { getProject } from "@/lib/projectsApi";
+import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
@@ -1082,6 +1084,19 @@ export function ChatPage() {
     else void reconnect();
   }, [isUnboundFork, canResumeOnLocalHost, reconnect]);
 
+  const openNewSession = useCallback(async () => {
+    const row = conversations?.find((conversation) => conversation.id === urlConvId);
+    const projectId = row?.project_id !== undefined ? row.project_id : activeSession?.projectId;
+    try {
+      const projectName = projectId
+        ? (await getProject(projectId)).name
+        : (row?.labels ?? activeSession?.labels)?.[PROJECT_LABEL_KEY];
+      navigate(projectName ? `/?project=${encodeURIComponent(projectName)}` : "/");
+    } catch {
+      toast.error("Couldn't open a new session in this project. Please try again.");
+    }
+  }, [conversations, urlConvId, activeSession?.projectId, activeSession?.labels, navigate]);
+
   // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
   // early return can't change the hook order between renders.
   if (urlConvId) {
@@ -1108,6 +1123,7 @@ export function ChatPage() {
       agentsError={agentsError}
       disabled={!agentId || agentsError !== null}
       onSend={onSend}
+      onNewSession={openNewSession}
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
       onShowReconnectHelp={onShowReconnectHelp}
@@ -1227,6 +1243,7 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
 }
 
 interface MainAgentSurfaceProps {
+  onNewSession: () => void;
   /**
    * Active conversation id, or null when on the landing page. Forwarded
    * to MainTerminalView so the inline terminal can target the right
@@ -1418,6 +1435,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   disabled,
   onSend,
   onSendSlashCommand,
+  onNewSession,
   onStop,
   onShowReconnectHelp,
   agents,
@@ -1728,6 +1746,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             status={status}
             isWorking={isWorking}
             onSend={handleSend}
+            onNewSession={onNewSession}
             onSendSlashCommand={handleSendSlashCommand}
             onStop={onStop}
             agents={agents}
@@ -1827,6 +1846,7 @@ interface ComposerHandle {
 }
 
 interface ComposerProps {
+  onNewSession: () => void;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. */
   isWorking: boolean;
@@ -2200,6 +2220,7 @@ function ComposerImpl(
     disabled,
     onSend,
     onSendSlashCommand,
+    onNewSession,
     onStop,
     agents,
     selectedAgentId,
@@ -2890,6 +2911,17 @@ function ComposerImpl(
    */
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
+      case "/new": {
+        if (arg) {
+          setCommandError("/new does not accept arguments");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        onNewSession();
+        return true;
+      }
       case "/compact": {
         if (!showCompact) {
           setCommandError("/compact is not supported for this agent type");

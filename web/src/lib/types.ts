@@ -274,6 +274,7 @@ export interface BackgroundTaskInfo {
 }
 
 export interface Session {
+  projectId?: string | null;
   id: string;
   agentId: string;
   /**

@@ -19,6 +19,7 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/context": "Show context window usage for this session",
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name>",
+  "/new": "Start a blank session in the same project",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
   "/side":
     "Start a side chat: an ephemeral fork opened as its own sub-agent chat, kept out of this conversation",
@@ -26,6 +27,9 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
 };
 
 const DEFAULT_BUILTIN_NAMES = new Set(Object.keys(BUILTIN_SLASH_COMMANDS));
+const BUILTIN_SLASH_COMMAND_LABELS: Readonly<Record<string, string>> = {
+  "/new": "New session",
+};
 
 // First token must read as a command name (`/cross-review`,
 // `/dev-productivity:simplify`) — letters/digits then word chars, `:`, `-`.
@@ -172,6 +176,7 @@ interface SlashCommandMenuProps {
 interface MenuRow {
   /** Slash-prefixed command name, e.g. ``"/review-pr"``. */
   name: string;
+  label: string;
   /** One-line description shown in the detail card when active. */
   description: string;
   /** Index into the flat ``matches`` list — the caller's keyboard index. */
@@ -218,7 +223,7 @@ function MenuRowButton({
           )}
         />
       </span>
-      <span className="shrink-0">{row.name}</span>
+      <span className="shrink-0">{row.label}</span>
       {/* Description inline (matching the "+" tray), so the menu is
           self-describing without a separate detail card. */}
       {row.description && (
@@ -269,6 +274,7 @@ export function SlashCommandMenu({
   // visual = keyboard order.
   const rows: MenuRow[] = matchedNames.map((name, flatIndex) => ({
     name,
+    label: (builtinNames.has(name) && BUILTIN_SLASH_COMMAND_LABELS[name]) || name,
     description: commands[name] ?? "",
     flatIndex,
     isBuiltin: builtinNames.has(name),
