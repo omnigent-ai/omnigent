@@ -68,6 +68,7 @@ class Feature(StrEnum):
     GADGETS = "gadgets"
     SHARED_SESSION_UPDATES_SOCKET = "shared_session_updates_socket"
     PULL_REQUESTS_V2 = "pull_requests_v2"
+    HOST_STATS = "host_stats"
 
 
 class FeatureIntent(StrEnum):
@@ -255,6 +256,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         # On by default; remove the flag and its off path in 0.23.0.
         review_by_release="0.23.0",
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.HOST_STATS,
+        description="Host CPU, memory, disk and network stats in the sidebar session tooltip",
+        owner="hosts",
+        review_by_release="0.19.0",
     ),
     FeatureDefinition(
         feature=Feature.CLAUDE_OSC_STATUS,
