@@ -3756,12 +3756,16 @@ describe("session tooltip project detail", () => {
     expect(screen.queryByTestId("session-tooltip-content")).toBeNull();
   });
 
-  it("keeps the legacy tooltip free of a Project row when grouping is disabled", async () => {
-    projectsMock.push("Alpha");
-    mockConversations([filedSession("conv_filed")]);
+  it("keeps the legacy tooltip free of a Project row for a shared row outside project folders", async () => {
+    mockConversations([
+      filedSession("conv_shared", {
+        owner: "other@example.com",
+      }),
+    ]);
     renderSidebar();
-    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
-    const legacyTooltip = await openTooltip("conv_filed");
+    showSharedTab();
+    expect(screen.queryByRole("button", { name: /^Alpha/ })).toBeNull();
+    const legacyTooltip = await openTooltip("conv_shared");
     expect(within(legacyTooltip).queryByTestId("session-tooltip-project")).toBeNull();
   });
 
@@ -3808,6 +3812,20 @@ describe("session tooltip project detail", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
 
     const projectTooltip = await openTooltip("conv_filed");
+    expect(within(projectTooltip).queryByTestId("session-tooltip-project")).toBeNull();
+  });
+
+  it("hides the project detail inside its first-class project folder", async () => {
+    projectRowsRef.current = [{ id: "p_alpha", name: "Alpha" }];
+    mockConversations([
+      filedSession("conv_first_class", {
+        project_id: "p_alpha",
+      }),
+    ]);
+    renderGroupingSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+
+    const projectTooltip = await openTooltip("conv_first_class");
     expect(within(projectTooltip).queryByTestId("session-tooltip-project")).toBeNull();
   });
 });
