@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import type { BackgroundTaskInfo } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { COMPOSER_POPOVER_HEADER_INSET } from "@/pages/chatLayout";
 import { useChatStore } from "@/store/chatStore";
 
 function taskLabel(task: BackgroundTaskInfo): string {
@@ -135,7 +136,7 @@ export function BackgroundTaskIndicator() {
         <PopoverContent
           side="top"
           align="end"
-          collisionPadding={8}
+          collisionPadding={COMPOSER_POPOVER_HEADER_INSET}
           aria-label={countLabel}
           onEscapeKeyDown={() => {
             if (open) closeReasonRef.current = "escape";
