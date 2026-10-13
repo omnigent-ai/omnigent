@@ -567,6 +567,11 @@ when *every* sub-symptom is fixed is the overall verdict `already_fixed`.
 
 ## Step 3 — Identify the smallest reliable regression coverage
 
+In the product checkout, read `tests/README.md` and `tests/_helpers/README.md`
+before writing setup; follow its API examples and the selection policy below.
+In `evidence`, name the nearest test/helper considered and explain any new setup.
+If the target repository has no catalog, inspect its nearby fixtures instead.
+
 Search existing tests across the repository by behavior, input event, and fixture,
 and read the nearest scenarios. Reuse their helpers before writing new setup.
 If one already drives the relevant setup and state transition, fold the missing

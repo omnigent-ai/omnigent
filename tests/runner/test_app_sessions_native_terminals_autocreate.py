@@ -2297,6 +2297,135 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_transcript", ["missing", "unreadable", "available"])
+async def test_auto_create_claude_fork_preserves_history_in_another_workspace(
+    source_transcript: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fork rebuilds missing local history and resumes it in the chosen directory."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.claude_native import main as claude_native
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitSnapshot,
+    )
+
+    session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    workspace = tmp_path / "chosen-workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        claude_native_bridge, "ensure_claude_workspace_trusted", lambda *a, **k: None
+    )
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
+    monkeypatch.setattr("omnigent.config.load_effective_config", lambda **_: {})
+    forwarder = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", forwarder
+    )
+
+    source_path = tmp_path / "projects" / "old-workspace" / f"{source_uuid}.jsonl"
+    source_text = json.dumps(
+        {
+            "type": "user",
+            "uuid": "source-message",
+            "parentUuid": None,
+            "sessionId": source_uuid,
+            "cwd": "/missing-workspace",
+            "message": {"role": "user", "content": "Remember the recovery context."},
+        }
+    )
+    if source_transcript != "missing":
+        source_path.parent.mkdir(parents=True)
+        source_path.write_text(source_text + "\n", encoding="utf-8")
+    if source_transcript == "unreadable":
+
+        def unreadable_clone(**_: Any) -> None:
+            raise OSError("Source transcript is unreadable")
+
+        monkeypatch.setattr(claude_native, "_clone_claude_transcript", unreadable_clone)
+
+    history_requests: list[str] = []
+    patched_ids: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            external_id = json.loads(request.content).get("external_session_id")
+            if external_id:
+                patched_ids.append(external_id)
+            return httpx.Response(200, json={})
+        assert request.url.path == f"/v1/sessions/{session_id}/items"
+        history_requests.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Remember the recovery context."}
+                        ],
+                    }
+                ],
+                "has_more": False,
+            },
+        )
+
+    captured: dict[str, Any] = {}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8000"
+    ) as client:
+        await _auto_create_claude_terminal(
+            session_id,
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=client,
+            session_init=RunnerSessionInitEnvelope(
+                protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+                server_version="test",
+                session_id=session_id,
+                agent_id="agent",
+                snapshot=RunnerSessionInitSnapshot(
+                    created_at=0,
+                    updated_at=0,
+                    workspace=str(workspace),
+                    labels={
+                        "omnigent.fork.source_external_session_id": source_uuid,
+                        "omnigent.fork.carry_history": "1",
+                    },
+                ),
+            ),
+            auth_token_factory=lambda: None,
+            resolve_launch_config=AsyncMock(return_value=None),
+        )
+        await asyncio.sleep(0)
+
+    spec = captured["spec"]
+    assert spec.os_env.cwd == str(workspace)
+    assert "--resume" in spec.args
+    resume_id = spec.args[spec.args.index("--resume") + 1]
+    assert resume_id != source_uuid
+    assert patched_ids == [resume_id]
+    transcript = claude_native._claude_project_dir_for_cwd(workspace) / f"{resume_id}.jsonl"
+    records = [json.loads(line) for line in transcript.read_text(encoding="utf-8").splitlines()]
+    assert records and all(record["cwd"] == str(workspace) for record in records)
+    assert all(record["sessionId"] == resume_id for record in records)
+    assert "Remember the recovery context." in transcript.read_text(encoding="utf-8")
+    assert bool(history_requests) is (source_transcript != "available")
+    assert forwarder.call_args.kwargs["start_at_end"] is True
+    if source_transcript != "missing":
+        assert source_path.read_text(encoding="utf-8") == source_text + "\n"
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_bridge_sid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

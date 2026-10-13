@@ -77,8 +77,8 @@ both ends.
 - `runner_disconnect_decision`: a warning explaining the status check in the
   relay (`origin = runner_disconnected_mid_turn`) or offline sweep
   (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
-  `failed_mid_turn`, `failed_before_start`, `intentional_stop`, or
-  `subagent_unobserved`.
+  `failed_mid_turn`, `failed_before_start`, `already_failed`, `intentional_stop`,
+  or `subagent_unobserved`.
   Idle subsessions keep their status and emit no `session_turn_failed` event
   or error labels. Running and waiting sessions still fail on disconnect, but
   a subsession mirrored from a native parent (such as a Claude subsession)
@@ -86,6 +86,9 @@ both ends.
   status alone gives `subagent_unobserved`. A mirror's row can still read
   mid-turn after its last idle edge, and the parent's native runtime, not the
   server, drives the mirror's turn and reports its outcome.
+  A top-level session that already carries its own runner's failure cause keeps
+  it and emits no new `session_turn_failed` (`already_failed`); only a stale
+  cause left by a prior runner yields to this runner's startup failure.
   `fail_idle_top_level` applies only to top-level startup failures.
 
   `status_source` is `cache`, `persisted`, `snapshot`, `relay_snapshot`, or

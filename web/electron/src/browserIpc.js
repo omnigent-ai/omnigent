@@ -261,6 +261,7 @@ function registerBrowserIpc({
   isPinnedOriginSender,
   getRegistryForEvent,
   getAgentContextForEvent = () => null,
+  recoverAgentNavigationForEvent = async () => false,
   getAgentNavigationHintForEvent = () => null,
 }) {
   /**
@@ -290,20 +291,42 @@ function registerBrowserIpc({
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
   // intent). Returns the registry's structured `{ ok, created, error }`.
-  ipcMain.handle("omnigent:browser-open-or-navigate", (event, args) => {
+  ipcMain.handle("omnigent:browser-open-or-navigate", async (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
     const { conversationId, url, bounds, opts } = args ?? {};
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const r = g.registry.openOrNavigate(conversationId, url, bounds, {
-      force: !!opts?.force,
-      agent: !!opts?.agent,
-      // The first-party renderer supplies the source-session host; main owns
-      // the target and eligibility. Caller exception flags never establish identity.
-      agentContext: opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null,
-    });
+    const navigate = (registry) =>
+      registry.openOrNavigate(conversationId, url, bounds, {
+        force: !!opts?.force,
+        agent: !!opts?.agent,
+        // The first-party renderer supplies the source-session host; main owns
+        // the target and eligibility. Caller exception flags never establish identity.
+        agentContext: opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null,
+      });
+    let r = navigate(g.registry);
+    let recovered = false;
+    if (!r.ok && opts?.agent) {
+      try {
+        recovered = await recoverAgentNavigationForEvent(
+          event,
+          url,
+          opts?.sourceHostId,
+          opts?.rememberedArcaHostId,
+          opts?.sourceIsArcaHost,
+        );
+      } catch {
+        recovered = false;
+      }
+    }
+    if (recovered) {
+      // Recovery updates main-owned identity, so rebuild the context and ask
+      // the registry to evaluate the same navigation once more.
+      const refreshed = gateRegistry(event);
+      if (!refreshed.error) r = navigate(refreshed.registry);
+    }
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.
     if (r.ok && r.created && r.entry) {
@@ -314,7 +337,16 @@ function registerBrowserIpc({
       });
     }
     // Strip the non-serializable `entry` before it crosses the IPC boundary.
-    const hint = !r.ok && opts?.agent ? getAgentNavigationHintForEvent(event, url) : null;
+    const hint =
+      !r.ok && opts?.agent
+        ? getAgentNavigationHintForEvent(
+            event,
+            url,
+            opts?.sourceHostId,
+            opts?.rememberedArcaHostId,
+            opts?.sourceIsArcaHost,
+          )
+        : null;
     return {
       ok: r.ok,
       created: r.created ?? false,

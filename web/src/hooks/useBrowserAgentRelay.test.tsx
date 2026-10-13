@@ -20,6 +20,7 @@ vi.mock("@/lib/sessionsApi", () => ({
   getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
 }));
 import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
@@ -73,10 +74,10 @@ function installBridge(overrides: Record<string, unknown> = {}) {
  *  single claim fetch to have fired. */
 async function runAction(
   evt: BrowserActionRequestEvent,
-  opts: { expectResult?: boolean; source?: string } = {},
+  opts: { client?: QueryClient; expectResult?: boolean; source?: string } = {},
 ): Promise<void> {
-  const { expectResult = true, source = CONV } = opts;
-  renderRelay();
+  const { client = new QueryClient(), expectResult = true, source = CONV } = opts;
+  renderRelay(CONV, client);
   emitBrowserActionRequest(evt, source);
   if (expectResult) {
     await vi.waitFor(() => {
@@ -110,6 +111,7 @@ function postedResult(): Record<string, unknown> {
 }
 
 beforeEach(() => {
+  writeArcaHostId(null);
   authenticatedFetch.mockReset();
   getSessionSlim.mockReset().mockImplementation(async (id: string) => ({
     id,
@@ -287,6 +289,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
   });
   it("derives inherited provenance from the source session, never model args or visible host", async () => {
     const bridge = installBridge();
+    writeArcaHostId("arca-host");
     setSessionHost(CONV, "local-host");
     setSessionHost("parent", "arca-host");
     setSessionParent("conv_background_A", "parent");
@@ -307,9 +310,56 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       "conv_background_A",
       "http://localhost:5173",
       undefined,
-      { force: true, agent: true, sourceHostId: "arca-host" },
+      {
+        force: true,
+        agent: true,
+        sourceHostId: "arca-host",
+        rememberedArcaHostId: "arca-host",
+      },
     );
     expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(["conv_background_A", "parent"]);
+  });
+
+  it("corrects a mismatched remembered Arca host after an authorized preview retry", async () => {
+    const bridge = installBridge();
+    const client = new QueryClient();
+    client.setQueryData(
+      ["hosts", { includeSandbox: false }],
+      [
+        {
+          host_id: "actual-arca-host-b",
+          name: "Jackson's arca",
+          owner: "jackson",
+          status: "online",
+        },
+      ],
+    );
+    writeArcaHostId("remembered-host-a");
+    setSessionHost("conv_background_A", "actual-arca-host-b");
+    getSessionSlim.mockResolvedValue({
+      id: "conv_background_A",
+      hostId: "actual-arca-host-b",
+      parentSessionId: null,
+    });
+
+    await runAction(actionEvent("navigate", { url: "http://localhost:5173" }), {
+      client,
+      source: "conv_background_A",
+    });
+
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      "conv_background_A",
+      "http://localhost:5173",
+      undefined,
+      {
+        force: true,
+        agent: true,
+        sourceHostId: "actual-arca-host-b",
+        rememberedArcaHostId: "remembered-host-a",
+        sourceIsArcaHost: true,
+      },
+    );
+    expect(readArcaHostId()).toBe("actual-arca-host-b");
   });
 
   it("loads a child's own host before granting eligibility from a parent-list hint", async () => {

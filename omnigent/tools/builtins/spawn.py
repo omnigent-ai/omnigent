@@ -16,7 +16,6 @@ from omnigent.entities import (
     Conversation,
     ConversationItem,
 )
-from omnigent.runtime import pending_elicitations
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
@@ -1660,6 +1659,9 @@ class SysSessionGetHistoryTool(Tool):
             )
             for item in reversed(page.data)
         ]
+        # The server's pending index imports ORM models for workspace scoping.
+        from omnigent.runtime import pending_elicitations
+
         # A parked elicitation never lands in the conversation store
         # (it lives only in the pending-elicitations index), so without
         # this a peek on a sub-agent blocked on AskUserQuestion would

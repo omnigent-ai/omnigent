@@ -6102,8 +6102,8 @@ def _wait_for_claude_prompt_ready(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param timeout_s: Base readiness budget, e.g. ``30.0``. A live pane or
         unanswered liveness probe extends the wait to
-        :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`; a dead pane or rejected
-        query ends the wait at the next liveness check.
+        :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`. Liveness checks start within
+        one second; a dead pane or rejected query ends the wait.
     :param bridge_dir: Protect live permission-hook waits when delivering a message.
     :returns: None.
     :raises ClaudeTerminalExited: If tmux affirms the pane's process has
@@ -6128,7 +6128,7 @@ def _wait_for_claude_prompt_ready(
         a box that never appeared — is diagnosable from the error alone.
     """
     started = time.monotonic()
-    next_liveness_probe = started + timeout_s
+    next_liveness_probe = started + min(timeout_s, _CLAUDE_LIVENESS_POLL_INTERVAL_S)
     hard_deadline = started + max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S)
     polls = 0
     empty_polls = 0
@@ -6193,8 +6193,6 @@ def _wait_for_claude_prompt_ready(
             )
         sign_in_url = sign_in.url if sign_in is not None else None
         now = time.monotonic()
-        if now >= hard_deadline:
-            break
         if now >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)
             if state.alive is False:
@@ -6202,6 +6200,8 @@ def _wait_for_claude_prompt_ready(
                 exited_status = state.exit_status
                 break
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
+        if time.monotonic() >= hard_deadline:
+            break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     # Timed out. The poll/empty-capture counts separate the failure modes:
     # mostly-empty captures point at a torn read under a busy repaint (the

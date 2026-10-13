@@ -2424,6 +2424,7 @@ export function NewChatLandingScreen() {
   // Arca (Databricks-internal): the desktop shell reports the MDM flag; when
   // set, the picker offers connecting the user's Arca dev instance as a host.
   const [arcaEnabled, setArcaEnabled] = useState(false);
+  const [arcaPreviewRecovery, setArcaPreviewRecovery] = useState(false);
   const [connectingArca, setConnectingArca] = useState(false);
   const [arcaError, setArcaError] = useState<string | null>(null);
   // Mirrors pendingConnectRef for the Arca row: connect after the menu closes.
@@ -2719,7 +2720,10 @@ export function NewChatLandingScreen() {
     if (!isElectronShell()) return;
     let cancelled = false;
     void getDesktopFeatures().then((features) => {
-      if (!cancelled) setArcaEnabled(features?.databricksInternalFeatures === true);
+      if (!cancelled) {
+        setArcaEnabled(features?.databricksInternalFeatures === true);
+        setArcaPreviewRecovery(features?.arcaPreviewRecovery === true);
+      }
     });
     return () => {
       cancelled = true;
@@ -5006,9 +5010,11 @@ export function NewChatLandingScreen() {
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
   // The Arca row is remembered by host ID, never inferred from its machine hostname.
-  // Reconnect remains available to recapture daemon identity after a desktop restart.
+  // A recovery-capable desktop restores preview identity on demand. Older
+  // shells keep Run on Arca visible because reconnecting is their only recovery.
   const arcaHostId = arcaEnabled ? readArcaHostId() : null;
-  const showArcaOption = arcaEnabled;
+  const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
+  const showArcaOption = arcaEnabled && (!arcaPreviewRecovery || !arcaHostOnline);
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : connectingArca

@@ -1989,6 +1989,7 @@ def register_events_routes(
                     session_id,
                     status_error,
                     conversation_store,
+                    owner_runner_id=conv.runner_id,
                     agent_name=failed_agent_name,
                 )
             elif status == "running":

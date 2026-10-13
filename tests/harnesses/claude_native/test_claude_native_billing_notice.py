@@ -379,6 +379,7 @@ def test_permission_mode_change_acknowledges_notice_before_or_during_switch(
 
     monkeypatch.setattr(bridge, "_capture_pane", capture)
     monkeypatch.setattr(bridge, "_run_tmux", send)
+    monkeypatch.setattr(bridge, "_claude_pane_state", lambda *_: bridge._ClaudePaneState(True))
     assert bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0) == "auto"
     assert keys.count("BTab") == 1
     assert keys.count("Enter") >= 1
