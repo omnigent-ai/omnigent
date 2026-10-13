@@ -336,6 +336,17 @@ _SUBMIT_RETRY_INTERVAL_S = 1.0
 # Enter sent into a stalled TUI queues in the pty and replays when it
 # recovers, so retries slow down instead of piling up there.
 _SUBMIT_RETRY_MAX_INTERVAL_S = 8.0
+# After the submit, how long the delivery watch reads the hook log for a
+# matching ``UserPromptSubmit`` receipt or an in-pane-restart
+# ``SessionStart`` before accepting delivery. Absence never fails a send.
+_DELIVERY_CONFIRM_WATCH_S = 2.0
+# Once an in-pane restart is positively identified, how long the watch
+# keeps waiting for a delivery receipt (the restart may have landed just
+# after a successful submit) before re-delivering the message.
+_RESTART_RECEIPT_GRACE_S = 5.0
+# Re-deliveries allowed per injected message before failing loud. Each
+# one only fires on positive restart evidence with no delivery receipt.
+_MESSAGE_REDELIVERY_BUDGET = 2
 # How long to watch for Claude Code's "Unknown command" rejection after a
 # message leading with an unrecognized slash command was submitted
 # unescaped. The rejection prints within ~1s of the swallowed submit and
@@ -906,6 +917,8 @@ class ClaudeHookRecord:
         advance past it.
     :param source: Claude ``SessionStart`` source, e.g. ``"clear"``,
         or ``None`` for hook records without a source field.
+    :param prompt: User text from a ``UserPromptSubmit`` hook, or
+        ``None`` for other hook events.
     :param claude_session_id: Claude-native session uuid from the hook
         payload, e.g. ``"a1b2c3d4-1234-5678-9abc-def012345678"``,
         or ``None`` when absent.
@@ -971,6 +984,7 @@ class ClaudeHookRecord:
     event_name: str | None
     recorded_at: float | None = None
     source: str | None = None
+    prompt: str | None = None
     claude_session_id: str | None = None
     transcript_path: Path | None = None
     agent_id: str | None = None
@@ -3803,6 +3817,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     if isinstance(raw_event_name, str) and raw_event_name:
         event_name = raw_event_name
     raw_source = payload.get("source") if isinstance(payload, dict) else None
+    raw_prompt = payload.get("prompt") if isinstance(payload, dict) else None
     raw_recorded_at = envelope.get("recorded_at") if isinstance(envelope, dict) else None
     raw_claude_session_id = payload.get("session_id") if isinstance(payload, dict) else None
     raw_transcript_path = payload.get("transcript_path") if isinstance(payload, dict) else None
@@ -3911,6 +3926,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         if isinstance(raw_recorded_at, (int, float)) and not isinstance(raw_recorded_at, bool)
         else None,
         source=raw_source if isinstance(raw_source, str) and raw_source else None,
+        prompt=raw_prompt if isinstance(raw_prompt, str) else None,
         claude_session_id=(
             raw_claude_session_id
             if isinstance(raw_claude_session_id, str) and raw_claude_session_id
@@ -4127,6 +4143,21 @@ def inject_user_message(
     the box — re-sending Enter while it hasn't — and raises if the
     message never submits.
 
+    Pane state alone cannot see an **in-pane restart**: the readiness
+    gate keys on the prompt glyph, which carries no process identity,
+    so when Claude Code relaunches inside the same pane mid-delivery
+    (an auto-update or crash restart during boot), the paste and Enter
+    land in the dying process, the replacement flushes pending stdin,
+    and the empty composer it renders looks exactly like a successful
+    submit. After the submit the hook log is therefore watched briefly
+    (see :func:`_confirm_message_delivery`): a matching
+    ``UserPromptSubmit`` receipt confirms delivery; a fresh startup
+    ``SessionStart`` under a Claude session id not seen before the
+    paste, with no receipt, positively identifies a restart and the
+    message is re-delivered into the replacement process (bounded
+    budget). No evidence either way keeps the success verdict — a
+    missing receipt alone never fails a send.
+
     A message leading with an *unknown* slash command passes through
     unescaped on the guess that it names a skill. When Claude Code
     rejects that guess ("Unknown command: /<name>") it drops the whole
@@ -4147,8 +4178,9 @@ def inject_user_message(
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
-        invocation fails, or if the draft never leaves the input box
-        after repeated submit Enters (message not delivered).
+        invocation fails, if the draft never leaves the input box after
+        repeated submit Enters (message not delivered), or if Claude
+        Code kept restarting in-pane and every re-delivery was dropped.
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
@@ -4173,6 +4205,12 @@ def inject_user_message(
     # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
     injected_text = _escape_unsupported_slash_command(content)
     needle = _submit_needle(content)
+    # Lifecycle commands (``/clear``, ``/model``, …) rotate sessions on
+    # purpose and don't reliably emit UserPromptSubmit; whitespace-only text
+    # has no receipt. Skip confirmation for both; others get the restart watch.
+    confirm_delivery = bool(needle) and (
+        _first_slash_command_name(content) not in _CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS
+    )
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
     # A leading ``/name`` that is neither allowed nor known-dropped passes
@@ -4191,7 +4229,14 @@ def inject_user_message(
         rejection_baseline = _count_unknown_command_rejections(
             _capture_pane(socket_path, tmux_target), rejection_needle
         )
-    _paste_and_submit(bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle)
+    _paste_and_submit(
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        text=injected_text,
+        needle=needle,
+        confirm_delivery=confirm_delivery,
+    )
     if rejection_needle is None:
         return
     if not _unknown_command_rejection_appeared(
@@ -4216,6 +4261,7 @@ def inject_user_message(
         tmux_target,
         text=_escape_slash_command_text(content),
         needle=needle,
+        confirm_delivery=confirm_delivery,
     )
 
 
@@ -4226,6 +4272,9 @@ def _paste_and_submit(
     *,
     text: str,
     needle: str,
+    confirm_delivery: bool = False,
+    redelivery_budget: int = _MESSAGE_REDELIVERY_BUDGET,
+    prior_delivery_offset: int | None = None,
 ) -> None:
     r"""
     Deliver *text* into Claude's input box as one paste plus a verified Enter.
@@ -4234,7 +4283,11 @@ def _paste_and_submit(
     the full hazard notes): clear any leftover draft, bracketed-paste the
     payload via ``load-buffer`` + ``paste-buffer -p``, wait for the draft to
     visibly commit, submit, and verify the draft left the box — re-sending
-    Enter while it verifiably hasn't.
+    Enter while it verifiably hasn't. With *confirm_delivery*, both
+    successful-looking exits (draft left the box, or an unverifiable blind
+    submit) additionally pass through :func:`_confirm_message_delivery`,
+    which catches an in-pane Claude restart swallowing the keystrokes and
+    re-delivers the message.
 
     :param bridge_dir: Bridge directory path (hosts the paste temp file).
     :param socket_path: Absolute path to the tmux socket.
@@ -4242,12 +4295,20 @@ def _paste_and_submit(
     :param text: Exact text to paste (already escaped as needed).
     :param needle: Draft marker from :func:`_submit_needle`; empty skips
         draft-visibility verification (blind submit).
+    :param confirm_delivery: Watch the hook log after the submit and
+        re-deliver on positive in-pane-restart evidence.
+    :param redelivery_budget: Re-deliveries still allowed for this
+        message, e.g. ``2``.
+    :param prior_delivery_offset: Hook offset of the attempt that triggered
+        this re-delivery; when set, a matching receipt found there just
+        before submit cancels the duplicate. ``None`` on the first delivery.
     :returns: None.
     :raises ClaudeUserPromptPending: If a question or permission prompt is
         pending before the submit Enter; the message was not sent.
     :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
-        never leaves the input box after repeated submit Enters, or if a
-        prompt appears after the submit Enter.
+        never leaves the input box after repeated submit Enters, if a
+        prompt appears after the submit Enter, or if Claude Code kept
+        restarting in-pane and every re-delivery was dropped.
     """
     delivery_diagnostics.start_attempt()
     delivery_diagnostics.set_stage("checking_pending_prompt")
@@ -4255,11 +4316,17 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
+    hook_offset = 0
+    baseline_session_ids: frozenset[str] = frozenset()
+    if confirm_delivery:
+        # Snapshot the hook log before touching the pane so only events
+        # recorded during this delivery can count as evidence about it.
+        hook_offset = _hook_file_size(bridge_dir)
+        baseline_session_ids = _baseline_claude_session_ids(bridge_dir, hook_offset)
     delivery_diagnostics.set_stage("pasting")
-    # Clear stale text first: raw controls can otherwise become pasted text.
-    # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
+    # Clear any leftover draft first: raw controls can otherwise become
+    # pasted text.
+    _clear_input_draft(socket_path, tmux_target)
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -4327,13 +4394,37 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; message not sent."
         )
+    if prior_delivery_offset is not None and _matching_receipt_present(
+        bridge_dir, prior_delivery_offset, _normalized_delivery_prompt(text)
+    ):
+        # A prior attempt's receipt arrived while this retry's draft was
+        # pending, so the message is already delivered; clear the draft and
+        # skip the duplicate submit.
+        _clear_input_draft(socket_path, tmux_target)
+        _logger.info(
+            "claude-native: original message confirmed delivered during "
+            "re-delivery; discarding the retry draft without resubmitting"
+        )
+        return
     delivery_diagnostics.set_stage("submitting")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     delivery_diagnostics.record_details(submit_sent=True)
     if not draft_seen:
         delivery_diagnostics.record_details(verification="unverified")
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
+        # Draft never observed, so its absence proves nothing — submit
+        # blind. The delivery watch below still catches an in-pane restart
+        # having eaten the paste (the common way the draft never shows).
+        if confirm_delivery:
+            _confirm_message_delivery(
+                bridge_dir,
+                socket_path,
+                tmux_target,
+                text=text,
+                needle=needle,
+                hook_offset=hook_offset,
+                baseline_session_ids=baseline_session_ids,
+                redelivery_budget=redelivery_budget,
+            )
         return
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
@@ -4357,6 +4448,20 @@ def _paste_and_submit(
             "it may already have been delivered."
         ) from exc
     if accepted:
+        # An empty composer is how a successful submit looks — and also
+        # how the fresh composer of an in-pane restart looks. Let the
+        # hook log disambiguate before declaring delivery.
+        if confirm_delivery:
+            _confirm_message_delivery(
+                bridge_dir,
+                socket_path,
+                tmux_target,
+                text=text,
+                needle=needle,
+                hook_offset=hook_offset,
+                baseline_session_ids=baseline_session_ids,
+                redelivery_budget=redelivery_budget,
+            )
         return
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
@@ -4448,6 +4553,292 @@ def _verify_submit_accepted(
         polls=polls,
     )
     return False
+
+
+def _hook_file_size(bridge_dir: Path) -> int:
+    """
+    Return the hook log size used to snapshot delivery-time events.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: Size of ``hooks.jsonl`` in bytes; ``0`` when absent.
+    """
+    try:
+        return (bridge_dir / _HOOKS_FILE).stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+def _is_subagent_hook_record(record: ClaudeHookRecord) -> bool:
+    """
+    Return whether a hook record belongs to a Claude subagent.
+
+    :param record: Hook record parsed from ``hooks.jsonl``.
+    :returns: ``True`` when the record carries a subagent ``agent_id`` or
+        its transcript path sits under a ``subagents/`` component.
+    """
+    if record.agent_id:
+        return True
+    return record.transcript_path is not None and "subagents" in record.transcript_path.parts
+
+
+def _baseline_claude_session_ids(bridge_dir: Path, hook_offset: int) -> frozenset[str]:
+    """
+    Collect the Claude session ids recorded through the pre-paste offset.
+
+    A restarted Claude announces itself with a startup ``SessionStart``
+    under a **new** session id, so the baseline is every session id in
+    the hook log at or before ``hook_offset`` — an id first seen past it
+    reads as that new process, not an incumbent. The log is bound by the
+    same offset the delivery watch uses, never the live ``state.json``
+    seen-ids, which a separate process may update with the restart after
+    the snapshot and so absorb it into the baseline. Only ``SessionStart``
+    lines are JSON-parsed, but the scan still reads every line through the
+    offset, so its cost tracks that bounded slice of the log.
+
+    :param bridge_dir: Bridge directory path.
+    :param hook_offset: Hook log size snapshot from :func:`_hook_file_size`.
+    :returns: Session ids recorded at or before the offset; may be empty.
+    """
+    if hook_offset <= 0:
+        return frozenset()
+    ids: set[str] = set()
+    consumed = 0
+    try:
+        with (bridge_dir / _HOOKS_FILE).open("rb") as handle:
+            for line_number, raw in enumerate(handle, start=1):
+                start = consumed
+                consumed += len(raw)
+                if consumed > hook_offset:
+                    break
+                if b"SessionStart" not in raw:
+                    continue
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                record = _hook_record_from_jsonl_record(
+                    _JsonlRecord(
+                        line_number=line_number,
+                        byte_offset=start,
+                        next_byte_offset=consumed,
+                        text=text,
+                    )
+                )
+                if record.event_name != "SessionStart" or _is_subagent_hook_record(record):
+                    continue
+                if record.claude_session_id:
+                    ids.add(record.claude_session_id)
+    except FileNotFoundError:
+        return frozenset()
+    return frozenset(ids)
+
+
+def _normalized_delivery_prompt(prompt: str) -> str:
+    """
+    Normalize prompt text for delivery-receipt matching.
+
+    :param prompt: Injected text or a ``UserPromptSubmit`` prompt.
+    :returns: Text with CR/CRLF folded to LF and edges stripped.
+    """
+    return prompt.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _collapsed_delivery_prompt(prompt: str) -> str:
+    """
+    Collapse prompt text to a whitespace-normalized comparison key.
+
+    Drops the zero-width characters the slash-command escape prepends
+    and folds every whitespace run to one space, so rendering-level
+    differences (wrapping, trailing spaces, a stripped BOM) cannot defeat
+    receipt matching while word boundaries still have to agree.
+
+    :param prompt: Injected text or a ``UserPromptSubmit`` prompt.
+    :returns: The collapsed key; empty for whitespace-only text.
+    """
+    return " ".join(prompt.replace("\ufeff", "").replace("\u200b", "").split())
+
+
+def _delivery_prompts_match(prompt: str, expected: str) -> bool:
+    """
+    Return whether a ``UserPromptSubmit`` prompt acknowledges injected text.
+
+    :param prompt: Prompt text carried by the hook record.
+    :param expected: Normalized injected text
+        (:func:`_normalized_delivery_prompt` output).
+    :returns: ``True`` on a normalized or collapsed match.
+    """
+    if _normalized_delivery_prompt(prompt) == expected:
+        return True
+    collapsed = _collapsed_delivery_prompt(expected)
+    return bool(collapsed) and _collapsed_delivery_prompt(prompt) == collapsed
+
+
+def _matching_receipt_present(bridge_dir: Path, hook_offset: int, expected: str) -> bool:
+    """
+    Report whether a delivery receipt for *expected* was recorded past the offset.
+
+    Scans the parent session's hook records appended since ``hook_offset``
+    for a ``UserPromptSubmit`` acknowledging the injected text.
+
+    :param bridge_dir: Bridge directory path.
+    :param hook_offset: Hook log size snapshot to scan from.
+    :param expected: Normalized injected text
+        (:func:`_normalized_delivery_prompt` output).
+    :returns: ``True`` if a non-subagent receipt matches ``expected``.
+    """
+    result = read_hook_events_from_offset(bridge_dir, hook_offset, start_event_count=0)
+    for record in result.records:
+        if _is_subagent_hook_record(record):
+            continue
+        if (
+            record.event_name == "UserPromptSubmit"
+            and record.prompt is not None
+            and _delivery_prompts_match(record.prompt, expected)
+        ):
+            return True
+    return False
+
+
+def _clear_input_draft(socket_path: str, tmux_target: str) -> None:
+    """
+    Clear the composer without submitting (Ctrl+A then Ctrl+K via CSI-u).
+
+    CSI-u encodes the controls literally so Claude Code handles them as
+    editing keys instead of pasting them as text.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: None.
+    """
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
+
+
+def _confirm_message_delivery(
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    text: str,
+    needle: str,
+    hook_offset: int,
+    baseline_session_ids: frozenset[str],
+    redelivery_budget: int,
+) -> None:
+    """
+    Catch an in-pane Claude restart that swallowed a submitted message.
+
+    Runs after a submit already looked successful on the pane, watching the
+    parent session's hook records appended since the pre-paste snapshot:
+
+    - a ``UserPromptSubmit`` matching the injected text is the delivery
+      receipt; return immediately.
+    - a startup ``SessionStart`` under a session id outside the pre-paste
+      baseline (or a second distinct new id when no baseline exists) is an
+      in-pane restart: wait a short grace for a late receipt, then
+      re-deliver into the replacement process.
+
+    A missing receipt alone never fails a send, and with no baseline a lone
+    new session id reads as an ordinary first boot — the false positives
+    that made earlier gates raise spurious "message may not have been
+    delivered" banners on healthy sessions. Residual gap: a restart firing
+    before the booting session logs its own id shows a single new id, reads
+    as the boot, and still loses the message.
+
+    :param bridge_dir: Bridge directory path.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param text: Exact text that was pasted.
+    :param needle: Draft marker from :func:`_submit_needle`.
+    :param hook_offset: Hook log size snapshot taken before the paste.
+    :param baseline_session_ids: Claude session ids known before the
+        paste (see :func:`_baseline_claude_session_ids`).
+    :param redelivery_budget: Re-deliveries still allowed.
+    :returns: None. Returning means the send counts as delivered.
+    :raises RuntimeError: If restarts keep swallowing the message after
+        the re-delivery budget is spent.
+    """
+    if not (bridge_dir / _HOOKS_FILE).exists():
+        # No hook channel — no evidence is obtainable either way. Keep
+        # the pane-level verdict rather than stalling every send.
+        return
+    expected = _normalized_delivery_prompt(text)
+    offset = hook_offset
+    startup_ids: set[str] = set()
+    restart_seen = False
+    restart_seen_at: float | None = None
+    start = time.monotonic()
+    while True:
+        _check_injection_cancelled()
+        result = read_hook_events_from_offset(bridge_dir, offset, start_event_count=0)
+        offset = result.byte_offset
+        for record in result.records:
+            if _is_subagent_hook_record(record):
+                continue
+            if (
+                record.event_name == "UserPromptSubmit"
+                and record.prompt is not None
+                and _delivery_prompts_match(record.prompt, expected)
+            ):
+                return
+            if (
+                record.event_name == "SessionStart"
+                # startup is the restart signature; clear/resume/compact
+                # rotations are deliberate. No source at all still reads
+                # as a process start.
+                and record.source in (None, "startup")
+                and record.claude_session_id
+            ):
+                startup_ids.add(record.claude_session_id)
+        if not restart_seen:
+            if baseline_session_ids:
+                restart_seen = bool(startup_ids - baseline_session_ids)
+            else:
+                restart_seen = len(startup_ids) >= 2
+        now = time.monotonic()
+        if restart_seen:
+            # Measure the grace from when the restart was detected, not the
+            # start of the watch, so a late-detected restart gets a full window.
+            if restart_seen_at is None:
+                restart_seen_at = now
+            if now - restart_seen_at >= _RESTART_RECEIPT_GRACE_S:
+                break
+        elif now - start >= _DELIVERY_CONFIRM_WATCH_S:
+            return
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    if redelivery_budget <= 0:
+        raise RuntimeError(
+            "Claude Code restarted in its terminal pane while the message was "
+            "being delivered, and every re-delivery was dropped by another "
+            "restart. The message was not delivered."
+        )
+    _logger.warning(
+        "claude-native: Claude Code restarted in-pane during message delivery "
+        "and no delivery receipt arrived; re-delivering (%d attempt(s) left)",
+        redelivery_budget,
+    )
+    # The replacement process may still be booting; wait for its composer
+    # before pasting again, then run the full verified delivery against it.
+    _wait_for_claude_prompt_ready(
+        socket_path, tmux_target, timeout_s=_TMUX_READY_TIMEOUT_S, bridge_dir=bridge_dir
+    )
+    # The original submit may have recorded its receipt while we waited for the
+    # replacement composer; re-read from the last offset so a receipt arriving
+    # during that wait is honoured instead of pasting the prompt a second time.
+    if _matching_receipt_present(bridge_dir, offset, expected):
+        return
+    # Carry the pre-paste offset into the retry so a receipt that only lands
+    # while the retry's own draft is pending still cancels the duplicate submit.
+    _paste_and_submit(
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        text=text,
+        needle=needle,
+        confirm_delivery=True,
+        redelivery_budget=redelivery_budget - 1,
+        prior_delivery_offset=hook_offset,
+    )
 
 
 def _count_unknown_command_rejections(pane: str, needle: str) -> int:
