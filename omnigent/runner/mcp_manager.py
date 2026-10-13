@@ -16,12 +16,32 @@ from mcp.types import ElicitRequestParams, ElicitResult
 from mcp.types import Tool as McpToolDef
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.process_logging import redact_diagnostic_text
 from omnigent.spec.types import AgentSpec, MCPServerConfig, RetryPolicy
 from omnigent.tools.base import is_valid_tool_name
 from omnigent.tools.mcp import McpServerConnection
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
+
+
+def _leaf_exceptions(exc: BaseException) -> list[BaseException]:
+    """Flatten nested exception groups down to the errors that occurred."""
+    if isinstance(exc, BaseExceptionGroup):  # noqa: F821 — builtin since 3.11; ruff targets py310
+        return [leaf for sub in exc.exceptions for leaf in _leaf_exceptions(sub)]
+    return [exc]
+
+
+def _describe_connect_error(exc: Exception) -> str:
+    """Describe a connection error for the UI without its credentials.
+
+    The shared diagnostic redaction drops URL queries and fragments and scrubs
+    userinfo, authorization values and named secrets. Credentials embedded in a
+    URL path are not removed.
+    """
+    # The MCP client raises TaskGroup ExceptionGroups whose own text hides the cause.
+    message = "; ".join(f"{type(leaf).__name__}: {leaf}" for leaf in _leaf_exceptions(exc))
+    return redact_diagnostic_text(message)
 
 
 def _schema_requires_fields(params: ElicitRequestParams) -> bool:
@@ -819,7 +839,7 @@ class RunnerMcpManager:
                     raise
                 except Exception as exc:  # noqa: BLE001
                     async with self._lock:
-                        server.error = f"{type(exc).__name__}: {exc}"
+                        server.error = _describe_connect_error(exc)
                         server.connection = None
                         server.tools = []
                     _logger.warning(

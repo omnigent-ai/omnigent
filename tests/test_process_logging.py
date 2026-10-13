@@ -786,3 +786,81 @@ def test_redact_log_text_handles_large_url_without_userinfo_in_linear_time() -> 
     output = redact_log_text(text)
     assert time.perf_counter() - started < 0.5
     assert output == text
+
+
+def test_redact_diagnostic_text_drops_url_queries_and_named_secrets() -> None:
+    from omnigent.process_logging import redact_diagnostic_text
+
+    text = (
+        "403 for url 'https://blob.example.com/mcp?sig=fake-sig-123' "
+        "with token=fake-token-456 and Authorization: Bearer fake-bearer-789"
+    )
+    redacted = redact_diagnostic_text(text)
+    for secret in ("fake-sig-123", "fake-token-456", "fake-bearer-789"):
+        assert secret not in redacted
+    assert "https://blob.example.com/mcp?[REDACTED]" in redacted
+    assert "token=[REDACTED]" in redacted
+    assert "Authorization: [REDACTED]" in redacted
+
+
+def test_redact_diagnostic_text_handles_long_inputs_in_linear_time() -> None:
+    from omnigent.process_logging import _URL_QUERY_OR_FRAGMENT, redact_diagnostic_text
+
+    plain = "a" * 200_000
+    url_without_query = "https://" + "a" * 200_000 + " " + "://" * 50_000
+    for text in (plain, url_without_query):
+        started = time.perf_counter()
+        _URL_QUERY_OR_FRAGMENT.sub(r"\1\2x", text)
+        assert time.perf_counter() - started < 0.5
+        started = time.perf_counter()
+        bounded = redact_diagnostic_text(text)
+        assert time.perf_counter() - started < 0.5
+        assert len(bounded) <= 4001
+    assert redact_diagnostic_text("x" * 50) == "x" * 50
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "kept"),
+    [
+        (
+            "unreachable: https://alice:hunter2@mcp.example.com/sse",
+            "hunter2",
+            "@mcp.example.com/sse",
+        ),
+        (
+            "rejected with Authorization: Bearer fake-token-abc",
+            "fake-token-abc",
+            "Authorization: ",
+        ),
+        (
+            "rejected with Authorization: Basic ZmFrZTpjcmVkZW50aWFs",
+            "ZmFrZTpjcmVkZW50aWFs",
+            "Authorization: ",
+        ),
+        (
+            "rejected with Authorization: Negotiate fake-spnego-blob",
+            "fake-spnego-blob",
+            "Authorization: ",
+        ),
+        ("connect failed: api_key=fake-key-xyz is not valid", "fake-key-xyz", "api_key="),
+        (
+            "handshake failed for wss://mcp.example.com/ws?token=secret123",
+            "secret123",
+            "wss://mcp.example.com/ws?",
+        ),
+        (
+            "see https://mcp.example.com/sse#token=secret123 for details",
+            "secret123",
+            "https://mcp.example.com/sse#",
+        ),
+    ],
+)
+def test_redact_diagnostic_text_covers_shared_secret_shapes(
+    text: str, secret: str, kept: str
+) -> None:
+    from omnigent.process_logging import redact_diagnostic_text
+
+    redacted = redact_diagnostic_text(text)
+    assert secret not in redacted
+    assert kept in redacted
+    assert "[REDACTED]" in redacted

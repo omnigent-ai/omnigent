@@ -154,6 +154,7 @@ from omnigent.server.routes._sessions.common import (
     _interrupt_fenced_sessions,
     _logger,
     _pushed_model_options_cache,
+    _runner_mcp_startup_sessions,
     _session_active_response_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
@@ -2150,6 +2151,8 @@ def register_events_routes(
                     error=record_error if isinstance(record_error, str) and record_error else None,
                 )
             _publish_mcp_startup(session_id, mcp_servers)
+            # The native forwarder now owns this session's startup map.
+            _runner_mcp_startup_sessions.discard(session_id)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_USAGE_TYPE:
             # Persist the harness-reported cumulative usage so the
@@ -3321,6 +3324,7 @@ def register_events_routes(
         # for reload visibility while the session exists, so a session
         # whose MCP startup never settled clean would leak its entry.
         _session_mcp_startup_cache.pop(session_id, None)
+        _runner_mcp_startup_sessions.discard(session_id)
         # Same for the extension-pushed model catalog: kept across reloads
         # while the session exists (the extension only pushes on start), so a
         # deleted session would otherwise leak its entry for the process life.

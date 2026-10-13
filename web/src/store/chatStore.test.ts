@@ -7070,6 +7070,207 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         safe: { status: "starting", error: null },
       });
     });
+
+    it("retains a settled round's failures for the diagnostics surface", () => {
+      useChatStore.setState({ mcpStartup: null, mcpStartupFailures: null });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: {
+          pipeshub: { status: "failed", error: "401 Unauthorized" },
+          safe: { status: "ready", error: null },
+        },
+      });
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+      expect(useChatStore.getState().mcpStartupFailures).toEqual({
+        pipeshub: "401 Unauthorized",
+      });
+    });
+
+    it.each([
+      ["without an error", null],
+      ["with an empty-string error", ""],
+    ])("falls back to a generic detail for a failed server %s", (_label, error) => {
+      useChatStore.setState({ mcpStartupFailures: null });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: { pipeshub: { status: "failed", error } },
+      });
+      expect(useChatStore.getState().mcpStartupFailures).toEqual({
+        pipeshub: "startup failed",
+      });
+    });
+
+    it("clears retained failures when a later map reports recovery", () => {
+      useChatStore.setState({
+        mcpStartupFailures: { pipeshub: "401 Unauthorized" },
+      });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: { pipeshub: { status: "ready", error: null } },
+      });
+      expect(useChatStore.getState().mcpStartupFailures).toBeNull();
+    });
+
+    it("does not report cancellations or in-flight servers as failures", () => {
+      useChatStore.setState({ mcpStartupFailures: null });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: {
+          safe: { status: "starting", error: null },
+          "storage-console": { status: "cancelled", error: null },
+        },
+      });
+      expect(useChatStore.getState().mcpStartupFailures).toBeNull();
+    });
+
+    it("seeds retained failures from the session snapshot", async () => {
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (
+          url.split("?")[0] === "/v1/sessions/conv_mcp_failed_snapshot" &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          return mockResponse({
+            id: "conv_mcp_failed_snapshot",
+            agent_id: "agent_xyz",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            mcp_startup: {
+              pipeshub: { status: "failed", error: "handshake failed" },
+            },
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().switchTo("conv_mcp_failed_snapshot");
+
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+      expect(useChatStore.getState().mcpStartupFailures).toEqual({
+        pipeshub: "handshake failed",
+      });
+    });
+
+    const snapshotRaces: {
+      name: string;
+      id: string;
+      /** A second reader of the session snapshot, started before or after the bind. */
+      concurrent?: { when: "before" | "after"; start: (id: string) => Promise<unknown> };
+      snapshotStartup: Record<string, McpServerStartup> | null;
+      liveServers: Record<string, McpServerStartup>;
+      expected: Record<string, string> | null;
+    }[] = [
+      {
+        name: "the bind snapshot is still loading",
+        id: "conv_mcp_race",
+        snapshotStartup: null,
+        liveServers: { pipeshub: { status: "failed", error: "fresh" } },
+        expected: { pipeshub: "fresh" },
+      },
+      {
+        name: "another fetch of the session was already in flight",
+        id: "conv_mcp_inflight",
+        concurrent: {
+          when: "before",
+          start: (id) =>
+            client.fetchQuery({
+              queryKey: ["session", id],
+              queryFn: () => getSessionSlim(id),
+              staleTime: 0,
+              retry: false,
+            }),
+        },
+        snapshotStartup: null,
+        liveServers: { pipeshub: { status: "failed", error: "fresh" } },
+        expected: { pipeshub: "fresh" },
+      },
+      {
+        name: "a runner-online refresh joins the bind snapshot",
+        id: "conv_mcp_joined",
+        concurrent: {
+          when: "after",
+          start: (id) => useChatStore.getState().refreshSessionState(id),
+        },
+        snapshotStartup: null,
+        liveServers: { pipeshub: { status: "failed", error: "fresh" } },
+        expected: { pipeshub: "fresh" },
+      },
+      {
+        name: "a recovery lands before a stale failed snapshot resolves",
+        id: "conv_mcp_recovered",
+        snapshotStartup: { pipeshub: { status: "failed", error: "stale" } },
+        liveServers: { pipeshub: { status: "ready", error: null } },
+        expected: null,
+      },
+    ];
+
+    it.each(snapshotRaces)(
+      "keeps the newer live failure map when $name",
+      async ({ id, concurrent, snapshotStartup, liveServers, expected }) => {
+        let resolveSnapshot!: (response: Response) => void;
+        const snapshot = new Promise<Response>((resolve) => {
+          resolveSnapshot = resolve;
+        });
+        fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+          const url = typeof input === "string" ? input : input.toString();
+          if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+            return snapshot;
+          }
+          return defaultFetchHandler(input, init);
+        });
+        const pending: Promise<unknown>[] = [];
+        if (concurrent?.when === "before") {
+          pending.push(concurrent.start(id));
+          await tick();
+        }
+        pending.push(useChatStore.getState().switchTo(id));
+        await tick();
+        if (concurrent?.when === "after") {
+          pending.push(concurrent.start(id));
+          await tick();
+        }
+        handleSessionEvent({
+          type: "session_mcp_startup",
+          conversationId: id,
+          servers: liveServers,
+        });
+        // The snapshot was built before the live event.
+        resolveSnapshot(
+          mockResponse({
+            id,
+            agent_id: "agent_xyz",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            mcp_startup: snapshotStartup,
+          }),
+        );
+        await Promise.all(pending);
+
+        expect(useChatStore.getState().mcpStartupFailures).toEqual(expected);
+      },
+    );
+
+    it("does not confuse user-chosen server names with Object.prototype members", () => {
+      useChatStore.setState({ mcpStartupFailures: null });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: JSON.parse(
+          '{"toString": {"status": "ready", "error": null}, "__proto__": {"status": "failed", "error": "boom"}}',
+        ),
+      });
+      const failures = useChatStore.getState().mcpStartupFailures;
+      expect(failures).not.toBeNull();
+      expect(failures?.["toString"]).toBeUndefined();
+      expect(Object.keys(failures ?? {})).toEqual(["__proto__"]);
+      expect(failures?.["__proto__"]).toBe("boom");
+    });
   });
 
   describe("refreshSessionState", () => {

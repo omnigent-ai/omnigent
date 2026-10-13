@@ -107,7 +107,10 @@ _LEVEL_COLORS = {
 }
 _REDACTED = "[REDACTED]"
 _QUOTED_OR_NONSPACE_VALUE = r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|\S+)'
-_AUTHORIZATION_VALUE = r'(?:(?:"[^"\r\n]*"|\'[^\'\r\n]*\')|(?:bearer\s+)?\S+)'
+# Single-token schemes keep their credential in the next token; consume it too.
+_AUTHORIZATION_VALUE = (
+    r'(?:(?:"[^"\r\n]*"|\'[^\'\r\n]*\')|(?:(?:bearer|basic|negotiate|token|hoba|mutual)\s+)?\S+)'
+)
 _AUTHORIZATION_PATTERN = re.compile(
     rf"(?i)(\bauthorization\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
 )
@@ -116,6 +119,13 @@ _NAMED_SECRET_PATTERN = re.compile(
     rf"(?i)((?<![\w.-])[\w.-]*(?:token|api(?:[_-]|[ \t]+)?key|secret|password|credential)"
     rf"\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
 )
+# Any scheme's query or fragment: signed URLs carry their token there. The scheme
+# must start a token, so a long alphanumeric run is scanned once, not per offset.
+_URL_QUERY_OR_FRAGMENT = re.compile(
+    r"(?<![\w.+-])([a-z][a-z0-9+.-]*://[^\s'\"]+?)([?#])[^\s'\"]*", re.IGNORECASE
+)
+# Diagnostics shown to users are bounded before redaction; the rest is noise.
+_MAX_DIAGNOSTIC_CHARS = 4000
 _WHITESPACE_SECRET_PATTERN = re.compile(
     # Scan prefixes only from each key's start, as for assignment keys above.
     # Generic token/secret/credential labels require a prefix to distinguish them from prose.
@@ -177,6 +187,16 @@ def redact_log_text(text: str, *, include_whitespace_credentials: bool = False) 
             text,
         )
     return text
+
+
+def redact_diagnostic_text(text: str) -> str:
+    """Redact an error shown to users: drop URL queries and fragments, then secrets."""
+    if len(text) > _MAX_DIAGNOSTIC_CHARS:
+        # Cutting mid-secret is safe: every pattern below anchors on a prefix cue
+        # (key, scheme, `?`/`#`), so a truncated value is still redacted.
+        text = text[:_MAX_DIAGNOSTIC_CHARS] + "…"
+    text = _URL_QUERY_OR_FRAGMENT.sub(rf"\1\2{_REDACTED}", text)
+    return redact_log_text(text, include_whitespace_credentials=True)
 
 
 def format_log_level_name(levelno: int, levelname: str, *, use_colors: bool) -> str:

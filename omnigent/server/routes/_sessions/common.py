@@ -696,6 +696,9 @@ _session_sandbox_status_cache: WorkspaceScopedCache[str, SandboxStatus] = Worksp
 _session_mcp_startup_cache: WorkspaceScopedCache[str, dict[str, McpServerStartup]] = (
     WorkspaceScopedCache()
 )
+# Sessions whose cached startup map came from runner ``tools/list`` failures rather
+# than a native forwarder, so a later harness change can clear it.
+_runner_mcp_startup_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
 _model_options_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = WorkspaceScopedCache()
@@ -1232,6 +1235,7 @@ __all__ = [
     "_read_explicit_unread",
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
+    "_runner_mcp_startup_sessions",
     "_runner_relay_tasks",
     "_runner_status_probe_backoff",
     "_runner_status_probe_inflight",

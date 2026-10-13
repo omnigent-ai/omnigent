@@ -1121,6 +1121,15 @@ _SESSION_SKILLS_CACHE_TTL_SECONDS = 60.0
 _SESSION_INIT_ENVELOPE_TTL_SECONDS = 60.0
 
 
+def _without_mcp_tools(tools: list[_JsonObject]) -> list[_JsonObject]:
+    """Drop proxied MCP tools (``server__tool`` names) from an advertised tool list."""
+    return [
+        t
+        for t in tools
+        if not (isinstance(t, dict) and isinstance(t.get("name"), str) and "__" in t["name"])
+    ]
+
+
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -1322,6 +1331,9 @@ def create_runner_app(
     _instruction_delivery_warned: dict[str, set[tuple[str, InstructionDelivery]]] = {}
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
+    # Marker left by cache invalidation: never equals a real hash, so the next turn
+    # relists a configured spec or syncs an emptied one once.
+    _MCP_SPEC_HASH_STALE = "stale"
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
 
     # Process-lifetime monotonic fill-generation counter per session id.
@@ -3324,6 +3336,8 @@ def create_runner_app(
         await mcp_execution_registry.cancel_session(session_id)
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
+        # The MCP listing marker only matters for a live session's next turn.
+        _session_mcp_spec_hash.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
         _recovery_turn_ids.pop(session_id, None)
@@ -5130,17 +5144,13 @@ def create_runner_app(
                     mcp_result = await _session_mcp_proxy.schemas_for(
                         cached_spec,
                     )
-                    _builtin_tools = [
-                        t
-                        for t in _session_tool_schemas.get(conv, [])
-                        if not (
-                            isinstance(t, dict)
-                            and isinstance(t.get("name"), str)
-                            and "__" in cast(str, t.get("name"))
-                        )
-                    ]
-                    _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
-                    _session_mcp_spec_hash[conv] = _mcp_hash
+                    _session_tool_schemas[conv] = _without_mcp_tools(
+                        _session_tool_schemas.get(conv, [])
+                    ) + list(mcp_result.schemas)
+                    # Retry degraded listings even when the MCP config is unchanged.
+                    _session_mcp_spec_hash[conv] = (
+                        _mcp_hash if not mcp_result.failures else f"{_mcp_hash}:degraded"
+                    )
                 except (
                     httpx.HTTPError,
                     RuntimeError,
@@ -5152,6 +5162,27 @@ def create_runner_app(
                         exc_info=True,
                         extra={"session_id": conv},
                     )
+        elif cached_spec is not None and conv in _session_mcp_spec_hash:
+            # Sync once after the final server is removed to clear stale failures.
+            # The proxy reports transport errors as failures rather than raising.
+            sync_result = await ProxyMcpManager(
+                conv,
+                server_client,
+                execution_registry=mcp_execution_registry,
+            ).schemas_for(cached_spec, sync_when_empty=True)
+            # Tools of removed servers can no longer be routed; drop them regardless.
+            _session_tool_schemas[conv] = _without_mcp_tools(_session_tool_schemas.get(conv, []))
+            if sync_result.failures:
+                # Retry next turn, and relist if the config comes back unchanged.
+                _session_mcp_spec_hash[conv] = _MCP_SPEC_HASH_STALE
+                _logger.warning(
+                    "MCP empty-config sync failed for %s: %s",
+                    conv,
+                    sync_result.failures,
+                    extra={"session_id": conv},
+                )
+            else:
+                _session_mcp_spec_hash.pop(conv, None)
 
         _spec_tools = _session_tool_schemas.get(conv) or []
         # Request-driven harnesses should not advertise browser tools when no
@@ -7311,7 +7342,8 @@ def create_runner_app(
         _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)
-        _session_mcp_spec_hash.pop(session_id, None)
+        if session_id in _session_mcp_spec_hash:
+            _session_mcp_spec_hash[session_id] = _MCP_SPEC_HASH_STALE
         _instruction_delivery_warned.pop(session_id, None)
         _session_sub_agent_resolved.pop(session_id, None)
         if agent_id:
