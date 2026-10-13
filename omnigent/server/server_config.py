@@ -228,14 +228,31 @@ def load_picker_curation(config: Mapping[str, Any]) -> PickerCuration:
 
 
 def runner_tunnel_binary_request_body() -> bool:
-    """Allow opted-in raw request bodies; YAML false restores the JSON/base64 path."""
+    """Allow raw request bodies; refresh the kill switch when config metadata changes."""
+    path = resolve_config_path()
+    signature = None
+    if path is not None:
+        path = path.absolute()
+        try:
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+        except OSError:
+            pass
+    key = (path, signature)
+    cache = runner_tunnel_binary_request_body.__dict__
+    cached = cache.get("_cache")
+    if cached is not None and cached[0] == key:
+        return cached[1]
     raw = load_server_config().get("runner_tunnel_binary_request_body")
-    if raw is None:
-        return True
+    enabled = True
     if isinstance(raw, bool):
-        return raw
-    logger.warning("server config runner_tunnel_binary_request_body must be a bool; using true")
-    return True
+        enabled = raw
+    elif raw is not None:
+        logger.warning(
+            "server config runner_tunnel_binary_request_body must be a bool; using true"
+        )
+    cache["_cache"] = key, enabled
+    return enabled
 
 
 def _config_positive_int(key: str, default: int) -> int:

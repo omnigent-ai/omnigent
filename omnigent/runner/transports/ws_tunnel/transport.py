@@ -120,7 +120,10 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
     kill switch is enabled; otherwise the existing JSON encoding is used.
     At most two opted-in requests are admitted per connection, including JSON
     fallbacks. Excess callers get ``httpx.PoolTimeout`` and may retry after an
-    earlier response closes. Close every response to release its slot.
+    earlier runner response ends. Admission lasts until the runner's terminal
+    response or session retirement, even if the caller cancels or closes early.
+    An over-limit binary envelope raises ``httpx.LocalProtocolError`` with the
+    request attached; upload relays can map this error to HTTP 413.
     """
 
     def __init__(self, registry: TunnelRegistry, runner_id: str) -> None:
@@ -176,7 +179,10 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                 and BINARY_REQUEST_BODY_CAPABILITY in state.session.hello.capabilities
                 and runner_tunnel_binary_request_body()
             ):
-                wire: str | bytes = encode_binary_request(frame, body)
+                try:
+                    wire: str | bytes = encode_binary_request(frame, body)
+                except ValueError as exc:
+                    raise httpx.LocalProtocolError(str(exc), request=request) from exc
             else:
                 content_type = request.headers.get("content-type", "application/json")
                 frame.body, frame.encoding = (
