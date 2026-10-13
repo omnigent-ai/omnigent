@@ -190,7 +190,7 @@ async def test_elicitation_post_resets_backoff_after_a_gateway_severed_poll(
     assert response is not None
     assert response.status_code == 200
     initial = fwd._CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS
-    assert sleeps == [initial, initial, initial, initial * 2, initial * 4], (
+    assert sleeps == [initial, initial, initial, initial * 2, initial * 2], (
         "a gateway-severed held poll must reset the backoff so the re-POST lands "
         "inside the server's re-park grace; only fast failures may back off"
     )
@@ -222,6 +222,23 @@ async def test_elicitation_post_retries_gateway_5xx(
     # 2 = the 502 attempt + the successful retry; 1 would mean 5xx was
     # treated as a final answer and the prompt abandoned.
     assert len(client.posts) == 2
+
+
+@pytest.mark.asyncio
+async def test_elicitation_post_recovers_after_long_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fast failures never create a 30-second blind spot after recovery."""
+    monkeypatch.setattr(fwd, "_elicitation_retry_sleep", _instant_retry_sleep)
+    client = _FlakyElicitationClient(transport_failures=20)
+    response = await fwd._post_codex_elicitation_request(
+        client,  # type: ignore[arg-type]
+        "conv_x",
+        event=_ELICITATION_EVENT,
+    )
+    assert response is not None and response.status_code == 200
+    assert len(client.posts) == 21
+    assert fwd._CODEX_ELICITATION_RETRY_MAX_BACKOFF_SECONDS <= 2
 
 
 @pytest.mark.asyncio

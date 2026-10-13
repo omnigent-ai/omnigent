@@ -157,6 +157,7 @@ export type RenderItem =
       allowAutoMode?: boolean;
       rememberScope?: RememberScope | null;
       codexPersistModes?: CodexPersistMode[];
+      requestFingerprint?: string;
     };
 
 /** A bubble cluster. The page maps over these. */
@@ -1675,6 +1676,7 @@ function buildAssistantItems(
         allowAutoMode: b.allowAutoMode,
         rememberScope: b.rememberScope,
         codexPersistModes: b.codexPersistModes,
+        requestFingerprint: b.requestFingerprint,
       });
       i += 1;
       continue;

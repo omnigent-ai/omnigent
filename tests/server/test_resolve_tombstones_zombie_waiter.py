@@ -136,6 +136,54 @@ async def test_gap_resolve_fingerprints_the_tombstone_from_the_pending_prompt():
 
 
 @pytest.mark.asyncio
+async def test_restart_gap_resolve_uses_the_visible_cards_fingerprint():
+    """An answer to a pre-restart card survives missing in-process registries."""
+    from omnigent.runtime import pending_elicitations
+
+    sid = "conv_restart_gap"
+    eid = "elicit_codex_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    fingerprint = S._harness_elicitation_request_fingerprint(_params("Overwrite?"))
+    pending_elicitations.reset_for_tests()
+    S._harness_pre_resolved_elicitations.pop(eid, None)
+    try:
+        await S._resolve_elicitation(
+            sid,
+            {
+                "elicitation_id": eid,
+                "action": "accept",
+                "_meta": {
+                    "omnigent_request_fingerprint": fingerprint,
+                },
+            },
+            None,
+        )
+        await S._resolve_elicitation(
+            sid,
+            {
+                "elicitation_id": eid,
+                "action": "decline",
+                "_meta": {
+                    "omnigent_request_fingerprint": fingerprint,
+                },
+            },
+            None,
+        )
+        adopted = S._consume_pre_resolved_harness_elicitation(sid, eid, fingerprint)
+        assert adopted is not None and adopted.result is not None
+        assert adopted.result.action == "accept"  # the first answer wins
+        assert adopted.result.meta is None  # client correlation must not reach the harness
+        assert (
+            S._consume_pre_resolved_harness_elicitation(
+                sid, eid, S._harness_elicitation_request_fingerprint(_params("Delete?"))
+            )
+            is None
+        )
+    finally:
+        S._harness_pre_resolved_elicitations.pop(eid, None)
+        pending_elicitations.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_repark_of_the_same_question_adopts_the_verdict():
     # The intended consumer: a re-park of the SAME envelope (same params,
     # same fingerprint) adopts the gap-landing verdict.

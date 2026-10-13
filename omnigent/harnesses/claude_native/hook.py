@@ -46,53 +46,40 @@ if TYPE_CHECKING:
 # ``_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S`` and Claude Code's own
 # command-hook ``timeout`` so no single layer caps the wait early.
 #
-# NOTE: this bounds a SINGLE long-poll (a slow human), NOT the retry loop.
-# Re-POST attempts after a *failure* are bounded separately by
-# ``_PERMISSION_MAX_CONSECUTIVE_FAILURES`` — see :func:`_post_hook_with_reattach`.
-# Before #1782 the retry deadline was also one day, so a persistently
-# sick/unreachable server made the hook re-POST (each re-driving the turn and
-# respawning harness/tool subprocesses) every ≤30s for 24h — the spin-loop half
-# of the zombie pileup.
+# This also bounds the re-POST loop. A temporarily unreachable server must not
+# move an outstanding approval to the terminal before the user can answer it.
 _PERMISSION_TIMEOUT_S = 86400.0
 # Every retry after a held-poll sever must land inside the server's
 # re-park grace (proxies sever idle long-polls); only hard failures
 # back off.
 _PERMISSION_RETRY_INITIAL_BACKOFF_S = 1.0
-_PERMISSION_RETRY_MAX_BACKOFF_S = 30.0
+_PERMISSION_RETRY_MAX_BACKOFF_S = 2.0
 # Fail unreachable-server connects fast into the backoff loop instead
 # of inheriting the day-long read budget.
 _PERMISSION_CONNECT_TIMEOUT_S = 30.0
 
 
 def _env_int(name: str, default: int) -> int:
-    """Read an int env override, ignoring a malformed value.
-
-    A non-integer value must not crash the hook subprocess at import time —
-    that would defeat the terminal-fallback design elsewhere in this file. Bad
-    input logs a diagnostic and falls back to *default*.
-
-    :param name: Environment variable name.
-    :param default: Value used when unset or unparseable.
-    :returns: The parsed int, or *default*.
-    """
+    """Read an integer env override, ignoring malformed values."""
     raw = os.environ.get(name)
     if raw is None:
         return default
     try:
         return int(raw)
     except ValueError:
-        print(
-            f"omnigent hook: ignoring non-integer {name}={raw!r}; using {default}",
-            file=sys.stderr,
-        )
+        print(f"omnigent hook: ignoring non-integer {name}={raw!r}", file=sys.stderr)
         return default
+
+
+# An explicit operator limit is supported; by default a temporary outage
+# must not expire a pending approval before the day-long wait does.
+_PERMISSION_MAX_CONSECUTIVE_FAILURES = max(0, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 0))
 
 
 def _env_float(name: str, default: float) -> float:
     """Read a float env override, ignoring a malformed value.
 
-    Float sibling of :func:`_env_int`; a bad value logs and falls back to
-    *default* rather than crashing the hook at import time.
+    A bad value logs and falls back to *default* rather than crashing at import.
 
     :param name: Environment variable name.
     :param default: Value used when unset or unparseable.
@@ -116,18 +103,6 @@ def _env_float(name: str, default: float) -> float:
         )
         return default
     return value
-
-
-# Cap on CONSECUTIVE HARD failures before the reattach loop gives up and lets
-# the caller fail-ask. A "hard failure" is the server being sick or unreachable
-# (5xx, or a connection that never established) — i.e. the #1782 spin. It is
-# distinguished from a proxy severing a *held* poll (a connection that WAS
-# established and then dropped mid-wait), which is the re-park mechanism working
-# as intended and does NOT count — see :func:`_post_hook_with_reattach`. So a
-# legitimately-parked approval behind a severing proxy is never capped, while a
-# down server can no longer re-POST for a day. Overridable for operators who
-# want more slack against a flaky upstream.
-_PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 8))
 
 
 def _never_connected_errors() -> tuple[type[Exception], ...]:
@@ -690,29 +665,23 @@ def _post_hook_with_reattach(
     elicitation and can hand back a gap verdict via its pre-resolved
     tombstone. Retries transport errors and 5xx; a 4xx is final.
 
-    Retries are bounded by ``_PERMISSION_MAX_CONSECUTIVE_FAILURES`` consecutive
-    *hard* failures, classified by kind — NOT by wall-clock. This is the #1782
-    fix: before it the retry deadline was ``_PERMISSION_TIMEOUT_S`` (a day), so
-    a persistently down server re-POSTed — re-driving the turn and respawning
-    harness/tool subprocesses — every ≤30s for 24h.
+    By default retries continue until the day-long approval wait expires. Hard
+    failures back off, but cannot move a pending web approval into the native
+    terminal unless the operator explicitly sets ``OMNIGENT_HOOK_MAX_RETRIES``.
 
     Failure classification:
 
-    * **Hard failure → count toward the cap.** A 5xx returned in under
+    * **Hard failure → back off.** A 5xx returned in under
       :data:`_PERMISSION_HELD_POLL_FLOOR_S`, or a connection that never
       established (:func:`_never_connected_errors`), or an established
       connection that dropped in under the floor (a flapping/crash-looping
       server). This is the spin.
-    * **Held-poll sever → reset the counter and the backoff.** An established
+    * **Held-poll sever → reset the backoff.** An established
       connection that dropped mid-poll after being held ≥ the floor, or a
       gateway 5xx (the Databricks front door answers an idle long-poll with
       504 after 300s) that arrived after the poll was held ≥ the floor. Either
       is a proxy severing an idle long-poll — the re-park mechanism working as
-      intended — so it must NOT count, or a legitimately-parked human approval
-      behind a severing proxy would be capped after a handful of severs.
-      Classifying by *how the request failed* (established-then-severed vs
-      never-connected), not by elapsed wall-clock alone, is what makes "a slow
-      human is never capped" hold even when the proxy severs every 30-60s. The
+      intended. The
       backoff resets too, so the re-POST re-parks the same id inside the
       server's re-park grace and the approval card never clears between polls.
 
@@ -720,23 +689,9 @@ def _post_hook_with_reattach(
 
     Residual limitation (by design): a *sick* backend behind a proxy/LB that
     accepts the connection and then silently severs it after its upstream
-    timeout (>= the floor) — or whose proxy answers that timeout with a 5xx —
-    is indistinguishable at the transport layer from a proxy severing a
-    genuinely-parked human poll — both surface as an established-then-severed
-    error (or a late gateway 5xx) after N seconds, and the server holds the
-    POST silently with no client-visible "parked" ack. So this case resets the
-    counter and is NOT caught by the consecutive-hard-failure cap; it is bounded
-    only by the absolute :data:`_PERMISSION_TIMEOUT_S` ceiling below (the same
-    day-long human-answer window). That is the tightest safe client-side bound:
-    capping it sooner — or raising the floor for 5xx above the 10s shared with
-    torn connections — would necessarily cap a real slow human behind any
-    gateway that answers sooner than the floor, which is the very wedge this
-    loop exists to prevent. The blast radius is limited — this loop only
-    re-POSTs over HTTP from one hook process (it does not itself respawn
-    harness/tool subprocesses), and the host-side orphan reaper (#1782 Bug A)
-    reclaims any subprocesses a re-driven turn does spawn — so the worst case is
-    one hook re-POSTing once per proxy timeout for up to a day, which also
-    keeps the card alive until the server recovers.
+    timeout is indistinguishable from a severed human poll. Both are bounded
+    by the absolute day-long approval wait, not a failure count. Only this
+    hook process re-POSTs; each failed request waits before retrying.
 
     The absolute :data:`_PERMISSION_TIMEOUT_S` ceiling bounds the total wait on
     every path, matching the day-long human-answer window.
@@ -778,7 +733,7 @@ def _post_hook_with_reattach(
     # window — matches the read budget and the server's ask_timeout.
     deadline = time.monotonic() + _PERMISSION_TIMEOUT_S
     reauthed = False
-    consecutive_hard_failures = 0
+    hard_failures = 0
     marker_scope = (
         hold_approval_wait_marker(wait_marker)
         if wait_marker is not None
@@ -849,26 +804,27 @@ def _post_hook_with_reattach(
                     file=sys.stderr,
                 )
             if is_hard_failure:
-                consecutive_hard_failures += 1
+                hard_failures += 1
+                if (
+                    _PERMISSION_MAX_CONSECUTIVE_FAILURES
+                    and hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES
+                ):
+                    print(
+                        f"omnigent {hook_label} hook: operator retry limit reached",
+                        file=sys.stderr,
+                    )
+                    return None
             else:
+                hard_failures = 0
                 # A proxy severed a genuinely-held poll — the re-park mechanism
                 # working as intended. Reset so a slow human is never capped, and
                 # re-POST promptly so the same id re-parks inside the server's
                 # re-park grace instead of letting the card clear between polls.
-                consecutive_hard_failures = 0
                 backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
                 # The held poll proves this token was accepted, so the one-shot
                 # re-mint is armed again: a wait longer than the token lifetime
                 # lapses once an hour, and each lapse must be re-mintable.
                 reauthed = False
-            if consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
-                print(
-                    f"omnigent {hook_label} hook: giving up after "
-                    f"{consecutive_hard_failures} consecutive hard failures "
-                    "(server unreachable/sick) — failing ask",
-                    file=sys.stderr,
-                )
-                return None
             # Two-line backoff; not worth a retry lib in this dependency-light hook.
             time.sleep(backoff_s)
             backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)

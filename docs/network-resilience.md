@@ -51,18 +51,18 @@ a run happens to pass. Outages beyond the short default run only with
 | S1 | tool running, approval pending | 40 s / 180 s window | pass | pass |
 | S2 | idle; tool running; tool ends during outage | 5 s / 60 s / 120 s | pass | pass |
 | S2 | approval pending | 5 s | pass | pass |
-| S2 | approval pending | 60 s | gap: [R1](#r1-approval-card-missing-after-the-link-returns) | gap: [R1](#r1-approval-card-missing-after-the-link-returns) |
-| S2 | approval pending | 120 s | gap: [R2](#r2-long-outage-moves-the-approval-to-the-terminal) | gap: [R1](#r1-approval-card-missing-after-the-link-returns) |
+| S2 | approval pending | 60 s | pass | pass |
+| S2 | approval pending | 120 s | pass | pass |
 | S3 blackhole | idle, tool running, approval pending | 10 s / 45 s / 120 s | pass | pass, [R8](#r8-codex-status-sticks-on-running-after-a-reconnect) intermittent |
 | S3 reset | idle, tool running | 10 s / 45 s / 120 s | pass | pass, R8 intermittent |
 | S3 reset | approval pending | 10 s | pass | pass, R8 intermittent |
-| S3 reset | approval pending | 45 s / 120 s | gap: R1 / R2 | pass, R8 intermittent |
+| S3 reset | approval pending | 45 s / 120 s | pass | pass, R8 intermittent |
 | S3 flap (full mode only) | idle; tool running, approval pending | 40 s | pass | pass, R8 intermittent |
 | S3 flap (full mode only) | idle | 120 s | pass | pass, R8 intermittent |
 | S3 flap (full mode only) | tool running, approval pending | 120 s | gap: [R6](#r6-repeated-blips-add-up-to-a-disconnect-failure) | gap: R6 |
 | S4 | idle, tool running, approval pending | 10 s / 60 s / 300 s | pass | pass |
 | S5 | approve | 20 s | pass | pass |
-| S5 | approve | 150 s | gap: R2 | pass |
+| S5 | approve | 150 s | pass | pass |
 | S5 | send | 20 s / 150 s | gap: [R3](#r3-a-message-sent-while-the-host-is-unreachable-is-lost) | gap: R3 |
 | S5 | stop | 20 s / 150 s | pass | pass |
 | S6 | tool ends during outage, approval pending (half-open and refused) | 20 s / 120 s | gap: [R5](#r5-the-page-never-says-it-is-offline) | gap: R5 |
@@ -72,28 +72,21 @@ a run happens to pass. Outages beyond the short default run only with
 
 ## Findings
 
-### R1: Approval card missing after the link returns
+### R1: Approval card missing after the link returns (fixed)
 
-Both harnesses re-POST a held approval with backoff capped at 30 s. Claude
-does this in `_post_hook_with_reattach` in
-`omnigent/harnesses/claude_native/hook.py`. Codex does it in
-`_post_codex_elicitation_request` in
-`omnigent/harnesses/codex_native/forwarder.py`. The server keeps pending
-approvals in memory, so a restart or a refused host link loses the card until
-the harness's next attempt, which can be up to 30 s after the link is back.
-In the lab the card returned 28–30 s after the server did. An approval sent
-from the stale card in that gap was accepted with `202` but had no effect, and
-the turn stayed blocked until the user answered the returned card. Codex keeps
-retrying for up to a day, so for Codex this is also the 120 s outcome.
+Both harnesses now retry held approvals with a 2 s maximum backoff, so the
+card returns promptly after the server or host link recovers. The server's
+in-memory pending index still disappears on restart; an answer sent from the
+pre-restart card carries that question's fingerprint and is matched to the
+harness's re-POST via a session-scoped pre-resolved tombstone. A different
+question reusing the same id cannot inherit the answer.
 
-### R2: Long outage moves the approval to the terminal
+### R2: Long outage moves the approval to the terminal (fixed)
 
-Claude only. After `OMNIGENT_HOOK_MAX_RETRIES` (8) consecutive failed re-POSTs, about 90 s
-of backoff, the hook gives up and Claude Code falls back to its own terminal
-prompt. When the link returns, the web never shows the card again, and an
-approval the user already gave while the host was offline never reaches
-Claude. The session stays `running`, and new messages queue behind a prompt
-that only the terminal can answer.
+Claude's permission hook no longer stops after eight hard failures. It keeps
+the permission pending until the day-long approval wait expires, so an answer
+given while the host was offline reaches Claude after reconnection rather than
+falling back to its terminal prompt.
 
 ### R3: A message sent while the host is unreachable is lost
 

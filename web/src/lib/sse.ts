@@ -1070,6 +1070,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     return {
       type: "elicitation_request",
       elicitationId,
+      requestFingerprint:
+        typeof data.request_fingerprint === "string" ? data.request_fingerprint : undefined,
       targetSessionId:
         typeof targetSessionId === "string" && targetSessionId ? targetSessionId : null,
       message: String(p.message ?? ""),

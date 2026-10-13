@@ -28,11 +28,6 @@ _ACTIONS = {
 }
 _KNOWN_GAPS = {
     **contract.gaps(
-        "R2: the permission hook gives up after ~90s of failed re-POSTs, so an approval "
-        "given while the host was offline never reaches Claude",
-        [("approve", 150)],
-    ),
-    **contract.gaps(
         "R3: a message sent while the host is unreachable is accepted (202), then the "
         "relaunch fails with runner_failed_to_start; the message is never delivered and "
         "the failure stays after the host returns",
