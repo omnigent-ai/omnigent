@@ -89,8 +89,8 @@ If the test process is killed, recover that backup before retrying; subsequent
 runs refuse to overwrite it.
 
 Arbitrary Python/Playwright commands also work with the wrapper. They receive
-`OMNIGENT_REPRO_SERVER_URL`, `OMNIGENT_REPRO_MODEL_URL`, and
-`OMNIGENT_REPRO_RUNNER_ID`. These URLs are valid only inside that invocation;
+`OMNIGENT_REPRO_SERVER_URL`, `OMNIGENT_REPRO_MODEL_URL`, `OMNIGENT_REPRO_RUNNER_ID`,
+and the prepared runner's `CLAUDE_CONFIG_DIR`. The URLs are valid only inside that invocation;
 reuse session IDs across invocations, not the temporary URLs. HTTP, SSE and
 terminal WebSockets all use the same product endpoints. Put shared files in the
 worktree, since `/tmp` is private to each sandbox.

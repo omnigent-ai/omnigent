@@ -29,6 +29,8 @@ def command_environment(output: Path):
             OMNIGENT_REPRO_SERVER_URL=f"http://127.0.0.1:{server.port}",
             OMNIGENT_REPRO_MODEL_URL=f"http://127.0.0.1:{model.port}",
             OMNIGENT_REPRO_RUNNER_ID=state["runner_id"],
+            # Tests read Claude Code's files where the prepared runner's Claude writes them.
+            CLAUDE_CONFIG_DIR=str(output / "claude-config"),
         )
         for key in ("NO_PROXY", "no_proxy"):
             env[key] = ",".join(filter(None, (env.get(key), "localhost,127.0.0.1,::1")))
