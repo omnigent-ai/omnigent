@@ -197,6 +197,7 @@ from omnigent.server.schemas import (
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
     SessionCreateRequest,
+    SessionEventInput,
     SessionForkRequest,
     SessionLabelsResponse,
     SessionList,
@@ -403,6 +404,57 @@ def register_core_routes(
 ) -> None:
     """Register the core session routes on router."""
 
+    async def _accept_initial_input(
+        request: Request, session_id: str, event: SessionEventInput | None, user_id: str | None
+    ) -> None:
+        from starlette.datastructures import UploadFile as FormUploadFile
+
+        form = (
+            await request.form()
+            if request.headers.get("content-type", "").startswith("multipart/form-data")
+            else None
+        )
+        files = form.getlist("initial_files") if form is not None else []
+        if event is None:
+            if files:
+                raise OmnigentError(
+                    "initial_files requires initial_input", code=ErrorCode.INVALID_INPUT
+                )
+            return
+        startup = getattr(request.app.state, "startup_inputs", None)
+        if startup is None:
+            raise OmnigentError(
+                "durable initial input is not configured", code=ErrorCode.INVALID_INPUT
+            )
+        blocks = []
+        for file in files:
+            if not isinstance(file, FormUploadFile) or file_store is None:
+                raise OmnigentError(
+                    "initial_files must contain uploaded files", code=ErrorCode.INVALID_INPUT
+                )
+            resource = await request.app.state.initial_file_upload(request, session_id, file)
+            stored = await asyncio.to_thread(file_store.get, resource["id"], session_id=session_id)
+            assert stored is not None
+            blocks.append(
+                {
+                    "type": "input_image"
+                    if (stored.content_type or "").startswith("image/")
+                    else "input_file",
+                    "file_id": stored.id,
+                    "filename": stored.filename,
+                }
+            )
+        if blocks:
+            event = event.model_copy(
+                update={
+                    "data": {
+                        **event.data,
+                        "content": [*blocks, *event.data.get("content", [])],
+                    }
+                }
+            )
+        await startup.enqueue(session_id, event, user_id=user_id, headers=request.headers)
+
     async def _schedule_managed_launch(
         request: Request,
         *,
@@ -497,6 +549,12 @@ def register_core_routes(
                 conversation_store.set_labels,
                 session_id,
                 managed_repo_labels(workspaces),
+            )
+        if getattr(request.app.state, "startup_inputs", None) is not None:
+            from omnigent.server.startup_inputs import STARTUP_LABEL
+
+            await asyncio.to_thread(
+                conversation_store.set_labels, session_id, {STARTUP_LABEL: "pending"}
             )
         managed_launches.begin(session_id)
         # Seed the launch-progress indicator before the background task
@@ -739,7 +797,8 @@ def register_core_routes(
         """
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
-        if content_type == "multipart/form-data":
+        form = await request.form(max_files=21) if content_type == "multipart/form-data" else None
+        if form is not None and (form.get("bundle") is not None or "initial_files" not in form):
             result = await _create_bundled_session_from_multipart(request, user_id)
             # Surface the freshly-minted session id (the request path has no
             # {session_id} on create); the middleware promotes a bag session_id
@@ -747,8 +806,14 @@ def register_core_routes(
             add_audit_attrs(session_id=result.session_id, agent=result.agent_id)
             return result
 
+        if form is not None and not isinstance(form.get("metadata"), str):
+            raise HTTPException(status_code=422, detail=[_multipart_missing_detail("metadata")])
         try:
-            payload = await request.json()
+            payload = (
+                json.loads(str(form.get("metadata", "{}")))
+                if form is not None
+                else await request.json()
+            )
             # Dispatch on the VALUE, not key presence: a null project_id is
             # "no project", so it must keep the legacy request shape (and its
             # 422 contract) byte-identical to an absent key.
@@ -881,6 +946,7 @@ def register_core_routes(
                     LEVEL_OWNER,
                 )
             resp.permission_level = grant.level
+        await _accept_initial_input(request, resp.id, body.initial_input, user_id)
         # Push the new session to this user's other open tabs (see the
         # multipart path above for the rationale).
         _announce_session_added(user_id, resp.id)
@@ -1116,6 +1182,9 @@ def register_core_routes(
                 await asyncio.to_thread(
                     permission_store.grant, user_id, result.session_id, LEVEL_OWNER
                 )
+        await _accept_initial_input(
+            request, result.session_id, parsed_metadata.initial_input, user_id
+        )
         _announce_session_added(user_id, result.session_id)
         # Managed bundle create: provision a sandbox host for the
         # just-uploaded session-scoped agent (same background launch as

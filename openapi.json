@@ -3733,6 +3733,16 @@
             "title": "Role",
             "type": "string"
           },
+          "startup_options": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupInputOptions"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "stream_message_id": {
             "anyOf": [
               {
@@ -5334,6 +5344,11 @@
           },
           "dictation_available": {
             "title": "Dictation Available",
+            "type": "boolean"
+          },
+          "durable_initial_input": {
+            "default": false,
+            "title": "Durable Initial Input",
             "type": "boolean"
           },
           "enabled_connections": {
@@ -7543,7 +7558,7 @@
             "type": "array"
           },
           "pending_inputs": {
-            "description": "Un-consumed web-composer user messages on native-terminal (claude-native / codex-native) sessions at snapshot time, each `{\"pending_id\", \"content\"}`. Native sessions don't persist a web message at POST time (the transcript forwarder is the single writer), so a client that posted then navigated away / rebound would lose its optimistic bubble; replaying these re-hydrates it. Empty list otherwise. Sourced from the in-memory `omnigent.runtime.pending_inputs` index.",
+            "description": "Accepted messages awaiting consumption, each `{\"pending_id\", \"content\"}`. Includes durable managed-startup inputs and native messages awaiting a transcript receipt. Clients restore their pending bubbles from this list after reconnecting. Ordinary native sends use the in-memory `omnigent.runtime.pending_inputs` index; startup inputs also survive server restart in the conversation store.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -8597,6 +8612,16 @@
             ],
             "description": "`<local-command-stdout>` text when present, else `None` (the common case \u2014 Skills act via the next assistant turn, not stdout).",
             "title": "Output"
+          },
+          "startup_options": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupInputOptions"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -8623,6 +8648,44 @@
           "oss"
         ],
         "title": "SmartRoutingSourcesInfo",
+        "type": "object"
+      },
+      "StartupInputOptions": {
+        "description": "Request options retained only while a startup input awaits delivery.",
+        "properties": {
+          "background_titles_enabled": {
+            "default": false,
+            "title": "Background Titles Enabled",
+            "type": "boolean"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Override"
+          },
+          "tools": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tools"
+          }
+        },
+        "title": "StartupInputOptions",
         "type": "object"
       },
       "StoreHarnessCredentialRequest": {

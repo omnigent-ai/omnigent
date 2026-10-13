@@ -46,7 +46,9 @@ class ManagedReplicas:
 
 
 @pytest.fixture
-def managed_replicas(tmp_path: Path, mock_llm_server_url: str) -> Iterator[ManagedReplicas]:
+def managed_replicas(
+    tmp_path: Path, mock_llm_server_url: str, request: pytest.FixtureRequest
+) -> Iterator[ManagedReplicas]:
     """Start isolated product replicas, the real host launcher and a keyed ingress."""
     ports = {role: _find_free_port() for role in ("a", "b", "ingress", "ui")}
     urls = {role: f"http://127.0.0.1:{port}" for role, port in ports.items()}
@@ -111,6 +113,8 @@ def managed_replicas(tmp_path: Path, mock_llm_server_url: str) -> Iterator[Manag
                     urls["a"],
                     "--replica-b",
                     urls["b"],
+                    "--runner-replica",
+                    getattr(request, "param", "b"),
                 ]
                 cwd, process_env = _REPO_ROOT, env
             with log_path.open("w") as log:
@@ -149,7 +153,7 @@ def test_managed_first_message_rebinds_live_stream_across_replicas(
     managed_replicas: ManagedReplicas,
     mock_llm_server_url: str,
 ) -> None:
-    """Create and send through the UI; recover both POST and SSE without navigation."""
+    """Create through the UI; follow server-owned delivery live without navigation."""
     configure_mock_llm(
         mock_llm_server_url,
         [{"text": _REPLY, "stream": True, "block": True}],
@@ -196,6 +200,8 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
     ):
         browser = await playwright.chromium.launch()
         page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        page_errors: list[str] = []
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
         await page.context.tracing.start(screenshots=True, snapshots=True, sources=True)
         network_url = f"{rig.ingress}/__test/network"
         try:
@@ -228,13 +234,16 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             rows = await _poll(
                 client,
                 network_url,
-                lambda rows: bool(posts(rows) and streams(rows) and streams(rows)[0]["body"]),
+                lambda rows: bool(streams(rows) and streams(rows)[0]["body"]),
             )
             create = next(
                 row for row in rows if row["path"] == "/v1/sessions" and row["method"] == "POST"
             )
             assert json.loads(create["request"])["host_type"] == "managed"
-            assert posts(rows)[0]["key"] is None and posts(rows)[0]["status"] is None
+            assert json.loads(create["request"])["initial_input"]["data"]["content"] == [
+                {"type": "input_text", "text": _PROMPT}
+            ]
+            assert not posts(rows), "the server owns delivery of the accepted first input"
             assert streams(rows)[0]["replica"] == "a" and streams(rows)[0]["status"] == 200
             assert not streams(rows)[0]["closed"]
             snapshot = (await client.get(rig.a + session_path)).json()
@@ -250,20 +259,14 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             )
             await page.screenshot(path=str(rig.logs / "provisioning.png"))
             (await client.post(f"{rig.a}/__test/provision/release")).raise_for_status()
-            rows = await _poll(
+            snapshot = await _poll(
                 client,
-                network_url,
-                lambda rows: len(posts(rows)) == 2 and posts(rows)[1]["status"] == 202,
+                rig.b + session_path,
+                lambda body: bool(body["host_id"] and body["runner_id"]),
                 timeout=90,
             )
-            initial, retry = posts(rows)
-            assert initial["status"] == 400
-            assert json.loads(initial["body"])["error"]["code"] == "wrong_replica"
-            assert initial["request"] == retry["request"], "retry changed the message/stable_id"
-            snapshot = (await client.get(rig.b + session_path)).json()
             host_id = snapshot["host_id"]
             assert host_id and snapshot["runner_id"]
-            assert retry["key"] == host_id and retry["replica"] == "b"
             state_a, state_b = [
                 (await client.get(f"{url}/__test/state", params={"host_id": host_id})).json()
                 for url in (rig.a, rig.b)
@@ -271,6 +274,13 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             assert state_a["pid"] != state_b["pid"]
             assert state_a["host_local"] is False and state_b["host_local"] is True
             await _poll(client, f"{model_url}/gate/pending", lambda body: body["pending"])
+            await _poll(
+                client,
+                network_url,
+                lambda rows: any(
+                    row["key"] == host_id and row["status"] == 200 for row in streams(rows)
+                ),
+            )
             (await client.post(f"{model_url}/gate/release")).raise_for_status()
 
             # Confirm the runner actually committed the reply before attributing
@@ -284,6 +294,9 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
             await expect(assistant.filter(has_text=_REPLY)).to_be_visible(timeout=20_000)
             rows = (await client.get(network_url)).json()
+            assert not posts(rows), "opening the session must not resend its first input"
+            assert len(streams(rows)) == 2, "handoff must not depend on error-driven reconnects"
+            assert not page_errors
             assert streams(rows)[0]["closed"], "the browser left its wrong-replica stream open"
             keyed = [
                 row for row in streams(rows) if row["key"] == host_id and row["status"] == 200
@@ -302,8 +315,8 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             await expect(page.get_by_test_id("runner-starting-indicator")).to_have_count(0)
             rows = (await client.get(network_url)).json()
             assert len(streams(rows)) == stream_count
-            assert len(posts(rows)) == 3
-            assert posts(rows)[2]["key"] == host_id
+            assert len(posts(rows)) == 1
+            assert posts(rows)[0]["key"] == host_id
             await expect(page).to_have_url(f"{rig.ui}/c/{session_id}")
 
             snapshot = (await client.get(rig.b + session_path)).json()

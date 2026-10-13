@@ -249,12 +249,14 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--replica-a", required=True)
     parser.add_argument("--replica-b", required=True)
+    parser.add_argument("--runner-replica", choices=["a", "b"], default="b")
     args = parser.parse_args()
     launcher = None
     if args.role == "ingress":
         app = ingress_app(args.replica_a, args.replica_b)
     else:
-        app, launcher = replica_app(args.root, args.role, args.replica_b)
+        runner_url = args.replica_a if args.runner_replica == "a" else args.replica_b
+        app, launcher = replica_app(args.root, args.role, runner_url)
     try:
         uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
     finally:

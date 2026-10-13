@@ -407,8 +407,8 @@ export function hasPendingLocalMessage(tempConvId: string): boolean {
  * Hydrate a client-only conversation onto its real server id once
  * `createSession` returns: rekey the registry entry (carrying the optimistic
  * bubble), the send chain, and the sidebar row from `tempConvId` to `realId`;
- * flip the store + URL when still viewing it; then POST the first message via
- * `send` (reusing the already-shown bubble), which binds the real stream.
+ * flip the store + URL when still viewing it; then bind the stream and send
+ * the first message unless the create already accepted it durably.
  *
  * Navigate-away safe: the registry/chain/sidebar rekey is id-addressed and
  * always runs. The store flip + `navigate` run ONLY when still on `tempConvId`,
@@ -425,8 +425,9 @@ export function hydrateLocalConversation(
   navigate: (to: string, opts?: { replace?: boolean }) => void,
   isStillViewing: () => boolean = () => true,
   project?: LocalConversationProject,
+  initialInputAccepted = false,
 ): void {
-  const shouldSend = hasPendingLocalMessage(tempConvId);
+  const shouldSend = !initialInputAccepted && hasPendingLocalMessage(tempConvId);
   const restoredDraft = conversationRegistry.peek(tempConvId)?.getState().failedSendDraft;
   // Registry entry (carrying the optimistic bubble) + the sidebar row, both
   // id-addressed. Rekey the row BEFORE the caller's refetch so a lagging index
@@ -448,10 +449,33 @@ export function hydrateLocalConversation(
   }
 
   if (!shouldSend) {
-    // Creation can finish after Interrupt; bind the empty session without sending.
-    void ensureBoundSession(agentId, useChatStore.getState, undefined, realId).catch(() => {
-      // bindStream records load failures on the conversation.
-    });
+    if (initialInputAccepted) {
+      setterFor(realId)((state) => ({
+        startupPending: true,
+        pendingUserMessages: state.pendingUserMessages.map((message) =>
+          message.tempId === pendingMsgTempId
+            ? { ...message, posted: true, initialDraft: undefined }
+            : message,
+        ),
+      }));
+    }
+    // Stop may have restored the draft while the create request was in flight.
+    const cancel =
+      initialInputAccepted && restoredDraft ? interruptSession(realId) : Promise.resolve();
+    void cancel
+      .catch((err) => {
+        const { code } = describeSendFailure(err);
+        setterFor(realId)((state) => ({
+          blocks: [
+            ...state.blocks,
+            makeClientErrorBlock("Couldn't cancel the saved first message. Try Stop again.", code),
+          ],
+        }));
+      })
+      .then(() => ensureBoundSession(agentId, useChatStore.getState, undefined, realId))
+      .catch(() => {
+        // bindStream records load failures on the conversation.
+      });
     return;
   }
 
@@ -995,6 +1019,8 @@ export interface ConversationState {
    * launch.
    */
   sandboxStatus: SandboxStatus | null;
+  /** Managed startup accepts sends durably before its first harness dispatch. */
+  startupPending: boolean;
   /**
    * Native MCP startup progress, cleared when startup settles or live
    * assistant text arrives. Failures/cancellations stay in host diagnostics,
@@ -1920,14 +1946,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   runnerLaunchedAt: null,
   viewers: [],
   sandboxStatus: null,
+  startupPending: false,
   mcpStartup: null,
   mcpStartupLaunch: { pending: false, dismissed: false },
   abortController: null,
   historyGeneration: 0,
 
   enqueueMessage: (text, files, replyDraft) => {
-    const { conversationId, boundAgentId, sessionHarness } = get();
+    const { conversationId, boundAgentId, sessionHarness, startupPending } = get();
     if (conversationId === null) return;
+    if (startupPending && boundAgentId && !isCompactControl(sessionHarness, text, files)) {
+      void get().send(text, boundAgentId, files, {
+        replyDraft,
+        pinnedConversationId: conversationId,
+      });
+      return;
+    }
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
     const stableId = randomUUID().replace(/-/g, "");
@@ -2321,6 +2355,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             ?.initialDraft
         : !skipPendingBubble &&
             targetState &&
+            !targetState.startupPending &&
             (modelSelectionPending(targetState) ||
               (targetState.sessionModelSeeded && targetState.sessionHarness === null))
           ? { text, files: files ?? [] }
@@ -2727,7 +2762,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // message, and forwards the meta to the runner.
       const postResult = await postEvent(sessionId, {
         type: "slash_command",
-        data: { kind: "skill", name, arguments: args },
+        data: {
+          kind: "skill",
+          name,
+          arguments: args,
+          ...(setterForState(sessionId)?.startupPending
+            ? { stable_id: randomUUID().replace(/-/g, "") }
+            : {}),
+        },
       });
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
@@ -4150,6 +4192,7 @@ function sessionBindingPatch(
   | "codexModelOptions"
   | "terminalPending"
   | "sandboxStatus"
+  | "startupPending"
   | "mcpStartup"
   | "mcpStartupLaunch"
 > {
@@ -4185,6 +4228,7 @@ function sessionBindingPatch(
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
+    startupPending: session.labels?.["omnigent.startup"] === "pending",
     ...mcpStartupSnapshotPatch(session, state, launchBeforeFetch),
   };
 }
@@ -7127,6 +7171,22 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation({
         sandboxStatus: event.stage === "ready" ? null : { stage: event.stage, error: event.error },
       });
+      if (
+        sourceConversationId !== null &&
+        (event.stage === "connecting" || event.stage === "ready")
+      ) {
+        // The host binding is now durable. Learning it readdresses a stream
+        // opened before provisioning, without depending on a browser send.
+        void getSessionSlim(sourceConversationId)
+          .then((session) => {
+            queryClient?.setQueryData(["session", sourceConversationId], session);
+            applyToConversation({
+              sessionHostId: session.hostId ?? null,
+              sandboxStatus: session.sandboxStatus ?? null,
+            });
+          })
+          .catch(() => {});
+      }
       return;
     case "session_mcp_startup": {
       // Mirror the harness's per-MCP-server startup map while the round
@@ -7601,6 +7661,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     }
     case "session_input_consumed":
+      applyToConversation({ startupPending: false });
       // This committed item may be a send whose POST failed client-side —
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt.
