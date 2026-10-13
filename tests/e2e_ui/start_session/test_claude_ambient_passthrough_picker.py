@@ -22,7 +22,7 @@ import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -143,15 +143,23 @@ class AmbientGatewayRig:
             time.sleep(1.0)
 
     def diagnostics(self) -> str:
+        def best_effort(read: Callable[[], object]) -> object:
+            try:
+                return read()
+            except Exception as exc:
+                return f"unavailable: {type(exc).__name__}: {exc}"
+
         return json.dumps(
             {
-                "host_model_options": self.model_options(),
-                "persisted_catalogs": self.persisted_catalogs(),
+                "host_model_options": best_effort(self.model_options),
+                "persisted_catalogs": best_effort(self.persisted_catalogs),
                 "gateway_requests": self.gateway_requests,
                 "cli_rows": self.cli_rows,
                 "cli_default_model": self.cli_default_model,
                 "notes": self.notes,
-                "host_log_tail": self.host_log.read_text(errors="replace")[-1500:],
+                "host_log_tail": best_effort(
+                    lambda: self.host_log.read_text(errors="replace")[-1500:]
+                ),
             },
             indent=1,
         )
@@ -196,11 +204,12 @@ def _cli_picker(env: dict[str, str], home: Path) -> tuple[list[dict[str, str]], 
         if event.get("type") == "control_response":
             for model in (event.get("response") or {}).get("response", {}).get("models") or []:
                 alias, resolved = model.get("value"), model.get("resolvedModel")
-                if alias == "default" or model.get("disabled") is True or resolved in seen:
+                model_id = resolved or alias
+                if alias == "default" or model.get("disabled") is True or model_id in seen:
                     continue
-                seen.add(resolved)
+                seen.add(model_id)
                 rows.append(
-                    {"id": alias, "model": resolved, "label": model.get("displayName", alias)}
+                    {"id": alias, "model": model_id, "label": model.get("displayName", alias)}
                 )
         elif event.get("type") == "system" and event.get("subtype") == "init":
             default_model = event.get("model")
@@ -246,6 +255,10 @@ def ambient_gateway_rig(
     home = root / "home"
     home.mkdir()
     cli_rows, cli_default = _cli_picker(isolated_process_env(home, ambient, base_env), home)
+    assert cli_default in {row["model"] for row in cli_rows}, (
+        f"the CLI's default {cli_default!r} is not among its picker rows {cli_rows}"
+    )
+    gateway_requests.clear()  # attribute later traffic to the host alone
 
     host_name = f"gateway-{request.param[:8]}-{root.name[-6:]}"
     command = [
@@ -273,10 +286,14 @@ def ambient_gateway_rig(
                 )
                 time.sleep(2.0)
                 row = next(
-                    r
-                    for r in client.get("/v1/hosts").json()["hosts"]
-                    if r["host_id"] == host.host_id
+                    (
+                        r
+                        for r in client.get("/v1/hosts").json()["hosts"]
+                        if r["host_id"] == host.host_id
+                    ),
+                    None,
                 )
+                assert row is not None, f"host {host.host_id} vanished from /v1/hosts"
             rig = AmbientGatewayRig(
                 base_url=live_server,
                 host_id=host.host_id,
@@ -295,6 +312,7 @@ def ambient_gateway_rig(
             (out_dir / "rig.json").write_text(rig.diagnostics())
     finally:
         gateway.shutdown()
+        gateway.server_close()
 
 
 def _select_host(page: Page, rig: AmbientGatewayRig) -> None:
