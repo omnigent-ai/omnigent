@@ -31,7 +31,8 @@ from omnigent.server.routes.sessions import (
     _publish_status,
     _session_status_with_child_rollup,
 )
-from omnigent.server.schemas import BackgroundTaskInfo
+from omnigent.server.schemas import BackgroundTaskInfo, ErrorDetail
+from tests.debug_log_helpers import capture_debug_rows
 
 _SID = "conv_bg_test"
 
@@ -155,6 +156,53 @@ def test_failure_clears_tally_and_wins_over_count() -> None:
     assert _SID not in _sessions_mod._session_background_task_count_cache
     # ``failed`` is authoritative for the list row, never masked by a tally.
     assert _session_status_with_child_rollup(_SID, []) == "failed"
+
+
+@pytest.mark.parametrize("count", [2, 0, None], ids=["positive", "cleared", "unknown"])
+@pytest.mark.parametrize(
+    ("code", "origin"),
+    [
+        ("runner_disconnected", "runner_disconnected_mid_turn"),
+        ("native_turn_error", "external_session_status"),
+    ],
+)
+def test_failure_debug_row_preserves_background_count_before_cleanup(
+    count: int | None,
+    code: str,
+    origin: str,
+) -> None:
+    if count is not None:
+        _publish_status(
+            _SID, "idle", background_task_count=2, background_tasks=_tasks("private shell task")
+        )
+        if count == 0:
+            _publish_status(_SID, "idle", background_task_count=0)
+    _publish_status(_SID, "running", response_id="resp_bg")
+
+    with capture_debug_rows("server") as rows:
+        _publish_status(
+            _SID,
+            "failed",
+            ErrorDetail(code=code, message="Synthetic failure"),
+            response_id="resp_bg",
+            failure_origin=origin,
+        )
+
+    failed = [row for row in rows if row["event_name"] == "session_turn_failed"]
+    assert len(failed) == 1
+    assert failed[0]["session_id"] == _SID
+    expected = {
+        "code": code,
+        "origin": origin,
+        "previous_status": "running",
+        "response_id": "resp_bg",
+    }
+    if count == 2:
+        expected["cached_background_task_count"] = "2"
+    assert failed[0]["attributes"] == expected
+    assert "private shell task" not in repr(failed)
+    assert _SID not in _sessions_mod._session_background_task_count_cache
+    assert _SID not in _sessions_mod._session_background_tasks_cache
 
 
 # ── background-task detail rides with the tally ─────────────────────────────

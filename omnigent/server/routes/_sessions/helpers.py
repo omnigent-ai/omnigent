@@ -4980,6 +4980,7 @@ def _publish_status(
                 code=failure_code,
                 previous_status=previous_status or "unknown",
                 response_id=response_id,
+                cached_background_task_count=_session_background_task_count_cache.get(session_id),
                 **failure_log_attributes(failure_context),
             ),
         )
