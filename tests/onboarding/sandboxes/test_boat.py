@@ -141,7 +141,7 @@ def test_provision_isolated_and_cleanup(
 
 def test_attach_resumes_and_waits(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BOAT_API_KEY", "test-secret")
-    states = iter(["archived", "provisioning", "ready"])
+    states = iter(["archived", "archived", "provisioning", "ready"])
     calls = []
 
     def request(method, url, **kwargs):
@@ -153,9 +153,9 @@ def test_attach_resumes_and_waits(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_request(monkeypatch, request)
     monkeypatch.setattr("omnigent.onboarding.sandboxes.boat.time.sleep", lambda _: None)
     BoatSandboxLauncher().attach("bx_test")
-    assert calls[1][0] == "POST" and calls[1][1].endswith("/resume")
-    assert calls[1][2]["json"] == {"ttlSeconds": None}
-    assert len(calls) == 4
+    assert calls[2][0] == "POST" and calls[2][1].endswith("/resume")
+    assert calls[2][2]["json"] == {"ttlSeconds": None}
+    assert len(calls) == 5
 
 
 def test_large_upload_uses_signed_url_without_api_key(
@@ -182,7 +182,7 @@ def test_large_upload_uses_signed_url_without_api_key(
     assert calls[0][1]["content"] == source.read_bytes()
 
 
-@pytest.mark.parametrize("state", ["deleted", "error", "cancelled"])
+@pytest.mark.parametrize("state", ["deleted", "cancelled"])
 def test_terminal_state_raises_sandbox_gone(monkeypatch: pytest.MonkeyPatch, state: str) -> None:
     monkeypatch.setenv("BOAT_API_KEY", "test-secret")
     _patch_request(
@@ -194,6 +194,8 @@ def test_terminal_state_raises_sandbox_gone(monkeypatch: pytest.MonkeyPatch, sta
         launcher.attach("bx_test")
     with pytest.raises(SandboxGoneError):
         launcher._wait_ready("bx_test")
+    with pytest.raises(SandboxGoneError):
+        launcher.resume("bx_test")
 
 
 def test_keep_alive_soft_fails(
@@ -233,3 +235,33 @@ def test_default_host_package_is_pinned(monkeypatch: pytest.MonkeyPatch) -> None
     assert _host_package() == f"omnigent=={importlib.metadata.version('omnigent')}"
     monkeypatch.setenv("OMNIGENT_BOAT_HOST_PACKAGE", "omnigent==1.2.3")
     assert _host_package() == "omnigent==1.2.3"
+
+
+def test_resume_preserves_recoverable_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BOAT_API_KEY", "test-secret")
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append(method)
+        if method == "GET":
+            return httpx.Response(200, json={"ok": True, "sandbox": {"state": "error"}})
+        return httpx.Response(409, json={"code": "resume_failed"})
+
+    _patch_request(monkeypatch, request)
+    with pytest.raises(click.ClickException, match="resume_failed") as error:
+        BoatSandboxLauncher().resume("bx_test")
+    assert not isinstance(error.value, SandboxGoneError)
+    assert calls == ["GET", "POST"]
+
+
+def test_resume_active_sandbox_does_not_restart_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BOAT_API_KEY", "test-secret")
+    methods = []
+
+    def request(method, url, **kwargs):
+        methods.append(method)
+        return httpx.Response(200, json={"ok": True, "sandbox": {"state": "running"}})
+
+    _patch_request(monkeypatch, request)
+    BoatSandboxLauncher().resume("bx_test")
+    assert methods == ["GET", "GET"]

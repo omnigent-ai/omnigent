@@ -37,7 +37,8 @@ sandbox:
 ## How it works
 
 An archived or stopped sandbox is resumed on the next message. A sandbox that
-Boat reports as deleted, errored or cancelled is replaced with a new one.
+Boat reports as deleted or cancelled is replaced with a new one. Errors during
+resume preserve the sandbox and its disk for recovery.
 Launch tokens use the same 7 day policy window as Daytona and Islo.
 
 New sandboxes use `noEnv: true`, so Boat account secrets and repositories are

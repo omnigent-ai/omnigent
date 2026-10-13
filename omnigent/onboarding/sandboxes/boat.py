@@ -14,7 +14,7 @@ Platform notes that shape this launcher:
   account secrets and repositories are not inherited, with command
   monitoring and automatic archival disabled.
 - **Persistent resume.** Archived or stopped sandboxes are resumed on
-  attach. Terminal states (deleted, error, cancelled) raise
+  attach. Terminal states (deleted, cancelled) raise
   :class:`SandboxGoneError` so the server provisions a replacement.
 - **Host package.** The host is installed with ``uv`` into an isolated
   Python 3.12 environment. ``OMNIGENT_BOAT_HOST_PACKAGE`` overrides the
@@ -47,7 +47,7 @@ from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 BOAT_API_URL = "https://boat.dev/api/v1"
 _ACTIVE = frozenset({"ready", "idle", "running"})
 _RESUMABLE = frozenset({"archived", "stopped"})
-_TERMINAL = frozenset({"deleted", "error", "cancelled"})
+_TERMINAL = frozenset({"deleted", "cancelled"})
 _TIMEOUT = httpx.Timeout(620.0, connect=10.0)
 
 
@@ -151,7 +151,7 @@ class BoatSandboxLauncher(ExecModelHostLauncher):
             state = self._state(sandbox_id)
             if state in _ACTIVE:
                 return
-            if state in _RESUMABLE:
+            if state in _RESUMABLE or state == "error":
                 raise click.ClickException(f"Boat sandbox is {state}; cannot launch host.")
             time.sleep(2)
         raise click.ClickException("Timed out waiting for Boat sandbox to become ready.")
@@ -195,7 +195,9 @@ class BoatSandboxLauncher(ExecModelHostLauncher):
 
     def resume(self, sandbox_id: str) -> None:
         """Restore the persistent sandbox filesystem."""
-        self._request("POST", self._path(sandbox_id) + "/resume", body={"ttlSeconds": None})
+        state = self._state(sandbox_id)
+        if state not in _ACTIVE:
+            self._request("POST", self._path(sandbox_id) + "/resume", body={"ttlSeconds": None})
         self._wait_ready(sandbox_id)
 
     def keep_alive(self, sandbox_id: str) -> bool:
