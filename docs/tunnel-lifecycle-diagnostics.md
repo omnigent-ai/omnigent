@@ -194,6 +194,28 @@ ultimately failed. Replay uses source IDs to avoid duplicating persisted events.
 The structured fields contain no event bodies or credentials. Existing exception
 tracebacks and log severity are unchanged; successful retries add no error row.
 
+## Background-shell observations
+
+`session.status` debug rows preserve `attributes['background_task_count']` when
+the status event supplies a nonnegative integer. A positive value reports
+background shells; `0` explicitly reports none. An absent field means no new
+observation. Task descriptions, shell commands, and `blocked_on` text are excluded.
+
+`runner_disconnect_decision` also records `cached_background_task_count` before
+failure cleanup, when the server has a cached positive count. The cache removes
+explicit zeroes, so an absent decision field cannot distinguish a reported zero
+from an unknown count. Read the preceding `session.status` history for that
+distinction: retain the last explicit count and its observation timestamp across
+later rows that omit it. Do not replace a missing count with zero or carry an
+observation across a failure or runner replacement without fresh evidence.
+
+These are last-reported counts, currently supplied by Claude Stop hooks. A shell
+can finish before the next observation; the status row timestamp records receipt,
+not a shell start or finish. Counts do not cover other harnesses, timers, approvals,
+or child-session work. An idle status alone does not establish that background
+work stopped. Historical rows from servers that filtered out the count remain
+unknown; deploying this change improves future observations only.
+
 ## Correlation
 
 The disconnect grace task rechecks the local tunnel after loading bound

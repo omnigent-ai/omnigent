@@ -183,6 +183,10 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
         value = event.get(key)
         if value is not None and not isinstance(value, (dict, list)):
             attrs[key] = value
+    if event.get("type") == "session.status":
+        count = event.get("background_task_count")
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            attrs["background_task_count"] = count
     response = event.get("response")
     if isinstance(response, dict) and isinstance(response.get("id"), str):
         attrs["response_id"] = response["id"]

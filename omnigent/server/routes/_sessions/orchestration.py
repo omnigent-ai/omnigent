@@ -7846,6 +7846,8 @@ async def _runner_disconnect_requires_failure(
             error_code=error_code,
             status_source=source,
             cached_session_status=cached,
+            # The cache retains positive counts only; absence is not an observed zero.
+            cached_background_task_count=_session_background_task_count_cache.get(session_id),
             persisted_session_status=persisted.live_status if persisted is not None else None,
             snapshot_session_status=fallback.live_status if fallback is not None else None,
             status_lookup=lookup,

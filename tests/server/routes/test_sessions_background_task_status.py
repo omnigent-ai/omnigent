@@ -16,10 +16,13 @@ and the session takes a new message immediately.
 
 from __future__ import annotations
 
+import logging
 import types
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
+from omnigent.runtime import session_stream
 from omnigent.server.routes import sessions as _sessions_mod
 from omnigent.server.routes.sessions import (
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
@@ -93,6 +96,47 @@ def test_authoritative_zero_clears_tally_and_list_drops_to_idle() -> None:
     _publish_status(_SID, "idle", background_task_count=0)
     assert _SID not in _sessions_mod._session_background_task_count_cache
     assert _session_status_with_child_rollup(_SID, []) == "idle"
+
+
+def test_background_task_debug_rows_preserve_known_counts_without_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows: list[dict[str, object]] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            rows.append(record_to_row(record, source="server"))
+
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
+    logger = session_stream.sse_event_logger()
+    previous_level = logger.level
+    handler = Capture()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        for count in (2, None, 0):
+            _publish_status(
+                _SID,
+                "idle",
+                response_id="resp_bg",
+                background_task_count=count,
+                background_tasks=_tasks("private shell command", "private task detail")
+                if count == 2
+                else None,
+                blocked_on="private approval detail",
+            )
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+    assert [row["event_name"] for row in rows] == ["session.status"] * 3
+    assert [row["session_id"] for row in rows] == [_SID] * 3
+    assert [row["attributes"] for row in rows] == [
+        {"status": "idle", "response_id": "resp_bg", "background_task_count": "2"},
+        {"status": "idle", "response_id": "resp_bg"},
+        {"status": "idle", "response_id": "resp_bg", "background_task_count": "0"},
+    ]
+    assert "private" not in repr(rows)
 
 
 def test_new_turn_running_keeps_tally() -> None:
