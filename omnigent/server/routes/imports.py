@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal, cast, get_args
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -389,6 +389,11 @@ def create_imports_router(
             # resume lands on the right machine. Requires a workspace (check
             # constraint), so only set host_id when one is recorded.
             if host_id is not None:
+                # Host ownership must still hold when the import is persisted.
+                if host_store is not None:
+                    await asyncio.to_thread(
+                        resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
+                    )
                 create_kwargs["host_id"] = host_id
         if project_id is not None:
             create_kwargs["project_id"] = project_id
@@ -632,6 +637,15 @@ def create_imports_router(
                 continue
             except ValueError:
                 _fail(external_session_id, source, "This session's data could not be imported.")
+                continue
+            except HTTPException:
+                # Host authorization can change during a batch. Retain the
+                # per-session failure handling instead of aborting the batch.
+                _fail(
+                    external_session_id,
+                    source,
+                    "This session's host is no longer available to you.",
+                )
                 continue
             counts["imported"] += 1
             yield ImportedSessionRef(session_id=session_id, title=title)

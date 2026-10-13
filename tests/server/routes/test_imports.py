@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.imports import (
     LocalImportRequest,
@@ -34,6 +35,65 @@ def _seed_claude_agent(db_uri: str) -> str:
         bundle_location="builtin://claude-native-ui",
     )
     return agent_id
+
+
+@pytest.mark.parametrize(
+    "owner,caller,expected_status",
+    [
+        ("alice@example.com", "alice@example.com", 201),
+        ("alice@example.com", "bob@example.com", 403),
+        (None, "alice@example.com", 404),
+    ],
+)
+async def test_import_checks_host_ownership_before_persisting(
+    db_uri: str, owner: str | None, caller: str, expected_status: int
+) -> None:
+    _seed_claude_agent(db_uri)
+    host_id = "0123456789abcdef0123456789abcdef"
+    host_store = HostStore(db_uri)
+    if owner is not None:
+        host_store.upsert_on_connect(host_id, "laptop", owner)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    app = FastAPI()
+    app.include_router(
+        create_imports_router(
+            conversation_store,
+            SqlAlchemyAgentStore(db_uri),
+            host_store=host_store,
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        ),
+        prefix="/v1",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as import_client:
+        response = await import_client.post(
+            "/v1/imports",
+            headers={"X-Forwarded-Email": caller},
+            json={
+                "source": "claude",
+                "external_session_id": "owned-host-import",
+                "workspace": "/workspace",
+                "host_id": host_id,
+                "items": [
+                    {
+                        "type": "message",
+                        "response_id": "claude:turn-1",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Hello"}],
+                        },
+                    }
+                ],
+            },
+        )
+    assert response.status_code == expected_status, response.text
+    conversation = conversation_store.find_conversation_by_external_session_id("owned-host-import")
+    if expected_status == 201:
+        assert conversation is not None
+        assert conversation.host_id == host_id
+    else:
+        assert conversation is None
 
 
 async def test_import_session_creates_normal_session_and_blocks_duplicate(
