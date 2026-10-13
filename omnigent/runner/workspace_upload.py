@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import time
@@ -121,7 +122,7 @@ class RouteError(Exception):
     def response(self) -> JSONResponse:
         headers = {"Upload-Offset": str(self.offset)} if self.offset is not None else {}
         if self.status == 429:
-            headers["Retry-After"] = "60"
+            headers["Retry-After"] = str(random.randint(1, 5)) if self.code == "busy" else "60"
         return JSONResponse(
             status_code=self.status,
             content={"error": {"code": self.code, "message": str(self)}},
@@ -155,13 +156,14 @@ def _unwrap(result: dict[str, object]) -> dict[str, object]:
 
 
 def os_error(exc: OSError) -> RouteError:
+    logger.error("Upload I/O failed", exc_info=exc)
     if exc.errno in (errno.ENOSPC, errno.EDQUOT):
-        return RouteError(507, "no_space", str(exc))
+        return RouteError(507, "no_space", "Insufficient storage")
     if isinstance(exc, FileNotFoundError):
-        return RouteError(400, "invalid_path", str(exc))
+        return RouteError(400, "invalid_path", "Invalid upload path")
     if isinstance(exc, PermissionError):
-        return RouteError(403, "permission_denied", str(exc))
-    return RouteError(500, "io_error", str(exc))
+        return RouteError(403, "permission_denied", "Upload permission denied")
+    return RouteError(500, "io_error", "Upload I/O failed")
 
 
 def _now() -> float:
@@ -359,8 +361,12 @@ class UploadManager:
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            await self._settle(task)
-            self.index_dirty = False
+            try:
+                await self._settle(task)
+            except Exception:
+                logger.exception("Unable to save upload index during cancellation")
+            else:
+                self.index_dirty = False
             raise
         self.index_dirty = False
 

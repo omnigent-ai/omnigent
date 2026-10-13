@@ -30,12 +30,13 @@ from omnigent.inner.sandbox import SandboxPolicy
 MAX_RENAME_ATTEMPTS = 1000
 CALL_TIMEOUT_S = 30
 SHORT_OP_QUEUE_WAIT_S = 1
+LONG_OPS = ("plan", "complete", "recover")
 COMPLETE_TIMEOUT_FLOOR_S = 120
 COMPLETE_TIMEOUT_PER_GIB_S = 300
 
 
 def operation_timeout(metadata: dict[str, object]) -> float:
-    if metadata.get("op") in ("plan", "complete", "recover"):
+    if metadata.get("op") in LONG_OPS:
         size = metadata.get("size", 0)
         return COMPLETE_TIMEOUT_FLOOR_S + COMPLETE_TIMEOUT_PER_GIB_S * (
             max(0, size) / 1024**3 if isinstance(size, int) else 0
@@ -166,6 +167,7 @@ class UploadHelperClient(_HelperProcessClient):
             copy_on_write_environment=env.copy_on_write_environment,
             upload_raw=True,
         )
+        self._active_op: object = None
 
     def interrupt(self) -> None:
         proc = self._proc
@@ -179,11 +181,21 @@ class UploadHelperClient(_HelperProcessClient):
         """A busy result guarantees no request frame could have been sent."""
         timeout_s = operation_timeout(metadata) if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout_s
-        queue_wait = timeout_s
-        if metadata.get("op") not in ("plan", "complete", "recover"):
-            queue_wait = min(queue_wait, SHORT_OP_QUEUE_WAIT_S)
-        if not self._lock.acquire(timeout=max(0, queue_wait)):
-            return {"error": "Upload helper queue timed out", "code": "busy"}
+        op = metadata.get("op")
+        queue_deadline = deadline
+        while not self._lock.acquire(blocking=False):
+            now = time.monotonic()
+            if op not in LONG_OPS and self._active_op in LONG_OPS:
+                queue_deadline = min(queue_deadline, now + SHORT_OP_QUEUE_WAIT_S)
+            else:
+                queue_deadline = deadline
+            remaining = queue_deadline - now
+            if remaining <= 0:
+                return {"error": "Upload helper queue timed out", "code": "busy"}
+            # Recheck the holder when queued operations change from short to long.
+            if self._lock.acquire(timeout=min(remaining, 0.05)):
+                break
+        self._active_op = op
         try:
             if self._closed:
                 return {"error": "Upload helper closed", "code": "busy"}
@@ -224,6 +236,7 @@ class UploadHelperClient(_HelperProcessClient):
                 watchdog.join()
 
         finally:
+            self._active_op = None
             self._lock.release()
 
 
