@@ -144,6 +144,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Judge for free-text assertions. Default: a bench test model of the other family.",
     )
     parser.add_argument("--no-judge", action="store_true", help="Grade deterministic checks only.")
+    parser.add_argument("--baseline-label", help="Commit or name for the baseline in the report.")
+    parser.add_argument(
+        "--treatment-label", help="Commit or name for the treatment in the report."
+    )
     parser.add_argument(
         "--profile", default=None, help="Databricks profile for gateway credentials."
     )
@@ -306,8 +310,8 @@ def _write_reports(
         "model": ", ".join(f"{harness} `{model}`" for harness, model in args.models.items()),
         "runs": args.runs,
         "judge": args.judge_model or "off",
-        "baseline_commit": arms[0].commit,
-        "treatment_commit": arms[1].commit,
+        "baseline_commit": args.baseline_label or arms[0].commit,
+        "treatment_commit": args.treatment_label or arms[1].commit,
         "baseline_version": arms[0].version,
         "treatment_version": arms[1].version,
     }
