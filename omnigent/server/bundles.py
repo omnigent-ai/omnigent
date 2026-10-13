@@ -26,32 +26,12 @@ if TYPE_CHECKING:
 
 
 def _is_dotted_callable_path(path: str) -> bool:
-    """Whether a local-tool ``path`` is a dotted Python *import* path.
-
-    A server-side ``callable:`` tool carries a dotted import path such as
-    ``"subprocess.check_output"`` that the runner resolves with
-    ``importlib.import_module`` and then invokes (see
-    ``omnigent.runner.tool_dispatch._resolve_spec_callable``) — the
-    GHSA-756x runner-RCE sink. Bundled tool *files* instead carry a
-    bundle-relative filesystem path (``"tools/python/arxiv_search.py"``),
-    distinguished by a ``/`` separator or a source-file suffix; those run
-    the bundle's own shipped code rather than importing an arbitrary
-    server-installed module, so they are out of scope here.
-    """
+    """Distinguish dotted Python imports from bundle-relative tool files."""
     return "/" not in path and not path.endswith((".py", ".ts")) and "." in path
 
 
 def _reject_uploaded_callable_tools(spec: AgentSpec) -> None:
-    """Reject server-side Python ``callable:`` tools in an untrusted upload.
-
-    Recurses into sub-agents — each is a full :class:`AgentSpec` with its
-    own ``local_tools`` — mirroring the handler-allowlist guard's sub-agent
-    coverage so a malicious callable can't hide in a child agent.
-
-    :param spec: The parsed (sub-)agent spec to scan.
-    :raises OmnigentError: If any (sub-)agent declares a server-runtime tool
-        whose ``path`` is a dotted import path.
-    """
+    """Reject server-side callable and source-file tools in untrusted bundles."""
     for tool in spec.local_tools:
         if (
             tool.runtime == ToolRuntime.SERVER
@@ -63,6 +43,19 @@ def _reject_uploaded_callable_tools(spec: AgentSpec) -> None:
                 f"callable tool (tool {tool.name!r} -> {tool.path!r}); a "
                 "'callable:' tool imports and runs operator-trusted code on "
                 "the runner, so it is rejected from untrusted uploads",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # Source-file tools also require operator-authored bundles.
+        if (
+            tool.runtime == ToolRuntime.SERVER
+            and tool.path is not None
+            and tool.path.endswith((".py", ".ts"))
+        ):
+            raise OmnigentError(
+                "uploaded agent bundle may not ship a server-side Python/TS "
+                f"tool file (tool {tool.name!r} -> {tool.path!r}); its module "
+                "body is imported and executed in-process on the runner at tool "
+                "discovery, so it is rejected from untrusted uploads",
                 code=ErrorCode.INVALID_INPUT,
             )
     for sub in spec.sub_agents:
