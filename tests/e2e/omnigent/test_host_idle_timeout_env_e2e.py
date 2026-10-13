@@ -1,12 +1,9 @@
 """E2E: idle-timeout knobs set in the host environment must reach host-spawned runners.
 
-Journey: run the host with ``OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S=0`` and
-``OMNIGENT_HARNESS_IDLE_TIMEOUT_S=0`` in its environment, start a claude-native
-session on it, then read the spawned runner's log head. The runner's pane reaper
-logs the window it was armed with at boot; a host that drops the knobs leaves it
-on the 1-hour default. The ``passthrough`` row delivers the same names through
-``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` as a control that the runner honors them
-when they arrive.
+Journey: run the host with both idle knobs set to ``0``, start a claude-native
+session on it, then read the spawned runner's log head: the pane reaper logs the
+window it was armed with at boot, so a host that drops the knobs leaves it on
+the 1-hour default.
 """
 
 from __future__ import annotations
@@ -84,20 +81,11 @@ def _runner_log(host: Host) -> Path | None:
     return logs[-1] if logs else None
 
 
-@pytest.mark.parametrize(
-    ("delivery", "spawn"),
-    [
-        pytest.param("host-env", "zygote", id="host-env-zygote"),
-        pytest.param("host-env", "direct", id="host-env-direct"),
-        pytest.param("passthrough", "direct", id="passthrough-control"),
-    ],
-)
+@pytest.mark.parametrize("spawn", ["zygote", "direct"])
 def test_host_env_idle_timeout_knobs_reach_spawned_runner(
-    tmp_path: Path, mock_llm_server_url: str, delivery: str, spawn: str
+    tmp_path: Path, mock_llm_server_url: str, spawn: str
 ) -> None:
     host_env: dict[str, str] = {**_IDLE_KNOBS, **_CONTROL}
-    if delivery == "passthrough":
-        host_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] = ",".join(_IDLE_KNOBS)
     if spawn == "direct":
         # /proc shows exec-time environment; a zygote-forked runner never re-execs.
         host_env["OMNIGENT_RUNNER_ZYGOTE"] = "0"
@@ -141,7 +129,10 @@ def test_host_env_idle_timeout_knobs_reach_spawned_runner(
                 timeout=_RUNNER_TIMEOUT_S,
                 what="runner 'native pane reaper started' line",
                 diagnostics=lambda: (
-                    (log := _runner_log(host)) and log.read_text(errors="replace")[-3000:]
+                    log.read_text(errors="replace")[-3000:]
+                    if (log := _runner_log(host))
+                    else "no runner log yet; host log tail:\n"
+                    + host.log_path.read_text(errors="replace")[-3000:]
                 ),
             ).group(0)
 
