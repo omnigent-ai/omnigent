@@ -113,7 +113,7 @@ def pi_fork_rig(
     try:
         with (
             tempfile.TemporaryDirectory(prefix="pi-fork-", dir="/tmp") as short_tmp,
-            isolated_local_server(tmp_path) as base_url,
+            isolated_local_server(tmp_path, env={"OMNIGENT_CONFIG_HOME": str(config)}) as base_url,
             httpx.Client(
                 base_url=base_url,
                 trust_env=False,

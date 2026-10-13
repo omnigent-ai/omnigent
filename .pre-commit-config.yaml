@@ -203,6 +203,7 @@ repos:
         exclude: (\.(md|svg)$|/AppIcon\.icon/)
       - id: check-yaml
         name: check yaml syntax
+        args: ['--allow-multiple-documents']
         # docker-compose override files use non-standard tags
         # (`!reset`, `!override`) that PyYAML can't parse.
         exclude: ^deploy/docker/docker-compose\.[a-z]+\.yaml$

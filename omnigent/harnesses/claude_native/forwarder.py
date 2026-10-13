@@ -20,6 +20,7 @@ import httpx
 
 from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
@@ -145,6 +146,9 @@ _MAX_SEEN_BTW_KEYS = 64
 # progress rather than that a healthy backlog drain simply took a long time.
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
 _POST_TIMEOUT_S = 10.0
+# A child-history POST carries up to 100 items and can outlast the live lane's
+# budget; that lane runs off the latency-sensitive path, so it gets more room.
+_SUBAGENT_POST_TIMEOUT_S = 30.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _SUBAGENT_FORWARD_CONCURRENCY = 8
 # A batch gets a bounded number of attempts before it is split into
@@ -166,6 +170,17 @@ _HTTP_POST_RETRY_MAX_DELAY_S = 30.0
 # range for any realistic max_delay_s / base_delay_s ratio.
 _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT = 32
 _HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
+_FORWARDER_REJECTION_REASONS = frozenset(
+    {
+        ErrorCode.FORBIDDEN,
+        ErrorCode.INVALID_INPUT,
+        ErrorCode.NOT_FOUND,
+        "event batch exceeds count or size limit",
+        "event type is not allowed on runner tunnel",
+        "source_id required for tunnel replay",
+        "invalid session event",
+    }
+)
 # A 503 ``subagent_delivery_not_confirmed`` means the runner could not deliver a
 # terminal sub-agent result to the parent inbox. It is retried (the work entry can
 # be created slightly after the child reports terminal — a short dispatch race), but
@@ -178,6 +193,10 @@ _SUBAGENT_DROPPED_ITEM_REASON = "sub-agent transcript incomplete: an item could 
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
+# A poll that keeps failing (e.g. host credentials unavailable) backs off up to
+# this delay and logs its traceback once per streak, then at most this often.
+_LOOP_FAILURE_MAX_BACKOFF_S = 30.0
+_LOOP_FAILURE_LOG_INTERVAL_S = 300.0
 
 # Claude Code hook event names → Omnigent session-status values
 # published on the per-conversation SSE stream. Unmapped events emit
@@ -1252,6 +1271,7 @@ async def forward_claude_transcript_to_session(
     observer_stderr_offset = 0
     transcript_diagnostics = _TranscriptDiscoveryDiagnostics(started_at=time.monotonic())
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
+    subagent_timeout = httpx.Timeout(_SUBAGENT_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
     async with (
@@ -1267,10 +1287,12 @@ async def forward_claude_transcript_to_session(
             base_url,
             headers=headers,
             auth=auth,
-            timeout=timeout,
+            timeout=subagent_timeout,
             event_dispatcher=event_dispatcher,
         ) as subagent_client,
     ):
+        loop_failures = 0
+        loop_failure_logged_at = 0.0
         while True:
             try:
                 if subagent_task is not None and subagent_task.done():
@@ -1560,16 +1582,48 @@ async def forward_claude_transcript_to_session(
                     extra={"session_id": session_id},
                 )
             except Exception:
-                _logger.exception(
-                    "Claude transcript forwarder loop failed; session=%s",
-                    session_id,
-                    extra={"session_id": session_id},
-                )
+                loop_failures += 1
+                now = time.monotonic()
+                if (
+                    loop_failures == 1
+                    or now - loop_failure_logged_at >= _LOOP_FAILURE_LOG_INTERVAL_S
+                ):
+                    loop_failure_logged_at = now
+                    _logger.exception(
+                        "Claude transcript forwarder loop failed; session=%s failures=%d",
+                        session_id,
+                        loop_failures,
+                        extra={"session_id": session_id},
+                    )
+            else:
+                if loop_failures:
+                    _logger.info(
+                        "Claude transcript forwarder loop recovered after %d failures; session=%s",
+                        loop_failures,
+                        session_id,
+                        extra={"session_id": session_id},
+                    )
+                loop_failures = 0
             try:
-                await asyncio.sleep(poll_interval_s)
+                await asyncio.sleep(_loop_retry_delay_s(poll_interval_s, loop_failures))
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
                 raise
+
+
+def _loop_retry_delay_s(poll_interval_s: float, consecutive_failures: int) -> float:
+    """
+    Return how long the forwarder loop sleeps before its next poll.
+
+    :param poll_interval_s: The configured delay between healthy polls.
+    :param consecutive_failures: Polls that have failed in a row.
+    :returns: ``poll_interval_s`` while healthy, then doubling per failure
+        up to :data:`_LOOP_FAILURE_MAX_BACKOFF_S`.
+    """
+    if consecutive_failures <= 0:
+        return poll_interval_s
+    backoff_s = poll_interval_s * 2 ** min(consecutive_failures, 16)
+    return min(backoff_s, max(poll_interval_s, _LOOP_FAILURE_MAX_BACKOFF_S))
 
 
 def _subagents_dir_for_transcript(transcript_path: Path) -> Path:
@@ -3484,19 +3538,28 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
-def _stop_failure_detail(record: ClaudeHookRecord) -> str | None:
+def _stop_failure_detail(record: ClaudeHookRecord, *, session_id: str) -> str | None:
     """
     Return the reason a ``StopFailure`` hook gives for its failed turn.
 
-    The hook carries the error text Claude Code rendered, which the transcript
-    mirror can deliver after the failed edge or not at all; without it the
-    server borrows the turn's last prose or reports no detail.
+    When ``error_details`` was absent a WARNING is emitted so the missing
+    field is observable in structured logs; the server can then fall back
+    to the committed API-error text from its own store.
 
     :param record: ``StopFailure`` hook record.
-    :returns: The error text, a category-only fallback, or ``None``.
+    :param session_id: Session id for structured warning logs on fallback.
+    :returns: The error detail, a category-only fallback, or ``None``.
     """
     if record.failure_message is not None:
         return record.failure_message
+    _logger.warning(
+        "StopFailure hook carried no error_details; using fallback detail; "
+        "session=%s event_cursor=%s category=%s",
+        session_id,
+        record.event_cursor,
+        record.failure_category,
+        extra={"session_id": session_id},
+    )
     if record.failure_category is not None:
         return f"Claude Code ended the turn with an API error ({record.failure_category})."
     return None
@@ -3544,7 +3607,7 @@ def _stop_failure_context(
     parent_claude_session_ids: Collection[str],
     diagnostic_health: Callable[[], FailureContext] | None = None,
 ) -> FailureContext:
-    """Preserve hook evidence separately from last-assistant display text."""
+    """Preserve hook evidence separately from the displayed error detail."""
     reason = _subagent_hook_reason(record, parent_claude_session_ids)
     context: dict[str, object] = {
         **(record.failure_context or {}),
@@ -3570,7 +3633,7 @@ def _stop_failure_context(
         "failure_decision": "suppressed" if reason else "session_failed",
         "suppression_reason": reason,
         "detail_source": (
-            "hook_last_assistant_message"
+            "hook_error_details"
             if record.failure_message is not None
             else "hook_error_category"
             if record.failure_category is not None
@@ -4231,7 +4294,9 @@ async def _forward_available_status_events(
                 # the UI can name the shells. Dropped on ``failed`` for the same
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
-                failure_detail=_stop_failure_detail(record) if status == "failed" else None,
+                failure_detail=_stop_failure_detail(record, session_id=session_id)
+                if status == "failed"
+                else None,
                 failure_context=failure_context,
             )
         except httpx.HTTPError as exc:
@@ -4254,6 +4319,7 @@ async def _forward_available_status_events(
                         session_id=session_id,
                         reason=f"hook status {status} rejected",
                         source_id=retry_key,
+                        http_error=exc,
                         response_id=response_id,
                     )
                 durable = next_durable
@@ -4793,6 +4859,7 @@ async def _forward_available_items(
                         session_id=session_id,
                         reason=f"transcript item {item.source_id} rejected",
                         source_id=retry_key,
+                        http_error=exc,
                         response_id=current_response_id,
                     )
                 seen.add(item.source_id)
@@ -6241,12 +6308,28 @@ async def _maybe_sync_effort_from_slash_command(
         )
 
 
+def _forwarder_rejection_context(error: httpx.HTTPError) -> FailureContext:
+    """Retain rejection metadata without copying echoed transcript content."""
+    if not isinstance(error, httpx.HTTPStatusError):
+        return {}
+    context: FailureContext = {"http_status": error.response.status_code}
+    try:
+        body = error.response.json()
+    except ValueError:
+        return context
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, str) and detail in _FORWARDER_REJECTION_REASONS:
+        context["forwarder_rejection_reason"] = detail
+    return context
+
+
 async def _post_forwarder_failed_status(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     reason: str,
     source_id: str,
+    http_error: httpx.HTTPError,
     response_id: str | None = None,
 ) -> None:
     """
@@ -6257,6 +6340,7 @@ async def _post_forwarder_failed_status(
     :param reason: Diagnostic reason for the failure event, e.g.
         ``"transcript item item-1 rejected"``.
     :param source_id: Retry key of the rejected hook or transcript item.
+    :param http_error: The rejection that exhausted the delivery retry budget.
     :param response_id: Active turn's response id, so this ``failed``
         edge closes the streaming ``activeResponse`` for the matching
         turn rather than leaving its tool cards spinning. ``None`` when
@@ -6278,6 +6362,7 @@ async def _post_forwarder_failed_status(
                 "detail_source": "forwarder_delivery_error",
                 "failure_decision": "session_failed",
                 "runner_version": VERSION,
+                **_forwarder_rejection_context(http_error),
             },
         )
     except httpx.HTTPError:

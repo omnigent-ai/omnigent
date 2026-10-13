@@ -3110,7 +3110,7 @@ async def _handle_event(
     if await _maybe_handle_turn_event(
         client,
         session_id=route_session_id,
-        bridge_dir=bridge_dir if not is_child else Path(),
+        bridge_dir=bridge_dir if not is_child else None,
         method=method,
         params=params,
         usage_coalescer=(child_coalescer if child_coalescer is not None else usage_coalescer),
@@ -3630,7 +3630,7 @@ async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     method: str,
     params: _JsonObject,
     usage_coalescer: _SessionUsageCoalescer,
@@ -3660,16 +3660,17 @@ async def _maybe_handle_turn_event(
                 "Codex forwarder observed retryable turn error: turn_id=%s",
                 _turn_id_from_payload(params),
             )
-            await _maybe_fail_turn_on_certificate_failure(
-                client,
-                session_id=session_id,
-                bridge_dir=bridge_dir,
-                params=params,
-                usage_coalescer=usage_coalescer,
-                delta_coalescer=delta_coalescer,
-                codex_client=codex_client,
-                forwarder_state=forwarder_state,
-            )
+            if bridge_dir is not None:
+                await _maybe_fail_turn_on_certificate_failure(
+                    client,
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    params=params,
+                    usage_coalescer=usage_coalescer,
+                    delta_coalescer=delta_coalescer,
+                    codex_client=codex_client,
+                    forwarder_state=forwarder_state,
+                )
             return True
         async with _conversation_item_delivery_scope(session_id):
             if delta_coalescer is not None:
@@ -3687,7 +3688,8 @@ async def _maybe_handle_turn_event(
                     )
                     return True
                 forwarder_state.surfaced_terminal_error_turns.add(turn_id)
-                clear_active_turn_id_if_matches(bridge_dir, turn_id)
+                if bridge_dir is not None:
+                    clear_active_turn_id_if_matches(bridge_dir, turn_id)
             await _post_turn_status_edge(
                 client,
                 session_id,
@@ -3705,7 +3707,7 @@ async def _maybe_handle_turn_event(
             if delta_coalescer is not None:
                 await delta_coalescer.flush()
             await _handle_turn_started(client, session_id, bridge_dir, params)
-            if forwarder_state is not None:
+            if forwarder_state is not None and bridge_dir is not None:
                 # A new turn opens a fresh reasoning block: the next reasoning
                 # delta must emit ``response.reasoning.started`` again.
                 forwarder_state.reasoning_stream_item_id = None
@@ -3912,7 +3914,7 @@ async def _handle_terminal_turn_boundary(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     method: str,
     params: _JsonObject,
     usage_coalescer: _SessionUsageCoalescer,
@@ -3941,7 +3943,7 @@ async def _handle_terminal_turn_boundary_inner(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     method: str,
     params: _JsonObject,
     usage_coalescer: _SessionUsageCoalescer,
@@ -4010,6 +4012,7 @@ async def _handle_terminal_turn_boundary_inner(
     if (
         handled
         and method == "turn/completed"
+        and bridge_dir is not None
         and codex_client is not None
         and forwarder_state is not None
     ):
@@ -4867,7 +4870,7 @@ def _default_collaboration_mode(
 async def _handle_turn_started(
     client: httpx.AsyncClient,
     session_id: str,
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     params: _JsonObject,
 ) -> None:
     """
@@ -4884,7 +4887,7 @@ async def _handle_turn_started(
 
 
 def _turn_started_status_edge(
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     params: _JsonObject,
 ) -> _CodexTurnStatusEdge:
     """
@@ -4896,7 +4899,8 @@ def _turn_started_status_edge(
     """
     turn = params.get("turn")
     turn_id = _turn_id_from_payload(turn) or _turn_id_from_payload(params)
-    update_active_turn_id(bridge_dir, turn_id)
+    if bridge_dir is not None:
+        update_active_turn_id(bridge_dir, turn_id)
     return _CodexTurnStatusEdge(
         status="running",
         turn_id=turn_id,
@@ -4905,7 +4909,7 @@ def _turn_started_status_edge(
 
 
 def _prepare_terminal_turn_event(
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     method: str,
     params: _JsonObject,
     *,
@@ -4927,7 +4931,8 @@ def _prepare_terminal_turn_event(
         and terminal_turn_id is not None
         and terminal_turn_id in forwarder_state.surfaced_terminal_error_turns
     ):
-        clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id)
+        if bridge_dir is not None:
+            clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id)
         _logger.info(
             "Codex forwarder suppressed terminal boundary after standalone error: "
             "method=%s turn_id=%s",
@@ -4947,7 +4952,7 @@ def _prepare_terminal_turn_event(
 
 
 def _terminal_turn_status_edge(
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     method: str,
     params: _JsonObject,
 ) -> _CodexTurnStatusEdge | None:
@@ -4964,7 +4969,10 @@ def _terminal_turn_status_edge(
     :returns: Terminal status edge, or ``None`` when the event is stale.
     """
     terminal_turn_id = _terminal_turn_id_from_params(params)
-    if not clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id):
+    # Child threads share the app-server but have no on-disk bridge of their own.
+    if bridge_dir is not None and not clear_active_turn_id_if_matches(
+        bridge_dir, terminal_turn_id
+    ):
         if not _terminal_turn_boundary_matches_idle_bridge(bridge_dir, params, terminal_turn_id):
             return None
         source = f"{method}:recovered"
@@ -5006,7 +5014,7 @@ def _terminal_turn_status_edge(
                 terminal_turn_id,
                 method,
             )
-        if _turn_status_from_params(params) in (None, "completed"):
+        if bridge_dir is not None and _turn_status_from_params(params) in (None, "completed"):
             # The model answered, so a certificate failure recorded at launch
             # no longer describes this app-server's egress.
             clear_certificate_failure(bridge_dir)

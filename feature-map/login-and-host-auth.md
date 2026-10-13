@@ -130,8 +130,9 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `tests/server/integration/test_oidc_native_login.py`.
 - **Desktop sign-out (Server menu and sidebar picker):** connect the desktop to an
   OIDC server or a Databricks workspace, choose **Server → Sign Out of Server**,
-  and confirm every window on it shows "You're signed out of …" and the next
-  Connect opens the browser. The sidebar picker's **Sign out of <server>** needs a
+  and confirm every window on it returns to the server selector without a message
+  and the next Connect opens the browser. An incomplete sign-out still shows an error.
+  The sidebar picker's **Sign out of <server>** needs a
   server serving this checkout's web build. Component tests: the
   "signs a workspace out…", "Server → Sign Out of Server…", and "holds a
   connection that starts during sign-out…" cases in `web/electron/test/main.test.js`,

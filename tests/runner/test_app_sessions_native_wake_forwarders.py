@@ -969,6 +969,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        model_provider: str | None = None,
     ) -> None:
         """
         No-op thread preload.
@@ -1298,6 +1299,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        model_provider: str | None = None,
     ) -> None:
         """
         Refuse the resume the way a stale writer-lock holder does.
@@ -1515,6 +1517,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        model_provider: str | None = None,
     ) -> None:
         """
         Refuse the resume with the parametrized error payload.

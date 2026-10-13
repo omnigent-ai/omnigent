@@ -19,6 +19,7 @@ import yaml
 
 from omnigent.config import global_config_path
 from omnigent.host import identity_env
+from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
 
@@ -71,9 +72,8 @@ def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
     process from the env override or config file, turns that confusing
     remote rejection into a loud, local, actionable error.
 
-    Reuses the server's own ``uuid_to_bytes`` (imported lazily so the host
-    CLI's common auto-generate path never pulls in the DB/sqlalchemy
-    module) so the client and server accept exactly the same id shapes.
+    Reuses the database column's canonical normalizer without importing the
+    server's ORM models into the host process.
 
     :param host_id: The raw host id from the env override or config file.
     :param source: Where it came from, named in the error (e.g. the env var).
@@ -81,8 +81,6 @@ def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
     :returns: The normalized (to bare hex, legacy-prefix-stripped) host id.
     :raises ValueError: If *host_id* is not a valid uuid-shaped host id.
     """
-    from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
-
     try:
         # Validate and normalize to bare hex (16 bytes -> 32-char hex string)
         normalized = uuid_to_bytes(host_id).hex()

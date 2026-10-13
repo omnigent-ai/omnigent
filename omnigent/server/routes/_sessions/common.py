@@ -319,6 +319,12 @@ _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediat
 _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: str = "omnigent.last_task_error_item_id"
 
 
+# The runner bound when this failure was recorded, so a later exit from a
+# different runner attempt surfaces its own startup failure instead of hiding
+# behind this stale cause. Empty when unknown (treated as the current runner's).
+_LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: str = "omnigent.last_task_error_runner_id"
+
+
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 

@@ -71,6 +71,7 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.llms.errors import detect_request_size_overflow
+from omnigent.native.failure_telemetry import failure_log_attributes
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -930,7 +931,8 @@ def _side_chat_text_from_content(content: object) -> str:
 
     :param content: A message body's ``content`` list, e.g.
         ``[{"type": "input_text", "text": "and why?"}]``.
-    :returns: The concatenated text, or ``""`` when there is none.
+    :returns: The concatenated text with leading indentation preserved, or
+        ``""`` when there is none.
     """
     if not isinstance(content, list):
         return ""
@@ -940,7 +942,7 @@ def _side_chat_text_from_content(content: object) -> str:
             text = block.get("text")
             if isinstance(text, str) and text:
                 parts.append(text)
-    return "\n".join(parts).strip()
+    return "\n".join(parts).rstrip()
 
 
 def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
@@ -3555,6 +3557,8 @@ def create_runner_app(
                     "runner_turn_failed",
                     session_id=conv_id,
                     harness=harness,
+                    response_id=response_id,
+                    **failure_log_attributes(source.get("failure_context")),
                     **dimensions,
                 ),
             )
@@ -6294,7 +6298,7 @@ def create_runner_app(
             from omnigent.harnesses.codex_native import side_chat as _side_chat
 
             _side_question = _side_chat.side_chat_question_from_text(
-                _side_chat_text_from_content(body.get("content"))
+                _side_chat_text_from_content(body.get("content")).lstrip()
             )
             if (
                 _side_question is not None
@@ -8161,7 +8165,9 @@ async def _evaluate_agent_start_gate(
 
     sandbox_dict: _JsonObject | None = None
     if spec.os_env is not None and spec.os_env.sandbox is not None:
-        sandbox_dict = cast(_JsonObject, dataclasses.asdict(spec.os_env.sandbox))
+        from omnigent.inner.os_env_serialization import encode_sandbox_spec
+
+        sandbox_dict = cast(_JsonObject, encode_sandbox_spec(spec.os_env.sandbox))
 
     return await gate.evaluate_agent_start(
         {

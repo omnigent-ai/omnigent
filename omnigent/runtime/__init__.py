@@ -253,6 +253,10 @@ def get_caps() -> RuntimeCaps:
     :returns: The :class:`RuntimeCaps` instance. Always
         non-None (defaults are used if none were provided).
     """
+    if _globals._caps is None:
+        with _globals._caps_lock:
+            if _globals._caps is None:
+                _globals._caps = RuntimeCaps()
     return _globals._caps
 
 

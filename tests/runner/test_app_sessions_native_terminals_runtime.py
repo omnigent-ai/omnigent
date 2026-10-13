@@ -12,6 +12,7 @@ import shutil
 import sys
 import threading
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -412,15 +413,39 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("version", "permission_args", "retain_subscription"),
+    (
+        "version",
+        "permission_args",
+        "retain_subscription",
+        "cancel_launch",
+        "use_envelope",
+        "provider_profile",
+    ),
     [
-        ((0, 153, 1), ["--config", "approval_policy=on-request"], False),
-        ((0, 154, 0), [], True),
-        (None, [], True),
+        pytest.param(
+            version,
+            permission_args,
+            retain_subscription,
+            cancel_launch,
+            use_envelope,
+            None,
+            id=f"{version}-{'cancel' if cancel_launch else 'launch'}-"
+            f"{'envelope' if use_envelope else 'legacy'}",
+        )
+        for version, permission_args, retain_subscription in [
+            ((0, 153, 1), ["--config", "approval_policy=on-request"], False),
+            ((0, 154, 0), [], True),
+            (None, [], True),
+        ]
+        for cancel_launch in (False, True)
+        for use_envelope in (False, True)
+    ]
+    + [
+        pytest.param(
+            (0, 154, 0), [], True, False, True, "configured-workspace", id="configured-provider"
+        )
     ],
 )
-@pytest.mark.parametrize("cancel_launch", [False, True])
-@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
 async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -429,6 +454,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     retain_subscription: bool,
     cancel_launch: bool,
     use_envelope: bool,
+    provider_profile: str | None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
@@ -570,7 +596,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
     def _recording_resolve_launch(**kwargs: Any) -> codex_app_mod.NativeCodexLaunch:
         resolve_calls.append(kwargs)
-        return real_resolve_launch(**kwargs)
+        return replace(
+            real_resolve_launch(**kwargs), profile=provider_profile, config_overrides=[]
+        )
 
     monkeypatch.setattr(codex_app_mod, "resolve_native_codex_launch", _recording_resolve_launch)
 
@@ -669,7 +697,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
     published_events: list[dict[str, Any]] = []
     forward_calls: list[dict[str, Any]] = []
-    preload_calls: list[tuple[str, str, list[str] | None]] = []
+    preload_calls: list[tuple[str, str, list[str] | None, str | None]] = []
     effort_calls: list[tuple[str, str, object]] = []
 
     async def _fake_apply_effort(
@@ -686,6 +714,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        model_provider: str | None = None,
     ) -> Any:
         """
         Record preloading of the known Codex thread.
@@ -698,7 +727,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "stale bridge state must be cleared until the new app-server has "
             "loaded the resume thread"
         )
-        preload_calls.append((transport, loaded_thread_id, terminal_launch_args))
+        preload_calls.append((transport, loaded_thread_id, terminal_launch_args, model_provider))
         assert isinstance(cwd, Path)
         assert retain_client is retain_subscription
         return retained_client if retain_client else None
@@ -832,6 +861,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             app_server.listen_url,
             thread_id,
             ["--config", "approval_policy=on-request"],
+            "omnigent_databricks" if provider_profile else None,
         )
     ]
     assert published_events[0]["type"] == "session.resource.created"
@@ -1095,6 +1125,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        model_provider: str | None = None,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -1392,6 +1423,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        model_provider: str | None = None,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         assert terminal_launch_args is None
@@ -4661,6 +4693,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        model_provider: str | None = None,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -4900,6 +4933,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        model_provider: str | None = None,
     ) -> None:
         """Accept preloading of the known Codex thread."""
         del transport, loaded_thread_id, terminal_launch_args

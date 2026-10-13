@@ -698,10 +698,10 @@ def databricks_request_headers(
         runners, and their session traffic all name it so they co-locate on one
         replica). Pass it unconditionally: it is emitted (as the
         :data:`OMNIGENT_SLICE_KEY_HEADER` routing header) only when *server_url*
-        is a host-sharded mount, since that is the only deployment with the
-        sharding layer that reads it. ``None`` defaults to the runner's own
-        host_id inside a runner process (via ``OMNIGENT_RUNNER_SLICE_KEY``) and
-        otherwise leaves routing to the default.
+        is a host-sharded mount or ``OMNIGENT_HOST_SLICE_KEY_ENABLED=1``
+        explicitly enables host routing on an OSS server. ``None`` defaults to
+        the runner's own host_id inside a runner process (via
+        ``OMNIGENT_RUNNER_SLICE_KEY``) and otherwise leaves routing to the default.
     :param org_id: An explicit workspace selector captured from the current
         server URL. When omitted, the selector from the stored login record is
         used. An explicit value wins over stored state.
@@ -731,33 +731,23 @@ def databricks_request_headers(
     #      host identity — a host-less CLI request (session list, /me-adjacent
     #      reads, export) then keys to the replica holding this CLI's own hosts'
     #      tunnels. Read-only (never mints an identity), so a non-host machine
-    #      stays unkeyed (→ default). Gated on the host-sharded mount below so
-    #      the file read only happens for requests that could use it.
-    # Only a host-sharded deployment runs the sharding layer that reads the
-    # header; an unsharded server is single-replica and would just log a header
-    # it ignores — so gate emission (and the CLI identity lookup) on the mount.
-    # Callers never reason about the deployment; a new RPC routed through this
-    # builder is keyed automatically.
-    on_workspace_mount = is_workspace_hosted_url(server_url)
+    #      stays unkeyed (→ default). Read only when host routing is enabled.
+    # An explicit opt-in also supports OSS ingress routing by the same host key.
+    slice_key_setting = os.environ.get("OMNIGENT_HOST_SLICE_KEY_ENABLED")
+    host_routing = is_workspace_hosted_url(server_url) or slice_key_setting == "1"
     if host_id is None:
         from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
 
         host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
-    if host_id is None and on_workspace_mount:
+    if host_id is None and host_routing:
         from omnigent.host.identity import load_host_identity_if_present
 
         identity = load_host_identity_if_present()
         if identity is not None:
             host_id = identity.host_id
-    # Kill switch: slice-key emission is ON by default; export
-    # ``OMNIGENT_HOST_SLICE_KEY_ENABLED=0`` to turn it off and fall back to the
-    # server's default (workspace-id) routing with no redeploy — a per-process
-    # escape hatch for a bad rollout, since this emits from sidecar-less
-    # processes (laptop CLI, managed sandbox host, spawned runner) that can't
-    # evaluate a server-side flag. Only the exact value "0" disables it; unset,
-    # "1", or anything else leaves emission on.
-    slice_key_enabled = os.environ.get("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1") != "0"
-    if host_id and on_workspace_mount and slice_key_enabled:
+    # Workspace routing is on by default; OSS requires the explicit opt-in.
+    # Setting "0" disables the routing header for either deployment.
+    if host_id and host_routing and slice_key_setting != "0":
         headers[OMNIGENT_SLICE_KEY_HEADER] = host_id
     # Opaque dev/test extra headers (request-routing selectors); no-op in prod
     # (env unset).

@@ -31,6 +31,8 @@ def create_session(client, *, guardrails=None):
 def setup_app(tmp_path, monkeypatch):
     import omnigent.server.app as app_module
 
+    # Tests add API routes after create_app; the SPA catch-all would hide them.
+    monkeypatch.setattr(app_module, "_WEB_UI_DIST", tmp_path / "no-web-ui")
     captured = {}
     original = app_module.create_app
 
@@ -730,7 +732,9 @@ async def test_scheduled_dispatch_obeys_revocation_boundary(setup_app, monkeypat
         assert tasks.get(task.id).state == "deleted"
         resume.set()
         if admitted:
-            frame = json.loads(await asyncio.wait_for(conn.outbound_queue.get(), timeout=10))
+            frame = json.loads(
+                (await asyncio.wait_for(conn.outbound_queue.get(), timeout=10)).data
+            )
             assert frame["kind"] == "host.launch_runner"
             conn.pending_launches.pop(frame["request_id"]).set_result(
                 {"status": "failed", "error": "test transport: runner was not started"}

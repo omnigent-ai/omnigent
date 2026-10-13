@@ -14,7 +14,19 @@
 
 "use strict";
 
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webFrame } = require("electron");
+
+// Native window controls stay in window pixels while the page zooms.
+if (process.platform === "darwin") {
+  const syncTitlebarZoom = () => {
+    document.documentElement.style.setProperty(
+      "--omnigent-electron-zoom",
+      String(webFrame.getZoomFactor()),
+    );
+  };
+  window.addEventListener("DOMContentLoaded", syncTitlebarZoom, { once: true });
+  window.addEventListener("resize", syncTitlebarZoom);
+}
 
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloading / downloaded / error-security) to `idle` so the server page can
@@ -133,6 +145,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
   connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+  /** Extend the local Arca instance with one of the main process's approved modes. */
+  extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
 
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host
@@ -215,7 +229,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} url
    * @param {{x:number,y:number,width:number,height:number,devicePixelRatio?:number}} [bounds]
-   * @param {{force?: boolean, agent?: boolean}} [opts]
+   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, rememberedArcaHostId?: string}} [opts]
    */
   browserOpenOrNavigate: (conversationId, url, bounds, opts) =>
     ipcRenderer.invoke("omnigent:browser-open-or-navigate", { conversationId, url, bounds, opts }),

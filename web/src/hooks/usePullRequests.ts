@@ -80,6 +80,9 @@ export interface PullRequest {
   base_ref: string | null;
   head_ref: string | null;
   checks: PullRequestChecks;
+  /** False when the signed-in token cannot read check runs (GitHub refuses them to
+   *  fine-grained personal access tokens), so `checks` is empty. Absent means supported. */
+  checks_supported?: boolean;
   head_sha?: string;
   base_sha?: string;
   /** PR description (GitHub-flavored markdown); null when empty. Optional: a

@@ -59,6 +59,7 @@ import {
   reactRouterRouting,
 } from "./lib/routing";
 import { initChatStore } from "./store/chatStore";
+import { cn } from "./lib/utils";
 import "katex/dist/katex.min.css";
 import "streamdown/styles.css";
 import "./index.css";
@@ -211,8 +212,10 @@ function OmnigentProviders({
     //     scope root, not the root itself.
     //   - the inner div carries the host-driven `dark` class (when dark) and is
     //     the Radix portal root, so both the app and its overlays read the dark
-    //     token overrides. Light mode = no class → inherits the scope root's
-    //     light tokens.
+    //     token overrides. Light mode = no `dark` class → inherits the scope
+    //     root's light tokens. It re-applies `text-foreground` because the scope
+    //     root resolves `color` from the light tokens, and overlays without
+    //     their own text color would inherit that value.
     <div
       ref={scopeRootRef}
       className="omnigent-app"
@@ -221,7 +224,7 @@ function OmnigentProviders({
     >
       <div
         ref={scopeRef}
-        className={isDarkMode ? "dark" : undefined}
+        className={cn(isDarkMode && "dark", "text-foreground")}
         style={{ height: "100%", width: "100%" }}
       >
         <EmbeddedProvider>
