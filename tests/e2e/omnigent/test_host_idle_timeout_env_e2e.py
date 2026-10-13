@@ -20,7 +20,7 @@ import yaml
 from tests._helpers.host import Host, isolated_host
 from tests._helpers.live_server import isolated_local_server
 from tests._helpers.native_session import create_native_session
-from tests.e2e._harness_probes import skip_if_harness_cli_missing
+from tests.e2e._harness_probes import cli_unavailable_reason
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux",
@@ -82,14 +82,14 @@ def _runner_log(host: Host) -> Path | None:
     return logs[-1] if logs else None
 
 
-# Older hosts predate this forwarding fix; the scheduled compat run pins them
-# and would otherwise fail these cases. ``.devN`` of the floor still runs them.
+# Hosts < 0.19.0 do not forward the idle-timeout env knobs to spawned runners.
 @pytest.mark.min_runner_version("0.19.0")
 @pytest.mark.parametrize("spawn", ["zygote", "direct"])
 def test_host_env_idle_timeout_knobs_reach_spawned_runner(
     tmp_path: Path, mock_llm_server_url: str, spawn: str
 ) -> None:
-    skip_if_harness_cli_missing("claude")
+    if (reason := cli_unavailable_reason("claude")) is not None:
+        pytest.skip(reason)
     host_env: dict[str, str] = {**_IDLE_KNOBS, **_CONTROL}
     if spawn == "direct":
         # /proc shows exec-time environment; a zygote-forked runner never re-execs.
@@ -119,13 +119,21 @@ def test_host_env_idle_timeout_knobs_reach_spawned_runner(
         )
         session_id = str(created["session_id"])
         try:
+            # A crash/retry would spawn a second runner, so pair the PID with the
+            # newest start line to match the lexicographically last runner log.
             started = _wait_for(
-                lambda: _RUNNER_STARTED.search(host.log_path.read_text(errors="replace")),
+                lambda: (
+                    (
+                        matches := list(
+                            _RUNNER_STARTED.finditer(host.log_path.read_text(errors="replace"))
+                        )
+                    )
+                    and matches[-1]
+                ),
                 timeout=_RUNNER_TIMEOUT_S,
                 what="host 'Runner started' line",
                 diagnostics=lambda: host.log_path.read_text(errors="replace")[-3000:],
             )
-            runner_pid = int(started.group(2))
             reaper_line = _wait_for(
                 lambda: (
                     (log := _runner_log(host))
@@ -142,6 +150,7 @@ def test_host_env_idle_timeout_knobs_reach_spawned_runner(
             ).group(0)
 
             if spawn == "direct":
+                runner_pid = int(started.group(2))
                 runner_environ = _proc_environ(runner_pid)
                 assert runner_environ.get("OMNIGENT_LOG_LEVEL") == "INFO", (
                     "control variable missing: the host→runner env chain is broken"
