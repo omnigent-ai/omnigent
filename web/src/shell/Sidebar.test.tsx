@@ -4211,20 +4211,21 @@ describe("session tooltip project detail", () => {
 
     const projectTooltip = await openTooltip("conv_filed");
     expect(within(projectTooltip).queryByTestId("session-tooltip-project")).toBeNull();
-  });
 
-  it("hides the project detail inside its first-class project folder", async () => {
-    projectRowsRef.current = [{ id: "p_alpha", name: "Alpha" }];
+    cleanup();
     mockConversations([
       filedSession("conv_first_class", {
         project_id: "p_alpha",
       }),
     ]);
     renderGroupingSidebar();
-    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    const firstClassFolder = screen.getByRole("button", { name: /^Alpha/ });
+    if (firstClassFolder.getAttribute("aria-expanded") !== "true") {
+      fireEvent.click(firstClassFolder);
+    }
 
-    const projectTooltip = await openTooltip("conv_first_class");
-    expect(within(projectTooltip).queryByTestId("session-tooltip-project")).toBeNull();
+    const firstClassTooltip = await openTooltip("conv_first_class");
+    expect(within(firstClassTooltip).queryByTestId("session-tooltip-project")).toBeNull();
   });
 });
 
