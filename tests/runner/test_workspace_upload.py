@@ -1977,6 +1977,63 @@ async def test_expiry_drops_upload_with_gone_parent(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup", ["sweep", "request", "restart"])
+async def test_expiry_drops_upload_with_replaced_staging(
+    client: httpx.AsyncClient, cleanup: str
+) -> None:
+    import omnigent.runner.workspace_upload as upload
+
+    manager = client._transport.app.state.workspace_uploads
+    manager.limits = UploadLimits(max_open_uploads=1, max_open_bytes=1)
+    created = await create(client, size=1)
+    uid = created.json()["upload_id"]
+    staging = Path(manager.records[uid].staging_path)
+    moved = staging.with_name("owned-moved")
+    staging.rename(moved)
+    unrelated = b"unrelated occupant\x00\xff"
+    staging.write_bytes(unrelated)
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    manager.records[uid].last_activity = upload._now() - manager.limits.idle_ttl_s - 1
+    await manager._persist()
+    url = BASE + "/" + uid + "?created_by=alice"
+    fresh = None
+    try:
+        if cleanup == "request":
+            assert (await client.head(url)).status_code == 410
+        elif cleanup == "restart":
+            await manager.stop()
+            fresh = restart(manager)
+            fresh.limits = manager.limits
+            manager = fresh
+            await manager.sweep()
+        else:
+            await manager.sweep()
+        assert uid not in manager.records
+        assert uid not in manager.upload_locks
+        assert uid not in json.loads(manager.state_path.read_text())
+        assert staging.read_bytes() == unrelated
+        assert moved.read_bytes() == b""
+        with pytest.raises(upload.RouteError) as exc:
+            await manager.operate("session", DEFAULT_ENVIRONMENT_ID, uid, "alice", "status")
+        assert exc.value.status == 410
+        if fresh is None:
+            assert (await client.head(url)).status_code == 410
+            assert (await asyncio.to_thread(helper.call, {"op": "status", "id": uid}))[
+                "code"
+            ] == "gone"
+        declaration = upload.UploadDeclaration(
+            dir="", name="quota-free", size=1, created_by="alice"
+        )
+        assert (await manager.create("session", DEFAULT_ENVIRONMENT_ID, declaration))[
+            "offset"
+        ] == 0
+        assert staging.read_bytes() == unrelated
+    finally:
+        if fresh is not None:
+            await fresh.stop()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("holder_op", ["plan", "complete"])
 async def test_async_short_operation_queue_budget(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, holder_op: str
