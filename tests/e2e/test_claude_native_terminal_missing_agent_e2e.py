@@ -247,7 +247,7 @@ def test_native_claude_terminal_ensure_fails_when_agent_missing(
         )
         # The corrected client-safe message names the lifecycle cause and the
         # remedy — it must NOT relabel this as a terminal-startup defect.
-        assert "agent is no longer available" in message, message
+        assert "agent no longer exists" in message, message
         assert "Native Claude terminal failed to start" not in message, message
         # The message carries a correlation id for operators to cross-ref the
         # runner log.
@@ -419,7 +419,7 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
         while time.monotonic() < deadline:
             for it in _error_items():
                 blob = json.dumps(it)
-                if "session_agent_missing" in blob and "agent is no longer available" in blob:
+                if "session_agent_missing" in blob and "agent no longer exists" in blob:
                     error_item = it
                     break
             if error_item is not None:
@@ -436,7 +436,7 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
         # (``to_api_dict``), so the ``ErrorData`` fields ride there directly.
         assert error_item.get("code") == "session_agent_missing", error_item
         item_message = error_item.get("message") or ""
-        assert "agent is no longer available" in item_message, error_item
+        assert "agent no longer exists" in item_message, error_item
         assert "Native Claude terminal failed to start" not in item_message, error_item
 
         # KPI log signature: the server logs the failed turn at ERROR with
@@ -471,7 +471,7 @@ def test_native_claude_turn_fails_when_agent_missing(tmp_path: Path) -> None:
         )
         # The turn-failed log now carries the lifecycle message, not the
         # generic terminal-startup defect message.
-        assert "agent is no longer available" in server_log_text, (
+        assert "agent no longer exists" in server_log_text, (
             f"server log missing the lifecycle failure message; tail:\n{server_log_text[-3000:]}"
         )
         assert "Native Claude terminal failed to start" not in server_log_text, (

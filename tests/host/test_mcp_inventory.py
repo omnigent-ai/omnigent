@@ -9,6 +9,7 @@ import pytest
 
 from omnigent.host import mcp_inventory
 from omnigent.host.mcp_inventory import HostMcpInventory, discover_mcp_servers
+from omnigent.spec.skill_sources import _plugin_asset_id
 
 _SECRET = "sk-live-secret-token"
 
@@ -100,6 +101,7 @@ def test_reads_each_harness_and_drops_secrets(home: Path) -> None:
             "transport": "stdio",
             "scope": "user",
             "plugin": "figma",
+            "source_id": _plugin_asset_id("figma@market", "mcp", "figma"),
         },
         {
             "name": "figjam",
@@ -107,6 +109,7 @@ def test_reads_each_harness_and_drops_secrets(home: Path) -> None:
             "transport": "http",
             "scope": "user",
             "plugin": "figma",
+            "source_id": _plugin_asset_id("figma@market", "mcp", "figjam"),
             "url_host": "f.io",
         },
         {"name": "glean", "harness": "codex", "transport": "stdio", "scope": "user"},

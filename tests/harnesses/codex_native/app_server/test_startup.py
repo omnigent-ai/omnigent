@@ -9,9 +9,15 @@ from unittest.mock import Mock
 
 import pytest
 
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexNativeAppServer,
+)
+from omnigent.harnesses.codex_native.bridge import (
+    read_certificate_failure,
+    record_certificate_failure,
 )
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
@@ -391,3 +397,60 @@ async def test_start_can_delegate_global_process_reconciliation(
     await server.close()
 
     assert reconcile_calls == 0
+
+
+async def test_start_clears_previous_launch_certificate_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A certificate record left by an earlier launch must not fail this launch's turns."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+    async def _supported_version(_codex_path: str) -> tuple[int, int, int]:
+        return (0, 147, 0)
+
+    monkeypatch.setattr(codex_native_app_server, "_codex_cli_version", _supported_version)
+    _disable_codex_startup_rpc(monkeypatch)
+    record_certificate_failure(
+        bridge_dir, CertificateFailure(evidence="certificate expired", expired=True)
+    )
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", bridge_dir, workspace)
+
+    await server.start()
+    try:
+        assert read_certificate_failure(bridge_dir) is None
+    finally:
+        await server.close()
+
+
+async def test_start_reports_a_removed_workspace_before_any_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deleted worktree fails as WORKSPACE_MISSING instead of a bare spawn ENOENT."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+    async def _supported_version(_codex_path: str) -> tuple[int, int, int]:
+        return (0, 147, 0)
+
+    monkeypatch.setattr(codex_native_app_server, "_codex_cli_version", _supported_version)
+    _disable_codex_startup_rpc(monkeypatch)
+    codex_home = tmp_path / "codex-home"
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", tmp_path / "removed")
+
+    with pytest.raises(OmnigentError) as failure:
+        await server.start()
+
+    assert failure.value.code == ErrorCode.WORKSPACE_MISSING
+    assert server.proc is None
+    assert not codex_home.exists()

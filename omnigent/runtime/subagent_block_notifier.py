@@ -127,8 +127,8 @@ class SubagentBlockNotifier:
         self._wake_dispatch = wake_dispatch
         self._loop = loop
         self._lock = threading.Lock()
-        # Debounce: armed ids (one wake per block), cleared + re-armed on resolve.
-        self._notified: set[str] = set()
+        # Map each armed elicitation to the conversation allowed to resolve it.
+        self._notified: dict[str, str] = {}
         # Per-block resolve signal, registered by the handler before it
         # dispatches a wake so a resolve racing the in-flight wake is never
         # missed; observe() sets it on the resolved event.
@@ -163,7 +163,13 @@ class SubagentBlockNotifier:
         event_type = event.get("type")
         if event_type == _RESOLVED_TYPE:
             with self._lock:
-                self._notified.discard(elicitation_id)
+                # Only the conversation that armed this block may resolve it.
+                if (
+                    elicitation_id not in self._notified
+                    or self._notified[elicitation_id] != conversation_id
+                ):
+                    return
+                del self._notified[elicitation_id]
                 signal = self._resolution_signals.get(elicitation_id)
                 action = _resolution_action(event)
                 if signal is not None and action is not None:
@@ -179,7 +185,7 @@ class SubagentBlockNotifier:
         with self._lock:
             if elicitation_id in self._notified:
                 return  # already armed for this block — debounce
-            self._notified.add(elicitation_id)
+            self._notified[elicitation_id] = conversation_id
         try:
             future = asyncio.run_coroutine_threadsafe(
                 self.handle_request(conversation_id, event),
@@ -188,7 +194,7 @@ class SubagentBlockNotifier:
         except RuntimeError:
             # Loop gone (shutdown): release the arm so a later block isn't wrongly debounced.
             with self._lock:
-                self._notified.discard(elicitation_id)
+                self._notified.pop(elicitation_id, None)
             _logger.debug(
                 "subagent block notifier: loop unavailable, dropping wake for %s",
                 conversation_id,
@@ -299,7 +305,7 @@ class SubagentBlockNotifier:
             if outcome is _WakeOutcome.FAILED:
                 # Release the arm so a later publish of this id can retry.
                 with self._lock:
-                    self._notified.discard(elicitation_id)
+                    self._notified.pop(elicitation_id, None)
                 return
             if outcome is _WakeOutcome.MOOT:
                 return

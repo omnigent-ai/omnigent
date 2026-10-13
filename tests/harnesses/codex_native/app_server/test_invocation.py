@@ -143,7 +143,7 @@ def test_args_only_config_survives_bare_executable_resolution(
     """Making bare Codex absolute must retain its terminal-only arguments."""
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.resolve_codex_invocation",
-        lambda: CodexInvocation(
+        lambda **_kwargs: CodexInvocation(
             "codex",
             terminal_prefix=("--terminal-only",),
             configured=True,
@@ -161,6 +161,31 @@ def test_args_only_config_survives_bare_executable_resolution(
     assert invocation.argv_prefix == ()
     assert invocation.terminal_prefix == ("--terminal-only",)
     assert invocation.app_server_configured is False
+
+
+def test_native_invocation_reads_the_supplied_workspace_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session launch resolves its wrapper from the workspace's project config."""
+    from omnigent.config import load_effective_config
+
+    workspace = tmp_path / "workspace"
+    (workspace / ".omnigent").mkdir(parents=True)
+    (workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  codex-native:\n    command: workspace-codex\n    args: [--workspace-arg]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_CODEX_PATH", raising=False)
+
+    assert _resolve_native_codex_invocation().executable != "workspace-codex"
+
+    invocation = _resolve_native_codex_invocation(cfg=load_effective_config(workspace=workspace))
+
+    assert invocation.executable == "workspace-codex"
+    assert invocation.argv("app-server") == ("workspace-codex", "--workspace-arg", "app-server")
+    assert invocation.terminal_prefix == ("--workspace-arg",)
 
 
 def test_configured_app_server_timeout_is_distinct_from_args_only() -> None:

@@ -110,8 +110,8 @@ export function MembersPage() {
 
   if (isSingleUser) {
     return (
-      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
-        <h1 className="mb-2 text-2xl font-semibold">Members</h1>
+      <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
+        <h1 className="settings-page-title mb-2 text-2xl font-semibold">Members</h1>
         <p className="text-ui text-muted-foreground">
           Member management is not available in single-user mode.
         </p>
@@ -135,8 +135,8 @@ export function MembersPage() {
   // Non-admin: hard stop. Server would also 403, this is just UX.
   if (meIsAdmin === false) {
     return (
-      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
-        <h1 className="mb-2 text-2xl font-semibold">Members</h1>
+      <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
+        <h1 className="settings-page-title mb-2 text-2xl font-semibold">Members</h1>
         <p className="text-ui text-muted-foreground">
           You don't have permission to manage members.
         </p>
@@ -187,9 +187,9 @@ export function MembersPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+    <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Members</h1>
+        <h1 className="settings-page-title text-2xl font-semibold">Members</h1>
         {/* Invite mints a password-backed account — accounts mode only.
         Under OIDC, accounts are provisioned by the IdP on first login, so
         there's nothing to invite here. */}

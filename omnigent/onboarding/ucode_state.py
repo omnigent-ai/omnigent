@@ -1,7 +1,7 @@
 """Read ucode's state.json.
 
 ucode (github.com/databricks/ucode) is a CLI that configures coding harnesses
-to talk to Databricks Unity AI Gateway.  After ``ucode configure`` runs, it
+to talk to Databricks Unity Gateway.  After ``ucode configure`` runs, it
 writes ``~/.ucode/state.json`` with the workspace URL, available models,
 base URLs, and per-agent auth/config snippets.
 

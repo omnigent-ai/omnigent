@@ -19,6 +19,9 @@ const {
   WORKSPACE_UI_PATH,
   fetchServerManifest,
   PRE_MANIFEST_BASELINE,
+  MAX_SERVER_NAME_LENGTH,
+  parseManifestAuth,
+  sanitizeServerName,
 } = require("../src/url");
 
 describe("defaultSchemeFor", () => {
@@ -603,6 +606,33 @@ describe("fetchServerManifest", () => {
     );
   });
 
+  it("reads the auth block and server name", async () => {
+    await withFetch(
+      async () =>
+        fakeJsonResponse({
+          manifest_version: 1,
+          auth: { mode: "oidc", session_cookie: "__Host-ap_session" },
+          server_name: "Acme Engineering",
+        }),
+      async () => {
+        const m = await fetchServerManifest("https://omni.example/");
+        assert.deepEqual(m.auth, { mode: "oidc", sessionCookie: "__Host-ap_session" });
+        assert.equal(m.serverName, "Acme Engineering");
+      },
+    );
+  });
+
+  it("leaves auth and server name null on an older server", async () => {
+    await withFetch(
+      async () => fakeJsonResponse({ manifest_version: 1 }),
+      async () => {
+        const m = await fetchServerManifest("https://omni.example/");
+        assert.equal(m.auth, null);
+        assert.equal(m.serverName, null);
+      },
+    );
+  });
+
   it("returns the baseline for an unparseable server URL", async () => {
     assert.deepEqual(await fetchServerManifest("not a url"), PRE_MANIFEST_BASELINE);
   });
@@ -620,5 +650,61 @@ describe("fetchServerManifest", () => {
         assert.equal(m.manifestVersion, 1);
       },
     );
+  });
+});
+
+describe("parseManifestAuth", () => {
+  it("accepts each known mode", () => {
+    for (const mode of ["oidc", "accounts", "header", "custom", "none"]) {
+      assert.equal(parseManifestAuth({ mode, session_cookie: null }, "https://a.test")?.mode, mode);
+    }
+  });
+
+  it("rejects unknown modes and non-objects", () => {
+    assert.equal(parseManifestAuth({ mode: "saml" }, "https://a.test"), null);
+    assert.equal(parseManifestAuth("oidc", "https://a.test"), null);
+    assert.equal(parseManifestAuth(null, "https://a.test"), null);
+  });
+
+  it("keeps only the real session cookie names", () => {
+    const auth = (cookie, url = "https://a.test") =>
+      parseManifestAuth({ mode: "oidc", session_cookie: cookie }, url).sessionCookie;
+    assert.equal(auth("__Host-ap_session"), "__Host-ap_session");
+    assert.equal(auth("ap_session", "http://localhost:8000"), "ap_session");
+    assert.equal(auth("session_id"), null);
+    assert.equal(auth(7), null);
+    // Chromium refuses a __Host- cookie on plain http.
+    assert.equal(auth("__Host-ap_session", "http://localhost:8000"), null);
+    assert.equal(auth("__Host-ap_session", "HTTPS://A.TEST"), "__Host-ap_session");
+    assert.equal(auth("__Host-ap_session", "not a url"), null);
+  });
+});
+
+describe("sanitizeServerName", () => {
+  it("trims and collapses whitespace", () => {
+    assert.equal(sanitizeServerName("  Acme \n  Engineering\t"), "Acme Engineering");
+  });
+
+  it("strips control, bidi, and zero-width characters", () => {
+    assert.equal(sanitizeServerName("Acme\u0000\u202eevil\u2066"), "Acmeevil");
+    assert.equal(sanitizeServerName("\u200fAc\u200bme\u061c\ufeff"), "Acme");
+  });
+
+  it("never cuts a character in half when capping", () => {
+    const flag = "\u{1F3F3}\u{FE0F}";
+    const name = sanitizeServerName("a".repeat(MAX_SERVER_NAME_LENGTH - 1) + flag + "tail");
+    assert.ok(name.endsWith(flag), JSON.stringify(name));
+  });
+
+  it("caps the length by characters", () => {
+    const name = sanitizeServerName("😀".repeat(MAX_SERVER_NAME_LENGTH + 10));
+    assert.equal(Array.from(name).length, MAX_SERVER_NAME_LENGTH);
+  });
+
+  it("returns null for blanks and non-strings", () => {
+    assert.equal(sanitizeServerName("   "), null);
+    assert.equal(sanitizeServerName("\u202e"), null);
+    assert.equal(sanitizeServerName(42), null);
+    assert.equal(sanitizeServerName(undefined), null);
   });
 });

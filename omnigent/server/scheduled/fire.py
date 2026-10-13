@@ -59,6 +59,7 @@ from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
@@ -475,6 +476,7 @@ async def _run_fire_for_task(
             return
 
         try:
+            effective = await _own_task_agent(deps, effective)
             conv = await _create_session(deps, effective)
         except Exception:
             _logger.exception("scheduled fire: failed to create session for task %s", task.id)
@@ -818,6 +820,29 @@ async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str,
             task.id,
         )
         return {}
+
+
+async def _own_task_agent(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
+    """Move a task saved on another user's agent onto its owner's own copy, once.
+
+    Tasks get the copy when created; this covers ones saved before that.
+    """
+    agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+    if agent is None:
+        return task
+    bound = await asyncio.to_thread(
+        agent_for_user, deps.agent_store, deps.artifact_store, agent, task.user_id
+    )
+    if bound.id == agent.id:
+        return task
+    await asyncio.to_thread(deps.scheduled_task_store.update, task.id, agent_id=bound.id)
+    return replace(task, agent_id=bound.id)
+
+
+async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
+    """The bundle the kickoff runs, so the runner can tell when it later changes."""
+    agent = await asyncio.to_thread(deps.agent_store.get, conv.agent_id) if conv.agent_id else None
+    return agent.bundle_location if agent is not None else None
 
 
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
@@ -1179,6 +1204,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             artifact_store=deps.artifact_store,
             created_by=owner,
             runner_router=deps.runner_router,
+            agent_revision=await _agent_revision(deps, conv_for_dispatch),
         )
 
     return _dispatch
@@ -1259,6 +1285,7 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
             artifact_store=deps.artifact_store,
             created_by=owner,
             runner_router=deps.runner_router,
+            agent_revision=await _agent_revision(deps, fresh),
         )
 
     return _dispatch

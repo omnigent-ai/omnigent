@@ -277,6 +277,20 @@ An agent that fails during its `initialize` handshake for no obvious reason is
 worth checking against this first; the ACP executor logs a hint pointing back at
 this field.
 
+> **How the start probe is evaluated.** `enforce_sandbox` runs when the runner
+> replays your tool-call policies over a synthetic `sys_agent_start` probe at
+> launch. Only a transform takes effect there: a policy that ALLOWs the probe
+> and returns a replacement payload (preserving the `name` and `arguments`
+> fields) reshapes the launch, chaining through later policies. A plain `DENY`
+> or `ASK` verdict on this probe does **not** block agent start — it is logged
+> and ignored, so a general-purpose tool allowlist or cost gate that happens to
+> reject the `sys_agent_start` name will not stop the agent from launching. The
+> runner only refuses to start (fails closed) when a policy cannot be evaluated
+> at all — it raised, could not be resolved, or returned a transform that drops
+> the probe's `name`/`arguments` shape — because then its intended sandbox
+> transform is unknown. Do not rely on a tool-call `DENY` to gate which agents
+> may launch; there is no agent-start policy phase today.
+
 #### `deny_pii_in_llm_request`
 
 Scans user messages and LLM prompts for PII patterns (SSN, credit card, email, phone).
@@ -333,6 +347,15 @@ daily_budget:
 #### `github_policy`
 
 Controls GitHub access across MCP tools and `git`/`gh` shell commands. Restricts reads to an allowlist (unless `read_all`) and writes to specific repos/branches. Shell commands with ambiguous targets return ASK.
+
+Shell comments, here-documents (including here-strings), line continuations, and
+command substitutions are not classified. Completed command segments before
+and after these regions retain their policy decisions when the parser can
+determine their boundaries, including commands surrounding a comment. Unsupported
+syntax adds an ASK decision; DENY takes precedence over ASK, which takes
+precedence over ALLOW. Substitutions inside double quotes
+also require approval, as do ANSI-C (`$'...'`) and locale-specific (`$"..."`)
+quoting. Ordinary single-quoted or escaped literal delimiters remain arguments.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -399,6 +422,13 @@ Controls Google Calendar access. Defaults to read-only.
 #### `block_working_dir_changes`
 
 Blocks shell commands that change the working directory (`cd`, `pushd`, `git -C`) or manage git worktrees. Parses chained and wrapped commands to prevent trivial bypasses.
+
+Shell comments, here-documents (including here-strings), line continuations, and
+command substitutions take the configured `action` because the parser cannot
+classify them reliably. This also applies when the visible command does not
+change directories. ANSI-C (`$'...'`) and locale-specific (`$"..."`) quoting also
+take this action; ordinary single-quoted or escaped literal delimiters remain
+arguments.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|

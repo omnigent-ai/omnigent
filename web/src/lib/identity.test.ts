@@ -27,6 +27,9 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+  vi.doUnmock("./host");
+  vi.doUnmock("./sessionHost");
 });
 
 describe("resolveIdentity", () => {
@@ -285,6 +288,7 @@ describe("authenticatedFetch", () => {
           getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
           hostFetch: fetchMock,
           isDatabricksWorkspace: vi.fn(() => true),
+          isHostRoutingEnabled: vi.fn(() => true),
         }));
         const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
         const resolve = vi.fn(async (sessionId: string) => {
@@ -319,6 +323,7 @@ describe("authenticatedFetch", () => {
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
+        isHostRoutingEnabled: vi.fn(() => true),
       }));
 
       fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
@@ -351,6 +356,7 @@ describe("authenticatedFetch", () => {
         getOmnigentHostConfig: vi.fn(() => ({})),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
+        isHostRoutingEnabled: vi.fn(() => true),
       }));
 
       fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
@@ -377,6 +383,7 @@ describe("authenticatedFetch", () => {
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
+        isHostRoutingEnabled: vi.fn(() => true),
       }));
 
       const wrongReplicaResponse = {
@@ -419,6 +426,7 @@ describe("authenticatedFetch", () => {
           getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
           hostFetch: fetchMock,
           isDatabricksWorkspace: vi.fn(() => true),
+          isHostRoutingEnabled: vi.fn(() => true),
         }));
         const { authenticatedFetch } = await import("./identity");
         fetchMock
@@ -479,6 +487,7 @@ describe("authenticatedFetch", () => {
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
+        isHostRoutingEnabled: vi.fn(() => true),
       }));
 
       fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
@@ -493,6 +502,81 @@ describe("authenticatedFetch", () => {
       const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
       expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_target");
     });
+  });
+});
+
+describe("OSS host routing", () => {
+  beforeEach(() => {
+    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+  });
+
+  it("resolves a cold session's host before sending a runner request", async () => {
+    const { setSessionHost } = await import("./sessionHost");
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ host_id: "host_oss" }));
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+    const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+    setSessionHostResolver(async (id) => {
+      const response = await authenticatedFetch(`/v1/sessions/${id}`);
+      const session = await response.json();
+      setSessionHost(id, session.host_id);
+    });
+
+    await authenticatedFetch("/v1/sessions/sess_oss/resources/terminals");
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/sess_oss");
+    const headers = new Headers((fetchMock.mock.calls[1][1] as RequestInit).headers);
+    expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_oss");
+  });
+
+  it("retries a failed OSS host lookup on the next request", async () => {
+    const { setSessionHost } = await import("./sessionHost");
+    const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+    const resolve = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Server restarting"))
+      .mockImplementationOnce(async (id: string) => setSessionHost(id, "host_oss"));
+    setSessionHostResolver(resolve);
+    fetchMock.mockImplementation(async (_url, init: RequestInit) =>
+      new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key") === "host_oss"
+        ? Response.json({})
+        : Response.json({ error: { code: "wrong_replica" } }, { status: 400 }),
+    );
+
+    const url = "/v1/sessions/sess_oss/resources/terminals";
+    expect((await authenticatedFetch(url)).status).toBe(400);
+    expect((await authenticatedFetch(url)).status).toBe(200);
+    expect(resolve).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("remembers a successful hostless OSS lookup", async () => {
+    const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+    const resolve = vi.fn(async () => {});
+    setSessionHostResolver(resolve);
+    fetchMock.mockResolvedValue(Response.json({}));
+
+    const url = "/v1/sessions/sess_oss/resources/terminals";
+    expect((await authenticatedFetch(url)).status).toBe(200);
+    expect((await authenticatedFetch(url)).status).toBe(200);
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the host key when a rollout temporarily returns wrong_replica", async () => {
+    const { setSessionHost, isHostKeyless } = await import("./sessionHost");
+    setSessionHost("sess_oss", "host_oss");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ error: { code: "wrong_replica" } }, { ok: false, status: 400 }),
+    );
+    const { authenticatedFetch } = await import("./identity");
+
+    const response = await authenticatedFetch("/v1/sessions/sess_oss/resources/terminals");
+
+    expect(response.status).toBe(400);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(isHostKeyless("host_oss")).toBe(false);
+    const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+    expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_oss");
   });
 });
 

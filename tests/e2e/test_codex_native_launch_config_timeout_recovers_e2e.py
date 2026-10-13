@@ -1,39 +1,12 @@
-"""E2E: a native Codex terminal launch recovers from a transient config-fetch timeout.
+"""E2E: Codex starts when launch-metadata HTTP reads fail.
 
-The runner's ``_codex_native_launch_config`` fetches the session snapshot with
-``GET /v1/sessions/<id>`` (a short client timeout) to build the Codex launch
-config. Under load that one read can exceed the timeout and raise
-``httpx.ReadTimeout``. Historically the function re-raised it as
-``RuntimeError("Could not fetch Codex launch config for '<id>'.")``, and that
-single transient blip tore through every Codex-terminal entry point:
+With a complete initialization envelope, every config GET raises ReadTimeout:
+the terminal must launch without attempting that callback. Without an
+envelope, the first GET raises ReadTimeout and the next uses the real server:
+the legacy-server path must retry and launch successfully.
 
-* the **launch** path (``_launch_native_terminal`` -> ``_auto_create_codex_terminal``)
-  logged ``Failed to auto-create codex terminal for <id>`` and published
-  ``session.status: failed``;
-* the **ensure** path (``_ensure_native_terminal`` -> ``_auto_create_codex_terminal``)
-  logged ``Codex terminal ensure failed for session=<id>`` and returned HTTP 500
-  ``native_terminal_start_failed``;
-* the next **user turn** on that session was then rejected with a durable
-  ``error`` item ("Native Codex terminal failed to start").
-
-The read is idempotent, so a bounded retry rides over one blip instead of
-failing the whole launch. This test proves that behavior end to end.
-
-It drives the REAL user journey: a real ``omnigent server`` subprocess, a real
-runner subprocess bound over the tunnel, a real codex-native wrapper session.
-The only injected element is the transient fault -- the runner is booted with
-``_codex_native_launch_config`` wrapped so the *first* snapshot ``GET`` raises
-the exact ``httpx.ReadTimeout`` the deployed stack showed, then delegates to the
-real client (which succeeds). So the production ``try``/retry runs for real, and
-all of the launch / ensure machinery below is unmodified product code.
-
-On a build that never retries a transient config-fetch timeout, the first fetch
-aborts the launch: ``Failed to auto-create codex terminal`` is logged and the
-ensure path returns ``native_terminal_start_failed`` -- the assertions below
-fail. On a build that retries the idempotent read, the launch recovers on the
-second attempt: the terminal is auto-created, ``Auto-created codex terminal +
-forwarder`` is logged, and the ensure path returns the terminal view -- the
-assertions pass.
+Both cases start an isolated real server, runner, Codex app-server and TUI,
+then ensure the terminal through the public API. No model turn is requested.
 
 Run::
 
@@ -58,42 +31,43 @@ from tests._helpers.server_runner import server_runner
 _http = httpx.Client(trust_env=False)
 
 
-# Runner bootstrap: wrap ``_codex_native_launch_config`` so only the FIRST
-# snapshot GET raises the deployed ``httpx.ReadTimeout``; every later attempt
-# delegates to the real client and succeeds. The REAL function body then runs
-# its production fetch-and-retry: an un-retried build re-raises on the first
-# timeout (launch fails); a build that retries the idempotent read recovers on
-# the second attempt (launch succeeds). No other runner->server call is touched.
+# Fault only the launch-config loader's HTTP client. Other runner requests
+# still use the real server, including initialization and terminal ensure.
 _RUNNER_BOOTSTRAP = """
 import httpx
 import omnigent.runner.native.orchestration as _orch
 
 _orig_launch_config = _orch._codex_native_launch_config
+_USE_ENVELOPE = __USE_ENVELOPE__
 
 
-class _FirstConfigFetchTimesOut:
+class _ConfigFetchTimesOut:
     def __init__(self, real):
         self._real = real
         self._failed_once = False
 
     async def get(self, url, *args, **kwargs):
-        if not self._failed_once:
+        if _USE_ENVELOPE or not self._failed_once:
             self._failed_once = True
             raise httpx.ReadTimeout(
-                "simulated first-attempt runner->server GET /v1/sessions read timeout",
+                "simulated runner->server GET /v1/sessions read timeout",
                 request=httpx.Request("GET", url),
             )
         return await self._real.get(url, *args, **kwargs)
 
 
-async def _launch_config_first_fetch_times_out(*, session_id, server_client):
-    return await _orig_launch_config(
-        session_id=session_id,
-        server_client=_FirstConfigFetchTimesOut(server_client),
-    )
+async def _launch_config_with_fault(*, session_id, server_client, session_init=None):
+    kwargs = {
+        "session_id": session_id,
+        "server_client": _ConfigFetchTimesOut(server_client),
+    }
+    if _USE_ENVELOPE:
+        assert session_init is not None, "test server must supply initialization metadata"
+        kwargs["session_init"] = session_init
+    return await _orig_launch_config(**kwargs)
 
 
-_orch._codex_native_launch_config = _launch_config_first_fetch_times_out
+_orch._codex_native_launch_config = _launch_config_with_fault
 
 from omnigent.runner._entry import main
 
@@ -101,8 +75,7 @@ main()
 """
 
 _POLL_S = 1.0
-# Terminal auto-create includes the pre-launch snapshot read + spec resolve, one
-# retried config fetch, then the tmux terminal + forwarder wiring; generous for CI.
+# Allow time for spec resolution, legacy retries, and terminal/forwarder startup.
 _LAUNCH_TIMEOUT_S = 180.0
 
 pytestmark = [
@@ -112,24 +85,17 @@ pytestmark = [
     ),
     pytest.mark.skipif(
         shutil.which("codex") is None,
-        reason="the recovered launch starts the codex CLI; codex not installed",
+        reason="the launch starts the codex CLI; codex not installed",
     ),
 ]
 
 
-def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
+@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
+def test_codex_native_launch_handles_config_fetch_timeouts(
     tmp_path: Path,
+    use_envelope: bool,
 ) -> None:
-    """A first-attempt config-fetch ReadTimeout is retried and the launch recovers.
-
-    Journey (the reporter's): a codex-native session is bound to a runner; the
-    runner's ``GET /v1/sessions/<id>`` launch-config read times out once under
-    load. On the fixed build the idempotent read is retried, the Codex terminal
-    is auto-created, and opening the terminal succeeds -- so the user's terminal
-    launches instead of erroring.
-
-    :param tmp_path: Per-test temp dir (server DB, runner HOME, workspace).
-    """
+    """Initialization avoids failing reads; legacy metadata reads still retry."""
     # Pin the runner's process log to a known file so the launch records are
     # readable from the test without globbing ~/.omnigent/logs/runner/.
     runner_log_file = tmp_path / "runner-process.log"
@@ -137,7 +103,7 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
     with server_runner(tmp_path) as stack:
         base_url, runner_id = stack.base_url, stack.runner_id
         stack.start_runner(
-            bootstrap=_RUNNER_BOOTSTRAP,
+            bootstrap=_RUNNER_BOOTSTRAP.replace("__USE_ENVELOPE__", str(use_envelope)),
             env={
                 "OMNIGENT_PROCESS_LOG_FILE": str(runner_log_file),
                 "OMNIGENT_LOG_LEVEL": "INFO",
@@ -149,9 +115,7 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
 
         session_id = str(create_native_session(_http, base_url, harness="codex")["session_id"])
 
-        # ---- Launch path: binding the runner auto-creates the Codex terminal.
-        # The first launch-config fetch times out; the retried read recovers and
-        # the terminal is created. ----
+        # Binding the runner must create a terminal despite the injected fault.
         _http.patch(
             f"{base_url}/v1/sessions/{session_id}",
             json={"runner_id": runner_id},
@@ -159,31 +123,28 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
         ).raise_for_status()
 
         deadline = time.monotonic() + _LAUNCH_TIMEOUT_S
-        launch_recovered = False
+        launched = False
         while time.monotonic() < deadline:
             log = _runner_log()
             if f"Auto-created codex terminal + forwarder for session {session_id}" in log:
-                launch_recovered = True
+                launched = True
                 break
             if f"Failed to auto-create codex terminal for {session_id}" in log:
-                # The launch aborted on the transient timeout instead of
-                # recovering -- the reported (un-retried) behavior.
                 break
             time.sleep(_POLL_S)
         log = _runner_log()
-        assert launch_recovered, (
-            "codex terminal launch did not recover from the first-attempt config-fetch "
-            f"timeout (expected 'Auto-created codex terminal + forwarder for session "
+        assert launched, (
+            "codex terminal did not launch with config-fetch faults "
+            f"(expected 'Auto-created codex terminal + forwarder for session "
             f"{session_id}'); runner log:\n{log[-4000:]}"
         )
         assert f"Failed to auto-create codex terminal for {session_id}" not in log, (
-            "launch logged an auto-create failure despite recovering; the transient "
-            f"config-fetch timeout was not ridden out. runner log:\n{log[-4000:]}"
+            f"launch logged an auto-create failure; runner log:\n{log[-4000:]}"
         )
+        retried = "Transient Codex launch-config fetch error" in log
+        assert retried == (not use_envelope), log[-4000:]
 
-        # ---- Ensure path: opening the terminal returns the created terminal
-        # view, not the native_terminal_start_failed error the un-retried build
-        # produced. ----
+        # Opening the terminal must return the resource created during startup.
         ensure = _http.post(
             f"{base_url}/v1/sessions/{session_id}/resources/terminals",
             json={
@@ -194,7 +155,7 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
             timeout=_LAUNCH_TIMEOUT_S,
         )
         assert ensure.status_code < 400, (
-            f"terminal ensure failed after launch recovery: {ensure.status_code} "
+            f"terminal ensure failed after launch: {ensure.status_code} "
             f"{ensure.text[:500]}; runner log:\n{_runner_log()[-4000:]}"
         )
         try:
@@ -203,9 +164,9 @@ def test_codex_native_launch_recovers_from_transient_config_fetch_timeout(
             ensure_body = {}
         ensure_error = ensure_body.get("error") if isinstance(ensure_body, dict) else None
         assert not (isinstance(ensure_error, dict) and ensure_error.get("code")), (
-            f"ensure returned a structured error despite launch recovery: {ensure.text[:500]}"
+            f"ensure returned a structured error after launch: {ensure.text[:500]}"
         )
         assert f"Codex terminal ensure failed for session={session_id}" not in _runner_log(), (
-            "ensure path logged a start failure despite the launch having recovered; "
+            "ensure path logged a start failure after successful launch; "
             f"runner log:\n{_runner_log()[-4000:]}"
         )

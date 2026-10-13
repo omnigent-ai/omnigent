@@ -226,7 +226,7 @@ describe("customTheme", () => {
     expect(variants.dark.shellBackground).toBe(PALETTES[0].tokens.dark.shellBackground);
   });
 
-  it("keeps muted helper text at WCAG AA contrast for every allowed contrast setting", () => {
+  it("keeps helper text and links readable across custom contrast settings", () => {
     const channel = (hex: string, offset: number) => {
       const value = Number.parseInt(hex.slice(offset, offset + 2), 16) / 255;
       return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
@@ -255,6 +255,7 @@ describe("customTheme", () => {
         variants.light.muted,
       ]) {
         expect(ratio(variants.light.mutedForeground, surface)).toBeGreaterThanOrEqual(4.5);
+        expect(ratio(variants.light.link, surface)).toBeGreaterThanOrEqual(4.5);
       }
       for (const surface of [
         variants.dark.background,
@@ -262,6 +263,7 @@ describe("customTheme", () => {
         variants.dark.muted,
       ]) {
         expect(ratio(variants.dark.mutedForeground, surface)).toBeGreaterThanOrEqual(4.5);
+        expect(ratio(variants.dark.link, surface)).toBeGreaterThanOrEqual(4.5);
       }
     }
   });

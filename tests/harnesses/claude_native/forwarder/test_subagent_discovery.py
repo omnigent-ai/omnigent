@@ -698,3 +698,110 @@ async def test_subagent_watcher_preserves_parked_sentinel_across_restart(
             await task
 
     assert starts == [], f"forwarder retried a parked sub-agent after restart: {starts!r}"
+
+
+def _inherited_spawn_record(tool_use_id: str, description: str) -> dict[str, Any]:
+    """A fork's own transcript row: a sidechain copy of the Agent record that
+    spawned it, inherited when the fork cloned the parent conversation."""
+    return {
+        "isSidechain": True,
+        "type": "assistant",
+        "uuid": f"inherited-spawn-{tool_use_id}",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": "Agent",
+                    "input": {"description": description},
+                }
+            ],
+        },
+    }
+
+
+def test_fork_inherited_spawn_record_resolves_to_the_real_parent(
+    tmp_path: Path,
+) -> None:
+    """A fork's inherited spawn copy must not strand its own spawn id.
+
+    Claude's ``fork`` agent clones the parent conversation, so the fork's own
+    ``agent-<id>.jsonl`` carries a sidechain copy of the Agent/Task record that
+    spawned it. The spawn id must still resolve to its real issuer (the root
+    transcript, ``None`` here) and not be dropped as ambiguous — being dropped
+    is what strands the fork with no parent.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-fork",
+        agent_type="fork",
+        description="continue in the background",
+        tool_use_id="toolu_fork",
+        transcript_records=[_inherited_spawn_record("toolu_fork", "continue in the background")],
+    )
+
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    owners = forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir)
+
+    assert "toolu_fork" in owners, "fork spawn id was dropped as ambiguous"
+    assert owners["toolu_fork"] is None, "fork should attach to the root transcript"
+
+
+async def test_fork_subagent_inheriting_its_own_spawn_record_registers(
+    tmp_path: Path,
+) -> None:
+    """End to end: a background ``fork`` sub-agent registers as a child row.
+
+    Before the fix the fork's inherited copy of its own spawn record made its
+    spawn id ambiguous, so correlation dropped it and the fork never appeared
+    in the Agents rail — the OMNI-11924 symptom. A non-inheriting sub-agent
+    (e.g. ``general-purpose``) was unaffected and is covered by the tests
+    above.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-fork",
+        agent_type="fork",
+        description="continue in the background",
+        tool_use_id="toolu_fork",
+        transcript_records=[_inherited_spawn_record("toolu_fork", "continue in the background")],
+    )
+
+    start_paths: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_paths[subagent_id] = request.url.path
+        return httpx.Response(
+            202,
+            json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert start_paths == {"a-fork": "/v1/sessions/conv_root/events"}
+    assert state.subagents["a-fork"].child_conversation_id == "conv_a-fork"
+    assert state.subagents["a-fork"].parent_subagent_id is None

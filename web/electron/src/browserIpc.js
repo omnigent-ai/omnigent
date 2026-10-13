@@ -256,7 +256,14 @@ function makeDesignModeInputHandler(gestureState) {
  *          (import('./browserViewRegistry').Registry | null)} deps.getRegistryForEvent
  *        Resolves the sender window's own browser-view registry.
  */
-function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent }) {
+function registerBrowserIpc({
+  ipcMain,
+  isPinnedOriginSender,
+  getRegistryForEvent,
+  getAgentContextForEvent = () => null,
+  recoverAgentNavigationForEvent = async () => false,
+  getAgentNavigationHintForEvent = () => null,
+}) {
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
    * `{ registry }` on success or `{ error }` (a structured result, never a
@@ -284,14 +291,42 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
   // intent). Returns the registry's structured `{ ok, created, error }`.
-  ipcMain.handle("omnigent:browser-open-or-navigate", (event, args) => {
+  ipcMain.handle("omnigent:browser-open-or-navigate", async (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
     const { conversationId, url, bounds, opts } = args ?? {};
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const r = g.registry.openOrNavigate(conversationId, url, bounds, opts);
+    const navigate = (registry) =>
+      registry.openOrNavigate(conversationId, url, bounds, {
+        force: !!opts?.force,
+        agent: !!opts?.agent,
+        // The first-party renderer supplies the source-session host; main owns
+        // the target and eligibility. Caller exception flags never establish identity.
+        agentContext: opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null,
+      });
+    let r = navigate(g.registry);
+    let recovered = false;
+    if (!r.ok && opts?.agent) {
+      try {
+        recovered = await recoverAgentNavigationForEvent(
+          event,
+          url,
+          opts?.sourceHostId,
+          opts?.rememberedArcaHostId,
+          opts?.sourceIsArcaHost,
+        );
+      } catch {
+        recovered = false;
+      }
+    }
+    if (recovered) {
+      // Recovery updates main-owned identity, so rebuild the context and ask
+      // the registry to evaluate the same navigation once more.
+      const refreshed = gateRegistry(event);
+      if (!refreshed.error) r = navigate(refreshed.registry);
+    }
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.
     if (r.ok && r.created && r.entry) {
@@ -302,7 +337,21 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
       });
     }
     // Strip the non-serializable `entry` before it crosses the IPC boundary.
-    return { ok: r.ok, created: r.created ?? false, error: r.error };
+    const hint =
+      !r.ok && opts?.agent
+        ? getAgentNavigationHintForEvent(
+            event,
+            url,
+            opts?.sourceHostId,
+            opts?.rememberedArcaHostId,
+            opts?.sourceIsArcaHost,
+          )
+        : null;
+    return {
+      ok: r.ok,
+      created: r.created ?? false,
+      error: hint ? `${r.error} ${hint}` : r.error,
+    };
   });
 
   // Attach the named conversation's view to the host window (detaching the

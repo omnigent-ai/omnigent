@@ -16,9 +16,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceChangedFiles: vi.fn(),
   useWorkspaceServeable: vi.fn(),
+  useWorkspaceEnvironment: vi.fn(),
 }));
 
-import { useWorkspaceChangedFiles, useWorkspaceServeable } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  useWorkspaceChangedFiles,
+  useWorkspaceEnvironment,
+  useWorkspaceServeable,
+} from "@/hooks/useWorkspaceChangedFiles";
 import { useFileDiff } from "./useFileDiff";
 
 const serveableMock = vi.mocked(useWorkspaceServeable);
@@ -50,6 +55,9 @@ beforeEach(() => {
   fetchMock.mockReset();
   serveableMock.mockReset();
   changedFilesMock.mockReset();
+  vi.mocked(useWorkspaceEnvironment).mockReturnValue({ data: undefined } as ReturnType<
+    typeof useWorkspaceEnvironment
+  >);
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -57,11 +65,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function renderDiff(conversationId: string | undefined, path: string | null) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderDiff(
+  conversationId: string | undefined,
+  path: string | null,
+  options: { requested?: boolean } = {},
+  retry: boolean | number = false,
+) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry, retryDelay: 0 } } });
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client: queryClient }, children);
-  return renderHook(() => useFileDiff(conversationId, path), { wrapper });
+  return renderHook(() => useFileDiff(conversationId, path, options), { wrapper });
 }
 
 describe("useFileDiff — enable gate", () => {
@@ -151,6 +164,73 @@ describe("useFileDiff — enable gate", () => {
     const { result } = renderDiff("conv_1", "a.ts");
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useFileDiff — requested diff before discovery", () => {
+  it("fetches a requested diff while the changed-files list is unresolved", async () => {
+    setHooks({ serveable: undefined });
+    fetchMock.mockResolvedValueOnce(mockResponse({ path: "a.ts", before: null, after: "new" }));
+    const { result } = renderDiff("conv_1", "a.ts", { requested: true });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { serveable: false, changedPaths: undefined },
+    { serveable: true, changedPaths: [] },
+    { serveable: true, changedPaths: ["other.ts"] },
+  ])("keeps offline and known-unchanged gates: %o", (state) => {
+    setHooks(state);
+    renderDiff("conv_1", "a.ts", { requested: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not request a diff when the workspace environment is known unavailable", () => {
+    setHooks({ serveable: true });
+    vi.mocked(useWorkspaceEnvironment).mockReturnValue({
+      data: { available: false },
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    renderDiff("conv_1", "a.ts", { requested: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "does not retry an early 404 when discovery resolves mid-request: %s",
+    async (discoveryResolves) => {
+      setHooks({ serveable: true });
+      let resolveResponse!: (response: Response) => void;
+      fetchMock.mockReturnValue(
+        new Promise<Response>((resolve) => {
+          resolveResponse = resolve;
+        }),
+      );
+      const { result, rerender } = renderDiff("conv_1", "a.ts", { requested: true }, 3);
+      if (discoveryResolves) {
+        setHooks({ serveable: true, changedPaths: ["a.ts"] });
+        rerender();
+      }
+      resolveResponse(mockResponse({}, { ok: false, status: 404 }));
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(result.current.failureCount).toBe(1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("does not bypass discovery after the changed-files query fails", () => {
+    setHooks({ serveable: true });
+    changedFilesMock.mockReturnValue({
+      data: undefined,
+      isError: true,
+    } as ReturnType<typeof useWorkspaceChangedFiles>);
+    renderDiff("conv_1", "a.ts", { requested: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not request a diff for a client-only temporary session", () => {
+    setHooks({ serveable: true });
+    renderDiff("temp:pending", "a.ts", { requested: true });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

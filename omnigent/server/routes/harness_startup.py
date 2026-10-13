@@ -30,7 +30,7 @@ def create_harness_startup_router(
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/startup")
     async def get_harness_startup(request: Request, host_id: str, harness: str) -> HarnessStartup:
-        """Read the binary, source, and argument count; never argument values."""
+        """Read host launch defaults, configured invocation, and env-wrapper settings."""
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(
             resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store

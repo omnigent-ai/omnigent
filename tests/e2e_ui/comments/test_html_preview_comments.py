@@ -182,6 +182,92 @@ def test_html_preview_add_comment(
     assert comment["end_index"] == raw_idx + len(_ANCHOR_SENTENCE)
 
 
+def test_html_comment_external_runtime_connects_under_strict_csp(
+    page: Page,
+    built_spa: None,
+) -> None:
+    """The emitted external bridge connects when inherited CSP blocks inline JS."""
+    del built_spa
+    assets = list(
+        (_REPO_ROOT / "omnigent/server/static/web-ui/assets").glob("htmlCommentBridgeRuntime-*.js")
+    )
+    assert len(assets) == 1, f"expected one emitted bridge asset, found {assets}"
+
+    probe_url = "https://app.example/probe"
+    asset_url = f"https://app.example/assets/{assets[0].name}"
+    page.route(
+        probe_url,
+        lambda route: route.fulfill(
+            body="<!doctype html><html><body></body></html>",
+            content_type="text/html",
+            headers={"content-security-policy": "default-src 'self'; script-src 'self'"},
+        ),
+    )
+    page.route(
+        asset_url,
+        lambda route: route.fulfill(path=assets[0], content_type="application/javascript"),
+    )
+    page.goto(probe_url)
+
+    nonce = "external-bridge-e2e"
+    page.evaluate(
+        r"""
+        ({ assetUrl, nonce }) => {
+          const protocol = JSON.stringify({
+            source: "omni-html-comment",
+            types: {
+              init: "omni:init",
+              ready: "omni:ready",
+              setComments: "omni:setComments",
+              setActive: "omni:setActive",
+              selection: "omni:selection",
+              commentClick: "omni:commentClick",
+              selectionCleared: "omni:selectionCleared",
+            },
+          }).replaceAll("&", "&amp;").replaceAll('"', "&quot;");
+          const iframe = document.createElement("iframe");
+          iframe.id = "external-bridge-probe";
+          iframe.dataset.ready = "false";
+          iframe.setAttribute("sandbox", "allow-scripts");
+          iframe.addEventListener("load", () => {
+            const channel = new MessageChannel();
+            channel.port1.onmessage = (event) => {
+              const message = event.data;
+              if (
+                message?.source === "omni-html-comment" &&
+                message?.nonce === nonce &&
+                message?.type === "omni:ready"
+              ) {
+                iframe.dataset.ready = "true";
+              }
+            };
+            iframe.contentWindow.postMessage(
+              { source: "omni-html-comment", nonce, type: "omni:init" },
+              "*",
+              [channel.port2],
+            );
+          });
+          iframe.srcdoc = `<!doctype html><html><body>
+            <script>window.__omniCspInlineCanary = true;<\/script>
+            <script src="${assetUrl}" data-omni-nonce="${nonce}"
+              data-omni-protocol="${protocol}"><\/script>
+          </body></html>`;
+          document.body.append(iframe);
+        }
+        """,
+        {"assetUrl": asset_url, "nonce": nonce},
+    )
+
+    iframe_el = page.locator("#external-bridge-probe")
+    expect(iframe_el).to_have_attribute("data-ready", "true", timeout=10_000)
+    preview = page.frame_locator("#external-bridge-probe")
+    expect(preview.locator(f'script[src="{asset_url}"][data-omni-nonce="{nonce}"]')).to_have_count(
+        1
+    )
+    canary_ran = preview.locator("body").evaluate("() => window.__omniCspInlineCanary === true")
+    assert not canary_ran, "inline canary ran; CSP did not reach the srcdoc frame"
+
+
 def _open_preview(page: Page, base_url: str, session_id: str):
     """Navigate to the HTML file and return the (file_viewer, preview) locators."""
     page.set_viewport_size({"width": 1600, "height": 900})

@@ -14,7 +14,7 @@ from omnigent.errors import OmnigentError
 from omnigent.models import model_catalog
 from omnigent.models.model_catalog import ModelEntry, ModelListing
 from omnigent.models.model_metadata import ModelMetadata, ModelReasoningMetadata, ModelWireAPI
-from omnigent.server.inference_catalog import SandboxInferenceService
+from omnigent.server.inference_catalog import SandboxInferenceService, ambient_gateway_providers
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
@@ -734,3 +734,183 @@ async def test_another_saved_binding_cannot_persist_embedded_credentials(field, 
         )
     assert "inline-test-secret" not in str(error.value)
     assert "user:secret" not in str(error.value)
+
+
+def _unbound_state(*, discovery=True, wire="responses"):
+    config = {
+        "providers": {
+            "team_gateway": {
+                "kind": "gateway",
+                "display_name": "Team AI Gateway",
+                "openai": {
+                    "base_url": "https://inference.example/v1",
+                    "api_key_ref": "env:POD_INFERENCE_KEY",
+                    "wire_api": wire,
+                },
+            }
+        }
+    }
+    target = ManagedSandboxConfig(
+        server_url="http://localhost:6767",
+        launcher_factory=lambda: None,
+        token_ttl_s=100,
+        provider="islo",
+        host_config=config,
+        model_discovery={
+            "team_gateway": {
+                "base_url": "https://catalog.example/v1",
+                "api_key_ref": "env:INFERENCE_CATALOG_KEY",
+            }
+        }
+        if discovery
+        else {},
+    )
+    return SimpleNamespace(
+        sandbox_config=ManagedSandboxDeployment.single(target),
+        databricks_store=None,
+        databricks_client=None,
+    )
+
+
+def test_ambient_gateway_providers_exclude_bound_and_undiscoverable_targets():
+    bound = _state().sandbox_config.default
+    assert ambient_gateway_providers(bound.host_config, bound.model_discovery) == {}
+    unbound = _unbound_state().sandbox_config.default
+    assert list(ambient_gateway_providers(unbound.host_config, unbound.model_discovery)) == [
+        "team_gateway"
+    ]
+    assert ambient_gateway_providers(unbound.host_config, {}) == {}
+    assert ambient_gateway_providers(None, unbound.model_discovery) == {}
+    malformed = {**unbound.host_config, "inference": "not-a-mapping"}
+    assert ambient_gateway_providers(malformed, unbound.model_discovery) == {}
+
+
+@pytest.mark.asyncio
+async def test_unbound_gateway_preview_lists_discovery_without_binding_or_pod_key():
+    state = _unbound_state()
+    requests = []
+    service = SandboxInferenceService(state, transport=_transport(requests=requests))
+    service._connection = AsyncMock(side_effect=AssertionError("Unexpected OAuth lookup"))
+    assert await service.prepare("islo", "codex-native", "alice") is None
+    preview = await service.ambient_catalog("islo", "codex-native", "alice")
+    assert preview is not None
+    assert preview["status"] == "ready"
+    assert preview["configured"] is False
+    assert preview["configuration_revision"] is None
+    assert preview["default_model"] is None
+    assert preview["provider_label"] == "Team AI Gateway"
+    assert [(row["id"], row["isDefault"]) for row in preview["models"]] == [
+        ("gateway/main", False),
+        ("gateway/fast", False),
+        ("gateway/noisy", False),
+    ]
+    assert requests[0].url == "https://catalog.example/v1/models"
+    assert requests[0].headers["authorization"] == "Bearer catalog-test-secret"
+    assert "catalog-test-secret" not in json.dumps(preview)
+    pod_family = state.sandbox_config.default.host_config["providers"]["team_gateway"]["openai"]
+    assert pod_family["api_key_ref"] == "env:POD_INFERENCE_KEY"
+    service._connection.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "build,harness",
+    [
+        (lambda: _unbound_state(discovery=False), "codex-native"),
+        (lambda: _unbound_state(), "claude-native"),
+        (lambda: _unbound_state(wire="chat"), "codex-native"),
+        (lambda: _unbound_state(), "cursor-native"),
+        (lambda: _state(), "codex-native"),
+    ],
+    ids=[
+        "no-discovery",
+        "no-family-endpoint",
+        "wrong-wire",
+        "unsupported-harness",
+        "bound-target",
+    ],
+)
+async def test_unbound_gateway_preview_requires_a_discoverable_compatible_gateway(build, harness):
+    state = build()
+    requests = []
+    service = SandboxInferenceService(state, transport=_transport(requests=requests))
+    provider = state.sandbox_config.default.provider
+    assert await service.ambient_catalog(provider, harness, "alice") is None
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_unbound_gateway_preview_failure_is_redacted_and_keeps_harness_default():
+    def fail(request):
+        return httpx.Response(401, json={"message": "upstream-secret"})
+
+    preview = await SandboxInferenceService(
+        _unbound_state(), transport=httpx.MockTransport(fail)
+    ).ambient_catalog("islo", "codex-native", "alice")
+    assert preview is not None
+    assert preview["status"] == "unavailable"
+    assert preview["configured"] is False
+    assert preview["models"] == []
+    assert "upstream-secret" not in json.dumps(preview)
+
+
+@pytest.mark.asyncio
+async def test_unbound_gateway_preview_falls_back_to_the_first_configured_gateway():
+    state = _unbound_state()
+    target = state.sandbox_config.default
+    target.host_config["providers"]["second"] = {
+        "kind": "gateway",
+        "display_name": "Second",
+        "openai": {
+            "base_url": "https://second.example/v1",
+            "api_key_ref": "env:POD_INFERENCE_KEY",
+            "wire_api": "responses",
+        },
+    }
+    target.model_discovery["second"] = {
+        "base_url": "https://second.example/v1",
+        "api_key_ref": "env:INFERENCE_CATALOG_KEY",
+    }
+    requests = []
+    preview = await SandboxInferenceService(
+        state, transport=_transport(requests=requests)
+    ).ambient_catalog("islo", "codex-native", "alice")
+    assert preview is not None
+    assert preview["provider_label"] == "Team AI Gateway"
+    assert [request.url.host for request in requests] == ["catalog.example"]
+
+
+@pytest.mark.asyncio
+async def test_unbound_gateway_preview_prefers_the_family_default_gateway():
+    state = _unbound_state()
+    target = state.sandbox_config.default
+    target.host_config["providers"]["chat_only"] = {
+        "kind": "gateway",
+        "openai": {
+            "base_url": "https://chat.example/v1",
+            "api_key_ref": "env:POD_INFERENCE_KEY",
+            "wire_api": "chat",
+        },
+    }
+    target.host_config["providers"]["preferred"] = {
+        "kind": "gateway",
+        "default": True,
+        "display_name": "Preferred",
+        "openai": {
+            "base_url": "https://preferred.example/v1",
+            "api_key_ref": "env:POD_INFERENCE_KEY",
+            "wire_api": "responses",
+        },
+    }
+    for name in ("chat_only", "preferred"):
+        target.model_discovery[name] = {
+            "base_url": f"https://{name}.example/v1",
+            "api_key_ref": "env:INFERENCE_CATALOG_KEY",
+        }
+    requests = []
+    preview = await SandboxInferenceService(
+        state, transport=_transport(requests=requests)
+    ).ambient_catalog("islo", "codex-native", "alice")
+    assert preview is not None
+    assert preview["provider_label"] == "Preferred"
+    assert [request.url.host for request in requests] == ["preferred.example"]

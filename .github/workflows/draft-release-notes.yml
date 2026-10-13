@@ -7,8 +7,8 @@ name: Draft release notes
 #   1. Open a PR to omnigent/main updating the granular CHANGELOG.md (harvested
 #      from each merged PR's "## Changelog" section or title), so the draft's
 #      "Full Changelog" link resolves before the release goes public.
-#   2. Prepend AI-written highlights to a compact list of remaining PRs
-#      grouped by contributor, then update the GitHub Release DRAFT
+#   2. Combine AI-written highlights with community thanks and a full
+#      changelog link, then update the GitHub Release DRAFT
 #      body for the coordinator to edit.
 #
 # Why `workflow_run` (not extending github-release.yml): that workflow is
@@ -146,7 +146,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # --- 1) Harvest CHANGELOG.md + the complete contribution list + agent input ---
+      # --- 1) Harvest CHANGELOG.md + fallback release notes + agent input ---
       - name: Harvest changelog and PR material
         id: harvest
         if: steps.guard.outputs.proceed == 'true'
@@ -173,7 +173,7 @@ jobs:
             args+=(--changelog-file CHANGELOG.md)
           fi
           python3 .github/scripts/changelog/generate.py "${args[@]}"
-          # The complete contribution list is also the fallback release body.
+          # Community thanks and the changelog link are the fallback release body.
           cp /tmp/mechanical_notes.md /tmp/release_notes.md
 
           if [ "$DRY_RUN" = "true" ]; then
@@ -185,7 +185,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      # --- 2) Optional AI highlights (the complete list is always preserved) ---
+      # --- 2) Optional AI highlights (all contributions remain in CHANGELOG.md) ---
       - name: Check LLM credentials
         id: creds
         if: steps.guard.outputs.proceed == 'true'
@@ -193,7 +193,7 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
           if [ -z "${LLM_API_KEY:-}" ]; then
-            echo "::warning::No LLM credentials — using the complete contribution list without highlights."
+            echo "::warning::No LLM credentials — using community thanks and the full changelog link without highlights."
             echo "available=false" >> "$GITHUB_OUTPUT"
           else
             echo "::add-mask::${LLM_API_KEY}"
@@ -214,13 +214,13 @@ jobs:
           # The agent is tools-less, so its input must be inline — but `omnigent run
           # -p` passes the whole prompt as one argv string, capped at ~128 KiB on
           # Linux (MAX_ARG_STRLEN). Cap the PR list well under that; the mechanical
-          # contribution list is appended separately and is never truncated.
+          # contribution list is preserved in CHANGELOG.md and is never truncated.
           MAX = 100_000
           pr_list = pathlib.Path("/tmp/pr_list.txt").read_text(encoding="utf-8", errors="replace")
           truncated = len(pr_list.encode("utf-8")) > MAX
           pr_list = truncate_pr_list(pr_list, MAX)
           note = ("\n> NOTE: the PR list was truncated. Summarize visible highlights; "
-                  "the workflow preserves the full contribution list separately.\n" if truncated else "")
+                  "the full contribution list remains in CHANGELOG.md.\n" if truncated else "")
           prompt = f"""Draft the release highlights for {tag}.
           {note}
           ## Merged PRs (number, title, author handle, and changelog entries)
@@ -246,7 +246,7 @@ jobs:
           llm-api-key: ${{ secrets.LLM_API_KEY }}
           model: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
 
-      - name: Combine curated highlights and contributor groups
+      - name: Combine curated highlights and community thanks
         if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
         run: |
           if python3 .github/scripts/changelog/compose_notes.py \
@@ -257,7 +257,7 @@ jobs:
             && mv /tmp/composed_notes.md /tmp/release_notes.md; then
             echo "Composed release notes."
           else
-            echo "::warning::Release-note composition failed; keeping the complete contributor groups."
+            echo "::warning::Release-note composition failed; keeping community thanks and the full changelog link."
           fi
 
       # --- 3) Mint the write-token — ONLY now, after the agent has run ---

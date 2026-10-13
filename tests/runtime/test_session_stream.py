@@ -848,6 +848,58 @@ async def test_inflight_replay_via_pre_ready_snapshot_does_not_duplicate_window_
 # ── SSE-event debug logging ───────────────────────────────────────────────────
 
 
+def test_sse_retains_nested_delivery_ids_without_consumed_content() -> None:
+    assert session_stream._sse_safe_attributes(
+        {
+            "type": "session.input.consumed",
+            "data": {
+                "item_id": "item_saved",
+                "cleared_pending_id": "pending_" + "a" * 32,
+                "data": {"content": [{"text": "private prompt"}]},
+                "created_by": "person@example.com",
+            },
+        }
+    ) == {"item_id": "item_saved", "cleared_pending_id": "pending_" + "a" * 32}
+    event = {
+        "type": "response.output_item.done",
+        "item": {"id": "error_saved", "type": "error", "response_id": "resp_nested"},
+    }
+    assert session_stream._sse_safe_attributes(event)["response_id"] == "resp_nested"
+    event["item"]["response_id"] = "x" * 256
+    assert session_stream._sse_safe_attributes(event)["response_id"] == "x" * 256
+    event["item"]["response_id"] = "x" * 257
+    assert "response_id" not in session_stream._sse_safe_attributes(event)
+    event["item"]["response_id"] = "resp_nested"
+    event["response_id"] = "resp_envelope"
+    assert session_stream._sse_safe_attributes(event)["response_id"] == "resp_envelope"
+    event["response"] = {"id": "resp_object"}
+    assert session_stream._sse_safe_attributes(event)["response_id"] == "resp_object"
+    failed = {
+        "type": "response.failed",
+        "response": {"id": "resp_failed", "error": {"message": "private failure"}},
+        "input_stable_id": "a" * 32,
+    }
+    assert session_stream._sse_safe_attributes(failed) == {
+        "response_id": "resp_failed",
+        "input_stable_id": "a" * 32,
+    }
+    failed["input_stable_id"] = "private prompt"
+    assert session_stream._sse_safe_attributes(failed) == {"response_id": "resp_failed"}
+
+
+def test_sse_consumed_id_extraction_is_event_specific_and_type_checked() -> None:
+    data = {"item_id": {"text": "private prompt"}, "cleared_pending_id": "x" * 257}
+    assert (
+        session_stream._sse_safe_attributes({"type": "session.input.consumed", "data": data}) == {}
+    )
+    assert (
+        session_stream._sse_safe_attributes(
+            {"type": "response.output_text.delta", "data": {"item_id": "private prompt"}}
+        )
+        == {}
+    )
+
+
 def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
     # The whitelist captures identifiers/dimensions and NEVER content — no model
     # text, tool arguments/outputs, message data, error messages, or the
@@ -977,6 +1029,67 @@ def test_sse_safe_attributes_omits_oversized_code() -> None:
     }
     attrs = session_stream._sse_safe_attributes(event)
     assert "item_code" not in attrs
+
+
+def test_sse_safe_attributes_uses_real_serializer_for_destructive_error() -> None:
+    # A destructive error item (no level) built through the real to_api_dict()
+    # serializer must have item_code and item_source captured, and item_level
+    # must be absent (the dashboard treats missing as "error").
+    from omnigent.entities.conversation import ConversationItem, ErrorData
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    persisted = ConversationItem(
+        id="item_destruct",
+        type="error",
+        status="completed",
+        response_id="resp_test",
+        created_at=1753900000,
+        data=ErrorData(
+            source="execution",
+            code="native_terminal_start_failed",
+            message="terminal failed to start; do not log this",
+        ),
+    )
+    event = OutputItemDoneEvent(type="response.output_item.done", item=persisted.to_api_dict())
+    attrs = session_stream._sse_safe_attributes(event.model_dump())
+    assert attrs["item_type"] == "error"
+    assert attrs["item_code"] == "native_terminal_start_failed"
+    assert attrs["item_source"] == "execution"
+    # No level means the dashboard should count this as a failure.
+    assert "item_level" not in attrs
+    # message text must never reach the debug table
+    assert "message" not in attrs
+    flat = repr(attrs).lower()
+    assert "terminal failed" not in flat
+    assert "do not log" not in flat
+
+
+def test_sse_safe_attributes_uses_real_serializer_for_info_notice() -> None:
+    # An info-level notice built through the real to_api_dict() serializer must
+    # have item_level="info", item_code, and item_source captured.
+    from omnigent.entities.conversation import ConversationItem, ErrorData
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    persisted = ConversationItem(
+        id="item_notice",
+        type="error",
+        status="completed",
+        response_id="resp_test",
+        created_at=1753900000,
+        data=ErrorData(
+            source="execution",
+            code="managed_sandbox_workspace_reset",
+            message="workspace reset notice; do not log this",
+            level="info",
+        ),
+    )
+    event = OutputItemDoneEvent(type="response.output_item.done", item=persisted.to_api_dict())
+    attrs = session_stream._sse_safe_attributes(event.model_dump())
+    assert attrs["item_type"] == "error"
+    assert attrs["item_level"] == "info"
+    assert attrs["item_code"] == "managed_sandbox_workspace_reset"
+    assert attrs["item_source"] == "execution"
+    assert "message" not in attrs
 
 
 @contextlib.contextmanager

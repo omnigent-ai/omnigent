@@ -10,24 +10,52 @@ the header menu), and each place is a separate entry point.
 ## Sub-features
 
 - `pin`: pinned sessions move to their own section and back.
+- `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
+  old Pinned slot. Dragging a pinned row into a folder unpins it without one.
+- `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
+  order, which persists across reloads; dropping an unpinned row onto a pinned
+  row pins it into that slot.
 - `rename`: from the row, the header menu, or the header title; long titles are
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged.
+- `stop`: Stop session on a hosted parent ends its runner, including side chats
+  and sub-agents sharing that runner. Conversation histories are kept.
+- `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
+  closing one stops only that chat. Starting one from a stopped generic hosted
+  parent relaunches the parent first, then shares its replacement runner.
+- `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
+  writable side chat; Reply on side-chat text quotes it in that chat. Both keep
+  the existing draft and attachments, and quotes can be removed before sending.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
+- `export`: Export in the header menu saves the transcript as a local file.
+- `unread`: Mark as unread re-lights a row's unread dot and Mark as read clears
+  it; the state survives a reload.
+- `project`: Add to project (Move session once filed) puts a session in a
+  project folder from the row menu, the header menu, or the header's folder tag.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
-- `fork-custom-agent`: switch to a custom agent discovered from an existing
-  session, as well as to a built-in agent; the fork uses the chosen agent.
+  For a native target, the fork dialog also offers model, reasoning effort,
+  and permission mode pickers.
+- `fork-custom-agent`: switch to one of your custom agents (installed, imported,
+  or discovered from an existing session), as well as to a built-in agent; the
+  fork uses the chosen agent.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
+- `unsupported-sandbox-actions`: Databricks Sandbox and Arclet fork and
+  host-switch controls stay visible but disabled, with hover and keyboard
+  explanations. Their forms cannot submit.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app can reconnect a local host
-  itself. States: reconnecting (spinner), reconnect failed (retry), host offline.
+  itself or explicitly reconnect a remembered Arca host. States: reconnecting
+  (spinner), reconnect failed (retry), host offline.
+- `workspace-recovery`: a missing-workspace error offers **Continue in another
+  directory…**. Choose an existing host directory to fork the conversation into
+  a new session; the original remains available and missing files are not restored.
 - `message-recovery`: a message racing initial runner binding or replacement
   reaches the available runner without a false failed turn. Native sessions
   initialize before delivery; SDK sub-agents reuse their loaded session state.
@@ -37,37 +65,155 @@ the header menu), and each place is a separate entry point.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
   per-tab.
+- `canvas-workspace`: Canvas collapses the shared sidebar on entry; clicking a
+  card opens its session beside the project board. Switching cards keeps
+  drafts and board state; resize, focus, and close controls adjust the split.
+- `canvas-mobile`: the board and selected session use the standard top-left
+  hamburger to open navigation. Back to canvas retains the selected project
+  across deep links and reloads.
+- `canvas-navigation`: Canvas uses the same collapsed-sidebar button and hover
+  preview as other pages, including the macOS titlebar controls. Opening it
+  reveals the shared destinations, including Usage when enabled.
+- `canvas-create`: the plus button on Main or a project opens the new-session
+  composer; sending returns to that board with the new session selected.
+- `canvas-session-health`: an opened Canvas session receives host health and
+  live updates even before it appears in the loaded sidebar pages.
+- `view-options`: the one filter menu, on the Projects header, with Grouping
+  (Default / Status / Updated), Display (All / My / Shared / Archived), Ordering
+  (Updated / Status) and Show (Updated / Environment / Repo / Branch) submenus,
+  saved per device. Shared sessions get their own section above Sessions. A
+  Status or Updated grouping replaces Projects, Shared and Sessions with titled
+  groups; the first group's header takes the Projects header's place. Select
+  sessions sits beside the filter and selects every list below it at once. Behind
+  the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
+  a flat Display filter and the tooltip keeps its plain layout.
 
 ## How to get to it (user POV)
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
-offer pin, rename, archive or unarchive, and delete.
+offer pin, fork, rename, mark as unread or read, add to project (or move
+session), archive or unarchive, and delete.
+
+**Pinned section drag:** drag a pinned row onto another pinned row to reorder
+the Pinned section, or drop an unpinned row onto a pinned row to pin it into
+that slot.
 
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (archive, unarchive, delete).
 
 **Session header menu:** open a session and use the menu next to its title for
-pin, fork, rename, archive or unarchive, and delete. Clicking the title also
-renames. Sub-agent sessions hide owner-only actions.
+pin, fork, export, rename, mark as unread, add to project, archive or
+unarchive, and delete. Clicking the title also renames, and the title's folder
+tag also moves the session into a project. Sub-agent sessions hide owner-only
+actions.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
-dialog, keep the agent or choose another built-in or custom agent. To make a
-custom agent available, first run a session using its spec file.
+dialog, keep the agent or choose another built-in or custom agent; for a
+native target, the dialog also shows model, reasoning effort, and permission
+mode pickers. Your custom
+agents (installed with `omnigent agent add`, imported in the Create custom agent
+dialog, or uploaded by running a session with their spec) stay available until
+you remove them.
 
-**Archived view:** switch the sidebar to archived sessions and filter by project.
+**Archived view:** choose Display → Archived sessions in the sidebar filter
+menu, then filter by project.
+
+**Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
+Projects header holds Grouping, Display, Ordering and Show. In a Status or
+Updated grouping, Projects is hidden and the funnel sits in the same spot on the
+first group's header. The Select sessions button sits beside it and selects
+project, Shared and Sessions rows together; the Sessions header keeps only New
+session. Hovering a row opens
+its tooltip; the repo and PR rows load from the session's GitHub info only once
+the tooltip opens. With the flag off, the funnel sits on the Sessions header and
+offers Display only.
+
+**Canvas:** choose Canvas in the sidebar, select Main or a project, and click
+a session card once. Expand navigation manually to keep it open while switching
+cards. Choosing Canvas in the sidebar returns to the selected board.
+Drag the divider to resize, or focus it and use Left/Right arrows to
+adjust the split and Home/End to reach its limits. Double-click the divider to
+restore the default split. Focus the session to use the full area; Escape
+restores the board. Close the session to return to the board. Opening, closing,
+or maximizing Workspace keeps the canvas visible. Session focus is independent: Show canvas
+restores the board without closing Workspace. Each card remembers whether Workspace is open.
+On mobile, the top-left hamburger opens the sidebar from the board or a selected
+session. Back to canvas returns to the selected project. A Canvas session link
+opens the same layout directly. If a session is replaced, for example after `/clear`,
+its replacement stays beside the same board.
+The plus button starts a new session in the selected canvas. After sending,
+the new session opens beside that board; on narrow screens, Back to canvas
+returns to it. Reloading a temporary session before creation finishes returns to
+the same board. Open sidebar appears on the board or, when the board is hidden,
+in the conversation header. On desktop, hovering previews the sidebar and clicking
+opens it. The macOS app uses its existing titlebar toggle, Search, and Settings.
+On macOS desktop, the board and its controls stay below the window title bar,
+including while focusing a conversation or using a narrow window.
+Open a Canvas session outside the loaded sidebar pages to see its current host
+status and live session updates, including when the app is embedded.
 
 **Reconnect:** in a session whose agent stopped, use the reconnect affordance
 in the chat; the dialog shows the command for this situation (for example
 `omnigent host` when the host is offline, or the harness's `--resume` command
-when a local session is stranded). In the desktop app, reconnect acts directly.
+when a local session is stranded). In the desktop app, reconnect acts directly
+for this machine; an Arca-hosted session offers an explicit **Reconnect Arca**
+action in the same dialog.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
 and send a follow-up after its parent runner is replaced.
 
+**Missing workspace, desktop and mobile:** open a conversation whose working
+directory is no longer available and choose **Continue in another directory…**
+on the error card. The dialog explains the new session and missing files, then
+lets you type or browse for an existing directory on a connected host. Choose
+**Continue** to open the new session with the copied conversation. A missing
+destination stays in the dialog with an error and creates no session.
+The action also appears on an eligible error card inside a Canvas conversation
+or side chat; it continues that conversation, including when another parent
+conversation is open alongside it.
+
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
+
+**Databricks Sandbox and Arclet sessions:** Fork is disabled in the header,
+sidebar menus, and message actions. The composer's host menu shows a disabled
+**Switch host…** item when you have write access. Read-only viewers retain the
+existing host menu without switching controls. Hover or focus a disabled action
+to read why it is unsupported.
+The reconnect dialog also disables Clone and Switch host; directory selection
+cannot enable either action.
+While support is being checked, actions stay disabled. If that check fails,
+the explanation asks you to reload. A missing source-host record keeps switching
+disabled while ordinary shared sessions remain forkable. Direct dialogs show a loading status without
+an action button until the check finishes; supported forms then receive keyboard focus.
+If the reconnect dialog is already on Clone when an unsupported result arrives,
+it selects Reconnect and explains the restriction.
+An open switch dialog closes when switching becomes unavailable and stays closed
+if support returns; choose Switch host again to reopen it.
+
+**Stop session:** open the parent's sidebar row menu or right-click the row and
+choose Stop session while a side chat or sub-agent is working. On mobile, open
+the sidebar drawer and long-press the row. The current-turn interrupt control is
+a separate action that leaves the session connected.
+
+**Side-chat lifecycle:** use **Workspace → + → Side chat**, type `/side` in the
+parent composer, or choose **Start a new side chat** from the composer's add
+tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
+side chats open in a drawer; the header's **Conversation actions → Side
+chats** reopens it. A generic hosted parent can start a new side chat
+after stopping; this relaunches the parent and both use one runner. Close a side
+chat with its tab's close button; the parent and sibling chats keep running. A
+chat-only side chat can also send messages from its direct `/c/<child_id>` URL
+without choosing a workspace.
+
+**Side-chat quotes:** select text in the parent conversation and choose **Ask in
+side chat**. It appends a removable quote to the visible side-chat tab, including
+an unsent tab, while keeping the draft. With no eligible tab visible, it opens a
+new unsent tab. In the desktop side-chat pane or mobile drawer, select transcript
+text and choose **Reply** to quote it in that chat's composer. Adding a quote
+does not send a message; enter a question and send when ready.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -94,9 +240,20 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
+- **`pin-undo`, sidebar row:**
+  `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_undo_unpin_restores_pinned_slot`.
+  The row menu (mobile) and header menu Unpin have web unit coverage only:
+  unpin a pinned session, click Undo on the toast, and expect it back in the
+  same Pinned position.
+- **`pin-reorder`:**
+  `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_drag_reorders_pinned_sessions`.
+  Dropping an unpinned row onto a pinned row has web unit coverage only.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
-  `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`
+  `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`.
+  The iOS drawer rename under the soft keyboard:
+  `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_keeps_sidebar_sessions_reachable`,
+  `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_scrolls_edit_row_into_view_above_keyboard`
 - **`archive`:**
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
@@ -106,18 +263,54 @@ plain `uv run pytest`, which starts a private server for the test.
   The sidebar row and bulk unarchive have web unit coverage only: archive a
   session, open the archived view, choose Unarchive on the row, and expect the
   session back in the main list.
+- **`unarchive`, Undo toast:**
+  `tests/e2e_ui/sessions/test_sidebar_lifecycle.py::test_sidebar_session_organization_round_trip`
+  archives two sessions and restores both to Mine through Undo, including after
+  a reload.
 - **`delete`:**
   `tests/e2e_ui/sessions/test_sidebar_delete.py::test_delete_session_removes_row_and_from_store`,
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_delete_removes_sessions`
+- **`export`, header menu (own environment):**
+  `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_session_menu_offers_export`,
+  `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_export_downloads_transcript`
+  seed the transcript into the spawned server's database.
+- **`unread`, sidebar row:**
+  `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_mark_unread_lights_the_dot_and_persists_across_reload`.
+  Repeat from the header menu by hand and expect the row's unread dot.
+- **`project`, sidebar row and header folder tag:**
+  `tests/e2e_ui/sessions/test_move_to_project.py::test_move_session_into_project_regroups_sidebar_row`
+  and, seeding its own environment,
+  `tests/e2e_ui/sessions/test_header_move_to_project.py::test_header_folder_tag_moves_session_into_existing_project`.
+  Repeat from the header menu's Add to project by hand and expect the row to
+  regroup under that project.
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
 - **`fork`, message cutoff:**
   `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_fork_from_middle_truncates_history`,
-  plus agent switching:
-  `tests/e2e_ui/fork_session/test_fork_switch_agent.py::test_fork_switch_agent_carries_history`
+  plus agent switching (own environment):
+  `tests/e2e_ui/fork_session/test_fork_switch_agent.py::test_fork_switch_agent_carries_history`.
+  Its SDK-to-SDK target is a built-in agent that only the test's own server
+  loads; run it with plain `uv run pytest` so that target is available.
+- **`workspace-recovery`, desktop and mobile conversation, Canvas, and side-chat cards:**
+  `tests/browser_ui/chat/test_workspace_missing_recovery.py::test_continue_missing_workspace_in_another_directory`
+  runs without a repro instance using `uv run pytest <test>
+  --browser-ui-skip-build --video=on --output=<evidence-directory>`.
+  The browser contract covers the error action, visible explanation, blank
+  destination, rejected missing directory, directory browser, preflight before
+  fork and launch, and navigation to copied history while the original remains
+  available. The new session renders the source's workspace failure as a
+  historical notice without another recovery action, including after reload.
+  All three surfaces run at desktop and phone widths; the side-chat pane and
+  mobile drawer recover the child while leaving the neighboring parent intact.
+  Host filesystem and fork/launch responses are mocked; this does not prove a
+  native CLI received history or started in that directory.
 - **`fork`, whole session and resources:**
   `tests/e2e_ui/fork_session/test_fork_preserves_image_attachment.py::test_fork_carries_image_reference_and_its_resource`.
   This uses the header menu and checks that the fork's image URL loads.
+  The dialog's permission-mode picker for native targets has component
+  coverage in `web/src/shell/ForkSessionDialog.test.tsx`; drive the model and
+  effort pickers by hand: fork a Codex session, pick another effort, and expect
+  the new session's pill to show it.
   Duration coverage:
   `tests/e2e_ui/fork_session/test_fork_retains_worked_for.py::test_fork_retains_worked_for_duration`,
   and transcript-copy integration coverage (plain `uv run pytest`):
@@ -140,10 +333,106 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`clone`:**
   `tests/e2e_ui/sessions/test_clone_session.py::test_clone_session_copies_transcript_and_navigates`,
   `tests/e2e_ui/fork_session/test_typed_workspace_enables_clone.py::test_typed_tilde_workspace_enables_clone`
-- **`reconnect`, spinner:**
+- **`unsupported-sandbox-actions`:**
+  `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_sandbox_fork_and_switch_host_disabled`
+  covers the header, sidebar context menu, message action, and composer host menu
+  at desktop and phone widths, plus the desktop sidebar dropdown. It checks
+  hover, keyboard focus, and ignored activation.
+  The server and transcript are real; Databricks Sandbox and Arclet metadata is
+  patched at the browser boundary, and no live sandbox is provisioned. Direct form
+  and reconnect guards have component coverage in `web/src/shell/ForkSessionDialog.test.tsx`,
+  `web/src/shell/SwitchHostDialog.test.tsx`, and
+  `web/src/shell/ReconnectSessionDialog.test.tsx`. Header fallbacks, including
+  mobile, are covered by `web/src/shell/ChatHeader.test.tsx`.
+  Failed lookups, recovery, hostless sessions, and shared sessions with unlisted
+  hosts are covered by `web/src/hooks/useSessionActionRestrictions.test.tsx`.
+  Host-menu loading/error explanations and the default status badge's disabled
+  action have component coverage in `web/src/components/HostBadge.test.tsx`.
+  Loading-to-enabled keyboard focus is covered there and in
+  `web/src/components/DisabledActionTooltip.test.tsx`. The fork and switch-host
+  dialog suites also cover loading-to-form focus; the tooltip suite checks that a
+  cleared explanation does not reopen without interaction.
+  Supported host-switch UI coverage:
+  `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_switches_the_session_to_another_host`
+  checks the release/launch requests with stubbed host APIs.
+- **`reconnect`, spinner (own environment):**
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
+  seeds an error item directly into the spawned server's database.
+- **`reconnect`, offline-host cause (own environment):**
+  `tests/e2e_ui/sessions/test_session_host_offline.py::test_offline_native_host_preserves_failed_turn_and_retry`
+  creates Claude/Codex native-wrapper sessions on a real disposable host, stops
+  the host and its runners, and checks the API failure and browser details.
+  It covers missing and stale runner bindings, reload persistence, and retry
+  without duplicate transcript input. Repeat with `--device='iPhone 13'` for
+  the mobile entry point; keep browser evidence outside the checkout.
 - **`reconnect`, stopped session (own environment):**
   `tests/e2e_ui/sessions/test_sidebar_stop.py::test_stopped_session_shows_reconnect_affordance`
+- **`reconnect`, completed turn after host handoff (own environment):**
+  `tests/e2e/test_runner_exit_replica_handoff_e2e.py::test_host_report_after_handoff_preserves_only_completed_turns`
+  moves a real host tunnel to a different server replica while its runner
+  stays on the original replica, then kills that owned runner. Reloaded API
+  snapshots keep completed work idle; interrupted work and runners that never
+  connected still fail. The OpenAI Agents harness uses local scripted replies.
+- **`reconnect`, idle replica handoff (own environment):**
+  `tests/e2e_ui/sessions/test_idle_runner_handoff.py::test_idle_session_stays_healthy_after_unreadable_replica_handoff`
+  moves a real runner between two servers sharing storage, then makes the old
+  server's session and liveness reads unavailable through its production grace
+  period. A completed legacy transcript without saved lifecycle state must
+  remain readable without a disconnect error, including when the browser
+  returns to the old server after its reads recover.
+- **`reconnect`, completed Claude Task child (own environment):**
+  `tests/e2e_ui/sessions/test_claude_native_idle_handoff.py::test_completed_claude_child_survives_stale_status_handoff`
+  drives a real Claude-native parent and its Agent tool through child completion,
+  then stages stale saved `running` state and moves the runner to a fresh server.
+  After a real tunnel loss and the production disconnect grace, the child's
+  result stays readable without a chat error or failed Agents-row status,
+  including after reload. Only model replies and stale persistence are staged.
+  Requires Claude Code and tmux; machine-managed Claude credentials need an
+  isolated container for the local model endpoint.
+- **`stop`, `archive`, active sub-agents (own environment):**
+  `tests/e2e/test_parent_stop_subagents_e2e.py::test_native_parent_teardown_preserves_child_outcome`
+  drives real Claude and Codex parents, native children, a host daemon, and its
+  dedicated runner through the public Stop/Archive APIs. Only model replies are
+  scripted. It waits through the production disconnect grace and includes a
+  real runner crash that must still report a failure. Requires both native
+  CLIs and tmux; Claude's machine-managed credentials require an isolated
+  container for the local model endpoint.
+- **`stop`, `side-chat-lifecycle`, hosted side chats (own environment):**
+  `tests/e2e_ui/sessions/test_stop_side_chats.py::test_stop_session_stops_hosted_side_chats`
+  drives both desktop sidebar menus and the mobile long-press menu with a real
+  host. Side chats share their parent's runner. Closing one leaves its parent
+  and sibling working; stopping the parent stops that shared runner and keeps
+  all histories. An unrelated session stays online, and a new side chat
+  relaunches its parent before both share the replacement runner.
+  Only model replies are scripted.
+- **`side-chat-lifecycle`, creation entry points:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py` covers `/side`, the Workspace
+  menu, the composer add tray, selected text's Ask in side chat action, and the
+  mobile side-chat drawer. Its stale-branch scenarios simulate a stopped parent
+  runner and verify parent recovery before binding; the hosted lifecycle test
+  above proves live-parent reuse with actual runner processes.
+- **`side-chat-quotes`, desktop Ask in side chat and Reply:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_ask_in_side_chat_opens_a_quoted_side_chat_tab`
+  checks pending/live tab reuse, draft preservation, and replies sent only to
+  the child. Hide Workspace and repeat Ask in side chat to verify
+  a new tab opens instead of changing the hidden draft.
+- **`side-chat-quotes`, mobile drawer Reply:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_opens_in_a_drawer_on_mobile`
+  checks that Reply stays on screen and the quoted follow-up reaches only the
+  side chat. Component coverage in `web/src/components/chat/SideChatPane.test.tsx`
+  checks quote removal, preserved text/files, read-only chats, and starting-tab
+  eligibility; `web/src/pages/ChatPage.composer.test.tsx` checks target routing
+  and parent isolation. In an embedded app, repeat text selection in both the
+  parent and side chat and check the popup's theme and button styling.
+- **`side-chat-lifecycle`, direct chat-only URL (browser contract):**
+  `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
+  opens a runnerless child directly and sends a message without a directory
+  picker. Session metadata and message dispatch are mocked.
+- **`side-chat-lifecycle`, native Codex:**
+  `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
+  drives a real Codex CLI and app-server with scripted model replies. It checks
+  inherited context in the model request, isolated follow-ups, and a parent
+  that stays usable after closing its side chat.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`
@@ -180,8 +469,96 @@ plain `uv run pytest`, which starts a private server for the test.
   tab, open it in another tab and the agent browser, and confirm both are signed
   in. Another session should be signed out. Log out and refresh the same-session
   tabs; all should be signed out.
+- **`canvas-workspace` (sidebar entry, project cards, chat, focus, and history):**
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions`.
+  Workspace open/close, independent focus, maximizing, and pane sizing on wide
+  and smaller desktops:
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_stays_visible_when_workspace_opens`.
+  Grouping, feature gating, drag persistence, and live updates also run in
+  `tests/e2e_ui/sessions/test_canvas_page.py`, with selection churn in
+  `tests/e2e_ui/sessions/test_canvas_selected_highlight_persists.py::test_clicked_card_keeps_selected_highlight_across_live_updates`.
+  Unit tests in `web/src/canvas/canvasNavigation.test.ts` distinguish Canvas
+  from similarly named routes under standalone and embedded mount paths.
+  `web/src/canvas/CanvasWorkspace.test.tsx` verifies that dismissing a nested
+  dialog with Escape preserves conversation focus and that resizing respects
+  both panes' minimum widths; double-click restores and saves the default split.
+  It also checks that the sidebar menu stays usable while the board is loading.
+  `web/src/pages/CanvasPage.test.tsx` checks viewport
+  translation across successive resizes, hiding, and restoring the pane,
+  refitting untouched boards after card changes, and preserving queued viewports
+  during rapid project switches and resizes. `web/src/shell/AppShell.test.tsx`
+  verifies Workspace's saved open/closed choice across card changes.
+  `web/src/hooks/useConversationRedirect.test.tsx` delivers session replacement
+  events and checks the same board, query parameters, and replaced history under
+  standalone and embedded routes.
+- **`canvas-session-health` (card selection and direct session links):** component
+  tests in `web/src/hooks/useActiveConversationId.test.tsx` cover standalone and
+  embedded session routes, switching cards, and returning to the board.
+  `web/src/hooks/RunnerHealthProvider.test.tsx` and
+  `web/src/hooks/SessionUpdatesProvider.test.tsx` verify that a Canvas session
+  outside the loaded sidebar pages enters health polling and the live watch
+  set; changing cards updates the watched session and encoded temporary ids
+  are excluded.
+- **`canvas-mobile` (deep link, back button, and reload):**
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_deep_link_and_mobile_return_keep_the_project`.
+  At phone width and just below the desktop breakpoint, the journey compares the
+  hamburger with an ordinary session, opens navigation from both Canvas views,
+  and returns to the selected project.
+- **`canvas-navigation` (collapsed/expanded, Usage enabled/disabled):**
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_uses_standard_sidebar_navigation`.
+  The journey compares the toggle's icon, position, and size with an ordinary
+  session, previews and opens navigation, and checks that split and focused
+  conversations retain one toggle. It compares destinations and returns through
+  Canvas, then reloads to confirm the selected project remains remembered.
+  macOS title-bar clearance, sidebar opening from the titlebar toggle or mobile
+  hamburger, and conversation focus/return at wide and narrow widths run in
+  `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_controls_clear_the_macos_titlebar`.
+  This Chromium journey emulates the macOS preload bridge and user agent; it
+  verifies the app's layout around the title bar, not native traffic-light rendering.
+  `web/src/embed.test.tsx` checks that the compiled Canvas clearance selector
+  matches the embedded app's Mac scope root. For an embedded desktop build,
+  enable Canvas only in the isolated test host, enter through the sidebar and a
+  Canvas deep link, then collapse/preview/reopen navigation and focus/restore a
+  session. Check that the Canvas heading and restore control stay below the
+  native title bar at 14px/16px host roots and 80%, 100%, 110%, and 125% page zoom.
+  `web/src/shell/ChatHeader.test.tsx` checks the shared toggle's desktop/mobile
+  icons, peek cancellation, and hover/keyboard tooltip behavior.
+- **`canvas-create` (Main/project plus button, desktop/mobile):**
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_canvas_plus_creates_session_on_the_selected_board`.
+  The composer uses a fixture host; session creation, binding to the isolated
+  runner, and the mock-backed first reply use the real server. Temporary-id
+  replacement, server-first creation, feature gating, and failed-create draft
+  recovery also run in `web/src/shell/NewChatDialog.flow.test.tsx`.
+  Stale temporary routes return to their board in
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_canvas_creation_url_returns_to_its_board`;
+  ordinary sessions still return to the new-session page in
+  `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
+- **`view-options`:**
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_status_grouping_and_show_toggles_persist_across_reload`,
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`
+  (both enable the flag by patching `GET /v1/info`). Unit tests in
+  `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
+  that the flag-off sidebar ignores stored view options.
 
 ## Gotchas
+
+- Existing side chats on separate runners must still be closed individually.
+  Hostless CLI Stop keeps its existing per-conversation behavior.
+- Starting a side chat after its parent stopped relaunches the parent. The new
+  chat shares that replacement runner and stops with the parent again.
+- Ask in side chat reuses only a visible, writable tab belonging to the current
+  parent. Hidden, ended, and currently starting tabs are ineligible; another
+  selection opens a new unsent tab. Ended chats do not offer Reply.
+- A phone-width browser run does not prove the mobile side-chat drawer in the
+  embedded web app or the native apps. Both style the drawer only inside the
+  app's own page area: placed outside it, the drawer stays off screen when
+  embedded and sits under the status bar in the native apps.
+- Canvas is feature-gated, including conversation deep links. Its browser
+  tests enable that flag explicitly; they do not enable it on a deployed app.
+- Canvas entry collapses navigation once. Selecting another card must not
+  collapse navigation that the user has manually expanded. Card dragging must
+  not open a session. Workspace must not hide the canvas or change session
+  focus; both panels resize to leave room for the conversation controls.
 
 - Browser storage sharing is limited to one desktop window and app run;
   restarting the app clears it. Closing an individual tab does not.
@@ -193,11 +570,20 @@ plain `uv run pytest`, which starts a private server for the test.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
-- A custom agent belongs to its original session; appearing in the picker does
-  not prove the fork API accepts it. Check the bound agent after navigation.
+- Databricks Sandbox and Arclet restrictions apply to managed sources, including
+  shared sessions. Other sandbox providers support forking. Verify the supported
+  path with
+  `tests/e2e_ui/fork_session/test_fork_managed_sandbox.py::test_fork_onto_managed_sandbox_with_no_host_online`.
+- A custom agent outlives its sessions: forks of your own sessions share it,
+  and forking someone else's session gives you your own copy. Appearing in the
+  picker does not prove the fork API accepts it; check the bound agent after
+  navigation.
 - A copied web transcript does not prove the native CLI received that history.
   Native variants of the agent-switch test skip without `LLM_API_KEY`; record
   those skips and use a configured test harness before claiming native coverage.
+- Continuing in another directory preserves conversation history, not files
+  from the missing workspace. Existing worktree recreation and sandbox creation
+  belong to the ordinary fork dialog, not this recovery action.
 - The reconnect command depends on why the session stopped (host offline vs. a
   stranded local session vs. a sandbox). Reproduce the reporter's reason, not
   just any stopped session.
@@ -205,3 +591,6 @@ plain `uv run pytest`, which starts a private server for the test.
   shows the command instead.
 - Tests marked "own environment" fail under `verify-env run` with an explicit
   message. That is expected; run them with plain `uv run pytest`.
+- Grouping and ordering apply to the loaded pages only: an older session joins
+  its group once it is paged in. Grouped views hide Projects, so dragging a
+  session onto the list never removes it from its project there.

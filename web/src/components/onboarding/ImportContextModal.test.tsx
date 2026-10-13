@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter, useLocation } from "react-router-dom";
 
 import {
   ImportContextModal,
@@ -24,14 +25,21 @@ function renderModal(
   props: Partial<Omit<ImportContextModalProps, "context">> = {},
 ) {
   return render(
-    <ImportContextModal
-      open={true}
-      onOpenChange={vi.fn()}
-      onConfirm={vi.fn()}
-      {...props}
-      context={context}
-    />,
+    <MemoryRouter>
+      <ImportContextModal
+        open={true}
+        onOpenChange={vi.fn()}
+        onConfirm={vi.fn()}
+        {...props}
+        context={context}
+      />
+      <LocationProbe />
+    </MemoryRouter>,
   );
+}
+
+function LocationProbe() {
+  return <span data-testid="location">{useLocation().pathname}</span>;
 }
 
 function selectTab(tab: HTMLElement) {
@@ -79,15 +87,15 @@ describe("ImportContextModal – harness tabs", () => {
     expect(screen.getByRole("tab", { name: "Claude Code" })).toBe(tabs[0]);
     expect(screen.getByRole("tab", { name: "Codex" })).toBe(tabs[1]);
     expect(screen.getByRole("tab", { name: "Cursor" })).toBe(tabs[2]);
-    expect(screen.getByText("Your imports are ready")).toBeTruthy();
+    expect(screen.getByText("Your setup is ready")).toBeTruthy();
     expect(screen.getByText(/These carry over automatically\./)).toBeTruthy();
   });
 
   it("shows the credential line and read-only asset lists with details", () => {
     renderModal();
 
-    expect(screen.getByText("Databricks AI Gateway")).toBeTruthy();
-    expect(screen.getAllByText("Imported")).toHaveLength(1);
+    expect(screen.getByText("Databricks Unity Gateway")).toBeTruthy();
+    expect(screen.getAllByText("Detected")).toHaveLength(1);
     expect(assetTabNames()).toEqual(["MCPs 5", "Skills 10", "Plugins 3"]);
 
     expect(rowNames("MCPs")).toEqual(["databricks-v2", "jira", "safe", "web-search", "figma"]);
@@ -141,24 +149,36 @@ describe("ImportContextModal – host and status", () => {
     expect(screen.queryAllByRole("tab")).toHaveLength(0);
   });
 
-  it("keeps what loaded and notes what couldn't be read", () => {
-    renderModal({ ...MOCK_IMPORT_CONTEXT, mcps: [] }, { unavailable: ["mcps"] });
+  it.each([false, true])(
+    "keeps loaded assets and explains MCP errors (unsupported: %s)",
+    (mcpUnsupported) => {
+      renderModal({ ...MOCK_IMPORT_CONTEXT, mcps: [] }, { unavailable: ["mcps"], mcpUnsupported });
 
-    expect(assetTabNames()).toEqual(["Skills 10", "Plugins 3"]);
-    expect(screen.getByRole("status").textContent).toBe(
-      "Couldn't read MCP servers from this machine.",
-    );
-  });
+      expect(assetTabNames()).toEqual(["Skills 10", "Plugins 3"]);
+      expect(screen.getByRole("status").textContent).toBe(
+        mcpUnsupported
+          ? "Please update this host to list MCP servers."
+          : "Couldn't read MCP servers from this machine.",
+      );
+    },
+  );
 
-  it("uses the failure as the empty state when nothing loaded", () => {
-    renderModal(
-      { credentials: [], mcps: [], skills: [], plugins: [] },
-      { unavailable: ["mcps", "skills"] },
-    );
-    expect(
-      screen.getByText("Couldn't read MCP servers or skills and plugins from this machine."),
-    ).toBeTruthy();
-  });
+  it.each([false, true])(
+    "explains all failures when nothing loaded (unsupported MCPs: %s)",
+    (mcpUnsupported) => {
+      renderModal(
+        { credentials: [], mcps: [], skills: [], plugins: [] },
+        { unavailable: ["mcps", "skills"], mcpUnsupported },
+      );
+      expect(
+        screen.getByText(
+          mcpUnsupported
+            ? "Please update this host to list MCP servers. Couldn't read skills and plugins from this machine."
+            : "Couldn't read MCP servers or skills and plugins from this machine.",
+        ),
+      ).toBeTruthy();
+    },
+  );
 });
 
 describe("ImportContextModal – empty states", () => {
@@ -166,7 +186,7 @@ describe("ImportContextModal – empty states", () => {
     renderModal({ ...MOCK_IMPORT_CONTEXT, mcps: [], skills: [], plugins: [] });
 
     expect(harnessTabs()).toHaveLength(3);
-    expect(screen.getByText("Databricks AI Gateway")).toBeTruthy();
+    expect(screen.getByText("Databricks Unity Gateway")).toBeTruthy();
     expect(screen.getByText("No MCPs, skills, or plugins detected")).toBeTruthy();
     expect(assetTabNames()).toEqual([]);
   });
@@ -180,6 +200,21 @@ describe("ImportContextModal – empty states", () => {
 });
 
 describe("ImportContextModal – closing", () => {
+  it("opens Harnesses and dismisses without confirming on See more", () => {
+    const onConfirm = vi.fn();
+    const onOpenChange = vi.fn();
+    renderModal(MOCK_IMPORT_CONTEXT, { onConfirm, onOpenChange });
+
+    const seeMore = screen.getByRole("link", { name: "See more" });
+    expect(seeMore.getAttribute("href")).toBe("/settings/harnesses");
+    expect(seeMore.nextElementSibling).toBe(screen.getByRole("button", { name: "Confirm" }));
+    fireEvent.click(seeMore);
+
+    expect(screen.getByTestId("location").textContent).toBe("/settings/harnesses");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+
   it("confirms and closes on Confirm", () => {
     const onConfirm = vi.fn();
     const onOpenChange = vi.fn();

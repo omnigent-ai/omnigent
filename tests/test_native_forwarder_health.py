@@ -104,3 +104,22 @@ def test_record_transport_failure_surfaces_preformatted_detail() -> None:
         assert detail == "gateway returned 401 Unauthorized at https://h/x"
     finally:
         health.clear()
+
+
+def test_note_post_success_stamps_last_post_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful POST round-trip records its monotonic time for the runner
+    idle watchdog; ``clear`` resets the stamp for test isolation."""
+    clock = _FakeClock(start=500.0)
+    monkeypatch.setattr(health, "time", clock)
+    health.clear()
+    try:
+        assert health.last_post_at() is None
+        health.note_post_success()
+        assert health.last_post_at() == 500.0
+        clock.now = 640.0
+        health.note_post_success()
+        assert health.last_post_at() == 640.0
+        health.clear()
+        assert health.last_post_at() is None
+    finally:
+        health.clear()

@@ -31,84 +31,13 @@ from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
+from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
+from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
 
 # 32-byte sha256 digest column. LargeBinary → BYTEA (Postgres) / BLOB (SQLite),
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
-
-# Hex length of a bare uuid4 id, the canonical Python-side form.
-_UUID_HEX_LEN = 32
-
-# Prefixes ids carried before they became bare 32-char hex. ``uuid_to_bytes``
-# strips exactly these (so old URLs/clients keep resolving) and nothing else —
-# an unknown prefix fails loud rather than silently storing a wrong-typed id's
-# hex tail (e.g. a ``resp_``/``runner_token_`` value mis-passed to a uuid column).
-_LEGACY_ID_PREFIXES = frozenset(
-    {
-        "ag",
-        "conv",
-        "host",
-        "pol",
-        "file",
-        "cmt",
-        # conversation-item per-type prefixes
-        "msg",
-        "fc",
-        "fco",
-        "err",
-        "rs",
-        "cmp",
-        "nt",
-        "rse",
-        "sc",
-        "tc",
-        "rd",
-        # runner-internal conversation binding
-        "agy_conv",
-    }
-)
-
-
-class InvalidUuidError(ValueError):
-    """An id string could not be normalised to a 32-char hex uuid.
-
-    Subclasses ``ValueError`` so existing ``except ValueError`` sites keep
-    working. Surfaced (wrapped in ``sqlalchemy.exc.StatementError``) when a
-    malformed id reaches a ``Uuid16`` column bind; the server maps it to a 404
-    so a bad id in a URL is not-found rather than a 500.
-    """
-
-
-def uuid_to_bytes(value: str | uuid.UUID) -> bytes:
-    """Normalise an id to the 16 raw bytes stored in a ``Uuid16`` column.
-
-    Accepts, reducing them all to the same 16 bytes: a :class:`uuid.UUID`
-    object; the bare 32-char hex form (what generators emit); the dashed
-    canonical uuid (``str(uuid4())``); and a legacy id carrying one of the
-    known :data:`_LEGACY_ID_PREFIXES` (``conv_<hex>``, ``ag_<hex>``, …) — so
-    old bookmarked URLs, pasted ids, and pre-migration clients keep resolving.
-    Anything else — a truncated id, non-hex text, an unknown prefix — fails
-    loud rather than silently storing the wrong bytes.
-
-    :param value: A ``uuid.UUID``, or a 32-char hex uuid optionally dashed or
-        legacy-prefixed.
-    :returns: The 16-byte big-endian value.
-    :raises InvalidUuidError: If *value* is not a 32-char hex uuid.
-    """
-    if isinstance(value, uuid.UUID):
-        return value.bytes
-    normalized = value.replace("-", "")
-    if "_" in normalized:
-        prefix, _, tail = normalized.rpartition("_")
-        if prefix in _LEGACY_ID_PREFIXES and len(tail) == _UUID_HEX_LEN:
-            normalized = tail
-    if len(normalized) != _UUID_HEX_LEN:
-        raise InvalidUuidError(f"expected a 32-char hex uuid, got {value!r}")
-    try:
-        return bytes.fromhex(normalized)
-    except ValueError as exc:
-        raise InvalidUuidError(f"invalid hex uuid: {value!r}") from exc
 
 
 def normalize_uuid(value: str | None) -> str | None:
@@ -144,6 +73,9 @@ class Uuid16(TypeDecorator[str]):
     legacy-prefixed uuids; results always come back as bare lowercase hex.
     Result values guard the same driver variance ``CompressedText`` does:
     ``bytes``, ``memoryview`` (some drivers), or ``str`` (already hex).
+
+    Malformed binds raise ``InvalidUuidError``, wrapped by SQLAlchemy in
+    ``StatementError``. The server maps these invalid URL ids to a 404.
     """
 
     impl = LargeBinary(16)
@@ -238,8 +170,8 @@ def workspace_scope(workspace_id: int) -> Iterator[None]:
         _current_workspace_id.reset(token)
 
 
-AGENT_KIND_TEMPLATE = "template"
-AGENT_KIND_SESSION = "session"
+AGENT_KIND_SERVER = "server"
+AGENT_KIND_USER = "user"
 
 POLICY_SCOPE_DEFAULT = "default"
 POLICY_SCOPE_SESSION = "session"
@@ -261,8 +193,8 @@ class SqlAgent(OmnigentBase):
         ``"ag_abc123/a1b2c3d4e5f6..."``.
     :param version: Monotonic version counter. Starts at 1, incremented
         on each update via ``PUT /api/agents/{id}``.
-    :param kind: ``"template"`` for server-wide registered agents;
-        ``"session"`` for per-conversation copies.
+    :param kind: ``"server"`` for server-wide agents (built-ins, ``--agent``);
+        ``"user"`` for agents users upload or install.
     :param description: Optional free-text description of the agent's
         purpose. ``None`` when not provided.
     :param updated_at: Unix epoch seconds of the last update, or
@@ -290,14 +222,14 @@ class SqlAgent(OmnigentBase):
     bundle_location: Mapped[str] = mapped_column(String(512))
     version: Mapped[int] = mapped_column(Integer, default=1)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
-    # AGENT_KIND: template=1, session=2). The store converts to/from the
+    # AGENT_KIND: server=1, user=2). The store converts to/from the
     # string name at the row↔entity boundary.
     kind: Mapped[int] = mapped_column(SmallInteger)
     description: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Owner of a session-scoped agent (the creating user). Gates agent-code
-    # mutation to the owner; NULL for template agents, single-user mode, and
-    # pre-migration rows (an unowned session-scoped agent is admin-only).
+    # Owner of a user agent (the creating user). Gates agent-code mutation to
+    # the owner; NULL for server agents and pre-migration rows (an unowned
+    # user agent is admin-only).
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (

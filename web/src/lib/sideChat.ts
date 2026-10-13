@@ -12,6 +12,11 @@
 /** Prefix that opens a side chat. The trailing space keeps `/sidebar` out. */
 export const SIDE_CHAT_COMMAND_PREFIX = "/side ";
 
+/** A fresh id for a side-chat rail tab whose fork isn't created yet. */
+export function newPendingSideChatId(): string {
+  return `pending:${crypto.randomUUID()}`;
+}
+
 /**
  * Whether a harness supports the `/side` panel side chat.
  *

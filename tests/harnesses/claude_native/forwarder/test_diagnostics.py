@@ -145,6 +145,67 @@ def test_missing_transcript_discovered_after_warning_never_errors(
     assert len([r for r in caplog.records if "path discovered" in r.getMessage()]) == 1
 
 
+def _observe_at_error_deadline(bridge_dir: Path) -> None:
+    diagnostics = forwarder._TranscriptDiscoveryDiagnostics(started_at=0.0)
+    forwarder._observe_transcript_discovery(
+        bridge_dir=bridge_dir,
+        session_id="conv_idle",
+        transcript_path=None,
+        diagnostics=diagnostics,
+        now=forwarder._TRANSCRIPT_DISCOVERY_ERROR_S + 1.0,
+    )
+
+
+def test_idle_pane_at_error_deadline_logs_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No hooks file, settings present, no stderr: an unused pane, not a failure."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
+
+    _observe_at_error_deadline(bridge_dir)
+
+    [record] = [r for r in caplog.records if "has not started" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert record.discovery_verdict == "idle"
+
+
+def test_observer_stderr_at_error_deadline_logs_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    (bridge_dir / forwarder.OBSERVER_HOOK_STDERR_FILE).write_text("boom", encoding="utf-8")
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
+
+    _observe_at_error_deadline(bridge_dir)
+
+    [record] = [r for r in caplog.records if "has not started" in r.getMessage()]
+    assert record.levelno == logging.ERROR
+    assert record.discovery_verdict == "hook_failure"
+
+
+def test_hooks_file_without_path_at_error_deadline_logs_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
+
+    _observe_at_error_deadline(bridge_dir)
+
+    [record] = [r for r in caplog.records if "has not started" in r.getMessage()]
+    assert record.levelno == logging.ERROR
+
+
 @pytest.mark.parametrize("http_status", [None, 503])
 async def test_degraded_sync_log_belongs_to_the_destination_session(
     tmp_path: Path,

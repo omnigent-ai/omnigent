@@ -30,11 +30,21 @@ from omnigent.stores.host_store import HostStore
 _PLUGINS_TIMEOUT_S = 15.0
 
 
+class PluginAsset(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    name: str = Field(max_length=MAX_PLUGIN_NAME)
+
+
 class PluginSummary(BaseModel):
     """Installed Claude plugin metadata, without paths or executable configuration."""
 
     model_config = ConfigDict(strict=True)
 
+    id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    skill_entries: list[PluginAsset] | None = Field(default=None, max_length=MAX_PLUGIN_ITEMS)
+    mcp_entries: list[PluginAsset] | None = Field(default=None, max_length=MAX_PLUGIN_ITEMS)
     harness: Literal["claude"]
     name: str = Field(min_length=1, max_length=MAX_PLUGIN_NAME)
     marketplace: str = Field(max_length=MAX_PLUGIN_NAME)

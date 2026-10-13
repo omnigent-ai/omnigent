@@ -875,6 +875,19 @@ def test_preload_codex_thread_closes_client_on_failure(
         ),
         (
             codex_native_app_server.CodexAppServerResponseError(
+                {
+                    "code": -32600,
+                    "message": (
+                        "invalid paginated history lineage for "
+                        "019e96aa-0be2-7343-8d3b-6f914d60936d: "
+                        "source rollout is not paginated"
+                    ),
+                }
+            ),
+            True,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
                 {"code": -32600, "message": "thread 019e already has an active writer"}
             ),
             False,
@@ -886,8 +899,10 @@ def test_is_unreadable_thread_error(exc: BaseException, expected: bool) -> None:
     """
     Only codex's thread-store read failure counts as an unreadable thread.
 
-    A refused resume (another writer holds the thread) and a plain runtime
-    error must keep failing loud rather than silently starting a fresh thread.
+    A refused resume (another writer holds the thread), a paginated-lineage
+    mismatch (``-32600 … source rollout is not paginated``), and a plain
+    runtime error are each tested; only the thread-store and paginated-lineage
+    cases must start a fresh thread.
 
     :param exc: Exception raised by the resume request.
     :param expected: Whether it classifies as an unreadable thread.
@@ -8469,6 +8484,41 @@ def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
     assert "Codex is running in the session terminal" in result
 
 
+@pytest.mark.asyncio
+async def test_create_codex_session_retries_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fresh Codex session creation retries an explicit rate-limit response."""
+    attempts = 0
+    request_bodies: list[bytes] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        request_bodies.append(await request.aread())
+        if attempts == 1:
+            return httpx.Response(429, request=request)
+        return httpx.Response(201, json={"session_id": "conv_new"}, request=request)
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("omnigent.native.native_terminal._sleep", _fake_sleep)
+    async with httpx.AsyncClient(
+        base_url="https://example.databricks.com",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        session_id = await codex_native._create_codex_session(
+            client,
+            b"bundle",
+            bridge_id=None,
+            terminal_launch_args=["--config", "approval_policy=on-request"],
+        )
+
+    assert session_id == "conv_new"
+    assert attempts == 2
+    assert all(b"bundle" in body for body in request_bodies)
+    assert all(b"approval_policy=on-request" in body for body in request_bodies)
+
+
 def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
     """A malformed wrapper spec must not block the terminal launch."""
     bad_spec = tmp_path / "bad.yaml"
@@ -13040,11 +13090,13 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
+    record_at_forwarding: list[str | None] = []
+
     async def _wait(_client: object, *, timeout: float | None = 30.0) -> str:
         return "thread_after_signin"
 
     async def _forward(**_kwargs: object) -> None:
-        return None
+        record_at_forwarding.append(read_bridge_startup_error(bridge_dir))
 
     monkeypatch.setattr(_fwd, "wait_for_thread_started", _wait)
     monkeypatch.setattr(_fwd, "supervise_forwarder", _forward)
@@ -13067,7 +13119,7 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
         )
     )
 
-    assert read_bridge_startup_error(bridge_dir) is None
+    assert record_at_forwarding == [None]
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.thread_id == "thread_after_signin"

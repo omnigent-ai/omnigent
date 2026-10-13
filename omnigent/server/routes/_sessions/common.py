@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
+import time
 import weakref
 from dataclasses import dataclass
 from typing import Any
@@ -58,6 +60,7 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import (
     StateUpdate,
 )
+from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -320,6 +323,12 @@ _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediat
 _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: str = "omnigent.last_task_error_item_id"
 
 
+# The runner bound when this failure was recorded, so a later exit from a
+# different runner attempt surfaces its own startup failure instead of hiding
+# behind this stale cause. Empty when unknown (treated as the current runner's).
+_LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: str = "omnigent.last_task_error_runner_id"
+
+
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 
@@ -427,6 +436,13 @@ _MANAGED_RESUMABLE_TUNNEL_STALE_S = 30.0
 
 
 _RUNNER_CONVICTION_POLL_S = 0.25
+
+
+# Lookups, and the gap between them, when resolving a connected runner's client.
+_RUNNER_CLIENT_RESOLVE_ATTEMPTS = 3
+
+
+_RUNNER_CLIENT_RESOLVE_RETRY_S = 2.0
 
 
 _HOST_LAUNCH_RESULT_TIMEOUT_S = 10.0
@@ -637,7 +653,18 @@ _read_explicit_unread: WorkspaceScopedCache[str, set[str]] = WorkspaceScopedCach
 _interrupt_fenced_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
-_intentional_stop_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+# Markers belong to one runner and expire after teardown plus disconnect grace.
+# Do not evict live markers under load: each one suppresses an expected drop.
+_intentional_stop_sessions: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(
+        maxsize=math.inf, ttl=2 * RUNNER_LIVENESS_TTL_S, timer=lambda: time.monotonic()
+    )
+)
+
+
+_intentional_runner_stop_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
+    weakref.WeakValueDictionary
+)
 
 
 _TERMINAL_RESPONSE_EVENT_TYPES: frozenset[str] = frozenset(
@@ -813,6 +840,20 @@ _policy_evaluation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
 )
 
 
+@dataclass(frozen=True)
+class _RelayStatusSnapshot:
+    """Saved status and diagnostics without retaining a full conversation's payloads."""
+
+    live_status: str
+    kind: str
+    parent_conversation_id: str | None
+    runner_id: str
+    host_id: str | None
+    updated_at: int
+    # Mirrors an in-process sub-agent whose native parent owns its turn.
+    parent_owned: bool = False
+
+
 @dataclass
 class _RelayHandle:
     """
@@ -825,11 +866,20 @@ class _RelayHandle:
     :param ready: Event set after the relay observes the runner
         stream's ready heartbeat, proving the runner-side
         no-replay subscription is registered.
+    :param status_snapshot: Saved status read when adopting this binding,
+        used only when live status and a fresh row are unavailable.
+    :param intentional_stop_turn_ended: A terminal response arrived while the
+        current stop marker was pending; reset by each Stop request.
+    :param running_event_count: Running notifications observed by this relay,
+        used to preserve intervening activity when a Stop is rejected.
     """
 
     runner_id: str
     task: asyncio.Task[None]
     ready: asyncio.Event
+    status_snapshot: _RelayStatusSnapshot | None = None
+    intentional_stop_turn_ended: bool = False
+    running_event_count: int = 0
 
 
 _runner_relay_tasks: WorkspaceScopedCache[str, _RelayHandle] = WorkspaceScopedCache()
@@ -1157,6 +1207,8 @@ __all__ = [
     "_PI_NATIVE_WRAPPER_LABEL_VALUE",
     "_RACE_TASK_REAP_TIMEOUT_S",
     "_RETRY_SESSION_TYPE",
+    "_RUNNER_CLIENT_RESOLVE_ATTEMPTS",
+    "_RUNNER_CLIENT_RESOLVE_RETRY_S",
     "_RUNNER_CONVICTION_POLL_S",
     "_RUNNER_FORWARD_TIMEOUT",
     "_RUNNER_RELAY_READY_TIMEOUT_S",
@@ -1181,6 +1233,7 @@ __all__ = [
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
+    "_RelayStatusSnapshot",
     "_RunnerStatusProbeBackoff",
     "_browser_action_claim_events",
     "_browser_action_claims",
@@ -1188,6 +1241,7 @@ __all__ = [
     "_browser_action_registry",
     "_catalog_prefetch_tasks",
     "_deferred_elicitation_clear_tasks",
+    "_intentional_runner_stop_locks",
     "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",
     "_llm_response_denied_turns",
