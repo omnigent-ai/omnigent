@@ -1973,7 +1973,7 @@ describe("FileViewer video files", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     renderViewer({ open: true, path: "demo.webm" });
     expect(useFileContent).toHaveBeenCalledWith("conv_1", null);
-    expect(useFileDiff).toHaveBeenCalledWith("conv_1", null);
+    expect(useFileDiff).toHaveBeenCalledWith("conv_1", null, { requested: false });
     expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
   });
 });

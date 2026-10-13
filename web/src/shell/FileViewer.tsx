@@ -722,7 +722,8 @@ function FileViewerBody({
   const [diffActive, setDiffActive] = useState(
     () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
   );
-  const requestedDiff = open && isActiveViewport && diffActive && !isImage && !isPdf && !isVideo && !isModel;
+  const requestedDiff =
+    open && isActiveViewport && diffActive && !isImage && !isPdf && !isVideo && !isModel;
   // A saved preference also applies to unchanged files; only explicit links skip discovery.
   const linkedDiff =
     requestedDiff &&
