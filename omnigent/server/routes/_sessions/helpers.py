@@ -196,6 +196,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY,
     _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
     _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY,
+    _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY,
     _LAST_TASK_ERROR_TITLE_LABEL_KEY,
     _MAX_TERMINAL_LAUNCH_ARG_LEN,
     _MAX_TERMINAL_LAUNCH_ARGS,
@@ -5131,6 +5132,18 @@ async def _persist_session_status_error_labels(
     :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
         a client whose POST answer was lost can match the refusal to its own send.
     """
+    # Record which runner owns this cause so a later exit from a different
+    # runner attempt surfaces its own startup failure instead of this stale one.
+    # Read it here — at the failure moment the session is still bound to the
+    # responsible runner — rather than threading it through every caller.
+    owner_runner_id = ""
+    if error is not None:
+        try:
+            owning_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        except Exception:  # noqa: BLE001 — a failed read only loses owner scoping
+            owning_conv = None
+        if owning_conv is not None and owning_conv.runner_id:
+            owner_runner_id = owning_conv.runner_id
     # Structured fields are optional (present only when the runner classified
     # the failure). Always write all keys — empty when absent — because the
     # label store is upsert-only and a stale title/cause from a prior failure
@@ -5144,6 +5157,7 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_CAUSE_LABEL_KEY: _truncate_label(error.cause or ""),
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: _truncate_label(error.remediation or ""),
             _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: _truncate_label(item_id or ""),
+            _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: _truncate_label(owner_runner_id),
         }
         if error is not None
         else {
@@ -5154,6 +5168,7 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_CAUSE_LABEL_KEY: "",
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: "",
             _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: "",
+            _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: "",
         }
     )
     try:
@@ -5199,6 +5214,16 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
                 error[key] = value
         return error
     return None
+
+
+def _last_task_error_runner_id_from_labels(labels: Mapping[str, str]) -> str | None:
+    """Return the runner that owned the persisted failure, or ``None`` if unknown.
+
+    Older causes (and manually seeded labels) carry no owner, so ``None`` means
+    "attribute to the current runner" — the conservative choice that preserves
+    an existing cause rather than overwriting it.
+    """
+    return labels.get(_LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY) or None
 
 
 def _publish_terminal_pending(session_id: str, pending: bool) -> None:
@@ -11860,6 +11885,7 @@ __all__ = [
     "_is_devin_native_subagent",
     "_is_kiro_native_session",
     "_last_task_error_from_labels",
+    "_last_task_error_runner_id_from_labels",
     "_latest_assistant_text_from_store",
     "_latest_message_preview",
     "_launch_runner_on_host",

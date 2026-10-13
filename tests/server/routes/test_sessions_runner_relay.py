@@ -3025,6 +3025,60 @@ async def test_offline_sweep_rereads_cause_when_cache_outruns_labels(db_uri: str
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner_matches", [True, False], ids=["same_runner", "replacement_runner"])
+async def test_offline_sweep_scopes_preserved_cause_to_owning_runner(
+    db_uri: str, owner_matches: bool
+) -> None:
+    """A stale cause from a prior runner attempt must not hide a new runner's exit.
+
+    A failed session's cause belongs to the runner that recorded it. When the
+    session is rebound and the replacement runner dies before connecting, that
+    exit has to surface instead of the previous runner's unrelated cause; only
+    the owning runner's own later exit keeps the existing cause.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-owner")
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    # Persist through the real path so the owning runner_id label is recorded.
+    await sessions_module._persist_session_status_error_labels(
+        conv.id,
+        ErrorDetail(code=original["code"], message=original["message"]),
+        store,
+    )
+    store.set_session_live_status(conv.id, "failed")
+    exiting_runner = "runner-owner" if owner_matches else "runner-replacement"
+    if not owner_matches:
+        store.replace_runner_id(conv.id, exiting_runner)
+    snapshot = store.get_conversation(conv.id)
+    assert snapshot is not None
+    assert snapshot.runner_id == exiting_runner
+    exit_error = ErrorDetail(code="runner_failed_to_start", message="Synthetic runner exit")
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [snapshot], exit_error, store, fail_idle_top_level=True
+            )
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        assert refreshed.live_status == "failed"
+        persisted = sessions_module._last_task_error_from_labels(refreshed.labels)
+        decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        if owner_matches:
+            assert decision["attributes"]["decision"] == "already_failed"
+            assert persisted == original
+        else:
+            assert decision["attributes"]["decision"] == "failed_before_start"
+            assert persisted == {"code": exit_error.code, "message": exit_error.message}
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("labels", "fail_idle_top_level", "decision"),
     [

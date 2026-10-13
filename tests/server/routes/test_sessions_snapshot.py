@@ -643,6 +643,57 @@ async def test_session_snapshot_existing_failure_survives_runner_exit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner_matches", [True, False], ids=["same_runner", "replacement_runner"])
+async def test_session_snapshot_scopes_existing_failure_to_owning_runner(
+    monkeypatch: pytest.MonkeyPatch, owner_matches: bool
+) -> None:
+    """A failed cause owned by a prior runner yields to the current runner's exit.
+
+    When a session is rebound to a new runner that then dies before connecting,
+    the snapshot surfaces that runner's startup failure instead of the previous
+    runner's stale cause; a cause owned by the current runner still survives.
+    """
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "4d9f2c1b7a0e4d5e8c1f2a3b4c5d6e7f"
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    owner_runner = "runner_current" if owner_matches else "runner_previous"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        runner_id="runner_current",
+        agent_id="synthetic-agent",
+        live_status="failed",
+        labels={
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+            "omnigent.last_task_error_runner_id": owner_runner,
+        },
+    )
+    store = _ConversationStore([], conversations={session_id: conv})
+    _use_runner_client(monkeypatch, None)
+    monkeypatch.delitem(sessions_module._session_status_cache, session_id, raising=False)
+    reports = RunnerExitReports()
+    reports.record("runner_current", "Synthetic runner exit", owner=None)
+
+    snapshot = await _get_session_snapshot(
+        store,
+        session_id,
+        runner_exit_reports=reports,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.status == "failed"
+    assert snapshot.last_task_error == (
+        original
+        if owner_matches
+        else {"code": "runner_failed_to_start", "message": "Synthetic runner exit"}
+    )
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error() -> None:
     """
     A terminal/runtime failure captured from ``session.status`` survives reload.

@@ -276,6 +276,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_kiro_native_session,
     _is_native_interrupt_record,
     _last_task_error_from_labels,
+    _last_task_error_runner_id_from_labels,
     _latest_assistant_text_from_store,
     _latest_message_preview,
     _launch_runner_on_host,
@@ -7781,23 +7782,26 @@ async def _runner_disconnect_requires_failure(
     elif source == "unknown":
         decision = "unknown_no_failure"
     elif fail_idle_top_level and conv is not None and conv.kind != "sub_agent":
-        # A failed session that already carries a cause keeps it; one without a
-        # saved cause records this exit as its startup failure. The status cache
-        # can read "failed" before labels persist, so confirm against a fresh row.
-        has_cause = (
-            isinstance(conv, Conversation)
-            and _last_task_error_from_labels(conv.labels) is not None
-        )
-        if live == "failed" and not has_cause and persisted is None:
-            try:
-                refreshed = await asyncio.to_thread(
+        # A failed session keeps a cause its own runner recorded; a cause left by
+        # a previous runner attempt is stale, so this exit records its own startup
+        # failure. The status cache can read "failed" before labels persist, so
+        # confirm a missing cause against a fresh row.
+        cause_conv = conv if isinstance(conv, Conversation) else None
+        if (
+            live == "failed"
+            and persisted is None
+            and (cause_conv is None or _last_task_error_from_labels(cause_conv.labels) is None)
+        ):
+            # A failed read cannot prove the cause absent, so keep the snapshot.
+            with contextlib.suppress(Exception):
+                cause_conv = await asyncio.to_thread(
                     conversation_store.get_conversation, session_id
                 )
-            except Exception:  # noqa: BLE001 — a failed read cannot prove the cause absent
-                refreshed = None
-            if refreshed is not None:
-                has_cause = _last_task_error_from_labels(refreshed.labels) is not None
-        decision = "already_failed" if live == "failed" and has_cause else "failed_before_start"
+        own_cause = False
+        if cause_conv is not None and _last_task_error_from_labels(cause_conv.labels) is not None:
+            cause_runner = _last_task_error_runner_id_from_labels(cause_conv.labels)
+            own_cause = cause_runner is None or cause_runner == cause_conv.runner_id
+        decision = "already_failed" if live == "failed" and own_cause else "failed_before_start"
     else:
         decision = "idle_no_failure"
 
@@ -12514,10 +12518,18 @@ async def _get_session_snapshot(
             runner_exit_reports.was_connected(conv.runner_id)
             or session_live_state.last_liveness_stamp(conv.runner_id) is not None
         )
+        # A cause recorded by a previous runner attempt is stale once a new
+        # runner is bound; surface that runner's exit instead of hiding it.
+        cause_runner = _last_task_error_runner_id_from_labels(conv.labels)
+        stale_cause = (
+            last_task_error is not None
+            and cause_runner is not None
+            and cause_runner != conv.runner_id
+        )
         if (
             exit_error is not None
             and (status != "idle" or not runner_ran)
-            and (status != "failed" or last_task_error is None)
+            and (status != "failed" or last_task_error is None or stale_cause)
         ):
             last_task_error = {"code": "runner_failed_to_start", "message": exit_error}
             status = "failed"
