@@ -712,7 +712,11 @@ class SessionResourceRegistry:
         publishes these edges directly to the server, so without this the
         watcher would still believe its own last edge is live and swallow the
         next turn's ``running`` as a duplicate — leaving the session stuck on
-        the hook's ``idle`` with no working indicator for the whole turn.
+        the hook's ``idle`` with no working indicator for the whole turn. A
+        ``Stop``'s ``idle`` also re-arms the session's status-file poller (see
+        :meth:`resync_status_poller`); a ``failed`` edge leaves that to the
+        runner, which re-arms a dispatched child's poller but not a top-level
+        session's, whose sticky failure a stale replay would erase.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
@@ -722,7 +726,24 @@ class SessionResourceRegistry:
         elif status in {"running", "waiting"}:
             self._set_session_status_memo(session_id, "running")
         self._sync_status_edge(session_id, status)
+        if status == "idle":
+            self.resync_status_poller(session_id)
         self._note_terminal_status(session_id, status, "forwarded_status")
+
+    def resync_status_poller(self, session_id: str) -> None:
+        """Re-read the session's Claude status file on the poller's next tick.
+
+        Claude's file is written only on change, so a file still reading
+        ``busy`` after a hook's turn end (a delegate keeps working, or Claude
+        resumes the session on its own) would otherwise never re-publish
+        ``running``. Sessions without a poller are left alone.
+
+        :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+        """
+        with self._lock:
+            poller = self._status_pollers.get(session_id)
+        if poller is not None:
+            poller.resync()
 
     def _note_terminal_status(self, session_id: str, status: str, source: str) -> None:
         """Attach external status edges to the owning Claude terminal's history."""

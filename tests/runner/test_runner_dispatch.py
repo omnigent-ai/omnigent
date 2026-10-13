@@ -5052,6 +5052,7 @@ async def test_sys_session_send_by_id_names_child_from_snapshot(
             "title": snapshot_title or "",
             "tool": expected_agent,
             "session_name": expected_title,
+            "wrapper_label": None,
         }
     ]
     # The launching event is the Agents rail's live row for the child.
@@ -12783,7 +12784,7 @@ async def test_in_flight_send_serializes_concurrent_adopts(
 def test_in_flight_send_lock_is_cleaned_up_with_child_work() -> None:
     """The per-child in-flight-send lock does not leak past the child's work.
 
-    ``in_flight_send_lock`` inserts into a process-global map; without a cleanup
+    ``_in_flight_send_lock`` inserts into a process-global map; without a cleanup
     path a long-lived runner accumulates one lock per steered child forever
     (review issue #2). Unregistering the child's work — directly or via session
     teardown — must remove its lock.
@@ -12797,7 +12798,7 @@ def test_in_flight_send_lock_is_cleaned_up_with_child_work() -> None:
         agent="claude",
         title="merge-task",
     )
-    subagent_work.in_flight_send_lock(child_id)
+    subagent_work._in_flight_send_lock(child_id)
     assert child_id in subagent_work._in_flight_send_locks
     subagent_work.unregister_subagent_work(child_id)
     assert child_id not in subagent_work._in_flight_send_locks
@@ -12808,8 +12809,8 @@ def test_in_flight_send_lock_is_cleaned_up_with_child_work() -> None:
         subagent_work.register_subagent_work(
             parent_session_id=parent_id, child_session_id=cid, agent="claude", title=cid
         )
-        subagent_work.in_flight_send_lock(cid)
-    subagent_work.in_flight_send_lock(parent_id)
+        subagent_work._in_flight_send_lock(cid)
+    subagent_work._in_flight_send_lock(parent_id)
     try:
         subagent_work.unregister_subagent_work_for_session(parent_id)
         assert parent_id not in subagent_work._in_flight_send_locks

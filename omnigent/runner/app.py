@@ -173,6 +173,7 @@ from omnigent.runner.subagent_work import (
     _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX,
     _SUBAGENT_TERMINAL_STATUSES,
     _WAKE_POST_MAX_ATTEMPTS,
+    SUBAGENT_DISPATCH_ID_LABEL_KEY,
     _child_session_parents,
     _ChildParentMeta,
     _deliver_subagent_completion,
@@ -189,10 +190,15 @@ from omnigent.runner.subagent_work import (
     _SubagentWorkEntry,
     _truncate_child_preview,
     get_subagent_work,
+    in_flight_send_guard,
     is_codex_native_subagent_wrapper,
     list_subagent_work,
     mark_subagent_work_started,
     mark_subagent_work_terminal,
+    new_subagent_work_id,
+    note_subagent_child_activity,
+    rearmed_turn_confirmed_by,
+    settle_spurious_subagent_rearm,
     unregister_child_session,
     unregister_subagent_work_for_session,
 )
@@ -404,6 +410,10 @@ _RUNNER_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 # final long round covers a server that is reachable but slow to become ready;
 # rounds cost nothing once no parent is stranded (the loop exits early).
 _STRANDED_WAKE_RETRY_DELAYS_S = (2.0, 5.0, 10.0, 30.0)
+# How long a child re-armed by its own ``running`` edge may read ``idle`` again
+# before that re-arm is treated as a stale status-file read rather than a turn.
+# The forwarder's ``Stop`` for a real turn lands well within this window.
+_SUBAGENT_REARM_SETTLE_GRACE_S = 30.0
 
 # Cadence for ``session.heartbeat`` keepalive events on the runner's
 # ``GET /v1/sessions/{id}/stream`` endpoint. Between turns the event
@@ -1231,6 +1241,7 @@ def create_runner_app(
     # every spec-derived read (native-vs-SDK checks above all) still answers
     # with the harness the spec declared, which a routed session is not on.
     _session_harness_overrides: dict[str, str] = {}
+    app.state.session_harness_overrides = _session_harness_overrides
     # session_id → revision of the agent bundle its caches were built from
     _session_agent_revisions: dict[str, str] = {}
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
@@ -1400,6 +1411,7 @@ def create_runner_app(
     _sign_in_watchers: dict[str, asyncio.Task[None]] = {}
     _subagent_recovery_tasks: dict[str, asyncio.Task[None]] = {}
     _subagent_wake_pending: set[str] = set()
+    app.state.subagent_wake_pending = _subagent_wake_pending
     _last_rewake_notice: dict[str, str] = {}
     # Parents whose wake POST exhausted its bounded retries while their inbox
     # still held a sub-agent result (typically: the server was down when the
@@ -1620,6 +1632,101 @@ def create_runner_app(
 
     resource_registry.set_terminal_activity_publisher(_publish_terminal_activity)
 
+    # Child -> pending settle of a provisional re-arm (see _settle_subagent_rearm_later).
+    _rearm_settle_tasks: dict[str, asyncio.Task[None]] = {}
+    app.state.rearm_settle_tasks = _rearm_settle_tasks
+    # Child -> the error its forwarded StopFailure carried, so a settled stale
+    # replay can restore the failure with its detail, not just its status.
+    _native_pane_failures: dict[str, dict[str, str]] = {}
+    app.state.native_pane_failures = _native_pane_failures
+
+    def _cancel_subagent_rearm_settle(child_id: str) -> None:
+        task = _rearm_settle_tasks.pop(child_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _note_subagent_child_activity(child_id: str) -> None:
+        """Re-arm a finished dispatch on new child activity and show an idle SDK parent waiting."""
+        # New activity invalidates a settle scheduled for an earlier idle read.
+        _cancel_subagent_rearm_settle(child_id)
+        entry = note_subagent_child_activity(child_id)
+        if entry is None:
+            return
+        parent_id = entry.parent_session_id
+        # Only an idle SDK parent is shown waiting here: a native parent's status
+        # is owned by its terminal, and a parent mid-turn derives ``waiting`` at
+        # its own turn end. No status published in this process means idle.
+        if (
+            _is_native_harness(parent_id)
+            or parent_id in _active_turns
+            or _native_pane_status.get(parent_id) not in (None, "idle")
+        ):
+            return
+        _publish_turn_status(parent_id, "waiting")
+
+    def _settle_subagent_rearm_later(child_id: str) -> None:
+        """Undo a re-arm the file's own ``idle`` contradicts and no ``Stop`` confirms in time."""
+        entry = get_subagent_work(child_id)
+        if entry is None or not entry.rearmed or entry.status != "running":
+            return
+        pending = _rearm_settle_tasks.get(child_id)
+        if pending is not None and not pending.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _logger.warning(
+                "Sub-agent re-arm settle skipped off-loop for %s; the dispatch may stay live",
+                child_id,
+                extra={"session_id": child_id},
+            )
+            return
+
+        async def _settle() -> None:
+            await _subagent_work._wake_retry_sleep(_SUBAGENT_REARM_SETTLE_GRACE_S)
+            # Serialized with a terminal report's check-stamp-record step, so the
+            # settle cannot remove the entry a report is about to confirm.
+            async with in_flight_send_guard(child_id):
+                if get_subagent_work(child_id) is not entry:
+                    return
+                reverted = settle_spurious_subagent_rearm(child_id)
+            if reverted is None:
+                return
+            if reverted.rearmed_over is not None and reverted.rearmed_over.status == "failed":
+                # The stale replay showed the child running, then idle; put its
+                # confirmed failure back with the detail the replay cleared.
+                failed_event: _JsonObject = {"type": "session.status", "status": "failed"}
+                failure = _native_pane_failures.get(child_id)
+                if failure is not None:
+                    failed_event["error"] = dict(failure)
+                _publish_event(child_id, failed_event)
+            parent_id = reverted.parent_session_id
+            # An SDK parent reads waiting (``running`` on an older server) only
+            # because of re-armed children; once the last of them settles with no
+            # turn of its own in flight, it is idle. A native parent was never shown it.
+            if (
+                not _is_native_harness(parent_id)
+                and parent_id not in _active_turns
+                and parent_id not in _live_response_id
+                and _native_pane_status.get(parent_id) in ("waiting", "running")
+                and not any(
+                    e.status in ("launching", "running", "waiting")
+                    for e in list_subagent_work(parent_id)
+                )
+            ):
+                _publish_turn_status(parent_id, "idle")
+
+        task = loop.create_task(_settle(), name=f"subagent-rearm-settle:{child_id}")
+        _rearm_settle_tasks[child_id] = task
+        _background_tasks.add(task)
+
+        def _drop_settle(done: asyncio.Task[None]) -> None:
+            _background_tasks.discard(done)
+            if _rearm_settle_tasks.get(child_id) is done:
+                _rearm_settle_tasks.pop(child_id, None)
+
+        task.add_done_callback(_drop_settle)
+
     def _publish_session_status(
         session_id: str,
         status: str,
@@ -1628,6 +1735,16 @@ def create_runner_app(
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
+        if status in ("running", "waiting", "idle") and (
+            _session_harness_name(session_id) == "claude-native"
+        ):
+            # A claude-native child's running/idle arrives only here (status-file
+            # poller, or pane watcher while the file is unresolved) and may be
+            # stale; other harnesses' pane repaints neither mark nor end a turn.
+            if status == "idle":
+                _settle_subagent_rearm_later(session_id)
+            else:
+                _note_subagent_child_activity(session_id)
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
@@ -3414,6 +3531,14 @@ def create_runner_app(
         _stranded_wake_parents.discard(session_id)
         _last_rewake_notice.pop(session_id, None)
         _session_sub_agent_names.pop(session_id, None)
+        _native_pane_failures.pop(session_id, None)
+        _cancel_subagent_rearm_settle(session_id)
+        for _child_id in list(_subagent_work_by_parent.get(session_id, set())):
+            _cancel_subagent_rearm_settle(_child_id)
+        # Drained children have left the work registry but keep their record.
+        for _child_id, _meta in list(_child_session_parents.items()):
+            if _meta.parent_id == session_id:
+                _native_pane_failures.pop(_child_id, None)
         unregister_child_session(session_id)
         unregister_subagent_work_for_session(session_id)
         if filesystem_registry is not None:
@@ -3503,6 +3628,12 @@ def create_runner_app(
         agent = native_coding_agent_for_harness(_session_harness_name(conv_id))
         return agent is not None and agent.key in _TURN_OUTCOME_CONFIRMING_NATIVE_AGENTS
 
+    def _effective_waiting_status() -> str:
+        """``waiting`` when the server renders it; an older server is shown ``running``."""
+        if _server_version is not None and _version_supports_waiting_status(_server_version):
+            return "waiting"
+        return "running"
+
     def _publish_turn_status(
         conv_id: str,
         status: str,
@@ -3511,10 +3642,8 @@ def create_runner_app(
         source_error: Mapping[str, object] | None = None,
         response_id: str | None = None,
     ) -> None:
-        if status == "waiting" and not (
-            _server_version is not None and _version_supports_waiting_status(_server_version)
-        ):
-            status = "running"
+        if status == "waiting":
+            status = _effective_waiting_status()
         harness = _session_harness_name(conv_id)
         if status != "failed" and harness in {
             "claude-native",
@@ -4511,16 +4640,69 @@ def create_runner_app(
         status: str,
         output: str | None,
         only_if_work_id: str | None = None,
+        response_id: str | None = None,
+        confirmed_work_id: str | None = None,
     ) -> _SubagentDeliveryAck:
         ack = mark_subagent_work_terminal(
             child_session_id,
             status=status,
             output=output,
             only_if_work_id=only_if_work_id,
+            response_id=response_id,
+            confirmed_work_id=confirmed_work_id,
         )
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
         return ack
+
+    async def _deliver_terminal_report(
+        child_id: str,
+        *,
+        status: str,
+        output: str | None,
+        only_if_work_id: str | None = None,
+        response_id: str | None,
+    ) -> _SubagentDeliveryAck:
+        """Record a forwarded terminal report, giving a confirmed re-armed turn its own id.
+
+        The fresh dispatch id is written to the child before the result enters
+        the inbox, so restart recovery can tell it from the drained turn's
+        receipt (see ``note_subagent_child_activity``). A rejected stamp keeps
+        the receipted id on both sides: live delivery and the drain receipt stay
+        consistent, only restart recovery of this turn is lost. Check, stamp and
+        record run under the child's in-flight send lock, shared with the settle
+        and a follow-up's re-stamp, so no two of them act on the entry at once.
+        """
+        from omnigent.runner.tool_dispatch import _patch_subagent_label
+
+        async with in_flight_send_guard(child_id):
+            # A settle that ran while this report waited for the lock has put the
+            # dispatch back to its finished state; rebuild the entry it owes.
+            await _ensure_subagent_work_entry(child_id, report_response_id=response_id)
+            confirmed_work_id: str | None = None
+            if rearmed_turn_confirmed_by(child_id, response_id=response_id):
+                work_id = new_subagent_work_id()
+                stamp_error = await _patch_subagent_label(
+                    server_client, child_id, SUBAGENT_DISPATCH_ID_LABEL_KEY, work_id
+                )
+                if stamp_error is None:
+                    confirmed_work_id = work_id
+                else:
+                    _logger.warning(
+                        "self-resumed sub-agent %s: dispatch-id stamp failed (%s); the result "
+                        "is delivered under the receipted id and a restart cannot recover it",
+                        child_id,
+                        stamp_error,
+                        extra={"session_id": child_id},
+                    )
+            return _mark_subagent_terminal_and_wake(
+                child_id,
+                status=status,
+                output=output,
+                only_if_work_id=only_if_work_id,
+                response_id=response_id,
+                confirmed_work_id=confirmed_work_id,
+            )
 
     # Seam for the entrypoint's launch reaper (and tests): terminal delivery
     # that also schedules the parent wake POST, not just the inbox insert.
@@ -6512,6 +6694,14 @@ def create_runner_app(
             status = data.get("status") if isinstance(data, dict) else None
             forwarded_output = data.get("output") if isinstance(data, dict) else None
             output = forwarded_output if isinstance(forwarded_output, str) else None
+            # The forwarder names the turn a Stop ends; a report after a settled
+            # re-arm is a replay only when it names the finished turn again.
+            forwarded_response = data.get("response_id") if isinstance(data, dict) else None
+            report_response_id = (
+                forwarded_response
+                if isinstance(forwarded_response, str) and forwarded_response
+                else None
+            )
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             terminal_status = None
@@ -6519,7 +6709,9 @@ def create_runner_app(
                 recovered_entry = get_subagent_work(conversation_id)
                 turn_outcome = data.get("turn_outcome") if isinstance(data, dict) else None
                 if turn_outcome in ("completed", "cancelled", "failed"):
-                    recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                    recovered_entry = await _ensure_subagent_work_entry(
+                        conversation_id, report_response_id=report_response_id
+                    )
                     terminal_status = turn_outcome
                     if turn_outcome == "cancelled" and recovered_entry is not None:
                         recovered_entry.cancellation_confirmed = True
@@ -6537,7 +6729,24 @@ def create_runner_app(
                 # Forwarders report these edges straight to the server, so record
                 # them here too; the idle watchdog reads them for native turns.
                 _native_pane_status[conversation_id] = status
+                if status == "failed":
+                    detail = data.get("failure_detail") if isinstance(data, dict) else None
+                    _native_pane_failures[conversation_id] = {
+                        "code": "native_turn_error",
+                        "message": (
+                            detail
+                            if isinstance(detail, str) and detail
+                            else output or "Error: native sub-agent turn failed"
+                        ),
+                    }
+                else:
+                    _native_pane_failures.pop(conversation_id, None)
                 resource_registry.note_external_session_status(conversation_id, status)
+                if status == "failed" and conversation_id in _child_session_parents:
+                    # A dispatched child's file may still read busy after its
+                    # StopFailure: re-read it so a self-resume is seen; a stale
+                    # replay is settled and the failure restored.
+                    resource_registry.resync_status_poller(conversation_id)
                 child_status = (
                     "idle" if terminal_status == "completed" else terminal_status or status
                 )
@@ -6547,6 +6756,10 @@ def create_runner_app(
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
+            if status in ("running", "waiting"):
+                # New activity from a child whose result was already delivered
+                # or drained is a turn Claude Code started on its own.
+                _note_subagent_child_activity(conversation_id)
             turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
             interrupt_pending = False
             interrupt_work_id: str | None = None
@@ -6579,10 +6792,11 @@ def create_runner_app(
                     output = output or "[System: sub-agent interrupted]"
                 elif terminal_status == "failed":
                     output = output or "Error: native sub-agent turn failed"
-                delivery_ack = _mark_subagent_terminal_and_wake(
+                delivery_ack = await _deliver_terminal_report(
                     conversation_id,
                     status=terminal_status,
                     output=output if output is not None else "",
+                    response_id=report_response_id,
                 )
             elif ambiguous_idle:
                 # This harness's forwarder marks genuine turn completions
@@ -6603,31 +6817,36 @@ def create_runner_app(
                     _schedule_subagent_wake(entry)
             else:
                 if status in ("idle", "failed"):
-                    recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                    recovered_entry = await _ensure_subagent_work_entry(
+                        conversation_id, report_response_id=report_response_id
+                    )
                 if status == "idle" and interrupt_pending:
                     # Interrupt with no confirming edge, resolved to the CURRENT
                     # dispatch (``resolve_pending_interrupt`` only reports pending
                     # when the recorded ``work_id`` matches). Bound to that
                     # dispatch so it cannot cancel a newer send.
-                    delivery_ack = _mark_subagent_terminal_and_wake(
+                    delivery_ack = await _deliver_terminal_report(
                         conversation_id,
                         status="cancelled",
                         output=output,
                         only_if_work_id=interrupt_work_id,
+                        response_id=report_response_id,
                     )
                 elif status == "idle":
                     _native_interrupt_runner.clear_pending_interrupt(conversation_id)
-                    delivery_ack = _mark_subagent_terminal_and_wake(
+                    delivery_ack = await _deliver_terminal_report(
                         conversation_id,
                         status="completed",
                         output=output if output is not None else "",
+                        response_id=report_response_id,
                     )
                 elif status == "failed":
                     _native_interrupt_runner.clear_pending_interrupt(conversation_id)
-                    delivery_ack = _mark_subagent_terminal_and_wake(
+                    delivery_ack = await _deliver_terminal_report(
                         conversation_id,
                         status="failed",
                         output=output or "Error: native sub-agent turn failed",
+                        response_id=report_response_id,
                     )
             if delivery_ack is not None:
                 if (

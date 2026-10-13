@@ -1584,7 +1584,10 @@ async def _send_to_in_flight_child(
       is never torn down);
     * post succeeds and the child's tracked turn is **still active** — the
       message was buffered into it, so its single existing work entry is reused
-      verbatim (no re-stamp) and that one completion delivers under it;
+      verbatim (no re-stamp) and that one completion delivers under it. A turn
+      Claude Code resumed on its own was re-armed under the drained turn's
+      receipted id; it keeps its entry but is re-stamped with a fresh id so a
+      restart can still recover the follow-up's unread result;
     * post succeeds and no tracked turn is active — the old turn already ended
       and the server started a new one, or the child was in-flight but untracked
       locally (e.g. after a runner restart). Either way a fresh entry is
@@ -1608,7 +1611,7 @@ async def _send_to_in_flight_child(
 
     Concurrent sends to one child are serialized by the per-child lock so they
     can't install divergent entries; the lock is cleaned up with the child's
-    work registry (see ``in_flight_send_lock`` /
+    work registry (see ``_in_flight_send_lock`` /
     ``unregister_subagent_work_for_session``).
 
     :param child_session_id: The in-flight child session id.
@@ -1644,18 +1647,42 @@ async def _send_to_in_flight_child(
             f"{msg_resp.status_code} {msg_resp.text[:200]}"
         )
 
-    async with _subagent_work.in_flight_send_lock(child_session_id):
+    async with _subagent_work.in_flight_send_guard(child_session_id):
         entry = _subagent_work.get_subagent_work(child_session_id)
-        if entry is not None and entry.status in ("running", "waiting"):
+        live = entry if entry is not None and entry.status in ("running", "waiting") else None
+        if live is not None and not live.rearmed:
             # The tracked turn is still active, so the post was buffered into it.
             # Reuse the one entry so its single completion delivers under it;
             # re-stamping/replacing here is what would orphan that completion.
-            work_id = entry.work_id
+            work_id = live.work_id
+        elif live is not None:
+            # Re-armed under the drained turn's receipted id: the follow-up needs
+            # its own id or a restart would skip its unread result. Persist it
+            # first so the entry never carries an id the child does not.
+            work_id = _subagent_work.new_subagent_work_id()
+            stamp_error = await _patch_subagent_label(
+                server_client,
+                child_session_id,
+                _subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY,
+                work_id,
+            )
+            if stamp_error is None:
+                _subagent_work.restamp_rearmed_subagent_work(live, work_id=work_id)
+            else:
+                # The parent's follow-up confirms the turn: keep the receipted id
+                # but drop the provisional re-arm so a settle cannot revert it.
+                work_id = live.work_id
+                _subagent_work.restamp_rearmed_subagent_work(live, work_id=work_id)
+                _logger.warning(
+                    "steered self-resumed sub-agent %s: dispatch-id stamp failed (%s); the "
+                    "turn keeps its receipted id and a restart cannot recover its result",
+                    child_session_id,
+                    stamp_error,
+                )
         else:
-            # No active tracked turn: the old turn ended and a fresh one started,
-            # or the in-flight turn was untracked locally (post-restart). Track
-            # it freshly so the completion is delivered, directly as "running"
-            # (never "launching") to stay clear of the launch-timeout reaper.
+            # No tracked turn (it ended, or is untracked post-restart): track it
+            # freshly as "running", never "launching", to stay clear of the
+            # launch-timeout reaper.
             work_id = _subagent_work.new_subagent_work_id()
             _subagent_work.register_child_session(
                 child_session_id,
@@ -1663,6 +1690,7 @@ async def _send_to_in_flight_child(
                 title=child_display_title,
                 tool=agent,
                 session_name=title,
+                wrapper_label=wrapper_label,
             )
             fresh = _subagent_work.register_subagent_work(
                 parent_session_id=conversation_id,
@@ -3039,6 +3067,7 @@ async def _execute_subagent_tool(
         title=f"{sub_agent_name}:{session_name}",
         tool=sub_agent_name,
         session_name=session_name,
+        wrapper_label=child_wrapper_label,
     )
     _subagent_work.register_subagent_work(
         parent_session_id=conversation_id,
@@ -3252,6 +3281,7 @@ async def _send_to_existing_session(
         title=display_title or "",
         tool=agent_label,
         session_name=instance_title,
+        wrapper_label=_session_wrapper_label(snap_data),
     )
     _subagent_work.register_subagent_work(
         parent_session_id=conversation_id,
@@ -3398,6 +3428,7 @@ def _finalize_created_session(
         title=label,
         tool=agent_label,
         session_name=label,
+        wrapper_label=_session_wrapper_label(data),
     )
     evt = SessionCreatedEvent(
         type="session.created",

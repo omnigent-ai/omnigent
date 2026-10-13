@@ -322,6 +322,8 @@ class SessionStatusPoller:
         self._last_mtime: float | None = None
         self._last_edge: tuple[str, str | None] | None = None
         self._last_status: SessionStatus | None = None
+        # Set from other threads by :meth:`resync`; consumed on the watcher thread.
+        self._resync_requested = False
 
     @property
     def active(self) -> bool:
@@ -342,6 +344,12 @@ class SessionStatusPoller:
         """
         if self._exhausted:
             return
+        if self._resync_requested:
+            # Drop the baselines here, on the watcher thread, so a tick that was
+            # mid-read when resync() was requested cannot write them back.
+            self._resync_requested = False
+            self._last_mtime = None
+            self._last_edge = None
         if self._path is None:
             self._try_resolve()
             if self._path is None:
@@ -407,15 +415,15 @@ class SessionStatusPoller:
         publish the file's current value verbatim.
 
         Keeps the resolved path and the attempt count — this re-asserts a
-        working poller, it does not restart resolution.
+        working poller, it does not restart resolution. Safe to call from any
+        thread: the baselines are cleared by the next :meth:`tick`.
         """
         _logger.info(
             "claude status file resync: path=%s",
             self._path,
             extra={"session_id": self._omnigent_session_id},
         )
-        self._last_mtime = None
-        self._last_edge = None
+        self._resync_requested = True
 
     @property
     def blocked_on(self) -> str | None:

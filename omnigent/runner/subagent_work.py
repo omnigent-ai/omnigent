@@ -9,13 +9,14 @@ child→parent mapping used to mirror child status onto the parent stream.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import math
 import os
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -102,6 +103,28 @@ _WAKE_POST_RETRY_MAX_DELAY_S = 4.0
 _WAKE_POST_TRANSIENT_4XX = frozenset({408, 409, 425, 429})
 
 
+@dataclasses.dataclass(frozen=True)
+class _FinishedSubagentDispatch:
+    """
+    A finished dispatch as a re-arm or a drain remembers it.
+
+    :param work_id: Dispatch id stamped on the child session, e.g.
+        ``"subagent_a1b2c3d4e5f6"``; a re-armed turn is delivered under it.
+    :param status: The turn's terminal status, e.g. ``"failed"``, so a settled
+        re-arm can restore what the child displayed.
+    :param response_id: Id of the assistant turn whose report finished it, when
+        the forwarder named it, so a replay of that report is told from a
+        later turn's.
+    :param rearmed: Whether a re-arm of this dispatch settled with no terminal
+        report, so a later turn's report is still delivered once.
+    """
+
+    work_id: str
+    status: str
+    response_id: str | None = None
+    rearmed: bool = False
+
+
 @dataclasses.dataclass
 class _SubagentWorkEntry:
     """
@@ -130,12 +153,25 @@ class _SubagentWorkEntry:
         terminal status, or ``None`` while running.
     :param delivered: Whether the terminal payload has been pushed to
         the parent's inbox.
+    :param response_id: Id of the assistant turn whose terminal report this
+        entry recorded, when the forwarder named it.
     :param cancellation_confirmed: Whether a native terminal edge confirmed
         an abort, rather than an interrupt merely being requested.
     :param launch_timed_out: Whether the recorded ``failed`` came from the
         launch-liveness reaper rather than from the child itself. Such a
         failure is a guess ("no start acknowledgment"), so a genuine
         terminal edge from the child afterwards must replace it.
+    :param rearmed: Whether the child's own ``running`` edge announced a turn
+        no terminal report has confirmed yet (see
+        :func:`note_subagent_child_activity`): set on the live re-armed entry
+        and kept on the finished entry a settle restores, so a report that
+        lands after the grace window is still delivered once.
+    :param rearmed_from: The delivered entry that re-arm replaced, so a
+        spurious re-arm can restore it; ``None`` when it replaced a drain.
+    :param rearmed_over: The finished dispatch that re-arm replaced
+        (``rearmed_from``'s state, or the drained dispatch), so a settle can
+        restore what the child displayed and still recognise a replay of its
+        report.
     """
 
     parent_session_id: str
@@ -150,8 +186,12 @@ class _SubagentWorkEntry:
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
     delivered: bool = False
+    response_id: str | None = None
     cancellation_confirmed: bool = False
     launch_timed_out: bool = False
+    rearmed: bool = False
+    rearmed_from: _SubagentWorkEntry | None = None
+    rearmed_over: _FinishedSubagentDispatch | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -179,6 +219,9 @@ class _SubagentDeliveryAck:
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 _drained_delivered_subagent_children: set[str] = set()
+# child_session_id -> the drained dispatch, kept alongside the tombstone above so
+# a turn Claude Code resumes on its own is delivered under the stamped id.
+_drained_subagent_dispatches: dict[str, _FinishedSubagentDispatch] = {}
 # Parents whose restart-recovery scan completed in this process, plus a
 # per-parent lock so an init racing a sys_read_inbox drain cannot run two
 # scans that both pass the registry check and queue one result twice.
@@ -229,17 +272,19 @@ def new_subagent_work_id() -> str:
     return f"subagent_{uuid.uuid4().hex[:12]}"
 
 
-# Per-child locks serializing the classify+register step of an in-flight
-# sub-agent send (see ``tool_dispatch._send_to_in_flight_child``), so two
-# concurrent sends to one child can't install divergent work entries. Co-located
-# with the work registries so it is torn down alongside them — otherwise a
-# long-lived runner would accumulate one lock per steered child forever.
+# Per-child locks serializing an in-flight send's classify+register step, a
+# terminal report's confirmation stamp and the grace settle. Torn down with the
+# work registries once no holder or waiter relies on one (``in_flight_send_guard``).
 _in_flight_send_locks: dict[str, asyncio.Lock] = {}
+_in_flight_send_lock_users: dict[str, int] = {}
 
 
-def in_flight_send_lock(child_session_id: str) -> asyncio.Lock:
+def _in_flight_send_lock(child_session_id: str) -> asyncio.Lock:
     """
     Return (creating on first use) the per-child in-flight-send lock.
+
+    Hold it through :func:`in_flight_send_guard`: a raw acquisition is not
+    counted as a user, so cleanup could forget the lock mid-handoff.
 
     :param child_session_id: Child session id, e.g. ``"conv_child456"``.
     :returns: The lock guarding that child's in-flight-send bookkeeping.
@@ -249,6 +294,45 @@ def in_flight_send_lock(child_session_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _in_flight_send_locks[child_session_id] = lock
     return lock
+
+
+@contextlib.asynccontextmanager
+async def in_flight_send_guard(child_session_id: str) -> AsyncIterator[None]:
+    """
+    Hold the child's send lock, counted as its user from the wait to the release.
+
+    ``asyncio.Lock.locked()`` reads ``False`` between a release and the woken
+    waiter's re-acquire, so the user count, not the lock state, decides when
+    cleanup may forget the lock. The last user to leave forgets it when the
+    child has no work entry left to guard.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    """
+    _in_flight_send_lock_users[child_session_id] = (
+        _in_flight_send_lock_users.get(child_session_id, 0) + 1
+    )
+    try:
+        async with _in_flight_send_lock(child_session_id):
+            yield
+    finally:
+        remaining = _in_flight_send_lock_users.get(child_session_id, 0) - 1
+        if remaining > 0:
+            _in_flight_send_lock_users[child_session_id] = remaining
+        else:
+            _in_flight_send_lock_users.pop(child_session_id, None)
+            if child_session_id not in _subagent_work_by_child:
+                _drop_in_flight_send_lock(child_session_id)
+
+
+def _drop_in_flight_send_lock(child_session_id: str) -> None:
+    """Forget a child's send lock unless a holder or waiter still relies on it."""
+    lock = _in_flight_send_locks.get(child_session_id)
+    if (
+        lock is not None
+        and not lock.locked()
+        and not _in_flight_send_lock_users.get(child_session_id)
+    ):
+        _in_flight_send_locks.pop(child_session_id, None)
 
 
 def register_subagent_work(
@@ -299,6 +383,7 @@ def register_subagent_work(
         created_by=created_by,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
+    _drained_subagent_dispatches.pop(child_session_id, None)
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
     return entry
@@ -333,6 +418,211 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     return entry
 
 
+def forget_drained_subagent_delivery(child_session_id: str) -> bool:
+    """
+    Stop treating *child_session_id*'s next terminal edge as already delivered.
+
+    ``sys_read_inbox`` remembers a drained child so the PTY watcher's trailing
+    ``idle`` after the delivered ``Stop`` is not pushed to the parent twice.
+    That memory must end when the child does new work — a self-resumed turn
+    (Claude Code continuing after a background task or subagent hand-back)
+    ends with a real result the parent has never seen.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: ``True`` when the child was remembered as drained.
+    """
+    if child_session_id in _drained_delivered_subagent_children:
+        _drained_delivered_subagent_children.discard(child_session_id)
+        return True
+    return False
+
+
+def _register_subagent_work_from_child_record(
+    child_session_id: str, *, work_id: str | None
+) -> _SubagentWorkEntry | None:
+    """
+    Register *child_session_id*'s dispatch from the runner's own child record.
+
+    ``register_child_session`` recorded the parent of every child this runner
+    dispatched, so no server read is needed. The parent must own an inbox on
+    this runner; otherwise a mirrored child would be turned into a delivery.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :param work_id: Dispatch id to keep, e.g. ``"subagent_a1b2c3d4e5f6"``, or
+        ``None`` to mint one.
+    :returns: The registered entry, or ``None`` when no local record applies.
+    """
+    meta = _child_session_parents.get(child_session_id)
+    if (
+        meta is None
+        or not meta.parent_id
+        or meta.parent_id == child_session_id
+        or meta.parent_id not in _session_inboxes_ref
+    ):
+        return None
+    return register_subagent_work(
+        parent_session_id=meta.parent_id,
+        child_session_id=child_session_id,
+        agent=meta.tool or "sub-agent",
+        title=meta.session_name or "",
+        wrapper_label=meta.wrapper_label,
+        work_id=work_id,
+    )
+
+
+def _confirm_subagent_rearm(entry: _SubagentWorkEntry) -> None:
+    """Forget a re-arm's provisional state once a report or a new send confirms its turn."""
+    entry.rearmed = False
+    entry.rearmed_from = None
+    entry.rearmed_over = None
+
+
+def restamp_rearmed_subagent_work(entry: _SubagentWorkEntry, *, work_id: str) -> None:
+    """
+    Give a re-armed dispatch a follow-up's own id and treat its turn as confirmed.
+
+    A re-arm reuses the drained turn's dispatch id, whose delivery receipt is
+    already written on the child. A parent's explicit follow-up into that turn
+    needs an id of its own so restart recovery can tell the follow-up's unread
+    result from the earlier drained one; the caller stamps it on the child.
+
+    :param entry: The live re-armed entry, e.g. from :func:`get_subagent_work`.
+    :param work_id: Fresh dispatch id, e.g. ``"subagent_a1b2c3d4e5f6"``.
+    """
+    entry.work_id = work_id
+    _confirm_subagent_rearm(entry)
+
+
+def _replays_finished_report(entry: _SubagentWorkEntry, response_id: str | None) -> bool:
+    """Whether a report naming *response_id* repeats the finished turn a re-arm replaced."""
+    return (
+        response_id is not None
+        and entry.rearmed_over is not None
+        and response_id == entry.rearmed_over.response_id
+    )
+
+
+def _rearm_confirmed_by(entry: _SubagentWorkEntry, response_id: str | None) -> bool:
+    """Whether a terminal report naming *response_id* confirms *entry*'s re-armed turn.
+
+    A live re-armed entry is confirmed by any report but a replay of the finished
+    turn's own (the forwarder re-sending its ``Stop``). A report naming no turn
+    confirms it too: nothing tells it from the resumed turn's result, and a
+    duplicate beats a lost result, so a forwarder that names no turn pays for a
+    replay landing inside a live re-arm with that turn's real result. A finished
+    entry a settle restored still awaits the anticipated turn's report: any
+    report but a replay of its own (the same ``response_id``) confirms it.
+    """
+    if not entry.rearmed:
+        return False
+    if entry.status not in _SUBAGENT_TERMINAL_STATUSES:
+        return not _replays_finished_report(entry, response_id)
+    return response_id is None or response_id != entry.response_id
+
+
+def rearmed_turn_confirmed_by(child_session_id: str, *, response_id: str | None) -> bool:
+    """
+    Whether a terminal report for *child_session_id* would confirm a re-armed turn.
+
+    Lets the caller give that turn its own dispatch id on the child before the
+    report's result is delivered (see ``mark_subagent_work_terminal``).
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :param response_id: Id of the turn the report ends, when the forwarder named it.
+    :returns: ``True`` when the child's entry is a re-arm this report confirms.
+    """
+    entry = _subagent_work_by_child.get(child_session_id)
+    return entry is not None and _rearm_confirmed_by(entry, response_id)
+
+
+def note_subagent_child_activity(child_session_id: str) -> _SubagentWorkEntry | None:
+    """
+    Re-arm a finished dispatch whose child reports new work.
+
+    Claude Code resumes a session on its own when a background task or one of
+    its subagents hands back, so a ``running``/``waiting`` edge can arrive for
+    a child whose last result the parent already received or drained. That
+    edge opens a new turn: track it as a live dispatch under the same id, so
+    the parent's turn end counts the child as running and the turn's terminal
+    edge is delivered instead of deduplicated against the old result. A
+    finished result the parent has not received yet is left in place; the next
+    terminal report replaces it. The entry is provisional (``rearmed``) until a
+    terminal report or an explicit follow-up confirms the turn and gives it a
+    dispatch id of its own on the child.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The re-armed entry, or ``None`` when this edge did not restart a
+        finished dispatch (the child is untracked or its dispatch is live).
+    """
+    entry = _subagent_work_by_child.get(child_session_id)
+    if entry is not None:
+        if entry.status not in _SUBAGENT_TERMINAL_STATUSES or not entry.delivered:
+            return None
+        fresh = register_subagent_work(
+            parent_session_id=entry.parent_session_id,
+            child_session_id=child_session_id,
+            agent=entry.agent,
+            title=entry.title,
+            wrapper_label=entry.wrapper_label,
+            created_by=entry.created_by,
+            work_id=entry.work_id,
+        )
+        fresh.rearmed_from = entry
+        fresh.rearmed_over = _FinishedSubagentDispatch(
+            work_id=entry.work_id, status=entry.status, response_id=entry.response_id
+        )
+    else:
+        drained = _drained_subagent_dispatches.get(child_session_id)
+        if not forget_drained_subagent_delivery(child_session_id):
+            return None
+        fresh = _register_subagent_work_from_child_record(
+            child_session_id, work_id=drained.work_id if drained is not None else None
+        )
+        if fresh is None:
+            # No local record (dispatch adopted after a restart): keep the drain
+            # forgotten so turn-end snapshot recovery can deliver; a stale running
+            # edge costs at most one duplicate, which beats a lost result.
+            return None
+        fresh.rearmed_over = drained
+    fresh.status = "running"
+    fresh.rearmed = True
+    return fresh
+
+
+def settle_spurious_subagent_rearm(child_session_id: str) -> _SubagentWorkEntry | None:
+    """
+    Undo a re-arm that no terminal report confirmed.
+
+    The status-file poller re-reads Claude's file after every forwarded turn
+    end, so a ``busy`` left over from the turn that just ended can publish a
+    ``running`` edge for a turn that never happens. Once the file reads
+    ``idle`` again with no ``Stop`` behind it, the dispatch goes back to its
+    finished state (the delivered entry it replaced, or the drain memory) so
+    the parent is not counted as waiting on it. That finished state remembers
+    the re-arm: a terminal report that lands after the grace window is a real
+    turn's result and is still delivered once.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The settled re-armed entry, now replaced by the restored entry or
+        unregistered, or ``None`` when the child has no unsettled re-arm.
+    """
+    entry = _subagent_work_by_child.get(child_session_id)
+    if entry is None or not entry.rearmed or entry.status != "running":
+        return None
+    if entry.rearmed_from is not None:
+        restored = entry.rearmed_from
+        restored.rearmed = True
+        _subagent_work_by_child[child_session_id] = restored
+    else:
+        unregister_subagent_work(child_session_id, work_id=entry.work_id)
+        _drained_delivered_subagent_children.add(child_session_id)
+        over = entry.rearmed_over or _FinishedSubagentDispatch(
+            work_id=entry.work_id, status="completed"
+        )
+        _drained_subagent_dispatches[child_session_id] = dataclasses.replace(over, rearmed=True)
+    return entry
+
+
 def unregister_subagent_work(
     child_session_id: str,
     *,
@@ -351,7 +641,8 @@ def unregister_subagent_work(
         that dispatch.
     :param remember_drained_delivery: Whether to remember a delivered
         entry as drained so duplicate terminal status reports for the
-        same child are acknowledged as already delivered.
+        same child are acknowledged as already delivered. An entry that
+        is live again is kept: the drained payload was the earlier turn's.
     :returns: None.
     """
     entry = _subagent_work_by_child.get(child_session_id)
@@ -359,10 +650,21 @@ def unregister_subagent_work(
         return
     if work_id is not None and entry.work_id != work_id:
         return
+    if remember_drained_delivery and entry.status not in _SUBAGENT_TERMINAL_STATUSES:
+        # The drained payload came from a finished turn; a live entry under its
+        # id is a newer turn (see note_subagent_child_activity) that still owes
+        # the parent its own result.
+        return
     if remember_drained_delivery and entry.delivered:
         _drained_delivered_subagent_children.add(child_session_id)
+        _drained_subagent_dispatches[child_session_id] = _FinishedSubagentDispatch(
+            work_id=entry.work_id,
+            status=entry.status,
+            response_id=entry.response_id,
+            rearmed=entry.rearmed,
+        )
     _subagent_work_by_child.pop(child_session_id, None)
-    _in_flight_send_locks.pop(child_session_id, None)
+    _drop_in_flight_send_lock(child_session_id)
     children = _subagent_work_by_parent.get(entry.parent_session_id)
     if children is None:
         return
@@ -385,11 +687,21 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     """
     unregister_subagent_work(session_id)
     _drained_delivered_subagent_children.discard(session_id)
-    _in_flight_send_locks.pop(session_id, None)
+    _drained_subagent_dispatches.pop(session_id, None)
+    _drop_in_flight_send_lock(session_id)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_children.discard(child_id)
-        _in_flight_send_locks.pop(child_id, None)
+        _drained_subagent_dispatches.pop(child_id, None)
+        _drop_in_flight_send_lock(child_id)
+    # Drained children left the work registry but keep their drain memory and
+    # may still hold a lock; their records serve nothing once the parent is gone.
+    for child_id, meta in list(_child_session_parents.items()):
+        if meta.parent_id == session_id:
+            _drained_delivered_subagent_children.discard(child_id)
+            _drained_subagent_dispatches.pop(child_id, None)
+            _drop_in_flight_send_lock(child_id)
+            _child_session_parents.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
 
 
@@ -597,12 +909,24 @@ async def _recover_subagent_results_from_server(
             schedule_wake(entry)
 
 
+def _record_terminal_report(
+    entry: _SubagentWorkEntry, *, status: str, output: str | None, response_id: str | None
+) -> None:
+    """Apply a terminal report to *entry* as its current result."""
+    entry.status = status
+    entry.output = output
+    entry.completed_at = time.time()
+    entry.response_id = response_id
+
+
 def mark_subagent_work_terminal(
     child_session_id: str,
     *,
     status: str,
     output: str | None,
     only_if_work_id: str | None = None,
+    response_id: str | None = None,
+    confirmed_work_id: str | None = None,
 ) -> _SubagentDeliveryAck:
     """
     Mark a sub-agent dispatch terminal and notify the parent inbox.
@@ -625,6 +949,14 @@ def mark_subagent_work_terminal(
         entry is still that dispatch. A delayed op (an interrupt's grace-timer
         cancel) bound to the dispatch it was raised for is dropped when a newer
         send has replaced the entry, so an old timer never cancels new work.
+    :param response_id: Id of the assistant turn this report ends, when the
+        forwarder named it. After a settled re-arm it tells a replay of the
+        finished turn's report (same id, absorbed) from the anticipated turn's
+        own report (any other id, delivered).
+    :param confirmed_work_id: Fresh dispatch id the caller stamped on the child
+        for the re-armed turn this report confirms (see
+        :func:`rearmed_turn_confirmed_by`); the entry takes it so the result
+        and its drain receipt carry it. Ignored when no re-arm is confirmed.
     :returns: Delivery acknowledgement for this terminal report.
     :raises ValueError: If ``status`` is not terminal.
     """
@@ -658,7 +990,30 @@ def mark_subagent_work_terminal(
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH,
         )
+    if (
+        entry.rearmed
+        and entry.status not in _SUBAGENT_TERMINAL_STATUSES
+        and _replays_finished_report(entry, response_id)
+    ):
+        # The forwarder re-sent the finished turn's Stop while the re-arm is
+        # live: already delivered, and not the result the re-arm awaits.
+        return _SubagentDeliveryAck(
+            entry=entry,
+            delivered=True,
+            delivered_now=False,
+            reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
+        )
     if entry.status in _SUBAGENT_TERMINAL_STATUSES:
+        if _rearm_confirmed_by(entry, response_id):
+            # The turn a settled re-arm anticipated reports after the grace
+            # window: a new result, not a replay of the finished one. An unnamed
+            # report counts as new: a duplicate beats a lost result.
+            if confirmed_work_id is not None:
+                entry.work_id = confirmed_work_id
+            _record_terminal_report(entry, status=status, output=output, response_id=response_id)
+            entry.delivered = False
+            _confirm_subagent_rearm(entry)
+            return _deliver_subagent_completion(entry)
         # ``failed`` outranks ``completed``: a quiescence-derived ``completed``
         # (the watcher's ``idle`` edge) can be recorded — and delivered — before
         # the turn's real ``failed`` edge lands. The failure must replace it and
@@ -667,16 +1022,12 @@ def mark_subagent_work_terminal(
         # success before the re-delivery arrives — that window is inherent to
         # the edge race; re-delivery is the mitigation, not a prevention.
         if status == "failed" and entry.status == "completed":
-            entry.status = status
-            entry.output = output
-            entry.completed_at = time.time()
+            _record_terminal_report(entry, status=status, output=output, response_id=response_id)
             entry.delivered = False
             return _deliver_subagent_completion(entry)
         # A child-reported terminal state supersedes the reaper's provisional failure.
         if entry.launch_timed_out and status in ("completed", "failed"):
-            entry.status = status
-            entry.output = output
-            entry.completed_at = time.time()
+            _record_terminal_report(entry, status=status, output=output, response_id=response_id)
             entry.delivered = False
             entry.launch_timed_out = False
             return _deliver_subagent_completion(entry)
@@ -694,13 +1045,12 @@ def mark_subagent_work_terminal(
             status == "completed" and entry.status == "failed"
         )
         if not keep_recorded:
-            entry.status = status
-            entry.output = output
-            entry.completed_at = time.time()
+            _record_terminal_report(entry, status=status, output=output, response_id=response_id)
         return _deliver_subagent_completion(entry)
-    entry.status = status
-    entry.output = output
-    entry.completed_at = time.time()
+    if entry.rearmed and confirmed_work_id is not None:
+        entry.work_id = confirmed_work_id
+    _record_terminal_report(entry, status=status, output=output, response_id=response_id)
+    _confirm_subagent_rearm(entry)
     return _deliver_subagent_completion(entry)
 
 
@@ -1080,12 +1430,16 @@ class _ChildParentMeta:
     :param last_error: Last child failure detail fanned out, used to emit a
         new parent update when only the error changes, and to clear stale
         errors on a later running/waiting edge.
+    :param wrapper_label: The child's ``omnigent.wrapper`` label when known,
+        e.g. ``"claude-code-native-ui-subagent"``, so a work entry rebuilt
+        from this record routes ``sys_cancel_task`` like the original dispatch.
     """
 
     parent_id: str
     title: str
     tool: str
     session_name: str
+    wrapper_label: str | None = None
     last_busy: bool | None = None
     last_task_status: str | None = None
     last_error: tuple[str, str] | None = None
@@ -1103,6 +1457,7 @@ def register_child_session(
     title: str,
     tool: str,
     session_name: str,
+    wrapper_label: str | None = None,
 ) -> None:
     """
     Record a child→parent mapping for SSE status/preview fan-out.
@@ -1113,12 +1468,15 @@ def register_child_session(
     :param title: Child title, ``"{tool}:{session_name}"``.
     :param tool: Sub-agent type, e.g. ``"researcher"``.
     :param session_name: Sub-agent instance name, e.g. ``"auth"``.
+    :param wrapper_label: The child's ``omnigent.wrapper`` label when known,
+        e.g. ``"codex-native-ui"``.
     """
     _child_session_parents[child_session_id] = _ChildParentMeta(
         parent_id=parent_session_id,
         title=title,
         tool=tool,
         session_name=session_name,
+        wrapper_label=wrapper_label,
     )
 
 

@@ -18,7 +18,9 @@ from omnigent.runner.subagent_work import (
     _SUBAGENT_TERMINAL_STATUSES,
     _deliver_subagent_completion,
     _drained_delivered_subagent_children,
+    _drained_subagent_dispatches,
     _recover_subagent_results_from_server,
+    _register_subagent_work_from_child_record,
     _subagent_recovery_done,
     _subagent_recovery_locks,
     _subagent_work_by_child,
@@ -37,13 +39,19 @@ class _ScheduleSubagentWakeFn(Protocol):
     def __call__(self, entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None: ...
 
 
+class _EnsureSubagentWorkEntryFn(Protocol):
+    async def __call__(
+        self, conv_id: str, *, report_response_id: str | None = None
+    ) -> _SubagentWorkEntry | None: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class SubagentRecovery:
     """Sub-agent recovery helpers the rest of the runner app calls."""
 
     cancel_subagent_recovery: Callable[[str], Coroutine[Any, Any, None]]
     deliver_retained_subagent_results: Callable[[str], None]
-    ensure_subagent_work_entry: Callable[[str], Coroutine[Any, Any, _SubagentWorkEntry | None]]
+    ensure_subagent_work_entry: _EnsureSubagentWorkEntryFn
     parent_is_nested_subagent: Callable[[_SubagentWorkEntry], Coroutine[Any, Any, bool]]
     recover_sub_agent_name: Callable[[str], Coroutine[Any, Any, str | None]]
     recover_undrained_subagent_results: Callable[[str], Coroutine[Any, Any, None]]
@@ -79,26 +87,58 @@ def build_subagent_recovery(
             _session_sub_agent_names[conv_id] = name
         return name
 
-    async def _ensure_subagent_work_entry(conv_id: str) -> _SubagentWorkEntry | None:
+    async def _ensure_subagent_work_entry(
+        conv_id: str, *, report_response_id: str | None = None
+    ) -> _SubagentWorkEntry | None:
+        """Return the child's work entry, rebuilding one for a report that still owes delivery.
+
+        :param report_response_id: Id of the turn the arriving report ends, when
+            the forwarder named it; a replay of the drained turn's own report is
+            never rebuilt, while a settled re-arm is rebuilt for any other turn's.
+        """
         existing = get_subagent_work(conv_id)
         if existing is not None:
             return existing
-        if conv_id in _drained_delivered_subagent_children:
+        drained = _drained_subagent_dispatches.get(conv_id)
+        if conv_id in _drained_delivered_subagent_children and (
+            drained is None or not drained.rearmed
+        ):
             return None
-        try:
-            snapshot = await _session_snapshot(conv_id)
-        except Exception:  # noqa: BLE001 — best-effort recovery
+        if (
+            drained is not None
+            and report_response_id is not None
+            and report_response_id == drained.response_id
+        ):
             return None
-        parent_id = snapshot.parent_session_id
-        if not parent_id or parent_id == conv_id:
-            return None
-        agent = snapshot.sub_agent_name or snapshot.agent_name or "sub-agent"
-        return register_subagent_work(
-            parent_session_id=parent_id,
-            child_session_id=conv_id,
-            agent=agent,
-            title=snapshot.sub_agent_name or "",
-        )
+        # Keep the stamped dispatch id so the drain receipt matches the child's
+        # label; a rebuild that fails here leaves the drain memory, and so the
+        # replay guard above, intact for the retried report.
+        work_id = drained.work_id if drained is not None else None
+        # The runner's own child record is authoritative; the server snapshot
+        # is the fallback for a child adopted after a restart.
+        rebuilt = _register_subagent_work_from_child_record(conv_id, work_id=work_id)
+        if rebuilt is None:
+            try:
+                snapshot = await _session_snapshot(conv_id)
+            except Exception:  # noqa: BLE001 — best-effort recovery
+                return None
+            parent_id = snapshot.parent_session_id
+            if not parent_id or parent_id == conv_id:
+                return None
+            agent = snapshot.sub_agent_name or snapshot.agent_name or "sub-agent"
+            rebuilt = register_subagent_work(
+                parent_session_id=parent_id,
+                child_session_id=conv_id,
+                agent=agent,
+                title=snapshot.sub_agent_name or "",
+                work_id=work_id,
+            )
+        # A report for a drained dispatch that is no replay ends a new turn: the
+        # rebuilt entry stands in for that turn's re-arm, so the report can give
+        # it its own id and a replay of the drained turn's own is still refused.
+        rebuilt.rearmed = drained is not None
+        rebuilt.rearmed_over = drained
+        return rebuilt
 
     async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:
         """
