@@ -3744,23 +3744,45 @@ describe("session tooltip project detail", () => {
       "session-tooltip-branch",
     ]);
     expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+  });
 
-    cleanup();
+  it("keeps the pinned project flyout when grouping is disabled", async () => {
     projectsMock.push("Alpha");
-    projectRowsRef.current = undefined;
     mockConversations([filedSession("conv_pinned"), filedSession("conv_filed")]);
     seedPins(["conv_pinned"]);
     renderSidebar();
     fireEvent.focus(screen.getByRole("link", { name: "conv_pinned" }));
     expect(await screen.findByTestId("pinned-project-flyout")).toBeInTheDocument();
     expect(screen.queryByTestId("session-tooltip-content")).toBeNull();
+  });
 
-    cleanup();
+  it("keeps the legacy tooltip free of a Project row when grouping is disabled", async () => {
+    projectsMock.push("Alpha");
     mockConversations([filedSession("conv_filed")]);
     renderSidebar();
     fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
     const legacyTooltip = await openTooltip("conv_filed");
     expect(within(legacyTooltip).queryByTestId("session-tooltip-project")).toBeNull();
+  });
+
+  it("shows a pinned project's Project row in the shared tooltip during selection", async () => {
+    projectRowsRef.current = [{ id: "p_alpha", name: "Alpha", icon: "🚀" }];
+    mockConversations([
+      filedSession("conv_pinned", {
+        project_id: "p_alpha",
+        workspace: "/Users/me/Alpha",
+      }),
+    ]);
+    seedPins(["conv_pinned"]);
+    renderGroupingSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    const row = screen.getByRole("link", { name: "conv_pinned" });
+    fireEvent.pointerMove(row, { pointerType: "mouse" });
+
+    const tooltip = await screen.findByTestId("session-tooltip-content");
+    expect(within(tooltip).getByTestId("session-tooltip-project")).toHaveTextContent("Alpha");
+    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
   });
 
   it.each(["status", "updated"] as const)(
