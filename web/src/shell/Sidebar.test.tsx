@@ -3421,6 +3421,7 @@ describe("session tooltip project detail", () => {
     mockConversations([
       filedSession("conv_pinned", {
         project_id: "p_alpha",
+        labels: {},
         workspace: "/Users/me/Alpha",
         owner: "owner@example.com",
         git_branch: "feature/tooltip",
