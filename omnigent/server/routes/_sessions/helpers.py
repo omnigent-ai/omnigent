@@ -6778,10 +6778,10 @@ def _surface_setting_change_forward_failure(
     setting: str,
     target: str,
     code: str,
-    message: str,
+    message_template: str,
 ) -> bool:
     """
-    Publish *message* when a reachable runner refused a native settings change.
+    Publish a notice when a reachable runner refused a native settings change.
 
     Silent when no runner answered at all (the relaunch reads the persisted
     value off the row) and when the runner accepted the change.
@@ -6793,8 +6793,8 @@ def _surface_setting_change_forward_failure(
     :param target: The persisted value, for the log, e.g. ``"opus"``.
     :param code: Error code of the notice, e.g.
         :data:`_MODEL_CHANGE_NOT_APPLIED_CODE`.
-    :param message: Notice text with a ``{reason}`` placeholder for the
-        runner's reason.
+    :param message_template: Notice text with ``{target}`` and ``{reason}``
+        placeholders, formatted in one pass so neither value is re-parsed.
     :returns: ``True`` when the runner rejected the change; ``False`` when it
         accepted the change or no runner answered.
     """
@@ -6823,7 +6823,11 @@ def _surface_setting_change_forward_failure(
     )
     _publish_error_event(
         session_id,
-        ErrorData(source="execution", code=code, message=message.format(reason=reason)),
+        ErrorData(
+            source="execution",
+            code=code,
+            message=message_template.format(target=target, reason=reason),
+        ),
     )
     return True
 
@@ -6865,8 +6869,8 @@ def _surface_model_change_forward_failure(
         setting="Model",
         target=target,
         code=_MODEL_CHANGE_NOT_APPLIED_CODE,
-        message=(
-            f"The terminal was not switched to {target}: {{reason}}. "
+        message_template=(
+            "The terminal was not switched to {target}: {reason}. "
             "It is still running on its previous model."
         ),
     )
@@ -6880,12 +6884,9 @@ def _surface_effort_change_forward_failure(
     """
     Publish a visible notice when a native pane never took an effort change.
 
-    The effort counterpart of :func:`_surface_model_change_forward_failure`.
-    The PATCH keeps its 200 and the persisted value (the next launch reads it
-    off the row), but on a native terminal the ``/effort`` injection is the
-    only thing that moves the live pane, so a runner that answered and still
-    refused (e.g. Claude is waiting on a permission prompt) would otherwise
-    leave the picker claiming a level the pane is not on, silently.
+    The effort counterpart of :func:`_surface_model_change_forward_failure`:
+    publish a refusal notice without changing the PATCH's successful
+    persistence semantics.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param effort: The effort that was persisted, e.g. ``"high"``, or
@@ -6902,8 +6903,8 @@ def _surface_effort_change_forward_failure(
         setting="Effort",
         target=target,
         code=_EFFORT_CHANGE_NOT_APPLIED_CODE,
-        message=(
-            f"The terminal's reasoning effort was not switched to {target}: {{reason}}. "
+        message_template=(
+            "The terminal's reasoning effort was not switched to {target}: {reason}. "
             "It is still running at its previous effort level."
         ),
     )

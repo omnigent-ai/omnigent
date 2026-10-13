@@ -219,7 +219,13 @@ def _claude_command_failure(
             status_code=503,
             content={"error": error, "detail": _client_safe_error_detail(exc, context=context)},
         )
-    _logger.warning("%s refused: %s", context, type(exc).__name__, extra={"session_id": conv_id})
+    _logger.warning(
+        "%s refused: %s: %s",
+        context,
+        type(exc).__name__,
+        exc,
+        extra={"session_id": conv_id},
+    )
     return JSONResponse(status_code=503, content={"error": error, "detail": detail})
 
 

@@ -12031,20 +12031,29 @@ async def test_patch_reasoning_effort_surfaces_a_refused_native_forward(
     assert "returned status" not in message
 
 
+@pytest.mark.parametrize(
+    "forward_result",
+    [
+        pytest.param(None, id="no-runner"),
+        pytest.param(_RunnerForwardResult(status_code=204, body=""), id="accepted-204"),
+    ],
+)
 async def test_patch_reasoning_effort_stays_quiet_when_no_runner_answers(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    forward_result: _RunnerForwardResult | None,
 ) -> None:
-    """A stopped or detached native session has no live pane to be wrong about."""
+    """A deferred (no runner) or accepted effort change publishes no refusal notice."""
     published: list[tuple[str, dict[str, Any]]] = []
     _capture_published(monkeypatch, published)
 
-    async def _no_runner(*_args: Any, **_kwargs: Any) -> None:
-        """No runner is bound; the relaunch reads the effort off the row."""
+    async def _forward(*_args: Any, **_kwargs: Any) -> _RunnerForwardResult | None:
+        """No runner is bound, or the live pane accepted the change."""
+        return forward_result
 
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._forward_session_change_to_runner",
-        _no_runner,
+        _forward,
     )
     agent = await create_test_agent(client)
     session = await _create_session(

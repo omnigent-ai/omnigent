@@ -1,17 +1,11 @@
 """E2E: a web model/effort change refused by a pending Claude prompt must say so.
 
-A real ``claude`` CLI runs in the session terminal against the mock LLM. The
-mock scripts a gated ``Write`` tool call, so Claude Code parks a permission
-prompt (the chat shows the pending approval card). While that prompt is open, a
-different effort level is picked from the composer's configuration gear, and a
-different model is applied through the same ``model_override`` PATCH the gear's
-picker issues. The mock backend resolves every Claude ``/model`` alias to the
-one mock model, so the probed catalog collapses to a single Models row with no
-second model to click; the chat notice is published by the server over the
-session stream either way. The runner refuses to type ``/model`` / ``/effort``
-into a pane that is waiting on a person, which is correct; the chat must then
-tell the person to answer the prompt first instead of a generic runner failure
-(or nothing).
+Exercise pending-permission refusal notices through the real ``claude`` CLI and
+browser: the mock scripts a gated ``Write`` so Claude parks a permission prompt,
+then a model/effort change is attempted from the composer. The mock catalog
+exposes one model, so the model case uses the picker's ``model_override`` PATCH
+directly. The chat must name the pending prompt instead of a generic runner
+failure (or nothing).
 """
 
 from __future__ import annotations
@@ -24,6 +18,7 @@ import uuid
 
 import httpx
 import pytest
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
@@ -38,8 +33,10 @@ _PENDING_CARD = '[data-testid="approval-card"][data-state="pending"]'
 _ERROR_PILL = '[data-testid="error-pill"]'
 _TOAST = "[data-sonner-toast]"
 _GENERIC_RUNNER_FAILURE = "Request failed on the runner"
-# Wording that tells the person what is blocking the change and what to do.
+# Wording that names what is blocking the change.
 _NAMES_THE_PROMPT = re.compile(r"question|permission|dialog", re.IGNORECASE)
+# The recovery step, shared by the pending-prompt and dialog refusal cases.
+_NAMES_THE_NEXT_STEP = re.compile(r"in the terminal|try again", re.IGNORECASE)
 # The runner answers the refusal at once; the server's forward budget is 20 s.
 _NOTICE_TIMEOUT_MS = 25_000
 
@@ -58,7 +55,7 @@ def _script_write_prompt(mock_url: str, go_token: str) -> None:
 
 
 def _decline_pending(base_url: str, session_id: str) -> None:
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(httpx.HTTPError, ValueError):
         snap = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
         for pending in snap.get("pending_elicitations") or []:
             if eid := pending.get("elicitation_id"):
@@ -96,12 +93,12 @@ def _open_config_submenu(page: Page) -> None:
 def _visible_notices(page: Page) -> list[str]:
     texts: list[str] = []
     for pill in page.locator(_ERROR_PILL).all():
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(PlaywrightError):
             if pill.locator('[data-testid="error-message-content"]').count() == 0:
                 pill.locator('[data-testid="error-headline"]').click()
             texts.append(pill.inner_text(timeout=2_000))
     for toast in page.locator(_TOAST).all():
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(PlaywrightError):
             texts.append(toast.inner_text(timeout=2_000))
     return [re.sub(r"\s+", " ", text).strip() for text in texts if text.strip()]
 
@@ -114,7 +111,9 @@ def _wait_for_notice(page: Page) -> list[str]:
         if notices:
             # Let the notice settle (the pill body renders after the expand click).
             page.wait_for_timeout(1_500)
-            return _visible_notices(page)
+            settled = _visible_notices(page)
+            # Keep the first-seen notices in case a transient toast auto-dismissed.
+            return list(dict.fromkeys(notices + settled))
         page.wait_for_timeout(500)
     return notices
 
@@ -131,6 +130,10 @@ def _assert_notice_names_the_prompt(notices: list[str], control: str) -> None:
     )
     assert _NAMES_THE_PROMPT.search(joined), (
         f"{control}: the notice does not tell the person to answer the pending prompt: {joined!r}"
+    )
+    assert _NAMES_THE_NEXT_STEP.search(joined), (
+        f"{control}: the notice names the blocker but omits the recovery step "
+        f"(clear it in the terminal, then try again): {joined!r}"
     )
 
 
