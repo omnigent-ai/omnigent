@@ -43,3 +43,15 @@ def test_repro_recording_rules_match_the_shared_guide() -> None:
     assert "Text-only CLI output is not a reason to skip recording" in instructions
     assert "name the specific blocker in `recording_unavailable_reason`" in instructions
     assert "Do not block the verdict because footage is missing or rejected" in instructions
+
+
+def test_lane_captions_name_stand_in_artifacts_visible_in_the_frames() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+    finishing = lanes.split("## Finishing a clip", 1)[1]
+
+    assert "the caption must name every one the proof frames show" in finishing
+    assert 'read "Models unavailable" beside the harness icon' in finishing
+    assert "Naming the stand-in environment does not explain these" in finishing
+    assert "`inner_text()` on the composer's harness/model trigger" in finishing
+    assert "state each visible artifact with its cause" in finishing
+    assert "a finding to settle, not an artifact to annotate" in finishing
