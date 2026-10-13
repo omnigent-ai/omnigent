@@ -7,6 +7,17 @@ that launches the host or CLI; the host forwards it to runners. Existing
 processes retain their launch environment, so start a fresh host and session
 after changing it.
 
+## Harness start-up deadline
+
+A harness subprocess has 30 seconds to bind its endpoint; otherwise the turn
+fails with `harness_spawn_failed` ("did not bind its endpoint within 30s"). On
+hosts where process start is slow, such as machines whose endpoint security
+scans each Python extension as it loads, set `OMNIGENT_HARNESS_SPAWN_TIMEOUT_S`
+(seconds, for example `120`) in the environment that launches the host. Only
+positive finite numbers are honoured; anything else keeps the default. As with
+the flag above, run `omnigent stop` before `omnigent start`, because a running
+daemon keeps its launch environment.
+
 The flag gates the additional diagnostic consumers' buffer reads and text
 exports, startup-error excerpts, and Codex's injected app-server logging filter.
 It does not disable in-memory exit-history capture or the existing registered

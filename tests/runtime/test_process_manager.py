@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -25,6 +26,7 @@ from omnigent.runtime.harnesses.process_manager import (
     _HarnessEndpoint,
     _model_env_key,
     _SubprocessEntry,
+    _wait_for_bind,
 )
 
 
@@ -267,3 +269,133 @@ def test_build_harness_spawn_env_keeps_desktop_session_in_runner(
     assert {name: overrides[name] for name in session_env} == session_env
     if with_overrides:
         assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s test-key"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 30.0),
+        ("120", 120.0),
+        ("2.5", 2.5),
+        ("0", 30.0),
+        ("-5", 30.0),
+        ("inf", 30.0),
+        ("nan", 30.0),
+        ("soon", 30.0),
+    ],
+)
+def test_spawn_ready_timeout_honours_positive_env_override(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: float
+) -> None:
+    """Slow hosts can raise the spawn deadline; bad values keep the default."""
+    from omnigent.runtime.harnesses import process_manager as pm
+
+    monkeypatch.setattr(pm, "_SPAWN_READY_TIMEOUT_S", 30.0)
+    if raw is None:
+        monkeypatch.delenv(pm.SPAWN_READY_TIMEOUT_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(pm.SPAWN_READY_TIMEOUT_ENV_VAR, raw)
+
+    assert pm._spawn_ready_timeout_s() == expected
+
+
+class _FakeClock:
+    """Loop stand-in whose ``time()`` only moves when the code under test sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def time(self) -> float:
+        return self.now
+
+
+class _ScriptedEndpoint:
+    """Endpoint that starts accepting connections at ``ready_at`` (never if ``None``)."""
+
+    def __init__(self, clock: _FakeClock, ready_at: float | None) -> None:
+        self._clock = clock
+        self._ready_at = ready_at
+        self.hardened = False
+
+    async def can_connect(self) -> bool:
+        return self._ready_at is not None and self._clock.now >= self._ready_at
+
+    def harden(self) -> None:
+        self.hardened = True
+
+
+class _KillableProc:
+    """Running subprocess stand-in that records ``kill()``."""
+
+    returncode = None
+
+    def __init__(self) -> None:
+        self.killed = False
+
+    def kill(self) -> None:
+        self.killed = True
+
+    async def wait(self) -> int:
+        return -9
+
+
+def _use_fake_clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
+    """Drive ``_wait_for_bind`` on a fake clock: each poll sleep advances it."""
+    from omnigent.runtime.harnesses import process_manager as pm
+
+    clock = _FakeClock()
+
+    async def _sleep(delay: float) -> None:
+        clock.now += delay
+
+    # A module-local copy of asyncio with only the clock swapped: every other
+    # asyncio name stays real, and the test runner's own loop is untouched (patching
+    # the shared asyncio module would replace sleep/get_running_loop process-wide).
+    fake_asyncio = SimpleNamespace(**vars(pm.asyncio))
+    fake_asyncio.get_running_loop = lambda: clock
+    fake_asyncio.sleep = _sleep
+    monkeypatch.setattr(pm, "asyncio", fake_asyncio)
+    monkeypatch.setattr(pm, "_SPAWN_READY_TIMEOUT_S", 30.0)
+    return clock
+
+
+async def test_wait_for_bind_override_outlasts_default_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A harness that binds after 45 s succeeds when the override allows 120 s."""
+    clock = _use_fake_clock(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_HARNESS_SPAWN_TIMEOUT_S", "120")
+    proc = _KillableProc()
+    endpoint = _ScriptedEndpoint(clock, ready_at=45.0)
+
+    await _wait_for_bind(proc, endpoint, "claude-sdk", "conv-1")  # type: ignore[arg-type]
+
+    assert endpoint.hardened
+    assert not proc.killed
+    assert 45.0 <= clock.now < 46.0
+
+
+@pytest.mark.parametrize(("raw", "shown"), [(None, "30s"), ("2.5", "2.5s")])
+async def test_wait_for_bind_deadline_follows_override_and_names_it(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, shown: str
+) -> None:
+    """The resolved deadline governs expiry, and the error says how to raise it."""
+    from omnigent.runtime.harnesses import process_manager as pm
+
+    clock = _use_fake_clock(monkeypatch)
+    if raw is None:
+        monkeypatch.delenv(pm.SPAWN_READY_TIMEOUT_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(pm.SPAWN_READY_TIMEOUT_ENV_VAR, raw)
+    proc = _KillableProc()
+    deadline = pm._spawn_ready_timeout_s()
+
+    with pytest.raises(RuntimeError) as raised:
+        await _wait_for_bind(proc, _ScriptedEndpoint(clock, ready_at=None), "claude-sdk", "conv-1")  # type: ignore[arg-type]
+
+    assert proc.killed
+    assert deadline <= clock.now < deadline + 1.0
+    message = str(raised.value)
+    assert f"within {shown} " in message
+    assert pm.SPAWN_READY_TIMEOUT_ENV_VAR in message
+    assert "restart the host" in message

@@ -425,3 +425,25 @@ def test_runner_env_preserves_claude_telemetry_opt_in() -> None:
     # Then
     assert env.get("OTEL_METRICS_EXPORTER") == "otlp"
     assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_harness_spawn_timeout_reaches_daemon_and_runner(
+    monkeypatch: pytest.MonkeyPatch, server_url: str | None
+) -> None:
+    """The spawn-deadline knob set where the host starts reaches the runner."""
+    monkeypatch.setenv("OMNIGENT_HARNESS_SPAWN_TIMEOUT_S", "120")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:6767",
+        runner_id="runner_spawn_timeout",
+        binding_token="binding-spawn-timeout",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    assert daemon_env["OMNIGENT_HARNESS_SPAWN_TIMEOUT_S"] == "120"
+    assert runner_env["OMNIGENT_HARNESS_SPAWN_TIMEOUT_S"] == "120"
