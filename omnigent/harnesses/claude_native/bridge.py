@@ -4174,6 +4174,8 @@ def inject_user_message(
         if Claude's input prompt never renders, if a ``tmux send-keys``
         invocation fails, or if the draft never leaves the input box
         after repeated submit Enters (message not delivered).
+    :raises ClaudeTerminalDialog: If the input box stays in shell mode or the
+        prompt-history search after the reclaim; nothing was typed.
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
@@ -4181,7 +4183,16 @@ def inject_user_message(
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
-    _restore_occupied_input(info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir)
+    surface = _restore_occupied_input(
+        info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir
+    )
+    if surface is not None and surface != _OVERLAY_SURFACE:
+        # An overlay may be launcher output the readiness gate waits through; a
+        # box held in another mode never frees itself, and timing out reaps the pane.
+        raise ClaudeTerminalDialog(
+            f"Claude Code's input box is occupied by {surface}, so the message was not "
+            "delivered. Open the terminal, dismiss it, then resend your message."
+        )
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.

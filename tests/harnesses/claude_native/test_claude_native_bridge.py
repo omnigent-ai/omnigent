@@ -10965,6 +10965,40 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     assert tails[-1] == "Enter"
 
 
+def test_inject_user_message_refuses_a_shell_mode_draft_escape_cannot_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A shell-mode draft that outlives the reclaim is refused, not waited out.
+
+    Escape does not take a typed shell command out of the box, so the
+    readiness gate would poll its whole slow-boot budget for a ``❯`` that
+    cannot appear, and the delivery timeout then kills the healthy pane.
+    Only the dismissal Escapes may reach the pane.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    shell_draft_pane = (
+        "──────────────────────────────\n"
+        "! git status --short\n"
+        "──────────────────────────────\n"
+        "  ! for shell mode\n"
+    )
+    sends = _fake_tmux(monkeypatch, [shell_draft_pane])
+    # The pane is alive, so without the refusal the readiness gate keeps waiting.
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_args: claude_native_bridge._ClaudePaneState(alive=True),
+    )
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by shell mode"):
+        inject_user_message(bridge_dir, content="hello from the web")
+
+    tails = [args[-1] for args in sends]
+    assert tails and set(tails) == {"Escape"}, f"Only dismissal Escapes may be sent; got {tails}."
+
+
 _MCP_APPROVAL_DIALOG_PANE = """\
 ────────────────────────────────────────────────────────────────────────────────
   New MCP server found in this project: e2e-noop
