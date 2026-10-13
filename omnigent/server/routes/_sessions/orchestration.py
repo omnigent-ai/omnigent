@@ -3884,7 +3884,9 @@ async def _mark_runner_sessions_offline_once(
         await record_subagent_activity(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
         )
-        await _persist_session_status_error_labels(conv.id, error, conversation_store)
+        await _persist_session_status_error_labels(
+            conv.id, error, conversation_store, owner_runner_id=conv.runner_id
+        )
     return retry
 
 
@@ -6851,7 +6853,11 @@ async def _forward_event_to_runner(
             # The item id lets a client whose 503 was lost match the refusal to
             # its own send instead of to any message the snapshot holds.
             await _persist_session_status_error_labels(
-                session_id, _reject_error, conversation_store, item_id=persisted_items[0].id
+                session_id,
+                _reject_error,
+                conversation_store,
+                owner_runner_id=conv.runner_id,
+                item_id=persisted_items[0].id,
             )
             _publish_status(
                 session_id,
@@ -7782,10 +7788,9 @@ async def _runner_disconnect_requires_failure(
     elif source == "unknown":
         decision = "unknown_no_failure"
     elif fail_idle_top_level and conv is not None and conv.kind != "sub_agent":
-        # A failed session keeps a cause its own runner recorded; a cause left by
-        # a previous runner attempt is stale, so this exit records its own startup
-        # failure. A cached or cold-read "failed" can precede the cause labels
-        # (written separately), so re-read a cause-less row before overwriting it.
+        # A failed session keeps a cause its own runner recorded; a prior runner's
+        # cause is stale, so this exit records its own startup failure. A cached
+        # "failed" can precede the cause labels, so re-read a cause-less row first.
         cause_conv = conv if isinstance(conv, Conversation) else None
         read_failed = False
         if live == "failed" and (
@@ -7803,13 +7808,23 @@ async def _runner_disconnect_requires_failure(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
+        # The exiting runner owns the sweep snapshot; compare the cause against it,
+        # not a re-read a mid-sweep rebind could have moved to another runner.
+        exiting_runner = snapshot.runner_id if snapshot is not None else None
         own_cause = False
         if cause_conv is not None and _last_task_error_from_labels(cause_conv.labels) is not None:
             cause_runner = _last_task_error_runner_id_from_labels(cause_conv.labels)
-            own_cause = cause_runner is None or cause_runner == cause_conv.runner_id
-        # An unreadable failed row is inconclusive: preserve rather than overwrite
-        # a possibly-existing cause with a startup failure.
-        preserve = own_cause or read_failed
+            own_cause = cause_runner is None or cause_runner == exiting_runner
+        # Preserve the failure when the cause is this runner's own, an unreadable row
+        # leaves it inconclusive, or a rebind moved the session to another runner
+        # whose exit is not ours to settle.
+        rebound = (
+            exiting_runner is not None
+            and cause_conv is not None
+            and cause_conv.runner_id is not None
+            and cause_conv.runner_id != exiting_runner
+        )
+        preserve = own_cause or read_failed or rebound
         decision = "already_failed" if live == "failed" and preserve else "failed_before_start"
     else:
         decision = "idle_no_failure"
@@ -8126,6 +8141,7 @@ async def _relay_runner_stream(
                     session_id,
                     disconnect_error,
                     conversation_store,
+                    owner_runner_id=runner_id,
                 )
             return
 
@@ -8350,6 +8366,7 @@ async def _relay_runner_stream_once(
                                     session_id,
                                     status_error,
                                     conversation_store,
+                                    owner_runner_id=runner_id,
                                     agent_name=failure_agent_name,
                                 )
                             elif status == "running":
@@ -12511,16 +12528,9 @@ async def _get_session_snapshot(
     if isinstance(raw_label, str) and raw_label.isdigit():
         last_total_tokens = int(raw_label)
     last_task_error = _last_task_error_from_labels(conv.labels)
-    # Runner-crash durability: if the session's bound runner reported an
-    # unexpected exit (host.runner_exited → RunnerExitReports), surface the
-    # cause as last_task_error so a reload/late-open still renders the error
-    # banner — the live session.status:failed push is gone by then. status
-    # reads "failed" from the cache (set by _on_runner_exited), except an idle
-    # session whose runner connected: it lost no work and stays
-    # idle. The report is keyed by the CURRENT runner_id, so a successful relaunch
-    # (new token-bound runner_id) naturally stops matching. Access is gated
-    # by the session-snapshot's own authorization, so the unscoped get is
-    # correct here (the report is this session's own runner).
+    # Runner-crash durability: when the bound runner reported an unexpected exit,
+    # surface its cause as last_task_error so a reload still renders the error
+    # banner. The report is keyed by the current runner_id, so a relaunch stops matching.
     if runner_exit_reports is not None and conv.runner_id is not None:
         exit_error = runner_exit_reports.get(conv.runner_id)
         runner_ran = (

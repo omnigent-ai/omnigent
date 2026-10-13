@@ -3168,11 +3168,12 @@ async def test_offline_sweep_scopes_preserved_cause_to_owning_runner(
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(runner_id="runner-owner")
     original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
-    # Persist through the real path so the owning runner_id label is recorded.
+    # Record the cause scoped to the owning runner through the real path.
     await sessions_module._persist_session_status_error_labels(
         conv.id,
         ErrorDetail(code=original["code"], message=original["message"]),
         store,
+        owner_runner_id="runner-owner",
     )
     store.set_session_live_status(conv.id, "failed")
     exiting_runner = "runner-owner" if owner_matches else "runner-replacement"
@@ -3201,6 +3202,90 @@ async def test_offline_sweep_scopes_preserved_cause_to_owning_runner(
     finally:
         sessions_module._session_status_cache.pop(conv.id, None)
         session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
+async def test_offline_sweep_preserves_cause_when_session_rebound_mid_sweep(
+    db_uri: str,
+) -> None:
+    """A rebind between snapshot and re-read must not clobber the owner's cause.
+
+    The exiting runner's cause belongs to the runner the sweep snapshot captured.
+    If the session is rebound to a replacement after that snapshot, the
+    confirmation re-read sees the new binding; comparing the cause against it
+    would mis-scope the owner and overwrite a valid failure with a startup error.
+    Anchoring ownership to the exiting runner keeps the cause.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-exiting")
+    store.set_session_live_status(conv.id, "failed")
+    # Snapshot the exiting runner's row before its cause labels land.
+    stale = store.get_conversation(conv.id)
+    assert stale is not None
+    assert stale.runner_id == "runner-exiting"
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    store.set_labels(
+        conv.id,
+        {
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+            "omnigent.last_task_error_runner_id": "runner-exiting",
+        },
+    )
+    # A concurrent reconnect rebinds the row to a replacement before the re-read.
+    store.replace_runner_id(conv.id, "runner-replacement")
+    sessions_module._session_status_cache[conv.id] = "failed"
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [stale],
+                ErrorDetail(code="runner_failed_to_start", message="Synthetic runner exit"),
+                store,
+                fail_idle_top_level=True,
+            )
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        assert sessions_module._last_task_error_from_labels(refreshed.labels) == original
+        assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+        decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert decision["attributes"]["decision"] == "already_failed"
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
+async def test_persist_error_labels_records_passed_owner_runner_despite_rebind(
+    db_uri: str,
+) -> None:
+    """The persisted owner is the caller's runner, not the row's current binding.
+
+    A rebind can move the row's binding before the labels land, so re-reading it
+    would mis-scope the cause. Passing the source runner keeps the attribution
+    correct while the public projection stays free of the owning runner.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-rebound")
+    await sessions_module._persist_session_status_error_labels(
+        conv.id,
+        ErrorDetail(code="native_turn_error", message="Synthetic provider rejection"),
+        store,
+        owner_runner_id="runner-source",
+    )
+    refreshed = store.get_conversation(conv.id)
+    assert refreshed is not None
+    assert refreshed.labels.get("omnigent.last_task_error_runner_id") == "runner-source"
+    assert sessions_module._last_task_error_from_labels(refreshed.labels) == {
+        "code": "native_turn_error",
+        "message": "Synthetic provider rejection",
+    }
 
 
 @pytest.mark.asyncio

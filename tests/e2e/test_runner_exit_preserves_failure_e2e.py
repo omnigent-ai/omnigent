@@ -31,6 +31,7 @@ async def test_runner_exit_preserves_original_failure(tmp_path: Path, restart: b
             session_id = create_native_session(client, base_url, harness="claude")["session_id"]
             # Bind a runner that has never opened its tunnel to this owned test server.
             store = SqlAlchemyConversationStore(f"sqlite:///{server_root / 'chat.db'}")
+            stack.callback(store._engine.dispose)
             assert store.set_runner_id(session_id, runner_id)
             response = client.post(
                 f"{base_url}/v1/sessions/{session_id}/events",
@@ -90,6 +91,9 @@ async def test_runner_exit_preserves_original_failure(tmp_path: Path, restart: b
             refreshed = store.get_conversation(session_id)
             assert refreshed is not None and refreshed.live_status == "failed"
             assert refreshed.labels["omnigent.last_task_error_code"] == original["code"]
+            # Re-read after the snapshot GET so a late sweep- or snapshot-path
+            # turn failure is captured, not only the log up to the decision.
+            log = log_path.read_text(errors="replace")
             assert "Synthetic runner exited with status 1" in log
             failure_lines = [
                 line
@@ -97,3 +101,4 @@ async def test_runner_exit_preserves_original_failure(tmp_path: Path, restart: b
                 if f"session turn failed for {session_id}" in line
             ]
             assert not any("runner_failed_to_start" in line for line in failure_lines)
+            assert not any("origin=runner_offline_sweep" in line for line in failure_lines)

@@ -2146,8 +2146,8 @@ async def _failed_native_session_on_never_connected_runner(
     launched = await client.post(
         f"/v1/hosts/{_HOST_ID}/runners", json={"session_id": session_id, "workspace": "/tmp"}
     )
-    await responder
     assert launched.status_code == 200, launched.text
+    await responder
 
     failed = await client.post(
         f"/v1/sessions/{session_id}/events",

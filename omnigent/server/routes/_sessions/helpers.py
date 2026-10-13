@@ -5112,6 +5112,7 @@ async def _persist_session_status_error_labels(
     error: ErrorDetail | None,
     conversation_store: ConversationStore,
     *,
+    owner_runner_id: str | None = None,
     agent_name: str | None = None,
     item_id: str | None = None,
 ) -> None:
@@ -5128,22 +5129,13 @@ async def _persist_session_status_error_labels(
     :param error: Failure detail from a ``session.status: failed`` edge, or
         ``None`` to clear stale error labels on subsequent activity.
     :param conversation_store: Store used to upsert labels.
+    :param owner_runner_id: Runner this failure belongs to, so a later exit from a
+        replacement runner surfaces its own startup failure instead of this cause.
+        Callers pass the runner they already hold; ``None`` leaves it unattributed.
     :param agent_name: Agent responsible for this failure, captured before a rebind.
     :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
         a client whose POST answer was lost can match the refusal to its own send.
     """
-    # Record which runner owns this cause so a later exit from a different
-    # runner attempt surfaces its own startup failure instead of this stale one.
-    # Read it here — at the failure moment the session is still bound to the
-    # responsible runner — rather than threading it through every caller.
-    owner_runner_id = ""
-    if error is not None:
-        try:
-            owning_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        except Exception:  # noqa: BLE001 — a failed read only loses owner scoping
-            owning_conv = None
-        if owning_conv is not None and owning_conv.runner_id:
-            owner_runner_id = owning_conv.runner_id
     # Structured fields are optional (present only when the runner classified
     # the failure). Always write all keys — empty when absent — because the
     # label store is upsert-only and a stale title/cause from a prior failure
@@ -5157,7 +5149,7 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_CAUSE_LABEL_KEY: _truncate_label(error.cause or ""),
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: _truncate_label(error.remediation or ""),
             _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: _truncate_label(item_id or ""),
-            _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: _truncate_label(owner_runner_id),
+            _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: _truncate_label(owner_runner_id or ""),
         }
         if error is not None
         else {
