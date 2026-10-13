@@ -415,21 +415,82 @@ def test_stalled_helper_call_is_bounded(helper: UploadHelperClient) -> None:
         helper.interrupt()
 
 
-def test_short_operation_queue_budget(helper: UploadHelperClient) -> None:
+@pytest.mark.parametrize("holder_op", ["plan", "complete"])
+def test_short_operation_queue_budget(
+    helper: UploadHelperClient, monkeypatch: pytest.MonkeyPatch, holder_op: str
+) -> None:
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
-    assert "error" not in begin(helper)
-    helper._lock.acquire()
-    release = threading.Timer(2, helper._lock.release)
-    release.start()
-    started = time.monotonic()
-    try:
-        result = helper.call({"op": "status", "id": UID})
-        assert result.get("code") == "busy"
-        assert time.monotonic() - started < 1.5
-    finally:
-        release.join()
-    assert helper.call({"op": "status", "id": UID})["offset"] == 0
+    import omnigent.inner.os_env_upload as upload
+
+    assert "error" not in begin(helper, size=0)
+    original = upload.read_frame
+    entered, release = threading.Event(), threading.Event()
+
+    def slow(stream):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return original(stream)
+
+    monkeypatch.setattr(upload, "read_frame", slow)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        holder = executor.submit(helper.call, {"op": holder_op, "id": UID})
+        assert entered.wait(5)
+        timer = threading.Timer(2, release.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            result = helper.call({"op": "probe"})
+            assert result.get("code") == "busy"
+            assert 0.8 <= time.monotonic() - started < 1.5
+        finally:
+            release.set()
+            timer.cancel()
+            timer.join()
+        assert "error" not in holder.result(timeout=5)
+    assert helper.call({"op": "probe"}) == {"raw_upload": True}
+
+
+def test_append_waits_for_slow_append_on_shared_helper(
+    helper: UploadHelperClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    import omnigent.inner.os_env_upload as upload
+
+    assert "error" not in begin(helper, size=1)
+    second = "b" * 32
+    assert "error" not in helper.call(
+        {"op": "begin", "id": second, "dir": "", "name": "other", "size": 1, "on_conflict": "fail"}
+    )
+    original = upload.read_frame
+    entered, release = threading.Event(), threading.Event()
+
+    def slow(stream):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return original(stream)
+
+    monkeypatch.setattr(upload, "read_frame", slow)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        holder = executor.submit(helper.call, {"op": "append", "id": UID, "offset": 0}, b"a")
+        assert entered.wait(5)
+        timer = threading.Timer(1.3, release.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            result = helper.call({"op": "append", "id": second, "offset": 0}, b"b", timeout_s=3)
+            assert result.get("offset") == 1, result
+            assert time.monotonic() - started >= 1.2
+        finally:
+            release.set()
+            timer.join()
+        assert holder.result(timeout=5)["offset"] == 1
+    assert helper.call({"op": "status", "id": UID})["offset"] == 1
 
 
 def test_helper_lock_wait_is_bounded(helper: UploadHelperClient) -> None:
