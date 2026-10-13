@@ -46,6 +46,8 @@ def test_new_command_opens_landing_in_current_project(
             handle.contract.json("/v1/sessions", {"object": "list", "data": [row]})
         if project_kind == "id":
             handle.harness = "codex-native"
+            handle.update_session(labels={"omnigent.wrapper": "codex-native-ui"})
+            handle.contract.json(f"/v1/sessions/{handle.session_id}/codex_goal", {"goal": None})
 
     page.goto(handle.url)
     composer = _composer(page)
