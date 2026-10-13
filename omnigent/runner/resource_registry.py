@@ -795,6 +795,26 @@ class SessionResourceRegistry:
         with self._lock:
             return self._terminal_roles.get((session_id, terminal_id))
 
+    def retain_terminal_role(
+        self,
+        session_id: str,
+        terminal_id: str,
+        resource_role: str,
+    ) -> None:
+        """Re-register a terminal's role after its exit popped the marker.
+
+        A terminal exit drops its role marker. When the runner declines to
+        auto-recreate the pane (for example at the exit-recreate rate cap) but
+        still wants a user attach to rebuild it on demand, this restores the
+        marker the attach path keys on.
+
+        :param session_id: Session/conversation identifier.
+        :param terminal_id: Opaque terminal resource id.
+        :param resource_role: Role marker to restore.
+        """
+        with self._lock:
+            self._terminal_roles[(session_id, terminal_id)] = resource_role
+
     def list_resources(
         self,
         session_id: str,

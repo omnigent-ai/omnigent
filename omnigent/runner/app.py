@@ -21,7 +21,7 @@ import tempfile
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -147,6 +147,7 @@ from omnigent.runner.native_controls import build_native_controls
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
+    OMNIGENT_REPL_TERMINAL_ROLE,
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
@@ -303,6 +304,12 @@ _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
 _server_version: str | None = None
+
+# An unexpectedly exited REPL terminal is recreated so a live SDK session
+# never silently loses its embedded main terminal. The cap bounds the
+# exit→recreate loop when something keeps killing the recreated tmux server.
+_REPL_TERMINAL_AUTO_RECREATE_LIMIT = 3
+_REPL_TERMINAL_AUTO_RECREATE_WINDOW_S = 300.0
 
 
 def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
@@ -1103,6 +1110,26 @@ _session_histories_ref: dict[str, list[_JsonObject]] = {}
 # ``/stream`` endpoint just to assert on emitted events).
 _session_event_queues_ref: dict[str, asyncio.Queue[_JsonObject | None]] = {}
 
+# Sessions whose teardown has begun; excluded from REPL recovery so an
+# exit-driven rebuild never resurrects a session mid-teardown.
+_sessions_tearing_down_ref: set[str] = set()
+
+
+@contextlib.contextmanager
+def _session_teardown_marker(session_id: str) -> Iterator[None]:
+    """Exclude ``session_id`` from REPL recovery while its teardown runs.
+
+    Teardown pops ``_session_start_cache`` only after its cleanup awaits, so an
+    exit-driven rebuild could otherwise read the session as live and recreate
+    the pane after cleanup ran. Discarding in ``finally`` keeps the exclusion
+    exact even when a teardown await raises.
+    """
+    _sessions_tearing_down_ref.add(session_id)
+    try:
+        yield
+    finally:
+        _sessions_tearing_down_ref.discard(session_id)
+
 
 def get_session_agent_id(session_id: str) -> str | None:
     """
@@ -1352,6 +1379,8 @@ def create_runner_app(
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    # Monotonic stamps of recent exit-driven REPL recreates, per session.
+    _repl_terminal_auto_recreates: dict[str, list[float]] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
     # Conversations whose claude-sdk `/compact` published an up-front
@@ -1413,6 +1442,7 @@ def create_runner_app(
     _last_server_item_id: dict[str, str] = {}
     _session_event_queues = _session_event_queues_ref
     app.state.session_event_queues = _session_event_queues
+    _sessions_tearing_down = _sessions_tearing_down_ref
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
@@ -1777,7 +1807,134 @@ def create_runner_app(
         task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(task)
 
+    def _runner_session_is_live(session_id: str) -> bool:
+        """Whether this runner still hosts ``session_id`` and may rebuild its
+        REPL pane; teardown pops the start cache and shutdown tears tmux down,
+        so an exit-driven rebuild skips an already-deleted or draining session.
+        """
+        if session_id in _sessions_tearing_down or _shutting_down.is_set():
+            return False
+        return (
+            process_manager is not None and process_manager.has_session(session_id)
+        ) or session_id in _session_start_cache
+
+    def _claim_repl_terminal_auto_recreate(session_id: str) -> bool:
+        """Claim one exit-driven REPL recreate inside the rate window.
+
+        :param session_id: Session/conversation identifier.
+        :returns: ``True`` when a recreate may run now.
+        """
+        now = time.monotonic()
+        stamps = [
+            stamp
+            for stamp in _repl_terminal_auto_recreates.get(session_id, [])
+            if now - stamp < _REPL_TERMINAL_AUTO_RECREATE_WINDOW_S
+        ]
+        allowed = len(stamps) < _REPL_TERMINAL_AUTO_RECREATE_LIMIT
+        if allowed:
+            stamps.append(now)
+        _repl_terminal_auto_recreates[session_id] = stamps
+        return allowed
+
+    def _begin_repl_terminal_recovery(event: TerminalExitEvent) -> bool:
+        """Claim an exit-driven REPL rebuild and announce it on the session stream.
+
+        ``tui:main`` is a live SDK session's main terminal, so an unexpected
+        tmux death must rebuild it rather than let the pane silently vanish.
+        Deliberate closes stop the watcher before killing tmux and never reach
+        the exit publisher, so an exit seen here is an unexpected death.
+
+        :param event: The auxiliary REPL terminal's exit event.
+        :returns: ``True`` when a rebuild was claimed; the caller then runs
+            :func:`_recover_repl_terminal_after_exit` once the deletion is
+            published.
+        """
+        if not _claim_repl_terminal_auto_recreate(event.session_id):
+            # The exit popped this terminal's REPL role. Keep auto-recreation
+            # capped, but restore the role so a user re-attach can still rebuild
+            # the pane on demand (attach-driven recreate is not rate-limited).
+            if resource_registry is not None:
+                resource_registry.retain_terminal_role(
+                    event.session_id, event.terminal_id, OMNIGENT_REPL_TERMINAL_ROLE
+                )
+            _logger.warning(
+                "REPL terminal %s keeps exiting for %s; not auto-recreating "
+                "again (max %d per %.0fs). A fresh terminal attach still "
+                "recreates it.",
+                event.terminal_name,
+                event.session_id,
+                _REPL_TERMINAL_AUTO_RECREATE_LIMIT,
+                _REPL_TERMINAL_AUTO_RECREATE_WINDOW_S,
+            )
+            return False
+        # Announce the rebuild before the deletion lands so the web view goes
+        # straight to "Starting up…" instead of flashing the resume fallback.
+        _publish_terminal_pending(_publish_event, event.session_id, True)
+        return True
+
+    def _recover_repl_terminal_after_exit(event: TerminalExitEvent) -> None:
+        """Rebuild the REPL terminal claimed by :func:`_begin_repl_terminal_recovery`.
+
+        :param event: The auxiliary REPL terminal's exit event.
+        """
+
+        async def _recover() -> None:
+            recovered = False
+            try:
+                entry = await _resource_routes.recreate_repl_terminal(
+                    event.session_id, event.terminal_id
+                )
+                recovered = entry is not None
+                if entry is None:
+                    if _runner_session_is_live(event.session_id):
+                        _logger.error(
+                            "Could not recover REPL terminal %s for %s after its tmux died",
+                            event.terminal_name,
+                            event.session_id,
+                        )
+                    else:
+                        _logger.debug(
+                            "Skipped REPL terminal recovery for %s; session already torn down",
+                            event.session_id,
+                        )
+            except Exception:
+                _logger.exception(
+                    "Unexpected error recovering REPL terminal %s for %s",
+                    event.terminal_name,
+                    event.session_id,
+                )
+            finally:
+                # A teardown finishing mid-recover already dropped the event
+                # queue; clearing the spinner now would resurrect a dead queue.
+                if _runner_session_is_live(event.session_id):
+                    if not recovered and resource_registry is not None:
+                        # A failed rebuild left the REPL role popped; restore it
+                        # so a later attach can retry it on demand.
+                        resource_registry.retain_terminal_role(
+                            event.session_id, event.terminal_id, OMNIGENT_REPL_TERMINAL_ROLE
+                        )
+                    _publish_terminal_pending(_publish_event, event.session_id, False)
+
+        task = asyncio.create_task(
+            _recover(),
+            name=f"repl-terminal-recover:{event.session_id}",
+        )
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
     def _publish_terminal_exit(event: TerminalExitEvent) -> None:
+        # The embedded REPL terminal is the one auxiliary pane a live SDK
+        # session cannot lose, so its unexpected death triggers a rebuild.
+        rebuild_repl = False
+        if (
+            event.lifecycle != TerminalLifecycle.REQUIRED
+            and event.terminal_name == _REPL_TERMINAL_NAME
+            and event.session_key == _REPL_TERMINAL_SESSION_KEY
+            and _runner_session_is_live(event.session_id)
+        ):
+            # Claims a rate-limit slot and publishes terminal_pending=True
+            # before the deletion event below.
+            rebuild_repl = _begin_repl_terminal_recovery(event)
         _publish_event(
             event.session_id,
             {
@@ -1791,6 +1948,8 @@ def create_runner_app(
         # particular, losing Codex's streamable TUI must not cancel an active
         # app-server turn; the native-terminal ensure path can recreate it.
         if event.lifecycle != TerminalLifecycle.REQUIRED:
+            if rebuild_repl:
+                _recover_repl_terminal_after_exit(event)
             return
 
         # A required terminal exit ends the session. Tear down any registered
@@ -3286,6 +3445,10 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        with _session_teardown_marker(session_id):
+            return await _delete_session_impl(session_id)
+
+    async def _delete_session_impl(session_id: str) -> JSONResponse:
         resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
         _session_message_buffers.pop(session_id, None)
@@ -3345,7 +3508,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
-        _repl_terminal_ensure_locks.pop(session_id, None)
+        _repl_terminal_auto_recreates.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
         # Close any OpenCode server that no forwarder adopted.
@@ -3361,7 +3524,13 @@ def create_runner_app(
         if process_manager is not None:
             await process_manager.release(session_id)
 
-        await resource_registry.cleanup_session(session_id)
+        # Coordinate with an in-flight exit-driven REPL rebuild: a launch past
+        # the liveness gate holds this recreate lock, so cleanup waits for it
+        # and tears its pane down instead of leaking one built after cleanup.
+        _repl_lock = _repl_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+        async with _repl_lock:
+            await resource_registry.cleanup_session(session_id)
+        _repl_terminal_ensure_locks.pop(session_id, None)
 
         await _delete_native_bridge_dirs(
             server_client=server_client,
@@ -3426,7 +3595,6 @@ def create_runner_app(
         stale_resp_ids = [rid for rid, cid in _resp_to_conv.items() if cid == session_id]
         for rid in stale_resp_ids:
             _resp_to_conv.pop(rid, None)
-
         return JSONResponse(
             status_code=200,
             content={
@@ -7124,6 +7292,7 @@ def create_runner_app(
         _resp_to_conv=_resp_to_conv,
         _search_registry_for_root=_search_registry_for_root,
         _session_comment_relays=_session_comment_relays,
+        _session_is_live=_runner_session_is_live,
         auth_token_factory=auth_token_factory,
         filesystem_registry=filesystem_registry,
         resource_registry=resource_registry,
@@ -7381,6 +7550,10 @@ def create_runner_app(
     async def cleanup_session_resources(
         session_id: str,
     ) -> JSONResponse:
+        with _session_teardown_marker(session_id):
+            return await _cleanup_session_resources_impl(session_id)
+
+    async def _cleanup_session_resources_impl(session_id: str) -> JSONResponse:
         _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
@@ -7392,10 +7565,15 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
-        _repl_terminal_ensure_locks.pop(session_id, None)
+        _repl_terminal_auto_recreates.pop(session_id, None)
         if process_manager is not None:
             await process_manager.release(session_id)
-        await resource_registry.cleanup_session(session_id)
+        # Serialize with an in-flight exit-driven REPL rebuild so cleanup tears
+        # down a pane the launch is still building rather than leaking it.
+        _repl_lock = _repl_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+        async with _repl_lock:
+            await resource_registry.cleanup_session(session_id)
+        _repl_terminal_ensure_locks.pop(session_id, None)
         await _delete_native_bridge_dirs(
             server_client=server_client,
             session_id=session_id,
@@ -7411,6 +7589,10 @@ def create_runner_app(
 
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
+        with _session_teardown_marker(session_id):
+            return await _reset_session_state_impl(session_id)
+
+    async def _reset_session_state_impl(session_id: str) -> JSONResponse:
         _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
@@ -7422,11 +7604,16 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _repl_terminal_auto_recreates.pop(session_id, None)
+        # Serialize with an in-flight exit-driven REPL rebuild so cleanup tears
+        # down a pane the launch is still building rather than leaking it.
+        _repl_lock = _repl_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+        async with _repl_lock:
+            await _teardown_session_terminals(session_id)
+            if process_manager is not None:
+                await process_manager.release(session_id)
+            await resource_registry.cleanup_session(session_id)
         _repl_terminal_ensure_locks.pop(session_id, None)
-        await _teardown_session_terminals(session_id)
-        if process_manager is not None:
-            await process_manager.release(session_id)
-        await resource_registry.cleanup_session(session_id)
         _clear_session_agent_caches(session_id, _session_agent_ids.get(session_id))
         return JSONResponse(
             status_code=200,

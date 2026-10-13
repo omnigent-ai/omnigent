@@ -9296,6 +9296,9 @@ async def _auto_create_repl_terminal(
         # docstring): no cost for never-opened terminals, and the REPL
         # starts against the real attached terminal size.
         tmux_start_on_attach=True,
+        # Keep the dead pane: tmux's defaults reap the lone-pane server the
+        # instant the REPL exits, which the watcher can only see as "unavailable".
+        keep_alive_after_exit=True,
     )
     terminal_view = await resource_registry.launch_auxiliary_terminal(
         session_id=session_id,

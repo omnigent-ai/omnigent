@@ -33,6 +33,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.terminals import TerminalRegistry
+from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 
@@ -270,10 +271,16 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
         OMNIGENT_REPL_TERMINAL_ROLE
     )
 
+    # An attach always targets a live session; register it so the
+    # recreate guard permits rebuilding the dead REPL pane.
+    process_manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    process_manager._sessions.add("conv_abc")
+
     app = create_runner_app(
         terminal_registry=registry,
         resource_registry=resource_registry,
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        process_manager=process_manager,  # type: ignore[arg-type]
     )
 
     # The recreated pane: same (tui, main) key, distinct socket path so
@@ -356,6 +363,67 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
 
     assert auto_create_sessions == ["conv_abc"]
     assert attach_sockets[1] == str(fresh_dir / "tui-main.sock")
+
+
+def test_runner_resource_attach_dead_repl_absent_session_skips_recreate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead REPL attach for an absent session closes 4404 without rebuilding.
+
+    The recreate branch fires for a REPL-role pane, but a session the runner
+    no longer hosts must not have its pane rebuilt. The liveness gate refuses
+    before auto-create runs, so a stale attach after teardown closes 4404
+    instead of resurrecting a tmux server and per-session state.
+
+    :param tmp_path: Pytest tmp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    registry = TerminalRegistry()
+    stale = _make_running_instance("tui", "main", tmp_path)
+
+    async def dead_tmux() -> bool:
+        stale.running = False
+        return False
+
+    stale.is_alive = dead_tmux  # type: ignore[method-assign]
+    _seed_registry(registry, "conv_gone", stale)
+
+    resource_registry = SessionResourceRegistry(terminal_registry=registry)
+    resource_registry._terminal_roles[("conv_gone", "terminal_tui_main")] = (
+        OMNIGENT_REPL_TERMINAL_ROLE
+    )
+
+    # The process manager never learns about conv_gone, so the runner treats
+    # the session as already gone and the recreate guard must refuse.
+    process_manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        process_manager=process_manager,  # type: ignore[arg-type]
+    )
+
+    auto_create_sessions: list[str] = []
+
+    async def fake_auto_create(session_id: str, *args: object, **kwargs: object) -> None:
+        auto_create_sessions.append(session_id)
+
+    monkeypatch.setattr(
+        "omnigent.runner.resource_routes._auto_create_repl_terminal", fake_auto_create
+    )
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_gone/resources/terminals/terminal_tui_main/attach"
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_bytes()
+
+    # The attach closed with the terminal-gone signal and never rebuilt the
+    # pane for the absent session.
+    assert exc_info.value.code == 4404
+    assert auto_create_sessions == []
 
 
 def test_runner_resource_attach_recreates_dead_qwen_terminal(

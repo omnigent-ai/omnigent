@@ -728,6 +728,9 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
     # client attaches — never-opened terminals stay an idle tmux pane,
     # and the session is fully live by first attach.
     assert launched.tmux_start_on_attach is True
+    # The REPL is the lone process in a private tmux server; without this
+    # tmux reaps the server the instant the REPL exits and tui:main vanishes.
+    assert launched.keep_alive_after_exit is True
     # cwd pins to the runner workspace (same convention as the
     # claude-native terminal); a wrong cwd drops the REPL into $HOME.
     assert launched.os_env.cwd == str(workspace)

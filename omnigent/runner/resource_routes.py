@@ -97,6 +97,7 @@ class ResourceRoutes:
     ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]]
     require_os_env: Callable[[str], Coroutine[Any, Any, AgentSpec | None]]
     resolve_conversation_id: Callable[[str], Coroutine[Any, Any, str | None]]
+    recreate_repl_terminal: Callable[[str, str], Coroutine[Any, Any, TerminalListEntry | None]]
 
 
 def register_resource_routes(
@@ -132,6 +133,7 @@ def register_resource_routes(
     _resp_to_conv: dict[str, str],
     _search_registry_for_root: Callable[[Path], FilesystemRegistry],
     _session_comment_relays: dict[str, _CommentRelayBinding],
+    _session_is_live: Callable[[str], bool],
     auth_token_factory: Callable[[], str | None] | None,
     filesystem_registry: FilesystemRegistry | None,
     resource_registry: SessionResourceRegistry,
@@ -875,8 +877,16 @@ def register_resource_routes(
         if resource_registry is None or resource_registry.terminal_registry is None:
             return None
         registry = resource_registry.terminal_registry
+        # Never rebuild the pane for a session being torn down. Checking before
+        # the lock avoids re-adding a lock entry that teardown has popped.
+        if not _session_is_live(session_id):
+            return None
         lock = _repl_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
+            # Teardown can finish during the exit's await window; recheck under
+            # the lock so a session deleted mid-recreate aborts.
+            if not _session_is_live(session_id):
+                return None
             existing = registry.get(session_id, _REPL_TERMINAL_NAME, _REPL_TERMINAL_SESSION_KEY)
             if existing is None or not existing.running or not await existing.is_alive():
                 await registry.close(session_id, _REPL_TERMINAL_NAME, _REPL_TERMINAL_SESSION_KEY)
@@ -1692,4 +1702,5 @@ def register_resource_routes(
         ensure_native_terminal_for_turn=_ensure_native_terminal_for_turn,
         require_os_env=_require_os_env,
         resolve_conversation_id=_resolve_conversation_id,
+        recreate_repl_terminal=_recreate_repl_terminal,
     )
