@@ -50,7 +50,7 @@ STAGING_SUFFIX_PATTERN = r"\.omnigent-upload-[0-9a-f]{32}\.part\Z"
 
 
 def is_upload_staging(path: str) -> bool:
-    return any(re.search(STAGING_SUFFIX_PATTERN, part) for part in path.split("/"))
+    return re.search(STAGING_SUFFIX_PATTERN, path.rsplit("/", 1)[-1]) is not None
 
 
 def staging_basename(name: str, uid: str) -> str:
@@ -167,7 +167,6 @@ class UploadHelperClient(_HelperProcessClient):
             copy_on_write_environment=env.copy_on_write_environment,
             upload_raw=True,
         )
-        self._active_op: object = None
 
     def interrupt(self) -> None:
         proc = self._proc
@@ -176,29 +175,23 @@ class UploadHelperClient(_HelperProcessClient):
                 proc.kill()
 
     def call(
-        self, metadata: dict[str, object], raw: bytes = b"", *, timeout_s: float | None = None
+        self,
+        metadata: dict[str, object],
+        raw: bytes = b"",
+        *,
+        timeout_s: float | None = None,
+        deadline: float | None = None,
     ) -> dict[str, object]:
         """A busy result guarantees no request frame could have been sent."""
         timeout_s = operation_timeout(metadata) if timeout_s is None else timeout_s
-        deadline = time.monotonic() + timeout_s
-        op = metadata.get("op")
-        queue_deadline = deadline
-        while not self._lock.acquire(blocking=False):
-            now = time.monotonic()
-            if op not in LONG_OPS and self._active_op in LONG_OPS:
-                queue_deadline = min(queue_deadline, now + SHORT_OP_QUEUE_WAIT_S)
-            else:
-                queue_deadline = deadline
-            remaining = queue_deadline - now
-            if remaining <= 0:
-                return {"error": "Upload helper queue timed out", "code": "busy"}
-            # Recheck the holder when queued operations change from short to long.
-            if self._lock.acquire(timeout=min(remaining, 0.05)):
-                break
-        self._active_op = op
+        deadline = time.monotonic() + timeout_s if deadline is None else deadline
+        if not self._lock.acquire(timeout=max(0, deadline - time.monotonic())):
+            return {"error": "Upload helper queue timed out", "code": "busy"}
         try:
             if self._closed:
                 return {"error": "Upload helper closed", "code": "busy"}
+            if time.monotonic() >= deadline:
+                return {"error": "Upload helper deadline elapsed", "code": "busy"}
             timed_out, done = threading.Event(), threading.Event()
 
             def watch() -> None:
@@ -236,7 +229,6 @@ class UploadHelperClient(_HelperProcessClient):
                 watchdog.join()
 
         finally:
-            self._active_op = None
             self._lock.release()
 
 
@@ -355,6 +347,14 @@ class UploadEngine:
             return self._resume(uid, m)
         if op == "cleanup":
             return self._cleanup(uid, m)
+        if op == "forget":
+            upload = self.uploads.get(uid)
+            if upload is not None:
+                self._grant(upload.directory, upload.name, upload.staging)
+                if upload.result is None:
+                    raise UploadError("incomplete", "Upload is still open")
+                self._forget(uid)
+            return {"forgotten": True}
         upload = self.uploads.get(uid)
         if upload is None:
             raise UploadError("gone", "Unknown upload")
@@ -651,21 +651,32 @@ class UploadEngine:
         upload.fd = upload.parent_fd = -1
         return upload.result
 
+    def _forget(self, uid: str) -> None:
+        upload = self.uploads.pop(uid, None)
+        if upload is not None:
+            for fd in (upload.fd, upload.parent_fd):
+                if fd >= 0:
+                    os.close(fd)
+
     def _cleanup(self, uid: str, m: dict[str, object]) -> dict[str, object]:
-        if uid in self.uploads:
-            return self._dispatch({"op": "abort", "id": uid}, b"")
         directory, name = str(m["dir"]), str(m["name"])
         if not valid_name(name):
             raise UploadError("invalid_name", "Invalid basename")
         staging = staging_basename(name, uid)
         self._grant(directory, name, staging)
-        parent = _parent(self.cwd, directory)
+        try:
+            parent = _parent(self.cwd, directory)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            self._forget(uid)
+            raise UploadError("parent_gone", "Destination directory disappeared") from exc
         try:
             if _identity(parent) != (m["parent_dev"], m["parent_ino"]):
-                raise UploadError("invalid_path", "Destination directory changed")
+                self._forget(uid)
+                raise UploadError("parent_gone", "Destination directory changed")
             try:
                 info = os.stat(staging, dir_fd=parent, follow_symlinks=False)
             except FileNotFoundError:
+                self._forget(uid)
                 return {"aborted": True}
             fd = os.open(staging, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             try:
@@ -683,6 +694,7 @@ class UploadEngine:
                 os.unlink(staging, dir_fd=parent)
             finally:
                 os.close(fd)
+            self._forget(uid)
             return {"aborted": True}
         finally:
             os.close(parent)

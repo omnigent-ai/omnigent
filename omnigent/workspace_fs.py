@@ -239,7 +239,6 @@ class WorkspaceReader:
             raise WorkspaceReaderError(
                 404, "not_found", f"Directory {rel!r} not found or not accessible"
             ) from exc
-        names = [name for name in names if not is_upload_staging(name)]
         for name in names:
             full = resolved / name
             child_rel = os.path.join(validated, name) if validated else name
@@ -260,6 +259,8 @@ class WorkspaceReader:
                 entry_type = "file"
                 size = None
                 mtime = int(ls.st_mtime)
+            if entry_type == "file" and is_upload_staging(name):
+                continue
             entries.append(
                 {
                     "id": child_rel,
@@ -432,7 +433,7 @@ class WorkspaceReader:
         def match(dirpath: str, name: str, *, is_dir: bool) -> None:
             # A directory carries no byte size; a file stats for size + mtime.
             p = rel(dirpath, name)
-            if is_upload_staging(p):
+            if not is_dir and is_upload_staging(p):
                 return
             if exc and any(r.match(p) for r in exc):
                 return
