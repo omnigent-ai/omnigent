@@ -47,6 +47,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.runner.transports.ws_tunnel.binary_requests import (
     BINARY_REQUEST_BODY_CAPABILITY,
+    BINARY_REQUEST_DISPATCH_TIMEOUT_S,
     BinaryRequestError,
     decode_binary_request,
 )
@@ -259,6 +260,13 @@ async def dispatch_via_asgi(
     head_sent_to_ws: bool = False
     end_sent_to_ws: bool = False
 
+    async def send_end(error: str | None = None) -> None:
+        nonlocal end_sent_to_ws
+        if not end_sent_to_ws:
+            # Record the terminal attempt before its await so cancellation cannot duplicate it.
+            end_sent_to_ws = True
+            await send_text(encode_frame(ResponseEndFrame(id=frame.id, error=error)))
+
     async def receive() -> Message:
         nonlocal body_sent
         if not body_sent:
@@ -279,7 +287,7 @@ async def dispatch_via_asgi(
         return await disconnect
 
     async def send(event: Message) -> None:
-        nonlocal head_sent_to_ws, end_sent_to_ws
+        nonlocal head_sent_to_ws
         ev_type = event.get("type")
         if ev_type == "http.response.start":
             response_status.append(event["status"])
@@ -319,11 +327,15 @@ async def dispatch_via_asgi(
                     )
                 )
             if not event.get("more_body", False):
-                await send_text(encode_frame(ResponseEndFrame(id=frame.id)))
-                end_sent_to_ws = True
+                await send_end()
 
+    deadline = asyncio.timeout(BINARY_REQUEST_DISPATCH_TIMEOUT_S if raw_body is not None else None)
     try:
-        await app(scope, receive, send)
+        async with deadline:
+            await app(scope, receive, send)
+    except asyncio.CancelledError:
+        await send_end("runner_request_cancelled")
+        raise
     except Exception:
         # If the app crashed BEFORE sending head, surface a 500 so
         # the server's request-side awaiter doesn't hang. If it
@@ -335,7 +347,7 @@ async def dispatch_via_asgi(
                 encode_frame(
                     ResponseHeadFrame(
                         id=frame.id,
-                        status=500,
+                        status=504 if deadline.expired() else 500,
                         headers=[["content-type", "application/json"]],
                     )
                 )
@@ -344,7 +356,11 @@ async def dispatch_via_asgi(
                 encode_frame(
                     ResponseBodyFrame(
                         id=frame.id,
-                        body='{"error": "runner_dispatch_failed"}',
+                        body=(
+                            '{"error": "runner_dispatch_timeout"}'
+                            if deadline.expired()
+                            else '{"error": "runner_dispatch_failed"}'
+                        ),
                         encoding="utf-8",
                     )
                 )
@@ -355,9 +371,13 @@ async def dispatch_via_asgi(
         # at most one end frame per request.
         if not end_sent_to_ws:
             # Only flag the end frame as an error when head was already sent;
-            # the pre-head path delivers a well-formed 500 that closes cleanly.
-            end_error = "runner_stream_error" if head_sent_to_ws else None
-            await send_text(encode_frame(ResponseEndFrame(id=frame.id, error=end_error)))
+            # the pre-head error response closes cleanly.
+            end_error = (
+                ("runner_request_timeout" if deadline.expired() else "runner_stream_error")
+                if head_sent_to_ws
+                else None
+            )
+            await send_end(end_error)
         raise
 
 
@@ -1640,7 +1660,8 @@ async def _handle_tunnel_frame(
             on_activity()
         dispatch_task = dispatch_tasks.get(frame.id)
         if dispatch_task is not None:
-            dispatch_task.cancel()
+            # Let a newly queued dispatch enter its cancellation/terminal handler first.
+            asyncio.get_running_loop().call_soon(_cancel_request_dispatch, dispatch_task)
     elif isinstance(frame, WSOpenFrame):
         if on_activity is not None:
             on_activity()
@@ -1880,6 +1901,12 @@ def _forget_ws_channel(
             )
 
     return _callback
+
+
+def _cancel_request_dispatch(task: asyncio.Task[None]) -> None:
+    """Cancel once, after the dispatch has had its first event-loop turn."""
+    if not task.done() and not task.cancelling():
+        task.cancel()
 
 
 def _forget_dispatch_task(

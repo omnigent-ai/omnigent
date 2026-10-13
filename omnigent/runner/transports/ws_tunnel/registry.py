@@ -45,6 +45,7 @@ from weakref import WeakValueDictionary
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.runner.transports.ws_tunnel.binary_requests import BINARY_REQUEST_ADMISSION_TIMEOUT_S
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     Frame,
@@ -147,6 +148,7 @@ class RunnerSession:
     binary_requests: set[str] = field(default_factory=set)
     binary_pending_sends: set[str] = field(default_factory=set)
     binary_waiting_response: set[str] = field(default_factory=set)
+    binary_deadlines: dict[str, asyncio.TimerHandle] = field(default_factory=dict)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
     # 8-char hex channel ids; values hold the inbound queue consumed
     # by whichever side terminated the attach.
@@ -444,7 +446,8 @@ class TunnelRegistry:
         for state in list(session.in_flight.values()):
             _call_soon_threadsafe(state, partial(_abort_request_state, state, error))
         session.in_flight.clear()
-        session.binary_requests.clear()
+        for req_id in list(session.binary_requests):
+            TunnelRegistry._release_binary_request(session, req_id)
         session.binary_pending_sends.clear()
         session.binary_waiting_response.clear()
         for channel in list(session.ws_channels.values()):
@@ -659,6 +662,15 @@ class TunnelRegistry:
             session.in_flight[req_id] = state
             if binary_body:
                 session.binary_requests.add(req_id)
+                deadline = time.monotonic() + BINARY_REQUEST_ADMISSION_TIMEOUT_S
+                try:
+                    _call_session_soon_threadsafe(
+                        session, partial(self._install_binary_deadline, session, req_id, deadline)
+                    )
+                except RuntimeError as exc:
+                    session.in_flight.pop(req_id, None)
+                    self._release_binary_request(session, req_id)
+                    raise ConnectionError("runner tunnel loop closed before admission") from exc
             return state
 
     def close_request(
@@ -687,7 +699,48 @@ class TunnelRegistry:
                 req_id not in target.binary_pending_sends
                 and req_id not in target.binary_waiting_response
             ):
-                target.binary_requests.discard(req_id)
+                self._release_binary_request(target, req_id)
+
+    @staticmethod
+    def _release_binary_request(session: RunnerSession, req_id: str) -> None:
+        """Release admission and its timer under the registry lock, idempotently."""
+        session.binary_requests.discard(req_id)
+        handle = session.binary_deadlines.pop(req_id, None)
+        if handle is not None:
+            with contextlib.suppress(RuntimeError):
+                _call_session_soon_threadsafe(session, handle.cancel)
+
+    def _install_binary_deadline(
+        self, session: RunnerSession, req_id: str, deadline: float
+    ) -> None:
+        with self._lock:
+            if self._sessions.get(session.runner_id) is not session:
+                return
+            if req_id not in session.binary_requests:
+                return
+            session.binary_deadlines[req_id] = asyncio.get_running_loop().call_later(
+                max(0.0, deadline - time.monotonic()), self._expire_binary_request, session, req_id
+            )
+
+    def _expire_binary_request(self, session: RunnerSession, req_id: str) -> None:
+        with self._lock:
+            if self._sessions.get(session.runner_id) is not session:
+                return
+            if req_id not in session.binary_requests:
+                return
+            _logger.warning(
+                "Runner %s binary admission deadline exceeded for %s; retiring tunnel",
+                session.runner_id,
+                req_id,
+                extra={"session_id": runner_primary_session_id()},
+            )
+            # Do not reopen admission on a socket whose runner may still be executing.
+            self.deregister(session.runner_id, session=session)
+
+    def binary_request_awaits_end(self, session: RunnerSession, req_id: str) -> bool:
+        """Whether an opted-in request is enqueued and still awaiting runner completion."""
+        with self._lock:
+            return req_id in session.binary_waiting_response
 
     def request_is_open(self, session: RunnerSession, req_id: str) -> bool:
         """Return whether a request is still in flight on ``session``.
@@ -820,7 +873,7 @@ class TunnelRegistry:
         with self._lock:
             session.binary_pending_sends.discard(req_id)
             if req_id not in session.binary_waiting_response:
-                session.binary_requests.discard(req_id)
+                self._release_binary_request(session, req_id)
 
     async def _send(
         self,
@@ -922,7 +975,7 @@ class TunnelRegistry:
             if isinstance(frame, ResponseEndFrame):
                 current.binary_waiting_response.discard(req_id)
                 if req_id not in current.binary_pending_sends:
-                    current.binary_requests.discard(req_id)
+                    self._release_binary_request(current, req_id)
             state = current.in_flight.get(req_id)
             if state is None:
                 return tracked_binary

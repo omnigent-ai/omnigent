@@ -22,6 +22,8 @@ abort propagates as a ``ConnectionError`` from the body iterator.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import uuid
 from collections.abc import AsyncIterator
 
@@ -84,24 +86,21 @@ class _TunneledByteStream(httpx.AsyncByteStream):
         # client disconnect). The transport translates this into a
         # request.cancel frame so the runner aborts.
         state = self._state
-        if self._registry.request_is_open(state.session, self._req_id):
-            try:  # noqa: SIM105 — contextlib.suppress doesn't work with await
-                await self._registry.send_text(
-                    state.session,
-                    encode_frame(
-                        RequestCancelFrame(
-                            id=self._req_id,
-                            reason="client_disconnected",
-                        )
-                    ),
-                )
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
-        self._registry.close_request(
-            self._runner_id,
-            self._req_id,
-            session=state.session,
-        )
+        try:
+            if self._registry.request_is_open(state.session, self._req_id):
+                with contextlib.suppress(Exception):
+                    await self._registry.send_text(
+                        state.session,
+                        encode_frame(
+                            RequestCancelFrame(id=self._req_id, reason="client_disconnected")
+                        ),
+                    )
+        finally:
+            self._registry.close_request(
+                self._runner_id,
+                self._req_id,
+                session=state.session,
+            )
 
 
 class WSTunnelTransport(httpx.AsyncBaseTransport):
@@ -122,6 +121,16 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
     fallbacks. Excess callers get ``httpx.PoolTimeout`` and may retry after an
     earlier runner response ends. Admission lasts until the runner's terminal
     response or session retirement, even if the caller cancels or closes early.
+    Caller cancellation/timeouts before headers also send ``request.cancel``
+    for enqueued opted-in requests. Writing cancel does not release admission.
+    ``BINARY_REQUEST_DISPATCH_TIMEOUT_S`` bounds binary runner work to 150s.
+    ``BINARY_REQUEST_ADMISSION_TIMEOUT_S`` bounds every opted-in slot, including
+    JSON fallback, to 180s from allocation;
+    a missing terminal response retires that whole tunnel before slots reopen.
+    Both bounds exceed the upload relay's longest deadline (finalize: 120s),
+    allowing the upload relay to return 504 first. The extra server grace covers queued sends,
+    old runners and handlers that ignore cancellation, without exceeding the
+    two-request cap on a connection that might still be executing work.
     An over-limit binary envelope raises ``httpx.LocalProtocolError`` with the
     request attached; upload relays can map this error to HTTP 413.
     """
@@ -193,10 +202,22 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             # Block until the response head arrives (or the tunnel
             # aborts the request).
             head = await state.head_future
-        except BaseException:
-            # If we failed before getting head, clean up the slot so
-            # we don't leak in_flight state.
-            self._registry.close_request(self._runner_id, req_id, session=state.session)
+        except BaseException as exc:
+            try:
+                if (
+                    opted_in
+                    and isinstance(
+                        exc, (asyncio.CancelledError, TimeoutError, httpx.TimeoutException)
+                    )
+                    and self._registry.binary_request_awaits_end(state.session, req_id)
+                ):
+                    with contextlib.suppress(Exception):
+                        await self._registry.send_text(
+                            state.session,
+                            encode_frame(RequestCancelFrame(id=req_id, reason="client_cancelled")),
+                        )
+            finally:
+                self._registry.close_request(self._runner_id, req_id, session=state.session)
             raise
 
         # Wrap the body queue as an httpx AsyncByteStream. The stream

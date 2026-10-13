@@ -9,6 +9,9 @@ from omnigent.runner.transports.ws_tunnel.frames import RequestFrame, decode_fra
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
 BINARY_REQUEST_BODY_CAPABILITY = "binary_request_body_v1"
+# Leave room for the upload relay's longest deadline (finalize: 120 seconds).
+BINARY_REQUEST_DISPATCH_TIMEOUT_S = 150.0
+BINARY_REQUEST_ADMISSION_TIMEOUT_S = 180.0
 _MAGIC = b"OTB\x01"
 _PREFIX_LEN = len(_MAGIC) + 4
 
