@@ -85,7 +85,10 @@ async def _drive_launch(
 ) -> None:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
-        context = await browser.new_context(viewport={"width": width, "height": 900})
+        context = await browser.new_context(
+            viewport={"width": width, "height": 900},
+            color_scheme="dark" if managed else "light",
+        )
         page = await context.new_page()
         creates: list[dict] = []
         connected = not databricks
@@ -179,7 +182,14 @@ async def _drive_launch(
             await page.goto(base_url)
             await page.get_by_test_id("new-chat-landing-input").fill("Read the demo ticket")
             await async_expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
-            chip = page.get_by_test_id("new-chat-landing-mcp-registry-chip")
+            chip = page.get_by_test_id("new-chat-landing-workspace-controls").get_by_test_id(
+                "new-chat-landing-mcp-registry-chip"
+            )
+            await async_expect(chip).to_be_visible()
+            chip_bounds = await chip.bounding_box()
+            composer_bounds = await page.get_by_test_id("new-chat-landing-composer").bounding_box()
+            assert chip_bounds and composer_bounds
+            assert chip_bounds["y"] + chip_bounds["height"] <= composer_bounds["y"] + 1
             await chip.click()
             toggle = page.get_by_role("switch", name="Demo work tracker")
             await toggle.click()
@@ -202,6 +212,11 @@ async def _drive_launch(
                     animations="disabled",
                 )
             await page.keyboard.press("Escape")
+            if directory := os.environ.get("E2E_SCREENSHOT_DIR"):
+                await page.screenshot(
+                    path=Path(directory) / f"mcp-topbar-{width}.png",
+                    animations="disabled",
+                )
             if not databricks:
                 await page.reload()
                 await async_expect(chip).to_have_attribute(

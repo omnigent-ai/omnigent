@@ -5950,6 +5950,17 @@ export function NewChatLandingScreen() {
     );
   };
 
+  const mcpRegistryPicker = mcpRegistryEnabled ? (
+    <McpRegistryLaunchPicker
+      key="mcp-registry-picker"
+      selected={mcpRegistryServices}
+      catalog={mcpRegistryCatalog}
+      disabled={creating}
+      onAuthorizingChange={setMcpAuthorizing}
+      onToggle={toggleMcpRegistryService}
+    />
+  ) : null;
+
   // The two compact triggers preserve the existing directory and worktree
   // actions while exposing their distinct state truthfully.
   const workspaceChip = (
@@ -6038,7 +6049,7 @@ export function NewChatLandingScreen() {
           )}
           data-testid="new-chat-landing-composer-surface"
         >
-          {sandboxSelected && (
+          {sandboxSelected ? (
             <ComposerWorkspaceBar
               className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
               data-testid="new-chat-landing-workspace-controls"
@@ -6247,9 +6258,9 @@ export function NewChatLandingScreen() {
                   </div>
                 </PopoverContent>
               </Popover>
+              {mcpRegistryPicker}
             </ComposerWorkspaceBar>
-          )}
-          {!sandboxSelected && (
+          ) : (
             <ComposerWorkspaceBar
               className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
               data-testid="new-chat-landing-workspace-controls"
@@ -6497,6 +6508,7 @@ export function NewChatLandingScreen() {
                     </PopoverContent>
                   </Popover>
                 )}
+              {mcpRegistryPicker}
             </ComposerWorkspaceBar>
           )}
           <form
@@ -6680,15 +6692,6 @@ export function NewChatLandingScreen() {
                       />
                     </div>
                     {/* Host chip */}
-                    {mcpRegistryEnabled && (
-                      <McpRegistryLaunchPicker
-                        selected={mcpRegistryServices}
-                        catalog={mcpRegistryCatalog}
-                        disabled={creating}
-                        onAuthorizingChange={setMcpAuthorizing}
-                        onToggle={toggleMcpRegistryService}
-                      />
-                    )}
                     <DropdownMenu
                       onOpenChange={(open) => {
                         // Run a requested "connect this machine" only once the menu

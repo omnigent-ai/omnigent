@@ -60,6 +60,7 @@ export function McpRegistryLaunchPicker({
       </PopoverTrigger>
       <PopoverContent
         align="start"
+        collisionPadding={12}
         className="flex max-h-[var(--radix-popover-content-available-height)] w-72 max-w-[calc(100vw-2rem)] flex-col p-0"
       >
         <div className="shrink-0 border-b border-border px-3 py-2.5">

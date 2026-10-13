@@ -85,7 +85,7 @@ credentials remain on the server; adding a URL to the reference is not the fix.
 
 ## Choose tools before launch
 
-On **New session**, open **MCPs** in the composer footer and turn on the services
+On **New session**, open **MCPs** in the workspace bar above the composer and turn on the services
 to add. The list comes from the administrator's registry. An unconnected OAuth
 service opens a sign-in popup and is selected only after authorization succeeds;
 launch is disabled while sign-in is pending. Connected accounts are reused.

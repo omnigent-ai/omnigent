@@ -95,7 +95,7 @@ and steers messages while the agent is busy.
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
 - Attach files or type `/` before the first send.
-- Open **MCPs** in the composer footer (the plug icon on mobile), then turn
+- Open **MCPs** in the workspace bar above the composer (the plug icon on mobile), then turn
   services on or off in **Tools for this session** before launching on a host or
   sandbox. Turning a service off keeps its account connected. Explicit selections
   are remembered for new sessions in this browser; an unsent draft takes precedence.
