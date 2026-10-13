@@ -13,7 +13,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import TypedDict, cast
+from typing import TypedDict, TypeVar, cast
 
 _logger = logging.getLogger(__name__)
 
@@ -25,6 +25,7 @@ _MAX_TRACKED_PINGS = 8
 # A healthy peer's last frame can predate a local stall by up to one ping
 # interval (30 s), so a stall this close to the silence explains all of it.
 _LOCAL_STALL_SLACK_S = 35.0
+_Payload = TypeVar("_Payload", str, bytes)
 
 
 class TunnelKeepaliveSettings(TypedDict, total=False):
@@ -83,9 +84,10 @@ class TunnelDiagnosticAttrs(TunnelKeepaliveSettings, total=False):
 class OutboundFrame:
     """An unchanged wire payload timestamped with its diagnostics' monotonic clock."""
 
-    data: str
+    data: str | bytes
     queued_at: float
     app_ping_ts: int | None = None
+    on_sent: Callable[[], None] | None = None
 
 
 @dataclass
@@ -266,8 +268,8 @@ class TunnelDiagnostics:
 
     async def send(
         self,
-        send_text: Callable[[str], Awaitable[None]],
-        data: str,
+        send_text: Callable[[_Payload], Awaitable[None]],
+        data: _Payload,
         *,
         app_ping_ts: int | None = None,
     ) -> None:
