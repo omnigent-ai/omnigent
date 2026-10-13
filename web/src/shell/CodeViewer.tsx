@@ -485,6 +485,11 @@ export interface CodeViewerProps {
   panelOpen: boolean;
   searchOpen: boolean;
   setSearchOpen: (open: boolean) => void;
+  /**
+   * Bumped by FileViewer on each Cmd+F. Forwarded to the Monaco editor so a
+   * press with the find widget already open refocuses its input.
+   */
+  searchFocusNonce?: number;
   searchInputRef: RefObject<HTMLInputElement | null>;
   viewMode: "editor" | "preview" | "source" | "diff";
   onDirtyChange?: (isDirty: boolean) => void;
@@ -520,6 +525,7 @@ export function CodeViewer({
   panelOpen,
   searchOpen,
   setSearchOpen,
+  searchFocusNonce,
   searchInputRef,
   viewMode,
   onDirtyChange,
@@ -979,6 +985,7 @@ export function CodeViewer({
           onDirtyChange={onDirtyChange}
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}
+          searchFocusNonce={searchFocusNonce}
           onSearchHandled={handleSearchHandled}
           comments={comments}
           activeSelection={activeSelection}

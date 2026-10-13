@@ -20,6 +20,8 @@ contextBridge.exposeInMainWorld("arcaConnect", {
   confirm: () => ipcRenderer.send("arca-connect:confirm"),
   /** Cancel / close the console (kills a mid-run command). */
   cancel: () => ipcRenderer.send("arca-connect:cancel"),
+  /** Resize the shell-owned window to the rendered page, within main-owned bounds. */
+  resizeToContent: (size) => ipcRenderer.send("arca-connect:resize", size),
   /** `{ serverUrl, command }` once the flow is ready. */
   onInit: (callback) => on("arca-connect:init", callback),
   /** `{ login, command }` when a command was spawned. */

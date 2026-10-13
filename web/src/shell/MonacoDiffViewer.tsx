@@ -76,6 +76,11 @@ interface MonacoDiffViewerProps {
    */
   searchOpen?: boolean;
   /**
+   * Bumped on every Cmd+F. Re-running Monaco's find action while the widget is
+   * already open refocuses its input, which `searchOpen` alone can't trigger.
+   */
+  searchFocusNonce?: number;
+  /**
    * Called when the find widget is closed from within Monaco (Escape or the
    * widget's ✕) so the owning toggle resets and the next Cmd+F re-opens it.
    */
@@ -104,6 +109,7 @@ export function MonacoDiffViewer({
   onSetActiveSelection,
   pendingBodyRef,
   searchOpen,
+  searchFocusNonce,
   onSearchHandled,
 }: MonacoDiffViewerProps) {
   const canEdit = useCanEdit(conversationId);
@@ -222,11 +228,9 @@ export function MonacoDiffViewer({
     [],
   );
 
-  // Mirror the "Find in file" toggle to Monaco's native find widget on the
-  // modified side. Gated on `mounted` so a Cmd+F pressed while the lazy chunk
-  // was still loading isn't dropped. `searchOpen` true opens find; false closes
-  // it. The controller drives the close directly so re-toggling is a real close,
-  // not a second open.
+  // Mirror the find toggle to Monaco's find widget on the modified side once
+  // `mounted` (so a Cmd+F during the lazy load isn't dropped): `searchOpen`
+  // opens/closes it via the controller; a bumped `searchFocusNonce` refocuses it.
   useEffect(() => {
     if (!mounted) return;
     const editor = modifiedEditorRef.current;
@@ -237,7 +241,7 @@ export function MonacoDiffViewer({
       const controller = editor.getContribution<FindController>(FIND_CONTROLLER_ID);
       if (controller?.getState().isRevealed) controller.closeFindWidget();
     }
-  }, [mounted, searchOpen]);
+  }, [mounted, searchOpen, searchFocusNonce]);
 
   // Reflect a find close initiated inside Monaco (Escape or the widget's ✕) back
   // to the owning toggle, so its state matches the visible widget and the next

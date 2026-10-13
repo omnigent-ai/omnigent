@@ -8521,7 +8521,7 @@ async def _auto_create_claude_terminal(
         # copied prefix (no double-render), and placing it in the clone's
         # own project dir means cwd-scoped ``--resume`` finds it in any
         # dir/worktree. Only viable when the source transcript exists on
-        # THIS host (same-host fork — CUJ 1 same-user); else launch fresh.
+        # THIS host; otherwise the stored-item fallback below rebuilds it.
         # See designs/FORK_SESSION_UX.md.
         from omnigent.harnesses.claude_native.main import _clone_claude_transcript
 
@@ -8533,10 +8533,11 @@ async def _auto_create_claude_terminal(
                 target_external_session_id=our_uuid,
                 clone_workspace=_clone_workspace,
             )
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
+        except Exception:  # noqa: BLE001 — best-effort; fall back to stored items
             _cloned = None
             _logger.warning(
-                "Could not clone source transcript for forked clone %s; launching fresh",
+                "Could not clone source transcript for forked clone %s; "
+                "trying item-history fallback",
                 session_id,
                 exc_info=True,
             )
@@ -8573,21 +8574,15 @@ async def _auto_create_claude_terminal(
                         session_id,
                         exc_info=True,
                     )
-    elif (
+    if (
         server_client is not None
         and fork_carry_history
         and session_external_id is None
-        and fork_source_external_id is None
+        and resume_external_session_id is None
     ):
-        # Forked clone bound to a native target with NO source native
-        # transcript to clone (an SDK or cross-family source): build the clone's
-        # native transcript from its OWN copied Omnigent items under a uuid we
-        # assign, then launch plain ``--resume <our_uuid>``. This reuses the
-        # same server-items→transcript converter the cross-machine cold
-        # resume path uses (``_ensure_local_claude_resume_transcript``), so
-        # the clone opens with the prior conversation (messages + tool
-        # history) as real Claude context. Best-effort: launch fresh on
-        # failure. See designs/FORK_SESSION_UX.md.
+        # A missing local transcript or cross-family source needs the fork's
+        # copied Omnigent items rebuilt into a resumable Claude transcript.
+        # The chosen workspace supplies its project directory and cwd fields.
         from omnigent.harnesses.claude_native.main import _ensure_local_claude_resume_transcript
 
         our_uuid = str(uuid.uuid4())

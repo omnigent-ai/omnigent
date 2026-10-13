@@ -64,7 +64,6 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
-from omnigent.runtime import pending_elicitations
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -6276,6 +6275,9 @@ async def _session_get_history_via_rest(
         for it in reversed(data)
     ]
     meta = await _fetch_peek_meta(target_id, server_client)
+    # Load the server's pending-index helpers only when a history tool needs them.
+    from omnigent.runtime import pending_elicitations
+
     # A parked elicitation never lands in the conversation store (it
     # lives only in the Omnigent server's pending-elicitations index, replayed
     # on the snapshot), so append the snapshot's outstanding prompts

@@ -600,7 +600,7 @@ class AcpExecutor(Executor):
         startup) when no sandbox is requested or the backend is unavailable.
 
         ponytail: a sandboxed *generic* agent gets only its binary dir (read),
-        the cwd, and ``/tmp`` (write) — we can't know an arbitrary agent's config
+        the cwd, and private scratch space (write) — we can't know an arbitrary agent's config
         dir. An agent that must write its own config under a sandbox needs
         ``sandbox: none`` (the default) for now; per-agent write roots is a
         documented follow-up.
@@ -618,7 +618,6 @@ class AcpExecutor(Executor):
                 create_exec_launcher,
                 resolve_sandbox,
                 with_additional_read_roots,
-                with_additional_write_roots,
                 with_spawn_env_allowlist,
             )
 
@@ -629,7 +628,6 @@ class AcpExecutor(Executor):
             resolved_bin = Path(binary)
             if resolved_bin.parent != Path(".") and resolved_bin.exists():
                 sandbox = with_additional_read_roots(sandbox, [resolved_bin.resolve().parent])
-            sandbox = with_additional_write_roots(sandbox, [Path("/tmp")])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(binary, sandbox), rest
         except (OSError, ImportError, NotImplementedError) as exc:

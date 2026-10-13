@@ -619,6 +619,9 @@ function FileViewerBody({
 
   // Find-in-file state lifted here so the toolbar button can open it.
   const [searchOpen, setSearchOpen] = useState(false);
+  // Bumped on every Cmd+F so the Monaco surfaces re-run find (refocusing its
+  // input) when the widget is already open and `searchOpen` can't change.
+  const [searchFocusNonce, setSearchFocusNonce] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const openSearch = useCallback(() => {
     setSearchOpen((prev) => {
@@ -894,6 +897,7 @@ function FileViewerBody({
       e.preventDefault();
       e.stopPropagation();
       setSearchOpen(true);
+      setSearchFocusNonce((n) => n + 1);
     };
     // Capture phase so the embed claims Cmd+F ahead of the host page's own
     // listeners and the browser's native find (which would search the whole
@@ -1645,6 +1649,7 @@ function FileViewerBody({
                     onSetActiveSelection={handleSetActiveSelection}
                     pendingBodyRef={pendingBodyRef}
                     searchOpen={searchOpen}
+                    searchFocusNonce={searchFocusNonce}
                     onSearchHandled={handleSearchHandled}
                   />
                 </Suspense>
@@ -1666,6 +1671,7 @@ function FileViewerBody({
               panelOpen={open}
               searchOpen={searchOpen}
               setSearchOpen={setSearchOpen}
+              searchFocusNonce={searchFocusNonce}
               searchInputRef={searchInputRef}
               viewMode={viewMode}
               tocOpen={tocOpen}

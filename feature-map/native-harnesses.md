@@ -67,7 +67,8 @@ Probes run only on expansion.
 
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
-shown for a newly connected or requested host → See more.
+shown for a newly connected or requested host → See more. The modal auto-opens
+only when the server enables the `import_review` release feature.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
@@ -149,11 +150,13 @@ Cross-harness journeys:
   `web/src/shell/settingsNav.test.tsx` and
   `tests/e2e_ui/onboarding/test_import_review_modal.py::test_import_modal_opens_once_and_links_to_harnesses`.
   Start the isolated instance without release flags. Check the Harnesses sidebar
-  link and direct links to the catalog and a harness detail page. Connect a new
-  host, then click See more beside Confirm. Check that the modal closes and
-  Harnesses opens. Open Import sessions and check that only session imports
-  remain. Older clients connected to an upgraded server keep these entry points
-  without deployment changes. The server response contract is covered by
+  link and direct links to the catalog and a harness detail page. Stop it, then
+  use `OMNIGENT_FEATURES=import_review verify-env start`; without that feature the
+  import review modal never opens. Connect a new host, then click See more
+  beside Confirm. Check that the modal closes and Harnesses opens. Open Import
+  sessions and check that only session imports remain. The Harnesses sidebar
+  and direct links remain available without the import-review flag. The server
+  response contract is covered by
   `tests/server/integration/test_utility_endpoints.py::test_info_returns_expected_fields`.
 
 - **`needs-auth`:**
@@ -317,6 +320,14 @@ Cross-harness journeys:
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
+- **`disconnect`, Claude startup (plain `uv run pytest`, no vendor CLI):**
+  `tests/harnesses/claude_native/test_claude_native_readiness_exit.py` delivers
+  a web message through the public bridge into a real retained dead tmux pane.
+  It checks prompt budgets equal to the hard cap and early exit detection with
+  longer budgets. `test_claude_native_slow_ready.py` checks successful delivery
+  after slow startup, an early crash, and the live-pane timeout. These tests
+  exercise the injection used by existing-session and first-message composers;
+  CLI typing bypasses the web injection gate. They do not run a vendor model.
 - **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**
   `tests/e2e/test_codex_native_event_stream_disconnect_e2e.py` covers waiting
   consumers, buffered events, explicit close, and startup discovery without a
@@ -345,6 +356,13 @@ Cross-harness journeys:
   including after reload. Run with plain `uv run pytest` and the browser
   prerequisites in the skill. Requires Claude Code and tmux; machine-managed
   Claude credentials need an isolated container for the scripted model endpoint.
+- **`disconnect`, an already failed session (own environment):**
+  `tests/e2e/test_runner_exit_preserves_failure_e2e.py` posts an actual native
+  failed-status event, then reports a never-connected runner's exit through
+  a real host WebSocket. It checks both a warm cache and a restarted server:
+  the original failure remains in the session response and durable labels,
+  with no additional turn-failure edge. Run with plain `uv run pytest`; no
+  vendor CLI, browser, or model is needed.
 
 - **`plugin-inventory` (component and host tests):**
   `tests/e2e/test_host_plugins_e2e.py::test_host_plugin_inventory` starts a real

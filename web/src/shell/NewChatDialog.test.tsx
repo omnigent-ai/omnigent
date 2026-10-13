@@ -2972,7 +2972,10 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     vi.mocked(isElectronShell).mockReturnValue(true);
     vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: false, hostId: null });
     vi.mocked(onHostStatusChanged).mockReturnValue(() => {});
-    vi.mocked(getDesktopFeatures).mockResolvedValue({ databricksInternalFeatures: true });
+    vi.mocked(getDesktopFeatures).mockResolvedValue({
+      databricksInternalFeatures: true,
+      arcaPreviewRecovery: true,
+    });
     vi.mocked(connectArcaHost).mockClear();
     vi.mocked(fetchHosts).mockClear();
   });
@@ -3006,7 +3009,7 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
   });
 
-  it("offers reconnect after relaunch while preserving the remembered online host row", async () => {
+  it("hides Run on Arca while preserving the remembered online host row", async () => {
     // The row is recognized by the host id remembered at connect time — a
     // host's name (machine hostname) is deliberately not matched against
     // anything from `arca status`.
@@ -3017,16 +3020,26 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
 
     const row = await screen.findByTestId("new-chat-landing-host-arca-1");
     expect(row.textContent).toContain("Arca instance");
-    expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
-      "Run on Arca",
-    );
+    expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
     fireEvent.click(row);
     await waitFor(() => expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1"));
   });
 
+  it("keeps Run on Arca visible in an older shell without preview recovery", async () => {
+    vi.mocked(getDesktopFeatures).mockResolvedValue({ databricksInternalFeatures: true });
+    localStorage.setItem("omnigent:arca-host-id", "arca-1");
+    mockHosts([{ host_id: "arca-1", name: "remote-box", owner: "me", status: "online" }]);
+    renderLanding();
+    await openHostMenu();
+
+    expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
+      /^Run on Arca$/,
+    );
+  });
+
   it("recaptures an already-running host through the same reconnect action", async () => {
     localStorage.setItem("omnigent:arca-host-id", "actual-arca");
-    mockHosts([{ host_id: "actual-arca", name: "remote-box", owner: "me", status: "online" }]);
+    mockHosts([{ host_id: "actual-arca", name: "remote-box", owner: "me", status: "offline" }]);
     vi.mocked(connectArcaHost).mockResolvedValue({
       ok: true,
       alreadyRunning: true,
@@ -3045,7 +3058,7 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
   it("keeps reconnect usable after a console failure without changing host selection", async () => {
     localStorage.setItem("omnigent:arca-host-id", "arca-1");
     localStorage.setItem("omnigent:last-host-choice", "arca-1");
-    mockHosts([{ host_id: "arca-1", name: "remote-box", owner: "me", status: "online" }]);
+    mockHosts([{ host_id: "arca-1", name: "remote-box", owner: "me", status: "offline" }]);
     vi.mocked(connectArcaHost).mockResolvedValue({
       ok: false,
       shownInConsole: true,
@@ -3061,8 +3074,8 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1");
   });
 
-  it.each(["missing", "offline", "online"] as const)(
-    "uses the same connect label when the remembered Arca host is %s",
+  it.each(["missing", "offline"] as const)(
+    "shows Run on Arca when the remembered host is %s",
     async (status) => {
       localStorage.setItem("omnigent:arca-host-id", "arca-1");
       mockHosts(

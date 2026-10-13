@@ -20,7 +20,7 @@ and steers messages while the agent is busy.
   model, and keeps the selection. States: catalog loading, delayed catalog,
   alias vs. full model ID, refused switch (the pill keeps the applied model).
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
-  Pi). States: available, unavailable placeholder, max/ultra levels, refused
+  Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
@@ -31,6 +31,7 @@ and steers messages while the agent is busy.
   be removed. State: unsupported file type rejected without losing the message.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers.
+- `new-session-hotkey`: ⌘/Ctrl+Alt+N opens and focuses the new-session composer.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
@@ -76,7 +77,7 @@ and steers messages while the agent is busy.
   composer.
 - Hover the model/effort pill to see the tooltip.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
-  Pi), and permission mode before the session exists.
+  Pi, Devin), and permission mode before the session exists.
 - With a managed sandbox selected and no connected host, the model picker lists
   the sandbox's default catalog when `/v1/info` advertises `default_models` (an
   unbound gateway with `sandbox.model_discovery`, or a provider hook): rows under
