@@ -592,6 +592,53 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True], ids=["persisted", "cached"])
+@pytest.mark.parametrize("live_status", ["failed", "running"])
+async def test_session_snapshot_existing_failure_survives_runner_exit(
+    monkeypatch: pytest.MonkeyPatch, cached: bool, live_status: str
+) -> None:
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "30cc5cfcaab3427698d56838f8b636cd"
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        runner_id="runner_exit_after_failure",
+        agent_id="synthetic-agent",
+        live_status=None if cached else live_status,
+        labels={
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+        },
+    )
+    store = _ConversationStore([], conversations={session_id: conv})
+    _use_runner_client(monkeypatch, None)
+    if cached:
+        monkeypatch.setitem(sessions_module._session_status_cache, session_id, live_status)
+    else:
+        monkeypatch.delitem(sessions_module._session_status_cache, session_id, raising=False)
+    reports = RunnerExitReports()
+    reports.record(conv.runner_id, "Synthetic runner exit", owner=None, had_connected=False)
+
+    snapshot = await _get_session_snapshot(
+        store,
+        session_id,
+        runner_exit_reports=reports,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.status == "failed"
+    assert snapshot.last_task_error == (
+        original
+        if live_status == "failed"
+        else {"code": "runner_failed_to_start", "message": "Synthetic runner exit"}
+    )
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error() -> None:
     """
     A terminal/runtime failure captured from ``session.status`` survives reload.

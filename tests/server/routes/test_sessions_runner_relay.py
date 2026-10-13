@@ -2885,6 +2885,51 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True], ids=["persisted", "cached"])
+@pytest.mark.parametrize("fail_idle_top_level", [False, True])
+async def test_offline_sweep_preserves_existing_failure(
+    db_uri: str, cached: bool, fail_idle_top_level: bool
+) -> None:
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-exit-after-failure")
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    store.set_labels(
+        conv.id,
+        {
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+        },
+    )
+    store.set_session_live_status(conv.id, "failed")
+    snapshot = store.get_conversation(conv.id)
+    assert snapshot is not None
+    if cached:
+        sessions_module._session_status_cache[conv.id] = "failed"
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [snapshot],
+                ErrorDetail(code="runner_failed_to_start", message="Synthetic runner exit"),
+                store,
+                fail_idle_top_level=fail_idle_top_level,
+            )
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        assert refreshed.live_status == "failed"
+        assert sessions_module._last_task_error_from_labels(refreshed.labels) == original
+        assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+        decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert decision["attributes"]["decision"] == "already_failed"
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("labels", "fail_idle_top_level", "decision"),
     [

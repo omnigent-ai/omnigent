@@ -345,6 +345,13 @@ Cross-harness journeys:
   including after reload. Run with plain `uv run pytest` and the browser
   prerequisites in the skill. Requires Claude Code and tmux; machine-managed
   Claude credentials need an isolated container for the scripted model endpoint.
+- **`disconnect`, an already failed session (own environment):**
+  `tests/e2e/test_runner_exit_preserves_failure_e2e.py` posts an actual native
+  failed-status event, then reports a never-connected runner's exit through
+  a real host WebSocket. It checks both a warm cache and a restarted server:
+  the original failure remains in the session response and durable labels,
+  with no additional turn-failure edge. Run with plain `uv run pytest`; no
+  vendor CLI, browser, or model is needed.
 
 - **`plugin-inventory` (component and host tests):**
   `tests/e2e/test_host_plugins_e2e.py::test_host_plugin_inventory` starts a real

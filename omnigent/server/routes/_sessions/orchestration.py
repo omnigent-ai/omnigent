@@ -7779,6 +7779,8 @@ async def _runner_disconnect_requires_failure(
         decision = "failed_mid_turn"
     elif source == "unknown":
         decision = "unknown_no_failure"
+    elif live == "failed":
+        decision = "already_failed"
     elif fail_idle_top_level and conv is not None and conv.kind != "sub_agent":
         decision = "failed_before_start"
     else:
@@ -12497,7 +12499,11 @@ async def _get_session_snapshot(
             runner_exit_reports.was_connected(conv.runner_id)
             or session_live_state.last_liveness_stamp(conv.runner_id) is not None
         )
-        if exit_error is not None and (status != "idle" or not runner_ran):
+        if (
+            exit_error is not None
+            and (status != "idle" or not runner_ran)
+            and (status != "failed" or last_task_error is None)
+        ):
             last_task_error = {"code": "runner_failed_to_start", "message": exit_error}
             status = "failed"
     llm_model: str | None = None
