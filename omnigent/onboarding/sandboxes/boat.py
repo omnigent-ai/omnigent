@@ -106,18 +106,23 @@ class BoatSandboxLauncher(ExecModelHostLauncher):
         missing_ok: bool = False,
     ) -> dict[str, Any]:
         self.prepare()
-        try:
-            response = self._client().request(
-                method,
-                _api_url() + path,
-                headers={
-                    "Authorization": f"Bearer {os.environ['BOAT_API_KEY']}",
-                    **(headers or {}),
-                },
-                json=body,
-            )
-        except httpx.RequestError as exc:
-            raise click.ClickException("Boat API request failed; check connectivity.") from exc
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                response = self._client().request(
+                    method,
+                    _api_url() + path,
+                    headers={
+                        "Authorization": f"Bearer {os.environ['BOAT_API_KEY']}",
+                        **(headers or {}),
+                    },
+                    json=body,
+                )
+            except httpx.RequestError as exc:
+                raise click.ClickException("Boat API request failed; check connectivity.") from exc
+            if not _safe_to_retry(response) or time.monotonic() >= deadline:
+                break
+            time.sleep(2)
         if response.status_code == 404:
             if missing_ok:
                 return {}
@@ -274,3 +279,26 @@ def _error_code(response: httpx.Response) -> str:
     if isinstance(code, str) and code.replace("_", "").isalnum() and len(code) <= 64:
         return f" ({code})"
     return ""
+
+
+def _safe_to_retry(response: httpx.Response) -> bool:
+    """Retry only when Boat guarantees that a remote command did not run."""
+    if response.status_code not in {409, 502}:
+        return False
+    try:
+        data = response.json()
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if response.status_code == 409:
+        return data.get("code") == "sandbox_starting"
+    if data.get("code") != "sandbox_direct_failed":
+        return False
+    error = data.get("error")
+    if not isinstance(error, dict):
+        return data.get("message") == "sandbox_restoring"
+    details = error.get("details")
+    return (isinstance(details, dict) and details.get("retryable") is True) or (
+        error.get("message") == "sandbox_restoring"
+    )
