@@ -176,31 +176,36 @@ class ClaudeNativeEvalDriver(NativeTuiDriver):
             _delete_session(self._client, self._session_id)
 
 
-class ClaudeSdkEvalDriver:
+class SdkEvalDriver:
     """
-    claude-sdk through a live server and runner, one session per run.
+    An SDK harness through a live server and runner, one session per run.
 
     The agent gets shell access (``os_env``) so it can run ``omnigent`` and
     fetch docs. Runs share the runner workspace, which is emptied before
     each run.
 
-    :param model: Pinned model, e.g. ``"databricks-claude-sonnet-4-6"``.
+    :param harness: An SDK harness, e.g. ``"openai-agents"`` or ``"claude-sdk"``.
+    :param model: Pinned model, e.g. ``"databricks-gpt-5-4-mini"``.
     :param databricks_profile: Profile for gateway credentials.
     :param extra_env: Env overrides for the server and runner, e.g. ``PATH``.
     :param timeout: Ceiling for one turn, in seconds.
+    :param executor_config: Extra ``executor.config`` keys, e.g.
+        ``{"use_responses": False}``.
     """
-
-    harness = "claude-sdk"
-    _AGENT_NAME = "eval-omnigent-guide-claude-sdk"
 
     def __init__(
         self,
         *,
+        harness: str,
         model: str,
         databricks_profile: str | None,
         extra_env: Mapping[str, str],
         timeout: float,
+        executor_config: Mapping[str, Any] | None = None,
     ) -> None:
+        self.harness = harness
+        self._executor_config = dict(executor_config or {})
+        self._agent_name = f"eval-omnigent-guide-{harness}"
         self._model = model
         self._db_profile = databricks_profile
         self._extra_env = dict(extra_env)
@@ -209,7 +214,7 @@ class ClaudeSdkEvalDriver:
         self._workspace = self._root / "workspace"
         self._server: SharedFullServer | None = None
 
-    def __enter__(self) -> ClaudeSdkEvalDriver:
+    def __enter__(self) -> SdkEvalDriver:
         try:
             env = resolve_bench_env(self._db_profile)
             self._workspace.mkdir(parents=True)
@@ -235,16 +240,18 @@ class ClaudeSdkEvalDriver:
         executor: dict[str, Any] = {
             "type": "omnigent",
             "model": self._model,
-            "config": {"harness": "claude-sdk"},
+            "config": {"harness": self.harness, **self._executor_config},
         }
         if db_profile:
             executor["profile"] = db_profile
         config = {
             "spec_version": 1,
-            "name": self._AGENT_NAME,
+            "name": self._agent_name,
             "prompt": "You are a helpful assistant.",
             "executor": executor,
             "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+            # Hide the operator's own host skills; framework skills still load.
+            "skills": "none",
         }
         bundle = bundle_files({"config.yaml": yaml.safe_dump(config).encode()})
         response = post_session_bundle(self._server.client.post, "/v1/sessions", bundle)
@@ -263,7 +270,7 @@ class ClaudeSdkEvalDriver:
                 child.unlink()
         record.workspace = str(self._workspace)
         try:
-            session_id = self._server.create_session(self._AGENT_NAME)
+            session_id = self._server.create_session(self._agent_name)
         except (httpx.HTTPError, IndexError, KeyError) as exc:
             record.status, record.error = INFRA_ERROR, repr(exc)
             return record

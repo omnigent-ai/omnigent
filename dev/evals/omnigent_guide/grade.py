@@ -197,7 +197,7 @@ class OpenAIJudge:
                 ],
                 temperature=0,
             )
-            results = _judge_results(reply.choices[0].message.content or "")
+            results = _judge_results(_message_text(reply.choices[0].message.content))
         except Exception as exc:  # noqa: BLE001 — a judge outage must not abort the eval
             results = []
             failure = f"judge error: {str(exc)[:200]}"
@@ -217,6 +217,19 @@ class OpenAIJudge:
                 )
             )
         return graded
+
+
+def _message_text(content: object) -> str:
+    """Text of a chat message; reasoning models can return a list of typed parts."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") in (None, "text", "output_text")
+        )
+    return ""
 
 
 def _judge_results(content: str) -> list[Any]:

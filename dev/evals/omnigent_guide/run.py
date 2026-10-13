@@ -17,18 +17,20 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from dev.evals.omnigent_guide.cases import Case, load_cases
 from dev.evals.omnigent_guide.drivers import (
     ClaudeNativeEvalDriver,
-    ClaudeSdkEvalDriver,
     EvalDriver,
+    SdkEvalDriver,
     isolated_claude_env,
 )
 from dev.evals.omnigent_guide.grade import Judge, OpenAIJudge, grade_run
@@ -37,9 +39,18 @@ from dev.evals.omnigent_guide.report import per_case, render_markdown, summarize
 from tests._helpers.compat import COMPAT_RUNNER_PYTHON_ENV, COMPAT_SERVER_PYTHON_ENV
 from tests.harness_bench.profile import resolve_profile
 
-_DRIVERS: dict[str, type[ClaudeNativeEvalDriver] | type[ClaudeSdkEvalDriver]] = {
+_RUNS_PER_DRIVER = 15
+
+# claude-native and claude-sdk run the Claude Code CLI, which a managed-settings
+# org login pin can restrict to first-party sign-in; openai-agents needs no CLI.
+_DRIVERS: dict[str, Callable[..., EvalDriver]] = {
     "claude-native": ClaudeNativeEvalDriver,
-    "claude-sdk": ClaudeSdkEvalDriver,
+    "claude-sdk": functools.partial(SdkEvalDriver, harness="claude-sdk"),
+    # The Databricks gateway offers the Responses API only for OpenAI GPT models;
+    # chat completions works for every chat model it serves.
+    "openai-agents": functools.partial(
+        SdkEvalDriver, harness="openai-agents", executor_config={"use_responses": False}
+    ),
 }
 
 # Printed by the arm's interpreter: version, commit, guide present, install path.
@@ -130,7 +141,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--judge-model",
         default=None,
-        help="Judge for free-text assertions. Default: the bench's codex (GPT) test model.",
+        help="Judge for free-text assertions. Default: a bench test model of the other family.",
     )
     parser.add_argument("--no-judge", action="store_true", help="Grade deterministic checks only.")
     parser.add_argument(
@@ -154,9 +165,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     args.models = {
         harness: args.model or resolve_profile(harness).model for harness in args.harness
     }
-    args.judge_model = (
-        None if args.no_judge else args.judge_model or resolve_profile("codex").model
-    )
+    if args.no_judge:
+        args.judge_model = None
+    elif not args.judge_model:
+        # Judge with the other model family, so it does not grade its own family's answers.
+        grades_claude = any("claude" in model for model in args.models.values())
+        args.judge_model = resolve_profile("codex" if grades_claude else "claude-native").model
     return args
 
 
@@ -231,25 +245,33 @@ def _run_arm(
         **isolated_claude_env(scratch),
     }
     print(f"== {harness} / {arm.name} ({arm.version}): {len(todo)} run(s)", flush=True)
-    driver: EvalDriver = _DRIVERS[harness](
-        model=args.models[harness],
-        databricks_profile=args.profile,
-        extra_env=extra_env,
-        timeout=args.timeout,
+    # A fresh driver per batch mints fresh gateway credentials; tokens last about an hour.
+    for start in range(0, len(todo), _RUNS_PER_DRIVER):
+        driver: EvalDriver = _DRIVERS[harness](
+            model=args.models[harness],
+            databricks_profile=args.profile,
+            extra_env=extra_env,
+            timeout=args.timeout,
+        )
+        with driver:
+            for case, index in todo[start : start + _RUNS_PER_DRIVER]:
+                _run_one(driver, case, index, harness, arm, runs_path)
+
+
+def _run_one(
+    driver: EvalDriver, case: Case, index: int, harness: str, arm: Arm, runs_path: Path
+) -> None:
+    record = RunRecord(case_id=case.id, harness=harness, arm=arm.name, run_index=index)
+    driver.run(case.prompt, record)
+    graded = grade_run(case, record, installed_version=arm.version)
+    with runs_path.open("a", encoding="utf-8") as runs_file:
+        runs_file.write(json.dumps(dataclasses.asdict(graded)) + "\n")
+    passed = sum(result.passed for result in graded.assertions)
+    print(
+        f"   {case.id} #{index}: {record.status}, loaded={graded.skills_loaded or '-'}, "
+        f"checks {passed}/{len(graded.assertions)}, {record.duration_s:.0f}s",
+        flush=True,
     )
-    with driver:
-        for case, index in todo:
-            record = RunRecord(case_id=case.id, harness=harness, arm=arm.name, run_index=index)
-            driver.run(case.prompt, record)
-            graded = grade_run(case, record, installed_version=arm.version)
-            with runs_path.open("a", encoding="utf-8") as runs_file:
-                runs_file.write(json.dumps(dataclasses.asdict(graded)) + "\n")
-            passed = sum(result.passed for result in graded.assertions)
-            print(
-                f"   {case.id} #{index}: {record.status}, loaded={graded.skills_loaded or '-'}, "
-                f"checks {passed}/{len(graded.assertions)}, {record.duration_s:.0f}s",
-                flush=True,
-            )
 
 
 def _judge(runs: list[GradedRun], cases: dict[str, Case], judge: Judge) -> None:

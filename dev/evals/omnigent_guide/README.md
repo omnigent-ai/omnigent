@@ -40,14 +40,27 @@ done
 
 Run from the repository root. Unset every `OMNIGENT_*` variable first if you
 are inside an Omnigent session. The eval needs gateway credentials, for
-example a Databricks profile that serves `databricks-claude-sonnet-4-6`.
+example a Databricks profile.
 
 ```sh
 uv run --no-sync python -m dev.evals.omnigent_guide.run \
   --baseline-python /tmp/eval/base/bin/python \
   --treatment-python /tmp/eval/head/bin/python \
-  --profile dev --out /tmp/eval/results
+  --profile dev --out /tmp/eval/results \
+  --harness openai-agents --model databricks-qwen35-122b-a10b \
+  --judge-model databricks-llama-4-maverick
 ```
+
+Harnesses:
+
+- `openai-agents` needs no CLI and works with any chat model the gateway serves.
+- `claude-native` and `claude-sdk` run the Claude Code CLI. A machine whose
+  Claude Code managed settings pin sign-in to an organization refuses gateway
+  credentials, so these two fail there.
+
+Models default to the harness bench's test models. Pass `--model` and
+`--judge-model` when your workspace serves other endpoints. Pick a judge from a
+different model family than the model under test.
 
 A preflight check stops the run unless the baseline lacks
 `omnigent-guide/SKILL.md`, the treatment has it, and neither arm imports
