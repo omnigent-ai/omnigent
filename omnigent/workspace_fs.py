@@ -47,6 +47,7 @@ from typing import TypeAlias, TypedDict, cast
 
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import PagedList, paginate_in_memory
+from omnigent.inner.os_env_upload import is_upload_staging
 from omnigent.runner import pr_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -473,6 +474,7 @@ class WorkspaceReader:
             raise WorkspaceReaderError(
                 404, "not_found", f"Directory {rel!r} not found or not accessible"
             ) from exc
+        names = [name for name in names if not is_upload_staging(name)]
         for name in names:
             if not is_utf8_encodable(name):
                 # A non-UTF-8 name comes back surrogate-escaped; no JSON or protobuf
@@ -591,8 +593,11 @@ class WorkspaceReader:
             limit=limit,
         )
 
+        def keep_entry(path: str) -> bool:
+            return not is_upload_staging(path)
+
         results, truncated = walk_search(
-            self._root, q, inc, exc, limit, budget=_SEARCH_SCAN_BUDGET
+            self._root, q, inc, exc, limit, budget=_SEARCH_SCAN_BUDGET, emit=keep_entry
         )
         if indexed is not None:
             results = merge_entries(indexed, results, limit)
@@ -647,6 +652,7 @@ class WorkspaceReader:
                 "untracked_lines": rec.get("untracked_lines"),
             }
             for rec in raw_changes
+            if not is_upload_staging(rec["path"])
         ]
         return {"object": "list", "data": data, "has_more": False}
 
