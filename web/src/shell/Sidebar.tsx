@@ -1594,7 +1594,7 @@ function ProjectFolder({
         onProjectAssigned={onProjectAssigned}
         emptyMessage={
           loadingFirstPage ? undefined : (
-            <span className="block text-ui">
+            <span className="block">
               No sessions. Start a{" "}
               <Link
                 to={`/?project=${encodeURIComponent(name)}`}
@@ -1630,7 +1630,16 @@ function ProjectFolder({
         }
         footer={
           loadingFirstPage ? (
-            <p className="px-2 py-1 pl-5 text-muted-foreground text-sm">Loading…</p>
+            <div className="pl-6">
+              <p
+                className={cn(
+                  SIDEBAR_ROW,
+                  "flex w-full flex-col justify-center text-left text-muted-foreground",
+                )}
+              >
+                Loading…
+              </p>
+            </div>
           ) : (
             <InfiniteScrollSentinel
               hasMore={query.hasNextPage}
@@ -3250,8 +3259,10 @@ function FilterMenuSub({
   return (
     <DropdownMenuSub>
       <DropdownMenuSubTrigger data-testid={testId}>
-        {label}
-        {value && <span className="ml-auto pl-6 text-muted-foreground">{value}</span>}
+        <span className="flex-1 flex justify-between">
+          {label}
+          {value && <span className="ml-auto text-muted-foreground">{value}</span>}
+        </span>
       </DropdownMenuSubTrigger>
       <DropdownMenuSubContent className="min-w-40 [&_[role=menuitemradio]]:text-ui [&_[role=menuitemcheckbox]]:text-ui">
         {children}
@@ -3639,6 +3650,7 @@ function ConversationSection({
       can expand that (possibly brand-new) project folder. */
   onProjectAssigned?: (projectName: string) => void;
 }) {
+  const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
   const protectsCollapsedBadge = isCollapsed && marker != null;
@@ -3713,13 +3725,22 @@ function ConversationSection({
             // Expanded but empty — a project with no loaded chats (indented, in a
             // dashed well) or a top-level list whose filter matched nothing.
             indentRows ? (
-              <div
-                className={cn(
-                  SIDEBAR_ROW,
-                  "mt-1 mr-2 ml-8 flex flex-col items-start justify-center gap-1.5 px-0 py-1 pb-2 text-left md:py-1 md:pb-2",
-                )}
-              >
-                <p className="text-ui text-muted-foreground">{emptyMessage}</p>
+              <div className="pl-6">
+                <div
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "relative flex w-full flex-col justify-center text-left text-muted-foreground",
+                    groupingEmptyState && "items-center text-center",
+                  )}
+                >
+                  {groupingEmptyState && (
+                    <span
+                      aria-hidden
+                      className="pointer-events-none absolute inset-0 rounded-[var(--radius-otto-button)] border border-dashed border-border"
+                    />
+                  )}
+                  <p>{emptyMessage}</p>
+                </div>
               </div>
             ) : (
               <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
