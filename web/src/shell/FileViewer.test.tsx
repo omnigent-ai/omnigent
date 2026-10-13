@@ -653,13 +653,15 @@ describe("FileViewer URL sync — diff param", () => {
           expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
           fireEvent.click(second.getByRole("button", { name: "Show diff" }));
           expect(await second.findByTestId("diff-viewer")).toBeInTheDocument();
+          expect(first.queryByTestId("diff-viewer")).toBeNull();
           expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
           fireEvent.click(second.getByRole("button", { name: "Exit diff view" }));
           expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
-          expect(first.getByTestId("diff-viewer")).toBeInTheDocument();
+          expect(first.queryByTestId("diff-viewer")).toBeNull();
 
           vi.mocked(useIsMobileViewport).mockReturnValue(isMobile);
           rerender(<Viewers />);
+          expect(await first.findByTestId("diff-viewer")).toBeInTheDocument();
           expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
           fireEvent.click(first.getByRole("button", { name: "Exit diff view" }));
           expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
