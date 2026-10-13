@@ -424,14 +424,18 @@ def test_helper_lock_wait_is_bounded(helper: UploadHelperClient) -> None:
     try:
         started = time.monotonic()
         result = helper.call({"op": "probe"}, timeout_s=0.05)
-        assert result["code"] == "timeout"
+        assert result["code"] == "busy"
         assert time.monotonic() - started < 0.15
     finally:
         release.join()
 
 
+@pytest.mark.parametrize("launch_error,timeout_s", [(False, 0.05), (True, 0.05), (True, 1)])
 def test_launch_and_ipc_share_deadline(
-    helper: UploadHelperClient, monkeypatch: pytest.MonkeyPatch
+    helper: UploadHelperClient,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_error: bool,
+    timeout_s: float,
 ) -> None:
     import time
 
@@ -439,12 +443,20 @@ def test_launch_and_ipc_share_deadline(
 
     def delayed():
         time.sleep(0.15)
+        if launch_error:
+            raise OSError("Launch interrupted")
         original()
 
     monkeypatch.setattr(helper, "_ensure_started_locked", delayed)
-    result = helper.call({"op": "probe"}, timeout_s=0.05)
-    assert result["code"] == "timeout"
+    result = helper.call({"op": "probe"}, timeout_s=timeout_s)
+    assert result["code"] == "busy"
     assert helper._proc is None or helper._proc.poll() is not None
+
+
+def test_closed_helper_does_not_dispatch_begin(helper: UploadHelperClient) -> None:
+    assert helper.call({"op": "probe"}) == {"raw_upload": True}
+    helper.close()
+    assert begin(helper)["code"] == "busy"
 
 
 def test_recovery_skips_fifo(helper: UploadHelperClient, tmp_path: Path) -> None:
