@@ -17,6 +17,7 @@ _CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 _CODEX_MOCK_MODEL = "gpt-4o"
 # USD per million tokens (input, output, cache read) for the mock codex provider.
 _CODEX_MOCK_PRICING_PER_MILLION = (2.5, 10.0, 0.25)
+_CLAUDE_MOCK_PRICING_PER_MILLION = (3.0, 15.0)
 
 
 class ServerState(dict[str, object]):
@@ -114,6 +115,8 @@ def temp_omnigent_mock_config(
     original = config_path.read_bytes() if config_path.exists() else None
 
     if harness == "claude":
+        # The spawned runner inherits OMNIGENT_DISABLE_CATALOG_LOOKUP=1, so the
+        # claude-native transcript cost walk can only price from configured rates.
         mock_config = textwrap.dedent(f"""\
             providers:
               mock-claude:
@@ -124,6 +127,9 @@ def temp_omnigent_mock_config(
                   api_key: "mock-key"
                   models:
                     default: {_CLAUDE_MOCK_MODEL}
+                  pricing:
+                    input_per_million: {_CLAUDE_MOCK_PRICING_PER_MILLION[0]}
+                    output_per_million: {_CLAUDE_MOCK_PRICING_PER_MILLION[1]}
             """)
     else:  # codex
         # The mock model is not in the pricing catalog; configured rates let

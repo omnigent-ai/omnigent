@@ -246,6 +246,7 @@ from omnigent.server.routes._sessions.helpers import (
     _build_policy_engine_from_spec,
     _child_session_summary_from_conversation,
     _codex_subagent_labels_from_body,
+    _coerce_cost_by_model,
     _coerce_cumulative_field,
     _collect_descendant_conversation_ids,
     _consume_pre_resolved_harness_elicitation,
@@ -1773,6 +1774,9 @@ def _persist_native_cumulative_usage(
       a token report that omits it keeps the persisted cached count.
     - ``model`` — LLM model id to price with (e.g. ``"databricks-gpt-5-5"``);
       falls back to the agent spec's model when absent.
+    - ``cost_by_model`` — optional per-model weights; the clamped
+      cumulative-cost delta is split across them proportionally instead of
+      assigned to the single active model (claude-native sub-agent spend).
 
     The ``total_cost_usd`` key is written only on the priced branches
     below (exact billing, or token-priced when the model is in the
@@ -1792,6 +1796,7 @@ def _persist_native_cumulative_usage(
     :raises OmnigentError: When a cumulative field is the wrong type.
     """
     cost = _coerce_cumulative_field(data, "cumulative_cost_usd", numeric=True)
+    cost_by_model_weights = _coerce_cost_by_model(data)
     policy_cost = _coerce_cumulative_field(data, "policy_cost_usd", numeric=True)
     cin = _coerce_cumulative_field(data, "cumulative_input_tokens", numeric=False)
     cout = _coerce_cumulative_field(data, "cumulative_output_tokens", numeric=False)
@@ -1916,19 +1921,42 @@ def _persist_native_cumulative_usage(
                 # priced cost below the persisted figure.
                 current["total_cost_usd"] = max(old_cost, compute_llm_cost(current, pricing))
 
-    # ADD this report's growth (new - old) to the active model, not the whole
-    # cumulative total, so per-model buckets sum to the flat total across model
-    # switches. Clamp >= 0 so a lowered report never claws a bucket back (flat
-    # tokens are SET not clamped, so buckets can exceed them then — fail-safe).
-    if isinstance(model_name, str) and model_name:
+    # Add each report's token growth (clamped >= 0) to the active model so buckets
+    # sum to the flat total across switches. Only a token report touches tokens: a
+    # cost-only split over ``cost_by_model`` must not leave the tagged model empty.
+    if has_tokens and isinstance(model_name, str) and model_name:
         bucket = _model_usage_bucket(current, model_name)
         for key in _MODEL_TOKEN_KEYS:
             if key in current:
                 bucket[key] = int(bucket.get(key, 0)) + max(0, int(current[key]) - old_tokens[key])
-        if "total_cost_usd" in current:
-            bucket["total_cost_usd"] = float(bucket.get("total_cost_usd", 0.0)) + max(
-                0.0, float(current["total_cost_usd"]) - old_cost
-            )
+    cost_growth = (
+        max(0.0, float(current["total_cost_usd"]) - old_cost)
+        if "total_cost_usd" in current
+        else 0.0
+    )
+    if "total_cost_usd" in current:
+        if cost_by_model_weights:
+            # Weighted reports stay on the weighted path. A clamped/re-sent report
+            # has no growth and attributes nothing, so it never falls back to a
+            # tagged-alias bucket — which would be a phantom zero row.
+            if cost_growth > 0.0:
+                # Split growth across the weights (a turn's Task sub-agents),
+                # normalized by the max weight so near-overflow finite weights still
+                # split proportionally and sum to the clamped flat delta.
+                max_weight = max(cost_by_model_weights.values())
+                scaled = {m: w / max_weight for m, w in cost_by_model_weights.items()}
+                weight_total = sum(scaled.values())
+                for weight_model, weight in scaled.items():
+                    share = cost_growth * (weight / weight_total)
+                    weight_bucket = _model_usage_bucket(current, weight_model)
+                    weight_bucket["total_cost_usd"] = (
+                        float(weight_bucket.get("total_cost_usd", 0.0)) + share
+                    )
+        elif isinstance(model_name, str) and model_name:
+            # Plain turn (no weights): record the delta — zero included — on the
+            # active model so a single-model session still gets its per-model row.
+            bucket = _model_usage_bucket(current, model_name)
+            bucket["total_cost_usd"] = float(bucket.get("total_cost_usd", 0.0)) + cost_growth
 
     # Enforcement value (claude-native display/policy split). Stored
     # separately from the displayed ``total_cost_usd`` so the gate can read
