@@ -1303,6 +1303,7 @@ async def _serve_tunnel_once(
         await _send_hello(
             send_text,
             runner_version,
+            app=app,
             direct_attach_port=direct_attach_port,
             direct_attach_token=direct_attach_token,
             connection_id=connection_id,
@@ -1516,6 +1517,7 @@ async def _send_hello(
     send_text: Callable[[str], Awaitable[None]],
     runner_version: str,
     *,
+    app: _ASGIApp | None = None,
     direct_attach_port: int | None = None,
     direct_attach_token: str | None = None,
     connection_id: str | None = None,
@@ -1546,12 +1548,43 @@ async def _send_hello(
     except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
         pass
 
+    import httpx
+    from fastapi import FastAPI, HTTPException
+
+    from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+    from omnigent.errors import OmnigentError
     from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
     from omnigent.host.frames import CAP_MCP_REGISTRY
     from omnigent.inner.native_attachments import (
         CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
         CAP_FILESYSTEM_ATTACHMENTS,
     )
+    from omnigent.runner.workspace_upload import (
+        WORKSPACE_UPLOAD_CAPABILITY,
+        UploadManager,
+        workspace_upload_supported,
+    )
+
+    upload_supported = False
+    if isinstance(app, FastAPI):
+        manager = getattr(app.state, "workspace_uploads", None)
+        session_id = runner_primary_session_id()
+        if isinstance(manager, UploadManager) and session_id is not None:
+            try:
+                async with asyncio.timeout(5):
+                    env = await manager.resolve_environment(session_id, DEFAULT_ENVIRONMENT_ID)
+                    upload_supported = await workspace_upload_supported(
+                        env, routes_registered=True
+                    )
+            except (
+                TimeoutError,
+                OSError,
+                ValueError,
+                OmnigentError,
+                HTTPException,
+                httpx.HTTPError,
+            ):
+                _logger.warning("Workspace upload probe unavailable during hello", exc_info=True)
 
     await send_text(
         encode_frame(
@@ -1564,6 +1597,7 @@ async def _send_hello(
                     CAP_MCP_REGISTRY,
                     CAP_SIDE_CHAT_SETTINGS,
                     BINARY_REQUEST_BODY_CAPABILITY,
+                    *([WORKSPACE_UPLOAD_CAPABILITY] if upload_supported else []),
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,

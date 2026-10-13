@@ -917,3 +917,66 @@ def branding_logo_asset(variant: str = "main") -> BrandingAsset | None:
 def branding_config() -> dict[str, Any]:
     """Branding block surfaced by ``GET /v1/info`` for the web UI."""
     return load_branding_snapshot().config()
+
+
+def workspace_upload_max_file_bytes() -> int:
+    """Return the workspace upload max file bytes setting."""
+    return _config_positive_int("workspace_upload_max_file_bytes", 1073741824)
+
+
+def workspace_upload_chunk_initial_bytes() -> int:
+    """Return the workspace upload chunk initial bytes setting."""
+    return _config_positive_int("workspace_upload_chunk_initial_bytes", 1048576)
+
+
+def workspace_upload_chunk_max_bytes() -> int:
+    """Return the workspace upload chunk max bytes setting."""
+    return max(
+        256 * 1024,
+        min(_config_positive_int("workspace_upload_chunk_max_bytes", 8388608), 16 * 1024**2),
+    )
+
+
+def workspace_upload_max_files_per_batch() -> int:
+    """Return the workspace upload max files per batch setting."""
+    return _config_positive_int("workspace_upload_max_files_per_batch", 100)
+
+
+def workspace_upload_max_batch_bytes() -> int:
+    """Return the workspace upload max batch bytes setting."""
+    return _config_positive_int("workspace_upload_max_batch_bytes", 5368709120)
+
+
+def workspace_upload_max_open_per_session() -> int:
+    """Return the workspace upload max open per session setting."""
+    return _config_positive_int("workspace_upload_max_open_per_session", 16)
+
+
+def workspace_upload_max_open_bytes_per_session() -> int:
+    """Return the workspace upload max open bytes per session setting."""
+    return _config_positive_int("workspace_upload_max_open_bytes_per_session", 5368709120)
+
+
+def workspace_upload_parallel_files() -> int:
+    """Return the workspace upload parallel files setting."""
+    return _config_positive_int("workspace_upload_parallel_files", 2)
+
+
+def workspace_upload_chunk_timeout_s() -> int:
+    """Return the workspace upload chunk timeout s setting."""
+    return _config_positive_int("workspace_upload_chunk_timeout_s", 60)
+
+
+def workspace_upload_finalize_timeout_s() -> int:
+    """Return the workspace upload finalize timeout s setting."""
+    return _config_positive_int("workspace_upload_finalize_timeout_s", 120)
+
+
+def workspace_upload_staging_idle_ttl_s() -> int:
+    """Return the workspace upload staging idle ttl s setting."""
+    return _config_positive_int("workspace_upload_staging_idle_ttl_s", 3600)
+
+
+def workspace_upload_staging_max_age_s() -> int:
+    """Return the workspace upload staging max age s setting."""
+    return _config_positive_int("workspace_upload_staging_max_age_s", 86400)

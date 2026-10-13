@@ -1182,3 +1182,54 @@ async def test_binary_dispatch_deadline_recovers_slot_with_healthy_pings(
                 blocked.set()
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("mode", ["supported", "no-routes", "no-raw-helper"])
+async def test_hello_workspace_upload_requires_routes_and_raw_helper(tmp_path, monkeypatch, mode):
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+    from omnigent.runner import workspace_upload
+
+    app = FastAPI()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    env = create_os_environment(
+        OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+
+    async def resolve_environment(session_id, environment_id):
+        return env
+
+    async def resolve_registry(session_id):
+        return None
+
+    manager = None
+    if mode != "no-routes":
+        manager = workspace_upload.register_upload_routes(
+            app,
+            resolve_environment=resolve_environment,
+            resolve_registry=resolve_registry,
+            state_path=tmp_path / "index.json",
+        )
+    if mode == "no-raw-helper":
+
+        async def unsupported(*args, **kwargs):
+            return False
+
+        monkeypatch.setattr(workspace_upload, "workspace_upload_supported", unsupported)
+    monkeypatch.setattr(serve_module, "runner_primary_session_id", lambda: "session")
+    frames = []
+
+    async def send(raw):
+        frames.append(decode_frame(raw))
+
+    try:
+        await _send_hello(send, "test", app=app)
+        assert len(frames) == 1
+        assert isinstance(frames[0], HelloFrame)
+        assert ("workspace_upload_v1" in frames[0].capabilities) == (mode == "supported")
+        assert frames[0].frame_protocol_version == 1
+    finally:
+        if manager is not None:
+            await manager.stop()
+        env.close()
