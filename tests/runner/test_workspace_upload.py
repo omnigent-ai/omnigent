@@ -829,6 +829,119 @@ async def test_lost_finalize_response_recovers_published_inode(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["unlink", "fchmod"])
+async def test_same_helper_recovery_releases_handles_and_expires(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import omnigent.inner.os_env as os_env
+
+    descriptor_state = tmp_path / "descriptor-state.json"
+    script = f"""
+import errno
+import json
+import os
+from pathlib import Path
+from omnigent.inner.os_env import main
+from omnigent.inner import os_env_upload as upload
+
+original = getattr(os, {failure!r})
+failed = False
+def fail_once(*args, **kwargs):
+    global failed
+    if not failed:
+        failed = True
+        raise OSError(errno.EIO, 'Injected post-publication failure')
+    return original(*args, **kwargs)
+setattr(os, {failure!r}, fail_once)
+
+recover = upload.UploadEngine._recover
+def observe_recovery(self, uid, metadata):
+    live = self.uploads[uid]
+    descriptors = (live.fd, live.parent_fd)
+    result = recover(self, uid, metadata)
+    closed = []
+    for fd in descriptors:
+        try:
+            os.fstat(fd)
+        except OSError as exc:
+            closed.append(exc.errno == errno.EBADF)
+        else:
+            closed.append(False)
+    Path({str(descriptor_state)!r}).write_text(json.dumps(closed))
+    return result
+upload.UploadEngine._recover = observe_recovery
+raise SystemExit(main())
+"""
+    original_popen = os_env.subprocess.Popen
+
+    def spawn(argv, **kwargs):
+        assert argv[1:4] == ["-P", "-m", "omnigent.inner.os_env"]
+        return original_popen([*argv[:2], "-c", script, *argv[4:]], **kwargs)
+
+    monkeypatch.setattr(os_env.subprocess, "Popen", spawn)
+    manager = client._transport.app.state.workspace_uploads
+    created = await create(client)
+    uid = created.json()["upload_id"]
+    url = BASE + "/" + uid + "?created_by=alice"
+    assert (await client.patch(url, headers=HEADERS, content=b"\x00\xffx")).status_code == 204
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    process = helper._proc
+    assert process is not None
+    first = await client.post(url.replace("?", "/complete?"))
+    assert first.status_code == 500
+    assert first.json()["error"]["code"] == "io_error"
+    published = tmp_path / "workspace" / "payload.bin"
+    assert published.read_bytes() == b"\x00\xffx"
+    recovered = await client.post(url.replace("?", "/complete?"))
+    assert recovered.status_code == 200
+    assert recovered.json()["outcome"] == "created"
+    assert json.loads(descriptor_state.read_text()) == [True, True]
+    assert helper._proc is process and process.poll() is None
+    assert (await client.post(url.replace("?", "/complete?"))).json() == recovered.json()
+    await manager.sweep(now=manager.records[uid].created_at + manager.limits.max_age_s + 1)
+    assert uid not in manager.records
+    assert uid not in manager.upload_locks
+    assert uid not in json.loads(manager.state_path.read_text())
+    assert (await client.head(url)).status_code == 410
+    assert published.read_bytes() == b"\x00\xffx"
+    assert helper._proc is process and process.poll() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fields, code",
+    [
+        ({"created_by": "x" * 70000}, "invalid_request"),
+        ({"created_by": "é" * 129}, "invalid_request"),
+        ({"dir": "x" * 4097}, "invalid_request"),
+        ({"dir": "é" * 2049}, "invalid_request"),
+        ({"name": "x" * 256}, "invalid_name"),
+        ({"name": "é" * 128}, "invalid_name"),
+    ],
+    ids=["owner-frame", "owner-utf8", "dir-ascii", "dir-utf8", "name-ascii", "name-utf8"],
+)
+async def test_oversized_declaration_preserves_shared_helper(
+    client: httpx.AsyncClient, fields: dict[str, str], code: str
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    existing = await create(client)
+    uid = existing.json()["upload_id"]
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    process = helper._proc
+    assert process is not None
+    rejected = await create(client, **fields)
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == code
+    assert helper._proc is process and process.poll() is None
+    assert list(manager.records) == [uid]
+    assert (
+        await client.patch(BASE + "/" + uid + "?created_by=alice", headers=HEADERS, content=b"abc")
+    ).status_code == 204
+    boundary = await create(client, name="é" * 127 + "x", created_by="é" * 128, size=0)
+    assert boundary.status_code == 201
+
+
+@pytest.mark.asyncio
 async def test_startup_recovers_publish_before_receipt(
     client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

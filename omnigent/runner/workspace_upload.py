@@ -32,7 +32,7 @@ from typing import TypeVar, cast
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.environment_filesystem import InvalidPath, ResourceError
@@ -117,6 +117,14 @@ class UploadDeclaration(BaseModel):
     on_conflict: str = "fail"
     sha256: str | None = None
     created_by: str = Field(min_length=1)
+
+    @field_validator("dir", "created_by")
+    @classmethod
+    def bounded_text(cls, value: str, info: ValidationInfo) -> str:
+        limit = 4096 if info.field_name == "dir" else 256
+        if len(value.encode("utf-8")) > limit:
+            raise ValueError("Upload field exceeds byte limit")
+        return value
 
 
 class RouteError(Exception):

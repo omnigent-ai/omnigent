@@ -570,3 +570,20 @@ def test_engine_publishes_empty_upload(helper: UploadHelperClient, tmp_path: Pat
         assert (tmp_path / "empty").exists()
     finally:
         engine.close()
+
+
+@pytest.mark.parametrize("oversized", ["metadata", "raw"])
+def test_unsent_invalid_frame_preserves_helper(helper: UploadHelperClient, oversized: str) -> None:
+    assert "error" not in begin(helper)
+    process = helper._proc
+    assert process is not None
+    metadata = {"op": "status", "id": UID}
+    raw = b""
+    if oversized == "metadata":
+        metadata["created_by"] = "x" * 70000
+    else:
+        raw = b"x" * (16 * 1024 * 1024 + 1)
+    rejected = helper.call(metadata, raw)
+    assert rejected["code"] == "invalid_request"
+    assert helper._proc is process and process.poll() is None
+    assert helper.call({"op": "append", "id": UID, "offset": 0}, b"abc")["offset"] == 3
