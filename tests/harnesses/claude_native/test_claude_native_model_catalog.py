@@ -950,16 +950,44 @@ async def test_launch_catalog_reprobes_when_the_ambient_credential_changes(
 async def test_catalog_asks_the_managed_settings_gateway_over_the_shell_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Managed settings win at Claude Code's launch, so their gateway is the one asked."""
+    """Managed settings win at Claude Code's launch: their gateway is asked, with their key."""
     managed = tmp_path / "managed-settings.json"
     managed.write_text(
-        json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://managed.gateway.example"}})
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://managed.gateway.example",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-managed",
+                }
+            }
+        )
     )
     requests = _ambient_gateway(
-        monkeypatch, _lists("anthropic/claude-sonnet-5"), url="http://shell.gateway.example"
+        monkeypatch,
+        _lists("anthropic/claude-sonnet-5"),
+        url="http://shell.gateway.example",
+        env={"ANTHROPIC_AUTH_TOKEN": "sk-shell"},
     )
     monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed,))
     _stub_picker(monkeypatch, _PASSTHROUGH_PICKER, default="claude-opus-5-5[1m]")
 
     assert await claude_native.claude_model_catalog(None) == []
-    assert [request.url.host for request in requests] == ["managed.gateway.example"]
+    (request,) = requests
+    assert request.url.host == "managed.gateway.example"
+    assert request.headers["authorization"] == "Bearer sk-managed"
+
+
+async def test_catalog_sends_an_api_key_only_credential_as_x_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``ANTHROPIC_API_KEY`` alone authenticates the listing the way Claude Code does."""
+    requests = _ambient_gateway(monkeypatch, _litellm_listing, env={"ANTHROPIC_API_KEY": "sk-api"})
+    _stub_picker(monkeypatch, _PASSTHROUGH_PICKER, default="claude-opus-5-5[1m]")
+
+    rows = await claude_native.claude_model_catalog(None)
+
+    assert rows is not None
+    assert [row["id"] for row in rows] == _PASSTHROUGH_ROWS
+    (request,) = requests
+    assert request.headers["x-api-key"] == "sk-api"
+    assert "authorization" not in request.headers
