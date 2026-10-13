@@ -15,7 +15,6 @@ from omnigent.policies.builtins._shell import split_command_segments
         ('echo "(one){two}"; echo three', ['echo "(one){two}"', "echo three"]),
         ("echo one & echo two", ["echo one", "echo two"]),
         ("echo one\necho two", ["echo one", "echo two"]),
-        ("echo $(echo one)", ["echo", "echo one"]),
     ],
 )
 def test_split_command_segments(command: str, expected: list[str]) -> None:
@@ -70,10 +69,16 @@ def test_braces_require_word_boundaries(command: str, expected: list[str]) -> No
         "cat <<'DATA'\nplain text\nDATA",
         "cat <<-DATA\n\tplain text\n\tDATA",
         "cat <<<text",
+        "echo $(echo one)",
+        'echo "$(echo one)"',
+        "echo `echo one`",
+        'echo "`echo one`"',
+        "echo $'text'",
+        'echo $"text"',
     ],
 )
 def test_unsupported_shell_syntax_requires_approval(command: str) -> None:
-    with pytest.raises(ValueError, match="require approval"):
+    with pytest.raises(ValueError, match=r"requires? approval"):
         split_command_segments(command)
 
 
@@ -86,7 +91,19 @@ def test_unsupported_shell_syntax_requires_approval(command: str) -> None:
         "echo word#suffix",
         'echo "<<DATA"',
         "echo 'line\\\nbreak'",
+        "echo '$(text)'",
+        "echo '`text`'",
+        r'echo "\$(text)"',
+        r"echo \`text\`",
     ],
 )
 def test_literal_comment_and_redirection_characters_remain_arguments(command: str) -> None:
     assert split_command_segments(command) == [command]
+
+
+@pytest.mark.parametrize("opening,closing", [("$(", ")"), ("`", "`")])
+def test_literal_substitution_delimiters_preserve_command_boundaries(
+    opening: str, closing: str
+) -> None:
+    first, last = f"echo '{opening}'", f"echo '{closing}'"
+    assert split_command_segments(f"{first}; echo middle; {last}") == [first, "echo middle", last]

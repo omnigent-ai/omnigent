@@ -460,6 +460,12 @@ def test_untokenizable_gated_segment_surfaces_action() -> None:
         "cat <<DATA\ntoday's status\nDATA\necho done",
         "sh -c 'echo ready # status'",
         "echo \\\nready",
+        "echo $(echo ready)",
+        'echo "$(echo ready)"',
+        "echo `echo ready`",
+        'echo "`echo ready`"',
+        "echo $'text'",
+        'echo $"text"',
     ],
 )
 @pytest.mark.parametrize("action,expected", [("deny", "DENY"), ("ask", "ASK")])
@@ -468,6 +474,11 @@ def test_unsupported_shell_syntax_takes_configured_action(
 ) -> None:
     policy = block_working_dir_changes(action=action)
     assert _action(policy(_sh(command))) == expected
+
+
+@pytest.mark.parametrize("command", ["echo '$(text)'", "echo '`text`'", r'echo "\$(text)"'])
+def test_literal_substitution_text_abstains(command: str) -> None:
+    assert block_working_dir_changes()(_sh(command)) is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════

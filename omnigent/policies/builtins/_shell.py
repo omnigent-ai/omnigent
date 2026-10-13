@@ -200,69 +200,9 @@ def is_shell_interpreter(tokens: list[str]) -> bool:
     return bool(tokens) and tokens[0].rsplit("/", 1)[-1] in SHELL_INTERPRETERS
 
 
-def _extract_command_substitutions(command: str) -> tuple[str, list[str]]:
-    """
-    Pull ``$(...)`` and backtick command-substitution bodies out of a command.
-
-    A substitution body is itself a command the shell *runs* — its output is
-    interpolated — so ``x=$(git push <url>)`` executes the push even though the
-    outer token looks like a plain env-assignment that
-    :func:`real_invocation_tokens` would skip. To gate it, the body must be
-    parsed as a command in its own right (GHSA-7mqg-cx4g-x2rf).
-
-    :param command: The raw shell command string.
-    :returns: ``(outer, bodies)`` — *outer* is *command* with each substitution
-        replaced by a space (so the residue, e.g. ``x=``, parses harmlessly),
-        and *bodies* is the list of inner command strings to parse separately.
-        ``$(...)`` is matched with balanced-paren scanning so nested
-        substitutions are captured whole; backticks are treated as non-nesting.
-    """
-    bodies: list[str] = []
-    out: list[str] = []
-    i, n = 0, len(command)
-    while i < n:
-        ch = command[i]
-        if ch == "$" and i + 1 < n and command[i + 1] == "(":
-            depth, j = 1, i + 2
-            while j < n and depth > 0:
-                if command[j] == "(":
-                    depth += 1
-                elif command[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            bodies.append(command[i + 2 : j])
-            out.append(" ")
-            i = j + 1
-            continue
-        if ch == "`":
-            j = command.find("`", i + 1)
-            if j == -1:
-                out.append(ch)
-                i += 1
-                continue
-            bodies.append(command[i + 1 : j])
-            out.append(" ")
-            i = j + 1
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out), bodies
-
-
 def split_command_segments(command: str) -> list[str]:
     """Separate commands, raising ValueError for unsupported shell syntax."""
-    # Validate before extracting substitutions, whose delimiters may occur in
-    # unsupported syntax without representing commands.
-    segments = _split_unquoted_operators(command)
-    outer, bodies = _extract_command_substitutions(command)
-    if bodies:
-        segments = _split_unquoted_operators(outer)
-    segments = [seg.strip() for seg in segments if seg.strip()]
-    for body in bodies:
-        segments.extend(split_command_segments(body))
-    return segments
+    return [seg.strip() for seg in _split_unquoted_operators(command) if seg.strip()]
 
 
 _SEGMENT_OPERATOR_CHARS: frozenset[str] = frozenset(";|&\n()")
@@ -288,6 +228,10 @@ def _split_unquoted_operators(command: str) -> list[str]:
             at_word_start = False
             i += 2
             continue
+        elif ch == "`" or command[i : i + 2] == "$(":
+            raise ValueError("Shell command substitutions require approval")
+        elif not in_double and command[i : i + 2] in ("$'", '$"'):
+            raise ValueError("Shell extended quoting requires approval")
         elif in_double:
             if ch == '"':
                 in_double = False
