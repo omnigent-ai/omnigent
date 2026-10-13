@@ -3313,6 +3313,14 @@ def create_app(
     )
     from omnigent.server.routes.sandbox_inference import create_sandbox_inference_router
     from omnigent.server.routes.sandbox_profiles import create_sandbox_profiles_router
+    from omnigent.server.routes.teams import create_teams_router
+    from omnigent.team_providers import load_team_provider
+
+    app.include_router(
+        create_teams_router(provider=load_team_provider(), auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["teams"],
+    )
 
     app.include_router(
         create_sandbox_profiles_router(

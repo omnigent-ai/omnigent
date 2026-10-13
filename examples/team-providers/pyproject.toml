@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnigent-team-providers"
+version = "0.1.0"
+description = "Read-only Okta and Google Groups provider examples for Omnigent"
+requires-python = ">=3.12"
+dependencies = ["omnigent>=0.18.0.dev0,<1", "httpx>=0.27,<1"]
+
+[project.entry-points."omnigent.team_providers"]
+okta = "omnigent_team_providers:OktaTeamProvider"
+google = "omnigent_team_providers:GoogleTeamProvider"
+
+[tool.setuptools.packages.find]
+where = ["src"]
