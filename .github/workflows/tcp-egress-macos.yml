@@ -1,0 +1,57 @@
+name: TCP egress macOS
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - '.github/workflows/tcp-egress-macos.yml'
+      - 'omnigent/inner/**'
+      - 'omnigent/spec/**'
+      - 'tests/inner/sandbox/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/tcp-egress-macos.yml'
+      - 'omnigent/inner/**'
+      - 'omnigent/spec/**'
+      - 'tests/inner/sandbox/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tcp-egress-macos-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
+  seatbelt:
+    name: TCP egress (macOS Seatbelt)
+    needs: gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      OMNIGENT_SKIP_WEB_UI: "true"
+      UV_INDEX_URL: https://pypi.org/simple
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version-file: ".python-version"
+      - uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+      - name: Install sandbox test dependencies
+        run: |
+          test -x /usr/bin/sandbox-exec
+          command -v tmux || brew install tmux
+          uv sync --locked --extra all --group test
+      - name: Test TCP and Git SSH through Seatbelt
+        run: |
+          uv run --no-sync pytest -q \
+            tests/inner/sandbox/test_tcp_egress.py \
+            tests/inner/sandbox/test_git_ssh_e2e.py \
+            --timeout=90
