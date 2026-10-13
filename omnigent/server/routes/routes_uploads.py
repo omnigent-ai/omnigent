@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
+import itertools
 import ntpath
 import random
 import re
@@ -10,6 +12,7 @@ import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import quote
@@ -23,6 +26,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from omnigent.entities import Conversation
 from omnigent.entities.environment_filesystem import InvalidPath
 from omnigent.errors import ErrorCode, OmnigentError
+
+# Reuse the helper's validation and finalize budget so both boundaries agree.
 from omnigent.inner.os_env_upload import operation_timeout, valid_name
 from omnigent.runner.environment_filesystem import _validate_path
 from omnigent.runner.routing import RunnerRouter
@@ -44,6 +49,7 @@ from omnigent.stores import ConversationStore
 CREATE_BODY_MAX_BYTES = 32 * 1024
 INFLIGHT_CHUNK_MAX_BYTES = 64 * 1024**2
 FINALIZE_RELAY_MARGIN_S = 5
+EXPIRY_CLEANUP_LIMIT = 64
 
 
 class UploadDeclaration(BaseModel):
@@ -197,17 +203,87 @@ class UploadRecord:
         )
 
 
+UploadKey = tuple[str, str, str]
+
+
+@dataclass
+class SessionAdmission:
+    keys: set[UploadKey] = field(default_factory=set)
+    size: int = 0
+
+
 @dataclass
 class UploadIndex:
     # The index belongs to one application's router, never another workspace.
-    records: dict[tuple[str, str, str], UploadRecord] = field(default_factory=dict)
+    records: dict[UploadKey, UploadRecord] = field(default_factory=dict)
+    sessions: dict[str, SessionAdmission] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    expiry_lock: threading.Lock = field(default_factory=threading.Lock)
+    expirations: list[tuple[float, int, UploadKey, UploadRecord]] = field(default_factory=list)
+    sequence: itertools.count = field(default_factory=itertools.count)
 
-    def prune(self) -> None:
+    def schedule(self, key: UploadKey, record: UploadRecord) -> None:
+        deadline = min(
+            record.created_at + record.max_age_s, record.last_activity + record.idle_ttl_s
+        )
+        with self.expiry_lock:
+            heapq.heappush(self.expirations, (deadline, next(self.sequence), key, record))
+
+    def add(self, key: UploadKey, record: UploadRecord) -> None:
+        self.remove(key)
+        self.records[key] = record
+        if not record.finished:
+            admission = self.sessions.setdefault(key[0], SessionAdmission())
+            admission.keys.add(key)
+            admission.size += record.size
+        self.schedule(key, record)
+
+    def remove(self, key: UploadKey) -> None:
+        record = self.records.pop(key, None)
+        if record is not None and not record.finished:
+            self.release(key, record)
+
+    def release(self, key: UploadKey, record: UploadRecord) -> None:
+        admission = self.sessions.get(key[0])
+        if admission is None or key not in admission.keys:
+            return
+        admission.keys.remove(key)
+        admission.size -= record.size
+        if not admission.keys:
+            del self.sessions[key[0]]
+
+    def finish(self, key: UploadKey, record: UploadRecord, *, aborted: bool = False) -> bool:
+        if record.finished:
+            return False
+        self.release(key, record)
+        record.finished = True
+        record.aborted = aborted
+        return True
+
+    def prune(self, session_id: str | None = None) -> None:
         now = time.monotonic()
-        for key, record in list(self.records.items()):
-            if record.expired(now):
-                del self.records[key]
+        for _ in range(EXPIRY_CLEANUP_LIMIT):
+            with self.expiry_lock:
+                if not self.expirations or self.expirations[0][0] > now:
+                    break
+                _, _, key, record = heapq.heappop(self.expirations)
+            with self.lock:
+                if self.records.get(key) is not record:
+                    continue
+                if record.expired(now):
+                    self.remove(key)
+                    continue
+                deadline_record = record
+            self.schedule(key, deadline_record)
+        if session_id is not None:
+            with self.lock:
+                admission = self.sessions.get(session_id)
+                keys = tuple(admission.keys) if admission is not None else ()
+            for key in keys:
+                with self.lock:
+                    record = self.records.get(key)
+                    if record is not None and record.expired(now):
+                        self.remove(key)
 
 
 def _limits(runner: dict[str, Any] | None = None) -> PublicLimits:
@@ -377,22 +453,43 @@ def register_upload_routes(
         except HTTPException as exc:
             raise OmnigentError("Trusted Origin required", code=ErrorCode.FORBIDDEN) from exc
 
-    async def runner_client(request: Request, conv: Conversation) -> httpx.AsyncClient:
+    async def classify(
+        conv: Conversation, *, allow_unavailable: bool = False
+    ) -> httpx.AsyncClient | None:
+        try:
+            return await _get_runner_client_for_resource_access(conv.id, conversation=conv)
+        except OmnigentError as exc:
+            if allow_unavailable and exc.code in (
+                ErrorCode.RUNNER_UNAVAILABLE,
+                ErrorCode.CONFLICT,
+            ):
+                return None
+            if exc.code in _MESSAGES:
+                raise UploadError(exc.code) from exc
+            if exc.code == ErrorCode.CONFLICT:
+                raise UploadError(ErrorCode.RUNNER_UNAVAILABLE) from exc
+            raise OmnigentError("Session runner cannot serve this request", code=exc.code) from exc
+
+    async def runner_client(request: Request, conv: Conversation) -> tuple[httpx.AsyncClient, Any]:
+        client = await classify(conv)
+        routing = runner_router or get_server_runner_router()
+        if client is None or routing is None:
+            raise UploadError(ErrorCode.RUNNER_UNAVAILABLE)
+        routed = routing.client_for_session_resources(conv.id, conversation=conv)
         registry = getattr(request.app.state, "tunnel_registry", None)
-        tunnel = registry.get(conv.runner_id) if registry is not None and conv.runner_id else None
+        tunnel = registry.get(routed.runner_id) if registry is not None else None
         if tunnel is None:
             raise UploadError(ErrorCode.RUNNER_UNAVAILABLE)
-        if WORKSPACE_UPLOAD_CAPABILITY not in tunnel.hello.capabilities:
+        if (
+            client is not routed.client
+            or WORKSPACE_UPLOAD_CAPABILITY not in tunnel.hello.capabilities
+        ):
             raise UploadError(ErrorCode.RUNNER_CAPABILITY_MISMATCH)
-        client = await _get_runner_client_for_resource_access(conv.id, conversation=conv)
-        if client is None:
-            raise UploadError(ErrorCode.RUNNER_UNAVAILABLE)
-        return client
+        return client, tunnel
 
-    async def capability(
-        request: Request, conv: Conversation, environment_id: str
-    ) -> tuple[httpx.AsyncClient, UploadCapability]:
-        client = await runner_client(request, conv)
+    async def probe_capability(
+        client: httpx.AsyncClient, conv: Conversation, environment_id: str
+    ) -> dict[str, Any]:
         response = await _relay(
             client,
             "GET",
@@ -401,14 +498,50 @@ def register_upload_routes(
         )
         try:
             payload = response.json()
-            supported = payload["supported"] is True
-            limits = _limits(payload["limits"])
+            if not isinstance(payload["supported"], bool) or not isinstance(
+                payload["limits"], dict
+            ):
+                raise ValueError("Invalid capability")
+            return payload
         except (ValueError, KeyError, TypeError) as exc:
             raise UploadError(ErrorCode.UPLOAD_RELAY_FAILED) from exc
+
+    async def capability(
+        request: Request, conv: Conversation, environment_id: str
+    ) -> tuple[httpx.AsyncClient, UploadCapability]:
+        client, tunnel = await runner_client(request, conv)
+        # Connection-owned futures also coalesce requests from different loops.
+        key = (conv.id, environment_id)
+        with index.lock:
+            cache = getattr(tunnel, "workspace_upload_capabilities", None)
+            if cache is None:
+                cache = {}
+                tunnel.workspace_upload_capabilities = cache
+            future = cache.get(key)
+            leader = future is None
+            if leader:
+                future = Future()
+                cache[key] = future
+        if leader:
+            try:
+                payload = await probe_capability(client, conv, environment_id)
+            except (OmnigentError, asyncio.CancelledError) as exc:
+                future.set_exception(
+                    exc
+                    if isinstance(exc, OmnigentError)
+                    else UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
+                )
+                with index.lock:
+                    cache.pop(key, None)
+                raise
+            future.set_result(payload)
+        else:
+            payload = await asyncio.shield(asyncio.wrap_future(future))
+        supported = payload["supported"] is True
         return client, UploadCapability(
             supported=supported,
             reason=None if supported else "runner_capability_mismatch",
-            limits=limits,
+            limits=_limits(payload["limits"]),
         )
 
     @uploads.get(base, response_model=UploadCapability, response_model_exclude_none=True)
@@ -466,14 +599,18 @@ def register_upload_routes(
                 raise UploadError(ErrorCode.INVALID_NAME)
         except UnicodeEncodeError as exc:
             raise UploadError(ErrorCode.INVALID_NAME) from exc
-        _, conv = await ensure_runner_connected(
-            session_id=session_id,
-            conv=conv,
-            app_state=request.app.state,
-            conversation_store=conversation_store,
-            runner_router=runner_router or get_server_runner_router(),
-            raise_host_refusal=True,
-        )
+        await classify(conv, allow_unavailable=True)
+        try:
+            _, conv = await ensure_runner_connected(
+                session_id=session_id,
+                conv=conv,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+                runner_router=runner_router or get_server_runner_router(),
+                raise_host_refusal=True,
+            )
+        except OmnigentError as exc:
+            raise OmnigentError("Session runner could not connect", code=exc.code) from exc
         client, cap = await capability(request, conv, environment_id)
         if not cap.supported:
             raise UploadError(ErrorCode.RUNNER_CAPABILITY_MISMATCH)
@@ -491,17 +628,15 @@ def register_upload_routes(
             conv.runner_id,
         )
         pending = (session_id, environment_id, uuid.uuid4().hex)
+        index.prune(session_id)
         with index.lock:
-            index.prune()
-            opened = [
-                r for key, r in index.records.items() if key[0] == session_id and not r.finished
-            ]
+            admission = index.sessions.get(session_id, SessionAdmission())
             if (
-                len(opened) >= cap.limits.max_open_uploads
-                or sum(r.size for r in opened) + declaration.size > cap.limits.max_open_bytes
+                len(admission.keys) >= cap.limits.max_open_uploads
+                or admission.size + declaration.size > cap.limits.max_open_bytes
             ):
                 raise UploadError(ErrorCode.UPLOAD_LIMIT, {"Retry-After": "60"})
-            index.records[pending] = record
+            index.add(pending, record)
         try:
             response = await _relay(
                 client,
@@ -513,15 +648,13 @@ def register_upload_routes(
             result: CreatedUpload = _json_model(response, CreatedUpload)
             if not re.fullmatch(r"[0-9a-f]{32}", result.upload_id) or result.offset != 0:
                 raise UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
-        except UploadError as exc:
-            # Ambiguous relays retain admission until expiry; creation may have reached disk.
-            if exc.http_status < 500 or exc.code == ErrorCode.NO_SPACE:
-                with index.lock:
-                    index.records.pop(pending, None)
-            raise
-        with index.lock:
-            index.records.pop(pending)
-            index.records[(session_id, environment_id, result.upload_id)] = record
+            with index.lock:
+                index.remove(pending)
+                index.add((session_id, environment_id, result.upload_id), record)
+        finally:
+            # The runner accounts for creates whose acknowledgement was lost.
+            with index.lock:
+                index.remove(pending)
         result.chunk_bytes = cap.limits.chunk.initial
         result.expires_at = min(
             result.expires_at, time.time() + min(record.idle_ttl_s, record.max_age_s)
@@ -534,6 +667,7 @@ def register_upload_routes(
         conv, owner = await authorize(request, session_id)
         if request.method not in ("GET", "HEAD"):
             trusted_origin(request)
+        await classify(conv, allow_unavailable=True)
         with index.lock:
             record = index.records.get((session_id, environment_id, upload_id))
             if record is None:
@@ -588,8 +722,12 @@ def register_upload_routes(
         reservation = record.limits.chunk.max + 1
         _chunk_admission.acquire(reservation)
         try:
-            body = await _read_capped(request, record.limits.chunk.max)
-            client = await runner_client(request, conv)
+            try:
+                async with asyncio.timeout(config.workspace_upload_chunk_timeout_s()):
+                    body = await _read_capped(request, record.limits.chunk.max)
+            except TimeoutError as exc:
+                raise UploadError(ErrorCode.UPLOAD_TIMEOUT) from exc
+            client, _ = await runner_client(request, conv)
             response = await _relay(
                 client,
                 "PATCH",
@@ -614,7 +752,7 @@ def register_upload_routes(
         request: Request, session_id: str, environment_id: str, upload_id: str
     ) -> Response:
         conv, owner, record = await owned(request, session_id, environment_id, upload_id)
-        client = await runner_client(request, conv)
+        client, _ = await runner_client(request, conv)
         response = await _relay(
             client,
             "HEAD",
@@ -642,7 +780,10 @@ def register_upload_routes(
         request: Request, session_id: str, environment_id: str, upload_id: str, abort: bool
     ) -> Response:
         conv, owner, record = await owned(request, session_id, environment_id, upload_id)
-        client = await runner_client(request, conv)
+        if not abort and request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+            raise UploadError(ErrorCode.PERMISSION_DENIED)
+        client, _ = await runner_client(request, conv)
+        key = (session_id, environment_id, upload_id)
         timeout = (
             max(
                 config.workspace_upload_finalize_timeout_s(),
@@ -661,7 +802,7 @@ def register_upload_routes(
         )
         if abort and response.status_code == 204:
             with index.lock:
-                record.finished = record.aborted = True
+                index.finish(key, record, aborted=True)
             return Response(status_code=204, headers={"Cache-Control": "no-store"})
         result: CompletedUpload = _json_model(response, CompletedUpload)
         try:
@@ -679,8 +820,8 @@ def register_upload_routes(
             raise UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
         touched(record)
         with index.lock:
-            record.finished = True
-        if not abort:
+            transitioned = index.finish(key, record)
+        if not abort and transitioned:
             _publish_changed_files_invalidated(session_id, environment_id)
         return JSONResponse(result.model_dump(), headers={"Cache-Control": "no-store"})
 
