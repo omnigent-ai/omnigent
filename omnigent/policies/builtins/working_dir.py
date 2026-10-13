@@ -162,13 +162,20 @@ def _classify_git(tokens: list[str], block_cd: bool, block_worktree: bool) -> _D
     """
     rest = tokens[1:]
     c_path: str | None = None
+    work_tree_path: str | None = None
     positionals: list[str] = []
     i = 0
     while i < len(rest):
         token = rest[i]
+        if token.startswith("--work-tree="):
+            work_tree_path = token.split("=", 1)[1]
+            i += 1
+            continue
         if token in _GIT_VALUE_OPTS and i + 1 < len(rest):
             if token == "-C":
                 c_path = rest[i + 1]
+            elif token == "--work-tree":
+                work_tree_path = rest[i + 1]
             i += 2
             continue
         if token.startswith("-"):
@@ -184,6 +191,8 @@ def _classify_git(tokens: list[str], block_cd: bool, block_worktree: bool) -> _D
             return _DirOp(kind="worktree", target=None, detail=f"git worktree {action_word}")
     if block_cd and c_path is not None:
         return _DirOp(kind="cd", target=c_path, detail=f"git -C {c_path}")
+    if block_cd and work_tree_path is not None:
+        return _DirOp(kind="cd", target=work_tree_path, detail=f"git --work-tree {work_tree_path}")
     return None
 
 

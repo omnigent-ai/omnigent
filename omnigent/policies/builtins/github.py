@@ -555,6 +555,27 @@ def _classify_mcp_tool(canonical: str, use_verb_heuristic: bool) -> str:
 _GIT_READ_SUBCMDS: frozenset[str] = frozenset({"clone", "fetch", "pull", "ls-remote"})
 _GIT_WRITE_SUBCMDS: frozenset[str] = frozenset({"push"})
 
+# Global options may consume an operand before the subcommand.
+_GIT_GLOBAL_VALUE_OPTS: frozenset[str] = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--exec-path"}
+)
+
+
+def _git_subcommand_index(tokens: list[str]) -> int | None:
+    """Find the subcommand after global options and their operands."""
+    i = 1
+    while i < len(tokens):
+        token = tokens[i]
+        if token in _GIT_GLOBAL_VALUE_OPTS and i + 1 < len(tokens):
+            i += 2
+            continue
+        if token.startswith("-"):
+            i += 1
+            continue
+        return i
+    return None
+
+
 # gh top-level command groups → the set of actions under each that write.
 # Any action NOT listed here (and not an unknown group) is treated as a read.
 _GH_WRITE_ACTIONS: dict[str, frozenset[str]] = {
@@ -737,8 +758,11 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
     """
     if len(tokens) < 2:
         return None
-    sub = tokens[1]
-    args = tokens[2:]
+    idx = _git_subcommand_index(tokens)
+    if idx is None:
+        return None
+    sub = tokens[idx]
+    args = tokens[idx + 1 :]
     if sub in _GIT_READ_SUBCMDS:
         return _ShellOp(
             kind="read",
