@@ -31,6 +31,7 @@ from omnigent.server import server_config as config
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature
 from omnigent.server.routes._auth_helpers import get_user_id
+from omnigent.server.routes._content_type import _request_media_type
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import get_server_runner_router
 from omnigent.server.routes._sessions.helpers import (
@@ -437,10 +438,7 @@ def register_upload_routes(
     async def create(request: Request, session_id: str, environment_id: str) -> CreatedUpload:
         conv, owner = await authorize(request, session_id)
         trusted_origin(request)
-        if (
-            request.headers.get("content-type", "").split(";")[0].strip().lower()
-            != "application/json"
-        ):
+        if _request_media_type(request) != "application/json":
             raise UploadError(ErrorCode.UNSUPPORTED_MEDIA_TYPE)
         try:
             declaration = UploadDeclaration.model_validate_json(
@@ -542,9 +540,11 @@ def register_upload_routes(
                 raise UploadError(ErrorCode.NOT_FOUND)
             if record.owner != owner:
                 raise UploadError(ErrorCode.UPLOAD_OWNER_MISMATCH)
-            if record.expired(time.monotonic()) or record.aborted:
-                raise UploadError(ErrorCode.GONE)
-            if record.runner_id != conv.runner_id:
+            if (
+                record.expired(time.monotonic())
+                or record.aborted
+                or record.runner_id != conv.runner_id
+            ):
                 raise UploadError(ErrorCode.GONE)
         return conv, owner, record
 
@@ -579,10 +579,7 @@ def register_upload_routes(
         request: Request, session_id: str, environment_id: str, upload_id: str
     ) -> Response:
         conv, owner, record = await owned(request, session_id, environment_id, upload_id)
-        if (
-            request.headers.get("content-type", "").split(";")[0].strip().lower()
-            != "application/offset+octet-stream"
-        ):
+        if _request_media_type(request) != "application/offset+octet-stream":
             raise UploadError(ErrorCode.UNSUPPORTED_MEDIA_TYPE)
         raw_offset = request.headers.get("upload-offset", "")
         if not re.fullmatch(r"[0-9]+", raw_offset) or len(raw_offset) > 20:
