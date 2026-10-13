@@ -4042,3 +4042,27 @@ async def test_runner_listing_matches_the_host_reader(
     assert runner.status_code == 200, runner.text
     assert runner.json()["data"] == host.data
     assert runner.json()["has_more"] is host.has_more
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("view", ["filesystem", "search", "changes"])
+async def test_upload_staging_hidden(
+    client: httpx.AsyncClient, workspace: Path, app: FastAPI, view: str
+) -> None:
+    """Staging never appears in listings, index search or changed files."""
+    hidden = "model.3mf.omnigent-upload-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.part"
+    (workspace / hidden).write_bytes(b"partial")
+    (workspace / "model.3mf").write_bytes(b"visible")
+    app.state.filesystem_registry.record_change(hidden, "write", "conv_test")
+    app.state.filesystem_registry.record_change("model.3mf", "write", "conv_test")
+    visible = ["notes.part", "x.omnigent-upload-notanid.part", ".x.omnigent-upload-notanid.part"]
+    for name in visible:
+        (workspace / name).write_bytes(b"visible")
+        app.state.filesystem_registry.record_change(name, "write", "conv_test")
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    response = await client.get(base + "/" + view, params={"limit": 500, "q": "."})
+    assert response.status_code == 200
+    names = {e["name"] for e in response.json()["data"]}
+    assert "model.3mf" in names
+    assert hidden not in names
+    assert set(visible) <= names
