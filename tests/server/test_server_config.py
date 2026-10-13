@@ -849,3 +849,38 @@ def test_a_default_without_any_restriction_is_kept() -> None:
 
     assert curation.restrict_to_agent_names == ()
     assert curation.default_agent_name == "polly"
+
+
+@pytest.mark.parametrize(
+    "name,default",
+    [
+        ("max_file_bytes", 1024**3),
+        ("chunk_initial_bytes", 1024**2),
+        ("chunk_max_bytes", 8 * 1024**2),
+        ("max_files_per_batch", 100),
+        ("max_batch_bytes", 5 * 1024**3),
+        ("max_open_per_session", 16),
+        ("max_open_bytes_per_session", 5 * 1024**3),
+        ("parallel_files", 2),
+        ("chunk_timeout_s", 60),
+        ("finalize_timeout_s", 120),
+        ("staging_idle_ttl_s", 3600),
+        ("staging_max_age_s", 86400),
+    ],
+)
+def test_workspace_upload_settings(tmp_path, monkeypatch, name, default):
+    config = tmp_path / "upload.yaml"
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    key = "workspace_upload_" + name
+    setting = getattr(server_config_module, key)
+    config.write_text("{}\n")
+    assert setting() == default
+    config.write_text(f"{key}: 0\n")
+    assert setting() == default
+    config.write_text(f"{key}: invalid\n")
+    assert setting() == default
+    config.write_text(f"{key}: 7\n")
+    assert setting() == (256 * 1024 if name == "chunk_max_bytes" else 7)
+    if name == "chunk_max_bytes":
+        config.write_text(f"{key}: {64 * 1024**2}\n")
+        assert setting() == 16 * 1024**2
