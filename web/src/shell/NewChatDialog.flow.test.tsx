@@ -659,6 +659,7 @@ describe("NewChatLandingScreen create flow", () => {
     await waitForWorkspaceSeed();
     typeMessage("Use my remembered tools");
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "MCP services: 2 selected" })).toBeVisible();
     expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
     await act(async () => finish({ data: [{ id: "tracker", title: "Tracker", connected: true }] }));
     expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
@@ -670,35 +671,58 @@ describe("NewChatLandingScreen create flow", () => {
     expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
   });
 
-  it("keeps preferences on a catalog failure and allows retry, reconnect and remembering none", async () => {
-    writeLastMcpServices(["tracker"]);
-    vi.mocked(registryRequest).mockRejectedValueOnce(new Error("Catalog unavailable"));
-    renderLanding([], { enabled_connections: ["mcp"] });
-    await waitForWorkspaceSeed();
-    typeMessage("Use my tools");
-    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
-    fireEvent.click(screen.getByTestId("new-chat-landing-mcp-registry-chip"));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Catalog unavailable");
-    const service = { id: "tracker", title: "Tracker", auth: "oauth", connected: false };
-    vi.mocked(registryRequest).mockResolvedValue({ data: [service] });
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(await screen.findByRole("switch", { name: "Tracker" })).toBeChecked();
-    expect(
-      screen.getByRole("button", { name: "MCP services: 1 selected, 1 needs sign-in" }),
-    ).toBeVisible();
-    vi.mocked(authorizeRegistryService).mockResolvedValue();
-    vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, connected: true }] });
-    fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
-    await screen.findByText("Connected");
-    expect(readLastMcpServices()).toEqual(["tracker"]);
-    fireEvent.click(screen.getByRole("switch", { name: "Tracker" }));
-    expect(readLastMcpServices()).toEqual([]);
-    cleanup();
-    resetLandingDraft();
-    renderLanding([], { enabled_connections: ["mcp"] });
-    fireEvent.click(screen.getByTestId("new-chat-landing-mcp-registry-chip"));
-    expect(await screen.findByRole("switch", { name: "Tracker" })).not.toBeChecked();
-  });
+  it.each(["retry", "opt out"])(
+    "keeps preferences on a catalog failure and allows %s",
+    async (recovery) => {
+      writeLastMcpServices(["tracker"]);
+      vi.mocked(registryRequest).mockRejectedValue(new Error("Catalog unavailable"));
+      renderLanding([], { enabled_connections: ["mcp"] });
+      await waitForWorkspaceSeed();
+      typeMessage("Use my tools");
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.click(screen.getByTestId("new-chat-landing-mcp-registry-chip"));
+      expect(await screen.findByRole("alert")).toHaveTextContent("Catalog unavailable");
+      expect(readLastMcpServices()).toEqual(["tracker"]);
+      expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+      expect(screen.queryByText(/No longer available/)).toBeNull();
+      if (recovery === "opt out") {
+        fireEvent.click(screen.getByRole("switch", { name: "tracker" }));
+        expect(readLastMcpServices()).toEqual([]);
+        fireEvent.keyDown(document, { key: "Escape" });
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+        vi.mocked(authenticatedFetch).mockResolvedValue({
+          ok: true,
+          json: async () => ({ id: "conv_without_mcp" }),
+        } as Response);
+        fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+        await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+        expect(
+          JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
+        ).not.toHaveProperty("mcp_registry_services");
+        expect(authorizeRegistryService).not.toHaveBeenCalled();
+        return;
+      }
+      const service = { id: "tracker", title: "Tracker", auth: "oauth", connected: false };
+      vi.mocked(registryRequest).mockResolvedValue({ data: [service] });
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(await screen.findByRole("switch", { name: "Tracker" })).toBeChecked();
+      expect(
+        screen.getByRole("button", { name: "MCP services: 1 selected, 1 needs sign-in" }),
+      ).toBeVisible();
+      vi.mocked(authorizeRegistryService).mockResolvedValue();
+      vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, connected: true }] });
+      fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+      await screen.findByText("Connected");
+      expect(readLastMcpServices()).toEqual(["tracker"]);
+      fireEvent.click(screen.getByRole("switch", { name: "Tracker" }));
+      expect(readLastMcpServices()).toEqual([]);
+      cleanup();
+      resetLandingDraft();
+      renderLanding([], { enabled_connections: ["mcp"] });
+      fireEvent.click(screen.getByTestId("new-chat-landing-mcp-registry-chip"));
+      expect(await screen.findByRole("switch", { name: "Tracker" })).not.toBeChecked();
+    },
+  );
 
   it("keeps project placement on the provisional and rekeyed conversation", async () => {
     searchParams = new URLSearchParams("project=Alpha");

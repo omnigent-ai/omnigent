@@ -102,8 +102,11 @@ starts with none. Existing sessions keep their own selection.
 
 The live catalog filters unavailable IDs from new-session requests without
 clearing the stored preference. Launch waits for the catalog when selections are
-restored; a failed load offers **Retry**. A **needs sign-in** indicator calls out
-restored selections with expired connections. Use **Reconnect** or turn them off.
+restored; a failed load offers **Retry** and keeps saved selections removable by
+their service IDs. Turn them all off to launch without MCPs during an outage;
+only this explicit choice changes the saved preference. A **needs sign-in**
+indicator calls out restored selections with expired connections. Use
+**Reconnect** or turn them off.
 The picker and catalog requests stay disabled when the server does not advertise
 the `mcp` connection capability. Working-directory `.mcp.json` files are not read
 for automatic selection.

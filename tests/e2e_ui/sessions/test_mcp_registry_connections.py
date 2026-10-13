@@ -86,7 +86,7 @@ async def _drive_launch(
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         context = await browser.new_context(
-            viewport={"width": width, "height": 900},
+            viewport={"width": width, "height": 480 if managed else 900},
             color_scheme="dark" if managed else "light",
         )
         page = await context.new_page()
@@ -160,6 +160,16 @@ async def _drive_launch(
                                 "tools": ["search"],
                                 "connect_provider": "",
                             },
+                            *[
+                                {
+                                    "id": f"extra-{number}",
+                                    "title": f"Extra service {number}",
+                                    "auth": "none",
+                                    "connected": True,
+                                    "tools": [],
+                                }
+                                for number in range(24 if managed else 0)
+                            ],
                         ]
                     }
                 ),
@@ -205,6 +215,25 @@ async def _drive_launch(
                     )
                 await page.get_by_role("button", name="Connect workspace").click()
             await async_expect(toggle).to_be_checked()
+            if managed:
+                last_toggle = page.get_by_role("switch", name="Extra service 23", exact=True)
+                await last_toggle.click()
+                await async_expect(last_toggle).to_be_checked()
+                await async_expect(last_toggle).to_be_in_viewport(ratio=1)
+                await async_expect(toggle).not_to_be_in_viewport()
+                await async_expect(
+                    page.get_by_role("heading", name="Tools for this session")
+                ).to_be_in_viewport(ratio=1)
+                await async_expect(
+                    page.get_by_role("link", name="Manage MCP accounts")
+                ).to_be_in_viewport(ratio=1)
+                if directory := os.environ.get("E2E_SCREENSHOT_DIR"):
+                    await page.screenshot(
+                        path=Path(directory) / "mcp-picker-overflow.png", animations="disabled"
+                    )
+                await last_toggle.click()
+                await async_expect(last_toggle).not_to_be_checked()
+                await toggle.scroll_into_view_if_needed()
             if directory := os.environ.get("E2E_SCREENSHOT_DIR"):
                 await page.screenshot(
                     path=Path(directory)
@@ -225,6 +254,7 @@ async def _drive_launch(
                 await chip.click()
                 await async_expect(toggle).to_be_checked()
                 await toggle.click()
+                await async_expect(toggle).not_to_be_checked()
                 await page.reload()
                 await chip.click()
                 await async_expect(toggle).not_to_be_checked()

@@ -53,7 +53,7 @@ export function useMcpRegistrySelection(draft: string[] | undefined, enabled: bo
       ? catalog.loading
         ? "Loading MCP services…"
         : catalog.error
-          ? "Could not load MCP services. Open MCPs to retry."
+          ? "Could not load MCP services. Open MCPs to retry or turn them off."
           : null
       : null;
   return {

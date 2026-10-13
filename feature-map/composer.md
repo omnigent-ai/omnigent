@@ -100,6 +100,8 @@ and steers messages while the agent is busy.
   sandbox. Turning a service off keeps its account connected. Explicit selections
   are remembered for new sessions in this browser; an unsent draft takes precedence.
   Reload to verify both remembered selections and choosing none.
+  If the catalog fails, retry or turn off saved services by ID to launch without
+  MCPs. The error itself leaves preferences intact.
 - Turn on an unconnected OAuth service to open its sign-in popup. Complete sign-in
   to select it; for Databricks, first enter the workspace URL and choose
   **Connect workspace**. Bearer-token services require **Manage MCP accounts**
@@ -177,13 +179,15 @@ Other connection providers alone do not enable the managed MCP picker.
   expect the new session's pill to show it. See [sessions](./sessions.md).
 - **`managed-mcp-picker`, new-session composer:**
   `tests/e2e_ui/sessions/test_mcp_registry_connections.py::test_managed_mcp_selection_is_sent_with_launch`
-  covers desktop sandbox and mobile local-host launches. After launch, the same
-  cases use desktop agent info and mobile **Agent info** to select managed
+  covers desktop sandbox and mobile local-host launches, including a long catalog
+  in a short viewport with a reachable last row and visible heading and footer.
+  After launch, the same cases use desktop agent info and mobile **Agent info** to select managed
   services on a builtin agent and remove unavailable references after registry
   disablement, while custom MCP controls remain read-only. The module has four
   browser cases: these two launches, settings sign-in routing, and the
   Databricks sign-in launch below. Selection persistence,
-  launch gating during sign-in, and an absent picker without registry enablement
+  explicit opt-out during a persistent catalog failure, launch gating during
+  sign-in, and an absent picker without registry enablement
   are covered in `web/src/shell/NewChatDialog.flow.test.tsx`.
 - **`managed-mcp-sign-in`, new-session composer:**
   `tests/e2e_ui/sessions/test_mcp_registry_connections.py::test_databricks_connects_from_launch_picker`

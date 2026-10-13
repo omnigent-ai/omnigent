@@ -372,14 +372,13 @@ export function McpRegistryPicker({
           );
         })}
         {!loading &&
-          !error &&
           unavailable.map((id) => (
             <li key={id} className="px-3 py-1.5">
               <label className="flex items-center justify-between gap-3 text-sm">
                 <span className="min-w-0">
                   <span className="block truncate">{id}</span>
                   <span className="block text-xs text-muted-foreground">
-                    No longer available · turn off to remove
+                    {error ? "Could not load service" : "No longer available"} · turn off to remove
                   </span>
                 </span>
                 <Switch
