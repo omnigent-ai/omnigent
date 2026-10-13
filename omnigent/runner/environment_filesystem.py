@@ -41,6 +41,7 @@ from omnigent.inner.os_env import (
     _read_impl,
     _write_impl,
 )
+from omnigent.inner.os_env_upload import STAGING_SUFFIX_PATTERN, is_upload_staging
 from omnigent.inner.sandbox import (
     ReachableRoot,
     contained_realpath,
@@ -294,6 +295,8 @@ def search_indexed_paths(
     candidates: dict[str, bool] = {}  # path -> is a directory
     seen_dirs: set[str] = set()
     for p in paths:
+        if is_upload_staging(p):
+            continue
         if q not in p.lower():
             continue
         candidates.setdefault(p, False)
@@ -813,14 +816,16 @@ class CallerProcessFilesystem:
         # stdout cap, even when names are unusually long or need JSON escaping.
         _script = "\n".join(
             [
-                "import os, json",
+                "import os, json, re",
                 f"d = {_json.dumps(target)}",
                 f"prefix = {_json.dumps(prefix)}",
                 f"after = {after!r}",
                 f"before = {before!r}",
                 f"order = {_json.dumps(order)}",
                 f"limit = {limit}",
-                "names = sorted(os.listdir(d), reverse=order == 'desc')",
+                f"stage_pattern = re.compile({STAGING_SUFFIX_PATTERN!r})",
+                "names = sorted((n for n in os.listdir(d) if not",
+                "    stage_pattern.search(n)), reverse=order == 'desc')",
                 "def cursor_index(cursor):",
                 "    if cursor is None: return None",
                 "    if prefix:",
@@ -972,6 +977,7 @@ class CallerProcessFilesystem:
                 f"start = {_json.dumps(start)}",
                 f"budget = {_SEARCH_SCAN_BUDGET}",
                 f"depri = set({_json.dumps(list(_DEFAULT_DEPRIORITIZED_DIRS))})",
+                f"stage_pattern = re.compile({STAGING_SUFFIX_PATTERN!r})",
                 f"inc = [re.compile(p, re.IGNORECASE) for p in {_json.dumps(include_regexes)}]",
                 f"exc = [re.compile(p, re.IGNORECASE) for p in {_json.dumps(exclude_regexes)}]",
             ]
@@ -1011,6 +1017,8 @@ def match(dirpath, name, is_dir):
     # re-checking keeps the two entry kinds symmetric so a future refactor of
     # that pre-filter can't silently leak excluded dirs.
     p = rel(dirpath, name)
+    if stage_pattern.search(name):
+        return
     if exc and any(r.match(p) for r in exc):
         return
     if inc and not any(r.match(p) for r in inc):
