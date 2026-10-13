@@ -28,6 +28,10 @@ from collections.abc import AsyncIterator
 
 import httpx
 
+from omnigent.runner.transports.ws_tunnel.binary_requests import (
+    BINARY_REQUEST_BODY_CAPABILITY,
+    encode_binary_request,
+)
 from omnigent.runner.transports.ws_tunnel.frames import (
     RequestCancelFrame,
     RequestFrame,
@@ -37,6 +41,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
+from omnigent.server.server_config import runner_tunnel_binary_request_body
 
 # A session event sent to the runner: a user message, approval, or other input
 # that can start work there.
@@ -114,6 +119,13 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
     :param registry: The :class:`TunnelRegistry` that owns the runner's
         live WebSocket and reassembly state.
     :param runner_id: Which runner this transport routes to.
+
+    Set ``extensions={"runner_tunnel_binary_request_body": True}`` on an
+    httpx request to opt in. Capable runners receive raw bytes when the server
+    kill switch is enabled; otherwise the existing JSON encoding is used.
+    At most two opted-in requests are admitted per connection, including JSON
+    fallbacks. Excess callers get ``httpx.PoolTimeout`` and may retry after an
+    earlier response closes. Close every response to release its slot.
     """
 
     def __init__(self, registry: TunnelRegistry, runner_id: str) -> None:
@@ -144,40 +156,39 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             raise httpx.ConnectError(f"runner {self._runner_id!r} is offline")
 
         req_id = uuid.uuid4().hex
-        # Read the request body up front. Streaming request bodies
-        # would need a multi-frame send; v1 sends the whole body in
-        # the request frame because all our request bodies are
-        # tiny JSON.
-        body = await request.aread() if request.content else b""
-        content_type = request.headers.get("content-type", "application/json")
-        body_str, encoding = encode_body(body, content_type) if body else (None, "utf-8")
-
+        opted_in = request.extensions.get("runner_tunnel_binary_request_body") is True
         try:
             state = self._registry.open_request(
                 self._runner_id,
                 req_id,
                 generation=request.extensions.get("runner_tunnel_generation"),
+                binary_body=opted_in,
             )
         except KeyError as exc:
             raise httpx.ConnectError(f"runner {self._runner_id!r} is offline") from exc
         try:
-            await self._registry.send_text(
-                state.session,
-                encode_frame(
-                    RequestFrame(
-                        id=req_id,
-                        method=request.method,
-                        path=request.url.path,
-                        query_string=request.url.query.decode("utf-8"),
-                        headers=[[k, v] for k, v in request.headers.items()],
-                        body=body_str,
-                        encoding=encoding,
-                        # Best-effort hint for streaming responses;
-                        # not load-bearing on the runner side.
-                        stream=True,
-                    )
-                ),
+            body = await request.aread()
+            frame = RequestFrame(
+                id=req_id,
+                method=request.method,
+                path=request.url.path,
+                query_string=request.url.query.decode("utf-8"),
+                headers=[[k, v] for k, v in request.headers.items()],
+                stream=True,
             )
+            if (
+                opted_in
+                and BINARY_REQUEST_BODY_CAPABILITY in state.session.hello.capabilities
+                and runner_tunnel_binary_request_body()
+            ):
+                wire: str | bytes = encode_binary_request(frame, body)
+            else:
+                content_type = request.headers.get("content-type", "application/json")
+                frame.body, frame.encoding = (
+                    encode_body(body, content_type) if body else (None, "utf-8")
+                )
+                wire = encode_frame(frame)
+            await self._registry.send_request(state.session, wire, request_id=req_id)
             if request.method == "POST" and _SESSION_EVENTS_PATH.match(request.url.path):
                 self._registry.note_work_dispatched(self._runner_id)
             # Block until the response head arrives (or the tunnel
