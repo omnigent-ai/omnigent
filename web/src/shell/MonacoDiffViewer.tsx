@@ -87,6 +87,11 @@ interface MonacoDiffViewerProps {
   onSearchHandled?: () => void;
 }
 
+/** Warm the shared themes and grammar without mounting an editor or starting a diff. */
+export function prepareDiffEditor(lang: ReturnType<typeof detectLang>) {
+  return Promise.all([ensureMonacoReady(), ensureLanguage(lang)]);
+}
+
 /**
  * Render a file's before/after diff in Monaco, with the comment layer on the
  * modified side. Comments are gated on edit permission; the diff itself is
@@ -127,7 +132,7 @@ export function MonacoDiffViewer({
     // not-yet-registered grammar/theme — independent of any remount key.
     setReady(false);
     setLoadError(false);
-    void Promise.all([ensureMonacoReady(), ensureLanguage(lang)]).then(
+    void prepareDiffEditor(lang).then(
       () => {
         if (!cancelled) setReady(true);
       },

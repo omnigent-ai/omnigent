@@ -57,11 +57,15 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function renderDiff(conversationId: string | undefined, path: string | null) {
+function renderDiff(
+  conversationId: string | undefined,
+  path: string | null,
+  options: { requested?: boolean } = {},
+) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client: queryClient }, children);
-  return renderHook(() => useFileDiff(conversationId, path), { wrapper });
+  return renderHook(() => useFileDiff(conversationId, path, options), { wrapper });
 }
 
 describe("useFileDiff — enable gate", () => {
@@ -151,6 +155,40 @@ describe("useFileDiff — enable gate", () => {
     const { result } = renderDiff("conv_1", "a.ts");
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useFileDiff — requested diff before discovery", () => {
+  it("fetches a requested diff while the changed-files list is unresolved", async () => {
+    setHooks({ serveable: undefined });
+    fetchMock.mockResolvedValueOnce(mockResponse({ path: "a.ts", before: null, after: "new" }));
+    const { result } = renderDiff("conv_1", "a.ts", { requested: true });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { serveable: false, changedPaths: undefined },
+    { serveable: true, changedPaths: [] },
+    { serveable: true, changedPaths: ["other.ts"] },
+  ])("keeps offline and known-unchanged gates: %o", (state) => {
+    setHooks(state);
+    renderDiff("conv_1", "a.ts", { requested: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not retry a missing diff while discovery is pending", async () => {
+    setHooks({ serveable: true });
+    fetchMock.mockResolvedValue(mockResponse({}, { ok: false, status: 404 }));
+    const { result } = renderDiff("conv_1", "a.ts", { requested: true });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not request a diff for a client-only temporary session", () => {
+    setHooks({ serveable: true });
+    renderDiff("temp:pending", "a.ts", { requested: true });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

@@ -95,6 +95,7 @@ vi.mock("./CommentsPanel", () => ({
 }));
 
 vi.mock("./MonacoDiffViewer", () => ({
+  prepareDiffEditor: vi.fn(() => Promise.resolve()),
   // Surface the toggle-driven props as data attributes so tests can assert the
   // "⋯" menu wires wrap-lines / hide-whitespace through to the diff editor.
   MonacoDiffViewer: ({

@@ -114,10 +114,10 @@ import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
 import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
-// Monaco diff is heavy (~MBs + worker); load it only when the diff view is
-// actually shown.
+// Load the editor on diff intent, in parallel with the file requests.
+const loadMonacoDiffViewer = () => import("./MonacoDiffViewer");
 const MonacoDiffViewer = lazy(() =>
-  import("./MonacoDiffViewer").then((m) => ({ default: m.MonacoDiffViewer })),
+  loadMonacoDiffViewer().then((m) => ({ default: m.MonacoDiffViewer })),
 );
 
 // ---------------------------------------------------------------------------
@@ -401,7 +401,6 @@ function FileViewerBody({
   // (embedded in the desktop aside, never a fixed overlay).
   const keyboardInset = useIOSNativeKeyboardInset(!frameless && open);
   const fileQuery = useFileContent(conversationId, path);
-  const diffQuery = useFileDiff(conversationId, path);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
 
   // Build the navigable file list from all changed files (including deleted),
@@ -718,6 +717,20 @@ function FileViewerBody({
   const [diffActive, setDiffActive] = useState(
     () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
   );
+  const requestedDiff = open && isActiveViewport && diffActive && !isImage && !isPdf && !isModel;
+  // A saved preference also applies to unchanged files; only explicit links skip discovery.
+  const linkedDiff = requestedDiff && initialDiffRef.current;
+  const diffQuery = useFileDiff(conversationId, path, { requested: linkedDiff });
+  const prepareDiff =
+    requestedDiff && (isDiffAvailable || (linkedDiff && changedFiles.data === undefined));
+  useEffect(() => {
+    if (!prepareDiff) return;
+    void loadMonacoDiffViewer()
+      .then((m) => m.prepareDiffEditor(lang))
+      .catch(() => {
+        // The mounted viewer retries initialization and surfaces load errors.
+      });
+  }, [prepareDiff, lang]);
   const [diffLayout, setDiffLayout] = useState<"unified" | "split">(
     () => persistedPrefsRef.current.diffLayout,
   );
