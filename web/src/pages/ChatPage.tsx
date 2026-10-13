@@ -1084,13 +1084,14 @@ export function ChatPage() {
     else void reconnect();
   }, [isUnboundFork, canResumeOnLocalHost, reconnect]);
 
+  const newSessionProjectId =
+    activeConv?.project_id !== undefined ? activeConv.project_id : activeSession?.projectId;
+  const newSessionProjectLabel = (activeConv?.labels ?? activeSession?.labels)?.[PROJECT_LABEL_KEY];
   const openNewSession = useCallback(async () => {
-    const row = conversations?.find((conversation) => conversation.id === urlConvId);
-    const projectId = row?.project_id !== undefined ? row.project_id : activeSession?.projectId;
     try {
-      const projectName = projectId
-        ? (await getProject(projectId)).name
-        : (row?.labels ?? activeSession?.labels)?.[PROJECT_LABEL_KEY];
+      const projectName = newSessionProjectId
+        ? (await getProject(newSessionProjectId)).name
+        : newSessionProjectLabel;
       navigate(projectName ? `/?project=${encodeURIComponent(projectName)}` : "/");
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
@@ -1099,7 +1100,7 @@ export function ChatPage() {
       }
       toast.error("Couldn't open a new session in this project. Please try again.");
     }
-  }, [conversations, urlConvId, activeSession?.projectId, activeSession?.labels, navigate]);
+  }, [newSessionProjectId, newSessionProjectLabel, navigate]);
 
   // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
   // early return can't change the hook order between renders.

@@ -31,6 +31,10 @@ const BUILTIN_SLASH_COMMAND_LABELS: Readonly<Record<string, string>> = {
   "/new": "New session",
 };
 
+function builtinCommandLabel(name: string): string {
+  return BUILTIN_SLASH_COMMAND_LABELS[name] ?? name;
+}
+
 // First token must read as a command name (`/cross-review`,
 // `/dev-productivity:simplify`) — letters/digits then word chars, `:`, `-`.
 // The leading `/` is the only slash allowed IN THE NAME, so file paths like
@@ -147,9 +151,7 @@ export function rankedSlashCommandNames(
       slashCommandMatches(
         name,
         query,
-        builtinNames.has(name)
-          ? (BUILTIN_SLASH_COMMAND_LABELS[name] ?? labels[name])
-          : labels[name],
+        builtinNames.has(name) ? builtinCommandLabel(name) : labels[name],
       ),
     )
     .sort((a, b) => rank(a) - rank(b));
@@ -282,7 +284,7 @@ export function SlashCommandMenu({
   // visual = keyboard order.
   const rows: MenuRow[] = matchedNames.map((name, flatIndex) => ({
     name,
-    label: (builtinNames.has(name) && BUILTIN_SLASH_COMMAND_LABELS[name]) || name,
+    label: builtinNames.has(name) ? builtinCommandLabel(name) : name,
     description: commands[name] ?? "",
     flatIndex,
     isBuiltin: builtinNames.has(name),

@@ -41,7 +41,7 @@ def test_new_command_opens_landing_in_current_project(
         if project_kind == "snapshot":
             handle.contract.json("/v1/sessions", {"object": "list", "data": []})
         if project_kind == "partial":
-            row = handle._session()
+            row = handle.session_snapshot()
             row.pop("project_id", None)
             handle.contract.json("/v1/sessions", {"object": "list", "data": [row]})
         if project_kind == "id":
@@ -80,7 +80,7 @@ def test_new_command_opens_landing_in_current_project(
 def test_new_command_respects_unfiled_sidebar_row(page: Page, chat_session_contract) -> None:
     handle = chat_session_contract
     handle.update_session(project_id="old-project", labels={"omni_project": "Old project"})
-    row = {**handle._session(), "project_id": None, "labels": {}}
+    row = {**handle.session_snapshot(), "project_id": None, "labels": {}}
     handle.contract.json("/v1/sessions", {"object": "list", "data": [row]})
     handle.contract.json(f"/v1/hosts/{handle.host_id}/filesystem", {"path": "/", "entries": []})
     page.goto(handle.url)
