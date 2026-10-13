@@ -375,6 +375,7 @@ function FileViewerBody({
   // Capture URL params once on open — we don't want re-renders caused by our own
   // param writes to re-run the initialization logic.
   const initialDiffRef = useRef(searchParams.get("diff") === "1");
+  const linkedFileRef = useRef(initialDiffRef.current ? { conversationId, path } : null);
   const initialCommentIdRef = useRef(searchParams.get("comment"));
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
@@ -719,7 +720,10 @@ function FileViewerBody({
   );
   const requestedDiff = open && isActiveViewport && diffActive && !isImage && !isPdf && !isModel;
   // A saved preference also applies to unchanged files; only explicit links skip discovery.
-  const linkedDiff = requestedDiff && initialDiffRef.current;
+  const linkedDiff =
+    requestedDiff &&
+    linkedFileRef.current?.conversationId === conversationId &&
+    linkedFileRef.current?.path === path;
   const diffQuery = useFileDiff(conversationId, path, { requested: linkedDiff });
   const prepareDiff =
     requestedDiff && (isDiffAvailable || (linkedDiff && changedFiles.data === undefined));

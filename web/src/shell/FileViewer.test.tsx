@@ -15,7 +15,7 @@
 //      comments panel is open — never from merely opening the file.
 
 import { useMemo } from "react";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -184,6 +184,7 @@ import { useComments } from "@/hooks/useComments";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
+import { prepareDiffEditor } from "./MonacoDiffViewer";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
@@ -711,6 +712,33 @@ describe("FileViewer URL sync — diff param", () => {
     expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
     expect(screen.queryByTestId("code-viewer")).toBeNull();
   });
+
+  it("prepares a linked diff during discovery and scopes the early request to that file", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+      () => ({ data: undefined }) as ReturnType<typeof useWorkspaceChangedFiles>,
+      async () => {
+        const { rerender } = render(viewerTree({ open: true, initialSearch: "diff=1" }));
+        await waitFor(() => expect(prepareDiffEditor).toHaveBeenCalledWith("python"));
+        expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", "file1.py", { requested: true });
+        expect(screen.queryByTestId("diff-viewer")).toBeNull();
+
+        rerender(viewerTree({ open: true, path: "other.py", initialSearch: "diff=1" }));
+        expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", "other.py", { requested: false });
+      },
+    );
+  });
+
+  it.each(["image.png", "document.pdf", "model.stl"])(
+    "does not prepare a diff for %s even with an explicit link",
+    async (path) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({ open: true, path, initialSearch: "diff=1" });
+      await act(async () => {});
+      expect(prepareDiffEditor).not.toHaveBeenCalled();
+      expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", path, { requested: false });
+    },
+  );
 
   it("writes ?diff=1 to the URL when the diff toggle button is clicked", async () => {
     // Start with no URL params and diff inactive.

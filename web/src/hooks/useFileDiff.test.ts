@@ -16,9 +16,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceChangedFiles: vi.fn(),
   useWorkspaceServeable: vi.fn(),
+  useWorkspaceEnvironment: vi.fn(),
 }));
 
-import { useWorkspaceChangedFiles, useWorkspaceServeable } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  useWorkspaceChangedFiles,
+  useWorkspaceEnvironment,
+  useWorkspaceServeable,
+} from "@/hooks/useWorkspaceChangedFiles";
 import { useFileDiff } from "./useFileDiff";
 
 const serveableMock = vi.mocked(useWorkspaceServeable);
@@ -50,6 +55,9 @@ beforeEach(() => {
   fetchMock.mockReset();
   serveableMock.mockReset();
   changedFilesMock.mockReset();
+  vi.mocked(useWorkspaceEnvironment).mockReturnValue({ data: undefined } as ReturnType<
+    typeof useWorkspaceEnvironment
+  >);
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -177,13 +185,35 @@ describe("useFileDiff — requested diff before discovery", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("does not retry a missing diff while discovery is pending", async () => {
+  it("does not request a diff when the workspace environment is known unavailable", () => {
     setHooks({ serveable: true });
-    fetchMock.mockResolvedValue(mockResponse({}, { ok: false, status: 404 }));
-    const { result } = renderDiff("conv_1", "a.ts", { requested: true });
-    await waitFor(() => expect(result.current.isError).toBe(true));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    vi.mocked(useWorkspaceEnvironment).mockReturnValue({
+      data: { available: false },
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    renderDiff("conv_1", "a.ts", { requested: true });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it.each([false, true])(
+    "does not retry an early 404 when discovery resolves mid-request: %s",
+    async (discoveryResolves) => {
+      setHooks({ serveable: true });
+      let resolveResponse!: (response: Response) => void;
+      fetchMock.mockReturnValue(
+        new Promise<Response>((resolve) => {
+          resolveResponse = resolve;
+        }),
+      );
+      const { result, rerender } = renderDiff("conv_1", "a.ts", { requested: true });
+      if (discoveryResolves) {
+        setHooks({ serveable: true, changedPaths: ["a.ts"] });
+        rerender();
+      }
+      resolveResponse(mockResponse({}, { ok: false, status: 404 }));
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("does not request a diff for a client-only temporary session", () => {
     setHooks({ serveable: true });

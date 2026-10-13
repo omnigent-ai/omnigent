@@ -12,7 +12,11 @@
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
-import { useWorkspaceChangedFiles, useWorkspaceServeable } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  useWorkspaceChangedFiles,
+  useWorkspaceEnvironment,
+  useWorkspaceServeable,
+} from "@/hooks/useWorkspaceChangedFiles";
 
 // The primary workspace environment is always "default".
 const DEFAULT_ENVIRONMENT_ID = "default";
@@ -73,6 +77,7 @@ export function useFileDiff(
 ) {
   const serveable = useWorkspaceServeable(conversationId);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
+  const environment = useWorkspaceEnvironment(conversationId);
   const isInChangedFiles = changedFiles.data?.data.some((f) => f.path === path) ?? false;
 
   const requestedBeforeDiscovery = options.requested && changedFiles.data === undefined;
@@ -85,6 +90,7 @@ export function useFileDiff(
       !isTempConvId(conversationId) &&
       !!path &&
       serveable !== false &&
+      environment.data?.available !== false &&
       (isInChangedFiles || !!requestedBeforeDiscovery),
     // An old diff link may point to a now-unchanged file; don't retry its expected 404.
     ...(requestedBeforeDiscovery && {

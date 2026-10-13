@@ -347,7 +347,10 @@ def test_diff_loads_in_parallel_with_workspace_metadata(
     )
     page.set_viewport_size({"width": 1600, "height": 1000})
     try:
-        with page.expect_request(f"{environment_url}/diff/{path}", timeout=10_000):
+        with (
+            page.expect_request(environment_url, timeout=10_000),
+            page.expect_request(f"{environment_url}/diff/{path}", timeout=10_000),
+        ):
             page.goto(f"{base_url}/c/{session_id}?file={path}&diff=1")
         # The editor code can load while both API responses are still held.
         page.wait_for_function("() => !!window.MonacoEnvironment", timeout=10_000)
