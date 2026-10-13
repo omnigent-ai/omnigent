@@ -277,7 +277,7 @@ async def test_wire_decision_is_bound_to_connection_generation(
             get_session = registry.get
             # Model a reconnect after the transport snapshots capabilities.
             monkeypatch.setattr(registry, "get", lambda runner_id: old_session)
-            with pytest.raises(ConnectionError, match="changed before request"):
+            with pytest.raises(httpx.ConnectError, match="changed before request") as error:
                 await asyncio.wait_for(
                     client.patch(
                         "/upload",
@@ -286,6 +286,7 @@ async def test_wire_decision_is_bound_to_connection_generation(
                     ),
                     0.5,
                 )
+            assert error.value.request.url.path == "/upload"
             monkeypatch.setattr(registry, "get", get_session)
             assert not current.in_flight
             assert not current.binary_requests
@@ -303,6 +304,93 @@ async def test_wire_decision_is_bound_to_connection_generation(
             finally:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("capable", "enabled", "opted_in"),
+    [(True, True, False), (False, True, True), (True, False, True)],
+    ids=["not-opted-in", "old-runner-fallback", "kill-switch-fallback"],
+)
+async def test_json_request_uses_replacement_connection(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capable: bool,
+    enabled: bool,
+    opted_in: bool,
+) -> None:
+    (tmp_path / "config.yaml").write_text(
+        f"runner_tunnel_binary_request_body: {str(enabled).lower()}\n"
+    )
+    async with _tunnel([_CAPABILITY] if capable else []) as (client, ws, registry):
+        old_session = registry.get(_RUNNER)
+        assert old_session is not None
+        async with connect(
+            f"ws://127.0.0.1:{ws.remote_address[1]}/v1/runners/{_RUNNER}/tunnel"
+        ) as replacement:
+            await replacement.send(encode_frame(HelloFrame("replacement", 1)))
+            async with asyncio.timeout(2):
+                while registry.get(_RUNNER) is old_session:
+                    await asyncio.sleep(0.01)
+            current = registry.get(_RUNNER)
+            assert current is not None
+            # Model a reconnect after the transport snapshots capabilities.
+            monkeypatch.setattr(registry, "get", lambda runner_id: old_session)
+            task = asyncio.create_task(
+                client.patch(
+                    "/upload",
+                    content=b"chunk",
+                    extensions={"runner_tunnel_binary_request_body": opted_in},
+                )
+            )
+            receiver = asyncio.create_task(replacement.recv())
+            try:
+                done, _ = await asyncio.wait(
+                    [task, receiver], timeout=2, return_when=asyncio.FIRST_COMPLETED
+                )
+                assert done
+                if task.done():
+                    await task
+                raw = await asyncio.wait_for(receiver, 2)
+                assert isinstance(raw, str)
+                frame = decode_frame(raw)
+                assert isinstance(frame, RequestFrame)
+                assert frame.path == "/upload"
+                assert decode_body(frame.body, frame.encoding) == b"chunk"
+                assert not current.binary_requests
+                await _reply(replacement, frame.id)
+                assert (await asyncio.wait_for(task, 2)).status_code == 204
+                assert not current.in_flight
+            finally:
+                task.cancel()
+                receiver.cancel()
+                await asyncio.gather(task, receiver, return_exceptions=True)
+
+
+async def test_binary_request_replacement_before_headers_is_connect_error() -> None:
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        session = registry.get(_RUNNER)
+        assert session is not None
+        task = asyncio.create_task(
+            client.patch(
+                "/upload",
+                content=b"chunk",
+                extensions={"runner_tunnel_binary_request_body": True},
+            )
+        )
+        try:
+            raw = await asyncio.wait_for(ws.recv(), 2)
+            assert isinstance(raw, bytes)
+            async with connect(
+                f"ws://127.0.0.1:{ws.remote_address[1]}/v1/runners/{_RUNNER}/tunnel"
+            ) as replacement:
+                await replacement.send(encode_frame(HelloFrame("replacement", 1)))
+                with pytest.raises(httpx.ConnectError, match="tunnel replaced") as error:
+                    await asyncio.wait_for(task, 2)
+                assert error.value.request.url.path == "/upload"
+                assert not session.binary_requests
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_hello_advertises_binary_without_version_bump() -> None:
