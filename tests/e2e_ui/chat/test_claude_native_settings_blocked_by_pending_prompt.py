@@ -106,12 +106,18 @@ def _visible_notices(page: Page) -> list[str]:
     return [re.sub(r"\s+", " ", text).strip() for text in texts if text.strip()]
 
 
+def _notice_names_the_prompt(notice: str) -> bool:
+    return bool(_NAMES_THE_PROMPT.search(notice) and _NAMES_THE_NEXT_STEP.search(notice))
+
+
 def _wait_for_notice(page: Page) -> list[str]:
     deadline = time.monotonic() + _NOTICE_TIMEOUT_MS / 1000
     notices: list[str] = []
     while time.monotonic() < deadline:
         notices = _visible_notices(page)
-        if notices:
+        # Wait for the refusal itself, not just any toast: an unrelated terminal
+        # notice can appear first and would otherwise end the wait too early.
+        if any(_notice_names_the_prompt(notice) for notice in notices):
             # Let the notice settle (the pill body renders after the expand click).
             page.wait_for_timeout(1_500)
             settled = _visible_notices(page)

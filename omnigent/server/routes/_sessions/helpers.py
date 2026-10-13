@@ -6761,8 +6761,12 @@ def _runner_refusal_reason(runner_result: _RunnerForwardResult) -> str:
     with contextlib.suppress(ValueError, TypeError):
         parsed_body = json.loads(runner_result.body)
         detail = parsed_body.get("detail") if isinstance(parsed_body, dict) else None
-        if isinstance(detail, str) and detail.strip():
-            return detail.strip().rstrip(".")
+        if isinstance(detail, str):
+            # Drop one trailing period so callers can embed the reason mid-sentence;
+            # keep the status fallback if the detail was only punctuation.
+            trimmed = detail.strip().removesuffix(".")
+            if trimmed:
+                return trimmed
     return f"the runner returned status {runner_result.status_code}"
 
 
