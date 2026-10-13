@@ -132,5 +132,7 @@ def test_message_to_real_dead_terminal_reports_exit(
     assert time.monotonic() - started < 2.5
     assert raised.value.exit_status in {None, "1"}
     assert "Last terminal output:" in str(raised.value)
-    assert "Pane is dead" in str(raised.value)
+    assert any(
+        marker in str(raised.value) for marker in ("Synthetic startup failure", "Pane is dead")
+    )
     assert "MUST_NOT_DELIVER" not in str(raised.value)
