@@ -40,13 +40,12 @@ from tests._helpers.compat import runner_executable
 from tests._helpers.host import isolated_host
 from tests._helpers.live_server import isolated_process_env
 from tests.e2e_ui.start_session.test_native_picker_cli_parity import (
-    _MODEL_ROW_PREFIX,
-    _MODEL_ROW_SENTINELS,
     _MODELS_SECTION_TESTID,
     _dismiss_setup_review,
     _expand_agent_config,
     _open_agent_menu,
     _pick_agent,
+    _read_model_rows,
 )
 
 _HOST_ONLINE_TIMEOUT_S = 180.0
@@ -333,20 +332,7 @@ def _settled_models_section(page: Page) -> tuple[str, list[dict[str, str]]]:
         if section.count() == 0:
             continue
         section_text = " ".join((section.first.inner_text() or "").split())
-        rows: list[dict[str, str]] = []
-        for option in section.first.locator(
-            f'[role="menuitemcheckbox"][data-testid^="{_MODEL_ROW_PREFIX}"]'
-        ).all():
-            row_id = (option.get_attribute("data-testid") or "")[len(_MODEL_ROW_PREFIX) :]
-            if row_id in _MODEL_ROW_SENTINELS:
-                continue
-            rows.append(
-                {
-                    "id": row_id,
-                    "text": " ".join((option.inner_text() or "").split()),
-                    "checked": option.get_attribute("aria-checked") or "",
-                }
-            )
+        rows = _read_model_rows(section.first)
         if rows or ("Loading models" not in section_text and section_text):
             return section_text, rows
     raise AssertionError(
