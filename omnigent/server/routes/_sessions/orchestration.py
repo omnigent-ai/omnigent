@@ -7784,24 +7784,33 @@ async def _runner_disconnect_requires_failure(
     elif fail_idle_top_level and conv is not None and conv.kind != "sub_agent":
         # A failed session keeps a cause its own runner recorded; a cause left by
         # a previous runner attempt is stale, so this exit records its own startup
-        # failure. The status cache can read "failed" before labels persist, so
-        # confirm a missing cause against a fresh row.
+        # failure. A cached or cold-read "failed" can precede the cause labels
+        # (written separately), so re-read a cause-less row before overwriting it.
         cause_conv = conv if isinstance(conv, Conversation) else None
-        if (
-            live == "failed"
-            and persisted is None
-            and (cause_conv is None or _last_task_error_from_labels(cause_conv.labels) is None)
+        read_failed = False
+        if live == "failed" and (
+            cause_conv is None or _last_task_error_from_labels(cause_conv.labels) is None
         ):
-            # A failed read cannot prove the cause absent, so keep the snapshot.
-            with contextlib.suppress(Exception):
+            try:
                 cause_conv = await asyncio.to_thread(
                     conversation_store.get_conversation, session_id
+                )
+            except Exception:  # noqa: BLE001 — an unreadable row cannot prove the cause absent
+                read_failed = True
+                _logger.warning(
+                    "Runner disconnect: cause re-read failed for session=%s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
                 )
         own_cause = False
         if cause_conv is not None and _last_task_error_from_labels(cause_conv.labels) is not None:
             cause_runner = _last_task_error_runner_id_from_labels(cause_conv.labels)
             own_cause = cause_runner is None or cause_runner == cause_conv.runner_id
-        decision = "already_failed" if live == "failed" and own_cause else "failed_before_start"
+        # An unreadable failed row is inconclusive: preserve rather than overwrite
+        # a possibly-existing cause with a startup failure.
+        preserve = own_cause or read_failed
+        decision = "already_failed" if live == "failed" and preserve else "failed_before_start"
     else:
         decision = "idle_no_failure"
 

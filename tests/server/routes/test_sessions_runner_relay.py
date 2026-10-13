@@ -3025,6 +3025,131 @@ async def test_offline_sweep_rereads_cause_when_cache_outruns_labels(db_uri: str
 
 
 @pytest.mark.asyncio
+async def test_offline_sweep_rereads_cause_on_cold_cache_labels_lag(db_uri: str) -> None:
+    """A cold-cache read that predates the cause labels is re-read, not clobbered.
+
+    ``live_status`` and the cause labels are written separately, so a cold-cache
+    sweep (another replica or after a restart) can read a "failed" row before its
+    cause labels land. The confirmation re-read runs on this path too, keeping the
+    real cause instead of overwriting it with a startup failure.
+    """
+    import dataclasses
+
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-cold-cache")
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    store.set_labels(
+        conv.id,
+        {
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+        },
+    )
+    store.set_session_live_status(conv.id, "failed")
+    snapshot = store.get_conversation(conv.id)
+    assert snapshot is not None
+
+    class _LabelLagStore:
+        """First read drops the cause labels; later reads return the real row."""
+
+        def __init__(self, inner: SqlAlchemyConversationStore) -> None:
+            self._inner = inner
+            self._reads = 0
+
+        def get_conversation(self, conversation_id: str) -> Conversation | None:
+            self._reads += 1
+            real = self._inner.get_conversation(conversation_id)
+            if self._reads == 1 and real is not None:
+                return dataclasses.replace(real, labels={})
+            return real
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [snapshot],
+                ErrorDetail(code="runner_failed_to_start", message="Synthetic runner exit"),
+                _LabelLagStore(store),  # type: ignore[arg-type]
+                fail_idle_top_level=True,
+            )
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        assert sessions_module._last_task_error_from_labels(refreshed.labels) == original
+        assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+        decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert decision["attributes"]["decision"] == "already_failed"
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
+async def test_offline_sweep_preserves_cause_when_reread_is_unavailable(db_uri: str) -> None:
+    """An unreadable row for a cache-failed session preserves its cause.
+
+    The status cache can read "failed" before the cause labels persist. When
+    the confirmation re-read fails, the sweep cannot prove the cause absent, so
+    it preserves the existing failure instead of recording a startup failure
+    over it.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-unreadable")
+    store.set_session_live_status(conv.id, "failed")
+    # The snapshot is read before the cause labels land: failed, but cause-less.
+    stale = store.get_conversation(conv.id)
+    assert stale is not None
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    store.set_labels(
+        conv.id,
+        {
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+        },
+    )
+    sessions_module._session_status_cache[conv.id] = "failed"
+
+    class _ReadFailingStore:
+        """Delegates to the real store but fails every ``get_conversation``."""
+
+        def __init__(self, inner: SqlAlchemyConversationStore) -> None:
+            self._inner = inner
+
+        def get_conversation(self, conversation_id: str) -> object:
+            raise RuntimeError("simulated transient read failure")
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [stale],
+                ErrorDetail(code="runner_failed_to_start", message="Synthetic runner exit"),
+                _ReadFailingStore(store),  # type: ignore[arg-type]
+                fail_idle_top_level=True,
+            )
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        assert sessions_module._last_task_error_from_labels(refreshed.labels) == original
+        assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+        decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert decision["attributes"]["decision"] == "already_failed"
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("owner_matches", [True, False], ids=["same_runner", "replacement_runner"])
 async def test_offline_sweep_scopes_preserved_cause_to_owning_runner(
     db_uri: str, owner_matches: bool
