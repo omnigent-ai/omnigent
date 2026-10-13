@@ -1,4 +1,4 @@
-"""Server-managed Boat lifecycle against a local stand-in for the Boat v1 API.
+"""Boat HTTP transport contract against a local API stand-in.
 
 The stand-in speaks the documented HTTP contract on a real socket, and the
 launcher reaches it through ``BOAT_API_URL`` exactly as it would reach Boat.
@@ -6,7 +6,7 @@ It covers the happy path the server drives: parse ``sandbox.provider: boat``,
 provision and install the host, keep alive, resume after archival, replace a
 deleted sandbox, and delete. No Boat account or API key is needed::
 
-    pytest tests/e2e/test_boat_managed_lifecycle_e2e.py -v
+    pytest tests/onboarding/sandboxes/test_boat_transport.py -v
 """
 
 from __future__ import annotations

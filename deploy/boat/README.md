@@ -64,3 +64,43 @@ Select a managed host in a new chat and send a message. The Boat dashboard
 shows the sandbox and the Omnigent host comes online. Archive the sandbox in
 Boat and send another message to check resume; delete it and send another
 message to check that a replacement is provisioned.
+
+
+### Real cloud E2E
+
+The live lifecycle test uses Boat's service and a real authenticated server.
+It builds a controller from your checkout's wheels, launches separate child
+sandboxes, verifies the host tunnel and repository clone, archives/resumes the
+same disk, replaces a deleted sandbox, and removes its temporary resources.
+It creates paid sandboxes and requires `BOAT_API_KEY`; model-backed agent turns
+are a separate verification requiring model credentials.
+
+From the repository root:
+
+```bash
+mkdir -p work/boat-wheels
+uv build --wheel --out-dir work/boat-wheels
+uv build --wheel sdks/python-client --out-dir work/boat-wheels
+uv build --wheel sdks/ui --out-dir work/boat-wheels
+uv run python tests/e2e/integrations/deploy/boat/boat_smoke_test.py \
+  --wheels work/boat-wheels --host-package 'omnigent==0.18.0'
+```
+
+Choose an available host release compatible with your controller. The explicit
+host requirement supports unreleased development controllers whose version is
+not yet on PyPI. The fast API stand-in lives in
+`tests/onboarding/sandboxes/test_boat_transport.py`; it verifies the HTTP contract
+without cloud credentials or provisioning.
+
+
+To run the same scenario through pytest, which builds isolated wheels itself:
+
+```bash
+export OMNIGENT_BOAT_HOST_PACKAGE='omnigent==0.18.0'
+BOAT_LIVE_E2E=1 uv run pytest \
+  tests/e2e/integrations/deploy/boat/boat_smoke_test.py -s --reruns 0
+```
+
+The live pytest scenario skips unless explicitly enabled. CI runs the credential-free
+transport and lifecycle unit tests; the attached cloud recording is the real live
+verification evidence.
