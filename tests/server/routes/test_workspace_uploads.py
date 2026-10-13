@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -14,13 +15,17 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
+from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, RequestFrame, decode_frame
 from omnigent.runner.transports.ws_tunnel.serve import _handle_tunnel_frame
 from omnigent.runner.workspace_upload import UploadLimits, register_upload_routes
+from omnigent.runtime import _globals
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.routes import routes_uploads as uploads
+from omnigent.server.routes._sessions import common as session_common
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.runner.transports.ws_tunnel.test_binary_requests import _tunnel
@@ -46,6 +51,21 @@ class UploadScenario:
     wake_calls: int = 0
     hard: dict = field(default_factory=lambda: UploadLimits().public())
     runner: httpx.AsyncClient | None = None
+    routing: RunnerRouter | None = None
+
+    def bind(self, registry, store, monkeypatch, client=None, **kwargs):
+        self.routing = self.app.state.runner_router
+        monkeypatch.setattr(self.routing, "_registry", registry)
+        monkeypatch.setattr(self.routing, "_conversation_store", store)
+        for name, value in kwargs.items():
+            monkeypatch.setattr(self.routing, "_" + name, value)
+        self.routing._clients.clear()
+        if client is not None:
+            self.routing._clients["binary-test"] = client
+        self.app.state.tunnel_registry = registry
+        monkeypatch.setattr(_globals, "_runner_router", self.routing)
+        monkeypatch.setattr(session_common, "_server_runner_router", self.routing)
+        return self.routing
 
     async def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -64,7 +84,7 @@ class UploadScenario:
             return httpx.Response(
                 201,
                 json={
-                    "upload_id": "a" * 32,
+                    "upload_id": uuid.uuid4().hex,
                     "offset": 0,
                     "chunk_bytes": 1024**2,
                     "expires_at": time.time() + 3600,
@@ -126,22 +146,25 @@ async def scenario(auth_app, auth_client, db_uri, tmp_path, monkeypatch):
     ) as runner:
         test.runner = runner
 
-        async def client_for(*args, **kwargs):
-            return test.runner
+        test.bind(
+            auth_app.state.tunnel_registry,
+            SqlAlchemyConversationStore(db_uri),
+            monkeypatch,
+            runner,
+        )
 
         async def wake(**kwargs):
             test.wake_calls += 1
             assert kwargs["raise_host_refusal"] is True
-            assert kwargs["session_id"] == session_id
+            assert kwargs["session_id"] == kwargs["conv"].id
             return test.runner, kwargs["conv"]
 
-        monkeypatch.setattr(uploads, "_get_runner_client_for_resource_access", client_for)
         monkeypatch.setattr(uploads, "ensure_runner_connected", wake)
         yield test
 
 
 @pytest.mark.parametrize("enabled", [True, False], ids=["binary", "json-fallback"])
-async def test_tunnel_upload_and_commit(scenario, tmp_path, monkeypatch, enabled):
+async def test_tunnel_upload_and_commit(scenario, tmp_path, monkeypatch, db_uri, enabled):
     config = tmp_path / "tunnel-config.yaml"
     config.write_text(f"runner_tunnel_binary_request_body: {str(enabled).lower()}\n")
     monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
@@ -174,7 +197,7 @@ async def test_tunnel_upload_and_commit(scenario, tmp_path, monkeypatch, enabled
             registry,
         ):
             scenario.runner = runner
-            scenario.app.state.tunnel_registry = registry
+            routing = scenario.bind(registry, SqlAlchemyConversationStore(db_uri), monkeypatch)
 
             async def dispatch():
                 async for raw in ws:
@@ -225,6 +248,7 @@ async def test_tunnel_upload_and_commit(scenario, tmp_path, monkeypatch, enabled
                 assert event["type"] == "session.changed_files.invalidated"
                 assert event["environment_id"] == DEFAULT_ENVIRONMENT_ID
                 assert (await scenario.client.post(url + "/complete")).json() == complete.json()
+                await collector.assert_no_event(0.02)
                 assert (await scenario.client.delete(url)).json() == complete.json()
                 assert (workspace / "payload.bin").read_bytes() == payload
                 if enabled:
@@ -253,12 +277,13 @@ async def test_tunnel_upload_and_commit(scenario, tmp_path, monkeypatch, enabled
                         isinstance(frame, RequestFrame) and frame.method == "GET"
                         for frame in probes
                     )
-                    == 2
+                    == 1
                 )
             finally:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 await asyncio.gather(*dispatches.values(), return_exceptions=True)
+                await routing.aclose()
     finally:
         await collector.stop()
         await manager.stop()
@@ -608,6 +633,9 @@ async def test_capability_limits_and_unavailable(scenario, monkeypatch):
     assert response.json()["limits"] == scenario.hard
     for key in ("max_files_per_batch", "max_batch_bytes", "parallel_files"):
         del scenario.hard[key]
+    previous = scenario.app.state.tunnel_registry.get("binary-test")
+    fresh = SimpleNamespace(hello=previous.hello)
+    scenario.app.state.tunnel_registry.get = lambda rid: fresh
     response = await scenario.client.get(scenario.base)
     assert response.json()["limits"]["max_files_per_batch"] == 1000
     assert response.json()["limits"]["max_batch_bytes"] == 10 * 1024**3
@@ -627,3 +655,266 @@ async def test_server_expiry(scenario, monkeypatch, setting):
     await asyncio.sleep(0.02)
     assert (await scenario.client.head(url)).status_code == 410
     assert scenario.requests == []
+
+
+async def test_stalled_body_releases_cross_session_admission(scenario, db_uri, monkeypatch):
+    url = await scenario.url()
+    agent = await create_test_agent(scenario.client)
+    response = await scenario.client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    other = response.json()["id"]
+    SqlAlchemyConversationStore(db_uri).set_runner_id(other, "binary-test")
+    response = await scenario.client.post(
+        scenario.base.replace(scenario.session_id, other),
+        json={"dir": "", "name": "other.bin", "size": 3},
+    )
+    assert response.status_code == 201
+    fresh = scenario.base.replace(scenario.session_id, other) + "/" + response.json()["upload_id"]
+    monkeypatch.setattr(uploads.config, "workspace_upload_chunk_timeout_s", lambda: 0.02)
+    scenario.requests.clear()
+
+    async def stalled():
+        yield b"x"
+        await asyncio.Event().wait()
+
+    response = await asyncio.wait_for(
+        scenario.client.patch(url, headers=HEADERS, content=stalled()), 0.5
+    )
+    assert response.status_code == 504
+    assert response.json()["error"]["code"] == "timeout"
+    assert uploads._chunk_admission.used == 0
+    assert scenario.requests == []
+    assert (await scenario.client.patch(fresh, headers=HEADERS, content=b"x")).status_code == 204
+    assert uploads._chunk_admission.used == 0
+
+
+@pytest.mark.parametrize(
+    "method,suffix",
+    [
+        ("GET", ""),
+        ("POST", ""),
+        ("PATCH", "/unknown"),
+        ("HEAD", "/unknown"),
+        ("POST", "/unknown/complete"),
+        ("DELETE", "/unknown"),
+    ],
+)
+async def test_remote_runner_readdresses_before_local_state(
+    scenario, db_uri, monkeypatch, method, suffix
+):
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(
+        scenario.session_id, "00000000-0000-0000-0000-000000000123", workspace="/private/workspace"
+    )
+    scenario.bind(
+        SimpleNamespace(get=lambda rid: None),
+        store,
+        monkeypatch,
+        host_registry=SimpleNamespace(get=lambda hid: None),
+        host_store=SimpleNamespace(is_online=lambda hid: True),
+    )
+    response = await scenario.client.request(
+        method,
+        scenario.base + suffix,
+        headers=HEADERS if method == "PATCH" else {},
+        json={"dir": "", "name": "x", "size": 1} if method == "POST" and not suffix else None,
+    )
+    assert response.status_code == 400
+    if method != "HEAD":
+        assert response.json()["error"]["code"] == "wrong_replica"
+        assert "/private" not in response.text
+    assert scenario.wake_calls == 0
+    assert scenario.requests == []
+
+
+@pytest.mark.parametrize(
+    "code,status",
+    [
+        (ErrorCode.WORKSPACE_MISSING, 410),
+        (ErrorCode.RUNNER_UNAVAILABLE, 503),
+        (ErrorCode.WRONG_REPLICA, 400),
+    ],
+)
+async def test_wake_refusals_are_sanitized(scenario, monkeypatch, code, status):
+    async def refused(**kwargs):
+        raise OmnigentError(
+            "workspace path does not exist: /private/workspace/credentials", code=code
+        )
+
+    monkeypatch.setattr(uploads, "ensure_runner_connected", refused)
+    response = await scenario.create()
+    assert response.status_code == status
+    assert response.json()["error"]["code"] == code
+    assert "/private" not in response.text
+    assert scenario.requests == []
+
+
+async def test_capability_and_relay_require_the_same_routed_client(scenario, monkeypatch):
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(scenario.handle), base_url="http://elsewhere"
+    ) as other:
+
+        async def different(*args, **kwargs):
+            return other
+
+        monkeypatch.setattr(uploads, "_get_runner_client_for_resource_access", different)
+        response = await scenario.create()
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "runner_capability_mismatch"
+        assert scenario.requests == []
+
+
+async def test_capability_probe_coalesces_and_reconnect_invalidates(scenario, monkeypatch):
+    original = scenario.handle
+    blocked = asyncio.Event()
+    entered = asyncio.Event()
+    probes = 0
+
+    async def handle(request):
+        nonlocal probes
+        if request.method == "GET":
+            probes += 1
+            entered.set()
+            await blocked.wait()
+        return await original(request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://runner"
+    ) as client:
+        scenario.routing._clients["binary-test"] = client
+        tasks = [asyncio.create_task(scenario.client.get(scenario.base)) for _ in range(3)]
+        try:
+            await asyncio.wait_for(entered.wait(), 0.5)
+            await asyncio.sleep(0.01)
+            blocked.set()
+            results = await asyncio.gather(*tasks)
+            assert all(r.json()["supported"] for r in results)
+            assert probes == 1
+            assert (await scenario.create()).status_code == 201
+            assert probes == 1
+            fresh = SimpleNamespace(
+                hello=HelloFrame("new", 1, capabilities=["workspace_upload_v1"])
+            )
+            scenario.app.state.tunnel_registry.get = lambda rid: fresh
+            assert (await scenario.client.get(scenario.base)).json()["supported"]
+            assert probes == 2
+        finally:
+            blocked.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("concurrent", [False, True], ids=["sequential", "concurrent"])
+async def test_completion_retries_publish_once(scenario, monkeypatch, concurrent):
+    url = await scenario.url()
+    events = []
+    monkeypatch.setattr(
+        uploads, "_publish_changed_files_invalidated", lambda *args: events.append(args)
+    )
+    if concurrent:
+        scenario.blocked = asyncio.Event()
+        tasks = [asyncio.create_task(scenario.client.post(url + "/complete")) for _ in range(2)]
+        try:
+            async with asyncio.timeout(0.5):
+                while sum(r.url.path.endswith("/complete") for r in scenario.requests) != 2:
+                    await asyncio.sleep(0)
+            scenario.blocked.set()
+            results = await asyncio.gather(*tasks)
+        finally:
+            scenario.blocked.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    else:
+        results = [await scenario.client.post(url + "/complete") for _ in range(2)]
+    assert all(r.status_code == 200 for r in results)
+    assert results[0].json() == results[1].json()
+    assert events == [(scenario.session_id, DEFAULT_ENVIRONMENT_ID)]
+    assert (await scenario.create()).status_code == 201
+
+
+@pytest.mark.parametrize(
+    "failure", [httpx.ReadTimeout("lost acknowledgement"), httpx.Response(502)]
+)
+async def test_ambiguous_create_does_not_hold_session_quota(scenario, monkeypatch, failure):
+    monkeypatch.setattr(uploads.config, "workspace_upload_max_open_per_session", lambda: 1)
+    scenario.failure = failure
+    for _ in range(2):
+        response = await scenario.create()
+        assert response.status_code in (502, 504)
+    scenario.failure = None
+    assert (await scenario.create()).status_code == 201
+
+
+async def test_cross_site_simple_complete_is_rejected(scenario, monkeypatch):
+    url = await scenario.url()
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
+    monkeypatch.delenv("OMNIGENT_WS_ALLOWED_ORIGINS", raising=False)
+    scenario.requests.clear()
+    response = await scenario.client.post(
+        url + "/complete",
+        headers={
+            "Origin": "https://attacker.example.test",
+            "Sec-Fetch-Site": "cross-site",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        content="submit=1",
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "permission_denied"
+    assert scenario.requests == []
+    assert (
+        await scenario.client.post(url + "/complete", headers={"Sec-Fetch-Site": "same-origin"})
+    ).status_code == 200
+
+
+@pytest.mark.parametrize("expired", [False, True], ids=["completed-history", "expiry-backlog"])
+def test_index_work_is_bounded_across_sessions(expired):
+    class NoScan(dict):
+        reads = 0
+
+        def get(self, *args):
+            self.reads += 1
+            return super().get(*args)
+
+        def items(self):
+            raise AssertionError("Upload admission scanned unrelated history")
+
+        def values(self):
+            raise AssertionError("Upload admission scanned unrelated history")
+
+        def __iter__(self):
+            raise AssertionError("Upload admission scanned unrelated history")
+
+    index = uploads.UploadIndex()
+    now = time.monotonic()
+    limits = uploads._limits()
+    for i in range(2000):
+        key = (f"session-{i}", "os", str(i))
+        record = uploads.UploadRecord(
+            "owner",
+            1,
+            limits,
+            now - (100 if expired else 0),
+            now - (100 if expired else 0),
+            10,
+            20,
+            "runner",
+        )
+        with index.lock:
+            index.add(key, record)
+            index.finish(key, record)
+    overdue_key = ("current", "os", "expired")
+    overdue = uploads.UploadRecord("owner", 1, limits, now - 50, now - 50, 10, 20, "runner")
+    with index.lock:
+        index.add(overdue_key, overdue)
+    index.records = NoScan(index.records)
+    index.prune("current")
+    assert index.records.reads <= uploads.EXPIRY_CLEANUP_LIMIT + 1
+    assert len(index.records) >= 2000 - uploads.EXPIRY_CLEANUP_LIMIT
+    assert not index.sessions
+    record = uploads.UploadRecord("owner", 7, uploads._limits(), now, now, 10, 20, "runner")
+    key = ("current", "os", "new")
+    with index.lock:
+        index.add(key, record)
+        assert len(index.sessions["current"].keys) == 1
+        assert index.sessions["current"].size == 7
+        assert index.finish(key, record)
+        assert not index.finish(key, record)
+        assert not index.sessions
