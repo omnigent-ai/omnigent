@@ -230,3 +230,44 @@ def test_every_failure_publish_site_names_itself() -> None:
             )
     # A scan that silently matched nothing would pass forever.
     assert checked >= 7, f"expected the known failure publish sites, found {checked}"
+
+
+@pytest.mark.parametrize("code", ["workspace_missing", "harness_not_configured"])
+@pytest.mark.parametrize(
+    "origin",
+    ["host_launch_failed", "native_terminal_boot_failed", "relayed_runner_status"],
+)
+def test_expected_refusal_code_downgrades_on_every_origin(
+    caplog: pytest.LogCaptureFixture,
+    origin: str,
+    code: str,
+) -> None:
+    """A user-remediable refusal code stays out of the ERROR funnel by code alone.
+
+    ``workspace_missing`` and ``harness_not_configured`` are USER/CONFIG,
+    pre-start conditions in the error taxonomy, so they log as a WARNING refusal
+    wherever they surface: the host launch refusal, a native terminal boot
+    refusal, or a relayed runner lifecycle status. Keying the downgrade on the
+    origin would push the latter two back into the turn-failure funnel.
+    """
+    session_id = "conv_refuse"
+    helpers._session_status_cache[session_id] = "running"
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.sessions"):
+        helpers._publish_status(
+            session_id,
+            "failed",
+            ErrorDetail(
+                source="execution",
+                code=code,
+                message="workspace path does not exist: /gone",
+            ),
+            failure_origin=origin,
+        )
+    refused = [r for r in caplog.records if r.getMessage().startswith("session turn refused")]
+    funnel = [r for r in caplog.records if r.getMessage().startswith("session turn failed")]
+    assert not funnel, [r.getMessage() for r in caplog.records]
+    assert len(refused) == 1, [r.getMessage() for r in caplog.records]
+    assert refused[0].levelno == logging.WARNING
+    assert refused[0].event_name == "session_turn_refused"
+    assert refused[0].attributes["origin"] == origin
+    assert refused[0].attributes["code"] == code
