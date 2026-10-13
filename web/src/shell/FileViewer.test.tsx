@@ -36,14 +36,12 @@ vi.mock("./CodeViewer", () => ({
     position,
     viewMode,
     searchOpen,
-    searchFocusNonce,
     onDirtyChange,
   }: {
     path: string;
     position?: { line: number };
     viewMode: string;
     searchOpen?: boolean;
-    searchFocusNonce?: number;
     onDirtyChange?: (dirty: boolean) => void;
   }) => {
     codeViewerRenders({ path, position });
@@ -52,7 +50,6 @@ vi.mock("./CodeViewer", () => ({
         data-testid="code-viewer"
         data-view-mode={viewMode}
         data-search-open={String(!!searchOpen)}
-        data-search-focus-nonce={String(searchFocusNonce ?? 0)}
       >
         <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
         {viewMode === "editor" && (
@@ -105,13 +102,11 @@ vi.mock("./MonacoDiffViewer", () => ({
     wrapLines,
     hideWhitespace,
     searchOpen,
-    searchFocusNonce,
   }: {
     position?: { line: number };
     wrapLines?: boolean;
     hideWhitespace?: boolean;
     searchOpen?: boolean;
-    searchFocusNonce?: number;
   }) => (
     <div
       data-testid="diff-viewer"
@@ -119,7 +114,6 @@ vi.mock("./MonacoDiffViewer", () => ({
       data-wrap-lines={String(!!wrapLines)}
       data-hide-whitespace={String(!!hideWhitespace)}
       data-search-open={String(!!searchOpen)}
-      data-search-focus-nonce={String(searchFocusNonce ?? 0)}
     />
   ),
 }));
@@ -1746,8 +1740,6 @@ describe("FileViewer Cmd+F opens find on Monaco surfaces", () => {
 
   const searchOpenOf = (testId: string) =>
     screen.getByTestId(testId).getAttribute("data-search-open");
-  const focusNonceOf = (testId: string) =>
-    Number(screen.getByTestId(testId).getAttribute("data-search-focus-nonce"));
 
   it("opens find on the code (source) surface with Cmd+F", () => {
     renderViewer({ open: true, path: "file1.py" });
@@ -1784,28 +1776,6 @@ describe("FileViewer Cmd+F opens find on Monaco surfaces", () => {
     expect(searchOpenOf("diff-viewer")).toBe("false");
     fireEvent.keyDown(window, { key: "f", metaKey: true });
     expect(searchOpenOf("diff-viewer")).toBe("true");
-  });
-
-  it("re-requests find focus on a repeated Cmd+F while find is already open", () => {
-    renderViewer({ open: true, path: "file1.py" });
-    fireEvent.keyDown(window, { key: "f", metaKey: true });
-    expect(searchOpenOf("code-viewer")).toBe("true");
-    const opened = focusNonceOf("code-viewer");
-    // `searchOpen` is already true, so only the nonce can tell the editor to
-    // re-run find and put focus back in the widget.
-    fireEvent.keyDown(window, { key: "f", metaKey: true });
-    expect(searchOpenOf("code-viewer")).toBe("true");
-    expect(focusNonceOf("code-viewer")).toBe(opened + 1);
-  });
-
-  it("re-requests find focus on a repeated Cmd+F in the diff view", async () => {
-    renderViewer({ open: true, path: "file1.py", initialSearch: "diff=1" });
-    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
-    fireEvent.keyDown(window, { key: "f", metaKey: true });
-    const opened = focusNonceOf("diff-viewer");
-    fireEvent.keyDown(window, { key: "f", metaKey: true });
-    expect(searchOpenOf("diff-viewer")).toBe("true");
-    expect(focusNonceOf("diff-viewer")).toBe(opened + 1);
   });
 
   it("does not intercept Cmd+Shift+F (leaves other chords alone)", () => {

@@ -67,7 +67,6 @@ function diffTree(props: {
   hideWhitespace?: boolean;
   wrapLines?: boolean;
   searchOpen?: boolean;
-  searchFocusNonce?: number;
   onSearchHandled?: () => void;
 }) {
   return (
@@ -84,7 +83,6 @@ function diffTree(props: {
       activeSelection={null}
       onSetActiveSelection={() => {}}
       searchOpen={props.searchOpen}
-      searchFocusNonce={props.searchFocusNonce}
       onSearchHandled={props.onSearchHandled}
     />
   );
@@ -374,35 +372,6 @@ describe("MonacoDiffViewer", () => {
     // searchOpen=true opens Monaco's native find on the modified editor — the
     // path Cmd+F drives in the managed embed, where the keybinding won't fire.
     expect(controller.run).toHaveBeenCalledTimes(1);
-    expect(controller.closeFindWidget).not.toHaveBeenCalled();
-  });
-
-  it("re-runs find on a bumped searchFocusNonce while the widget is open", async () => {
-    const controller = makeFindController();
-    const fakeModified = makeFindableModified(controller);
-    const props = { before: "a", after: "b", layout: "split", searchOpen: true } as const;
-    const { rerender } = renderDiff({ ...props, searchFocusNonce: 1 });
-    await waitFor(() => expect(h.onMount).not.toBeNull());
-
-    act(() => {
-      h.onMount?.(
-        {
-          getModifiedEditor: () => fakeModified,
-          getOriginalEditor: () => ({ getModel: () => null }),
-        } as unknown as Parameters<DiffOnMount>[0],
-        {
-          editor: { EndOfLineSequence: { LF: 0, CRLF: 1 } },
-        } as unknown as Parameters<DiffOnMount>[1],
-      );
-    });
-    expect(controller.run).toHaveBeenCalledTimes(1);
-
-    // A repeated Cmd+F can't flip `searchOpen` (already true); the bumped nonce
-    // must re-run the action so Monaco refocuses the find input.
-    act(() => {
-      rerender(diffTree({ ...props, searchFocusNonce: 2 }));
-    });
-    expect(controller.run).toHaveBeenCalledTimes(2);
     expect(controller.closeFindWidget).not.toHaveBeenCalled();
   });
 

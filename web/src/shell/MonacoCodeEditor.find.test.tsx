@@ -148,9 +148,7 @@ import * as runnerHook from "@/hooks/RunnerHealthProvider";
 const PATH = "src/a.ts";
 const INITIAL = "const x = 1;\n";
 
-function makeEditor(
-  props: { searchOpen?: boolean; searchFocusNonce?: number; onSearchHandled?: () => void } = {},
-) {
+function makeEditor(props: { searchOpen?: boolean; onSearchHandled?: () => void } = {}) {
   return (
     <MonacoCodeEditor
       content={INITIAL}
@@ -216,18 +214,6 @@ describe("MonacoCodeEditor find toggle", () => {
     });
     expect(fakeController.closeFindWidget).toHaveBeenCalledTimes(1);
     expect(fakeController.run).toHaveBeenCalledTimes(1);
-  });
-
-  it("re-runs find on a bumped searchFocusNonce while the widget is open", async () => {
-    const { rerender } = await renderMounted(makeEditor({ searchOpen: true, searchFocusNonce: 1 }));
-    expect(fakeController.run).toHaveBeenCalledTimes(1);
-    // A repeated Cmd+F can't flip `searchOpen` (already true); the bumped nonce
-    // must re-run the action so Monaco refocuses the find input.
-    await act(async () => {
-      rerender(makeEditor({ searchOpen: true, searchFocusNonce: 2 }));
-    });
-    expect(fakeController.run).toHaveBeenCalledTimes(2);
-    expect(fakeController.closeFindWidget).not.toHaveBeenCalled();
   });
 
   it("does not call closeFindWidget when the widget is already closed", async () => {
