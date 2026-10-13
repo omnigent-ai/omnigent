@@ -76,6 +76,7 @@ from typing import Any
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
     SHELL_TOOLS,
+    UnsupportedShellSyntax,
     is_shell_interpreter,
     is_unresolved_invocation,
     real_invocation_tokens,
@@ -971,8 +972,9 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
     ops: list[_ShellOp] = []
     try:
         segments = split_command_segments(command)
-    except ValueError as exc:
-        return [
+    except UnsupportedShellSyntax as exc:
+        segments = exc.completed_segments
+        ops.append(
             _ShellOp(
                 kind="unparseable",
                 repo=None,
@@ -980,7 +982,7 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
                 branch_targeted=False,
                 detail=str(exc),
             )
-        ]
+        )
     for segment in segments:
         unreadable = False
         try:

@@ -26,7 +26,11 @@ from typing import Any
 
 import pytest
 
-from omnigent.policies.builtins._shell import SHELL_TOOLS
+from omnigent.policies.builtins._shell import (
+    SHELL_TOOLS,
+    UnsupportedShellSyntax,
+    split_command_segments,
+)
 from omnigent.policies.builtins.github import _DEFAULT_SHELL_TOOLS as _github_default_shell_tools
 from omnigent.policies.builtins.github import github_policy
 from omnigent.policies.builtins.orchestration import _SHELL_TOOLS as _orchestration_shell_tools
@@ -567,6 +571,25 @@ def test_shell_unparseable_git_command_asks() -> None:
 )
 def test_unsupported_shell_syntax_asks_even_for_benign_commands(command: str) -> None:
     assert _action(github_policy()(_sh(command))) == "ASK"
+
+
+@pytest.mark.parametrize("read_all,expected", [(False, "DENY"), (True, "ASK")])
+@pytest.mark.parametrize("command", ["parser-input", "sh -c 'parser-input'"])
+def test_completed_segments_keep_stricter_decisions(
+    monkeypatch: pytest.MonkeyPatch, read_all: bool, expected: str, command: str
+) -> None:
+    # Supply a partial parser result to isolate policy precedence from lexical syntax.
+    def partial_segments(value: str) -> list[str]:
+        if value == "parser-input":
+            raise UnsupportedShellSyntax(
+                "Unsupported syntax requires approval", ["gh repo view --repo octo/hello"]
+            )
+        return split_command_segments(value)
+
+    monkeypatch.setattr(
+        "omnigent.policies.builtins.github.split_command_segments", partial_segments
+    )
+    assert _action(github_policy(read_all=read_all)(_sh(command))) == expected
 
 
 @pytest.mark.parametrize("command", ["echo '$(text)'", "echo '`text`'", r'echo "\$(text)"'])

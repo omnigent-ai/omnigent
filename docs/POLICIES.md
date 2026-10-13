@@ -349,8 +349,10 @@ daily_budget:
 Controls GitHub access across MCP tools and `git`/`gh` shell commands. Restricts reads to an allowlist (unless `read_all`) and writes to specific repos/branches. Shell commands with ambiguous targets return ASK.
 
 Shell comments, here-documents (including here-strings), line continuations, and
-command substitutions are not classified; commands containing them return ASK,
-even when the visible command is benign. Substitutions inside double quotes
+command substitutions are not classified. Completed command segments retain
+their policy decisions, including the command before a comment. Unsupported
+syntax adds an ASK decision; DENY takes precedence over ASK, which takes
+precedence over ALLOW. Substitutions inside double quotes
 also require approval, as do ANSI-C (`$'...'`) and locale-specific (`$"..."`)
 quoting. Ordinary single-quoted or escaped literal delimiters remain arguments.
 

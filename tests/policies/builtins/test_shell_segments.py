@@ -2,7 +2,7 @@
 
 import pytest
 
-from omnigent.policies.builtins._shell import split_command_segments
+from omnigent.policies.builtins._shell import UnsupportedShellSyntax, split_command_segments
 
 
 @pytest.mark.parametrize(
@@ -58,28 +58,33 @@ def test_braces_require_word_boundaries(command: str, expected: list[str]) -> No
 
 
 @pytest.mark.parametrize(
-    "command",
+    "command,completed",
     [
-        "echo ready # today's status\necho done",
-        "# status $(with delimiters\necho done",
-        "echo ready;# status\necho done",
-        "echo \\\n# status\necho done",
-        "echo \\\nready",
-        "cat <<DATA\ntoday's status\nDATA\necho done",
-        "cat <<'DATA'\nplain text\nDATA",
-        "cat <<-DATA\n\tplain text\n\tDATA",
-        "cat <<<text",
-        "echo $(echo one)",
-        'echo "$(echo one)"',
-        "echo `echo one`",
-        'echo "`echo one`"',
-        "echo $'text'",
-        'echo $"text"',
+        ("echo ready # today's status\necho done", ["echo ready"]),
+        ("# status $(with delimiters\necho done", []),
+        ("echo ready;# status\necho done", ["echo ready"]),
+        ("echo \\\n# status\necho done", []),
+        ("echo \\\nready", []),
+        ("cat <<DATA\ntoday's status\nDATA\necho done", []),
+        ("cat <<'DATA'\nplain text\nDATA", []),
+        ("cat <<-DATA\n\tplain text\n\tDATA", []),
+        ("cat <<<text", []),
+        ("echo $(echo one)", []),
+        ('echo "$(echo one)"', []),
+        ("echo `echo one`", []),
+        ('echo "`echo one`"', []),
+        ("echo $'text'", []),
+        ('echo $"text"', []),
     ],
 )
-def test_unsupported_shell_syntax_requires_approval(command: str) -> None:
-    with pytest.raises(ValueError, match=r"requires? approval"):
-        split_command_segments(command)
+@pytest.mark.parametrize("prefix", ["", "echo first; "])
+def test_unsupported_shell_syntax_requires_approval(
+    command: str, completed: list[str], prefix: str
+) -> None:
+    with pytest.raises(UnsupportedShellSyntax, match=r"requires? approval") as error:
+        split_command_segments(prefix + command)
+    expected = ["echo first", *completed] if prefix else completed
+    assert error.value.completed_segments == expected
 
 
 @pytest.mark.parametrize(

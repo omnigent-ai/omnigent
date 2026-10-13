@@ -200,8 +200,16 @@ def is_shell_interpreter(tokens: list[str]) -> bool:
     return bool(tokens) and tokens[0].rsplit("/", 1)[-1] in SHELL_INTERPRETERS
 
 
+class UnsupportedShellSyntax(ValueError):
+    """Unsupported syntax with the fully delimited commands preceding it."""
+
+    def __init__(self, reason: str, completed_segments: list[str]) -> None:
+        super().__init__(reason)
+        self.completed_segments = [seg.strip() for seg in completed_segments if seg.strip()]
+
+
 def split_command_segments(command: str) -> list[str]:
-    """Separate commands, raising ValueError for unsupported shell syntax."""
+    """Separate commands, preserving completed segments in UnsupportedShellSyntax."""
     return [seg.strip() for seg in _split_unquoted_operators(command) if seg.strip()]
 
 
@@ -223,15 +231,15 @@ def _split_unquoted_operators(command: str) -> list[str]:
             buf.append(ch)
         elif ch == "\\" and i + 1 < n:
             if command[i + 1] == "\n":
-                raise ValueError("Shell line continuations require approval")
+                raise UnsupportedShellSyntax("Shell line continuations require approval", segments)
             buf.extend(command[i : i + 2])
             at_word_start = False
             i += 2
             continue
         elif ch == "`" or command[i : i + 2] == "$(":
-            raise ValueError("Shell command substitutions require approval")
+            raise UnsupportedShellSyntax("Shell command substitutions require approval", segments)
         elif not in_double and command[i : i + 2] in ("$'", '$"'):
-            raise ValueError("Shell extended quoting requires approval")
+            raise UnsupportedShellSyntax("Shell extended quoting requires approval", segments)
         elif in_double:
             if ch == '"':
                 in_double = False
@@ -242,8 +250,13 @@ def _split_unquoted_operators(command: str) -> list[str]:
         elif ch == '"':
             in_double = True
             buf.append(ch)
-        elif (ch == "#" and at_word_start) or command[i : i + 2] == "<<":
-            raise ValueError("Shell comments and here-documents require approval")
+        elif ch == "#" and at_word_start:
+            # A comment ends the current command's arguments; its body stays opaque.
+            raise UnsupportedShellSyntax(
+                "Shell comments require approval", [*segments, "".join(buf)]
+            )
+        elif command[i : i + 2] == "<<":
+            raise UnsupportedShellSyntax("Shell here-documents require approval", segments)
         elif command[i : i + 2] in ("&&", "||"):
             segments.append("".join(buf))
             buf = []
