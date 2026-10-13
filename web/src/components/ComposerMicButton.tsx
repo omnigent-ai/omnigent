@@ -107,17 +107,14 @@ export const ComposerMicButton = ({
   onVoiceStart,
   onVoiceDiscard,
 }: ComposerMicButtonProps) => {
-  // Web Speech is primary whenever the browser has the constructor
-  // (Chrome/Safari, unchanged behavior); with no constructor at all
-  // (Firefox) takes use server dictation when GET /v1/info advertises it.
-  // A constructor is no guarantee of a backend — Electron and plain
-  // Chromium error at runtime with "network" — so a failed Web Speech
-  // take falls back to the server per take (see handleError). Per-take,
-  // not sticky: a transient blip in real Chrome must not permanently
-  // downgrade the page to the local model.
+  // Web Speech is primary wherever its constructor exists; a take that dies with
+  // "network" falls back to the server for that take only (see handleError).
+  // Electron has the constructor but never a backend, so there only the server can serve.
   const [Ctor] = useState(getRecognitionCtor);
+  const electron = isElectronShell();
   const serverInfo = useServerInfo();
   const serverAvailable = serverInfo !== "loading" && serverInfo.dictation_available;
+  const canDictate = serverAvailable || (Ctor !== null && !electron);
   // Mirrored into a ref so the mount-time recognition handlers (closed
   // over [Ctor, lang]) see the current probe result.
   const serverAvailableRef = useRef(serverAvailable);
@@ -176,7 +173,8 @@ export const ComposerMicButton = ({
   const barRefs = useRef<(HTMLSpanElement | null)[]>(BAR_BINS.map(() => null));
 
   useEffect(() => {
-    if (!Ctor) return;
+    // Electron never starts a Web Speech take, so skip the dead recognizer.
+    if (!Ctor || electron) return;
 
     const recognition = new Ctor();
     // Keep listening until the user clicks stop — no auto-stop on silence.
@@ -254,7 +252,7 @@ export const ComposerMicButton = ({
       recognition.stop();
       recognitionRef.current = null;
     };
-  }, [Ctor, lang, reportError]);
+  }, [Ctor, electron, lang, reportError]);
 
   // Auto-stop if the composer goes disabled mid-dictation. Stops the
   // recognizer; the disabledRef guard in handleResult catches any final
@@ -440,12 +438,9 @@ export const ComposerMicButton = ({
       void toggleServer();
       return;
     }
-    // In Electron the SpeechRecognition constructor exists but has no backend,
-    // so a Web Speech take always fails with "network" and only THEN falls back
-    // to the server — a visible ~1s "fail then recover" on every first take.
-    // When the server can serve, go straight to it and skip the doomed attempt.
-    // (Real browsers keep Web Speech primary; it genuinely works there.)
-    if (!Ctor || (serverAvailable && isElectronShell())) {
+    // Electron's SpeechRecognition has no backend, so a Web Speech take there
+    // always fails: go straight to the server instead.
+    if (!Ctor || electron) {
       if (serverAvailable) void toggleServer();
       return;
     }
@@ -462,12 +457,12 @@ export const ComposerMicButton = ({
       // user can try again, and let the next event reconcile state.
       transitionRef.current = false;
     }
-  }, [isListening, Ctor, serverAvailable, toggleServer]);
+  }, [isListening, Ctor, electron, serverAvailable, toggleServer]);
 
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
-  // whenever dictation could run (Web Speech OR the server path) and the
-  // composer isn't disabled, so the chord is inert when it can't do anything.
-  useVoiceDictationHotkey(toggle, enableHotkey && (Boolean(Ctor) || serverAvailable) && !disabled);
+  // only while a dictation path can run and the composer isn't disabled, so
+  // the chord is inert when it can't do anything.
+  useVoiceDictationHotkey(toggle, enableHotkey && canDictate && !disabled);
 
   // While listening, Enter commits (end the take, keep the text) and Esc
   // cancels (end the take, discard back to the pre-dictation snapshot). Bound in
@@ -510,7 +505,7 @@ export const ComposerMicButton = ({
     return () => window.removeEventListener("keydown", handler, true);
   }, [isListening, toggle]);
 
-  if (!Ctor && !serverAvailable) return null;
+  if (!canDictate) return null;
 
   // Stable accessible name with aria-pressed signals toggle state to
   // screen readers. Error text takes over the tooltip when set.

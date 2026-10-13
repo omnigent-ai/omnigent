@@ -47,6 +47,10 @@ and steers messages while the agent is busy.
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
   a server without agent install.
+- `voice-dictation`: the mic button (and ⌘/Ctrl+Alt+V) dictates into the
+  message box through Web Speech in Chrome/Safari, or through the server when
+  `/v1/info` advertises dictation. The desktop app offers the mic only when the
+  server does. States: listening, connecting, error toast, mic hidden.
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
 
@@ -62,6 +66,10 @@ and steers messages while the agent is busy.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
 - Send while the agent is working to queue a message, then steer it.
+- Click the mic (or press ⌘/Ctrl+Alt+V) to dictate; in the desktop app the
+  mic appears only when the connected server has dictation enabled. A side
+  chat's composer ("Ask a side question...") shows the same mic under the same
+  rule; the shortcut belongs to the main composer.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
@@ -89,6 +97,7 @@ and steers messages while the agent is busy.
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
 - Attach files or type `/` before the first send.
+- Dictate with the mic or ⌘/Ctrl+Alt+V, under the same desktop rule as above.
 - Open the agent picker's custom agents, then Create custom agent → Import
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
   selects the agent, which stays listed after a reload. A rejected bundle (for
@@ -193,6 +202,23 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `.tar.gz` of an agent directory. Expect the dialog to close with the agent
   selected, and the agent still listed after a reload. A bundle named like a
   server agent keeps the dialog open with the server's reason.
+- **`voice-dictation`, browser (server path):**
+  `tests/e2e_ui/chat/test_dictation.py::test_dictation_streams_transcript_into_composer`,
+  `tests/e2e_ui/chat/test_dictation.py::test_hotkey_toggles_dictation`
+  (fake engine). The Web Speech path needs a real Chrome; its rules are pinned
+  by `web/src/components/ComposerMicButton.test.tsx`.
+- **`voice-dictation`, desktop:**
+  `web/electron/e2e/desktop_dictation_availability.e2e.js` (new-session
+  composer only), run from `web/electron` after building the SPA
+  (`OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python xvfb-run -a
+  node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
+  server without dictation, then the mic dictating through a fake-engine
+  server. Manually, for the in-session, new-session and side-chat composers:
+  connect the desktop app to a default `omnigent server` (`/v1/info` reports
+  `dictation_available: false`) and expect no mic and ⌘/Ctrl+Alt+V to do
+  nothing; restart the server with
+  `OMNIGENT_DICTATION_ENGINE=fake`, reconnect, and expect the mic, the listening
+  state on click, and the fake transcript in the message box.
 - **`mobile-labels`, new-session composer:**
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
 
