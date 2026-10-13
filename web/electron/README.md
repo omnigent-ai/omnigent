@@ -140,7 +140,10 @@ tries silent renewal. Missing credentials, failed renewal, unavailable OAuth,
 and cancellation lead to the shell's connect/retry screen—not embedded workspace
 SSO. Failed connections stay blocked through the selector handoff so a late login
 redirect cannot replace it. Connect reuses stored credentials and opens the
-system browser only when they can't sign in. To use another account, choose
+system browser only when they can't sign in. Credentials are stored per
+workspace, so an account URL that names its workspace (`?o=<workspace id>`)
+reuses the credentials of the workspace it reached last time; without `?o=` it
+runs the account sign-in and workspace picker. To use another account, choose
 **Server → Sign Out of Server** (or **Sign out of <workspace>** in the server
 picker at the bottom of the sidebar, on servers whose web app includes it): it
 forgets the stored OAuth token, clears DBAUTH, and returns every window on that
@@ -151,7 +154,10 @@ links use stored credentials without opening a browser automatically.
 When the workspace is briefly unreachable (a VPN reconnecting after wake, an IP
 access list refusing this network, or HTTP 5xx/429), the window keeps its page
 under a **Reconnecting to Databricks…** overlay and retries every 5s for a minute,
-then every 10s for another. Cancel, or running out of retries, returns to the
+then every 10s for another. After that, an unreachable or IP-blocked workspace
+keeps retrying every minute until it answers; HTTP 5xx/429 stops there. Attempts
+wait while the Mac is offline without counting, and waking or unlocking the Mac
+starts the 5s retries over. Cancel, or running out of retries, returns to the
 setup page with the reason.
 
 For the packaged macOS app, explicitly roll back to embedded Databricks sign-in:
@@ -313,8 +319,8 @@ sign-in has a passkey step), then `just electron-dev`:
    (the cookie is renewed silently).
 5. **Invalidate Cached Refresh Token**, then **Simulate Session Expiry**, then
    reload: the connect screen says "Sign in to <host> to continue."
-6. Sign out from the app's settings: the connect screen says "You're signed out
-   of <host>." Relaunching doesn't sign you back in.
+6. Sign out from the app's settings: the connect screen opens without a message.
+   Relaunching doesn't sign you back in.
 7. An accounts-mode server and `http://localhost:6767` (header mode) still sign
    in exactly as before.
 
@@ -520,13 +526,20 @@ navigation denied; the remembered host-picker label alone does not grant it.
 Eligibility is scoped to the selected server/workspace, not all sessions on
 a Databricks server.
 
-After restarting the desktop, or if automatic connect fails, open **New
-session** > **Host** > **Reconnect to Arca** (or **Run on Arca** if the host
-is not remembered). Complete the existing connect console, then select your
-original session in the sidebar and retry the browser tool. Reconnecting can
-capture identity from an already-running daemon; it does not create a new
-session or change automatic-connect preferences. Failed or unrecognized
-capture keeps localhost denied, and the connect action remains available.
+After restarting the desktop, launch-time auto-connect restores this identity
+for users who opted into it. Otherwise, the first loopback preview request with
+a remembered Arca host offers the shell-owned reconnect console and returns the
+denial immediately; nothing runs until the user confirms, and the agent retries
+after recovery finishes. Concurrent retries share the same prompt or run.
+Opted-in recovery stays silent only when the remembered and source hosts match;
+a mismatch requires consent and is offered only when the host list identifies
+the source as Arca, so an incorrect remembered host can be recaptured and
+corrected without prompting from sandbox sessions. Both paths verify that the
+captured host ID matches the source session. Consent or auto-connect opt-in, the
+captured identity check, and the agent-context gate remain the trust boundaries. A decline briefly
+suppresses repeat prompts, while failed runs remain retryable. **Run on Arca** is
+hidden for an online remembered host only when the desktop advertises preview
+recovery; older shells keep the action visible.
 
 The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
 redirects and links that would open a new window (which stay in the same pane).
@@ -745,7 +758,9 @@ Local packages use the `ai.omnigent.desktop-dev` app ID and the **Omnigent Dev**
 name; output lands in `electron/dist-dev/` (the DMG is named
 `Omnigent Dev-<version>-<arch>.dmg`). They keep their own app data and do not
 install production desktop updates. `build:mac:release` retains
-`ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
+`ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`. For the full
+cross-platform publishing and update-feed checklist, see [the desktop release
+runbook](RELEASING.md).
 
 macOS apps, including unpackaged development, default to V2 onboarding only when the MDM preference
 `databricksInternalFeaturesEnabled` is `true`, for both new and existing profiles.

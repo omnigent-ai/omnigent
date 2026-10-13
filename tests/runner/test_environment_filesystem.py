@@ -98,6 +98,117 @@ async def test_list_environment_root(
 
 
 @pytest.mark.asyncio
+async def test_list_directory_enumeration_failure_returns_404(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def failed_enumeration(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"error": "Directory disappeared", "exit_code": 1}
+
+    monkeypatch.setattr(
+        "omnigent.runner.environment_filesystem._run_os_env_async", failed_enumeration
+    )
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/src"
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "path_not_found"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name_character", "name_length", "entry_count"),
+    [("x", 180, 500), ("é", 100, 200)],
+)
+async def test_large_directory_listing_pages_beyond_shell_output_limit(
+    tmp_path: Path, name_character: str, name_length: int, entry_count: int
+) -> None:
+    large = tmp_path / "large"
+    large.mkdir()
+    names = [f"{i:04d}-" + name_character * name_length + ".txt" for i in range(entry_count)]
+    for name in names:
+        (large / name).touch()
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+    found: list[str] = []
+    after: str | None = None
+    while True:
+        page = await fs.list_dir("large", limit=1000, after=after, order="asc")
+        found.extend(entry.name for entry in page.data)
+        if not page.has_more:
+            break
+        assert page.last_id is not None
+        assert page.last_id != after
+        after = page.last_id
+
+    assert found == names
+    assert len(found) == len(set(found))
+
+
+@pytest.mark.asyncio
+async def test_directory_listing_before_cursor_keeps_nearest_entries(tmp_path: Path) -> None:
+    for name in ("a.txt", "b.txt", "c.txt", "d.txt", "e.txt"):
+        (tmp_path / name).touch()
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    page = await fs.list_dir(limit=2, before="e.txt", order="asc")
+    assert [entry.name for entry in page.data] == ["c.txt", "d.txt"]
+    assert page.has_more is True
+    assert page.first_id == "c.txt"
+    assert page.last_id == "d.txt"
+
+
+@pytest.mark.asyncio
+async def test_directory_listing_descending_after_cursor(tmp_path: Path) -> None:
+    for name in ("a.txt", "b.txt", "c.txt", "d.txt", "e.txt"):
+        (tmp_path / name).touch()
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    first = await fs.list_dir(limit=2, order="desc")
+    assert [entry.name for entry in first.data] == ["e.txt", "d.txt"]
+    assert first.has_more is True
+
+    second = await fs.list_dir(limit=2, after=first.last_id, order="desc")
+    assert [entry.name for entry in second.data] == ["c.txt", "b.txt"]
+    assert second.has_more is True
+
+    last = await fs.list_dir(limit=2, after=second.last_id, order="desc")
+    assert [entry.name for entry in last.data] == ["a.txt"]
+    assert last.has_more is False
+
+
+@pytest.mark.asyncio
+async def test_directory_listing_rejects_truncated_helper_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    async def truncated_output(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"stdout": '[{"n": "partial"}\n[stdout truncated]', "exit_code": 0}
+
+    monkeypatch.setattr(
+        "omnigent.runner.environment_filesystem._run_os_env_async", truncated_output
+    )
+    with pytest.raises(RuntimeError, match="Invalid directory listing"):
+        await fs.list_dir()
+
+
+@pytest.mark.asyncio
 async def test_list_environment_root_with_broken_symlink(
     tmp_path: Path,
 ) -> None:

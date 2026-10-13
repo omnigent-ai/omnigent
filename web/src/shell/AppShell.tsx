@@ -521,6 +521,7 @@ export function AppShell() {
   // the mobile menu Clone entry's behavior. Cleared whenever the dialog
   // opens fresh or closes, so a later Clone doesn't silently truncate.
   const [forkUpToResponseId, setForkUpToResponseId] = useState<string | null>(null);
+  const [forkWorkspaceRecovery, setForkWorkspaceRecovery] = useState(false);
   // Agent tools & policies dialog — the mobile counterpart of the desktop
   // AgentInfoButton popover, opened from the header's three-dot menu.
   const [agentInfoOpen, setAgentInfoOpen] = useState(false);
@@ -1497,7 +1498,8 @@ export function AppShell() {
     const selectedTab = tabList?.querySelector<HTMLElement>(
       '[role="tab"][aria-selected="true"], [role="button"][aria-current="true"]',
     );
-    (selectedTab ?? tabList)?.focus();
+    const visibleSelectedTab = (selectedTab?.checkVisibility?.() ?? true) ? selectedTab : null;
+    (visibleSelectedTab ?? tabList)?.focus();
   }, []);
   const revealRightPanel = useCallback(() => {
     if (!conversationId) return;
@@ -2284,13 +2286,17 @@ export function AppShell() {
   // through ForkDialogContext's per-message "Fork from here" action.
   const forkDialogContextValue = useMemo<ForkDialogContextValue>(
     () => ({
+      currentSessionId: serverConversationId ?? null,
       canFork: canClone,
       disabledReason: forkDisabledReason,
-      openForkDialog: (opts?: { sourceSessionId?: string; upToResponseId?: string }) => {
+      openForkDialog: (opts) => {
+        const sourceSessionId =
+          opts?.sourceSessionId && opts.sourceSessionId !== serverConversationId
+            ? opts.sourceSessionId
+            : null;
         // A scoped source resolves its own restrictions in the form, independently
         // of the session currently displayed by the shell.
-        if (forkDisabledReason && !opts?.sourceSessionId) return;
-        const sourceSessionId = opts?.sourceSessionId ?? null;
+        if (forkDisabledReason && !sourceSessionId) return;
         const sourceState = sourceSessionId
           ? queryClient.getQueryState(["session", sourceSessionId])
           : undefined;
@@ -2300,6 +2306,7 @@ export function AppShell() {
         setForkSourceSessionId(sourceSessionId);
         setForkHostSessionId(sourceSessionId ? (serverConversationId ?? null) : null);
         setForkUpToResponseId(opts?.upToResponseId ?? null);
+        setForkWorkspaceRecovery(opts?.workspaceRecovery ?? false);
         setForkOpen(true);
       },
     }),
@@ -2706,7 +2713,7 @@ export function AppShell() {
             <ForkSessionDialog
               // Remount per source so source-derived form defaults reset when
               // a side-chat bubble opens the app-wide dialog.
-              key={`fork-session-dialog-${effectiveForkSourceSessionId}`}
+              key={`fork-session-dialog-${effectiveForkSourceSessionId}-${forkWorkspaceRecovery}`}
               sourceSessionId={effectiveForkSourceSessionId}
               sourceTitle={forkSourceSession?.title}
               sourceWorkspace={
@@ -2723,6 +2730,7 @@ export function AppShell() {
               }
               sourceGitBranch={forkSourceSession?.gitBranch}
               upToResponseId={forkUpToResponseId}
+              workspaceRecovery={forkWorkspaceRecovery}
               open={forkOpen}
               onOpenChange={(open) => {
                 setForkOpen(open);
@@ -2730,6 +2738,7 @@ export function AppShell() {
                 // clear immediately so Clone never forks partial history.
                 if (!open) {
                   setForkUpToResponseId(null);
+                  setForkWorkspaceRecovery(false);
                 }
               }}
             />

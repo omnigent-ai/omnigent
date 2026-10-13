@@ -126,6 +126,14 @@ instruction to chat. No instruction bar should appear below the browser URL.
 
 ## Authoring a desktop reproduction
 
+For macOS titlebar clearance, build the SPA and run
+`OMNIGENT_PYTHON="$PWD/.venv/bin/python" node --test web/electron/e2e/desktop_titlebar_zoom.e2e.js`
+from the repository root. This checks real Electron zoom from 50% to 150%,
+14px/16px roots, sidebar toggling, and reloading at 80%. Set
+`OMNIGENT_DESKTOP_RECORD_DIR` outside the checkout to retain the recording.
+Native traffic lights require a human visual check: use View → Zoom Out and
+Actual Size, then collapse/reopen the sidebar and open Settings.
+
 1. Copy `desktop_connect.e2e.js` to `e2e/desktop_<slug>.e2e.js`.
 2. If the bug's failure is **past** connect, pass `serverUrl` to
    `launchDesktop` so the app boots straight into the shell; if the bug is in

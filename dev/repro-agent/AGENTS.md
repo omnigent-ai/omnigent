@@ -227,6 +227,45 @@ comment is not evidence of accidental behavior. Keep observed symptoms separate
 from suspected causes. When code or logs suggest a competing explanation, use
 a discriminating observation or focused check and record what it supports or
 rules out. A familiar error message alone does not establish its cause.
+Follow the reported path to any shared registry, default, or policy definition
+that governs the behavior, then read its rationale, relevant callers, and tests.
+Do not infer the full contract from one local fallback.
+Even when the local fallback is explicit, follow the phase or operation type to
+its declaration and inspect other consumers for a shared table or default
+controlling error behavior. Cite that declaration, or a bounded search if absent.
+Follow imported policy symbols to their defining files: search for the declaration
+and other consumers. Record the governing symbol/value, definition path, historical
+rationale, and pinning test in `evidence`. A filename in search output or a symbol
+in a caller is not a definition read. If no shared definition exists, record the
+search that established that before choosing the test's expected result.
+
+For credential-lifetime or recovery hypotheses, first establish a working control
+through the reported credential-selection code and SDK. When external auth
+services are unavailable or sanitized, substitute only boundaries that this
+provider uses, with bounded local services and fake credentials. Static
+credentials need no invented issuance or refresh service. Keep application token
+resolution and the installed SDK intact; replacing the suspected component with
+canned results assumes the cause. Put timeouts on discovery and subprocess calls.
+After the control succeeds, follow the retained auth wrapper to its credential-
+producing delegate. Record that delegate's runtime class/module and the method
+actually invoked on it, without credential values. Profile-loading logs or
+subprocess calls shared by several providers do not identify which succeeded.
+If the executing delegate cannot be established, keep provider identity unresolved.
+Start with the smallest credential consumer, such as request-header construction,
+and preserve its working control before adding a long-running process. Add the
+full process only when the remaining hypothesis requires it. If initialization
+hangs, capture the blocking stack and output in the same bounded tool call; keep
+probe logs under the workspace. Use that observation to choose the next probe.
+If the stack identifies external configuration metadata/discovery calls, provide
+controlled responses and record whether the control reached them. Preserve other
+concrete blockers.
+Load an isolated version of the reported profile and use its credential at the
+caller's transport boundary. Keep the same application credential object while
+exercising the suspected expiry or rejection. Record whether it refreshes or
+recovers; mocking that object or its factory cannot satisfy this check. Complete
+this before writing a test that assumes stale credentials are the cause. A
+controlled check does not by itself reproduce an unavailable production incident;
+retain the controlled boundaries, concrete blockers and unsupported hypotheses.
 
 Keep this investigation bounded to the reported journey; a complete diagnosis
 is not required to hand off a valid reproduction. Preserve unresolved intent in
@@ -528,6 +567,11 @@ when *every* sub-symptom is fixed is the overall verdict `already_fixed`.
 
 ## Step 3 — Identify the smallest reliable regression coverage
 
+In the product checkout, read `tests/README.md` and `tests/_helpers/README.md`
+before writing setup; follow its API examples and the selection policy below.
+In `evidence`, name the nearest test/helper considered and explain any new setup.
+If the target repository has no catalog, inspect its nearby fixtures instead.
+
 Search existing tests across the repository by behavior, input event, and fixture,
 and read the nearest scenarios. Reuse their helpers before writing new setup.
 If one already drives the relevant setup and state transition, fold the missing
@@ -616,6 +660,10 @@ Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
 Follow these rules for each clip:
 
 - Show the user action and the product's response.
+- **Caption the screen from screen evidence.** Compare claimed outcomes with
+  inspected frames or visible-state assertions from the clip. Backend storage
+  and logs do not establish what the UI displayed; keep those findings in
+  `evidence`. Correct captions that conflict with the frames.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.
@@ -644,6 +692,11 @@ choice:
   even when a recording is available. For `needs_more_info` or
   `needs_manual_review`, include the known steps and clearly identify missing
   information or unverified steps; do not invent a successful reproduction.
+  For a component probe, label the manual user journey as unrun and report the
+  probe's observations separately. Before emitting either prose or JSON, match
+  each claimed observation to the executed operation and output. A printed label
+  is not proof that the named operation ran; a general stand-in caveat does not
+  make an unexecuted login, new process, connection, or recovery observed.
   You may also include a brief verdict and per-facet notes. Then, as the
   last thing before the JSON block, give concise test references per Step 3,
   including source locations and results. All of this is
@@ -749,6 +802,20 @@ Field meanings:
   only — you do not fix). Include the tested configuration, sources for expected
   behavior, competing explanations checked, and remaining uncertainty. Keep this
   concise and distinguish observations from inferences; never include secrets.
+  Before finalizing, check that this field contains the governing definition
+  (symbol/value and source), its rationale and pinning test, or the bounded
+  search establishing that no shared definition exists. A local handler alone
+  does not establish that absence: inspect shared policy/type declarations and
+  other consumers. For credential hypotheses, include the configured-path
+  control and observation from Step 1. Execute missing feasible checks before
+  the final handoff; preserve concrete blockers and unverified causes explicitly.
+  For credential-related investigations, identify the provider that actually
+  returns credentials using its runtime type or call trace, including fallback
+  selection. Attempted SDK setup is not successful provider execution. Without
+  that evidence, keep provider identity unresolved and do not claim its failure
+  mode was ruled out by a different provider's successful control.
+  Label fresh-instance header checks separately from new-process or successful-
+  connection checks, and keep unexercised outcomes unverified throughout the handoff.
 - `recordings` — the Step 4 captures: a list of
   `{"surface", "kind", "path", "format", "capture_mode", "caption"}` objects. `kind` is
   `"before"` for a `reproduced` facet's failing run or `"fixed"` for an
@@ -759,11 +826,13 @@ Field meanings:
   what the clip shows — e.g. `"start a session → open the model picker → select
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
-  behavior (the journey completing). This is per-recording (each clip drives its
-  own steps), distinct from the bug-level `journey` field. `capture_mode` is one
-  of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
-  authored-but-unrendered VHS tape in the artifact, but do not declare it as a
-  recording. Empty list when nothing valid was recorded.
+  behavior (the journey completing). Each screen claim comes from screen
+  evidence, not from a transcript or API check (Step 4). This is per-recording
+  (each clip drives its own steps), distinct from the bug-level `journey`
+  field. `capture_mode` is one of the surface-appropriate values in
+  `dev/recording-lanes.md`. Keep an authored-but-unrendered VHS tape in the
+  artifact, but do not declare it as a recording. Empty list when nothing valid
+  was recorded.
 - `recording_unavailable_reason` — leave empty when every expected clip is
   present. Otherwise explain each missing clip:
 

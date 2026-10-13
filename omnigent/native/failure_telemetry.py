@@ -15,6 +15,7 @@ _TEXT_FIELDS = frozenset(
         "failure_id",
         "failure_source",
         "forwarder_source_id",
+        "forwarder_rejection_reason",
         "detail_source",
         "failure_decision",
         "suppression_reason",

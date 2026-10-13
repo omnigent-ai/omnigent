@@ -118,6 +118,22 @@ _SIGN_IN_CODE = re.compile(
 )
 
 
+def _nearby(lines: list[str], index: int) -> str:
+    """Join the few screen lines around ``index`` where sign-in wording may sit."""
+    return "\n".join(lines[max(0, index - 3) : index + 3])
+
+
+def _is_endpoint(url: str) -> bool:
+    """Whether the path, query, or fragment of ``url`` (not its host) is auth-shaped."""
+    return _SIGN_IN_URL_SHAPE.search(re.sub(r"^https?://[^/?#]*", "", url)) is not None
+
+
+def _is_reprint(line: str, url: str) -> bool:
+    """Whether ``line`` is just ``url`` again or another endpoint (an earlier attempt's link)."""
+    text = line.strip().rstrip(".,;:")
+    return text == url or (_SIGN_IN_URL.fullmatch(text) is not None and _is_endpoint(text))
+
+
 def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     """Find a device-style sign-in prompt in terminal screen text.
 
@@ -127,17 +143,20 @@ def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     that prompt so the chat can offer to open the live link.
 
     Only an address that is itself an OAuth or device-flow endpoint, or that
-    sits within a few lines of sign-in instructions, counts. A running agent's
+    sits within a few lines of sign-in instructions, counts. The latest
+    endpoint wins (a launcher that retries prints a fresh link); an address
+    that only sits near instructions is the fallback. A running agent's
     screen is full of ordinary addresses (pull requests, docs links in a
     banner) and none of those is a gate. The prompt must also still be the
-    launcher's latest output: an agent that draws inline leaves the launcher's
-    lines on screen above its own, so any output below the address other than
-    the prompt's own trailing lines (the code, "waiting for sign-in") means the
-    sign-in already completed and the address is stale. The code is the first
-    device-code-shaped token on a line that mentions "code"; the address
-    itself is never taken as the code. An address wrapped across two pane
-    lines is truncated at the wrap, so callers should capture with wrapped
-    rows joined.
+    launcher's latest output: an agent that draws inline leaves the
+    launcher's lines on screen above its own, so any output below the first
+    such address other than the prompt's own trailing lines (the code,
+    "waiting for sign-in", an endpoint printed again) means the sign-in
+    already completed and the address is stale. The code is the
+    first device-code-shaped token on a line that mentions "code"; the
+    address itself is never taken as the code. An address wrapped across two
+    pane lines is truncated at the wrap, so callers should capture with
+    wrapped rows joined.
 
     :param screen: ANSI-stripped terminal screen text, or ``None``.
     :returns: The prompt, or ``None`` when no pending sign-in address is on screen.
@@ -145,21 +164,22 @@ def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     if not screen:
         return None
     lines = screen.splitlines()
-    url: str | None = None
-    for index, line in enumerate(lines):
-        for match in _SIGN_IN_URL.finditer(line):
-            candidate = match.group(0).rstrip(".,;:")
-            nearby = "\n".join(lines[max(0, index - 3) : index + 3])
-            if _SIGN_IN_URL_SHAPE.search(candidate) or _SIGN_IN_CUE.search(nearby):
-                url = candidate
-                break
-        if url is not None:
-            break
-    if url is None:
+    addresses = [
+        (index, match.group(0).rstrip(".,;:"))
+        for index, line in enumerate(lines)
+        for match in _SIGN_IN_URL.finditer(line)
+    ]
+    endpoints = [(index, url) for index, url in addresses if _is_endpoint(url)]
+    cued = [(index, url) for index, url in addresses if _SIGN_IN_CUE.search(_nearby(lines, index))]
+    if not endpoints and not cued:
         return None
+    url = endpoints[-1][1] if endpoints else cued[0][1]
+    first = min(index for index, _ in endpoints + cued)
     if any(
-        re.search(r"\w", _ECHOED_CONTROL.sub("", line)) and not _SIGN_IN_TRAILER.search(line)
-        for line in lines[index + 1 :]
+        re.search(r"\w", _ECHOED_CONTROL.sub("", line))
+        and not _SIGN_IN_TRAILER.search(line)
+        and not _is_reprint(line, url)
+        for line in lines[first + 1 :]
     ):
         return None
     code: str | None = None

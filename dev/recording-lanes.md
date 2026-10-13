@@ -324,6 +324,13 @@ pane greyed out behind "Bridge closed: terminal session ended", a deleted
 session, a result list emptied by fixture cleanup — means the recording outlived
 the test body. Fix the stop point and re-record; do not caption around it.
 
+Base screen claims on inspected frames or visible-state assertions from that
+recording. Backend logs and transcript storage can differ from what the UI has
+already displayed. Keep backend findings in `evidence`; describe the visible
+outcome in the caption. Check each claimed moment, especially claims that text
+or controls are absent. If the frames contradict the caption, correct it or
+re-record.
+
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in
 what the clip shows: e.g. `"start a session → open the model picker → select the

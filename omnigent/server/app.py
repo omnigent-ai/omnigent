@@ -3623,9 +3623,12 @@ def create_app(
         # cancel any pending disconnect-grace timer so it can't re-run the
         # disconnect reconciliation on top of it.
         _cancel_disconnect_grace(runner_id)
-        # A runner this replica saw connect already ran, so its idle sessions lost
-        # no work; a replica that never saw it has no stamp and keeps failing them.
-        runner_ran = session_live_state.last_liveness_stamp(runner_id) is not None
+        # Host connection evidence survives tunnel moves between replicas. Older
+        # hosts fall back to this replica's observed liveness.
+        runner_ran = (
+            runner_exit_reports.was_connected(runner_id)
+            or session_live_state.last_liveness_stamp(runner_id) is not None
+        )
         try:
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id

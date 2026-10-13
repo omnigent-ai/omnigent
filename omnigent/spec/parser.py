@@ -34,6 +34,7 @@ from omnigent.inner.datamodel import (
     TerminalEnvSpec,
     parse_write_paths,
 )
+from omnigent.inner.git_ssh_policy import parse_git_ssh_bindings as _parse_git_ssh
 from omnigent.inner.sandbox import containment_prefix
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
@@ -997,6 +998,7 @@ def _parse_os_env_sandbox(
     mask_paths = _parse_mask_paths(raw.get("mask_paths"))
     env_passthrough = _parse_env_passthrough(raw.get("env_passthrough"))
     egress_rules = _parse_egress_rules(raw.get("egress_rules"))
+    git_ssh = _parse_git_ssh(raw.get("git_ssh"))
     from omnigent.inner.sandbox import _default_sandbox_for_platform, _resolve_sandbox_type
 
     if "type" not in raw:
@@ -1030,6 +1032,12 @@ def _parse_os_env_sandbox(
             "Fix: set os_env.sandbox.type to linux_bwrap on Linux or "
             "darwin_seatbelt on macOS; do not use sandbox.type=none with "
             "egress_rules.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if git_ssh and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise OmnigentError(
+            "os_env.sandbox.git_ssh requires linux_bwrap or darwin_seatbelt "
+            "for hard network enforcement",
             code=ErrorCode.INVALID_INPUT,
         )
     credential_proxy = _parse_credential_proxy(raw.get("credential_proxy"))
@@ -1073,6 +1081,7 @@ def _parse_os_env_sandbox(
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
         credential_proxy=credential_proxy,
+        git_ssh=git_ssh,
     )
 
 

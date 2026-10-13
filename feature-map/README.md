@@ -127,7 +127,8 @@ map an area, remove it here in the same change.
 **Web and apps** (UI test areas):
 
 - Chat transcript, errors, and MCP status: `tests/e2e_ui/chat/` (only the
-  composer and terminal journeys are mapped)
+  composer, side-chat, model-picker, harness-visibility, reconnect, and
+  terminal journeys are mapped)
 - Approvals, permission cards, and the inbox: `tests/e2e_ui/approvals/` (only
   native edit-tool approvals are mapped)
 - Sub-agents and the agent info popover: `tests/e2e_ui/agents/`
@@ -143,12 +144,13 @@ map an area, remove it here in the same change.
 - Branding and base-path deploys: `tests/e2e_ui/branding/`, `tests/e2e_ui/base_path/`
 - Hotkeys: `tests/e2e_ui/hotkeys/`
 - Message rendering: `tests/e2e_ui/messages/` (only per-harness render parity
-  is mapped)
-- Mobile layout: `tests/e2e_ui/mobile/` (only composer labels and terminal
-  touch scroll are mapped)
-- Host import review: `tests/e2e_ui/onboarding/`
+  and Claude shell-command settlement are mapped)
+- Mobile layout: `tests/e2e_ui/mobile/` (only composer labels, the composer
+  after an unacknowledged send, sidebar rename under the keyboard, and
+  terminal touch scroll are mapped)
+- Onboarding and host import review: `tests/e2e_ui/onboarding/` (only the
+  import review modal's link to Harnesses is mapped)
 - Visual snapshots: `tests/e2e_ui/visual/`
-- Onboarding: `tests/e2e_ui/onboarding/`
 
 **CLI commands:**
 
@@ -187,9 +189,9 @@ budgets, MCP servers, sandbox providers, and smart routing.
 - **Every PR, advisory:** when a PR changes user-facing code, the Polly review
   adds a non-blocking note if the change adds or removes an entry point that the
   matching feature file does not reflect.
-- **Weekly:** the feature-map upkeep workflow is being prepared to check the
-  seed files against source and run their referenced tests. Scheduled runs
-  start in report-only mode; opening a correction PR requires an explicit
+- **Weekly:** the feature-map upkeep workflow checks feature files against
+  source and runs their referenced tests. Scheduled runs are report-only;
+  opening an automatic correction PR requires an explicit
   apply run after validation. An incomplete or blocked pass must identify its
   gaps and must not publish corrections. A real product regression is reported,
   not documented away.

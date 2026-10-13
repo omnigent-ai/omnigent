@@ -16,6 +16,8 @@ import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
 import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
+import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import type { Host } from "@/hooks/useHosts";
 import type { Session } from "@/lib/types";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
@@ -26,7 +28,13 @@ interface BrowserDesktopBridge {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean; sourceHostId?: string },
+    opts?: {
+      force?: boolean;
+      agent?: boolean;
+      sourceHostId?: string;
+      rememberedArcaHostId?: string;
+      sourceIsArcaHost?: boolean;
+    },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserScreenshot?: (
     conversationId: string,
@@ -35,6 +43,20 @@ interface BrowserDesktopBridge {
     conversationId: string,
     js: string,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
+}
+
+function isLoopbackPreview(url: string): boolean {
+  try {
+    const { hostname } = new URL(url);
+    return (
+      hostname === "localhost" ||
+      hostname.endsWith(".localhost") ||
+      hostname === "127.0.0.1" ||
+      hostname === "[::1]"
+    );
+  } catch {
+    return false;
+  }
 }
 
 function getBrowserDesktop(): BrowserDesktopBridge | null {
@@ -222,6 +244,8 @@ async function dispatch(
   args: Record<string, unknown>,
   desktop: BrowserDesktopBridge,
   sourceHostId: string | null,
+  rememberedArcaHostId: string | null,
+  sourceIsArcaHost: boolean,
 ): Promise<ActionResult> {
   try {
     switch (action) {
@@ -237,8 +261,19 @@ async function dispatch(
           force: true,
           agent: true,
           ...(sourceHostId ? { sourceHostId } : {}),
+          ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
+          ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
+        if (
+          isLoopbackPreview(url) &&
+          sourceHostId &&
+          rememberedArcaHostId &&
+          sourceHostId !== rememberedArcaHostId
+        ) {
+          // Main only approves this after consent captures the source host.
+          writeArcaHostId(sourceHostId);
+        }
         return { ok: true, data: { final_url: url } };
       }
       case "screenshot": {
@@ -398,9 +433,27 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
           // Unknown provenance stays denied for localhost; public browsing still works.
         }
       }
+      const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
+      const sourceIsArcaHost =
+        evt.action === "navigate" && sourceHostId !== null
+          ? queryClient
+              .getQueriesData<Host[]>({ queryKey: ["hosts"] })
+              .flatMap(([, rows]) => rows ?? [])
+              .some(
+                (host) => host.host_id === sourceHostId && isArcaHost(host, rememberedArcaHostId),
+              )
+          : false;
       const result = cancelled
         ? { ok: false, error: "browser relay context changed" }
-        : await dispatch(sourceConversationId, evt.action, evt.args, desktop, sourceHostId);
+        : await dispatch(
+            sourceConversationId,
+            evt.action,
+            evt.args,
+            desktop,
+            sourceHostId,
+            rememberedArcaHostId,
+            sourceIsArcaHost,
+          );
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 

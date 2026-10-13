@@ -180,7 +180,7 @@ async def test_stop_intent_tracks_actual_host_frame_handoff(
             assert encoded is None
         else:
             assert encoded is not None
-            frame = decode_host_frame(encoded)
+            frame = decode_host_frame(encoded.data)
             assert isinstance(frame, HostStopRunnerFrame)
             assert frame.runner_id == _RUNNER
             if outcome == "cancelled":
@@ -464,7 +464,7 @@ async def test_repeated_stop_renews_retained_intent(
     try:
         encoded = await asyncio.wait_for(conn.outbound_queue.get(), timeout=10)
         assert encoded is not None
-        frame = decode_host_frame(encoded)
+        frame = decode_host_frame(encoded.data)
         assert isinstance(frame, HostStopRunnerFrame)
         assert frame.runner_id == _RUNNER
         assert not await asyncio.wait_for(first, timeout=10)
@@ -480,7 +480,7 @@ async def test_repeated_stop_renews_retained_intent(
         )
         encoded = await asyncio.wait_for(conn.outbound_queue.get(), timeout=10)
         assert encoded is not None
-        frame = decode_host_frame(encoded)
+        frame = decode_host_frame(encoded.data)
         assert isinstance(frame, HostStopRunnerFrame)
         assert frame.runner_id == _RUNNER
         now += 2

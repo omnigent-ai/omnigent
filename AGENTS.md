@@ -3,6 +3,17 @@
 Guidance for AI agents (Claude Code, Copilot, Cursor, etc.) working in this
 repository. See `CONTRIBUTING.md` for the full contributor workflow.
 
+## Test changes
+
+Before adding test setup, read [the test guide](tests/README.md) and
+[primitive catalog](tests/_helpers/README.md), then inspect the nearest scenario.
+Reuse sufficient coverage unchanged or extend a compatible scenario. Keep input
+matrices at the lowest reliable layer; retain E2E for distinct process, transport
+or browser boundaries. Reuse primitives with explicit caller inputs and keep
+faults and assertions in the test. Explain new setup or a separate E2E in the
+PR's Test Plan (Repro uses `evidence`; Resolve uses `test_audit`). Count helper changes in
+test LOC; fewer lines alone do not establish adequate coverage.
+
 ## Committing
 
 Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
