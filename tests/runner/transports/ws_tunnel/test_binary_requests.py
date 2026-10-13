@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import socket
 import time
 from collections.abc import AsyncIterator
@@ -19,6 +20,7 @@ from websockets.asyncio.server import serve
 from omnigent.runner.transports.ws_tunnel import registry as registry_module
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
 from omnigent.runner.transports.ws_tunnel.binary_requests import encode_binary_request
+from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     PingFrame,
@@ -762,6 +764,139 @@ async def test_cancel_queued_before_dispatch_starts_emits_one_end() -> None:
             assert isinstance(frame, ResponseEndFrame)
             assert frame.id == "queued-cancel" and frame.error == "runner_request_cancelled"
             assert isinstance(decode_frame(await asyncio.wait_for(ws.recv(), 2)), PingFrame)
+
+
+async def test_cancelled_dispatch_preserves_cancellation_on_closed_sender(caplog) -> None:
+    async def app(scope, receive, send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await asyncio.Event().wait()
+
+    async def peer(ws) -> None:
+        for _ in range(3):
+            assert isinstance(decode_frame(await ws.recv()), ResponseHeadFrame)
+        await ws.close(code=1011, reason="connection lost")
+
+    caplog.set_level(logging.WARNING, logger=serve_module.__name__)
+    async with serve(peer, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        async with connect(f"ws://127.0.0.1:{port}") as ws:
+            dispatches: dict[str, asyncio.Task[None]] = {}
+            for i in range(3):
+                await _handle_tunnel_frame(
+                    app,
+                    encode_frame(RequestFrame(f"sse-{i}", "GET", "/stream")),
+                    ws.send,
+                    dispatches,
+                    {},
+                )
+            tasks = list(dispatches.values())
+            await asyncio.wait_for(ws.wait_closed(), 2)
+            await serve_module._cancel_dispatch_tasks(dispatches)
+            assert all(task.cancelled() for task in tasks)
+            assert not [
+                record for record in caplog.records if record.name == serve_module.__name__
+            ]
+
+
+async def test_cancelled_terminal_send_is_bounded(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    monkeypatch.setattr(serve_module, "_CANCELLED_RESPONSE_END_TIMEOUT_S", 0.05, raising=False)
+    never = asyncio.Event()
+    head_received = asyncio.Event()
+    terminal_started = asyncio.Event()
+
+    async def app(scope, receive, send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await never.wait()
+
+    async def peer(ws) -> None:
+        assert isinstance(decode_frame(await ws.recv()), ResponseHeadFrame)
+        head_received.set()
+        await ws.wait_closed()
+
+    caplog.set_level(logging.WARNING, logger=serve_module.__name__)
+    async with serve(peer, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        async with connect(f"ws://127.0.0.1:{port}") as ws:
+
+            async def stalled_send(raw: str) -> None:
+                if isinstance(decode_frame(raw), ResponseEndFrame):
+                    terminal_started.set()
+                    await never.wait()
+                await ws.send(raw)
+
+            dispatches: dict[str, asyncio.Task[None]] = {}
+            await _handle_tunnel_frame(
+                app,
+                encode_frame(RequestFrame("stalled-end", "GET", "/stream")),
+                stalled_send,
+                dispatches,
+                {},
+            )
+            task = dispatches["stalled-end"]
+            try:
+                await asyncio.wait_for(head_received.wait(), 2)
+                task.cancel()
+                await asyncio.wait_for(terminal_started.wait(), 2)
+                done, _ = await asyncio.wait({task}, timeout=0.5)
+                assert task in done, (
+                    "cancellation terminal send must not stall dispatch cancellation"
+                )
+                assert task.cancelled()
+                assert not [
+                    record for record in caplog.records if record.name == serve_module.__name__
+                ]
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("shutdown_capable", [False, True], ids=["plain", "graceful"])
+async def test_closed_tunnel_skips_cancellation_terminal_send(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+    shutdown_capable: bool,
+) -> None:
+    dispatches: list[asyncio.Task[None]] = []
+    terminal_attempts: list[str] = []
+    original_send = TunnelDiagnostics.send
+
+    async def observe_send(self, sender, data, *, app_ping_ts=None) -> None:
+        if isinstance(data, str) and isinstance(decode_frame(data), ResponseEndFrame):
+            terminal_attempts.append(data)
+        await original_send(self, sender, data, app_ping_ts=app_ping_ts)
+
+    monkeypatch.setattr(TunnelDiagnostics, "send", observe_send)
+
+    async def app(scope, receive, send) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        dispatches.append(task)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await asyncio.Event().wait()
+
+    async def peer(ws) -> None:
+        assert isinstance(decode_frame(await ws.recv()), HelloFrame)
+        await ws.send(encode_frame(RequestFrame("closed-tunnel", "GET", "/stream")))
+        assert isinstance(decode_frame(await ws.recv()), ResponseHeadFrame)
+        await ws.close(code=1000)
+
+    caplog.set_level(logging.WARNING, logger=serve_module.__name__)
+    async with serve(peer, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        await asyncio.wait_for(
+            serve_module._serve_tunnel_once(
+                app,
+                tunnel_url=f"ws://127.0.0.1:{port}",
+                server_url=f"http://127.0.0.1:{port}",
+                runner_id=_RUNNER,
+                runner_version="test",
+                shutdown_event=asyncio.Event() if shutdown_capable else None,
+            ),
+            2,
+        )
+    assert len(dispatches) == 1 and dispatches[0].cancelled()
+    assert not terminal_attempts
+    assert not [record for record in caplog.records if record.name == serve_module.__name__]
 
 
 async def test_binary_dispatch_deadline_recovers_slot_with_healthy_pings(
