@@ -2434,3 +2434,91 @@ async def test_over_path_max_directory_is_client_error(
         for parent in reversed(parents):
             os.rmdir(part, dir_fd=parent)
             os.close(parent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_change", ["renamed", "replaced", "file"])
+@pytest.mark.parametrize("retire", ["restart_sweep", "status", "complete", "recovery"])
+async def test_finalizing_parent_loss_retires_upload(
+    client: httpx.AsyncClient, tmp_path: Path, parent_change: str, retire: str
+) -> None:
+    from omnigent.runner.workspace_upload import RouteError, UploadDeclaration
+
+    manager = client._transport.app.state.workspace_uploads
+    payload = b"\x00\xffabc"
+    original = b"unchanged destination\x00\xfe"
+    manager.limits = UploadLimits(max_open_uploads=1, max_open_bytes=len(payload))
+    sub = tmp_path / "workspace" / "sub"
+    sub.mkdir()
+    (sub / "payload.bin").write_bytes(original)
+    response = await create(client, dir="sub", size=len(payload), on_conflict="replace")
+    assert response.status_code == 201
+    uid = response.json()["upload_id"]
+    url = BASE + "/" + uid + "?created_by=alice"
+    assert (await client.patch(url, headers=HEADERS, content=payload)).status_code == 204
+    record = manager.records[uid]
+    staging = Path(record.staging_path)
+    record.publication = await manager._call(uid, record, "plan")
+    assert record.publication["sha256"] == hashlib.sha256(payload).hexdigest()
+    record.finalizing = True
+    await manager._persist()
+    persisted = json.loads(manager.state_path.read_text())[uid]
+    assert persisted["finalizing"] and persisted["publication"] == record.publication
+    assert persisted["result"] is None
+    sub.rename(sub.parent / "retired")
+    moved = sub.parent / "retired"
+    if parent_change == "replaced":
+        sub.mkdir()
+        (sub / "unrelated").write_bytes(original)
+    elif parent_change == "file":
+        sub.write_bytes(original)
+    with pytest.raises(RouteError) as failed_complete:
+        await manager._call(uid, record, "complete", publication=record.publication)
+    assert failed_complete.value.code == "invalid_path"
+    assert (moved / staging.name).read_bytes() == payload
+    assert (moved / "payload.bin").read_bytes() == original
+    fresh = None
+    try:
+        if retire == "restart_sweep":
+            await manager.stop()
+            fresh = restart(manager)
+            fresh.limits = manager.limits
+            manager = fresh
+            assert manager.records[uid].finalizing and uid in manager.restored
+            await manager.sweep(now=record.created_at + manager.limits.max_age_s + 1)
+        elif retire == "recovery":
+            with pytest.raises(RouteError) as failed_recovery:
+                await manager._recover(uid, record)
+            assert failed_recovery.value.status == 410
+        elif retire == "status":
+            assert (await client.head(url)).status_code == 410
+        else:
+            assert (await client.post(url.replace("?", "/complete?"))).status_code == 410
+        assert uid not in manager.records
+        assert uid not in manager.upload_locks
+        assert uid not in manager.restored
+        assert uid not in json.loads(manager.state_path.read_text())
+        assert not manager._pinned(("session", DEFAULT_ENVIRONMENT_ID))
+        helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+        assert (await asyncio.to_thread(helper.call, {"op": "status", "id": uid}))[
+            "code"
+        ] == "gone"
+        for op in ("status", "complete"):
+            with pytest.raises(RouteError) as expired:
+                await manager.operate("session", DEFAULT_ENVIRONMENT_ID, uid, "alice", op)
+            assert expired.value.status == 410
+        declaration = UploadDeclaration(
+            dir="", name="quota-free", size=len(payload), created_by="alice"
+        )
+        assert (await manager.create("session", DEFAULT_ENVIRONMENT_ID, declaration))[
+            "offset"
+        ] == 0
+        assert (moved / staging.name).read_bytes() == payload
+        assert (moved / "payload.bin").read_bytes() == original
+        if parent_change == "replaced":
+            assert (sub / "unrelated").read_bytes() == original
+        elif parent_change == "file":
+            assert sub.read_bytes() == original
+    finally:
+        if fresh is not None:
+            await fresh.stop()

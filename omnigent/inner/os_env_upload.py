@@ -442,10 +442,15 @@ class UploadEngine:
             raise UploadError("invalid_name", "Invalid basename")
         staging = staging_basename(original, uid)
         self._grant(directory, name, staging)
-        parent = _parent(self.cwd, directory)
+        try:
+            parent = _parent(self.cwd, directory)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            self._forget(uid)
+            raise UploadError("parent_gone", "Destination directory disappeared") from exc
         try:
             if _identity(parent) != (m["parent_dev"], m["parent_ino"]):
-                raise UploadError("invalid_path", "Destination directory changed")
+                self._forget(uid)
+                raise UploadError("parent_gone", "Destination directory changed")
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             except FileNotFoundError as exc:
