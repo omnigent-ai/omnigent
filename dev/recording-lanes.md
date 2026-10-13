@@ -199,6 +199,18 @@ pytest-playwright, or Chromium upgrades, rerun
 `tests/e2e_ui/test_recorded_page_clip_screenshots.py` and
 `tests/e2e_ui/test_recording_stops_before_teardown.py` as canaries.
 
+**End the clip on the assistant's reply, not on an echo of the prompt.** When
+the journey's outcome is an assistant response — marker prompts ("Reply with
+exactly the literal string X and nothing else") included — the user's own
+message bubble already contains the expected text, so a page-wide check such as
+`page.get_by_text(marker)` or `marker in page.inner_text("body")` passes the
+moment the prompt renders and proves nothing about the reply. Scope the wait to
+the assistant's message, excluding the user's bubble, and wait for the working
+indicator to clear before stopping the recording. If the reply never becomes
+visible, the clip does not show the claimed outcome: treat that recording
+attempt as failed and re-record, or declare the clip only with a caption
+limited to what it actually shows.
+
 ## `mobile` facets
 
 The iOS/Android apps are thin native shells that load the *same* server-served SPA
@@ -329,3 +341,11 @@ For each recording, write a short **`caption`** in its handoff entry describing
 what the clip shows: e.g. `"start a session → open the model picker → select the
 catalog → picker shows raw IDs"`. This is what a reader sees under the video on
 the ticket, so make it read like a journey, not a restatement of the bug title.
+
+The caption is a claim about the footage, so check it against the footage
+before declaring the clip: confirm the final frames actually show the end state
+the caption asserts (scrub the video or inspect the recorder's last
+screenshots). A driver's printed probe result is not that confirmation — a
+check the prompt text itself satisfies is vacuous, and quoting it as proof
+writes a demonstration claim the video does not support. Caption only what is
+visible on screen.

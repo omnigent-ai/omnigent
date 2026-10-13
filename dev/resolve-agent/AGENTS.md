@@ -125,6 +125,12 @@ commit-hook edit, or changed test/environment requires reassessment and rerunnin
 affected checks. Preserve earlier evidence under its original identity. A
 handoff narrative or file hash alone is not proof that a command ran.
 
+When a phase procedure requires a recording, the clip must visibly end on the
+corrected outcome it claims to demonstrate, and the caption must match the
+footage. For assistant-reply journeys that use marker prompts, scope validation
+to the assistant response and wait for the working indicator to clear; a marker
+echo elsewhere on the page is not proof the reply rendered.
+
 `fixed` or approval requires the mode's behavior proof and no uncovered required
 regression check. Preserve incomplete work as `partially_fixed` with
 `remaining_work`, or `needs_more_info` when resolution cannot be established.
