@@ -80,6 +80,10 @@ KIMI_KEY = "kimi"
 # installer, not an npm package managed by ``omni setup``.
 KIRO_KEY = "kiro"
 
+# IBM Bob Shell signs in from its own TUI (IBMid in the browser, stored under
+# ``~/.bob``) and ships via IBM's checksum-verifying install script.
+BOB_KEY = "bob"
+
 # Minimum CLI versions for native harnesses where the runtime has a known
 # feature floor. These are intentionally conservative: the runtime may
 # gracefully degrade on older CLIs, but setup enforces the floor so a user
@@ -118,6 +122,8 @@ KIRO_KEY = "kiro"
 # - hermes: parent_session_id schema introduced in v0.17.0. Hermes reports a
 #   semver version with the build date alongside it
 #   (``Hermes Agent v0.19.1 (2026.7.30)``), so the floor is that semver.
+# - bob: Bob Shell 2.0.0 replaced the 1.0.x CLI with the ``bob chat`` TUI the
+#   harness launches (1.0.x has no ``chat`` subcommand). Live-verified on 2.0.5.
 _CODEX_MIN_VERSION = "0.137.0"
 _PI_MIN_VERSION = "0.84.2"
 _QWEN_MIN_VERSION = "0.18.1"
@@ -128,6 +134,7 @@ _CLAUDE_MIN_VERSION = "2.1.161"
 _CURSOR_MIN_VERSION = "2026.06.02"
 _KIMI_MIN_VERSION = "0.7.0"
 _ANTIGRAVITY_MIN_VERSION = "1.1.13"
+_BOB_MIN_VERSION = "2.0.0"
 
 # OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
 # installed via the ``opencode-ai`` npm package. No login/logout/status argv
@@ -286,6 +293,14 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="curl -fsSL https://cli.kiro.dev/install | bash",
         min_version=_KIRO_MIN_VERSION,
     ),
+    BOB_KEY: HarnessInstallSpec(
+        "IBM Bob Shell",
+        "bob",
+        package=None,
+        install_hint="curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash",
+        auth_hint="sign in with IBMid when `bob chat` first opens; Bob stores the login",
+        min_version=_BOB_MIN_VERSION,
+    ),
     # The native Antigravity (agy) TUI bridge wraps the ``agy`` CLI. agy's auth
     # service is reached by launching ``agy`` itself (no login subcommand); after
     # the browser flow completes, ``agy models`` exits 0 and provides the same
@@ -402,6 +417,10 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary through the catalog.
     "devin-native": DEVIN_KEY,
     "native-devin": DEVIN_KEY,
+    # Native IBM Bob Shell TUI (``bob-native``, via ``omni bob``) wraps the
+    # ``bob`` CLI; the bare ``bob`` spelling canonicalizes to it.
+    "bob-native": BOB_KEY,
+    "native-bob": BOB_KEY,
 }
 
 

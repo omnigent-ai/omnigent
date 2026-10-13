@@ -38,6 +38,21 @@ describe("nativeCodingAgentForHarness", () => {
     expect(agent?.displayName).toBe("Qwen Code");
   });
 
+  it("resolves IBM Bob and folds the reversed native-bob alias", () => {
+    const bob = nativeCodingAgentForHarness("bob-native");
+    expect(bob).toMatchObject({
+      key: "bob",
+      agentName: "bob-native-ui",
+      harness: "bob-native",
+      wrapperLabel: "bob-native-ui",
+      displayName: "IBM Bob",
+      iconKind: "bob",
+    });
+    expect(nativeCodingAgentForHarness("native-bob")).toBe(bob);
+    // Model, effort, and permissions live in Bob's own TUI, so no picker knobs.
+    expect(bob && "capabilities" in bob).toBe(false);
+  });
+
   it("folds the reversed native-qwen alias to the qwen-native spec", () => {
     expect(nativeCodingAgentForHarness("native-qwen")).toBe(
       nativeCodingAgentForHarness("qwen-native"),

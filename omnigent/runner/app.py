@@ -277,6 +277,7 @@ def _native_builder(name: str) -> _NativeBuilderCall:
 
 for _builder_name in (
     "_auto_create_antigravity_terminal",
+    "_auto_create_bob_terminal",
     "_auto_create_claude_terminal",
     "_auto_create_codex_terminal",
     "_auto_create_cursor_terminal",
@@ -1347,6 +1348,7 @@ def create_runner_app(
     _qwen_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _kimi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _hermes_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _bob_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _claude_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -2671,6 +2673,7 @@ def create_runner_app(
                     "qwen": _qwen_terminal_ensure_locks,
                     "kimi": _kimi_terminal_ensure_locks,
                     "devin": _devin_terminal_ensure_locks,
+                    "bob": _bob_terminal_ensure_locks,
                 }
             )[_native_agent.key]
             _launch_ctx = NativeLaunchContext(
@@ -3345,6 +3348,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _bob_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
@@ -3525,6 +3529,7 @@ def create_runner_app(
             "qwen-native",
             "kimi-native",
             "hermes-native",
+            "bob-native",
         }:
             return
         if status == "idle" and harness in {"codex-native", "antigravity-native"}:
@@ -7097,6 +7102,7 @@ def create_runner_app(
     _resource_routes = register_resource_routes(
         app,
         _antigravity_terminal_ensure_locks=_antigravity_terminal_ensure_locks,
+        _bob_terminal_ensure_locks=_bob_terminal_ensure_locks,
         _claude_terminal_ensure_locks=_claude_terminal_ensure_locks,
         _codex_terminal_ensure_locks=_codex_terminal_ensure_locks,
         _cursor_terminal_ensure_locks=_cursor_terminal_ensure_locks,
@@ -7392,6 +7398,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _bob_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         if process_manager is not None:
             await process_manager.release(session_id)
@@ -7422,6 +7429,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _bob_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await _teardown_session_terminals(session_id)
         if process_manager is not None:

@@ -1324,6 +1324,90 @@ def register_native_commands(cli: click.Group) -> None:
         default=None,
         help=(
             "Remote omnigent URL. Ensures the host daemon, asks the "
+            "daemon-spawned runner to launch the bob chat TUI, and attaches this "
+            'TTY. Pass --server "" to auto-spawn a persistent local server in the '
+            "background and use that instead of a remote one."
+        ),
+    )
+    @click.option(
+        "-r",
+        "--resume",
+        "resume",
+        is_flag=False,
+        flag_value=_RESUME_PICKER_SENTINEL,
+        default=None,
+        help=(
+            "Resume a prior Omnigent conversation. With a conversation id "
+            "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+            "opens an interactive picker scoped to bob-native sessions."
+        ),
+    )
+    @click.argument("bob_args", nargs=-1, type=click.UNPROCESSED)
+    def bob(
+        server: str | None,
+        resume: str | None,
+        bob_args: tuple[str, ...],
+    ) -> None:
+        """Launch IBM Bob Shell (bob chat) with Omnigent.
+
+        Bob's own sign-in, license, folder-trust and tool-approval prompts
+        appear in its terminal; Omnigent never answers them. Pass documented
+        ``bob chat`` options after ``--`` (``--auto-approve`` is not accepted).
+
+        \b
+        Examples:
+          omnigent bob
+          omnigent bob -- --mode plan
+          omnigent bob -- --resume <bob-task-id>   # resume a Bob task
+          omnigent bob --resume conv_abc123        # reattach an Omnigent session
+          omnigent bob --resume                    # interactive picker
+        """
+        choice = _split_resume_value(resume)
+
+        from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.bob_native.launch_args import (
+            BobLaunchArgsError,
+            validate_bob_chat_args,
+        )
+        from omnigent.harnesses.bob_native.main import run_bob_native
+
+        cfg = _load_effective_config()
+        startup_args = _resolve_harness_startup_args(cfg, "bob-native", bob_args)
+        # Reject unsupported Bob args before any server or daemon is started.
+        try:
+            validate_bob_chat_args(startup_args or ())
+        except BobLaunchArgsError as exc:
+            raise click.ClickException(str(exc)) from exc
+        # Thread ``harness.bob-native.command`` config into the runner via
+        # ``OMNIGENT_BOB_PATH`` before ``_ensure_backend`` so a locally-spawned
+        # daemon inherits it.
+        _resolved = resolve_harness_command("bob-native", default="", explicit=None, cfg=cfg)
+        if _resolved:
+            os.environ["OMNIGENT_BOB_PATH"] = _resolved
+        if server is None:
+            server = cfg.get("server")
+        auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+        server = _ensure_backend(server)
+        run_bob_native(
+            server=server,
+            session_id=choice.conversation_id,
+            resume_picker=choice.picker,
+            extra_args=startup_args,
+            auto_open_conversation=auto_open_conversation,
+        )
+
+    @cli.command(
+        context_settings={
+            "ignore_unknown_options": True,
+            "allow_extra_args": True,
+        }
+    )
+    @click.option(
+        "--server",
+        default=None,
+        help=(
+            "Remote omnigent URL. Ensures the host daemon, asks the "
             "daemon-spawned runner to launch the qwen TUI, and attaches this TTY. "
             'Pass --server "" to auto-spawn a persistent local server in the '
             "background and use that instead of a remote one."

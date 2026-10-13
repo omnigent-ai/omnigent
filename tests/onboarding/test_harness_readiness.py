@@ -195,6 +195,8 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "goose-native",
         "native-goose",
         "hermes",
+        "bob-native",
+        "native-bob",
         # Builtin ACP CLI harnesses gate on their vendor binary; every catalog
         # row (and alias) joins automatically.
         *sorted(
@@ -414,6 +416,11 @@ def test_configured_harness_map_covers_all_spellings(
         # Native Kiro (``omni kiro``) — gates on the kiro-cli binary.
         "kiro-native",
         "native-kiro",
+        # Native IBM Bob Shell (``omni bob``) — gates on the bob binary; the bare
+        # ``bob`` spelling canonicalizes onto ``bob-native``.
+        "bob",
+        "bob-native",
+        "native-bob",
         # Native Devin (``omni devin``) — gates on the devin binary. The bare
         # ``devin`` spelling canonicalizes onto ``devin-native``, so it is
         # covered too; Devin's ACP row is keyed ``devin-acp`` and gates on the
@@ -518,6 +525,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "native-goose",
         "qwen",
         "hermes",
+        "bob-native",
+        "native-bob",
         *sorted(ACP_CLI_HARNESSES),
     ):
         assert result[cli] is not True, f"{cli} should be gated on its CLI binary"

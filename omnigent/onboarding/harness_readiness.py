@@ -46,6 +46,7 @@ from omnigent.harness_availability import (
 )
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
+    BOB_KEY,
     COPILOT_KEY,
     CURSOR_KEY,
     DEVIN_KEY,
@@ -170,6 +171,11 @@ _HERMES_NATIVE_HARNESSES: frozenset[str] = frozenset({"hermes-native", "native-h
 # inside the executor.
 _DEVIN_NATIVE_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
 
+# Native IBM Bob Shell harnesses boot the ``bob chat`` TUI (``omni bob``). Bob
+# owns its sign-in, license and folder-trust prompts in that TUI, so readiness
+# is binary presence plus the 2.x version floor.
+_BOB_NATIVE_HARNESSES: frozenset[str] = frozenset({"bob-native", "native-bob"})
+
 # CLI-wrapping qwen harnesses. ``qwen`` / ``qwen-code`` (the ACP harness) and
 # ``qwen-native`` / ``native-qwen`` (the native TUI via ``omni qwen``) all resolve
 # to the same ``qwen`` binary (canonicalize_harness folds ``qwen-code`` → ``qwen``
@@ -265,6 +271,8 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return _installer_only_availability(HERMES_KEY)
     if canonical in _DEVIN_NATIVE_HARNESSES:
         return _installer_only_availability(DEVIN_KEY)
+    if canonical in _BOB_NATIVE_HARNESSES:
+        return _installer_only_availability(BOB_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -1053,6 +1061,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_KIMI_NATIVE_HARNESSES)
     spellings.update(_HERMES_NATIVE_HARNESSES)
     spellings.update(_DEVIN_NATIVE_HARNESSES)
+    spellings.update(_BOB_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(KIMI_SURFACE)

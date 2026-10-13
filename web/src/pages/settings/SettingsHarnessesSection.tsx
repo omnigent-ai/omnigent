@@ -57,6 +57,7 @@ const HARNESS_DESCRIPTIONS: Record<string, string> = {
   "kimi-native":
     "A terminal coding agent for editing code, running commands, and completing development tasks.",
   "hermes-native": "A self-improving AI agent that learns reusable skills from experience.",
+  "bob-native": "IBM’s terminal coding agent, run in its own interactive Bob Shell TUI.",
 };
 
 // The harness catalog, derived from the shared native-agent registry so this

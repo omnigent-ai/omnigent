@@ -153,8 +153,12 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   Kiro tool approvals stay answerable in the embedded Terminal; supported
   one-time approvals also appear as Chat cards. See
   `docs/kiro-native-elicitation.md`.
+- **IBM Bob Shell 2.x** (optional), for `omnigent bob`: install with
+  `curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash`. Sign in with
+  IBMid, accept the license, trust the folder, and approve tools in Bob's own
+  terminal; Omnigent never answers those prompts. See `docs/bob-native.md`.
 - **`tmux`**, required by the native `omnigent <harness>` terminal wrappers
-  (`claude`, `codex`, `cursor`, `devin`, `hermes`, `kiro`, `pi`)
+  (`bob`, `claude`, `codex`, `cursor`, `devin`, `hermes`, `kiro`, `pi`)
   (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
 - **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent <harness>`
