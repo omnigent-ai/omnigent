@@ -117,8 +117,9 @@ def test_start_registers_host_daemon_with_cp1252_stdio(live_server: str, tmp_pat
             f"host {tunnel.group(1)} is {status!r} on the server; host log:\n{host_log[-3000:]}"
         )
     finally:
+        # Stop only this daemon; `omnigent stop` also sweeps the shared local-server port.
         subprocess.run(
-            [sys.executable, "-m", "omnigent", "stop", "--force"],
+            [sys.executable, "-m", "omnigent", "host", "stop", "--server", live_server, "--force"],
             env=env,
             cwd=cwd,
             stdout=subprocess.DEVNULL,
