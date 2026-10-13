@@ -241,8 +241,8 @@ _CLAUDE_RESUME_ITEMS_PAGE_LIMIT = 1000
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
 # Configured launchers may bootstrap credentials and settings before Claude starts.
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 60.0
-#: Cap on the ambient gateway's model-listing request; no answer in time
-#: leaves the CLI's own picker rows in place.
+#: Per-phase (connect/read/write) cap on the ambient gateway's model-listing
+#: request; a phase that does not finish in time leaves the CLI's rows in place.
 _AMBIENT_GATEWAY_LISTING_TIMEOUT_S = 10.0
 #: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
 #: still unresolved when it expires keep their bare rows (the cache's
@@ -530,6 +530,14 @@ def _ambient_claude_base_url() -> str:
     return _ambient_claude_env()[_UCODE_CLAUDE_BASE_URL_ENV]
 
 
+def _is_non_anthropic_host(base_url: str) -> bool:
+    """Whether *base_url* names an endpoint other than Anthropic's own API."""
+    if not base_url:
+        return False
+    host = (urlparse(base_url).hostname or "").lower()
+    return host != "anthropic.com" and not host.endswith(".anthropic.com")
+
+
 def _ambient_env_is_non_anthropic_gateway(configured_base_url: str | None = None) -> bool:
     """Whether managed settings or the process env route through a gateway.
 
@@ -543,14 +551,9 @@ def _ambient_env_is_non_anthropic_gateway(configured_base_url: str | None = None
         managed settings still take precedence.
     """
     if configured_base_url is None:
-        base_url = _ambient_claude_base_url()
-    else:
-        managed_base_url, _ = managed_claude_gateway_signal()
-        base_url = managed_base_url or configured_base_url
-    if not base_url:
-        return False
-    host = (urlparse(base_url).hostname or "").lower()
-    return host != "anthropic.com" and not host.endswith(".anthropic.com")
+        return _is_non_anthropic_host(_ambient_claude_base_url())
+    managed_base_url, _ = managed_claude_gateway_signal()
+    return _is_non_anthropic_host(managed_base_url or configured_base_url)
 
 
 def _gateway_claude_listing(
@@ -629,7 +632,7 @@ def _ambient_credential_digest(env: Mapping[str, str]) -> str | None:
 
 
 def _ambient_gateway_serves_canonical_ids(
-    *, transport: httpx.BaseTransport | None = None
+    env: Mapping[str, str] | None = None, *, transport: httpx.BaseTransport | None = None
 ) -> bool | None:
     """Ask the ambient gateway's model listing whether it routes bare ``claude-*`` ids.
 
@@ -639,6 +642,8 @@ def _ambient_gateway_serves_canonical_ids(
     list a ``claude-*`` passthrough route; other servers ignore the unknown
     parameter.
 
+    :param env: The ambient values from :func:`_ambient_claude_env`; read when
+        ``None``.
     :param transport: Optional httpx transport override for tests.
     :returns: ``True`` when the listing names a bare ``claude-*`` id or a
         wildcard, ``False`` when a non-empty listing names none (a namespaced
@@ -646,7 +651,8 @@ def _ambient_gateway_serves_canonical_ids(
         undetermined: nothing to authenticate with, unreachable, rejected,
         unparseable, or empty.
     """
-    env = _ambient_claude_env()
+    if env is None:
+        env = _ambient_claude_env()
     base_url = env[_UCODE_CLAUDE_BASE_URL_ENV]
     if not base_url:
         return None
@@ -703,14 +709,17 @@ async def _ambient_gateway_rejects_canonical_ids() -> bool:
     rows stay (Claude Code's own picker beats an empty one), except on a
     Databricks Unity Gateway, which routes only its own ids.
     """
-    if not _ambient_env_is_non_anthropic_gateway():
+    # One read of the ambient env serves the gate, the listing and the fallback.
+    env = _ambient_claude_env()
+    base_url = env[_UCODE_CLAUDE_BASE_URL_ENV]
+    if not _is_non_anthropic_host(base_url):
         return False
-    serves = await asyncio.to_thread(_ambient_gateway_serves_canonical_ids)
+    serves = await asyncio.to_thread(_ambient_gateway_serves_canonical_ids, env)
     if serves is not None:
         return not serves
     from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 
-    return is_databricks_ai_gateway_url(_ambient_claude_base_url())
+    return is_databricks_ai_gateway_url(base_url)
 
 
 def _rows_spell_canonical_ids(rows: list[dict[str, object]]) -> bool:
@@ -764,8 +773,8 @@ def claude_catalog_serves_model(
         and _ambient_env_is_non_anthropic_gateway()
         and not _rows_spell_canonical_ids(rows)
     ):
-        # The catalog keeps bare Anthropic rows only once the ambient gateway
-        # was found to route them; a catalog without any says it does not.
+        # Bare rows permit canonical spellings, including when gateway discovery
+        # failed open; a catalog without any says the gateway does not route them.
         return False
     if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
         return False
