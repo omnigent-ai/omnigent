@@ -359,8 +359,6 @@ def search_indexed_paths(
     candidates: dict[str, bool] = {}  # path -> is a directory
     seen_dirs: set[str] = set()
     for p in paths:
-        if is_upload_staging(p):
-            continue
         if q not in p.lower():
             continue
         candidates.setdefault(p, False)
@@ -390,6 +388,8 @@ def search_indexed_paths(
             continue
         # A submodule is one index entry but a directory on disk.
         is_dir = candidates[rel] or stat.S_ISDIR(st.st_mode)
+        if not is_dir and is_upload_staging(rel):
+            continue
         entries.append(
             FilesystemEntry(
                 id=rel,
@@ -899,7 +899,8 @@ class CallerProcessFilesystem:
                 "    except UnicodeEncodeError: return False",
                 f"stage_pattern = re.compile({STAGING_SUFFIX_PATTERN!r})",
                 "names = sorted((n for n in os.listdir(d) if utf8(n) and not",
-                "    stage_pattern.search(n)), reverse=order == 'desc')",
+                "    (stage_pattern.search(n) and not os.path.isdir(os.path.join(d, n)))),",
+                "    reverse=order == 'desc')",
                 "def cursor_index(cursor):",
                 "    if cursor is None: return None",
                 "    if prefix:",
@@ -1091,7 +1092,7 @@ def match(dirpath, name, is_dir):
     # re-checking keeps the two entry kinds symmetric so a future refactor of
     # that pre-filter can't silently leak excluded dirs.
     p = rel(dirpath, name)
-    if stage_pattern.search(name):
+    if not is_dir and stage_pattern.search(name):
         return
     if exc and any(r.match(p) for r in exc):
         return

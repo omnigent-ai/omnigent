@@ -360,11 +360,11 @@ async def test_cancelled_create_settles_and_accounts(
     original = helper.call
     entered, release, settled = threading.Event(), threading.Event(), threading.Event()
 
-    def slow(metadata: dict[str, object], raw: bytes = b"") -> dict[str, object]:
+    def slow(metadata: dict[str, object], raw: bytes = b"", **kwargs: float) -> dict[str, object]:
         if metadata["op"] == "begin":
             entered.set()
             assert release.wait(5)
-        result = original(metadata, raw)
+        result = original(metadata, raw, **kwargs)
         settled.set()
         return result
 
@@ -397,10 +397,12 @@ async def test_creation_intent_reconciled_after_crash(
     original = helper.call
     intent: dict[str, object] = {}
 
-    def capture(metadata: dict[str, object], raw: bytes = b"") -> dict[str, object]:
+    def capture(
+        metadata: dict[str, object], raw: bytes = b"", **kwargs: float
+    ) -> dict[str, object]:
         if metadata["op"] == "begin" and manager.state_path.exists():
             intent.update(json.loads(manager.state_path.read_text()))
-        return original(metadata, raw)
+        return original(metadata, raw, **kwargs)
 
     monkeypatch.setattr(helper, "call", capture)
     response = await create(client)
@@ -810,8 +812,8 @@ async def test_lost_finalize_response_recovers_published_inode(
     original = helper.call
     committed: dict[str, object] = {}
 
-    def lose(metadata: dict[str, object], raw: bytes = b"") -> dict[str, object]:
-        result = original(metadata, raw)
+    def lose(metadata: dict[str, object], raw: bytes = b"", **kwargs: float) -> dict[str, object]:
+        result = original(metadata, raw, **kwargs)
         if metadata["op"] == "complete":
             committed.update(result)
             helper.close()
@@ -841,10 +843,12 @@ async def test_startup_recovers_publish_before_receipt(
     original = helper.call
     before_publish: dict[str, object] = {}
 
-    def capture(metadata: dict[str, object], raw: bytes = b"") -> dict[str, object]:
+    def capture(
+        metadata: dict[str, object], raw: bytes = b"", **kwargs: float
+    ) -> dict[str, object]:
         if metadata["op"] == "complete":
             before_publish.update(json.loads(manager.state_path.read_text()))
-        return original(metadata, raw)
+        return original(metadata, raw, **kwargs)
 
     monkeypatch.setattr(helper, "call", capture)
     result = await client.post(BASE + "/" + uid + "/complete?created_by=alice")
@@ -1806,3 +1810,294 @@ def test_retry_after_distinguishes_busy_from_upload_limit() -> None:
         RouteError(429, "upload_limit", "Session limit reached").response().headers["Retry-After"]
         == "60"
     )
+
+
+@pytest.mark.asyncio
+async def test_helper_queue_preserves_default_executor_capacity(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import omnigent.inner.os_env_upload as upload
+
+    manager = client._transport.app.state.workspace_uploads
+    manager.limits = UploadLimits(max_open_uploads=16)
+    ids = [
+        (await create(client, name=f"queued-{i}", size=1)).json()["upload_id"] for i in range(9)
+    ]
+    original = upload.read_frame
+    entered, release = threading.Event(), threading.Event()
+
+    def slow(stream):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(10)
+        return original(stream)
+
+    monkeypatch.setattr(upload, "read_frame", slow)
+    previous_executor = asyncio.get_running_loop()._default_executor
+    assert previous_executor is not None
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        asyncio.get_running_loop().set_default_executor(executor)
+        holder = asyncio.create_task(
+            client.patch(BASE + "/" + ids[0] + "?created_by=alice", headers=HEADERS, content=b"x")
+        )
+        waiters = []
+        background = []
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            waiters = [
+                asyncio.create_task(client.head(BASE + "/" + uid + "?created_by=alice"))
+                for uid in ids[1:]
+            ]
+            await asyncio.sleep(0.1)
+            background = [
+                asyncio.create_task(asyncio.to_thread(lambda: 42)),
+                asyncio.create_task(manager._persist()),
+            ]
+            done, pending = await asyncio.wait(background, timeout=0.5)
+            assert not pending, "Helper waiters blocked unrelated executor work or an index save"
+            assert len(done) == 2
+            assert background[0].result() == 42
+            assert json.loads(manager.state_path.read_text())
+        finally:
+            release.set()
+            results = await asyncio.gather(holder, *waiters, return_exceptions=True)
+            await asyncio.gather(*background, return_exceptions=True)
+            asyncio.get_running_loop().set_default_executor(previous_executor)
+    assert all(isinstance(r, httpx.Response) and r.status_code in (200, 204) for r in results)
+
+
+@pytest.mark.asyncio
+async def test_expired_receipt_forgotten_by_pinned_helper(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    import omnigent.runner.workspace_upload as upload
+
+    manager = client._transport.app.state.workspace_uploads
+    first = await create(client, size=0)
+    uid = first.json()["upload_id"]
+    url = BASE + "/" + uid + "/complete?created_by=alice"
+    receipt = await client.post(url)
+    assert (await client.post(url)).json() == receipt.json()
+    second = await create(client, name="pinned", size=1)
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    assert (await asyncio.to_thread(helper.call, {"op": "status", "id": uid}))[
+        "outcome"
+    ] == "created"
+    manager.records[uid].last_activity = upload._now() - manager.limits.idle_ttl_s - 1
+    await manager.sweep()
+    assert uid not in manager.records
+    assert not helper._closed
+    assert await manager._helper("session", DEFAULT_ENVIRONMENT_ID) is helper
+    assert (await asyncio.to_thread(helper.call, {"op": "status", "id": uid}))["code"] == "gone"
+    assert (tmp_path / "workspace" / "payload.bin").read_bytes() == b""
+    assert (await asyncio.to_thread(helper.call, {"op": "forget", "id": uid})) == {
+        "forgotten": True
+    }
+    assert (
+        await asyncio.to_thread(helper.call, {"op": "forget", "id": second.json()["upload_id"]})
+    )["code"] == "incomplete"
+    assert (
+        await client.patch(
+            BASE + "/" + second.json()["upload_id"] + "?created_by=alice",
+            headers=HEADERS,
+            content=b"x",
+        )
+    ).status_code == 204
+    assert (await client.post(url)).status_code == 410
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_change", ["deleted", "renamed", "replaced", "file"])
+@pytest.mark.parametrize("cleanup", ["sweep", "request", "restart"])
+async def test_expiry_drops_upload_with_gone_parent(
+    client: httpx.AsyncClient, tmp_path: Path, parent_change: str, cleanup: str
+) -> None:
+    import omnigent.runner.workspace_upload as upload
+
+    manager = client._transport.app.state.workspace_uploads
+    manager.limits = UploadLimits(max_open_uploads=1)
+    sub = tmp_path / "workspace" / "sub"
+    sub.mkdir()
+    created = await create(client, dir="sub", size=1)
+    uid = created.json()["upload_id"]
+    staging = Path(manager.records[uid].staging_path)
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    if parent_change == "deleted":
+        staging.unlink()
+        sub.rmdir()
+    else:
+        sub.rename(sub.parent / "retired")
+        if parent_change == "replaced":
+            sub.mkdir()
+        elif parent_change == "file":
+            sub.write_bytes(b"unrelated")
+    manager.records[uid].last_activity = upload._now() - manager.limits.idle_ttl_s - 1
+    await manager._persist()
+    url = BASE + "/" + uid + "?created_by=alice"
+    if cleanup == "request":
+        assert (await client.head(url)).status_code == 410
+    elif cleanup == "restart":
+        await manager.stop()
+        fresh = restart(manager)
+        try:
+            await fresh.sweep()
+            assert uid not in fresh.records
+            assert not json.loads(fresh.state_path.read_text())
+            with pytest.raises(upload.RouteError) as exc:
+                await fresh.operate("session", DEFAULT_ENVIRONMENT_ID, uid, "alice", "status")
+            assert exc.value.status == 410
+            if parent_change != "deleted":
+                assert (sub.parent / "retired" / staging.name).exists()
+            if parent_change == "file":
+                assert sub.read_bytes() == b"unrelated"
+            fresh.limits = manager.limits
+            declaration = upload.UploadDeclaration(
+                dir="", name="quota-free", size=1, created_by="alice"
+            )
+            assert (await fresh.create("session", DEFAULT_ENVIRONMENT_ID, declaration))[
+                "offset"
+            ] == 0
+        finally:
+            await fresh.stop()
+        return
+    else:
+        await manager.sweep()
+    assert uid not in manager.records
+    assert uid not in json.loads(manager.state_path.read_text())
+    assert (await client.head(url)).status_code == 410
+    assert (await asyncio.to_thread(helper.call, {"op": "status", "id": uid}))["code"] == "gone"
+    if parent_change != "deleted":
+        assert (sub.parent / "retired" / staging.name).exists()
+    if parent_change == "file":
+        assert sub.read_bytes() == b"unrelated"
+    assert (await create(client, name="quota-free", size=1)).status_code == 201
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("holder_op", ["plan", "complete"])
+async def test_async_short_operation_queue_budget(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, holder_op: str
+) -> None:
+    import threading
+    import time
+
+    import omnigent.inner.os_env_upload as upload
+    from omnigent.runner.workspace_upload import RouteError
+
+    manager = client._transport.app.state.workspace_uploads
+    ids = [(await create(client, name=str(i), size=0)).json()["upload_id"] for i in range(2)]
+    original = upload.read_frame
+    entered, release = threading.Event(), threading.Event()
+
+    def slow(stream):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return original(stream)
+
+    monkeypatch.setattr(upload, "read_frame", slow)
+    holder = asyncio.create_task(manager._call(ids[0], manager.records[ids[0]], holder_op))
+    assert await asyncio.to_thread(entered.wait, 5)
+    timer = threading.Timer(2, release.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(RouteError) as exc:
+            await manager._call(ids[1], manager.records[ids[1]], "status")
+        assert exc.value.status == 429 and exc.value.code == "busy"
+        assert 0.8 <= time.monotonic() - started < 1.5
+    finally:
+        release.set()
+        timer.cancel()
+        timer.join()
+        await holder
+    assert (await manager._call(ids[1], manager.records[ids[1]], "status"))["offset"] == 0
+
+
+@pytest.mark.asyncio
+async def test_helper_deadline_includes_executor_queue(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import omnigent.inner.os_env_upload as upload
+    from omnigent.runner.workspace_upload import RouteError
+
+    manager = client._transport.app.state.workspace_uploads
+    uid = (await create(client)).json()["upload_id"]
+    previous_executor = asyncio.get_running_loop()._default_executor
+    assert previous_executor is not None
+    entered, release = threading.Event(), threading.Event()
+    written = []
+    original = upload.write_frame
+
+    def blocked():
+        entered.set()
+        assert release.wait(5)
+
+    def write(stream, metadata, raw=b""):
+        written.append(metadata["op"])
+        original(stream, metadata, raw)
+
+    monkeypatch.setattr(upload, "CALL_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(upload, "write_frame", write)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        asyncio.get_running_loop().set_default_executor(executor)
+        blocker = asyncio.create_task(asyncio.to_thread(blocked))
+        while not entered.is_set():
+            await asyncio.sleep(0.001)
+        timer = threading.Timer(0.15, release.set)
+        timer.start()
+        try:
+            with pytest.raises(RouteError) as exc:
+                await manager._call(uid, manager.records[uid], "status")
+            assert exc.value.code == "busy"
+            assert not written
+        finally:
+            release.set()
+            timer.cancel()
+            timer.join()
+            await blocker
+            asyncio.get_running_loop().set_default_executor(previous_executor)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_helper_call_keeps_gate_until_settled(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    import omnigent.inner.os_env_upload as upload
+
+    manager = client._transport.app.state.workspace_uploads
+    ids = [(await create(client, name=str(i))).json()["upload_id"] for i in range(2)]
+    original = upload.read_frame
+    entered, release = threading.Event(), threading.Event()
+    reads = []
+
+    def slow(stream):
+        reads.append("start")
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        result = original(stream)
+        reads.append("end")
+        return result
+
+    monkeypatch.setattr(upload, "read_frame", slow)
+    first = asyncio.create_task(manager._call(ids[0], manager.records[ids[0]], "status"))
+    assert await asyncio.to_thread(entered.wait, 5)
+    first.cancel()
+    waiter = asyncio.create_task(manager._call(ids[1], manager.records[ids[1]], "status"))
+    await asyncio.sleep(0.05)
+    still_settling = not first.done() and not waiter.done()
+    release.set()
+    result = await asyncio.gather(first, waiter, return_exceptions=True)
+    assert still_settling
+    assert isinstance(result[0], asyncio.CancelledError)
+    assert result[1] == {"offset": 0, "size": 3}
+    assert reads == ["start", "end", "start", "end"]
