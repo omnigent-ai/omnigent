@@ -161,6 +161,12 @@ def use_error_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_notice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields a TurnNotice followed by TurnComplete."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "notice")
+
+
+@pytest.fixture
 def use_provider_auth_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "provider_auth_failure")
 
@@ -501,6 +507,83 @@ async def test_executor_error_usage_reaches_response_failed(
     # The failure is still a failure — the error detail must not be
     # displaced by the usage payload.
     assert events[-1].data["response"]["error"] is not None
+
+
+async def test_turn_notice_emits_info_error_item_and_completes(
+    use_notice: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """TurnNotice → one info-level error item, then response.completed.
+
+    Guidance such as an intercepted ``/login`` must reach the user without
+    the turn being classified as failed (the ExecutorError path does that).
+    """
+    conv_id = "conv_notice"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST",
+        f"/v1/sessions/{conv_id}/events",
+        json={**_start_turn_body(), "durable_notices": True},
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    # The turn ends cleanly — a notice is not a failure.
+    assert events[-1].event == "response.completed"
+    assert "response.failed" not in [e.event for e in events]
+
+    # The notice rides as a durable error item with level="info" (the
+    # neutral-notice wire shape the web renders as a non-destructive pill).
+    notice_items = [
+        e.data["item"]
+        for e in events
+        if e.event == "response.output_item.done"
+        and isinstance(e.data.get("item"), dict)
+        and e.data["item"].get("type") == "error"
+    ]
+    assert len(notice_items) == 1
+    item = notice_items[0]
+    assert item["level"] == "info"
+    assert item["source"] == "harness"
+    assert item["code"] == "mock_notice"
+    assert "omni setup" in item["message"]
+
+
+async def test_turn_notice_is_a_failed_turn_for_servers_without_durable_notices(
+    use_notice: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """Without ``durable_notices`` a TurnNotice becomes the legacy failed turn.
+
+    A server older than 0.18.0 drops info-level error output items on persist,
+    so the guidance would vanish on reload. The adapter then answers with the
+    ``response.failed`` shape every server keeps (see
+    ``test_legacy_notice_fallback_persists_as_a_failed_turn``), naming the
+    message as never delivered so the queued web input settles too.
+    """
+    conv_id = "conv_notice_legacy"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.failed"
+    assert "response.completed" not in [e.event for e in events]
+    assert not [
+        e
+        for e in events
+        if e.event == "response.output_item.done"
+        and isinstance(e.data.get("item"), dict)
+        and e.data["item"].get("type") == "error"
+    ]
+    error = events[-1].data["response"]["error"]
+    assert error["code"] == "mock_notice"
+    assert "omni setup" in error["message"]
+    assert error["undelivered"] is True
 
 
 async def test_provider_auth_required_survives_adapter_and_sse_envelope(

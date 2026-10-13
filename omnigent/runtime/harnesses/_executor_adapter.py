@@ -42,6 +42,7 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     TurnCancelled,
     TurnComplete,
+    TurnNotice,
 )
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
 from omnigent.native.input_diagnostics import (
@@ -350,6 +351,15 @@ class ExecutorAdapter(HarnessApp):
                     system_prompt=system_prompt,
                     config=config,
                 ):
+                    if isinstance(event, TurnNotice) and not request.durable_notices:
+                        # Older servers drop info notices on reload; downgrade to the
+                        # failed-turn shape they persist. The executor stays reusable.
+                        event = ExecutorError(
+                            message=event.message,
+                            code=event.code,
+                            undelivered=True,
+                            preserve_session=True,
+                        )
                     if ctx.cancelled.is_set():
                         log_input_event(
                             _logger,
@@ -1105,6 +1115,23 @@ class ExecutorAdapter(HarnessApp):
             # Capture provider-reported usage for the response.completed payload.
             if event.usage is not None:
                 ctx.provider_usage = event.usage
+        elif isinstance(event, TurnNotice):
+            # Persist guidance as an info notice without failing the turn. The
+            # runner treats this stream-borne harness notice as answering the input.
+            ctx.emit(
+                OutputItemDoneEvent(
+                    type="response.output_item.done",
+                    item={
+                        "id": f"err_{uuid.uuid4().hex[:12]}",
+                        "type": "error",
+                        "source": "harness",
+                        "code": event.code,
+                        "message": event.message,
+                        "level": "info",
+                        "agent": ctx.response_id,
+                    },
+                )
+            )
         elif isinstance(event, CompactionStarted):
             from omnigent.server.schemas import CompactionInProgressEvent
 

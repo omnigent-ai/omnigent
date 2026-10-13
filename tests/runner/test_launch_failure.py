@@ -433,6 +433,7 @@ def test_client_update_diagnosis_ignores_unrelated_errors() -> None:
         ("databricks_sign_in_pending", "Databricks sign-in"),
         ("agent_startup_pending", "still starting"),
         ("codex_thread_not_started", "never ran"),
+        ("claude_native_auth_command", "omni setup on the host"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:

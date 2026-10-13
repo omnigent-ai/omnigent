@@ -7601,6 +7601,166 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         pending_inputs.reset_for_tests()
 
 
+_NOTICE_ITEM_DONE: dict[str, Any] = {
+    "type": "response.output_item.done",
+    "item": {
+        "id": "err_notice",
+        "type": "error",
+        "source": "harness",
+        "code": "claude_native_auth_command",
+        "message": "Run omni setup on the host to sign in again.",
+        "level": "info",
+    },
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "turn_announced", [True, False], ids=["in_progress_first", "no_in_progress"]
+)
+async def test_relay_settles_queued_native_message_answered_by_notice(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    turn_announced: bool,
+) -> None:
+    """A notice that answers a web message commits that message ahead of itself.
+
+    An intercepted ``/login`` never reaches the harness, so no transcript
+    mirror drains its queued entry even though the turn completes. The notice
+    names the message it answers; the relay persists it as the user message
+    under the notice's turn id, publishes the consumed event that swaps the
+    optimistic bubble, and leaves nothing queued, so the session list reads
+    idle instead of promoting the idle session to running until the entry
+    expires. The two items share one id even when the notice arrives before
+    the turn announced its own.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    pending_id = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "/login"}],
+        created_by="alice@example.com",
+        stable_id=stable_id,
+    )
+    caplog.set_level(logging.INFO)
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(session_id, event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
+    turn = {"id": "resp_notice", "model": "claude"}
+    frames: list[str | Callable[[], None]] = []
+    if turn_announced:
+        frames.append(_sse_frame({"type": "response.in_progress", "response": turn}))
+    frames += [
+        _sse_frame({**_NOTICE_ITEM_DONE, "input_stable_id": stable_id}),
+        _sse_frame({"type": "response.completed", "response": turn}),
+        _sse_frame({"type": "session.status", "status": "idle", "response_id": "resp_notice"}),
+        "data: [DONE]\n\n",
+    ]
+    client = _ScriptedStreamingRunnerClient(frames)
+    try:
+        # The queued command keeps the idle session listed as running until settled.
+        assert _list_status_with_starting("idle", sid) == "running"
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+
+        types = [i.type for i in store.appended_items]
+        assert types == ["message", "error"], types
+        message, notice = store.appended_items
+        assert message.data.role == "user"
+        assert message.data.user_authored is True
+        assert "".join(b["text"] for b in message.data.content) == "/login"
+        assert message.created_by == "alice@example.com"
+        # Both items share one turn id so they group in one bubble.
+        assert message.response_id == notice.response_id
+        if turn_announced:
+            assert message.response_id == "resp_notice"
+        assert notice.data.level == "info"
+        assert notice.data.code == "claude_native_auth_command"
+        assert pending_inputs.snapshot_for(sid) == []
+        assert _list_status_with_starting("idle", sid) == "idle"
+        consumed = [e for e in published if e.get("type") == "session.input.consumed"]
+        assert len(consumed) == 1
+        assert consumed[0]["data"]["cleared_pending_id"] == pending_id
+        [record] = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "native_input_settled"
+        ]
+        assert record.attributes["outcome"] == "answered_by_notice"
+        assert record.attributes["input_stable_id"] == stable_id
+        assert record.attributes["response_id"] == message.response_id
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_relay_notice_naming_no_message_settles_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A notice that names no web message leaves the queue alone.
+
+    Only the runner knows which message a turn carried. Without that id the
+    relay must not drain by position: the entry's own mirror may still arrive,
+    and a positional drain would hand it the wrong bubble.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    pending_id = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "/login"}],
+        created_by="alice@example.com",
+        stable_id="7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+    )
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(session_id, event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "response.in_progress",
+                    "response": {"id": "resp_notice", "model": "claude"},
+                }
+            ),
+            _sse_frame(_NOTICE_ITEM_DONE),
+            _sse_frame(
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp_notice", "model": "claude"},
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+
+        assert [i.type for i in store.appended_items] == ["error"]
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [pending_id]
+        assert not any(e.get("type") == "session.input.consumed" for e in published)
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("undelivered", [True, False])
 async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(

@@ -42,6 +42,7 @@ from omnigent.inner.executor import (
     Message,
     ToolSpec,
     TurnComplete,
+    TurnNotice,
     describe_exception,
 )
 from omnigent.inner.native_attachments import (
@@ -169,7 +170,8 @@ class ClaudeNativeExecutor(Executor):
             ``config.model``) and the switch is applied inline, before the
             message — see the ``/model`` handling below.
         :yields: :class:`TurnComplete` after the input was injected,
-            or :class:`ExecutorError` on bridge failure.
+            :class:`TurnNotice` + :class:`TurnComplete` for an intercepted
+            auth slash command, or :class:`ExecutorError` on bridge failure.
         """
         del tools, system_prompt
         if not _session_is_active(self._bridge_dir, self._request_session_id):
@@ -186,21 +188,18 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message="Claude native turn had no user text to send")
             return
         if is_auth_slash_command(text):
-            # Claude Code's sign-in flow is an interactive TUI handoff the
-            # bridge cannot drive, so /login is escaped into plain text and
-            # reaches the model as a prompt. An expired login answers it with
-            # "Login expired · Please run /login" — a loop. Point at the host
-            # command that does re-authenticate instead of typing anything.
-            # `omni setup` covers both directions: its harness menu signs in
-            # (`claude auth login --claudeai`) and signs out (`claude auth
-            # logout`), so one pointer serves /login and /logout alike.
-            yield ExecutorError(
+            # Sign-in is an interactive TUI handoff the bridge cannot drive;
+            # point at `omni setup` instead. An expected, user-remediable dead
+            # end: complete the turn, don't fail it.
+            yield TurnNotice(
                 message=(
                     "Claude Code's sign-in runs in its own terminal, so /login and "
                     "/logout do nothing from the web chat. Run omni setup on the host "
                     "to sign in again — or to sign out — then retry."
-                )
+                ),
+                code="claude_native_auth_command",
             )
+            yield TurnComplete(response=None)
             return
         from omnigent.runtime import telemetry
 
