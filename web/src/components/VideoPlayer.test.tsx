@@ -33,6 +33,7 @@ const revokeUrl = vi.fn();
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
   vi.mocked(parseVideoChapters).mockResolvedValue([]);
   fetchBlob.mockResolvedValue(new Blob(["video"], { type: "video/webm" }));
   vi.mocked(useFileContent).mockReturnValue({ data: undefined } as ReturnType<
@@ -48,6 +49,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -114,17 +116,17 @@ describe("VideoPlayer", () => {
     expect(downloadWorkspaceFile).toHaveBeenLastCalledWith("sess_1", "demo.webm");
   });
 
-  it("opens compact recording navigation in the file panel without loading video bytes", async () => {
+  it("keeps navigation controls out of chat and opens the file from its recording title", async () => {
     vi.mocked(useFileContent).mockReturnValue({
       data: { encoding: "utf-8", content: "WEBVTT\n" },
     } as ReturnType<typeof useFileContent>);
     vi.mocked(parseVideoChapters).mockResolvedValue([{ time: 0, end: 5, title: "Open the app" }]);
     const onOpenFile = vi.fn();
     render(<VideoPlayer {...props} compact onOpenFile={onOpenFile} />);
-    const navigation = await screen.findByRole("button", { name: "Open recording actions" });
+    await screen.findByRole("button", { name: "Download recording: Feature demo" });
+    expect(screen.queryByRole("button", { name: /recording actions/ })).toBeNull();
     expect(screen.queryByRole("group")).toBeNull();
-    expect(navigation).not.toHaveAttribute("aria-controls");
-    fireEvent.click(navigation);
+    fireEvent.click(screen.getByRole("button", { name: "Feature demo" }));
     expect(onOpenFile).toHaveBeenCalledOnce();
     expect(fetchBlob).not.toHaveBeenCalled();
   });
@@ -166,6 +168,7 @@ describe("VideoPlayer", () => {
     expect(video).toHaveAttribute("playsinline");
     expect(video).not.toHaveAttribute("autoplay");
     unmount();
+    expect(video.pause).toHaveBeenCalledOnce();
     expect(revokeUrl).toHaveBeenCalledWith("blob:recording");
   });
 
@@ -192,14 +195,14 @@ describe("VideoPlayer", () => {
     );
   });
 
-  it("cancels and discards an unfinished fetch when the source changes", async () => {
+  it("cancels unfinished fetches when the source changes or the player closes", async () => {
     let finish!: (blob: Blob) => void;
     fetchBlob.mockReturnValueOnce(
       new Promise((resolve) => {
         finish = resolve;
       }),
     );
-    const { rerender } = render(<VideoPlayer {...props} />);
+    const { rerender, unmount } = render(<VideoPlayer {...props} />);
     fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
     const signal = fetchBlob.mock.calls[0][2]!;
     rerender(<VideoPlayer {...props} path="other.webm" />);
@@ -209,5 +212,10 @@ describe("VideoPlayer", () => {
       expect(screen.getByRole("button", { name: "Play video: Feature demo" })).toBeVisible(),
     );
     expect(createUrl).not.toHaveBeenCalled();
+    fetchBlob.mockReturnValueOnce(new Promise(() => {}));
+    fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
+    const closingSignal = fetchBlob.mock.calls[1][2]!;
+    unmount();
+    expect(closingSignal.aborted).toBe(true);
   });
 });

@@ -126,9 +126,7 @@ def test_recording_action_navigation(
         f"{session.contract.base_url}/c/{session.session_id}"
         + ("?file=demo.webm" if entry == "deep-link" else "")
     )
-    if entry == "chat":
-        page.get_by_role("button", name="Open recording actions", exact=True).click()
-    elif entry == "file-link":
+    if entry == "chat" or entry == "file-link":
         page.get_by_role("button", name="Screen recording", exact=True).click()
     elif entry in {"files", "changes"}:
         if width == 390:
@@ -275,24 +273,25 @@ def test_recording_header_size_and_optional_controls(
     _post_message(session, "[Annotated](demo.webm)\n\n[Plain](plain.webm)")
     page.set_viewport_size({"width": width, "height": 1000})
     page.goto(f"{session.contract.base_url}/c/{session.session_id}")
-    navigation = page.get_by_role("button", name="Open recording actions", exact=True)
-    expect(navigation).to_be_visible()
+    expect(page.get_by_role("button", name="Open recording actions", exact=True)).to_have_count(0)
     annotated = page.get_by_role("button", name="Annotated", exact=True)
     plain = page.get_by_role("button", name="Plain", exact=True)
     acard, pcard = annotated.locator("../../.."), plain.locator("../../..")
     expect(acard.get_by_role("group")).to_have_count(0)
     expect(pcard.get_by_role("button", name="Open recording actions")).to_have_count(0)
     assert acard.bounding_box()["width"] == pcard.bounding_box()["width"]
-    assert acard.bounding_box()["width"] <= 450
+    assert acard.bounding_box()["width"] <= 320
     initial_height = acard.bounding_box()["height"]
     for title in ["Annotated", "Plain"]:
         page.get_by_role("button", name=f"Play video: {title}", exact=True).click()
         _assert_playback(page, page.locator(f'video[aria-label="{title}"]'))
     avideo, pvideo = acard.locator("video").bounding_box(), pcard.locator("video").bounding_box()
-    assert avideo["height"] == pvideo["height"] == 192
+    assert avideo["height"] == pvideo["height"]
+    assert avideo["height"] <= 200
+    assert abs(avideo["width"] / avideo["height"] - 1.6) < 0.01
     assert acard.bounding_box()["height"] == initial_height
     media = acard.locator("video").element_handle()
-    navigation.click()
+    annotated.click()
     viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(viewer).to_be_visible()
     actions = viewer.get_by_role("group", name="Recording actions: demo.webm", exact=True)
@@ -449,3 +448,28 @@ def test_recording_download_failure(
     ).to_be_visible()
     expect(viewer.get_by_role("button", name="Download video: demo.webm")).to_be_visible()
     expect(viewer.get_by_role("button", name="Retry")).to_be_visible()
+
+
+def test_closing_workspace_releases_recording(
+    page: Page, seeded_session: BrowserSession, recording: bytes
+) -> None:
+    """Closing a mounted desktop rail stops media and releases buffered bytes."""
+    session = seeded_session
+    _seed_video(session, recording)
+    _post_message(session, "[Screen recording](demo.webm)")
+    page.set_viewport_size({"width": 1600, "height": 1000})
+    page.goto(f"{session.contract.base_url}/c/{session.session_id}?file=demo.webm")
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    viewer.get_by_role("button", name="Play video: demo.webm", exact=True).click()
+    video = viewer.locator("video")
+    page.wait_for_function("el => el.readyState >= 2", arg=video.element_handle())
+    video.evaluate("el => { el.loop = true; return el.play(); }")
+    media, source = video.element_handle(), video.get_attribute("src")
+    page.get_by_role("button", name="Collapse right panel", exact=True).click()
+    expect(page.locator('[data-testid="file-viewer"] video')).to_have_count(0)
+    assert media.evaluate("el => !el.isConnected && el.paused")
+    assert page.evaluate(
+        "async url => {try {await fetch(url); return false;} catch {return true;}}", source
+    ), "Closing releases the buffered Blob URL"
+    page.get_by_role("button", name="Expand right panel", exact=True).click()
+    expect(viewer.get_by_role("button", name="Play video: demo.webm", exact=True)).to_be_visible()

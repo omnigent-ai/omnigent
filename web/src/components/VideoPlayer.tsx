@@ -110,14 +110,20 @@ function VideoPlayerContent(props: VideoPlayerProps) {
     };
   }, [requested, conversationId, path]);
 
+  useEffect(() => {
+    // Capture the element before React clears its ref on unmount.
+    const video = videoRef.current;
+    return () => video?.pause();
+  }, [src, failed]);
+
   const loading = requested && !src && !failed;
 
   return (
     <span
       ref={cardRef}
       className={cn(
-        "my-2 inline-flex max-w-full flex-col overflow-hidden rounded-xl border border-border bg-card align-top text-sm text-foreground",
-        compact ? "w-[28rem]" : "w-[64rem]",
+        "my-2 inline-flex max-w-full flex-col overflow-hidden rounded-xl border border-border bg-sidebar align-top text-sm text-foreground",
+        compact ? "w-80" : "w-[64rem]",
         className,
       )}
     >
@@ -203,26 +209,20 @@ function VideoPlayerContent(props: VideoPlayerProps) {
               <DownloadIcon className="size-4" />
             </button>
           )}
-          {chapters.length > 0 && (!compact || onOpenFile) && (
+          {!compact && chapters.length > 0 && (
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon-xs"
-                  aria-label={
-                    compact
-                      ? "Open recording actions"
-                      : actionsOpen
-                        ? "Hide recording actions"
-                        : "Show recording actions"
-                  }
-                  aria-expanded={compact ? undefined : actionsOpen}
-                  aria-controls={compact ? undefined : actionsId}
+                  aria-label={actionsOpen ? "Hide recording actions" : "Show recording actions"}
+                  aria-expanded={actionsOpen}
+                  aria-controls={actionsId}
                   className="border-none text-muted-foreground hover:text-foreground"
-                  onClick={() => (compact ? onOpenFile?.() : setActionsOpen((open) => !open))}
+                  onClick={() => setActionsOpen((open) => !open)}
                 >
-                  {!compact && actionsOpen ? (
+                  {actionsOpen ? (
                     <PanelRightCloseIcon aria-hidden="true" className="size-4" />
                   ) : (
                     <PanelRightIcon aria-hidden="true" className="size-4" />
@@ -230,13 +230,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
-                <span>
-                  {compact
-                    ? "Open recording actions in side panel"
-                    : actionsOpen
-                      ? "Collapse actions"
-                      : "Expand actions"}
-                </span>
+                <span>{actionsOpen ? "Collapse actions" : "Expand actions"}</span>
               </TooltipContent>
             </Tooltip>
           )}
@@ -259,7 +253,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
               preload="metadata"
               className={cn(
                 "w-full bg-black object-contain",
-                compact ? "h-48" : "aspect-video max-h-[70vh]",
+                compact ? "aspect-[16/10]" : "aspect-video max-h-[70vh]",
               )}
               onError={() => setFailed(true)}
               onTimeUpdate={(event) => setTime(event.currentTarget.currentTime)}
@@ -287,7 +281,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
             <span
               className={cn(
                 "flex w-full flex-col items-center justify-center gap-3 bg-muted p-4 text-muted-foreground",
-                compact ? "h-48" : "aspect-video max-h-[70vh]",
+                compact ? "aspect-[16/10]" : "aspect-video max-h-[70vh]",
               )}
             >
               {failed ? (

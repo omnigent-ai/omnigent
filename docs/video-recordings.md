@@ -2,10 +2,10 @@
 
 Save a browser-supported video in the session workspace and link it in the
 agent's response: `[Screen recording](recordings/verification.webm)`.
-Users can play a compact, fixed-height recording in chat or open a larger
-preview in the file viewer. Chat recordings show no action list. For an
-annotated recording, use its panel button to open navigation in the file side
-panel; the chat card keeps its height as that panel opens.
+Users can play a compact 16:10 recording preview (up to 320 pixels wide) in chat
+or open a larger preview in the file viewer. Chat recordings show no action list. For an
+annotated recording, click its title to open navigation in the file side
+panel; opening navigation adds no action list to the chat card.
 
 ## Optional clickable actions
 

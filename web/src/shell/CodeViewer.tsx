@@ -860,6 +860,7 @@ export function CodeViewer({
   }, [content]);
 
   if (isVideoFile(path, fileQuery.data?.content_type)) {
+    if (!panelOpen) return null;
     return (
       <div className="flex h-full items-center justify-center overflow-auto p-4">
         <VideoPlayer
