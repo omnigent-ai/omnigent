@@ -490,9 +490,16 @@ class UploadManager:
             await self._save_settled()
 
     async def _recover(self, uid: str, record: UploadRecord) -> None:
-        record.result = await self._call(
-            uid, record, "recover", **record.model_dump(exclude={"snapshot", "staging_path"})
-        )
+        try:
+            record.result = await self._call(
+                uid, record, "recover", **record.model_dump(exclude={"snapshot", "staging_path"})
+            )
+        except RouteError as exc:
+            if exc.code in ("parent_gone", "staging_gone"):
+                async with self.lock:
+                    self._drop(uid, record)
+                    await self._save_settled()
+            raise
         record.offset = record.size
         record.finalizing = False
         self.restored.discard(uid)
@@ -518,6 +525,8 @@ class UploadManager:
             try:
                 await self._recover(uid, record)
             except RouteError as exc:
+                if exc.code in ("parent_gone", "staging_gone"):
+                    return False
                 if exc.code != "gone":
                     raise
         if uid in self.restored:
