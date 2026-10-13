@@ -175,13 +175,14 @@ class UploadHelperClient(_HelperProcessClient):
     def call(
         self, metadata: dict[str, object], raw: bytes = b"", *, timeout_s: float | None = None
     ) -> dict[str, object]:
+        """A busy result guarantees no request frame could have been sent."""
         timeout_s = operation_timeout(metadata) if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout_s
         if not self._lock.acquire(timeout=max(0, timeout_s)):
-            return {"error": "Upload helper queue timed out", "code": "timeout"}
+            return {"error": "Upload helper queue timed out", "code": "busy"}
         try:
             if self._closed:
-                return {"error": "Upload helper closed", "code": "gone"}
+                return {"error": "Upload helper closed", "code": "busy"}
             timed_out, done = threading.Event(), threading.Event()
 
             def watch() -> None:
@@ -195,20 +196,25 @@ class UploadHelperClient(_HelperProcessClient):
 
             watchdog = threading.Thread(target=watch, daemon=True)
             watchdog.start()
+            frame_started = False
             try:
                 self._ensure_started_locked()
                 if timed_out.is_set() or time.monotonic() >= deadline:
                     self.interrupt()
                     self._stop_locked()
-                    return {"error": "Upload helper launch timed out", "code": "timeout"}
+                    return {"error": "Upload helper launch timed out", "code": "busy"}
                 assert self._proc is not None
                 assert self._proc.stdin is not None and self._proc.stdout is not None
+                frame_started = True
                 write_frame(cast(io.TextIOWrapper, self._proc.stdin).buffer, metadata, raw)
                 result, _ = read_frame(cast(io.TextIOWrapper, self._proc.stdout).buffer)
                 return result
             except (OSError, EOFError, ValueError) as exc:
                 self._stop_locked()
-                return {"error": str(exc), "code": "timeout" if timed_out.is_set() else "gone"}
+                code = (
+                    "busy" if not frame_started else ("timeout" if timed_out.is_set() else "gone")
+                )
+                return {"error": str(exc), "code": code}
             finally:
                 done.set()
                 watchdog.join()

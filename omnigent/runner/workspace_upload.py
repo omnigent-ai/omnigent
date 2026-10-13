@@ -144,6 +144,7 @@ def _unwrap(result: dict[str, object]) -> dict[str, object]:
         "gone": 410,
         "no_space": 507,
         "timeout": 504,
+        "busy": 429,
         "io_error": 500,
         "permission_denied": 403,
         "invalid_name": 400,
@@ -618,7 +619,15 @@ class UploadManager:
                         raise RouteError(429, "upload_limit", "Session upload limit reached")
                     self.upload_locks[uid] = creation_lock
                     self.records[uid] = record
-                    await self._save_settled()
+                    try:
+                        await self._save_settled()
+                    except OSError as exc:
+                        # Begin has not run, so there is no allocation to preserve.
+                        del self.records[uid]
+                        del self.upload_locks[uid]
+                        if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+                            raise RouteError(507, "no_space", str(exc)) from exc
+                        raise RouteError(500, "io_error", str(exc)) from exc
                 try:
                     result = await self._call(
                         uid,
@@ -719,6 +728,8 @@ class UploadManager:
                 if op == "append":
                     raise RouteError(409, "already_complete", "Upload already committed")
                 record.offset = record.size
+                if op == "status":
+                    return {"offset": record.offset, "size": record.size}
                 return record.result
             if op == "complete":
                 result = await self._finalize(uid, record)
@@ -732,6 +743,8 @@ class UploadManager:
                 record.last_activity = _now()
                 if "offset" in result:
                     record.offset = cast(int, result["offset"])
+            if op == "status":
+                return {"offset": record.offset, "size": record.size}
             return result
 
     async def _finalize(self, uid: str, record: UploadRecord) -> dict[str, object]:
@@ -854,12 +867,11 @@ def register_upload_routes(
                 raw = bytes(body)
             result = await manager.operate(session_id, environment_id, uid, owner, op, raw, offset)
             if op == "status":
-                record = manager.records[uid]
                 return Response(
                     status_code=200,
                     headers={
-                        "Upload-Offset": str(record.offset),
-                        "Upload-Length": str(record.size),
+                        "Upload-Offset": str(result["offset"]),
+                        "Upload-Length": str(result["size"]),
                         "Cache-Control": "no-store",
                     },
                 )

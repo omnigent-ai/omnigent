@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
@@ -530,24 +531,25 @@ async def test_missing_target_directory(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_independent_upload_not_blocked_by_slow_finalize(
+async def test_shared_helper_bounds_wait_during_slow_finalize(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import threading
 
-    manager = client._transport.app.state.workspace_uploads
+    import omnigent.inner.os_env_upload as upload
+
     first = await create(client, size=0)
     second = await create(client, name="second", size=0)
-    original = manager._call
+    original = upload.read_frame
     entered, release = threading.Event(), threading.Event()
 
-    async def slow(uid, record, op, *args, **kwargs):
-        if op == "complete":
-            entered.set()
-            await asyncio.to_thread(release.wait, 5)
-        return await original(uid, record, op, *args, **kwargs)
+    def slow(stream):
+        entered.set()
+        assert release.wait(5)
+        return original(stream)
 
-    monkeypatch.setattr(manager, "_call", slow)
+    monkeypatch.setattr(upload, "read_frame", slow)
+    monkeypatch.setattr(upload, "CALL_TIMEOUT_S", 0.05)
     task = asyncio.create_task(
         client.post(BASE + "/" + first.json()["upload_id"] + "/complete?created_by=alice")
     )
@@ -556,10 +558,121 @@ async def test_independent_upload_not_blocked_by_slow_finalize(
         response = await asyncio.wait_for(
             client.head(BASE + "/" + second.json()["upload_id"] + "?created_by=alice"), 0.5
         )
-        assert response.status_code == 200
+        assert response.status_code == 429
+        assert response.headers["Retry-After"] == "60"
     finally:
         release.set()
-        await task
+        completed = await task
+    assert completed.status_code == 200
+    response = await client.head(BASE + "/" + second.json()["upload_id"] + "?created_by=alice")
+    assert response.status_code == 200
+    assert response.headers["Upload-Offset"] == "0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_number,status",
+    [
+        (errno.ENOSPC, 507),
+        (errno.EDQUOT, 507),
+        (errno.EIO, 500),
+        (errno.EACCES, 500),
+        (errno.ENOENT, 500),
+    ],
+)
+async def test_initial_save_failure_releases_admission(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_number: int,
+    status: int,
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    manager.limits = UploadLimits(max_open_uploads=1, max_open_bytes=3)
+
+    def fail() -> None:
+        raise OSError(error_number, "initial save failed")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(manager, "_save", fail)
+        response = await create(client)
+    assert response.status_code == status
+    assert response.json()["error"]["code"] == ("no_space" if status == 507 else "io_error")
+    assert not manager.records
+    assert not manager.upload_locks
+    assert not list((tmp_path / "workspace").iterdir())
+    assert (await create(client)).status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_begin_queue_timeout_releases_admission(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omnigent.inner.os_env_upload as upload
+
+    manager = client._transport.app.state.workspace_uploads
+    manager.limits = UploadLimits(max_open_uploads=1, max_open_bytes=3)
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    saved, dispatch = asyncio.Event(), asyncio.Event()
+    original_save = manager._save_settled
+    original_timeout = upload.operation_timeout
+
+    async def pause_after_save() -> None:
+        await original_save()
+        saved.set()
+        await dispatch.wait()
+
+    def timeout(metadata: dict[str, object]) -> float:
+        return 0.05 if metadata.get("op") == "begin" else original_timeout(metadata)
+
+    monkeypatch.setattr(manager, "_save_settled", pause_after_save)
+    monkeypatch.setattr(upload, "operation_timeout", timeout)
+    task = asyncio.create_task(create(client))
+    await asyncio.wait_for(saved.wait(), 5)
+    assert helper._lock.acquire(blocking=False)
+    try:
+        dispatch.set()
+        response = await asyncio.wait_for(task, 1)
+    finally:
+        helper._lock.release()
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "60"
+    assert response.json()["error"]["code"] == "busy"
+    assert not manager.records
+    assert not manager.upload_locks
+    assert json.loads(manager.state_path.read_text()) == {}
+    assert not list((tmp_path / "workspace").iterdir())
+    assert (await create(client)).status_code == 201
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_head_uses_metadata_captured_before_expiry(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, committed: bool
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    response = await create(client)
+    uid = response.json()["upload_id"]
+    url = BASE + "/" + uid + "?created_by=alice"
+    assert (await client.patch(url, headers=HEADERS, content=b"abc")).status_code == 204
+    if committed:
+        assert (await client.post(url.replace("?", "/complete?"))).status_code == 200
+    original = manager.operate
+
+    async def expire_after_operation(session, environment, uid, owner, op, *args):
+        result = await original(session, environment, uid, owner, op, *args)
+        if op == "status":
+            await manager.sweep(now=manager.records[uid].created_at + manager.limits.max_age_s + 1)
+            assert uid not in manager.records
+        return result
+
+    monkeypatch.setattr(manager, "operate", expire_after_operation)
+    response = await client.head(url)
+    assert response.status_code == 200
+    assert response.headers["Upload-Offset"] == "3"
+    assert response.headers["Upload-Length"] == "3"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert (await client.head(url)).status_code == 410
 
 
 @pytest.mark.asyncio
@@ -1304,6 +1417,11 @@ async def test_request_reconciles_before_background_startup(
             with pytest.raises(RouteError) as exc:
                 await fresh.operate("session", DEFAULT_ENVIRONMENT_ID, uid, "alice", op)
             assert exc.value.code == "already_complete"
+        elif op == "status":
+            assert await fresh.operate("session", DEFAULT_ENVIRONMENT_ID, uid, "alice", op) == {
+                "offset": 0,
+                "size": 0,
+            }
         else:
             assert (
                 await fresh.operate("session", DEFAULT_ENVIRONMENT_ID, uid, "alice", op)
