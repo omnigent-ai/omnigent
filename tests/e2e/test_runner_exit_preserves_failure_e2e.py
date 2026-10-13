@@ -83,8 +83,9 @@ async def test_runner_exit_preserves_original_failure(tmp_path: Path, restart: b
             async with httpx.AsyncClient(base_url=base_url, trust_env=False) as client:
                 snapshot = await client.get(f"/v1/sessions/{session_id}")
                 snapshot.raise_for_status()
-            assert snapshot.json()["status"] == "failed"
-            error = snapshot.json()["last_task_error"]
+            body = snapshot.json()
+            assert body["status"] == "failed"
+            error = body["last_task_error"]
             assert {key: error[key] for key in original} == original
             refreshed = store.get_conversation(session_id)
             assert refreshed is not None and refreshed.live_status == "failed"

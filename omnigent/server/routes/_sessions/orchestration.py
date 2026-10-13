@@ -7727,7 +7727,8 @@ async def _runner_disconnect_requires_failure(
     If the read is unavailable, use the sweep or relay's adoption snapshot.
     Without any known state, preserve the session: a failed read does not
     establish that a turn was interrupted.
-    Only top-level sessions can fail before startup with ``fail_idle_top_level``.
+    Only top-level sessions can fail before startup with ``fail_idle_top_level``;
+    one that already failed with a persisted cause keeps that cause instead.
 
     A sub-agent mirrored from a native parent fails only on a turn in the
     cache: its saved status can still read mid-turn after its last idle edge.
@@ -7779,10 +7780,14 @@ async def _runner_disconnect_requires_failure(
         decision = "failed_mid_turn"
     elif source == "unknown":
         decision = "unknown_no_failure"
-    elif live == "failed":
-        decision = "already_failed"
     elif fail_idle_top_level and conv is not None and conv.kind != "sub_agent":
-        decision = "failed_before_start"
+        # A failed session that already carries a cause keeps it; one without a
+        # saved cause still records this exit as its startup failure.
+        has_cause = (
+            isinstance(conv, Conversation)
+            and _last_task_error_from_labels(conv.labels) is not None
+        )
+        decision = "already_failed" if live == "failed" and has_cause else "failed_before_start"
     else:
         decision = "idle_no_failure"
 
@@ -12488,8 +12493,9 @@ async def _get_session_snapshot(
     # cause as last_task_error so a reload/late-open still renders the error
     # banner — the live session.status:failed push is gone by then. status
     # reads "failed" from the cache (set by _on_runner_exited), except an idle
-    # session whose runner connected: it lost no work and stays
-    # idle. The report is keyed by the CURRENT runner_id, so a successful relaunch
+    # session whose runner connected (it lost no work and stays idle) and a
+    # failed session that already carries its own cause, which keeps it. The
+    # report is keyed by the CURRENT runner_id, so a successful relaunch
     # (new token-bound runner_id) naturally stops matching. Access is gated
     # by the session-snapshot's own authorization, so the unscoped get is
     # correct here (the report is this session's own runner).

@@ -2890,6 +2890,7 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
 async def test_offline_sweep_preserves_existing_failure(
     db_uri: str, cached: bool, fail_idle_top_level: bool
 ) -> None:
+    """A failed session keeps its saved cause when its runner is later reported gone."""
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.schemas import ErrorDetail
@@ -2923,7 +2924,53 @@ async def test_offline_sweep_preserves_existing_failure(
         assert sessions_module._last_task_error_from_labels(refreshed.labels) == original
         assert not any(row["event_name"] == "session_turn_failed" for row in rows)
         decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
-        assert decision["attributes"]["decision"] == "already_failed"
+        assert decision["attributes"]["decision"] == (
+            "already_failed" if fail_idle_top_level else "idle_no_failure"
+        )
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_idle_top_level", [False, True])
+async def test_offline_sweep_records_startup_failure_for_failed_session_without_cause(
+    db_uri: str, fail_idle_top_level: bool
+) -> None:
+    """A failed session with no saved cause still records a never-connected runner's exit.
+
+    A host launch refusal fails a session without error labels. When its retried
+    runner dies before connecting, the exit report is the only durable cause.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-exit-after-causeless-failure")
+    store.set_session_live_status(conv.id, "failed")
+    snapshot = store.get_conversation(conv.id)
+    assert snapshot is not None
+    exit_error = ErrorDetail(code="runner_failed_to_start", message="Synthetic runner exit")
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [snapshot], exit_error, store, fail_idle_top_level=fail_idle_top_level
+            )
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        assert refreshed.live_status == "failed"
+        persisted = sessions_module._last_task_error_from_labels(refreshed.labels)
+        decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        failed_rows = [row for row in rows if row["event_name"] == "session_turn_failed"]
+        if fail_idle_top_level:
+            assert decision["attributes"]["decision"] == "failed_before_start"
+            assert persisted == {"code": exit_error.code, "message": exit_error.message}
+            assert len(failed_rows) == 1
+        else:
+            assert decision["attributes"]["decision"] == "idle_no_failure"
+            assert persisted is None
+            assert failed_rows == []
     finally:
         sessions_module._session_status_cache.pop(conv.id, None)
         session_stream.close(conv.id)

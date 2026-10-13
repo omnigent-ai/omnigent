@@ -592,11 +592,13 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("had_connected", [False, True], ids=["never-connected", "connected"])
 @pytest.mark.parametrize("cached", [False, True], ids=["persisted", "cached"])
 @pytest.mark.parametrize("live_status", ["failed", "running"])
 async def test_session_snapshot_existing_failure_survives_runner_exit(
-    monkeypatch: pytest.MonkeyPatch, cached: bool, live_status: str
+    monkeypatch: pytest.MonkeyPatch, had_connected: bool, cached: bool, live_status: str
 ) -> None:
+    """A saved failure cause outlives the exit report; an interrupted turn still takes it."""
     from omnigent.server.host_registry import RunnerExitReports
     from omnigent.server.routes import sessions as sessions_module
 
@@ -622,7 +624,9 @@ async def test_session_snapshot_existing_failure_survives_runner_exit(
     else:
         monkeypatch.delitem(sessions_module._session_status_cache, session_id, raising=False)
     reports = RunnerExitReports()
-    reports.record(conv.runner_id, "Synthetic runner exit", owner=None, had_connected=False)
+    reports.record(
+        conv.runner_id, "Synthetic runner exit", owner=None, had_connected=had_connected
+    )
 
     snapshot = await _get_session_snapshot(
         store,
