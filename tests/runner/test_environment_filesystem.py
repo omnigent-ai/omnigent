@@ -3613,6 +3613,12 @@ async def test_upload_staging_hidden(
     (workspace / "model.3mf").write_bytes(b"visible")
     app.state.filesystem_registry.record_change(hidden, "write", "conv_test")
     app.state.filesystem_registry.record_change("model.3mf", "write", "conv_test")
+    directory = "folder.omnigent-upload-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.part"
+    (workspace / directory).mkdir()
+    (workspace / directory / "visible.txt").write_bytes(b"visible")
+    (workspace / directory / hidden).write_bytes(b"partial")
+    for path in (directory + "/visible.txt", directory + "/" + hidden):
+        app.state.filesystem_registry.record_change(path, "write", "conv_test")
     visible = ["notes.part", "x.omnigent-upload-notanid.part", ".x.omnigent-upload-notanid.part"]
     for name in visible:
         (workspace / name).write_bytes(b"visible")
@@ -3624,3 +3630,19 @@ async def test_upload_staging_hidden(
     assert "model.3mf" in names
     assert hidden not in names
     assert set(visible) <= names
+    paths = {e["path"] for e in response.json()["data"]}
+    assert directory + "/" + hidden not in paths
+    if view == "filesystem":
+        assert directory in paths
+        nested = (await client.get(base + "/filesystem/" + directory)).json()
+        assert {e["name"] for e in nested["data"]} == {"visible.txt"}
+    else:
+        assert directory + "/visible.txt" in paths
+    if view == "search":
+        assert directory in paths
+        indexed = search_indexed_paths(
+            workspace,
+            [hidden, directory, directory + "/visible.txt", directory + "/" + hidden],
+            ".",
+        )
+        assert {e.path for e in indexed} == {directory, directory + "/visible.txt"}
