@@ -526,13 +526,16 @@ def register_upload_routes(
             try:
                 payload = await probe_capability(client, conv, environment_id)
             except BaseException as exc:
-                future.set_exception(
+                error = (
                     exc
                     if isinstance(exc, OmnigentError)
                     else UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
                 )
+                future.set_exception(error)
                 with index.lock:
                     cache.pop(key, None)
+                if isinstance(exc, Exception) and not isinstance(exc, OmnigentError):
+                    raise error from exc
                 raise
             future.set_result(payload)
         else:
