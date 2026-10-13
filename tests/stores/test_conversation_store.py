@@ -3819,6 +3819,41 @@ def test_clear_host_binding_nulls_all_binding_fields(
     assert conversation_store.set_runner_id(conv.id, "runner_token_retry") is True
 
 
+def test_clear_host_binding_with_expected_runner_clears_only_the_matching_binding(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``expected_runner_id`` makes the unbind a compare-and-clear: a binding
+    another writer rotated meanwhile is returned unchanged, while a still-bound
+    matching runner is cleared exactly like the unconditional form."""
+    _register_host(db_uri, "873f058a4a48002a654a80be0ee09bfb")
+    conv = conversation_store.create_conversation()
+    conversation_store.set_host_id(
+        conv.id,
+        "873f058a4a48002a654a80be0ee09bfb",
+        workspace="/Users/corey/repo-worktrees/feature-y",
+        git_branch="feature/y",
+    )
+    assert conversation_store.set_runner_id(conv.id, "runner_a") is True
+    conversation_store.replace_runner_id(conv.id, "runner_b")
+
+    kept = conversation_store.clear_host_binding(conv.id, expected_runner_id="runner_a")
+    assert kept.runner_id == "runner_b"
+    assert kept.host_id == "873f058a4a48002a654a80be0ee09bfb"
+    assert kept.workspace == "/Users/corey/repo-worktrees/feature-y"
+    assert kept.git_branch == "feature/y"
+    refetched = conversation_store.get_conversation(conv.id)
+    assert refetched is not None
+    assert refetched.runner_id == "runner_b"
+    assert refetched.host_id == "873f058a4a48002a654a80be0ee09bfb"
+
+    cleared = conversation_store.clear_host_binding(conv.id, expected_runner_id="runner_b")
+    assert cleared.host_id is None
+    assert cleared.workspace is None
+    assert cleared.git_branch is None
+    assert cleared.runner_id is None
+
+
 def test_clear_host_binding_missing_conversation_raises(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

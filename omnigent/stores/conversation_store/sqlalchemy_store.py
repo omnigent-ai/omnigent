@@ -3974,7 +3974,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
-    def clear_host_binding(self, conversation_id: str) -> Conversation:
+    def clear_host_binding(
+        self, conversation_id: str, *, expected_runner_id: str | None = None
+    ) -> Conversation:
         """
         NULL ``host_id``/``workspace``/``git_branch``/``runner_id`` together.
 
@@ -3985,6 +3987,9 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param expected_runner_id: When set, the clear is a compare-and-clear
+            on ``runner_id``; a row another writer has already rotated is
+            returned unchanged.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
@@ -3996,10 +4001,22 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            meta.host_id = None
-            meta.workspace = None
-            meta.git_branch = None
-            meta.runner_id = None
+            if expected_runner_id is None:
+                meta.host_id = None
+                meta.workspace = None
+                meta.git_branch = None
+                meta.runner_id = None
+            else:
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.runner_id == expected_runner_id,
+                    )
+                    .values(host_id=None, workspace=None, git_branch=None, runner_id=None)
+                )
+                session.refresh(meta)
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_host_binding", write)

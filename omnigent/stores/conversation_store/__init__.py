@@ -1614,7 +1614,9 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def clear_host_binding(self, conversation_id: str) -> Conversation:
+    def clear_host_binding(
+        self, conversation_id: str, *, expected_runner_id: str | None = None
+    ) -> Conversation:
         """
         Revert a session to fully unbound: NULL ``host_id``,
         ``workspace``, ``git_branch``, and ``runner_id`` together.
@@ -1636,7 +1638,12 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
-        :returns: The updated :class:`Conversation`.
+        :param expected_runner_id: When set, clear the binding only while
+            this runner is still bound; a row whose runner has moved is
+            returned unchanged, so a cleanup path never erases a newer
+            binding written elsewhere.
+        :returns: The updated :class:`Conversation` (unchanged when the
+            expected runner no longer matched).
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
         """
