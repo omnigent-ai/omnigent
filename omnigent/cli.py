@@ -3589,6 +3589,7 @@ def _build_host_daemon_env(
         HOST_NAME_ENV_VAR,
         HOST_TOKEN_ENV_VAR,
     )
+    from omnigent.telemetry.environment import propagate_telemetry_opt_out
 
     identity_env_vars = frozenset(
         {
@@ -3634,6 +3635,7 @@ def _build_host_daemon_env(
 
     env.pop(DISPATCH_TRACEPARENT_ENV_VAR, None)
     env.pop(DISPATCH_TRACESTATE_ENV_VAR, None)
+    propagate_telemetry_opt_out(os.environ, env)
     return env
 
 

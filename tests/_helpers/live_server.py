@@ -126,6 +126,7 @@ def isolated_process_env(
         OMNIGENT_AUTH_PROVIDER="header",
         OMNIGENT_LOCAL_SINGLE_USER="1",
         OMNIGENT_DISABLE_CATALOG_LOOKUP="1",
+        OMNIGENT_DISABLE_TELEMETRY="1",
     )
     for name, value in overrides.items():
         if value is None:

@@ -878,6 +878,8 @@ def _build_runner_env(
         host janitor. ``None`` preserves the standalone runner default.
     :returns: The runner subprocess environment.
     """
+    from omnigent.telemetry.environment import propagate_telemetry_opt_out
+
     extra_names = {
         name.strip()
         for name in base_env.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
@@ -911,6 +913,7 @@ def _build_runner_env(
         or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
         or key in forwarded
     }
+    propagate_telemetry_opt_out(base_env, env)
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
