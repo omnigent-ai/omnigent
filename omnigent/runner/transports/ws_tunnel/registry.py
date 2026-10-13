@@ -45,7 +45,6 @@ from weakref import WeakValueDictionary
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
-from omnigent.runner.transports.ws_tunnel.binary_requests import BINARY_REQUEST_ADMISSION_TIMEOUT_S
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     Frame,
@@ -148,7 +147,6 @@ class RunnerSession:
     binary_requests: set[str] = field(default_factory=set)
     binary_pending_sends: set[str] = field(default_factory=set)
     binary_waiting_response: set[str] = field(default_factory=set)
-    binary_deadlines: dict[str, asyncio.TimerHandle] = field(default_factory=dict)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
     # 8-char hex channel ids; values hold the inbound queue consumed
     # by whichever side terminated the attach.
@@ -182,6 +180,7 @@ class RequestState:
     :param end_event: Event set when the response end frame arrives.
     :param aborted_with: Error to raise from the body iterator after
         a tunnel disconnect or registry abort.
+    :param enqueued: Whether the writer queue accepted this request, regardless of wire format.
     """
 
     loop: asyncio.AbstractEventLoop
@@ -190,6 +189,7 @@ class RequestState:
     body_queue: asyncio.Queue[ResponseBodyFrame | None]
     end_event: asyncio.Event = field(default_factory=asyncio.Event)
     aborted_with: BaseException | None = None
+    enqueued: bool = False
 
 
 # Inbound channel-queue item shape:
@@ -639,8 +639,8 @@ class TunnelRegistry:
         :raises ValueError: If a request with this ``req_id`` is
             already in flight on this runner. req_ids must be unique
             per session.
-        :param binary_body: Reserve one of two opted-in body slots before buffering.
-        :raises httpx.PoolTimeout: If both opted-in body slots are occupied.
+        :param binary_body: Reserve one of two binary envelope slots before buffering.
+        :raises httpx.PoolTimeout: If both binary envelope slots are occupied.
         """
         loop = asyncio.get_running_loop()
         with self._lock:
@@ -662,15 +662,6 @@ class TunnelRegistry:
             session.in_flight[req_id] = state
             if binary_body:
                 session.binary_requests.add(req_id)
-                deadline = time.monotonic() + BINARY_REQUEST_ADMISSION_TIMEOUT_S
-                try:
-                    _call_session_soon_threadsafe(
-                        session, partial(self._install_binary_deadline, session, req_id, deadline)
-                    )
-                except RuntimeError as exc:
-                    session.in_flight.pop(req_id, None)
-                    self._release_binary_request(session, req_id)
-                    raise ConnectionError("runner tunnel loop closed before admission") from exc
             return state
 
     def close_request(
@@ -703,44 +694,8 @@ class TunnelRegistry:
 
     @staticmethod
     def _release_binary_request(session: RunnerSession, req_id: str) -> None:
-        """Release admission and its timer under the registry lock, idempotently."""
+        """Release admission under the registry lock, idempotently."""
         session.binary_requests.discard(req_id)
-        handle = session.binary_deadlines.pop(req_id, None)
-        if handle is not None:
-            with contextlib.suppress(RuntimeError):
-                _call_session_soon_threadsafe(session, handle.cancel)
-
-    def _install_binary_deadline(
-        self, session: RunnerSession, req_id: str, deadline: float
-    ) -> None:
-        with self._lock:
-            if self._sessions.get(session.runner_id) is not session:
-                return
-            if req_id not in session.binary_requests:
-                return
-            session.binary_deadlines[req_id] = asyncio.get_running_loop().call_later(
-                max(0.0, deadline - time.monotonic()), self._expire_binary_request, session, req_id
-            )
-
-    def _expire_binary_request(self, session: RunnerSession, req_id: str) -> None:
-        with self._lock:
-            if self._sessions.get(session.runner_id) is not session:
-                return
-            if req_id not in session.binary_requests:
-                return
-            _logger.warning(
-                "Runner %s binary admission deadline exceeded for %s; retiring tunnel",
-                session.runner_id,
-                req_id,
-                extra={"session_id": runner_primary_session_id()},
-            )
-            # Do not reopen admission on a socket whose runner may still be executing.
-            self.deregister(session.runner_id, session=session)
-
-    def binary_request_awaits_end(self, session: RunnerSession, req_id: str) -> bool:
-        """Whether an opted-in request is enqueued and still awaiting runner completion."""
-        with self._lock:
-            return req_id in session.binary_waiting_response
 
     def request_is_open(self, session: RunnerSession, req_id: str) -> bool:
         """Return whether a request is still in flight on ``session``.
@@ -919,6 +874,8 @@ class TunnelRegistry:
                         on_sent=on_sent,
                     )
                     session.outbound_queue.put_nowait(frame)
+                    if request_id is not None:
+                        session.in_flight[request_id].enqueued = True
                     # Recording or logging failures cannot undo an accepted frame.
                     with contextlib.suppress(Exception):
                         try:

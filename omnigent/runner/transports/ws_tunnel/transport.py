@@ -117,20 +117,18 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
     Set ``extensions={"runner_tunnel_binary_request_body": True}`` on an
     httpx request to opt in. Capable runners receive raw bytes when the server
     kill switch is enabled; otherwise the existing JSON encoding is used.
-    At most two opted-in requests are admitted per connection, including JSON
-    fallbacks. Excess callers get ``httpx.PoolTimeout`` and may retry after an
-    earlier runner response ends. Admission lasts until the runner's terminal
+    At most two binary envelopes are admitted per connection; JSON fallbacks
+    do not consume slots. Excess binary callers get ``httpx.PoolTimeout`` and
+    may retry after an earlier runner response ends. Admission lasts until the runner's terminal
     response or session retirement, even if the caller cancels or closes early.
     Caller cancellation/timeouts before headers also send ``request.cancel``
     for enqueued opted-in requests. Writing cancel does not release admission.
     ``BINARY_REQUEST_DISPATCH_TIMEOUT_S`` bounds binary runner work to 150s.
-    ``BINARY_REQUEST_ADMISSION_TIMEOUT_S`` bounds every opted-in slot, including
-    JSON fallback, to 180s from allocation;
-    a missing terminal response retires that whole tunnel before slots reopen.
-    Both bounds exceed the upload relay's longest deadline (finalize: 120s),
-    allowing the upload relay to return 504 first. The extra server grace covers queued sends,
-    old runners and handlers that ignore cancellation, without exceeding the
-    two-request cap on a connection that might still be executing work.
+    This exceeds the upload relay's longest deadline (finalize: 120s), allowing
+    the relay to return 504 first. An ASGI handler that suppresses
+    ``CancelledError`` keeps its slot until tunnel teardown. The existing ping
+    keepalive retires an unresponsive runner; healthy pongs alone do not detect
+    a stuck handler.
     An over-limit binary envelope raises ``httpx.LocalProtocolError`` with the
     request attached; upload relays can map this error to HTTP 413.
     """
@@ -164,12 +162,18 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
 
         req_id = uuid.uuid4().hex
         opted_in = request.extensions.get("runner_tunnel_binary_request_body") is True
+        use_binary = (
+            opted_in
+            and BINARY_REQUEST_BODY_CAPABILITY in session.hello.capabilities
+            and runner_tunnel_binary_request_body()
+        )
+        generation = request.extensions.get("runner_tunnel_generation")
         try:
             state = self._registry.open_request(
                 self._runner_id,
                 req_id,
-                generation=request.extensions.get("runner_tunnel_generation"),
-                binary_body=opted_in,
+                generation=session.generation if generation is None else generation,
+                binary_body=use_binary,
             )
         except KeyError as exc:
             raise httpx.ConnectError(f"runner {self._runner_id!r} is offline") from exc
@@ -183,11 +187,7 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                 headers=[[k, v] for k, v in request.headers.items()],
                 stream=True,
             )
-            if (
-                opted_in
-                and BINARY_REQUEST_BODY_CAPABILITY in state.session.hello.capabilities
-                and runner_tunnel_binary_request_body()
-            ):
+            if use_binary:
                 try:
                     wire: str | bytes = encode_binary_request(frame, body)
                 except ValueError as exc:
@@ -209,7 +209,7 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                     and isinstance(
                         exc, (asyncio.CancelledError, TimeoutError, httpx.TimeoutException)
                     )
-                    and self._registry.binary_request_awaits_end(state.session, req_id)
+                    and state.enqueued
                 ):
                     with contextlib.suppress(Exception):
                         await self._registry.send_text(
