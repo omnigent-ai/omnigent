@@ -63,7 +63,7 @@ def test_dead_pane_at_deadline_retains_exit_evidence(monkeypatch: pytest.MonkeyP
 
     assert raised.value.exit_status == "137"
     assert "Synthetic startup failure" in str(raised.value)
-    assert clock.now == 0.3
+    assert clock.now == pytest.approx(0.3)
 
 
 @pytest.fixture
@@ -99,7 +99,7 @@ def dead_terminal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[P
                 timeout=5,
             )
             subprocess.run(
-                [*tmux, "set-option", "remain-on-exit", "on"],
+                [*tmux, "set-option", "-t", "main", "remain-on-exit", "on"],
                 check=True,
                 capture_output=True,
                 timeout=5,
