@@ -75,7 +75,7 @@ _WORKTREE_SWITCH_SUBCMDS: frozenset[str] = frozenset({"add", "move", "remove"})
 # so the scanner skips both when locating the subcommand. ``-C`` additionally
 # names a directory the command runs in.
 _GIT_VALUE_OPTS: frozenset[str] = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--attr-source"}
 )
 
 # Shell tools whose command string this policy parses, by default: every

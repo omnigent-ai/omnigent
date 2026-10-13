@@ -557,21 +557,57 @@ _GIT_WRITE_SUBCMDS: frozenset[str] = frozenset({"push"})
 
 # Global options may consume an operand before the subcommand.
 _GIT_GLOBAL_VALUE_OPTS: frozenset[str] = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--exec-path"}
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--attr-source"}
+)
+_GIT_GLOBAL_FLAG_OPTS: frozenset[str] = frozenset(
+    {
+        "-v",
+        "--version",
+        "-h",
+        "--help",
+        "-p",
+        "--paginate",
+        "-P",
+        "--no-pager",
+        "--html-path",
+        "--man-path",
+        "--info-path",
+        "--bare",
+        "--no-replace-objects",
+        "--no-lazy-fetch",
+        "--no-optional-locks",
+        "--no-advice",
+        "--literal-pathspecs",
+        "--glob-pathspecs",
+        "--noglob-pathspecs",
+        "--icase-pathspecs",
+    }
 )
 
 
 def _git_subcommand_index(tokens: list[str]) -> int | None:
-    """Find the subcommand after global options and their operands."""
+    """Find the subcommand, rejecting incomplete or unsupported global options."""
     i = 1
     while i < len(tokens):
         token = tokens[i]
-        if token in _GIT_GLOBAL_VALUE_OPTS and i + 1 < len(tokens):
+        if token == "--exec-path":
+            # Without an attached value, Git prints its exec path and exits.
+            return None
+        if token in _GIT_GLOBAL_VALUE_OPTS:
+            if i + 1 == len(tokens):
+                raise ValueError("Missing Git global option value")
             i += 2
             continue
-        if token.startswith("-"):
+        option, separator, _ = token.partition("=")
+        if (
+            token in _GIT_GLOBAL_FLAG_OPTS
+            or (separator and (option in _GIT_GLOBAL_VALUE_OPTS or option == "--exec-path"))
+            or (token.startswith(("-C", "-c")) and len(token) > 2)
+        ):
             i += 1
             continue
+        if token.startswith("-"):
+            raise ValueError("Unsupported Git global option")
         return i
     return None
 
@@ -682,8 +718,8 @@ class _ShellOp:
     One git / gh remote operation parsed from a shell command segment.
 
     :param kind: Access kind — ``"read"``, ``"write"``, ``"ignore"`` (local /
-        non-repo command, no gating), or ``"unparseable"`` (a git/gh write we
-        could not tokenize — fail to ASK).
+        non-repo command, no gating), or ``"unparseable"`` (a git/gh command
+        that requires approval because its invocation could not be classified).
     :param repo: Normalized ``owner/repo`` target, or ``None`` when the command
         relied on a local remote alias / cwd remote we cannot resolve.
     :param branches: Branch names the write targets (empty when none could be
@@ -752,13 +788,22 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
     Classify a ``git`` invocation into a remote :class:`_ShellOp`.
 
     :param tokens: Tokens starting at ``git``, e.g. ``["git", "push", "origin", "main"]``.
-    :returns: A :class:`_ShellOp` for remote read/write subcommands, or ``None``
-        for local-only git commands (status / commit / diff / branch / …),
-        which are never gated.
+    :returns: A :class:`_ShellOp` for remote read/write subcommands or an
+        unparseable invocation; ``None`` for local-only commands with
+        recognized global options (status / commit / diff / branch / …).
     """
     if len(tokens) < 2:
         return None
-    idx = _git_subcommand_index(tokens)
+    try:
+        idx = _git_subcommand_index(tokens)
+    except ValueError:
+        return _ShellOp(
+            kind="unparseable",
+            repo=None,
+            branches=frozenset(),
+            branch_targeted=False,
+            detail="incomplete or unsupported Git global options",
+        )
     if idx is None:
         return None
     sub = tokens[idx]
