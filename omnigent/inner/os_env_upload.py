@@ -82,6 +82,7 @@ def upload_support_reason() -> str | None:
 def valid_name(name: str) -> bool:
     return (
         bool(name)
+        and len(name.encode("utf-8")) <= 255
         and name not in (".", "..")
         and not any(c in name for c in ("/", "\\", "\0"))
         and not is_upload_staging(name)
@@ -136,12 +137,17 @@ def read_frame(stream: FrameReader) -> tuple[dict[str, object], bytes]:
     return metadata, _exact(stream, raw_length)
 
 
-def write_frame(stream: FrameWriter, metadata: dict[str, object], raw: bytes = b"") -> None:
-    if len(raw) > MAX_RAW_BYTES:
+def _frame_header(metadata: dict[str, object], raw_length: int) -> bytes:
+    if raw_length > MAX_RAW_BYTES:
         raise ValueError("Upload chunk too large")
-    header = json.dumps({**metadata, "raw_length": len(raw)}, separators=(",", ":")).encode()
+    header = json.dumps({**metadata, "raw_length": raw_length}, separators=(",", ":")).encode()
     if len(header) > MAX_METADATA_BYTES:
         raise ValueError("Upload metadata too large")
+    return header
+
+
+def write_frame(stream: FrameWriter, metadata: dict[str, object], raw: bytes = b"") -> None:
+    header = _frame_header(metadata, len(raw))
     stream.write(struct.pack("!I", len(header)))
     stream.write(header)
     stream.write(raw)
@@ -183,6 +189,10 @@ class UploadHelperClient(_HelperProcessClient):
         deadline: float | None = None,
     ) -> dict[str, object]:
         """A busy result guarantees no request frame could have been sent."""
+        try:
+            _frame_header(metadata, len(raw))
+        except (TypeError, ValueError) as exc:
+            return {"error": str(exc), "code": "invalid_request"}
         timeout_s = operation_timeout(metadata) if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout_s if deadline is None else deadline
         if not self._lock.acquire(timeout=max(0, deadline - time.monotonic())):
@@ -453,6 +463,7 @@ class UploadEngine:
                         os.unlink(staging, dir_fd=parent)
                 with contextlib.suppress(OSError):
                     os.fsync(parent)
+                self._forget(uid)
                 return self._publication_result(publication)
             finally:
                 os.close(fd)
