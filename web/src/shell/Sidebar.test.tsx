@@ -46,6 +46,7 @@ const {
   conversationsRef,
   pinnedIdsRef,
   projectSessionsMock,
+  projectSessionsLoadingRef,
   useHostsMock,
   usePullRequestInfoMock,
 } = vi.hoisted(() => ({
@@ -74,6 +75,7 @@ const {
   // serves exactly those rows instead of deriving from the global list — used to
   // prove a folder fetches its members independently of the global window.
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
+  projectSessionsLoadingRef: { current: false },
   useHostsMock: vi.fn(),
   usePullRequestInfoMock: vi.fn(),
 }));
@@ -122,6 +124,7 @@ vi.mock("@/hooks/useConversations", async () => {
     }),
     useProjectSessions: (project: string, enabled: boolean) => {
       const override = projectSessionsMock.current[project];
+      const loading = enabled && projectSessionsLoadingRef.current;
       const rows = !enabled
         ? []
         : (override ??
@@ -129,13 +132,14 @@ vi.mock("@/hooks/useConversations", async () => {
             (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
           ));
       return {
-        data: enabled
-          ? {
-              pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
-              pageParams: [undefined],
-            }
-          : undefined,
-        isLoading: false,
+        data:
+          enabled && !loading
+            ? {
+                pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
+                pageParams: [undefined],
+              }
+            : undefined,
+        isLoading: loading,
         isError: false,
         error: null,
         fetchNextPage: vi.fn(),
@@ -297,6 +301,7 @@ beforeEach(() => {
   fetchProjectSessionIdsMock.mockReset();
   fetchProjectSessionIdsMock.mockResolvedValue([]);
   projectSessionsMock.current = {};
+  projectSessionsLoadingRef.current = false;
   pinnedIdsRef.current = [];
   // Default to a multi-user server so the tab-based tests see the tabs.
   isServerLocalMock.mockReturnValue(false);
@@ -3521,6 +3526,61 @@ describe("sidebar_grouping_ui release flag", () => {
     fireEvent.click(within(projects).getByTestId("toggle-selection-mode"));
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
     expect(within(projects).getByTestId("session-filter")).toBe(filter);
+  });
+
+  it("centers empty project rows with a dashed border without changing row sizing", () => {
+    projectsMock.push("Alpha");
+    mockConversations([]);
+    renderGroupingSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+
+    const action = screen
+      .getAllByRole("link", { name: "new session" })
+      .find((link) => link.getAttribute("href") === "/?project=Alpha")!;
+    const empty = action.closest(".sidebar-row")!;
+    expect(empty).toHaveClass(
+      "items-center",
+      "text-center",
+      "h-auto",
+      "min-h-0",
+      "px-2",
+      "py-1.5",
+      "md:py-1",
+    );
+    expect(empty).not.toHaveClass("border", "border-dashed", "border-border");
+    const border = empty.firstElementChild!;
+    expect(border).toHaveAttribute("aria-hidden", "true");
+    expect(border).toHaveClass(
+      "pointer-events-none",
+      "absolute",
+      "inset-0",
+      "border",
+      "border-dashed",
+      "border-border",
+    );
+  });
+
+  it("keeps the project loading placeholder at session-row height", () => {
+    projectsMock.push("Alpha");
+    projectSessionsLoadingRef.current = true;
+    mockConversations([]);
+    renderGroupingSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+
+    const loading = screen.getByText("Loading…");
+    expect(loading.parentElement).toHaveClass("pl-6");
+    expect(loading).toHaveClass(
+      "sidebar-row",
+      "sidebar-compact-text",
+      "h-auto",
+      "min-h-0",
+      "w-full",
+      "px-2",
+      "py-1.5",
+      "md:py-1",
+      "justify-center",
+    );
+    expect(loading).not.toHaveClass("text-sm");
   });
 
   it("selects project, Shared and Sessions rows together from the Projects header", () => {
