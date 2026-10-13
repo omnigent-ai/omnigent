@@ -811,6 +811,9 @@ def _unreachable(request: httpx.Request) -> httpx.Response:
         pytest.param(_lists(), _LITELLM_URL, None, True, True, id="empty-listing"),
         pytest.param(_lists("claude-*"), _LITELLM_URL, {}, True, False, id="no-credential"),
         pytest.param(
+            _lists("claude-*"), f"{_LITELLM_URL}:bad", None, True, False, id="malformed-base-url"
+        ),
+        pytest.param(
             _unreachable,
             _DATABRICKS_GATEWAY_URL,
             _BEARER_ONLY,
@@ -873,6 +876,51 @@ async def test_catalog_asks_the_ambient_gateway_the_way_claude_code_does(
     assert request.headers["authorization"] == "Bearer sk-ant-oat01-subscription"
     assert request.headers["x-litellm-api-key"] == "sk-litellm-virtual"
     assert request.headers["anthropic-version"]
+
+
+async def test_catalog_lets_custom_headers_override_the_derived_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit custom header wins over the env-derived one, whatever its case."""
+    requests = _ambient_gateway(
+        monkeypatch,
+        _litellm_listing,
+        env={
+            "ANTHROPIC_AUTH_TOKEN": "sk-ant-env",
+            "ANTHROPIC_CUSTOM_HEADERS": (
+                "authorization: Bearer custom\nANTHROPIC-VERSION: 2024-01-01"
+            ),
+        },
+    )
+    _stub_picker(monkeypatch, _PASSTHROUGH_PICKER, default="claude-opus-5-5[1m]")
+
+    await claude_native.claude_model_catalog(None)
+
+    (request,) = requests
+    assert request.headers.get_list("authorization") == ["Bearer custom"]
+    assert request.headers.get_list("anthropic-version") == ["2024-01-01"]
+
+
+async def test_launch_catalog_reprobes_when_the_ambient_credential_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A different key for the same gateway URL must not reuse a persisted empty answer."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    _stub_picker(monkeypatch, _PASSTHROUGH_PICKER, default="claude-opus-5-5[1m]")
+    _ambient_gateway(
+        monkeypatch,
+        _lists("anthropic/claude-sonnet-5"),
+        env={"ANTHROPIC_AUTH_TOKEN": "sk-key-scoped-to-namespaced-routes"},
+    )
+    assert await claude_native.claude_launch_catalog(None) == []
+
+    _ambient_gateway(
+        monkeypatch, _litellm_listing, env={"ANTHROPIC_AUTH_TOKEN": "sk-key-scoped-to-claude"}
+    )
+    rows = await claude_native.claude_launch_catalog(None)
+
+    assert rows is not None
+    assert [row["id"] for row in rows] == _PASSTHROUGH_ROWS
 
 
 async def test_catalog_asks_the_managed_settings_gateway_over_the_shell_env(

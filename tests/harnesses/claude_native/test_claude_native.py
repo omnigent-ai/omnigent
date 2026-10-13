@@ -12925,6 +12925,28 @@ def test_ambient_env_is_non_anthropic_gateway_returns_false_when_unset(
     assert claude_native._ambient_env_is_non_anthropic_gateway() is False
 
 
+def test_catalog_fingerprint_tracks_the_ambient_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A changed ambient credential re-probes the same gateway; its value never enters the key."""
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    for name in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.litellm.svc.cluster.local")
+    without_credential = claude_native.claude_catalog_fingerprint(None)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-first")
+    first = claude_native.claude_catalog_fingerprint(None)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-second")
+    second = claude_native.claude_catalog_fingerprint(None)
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "x-litellm-api-key: sk-virtual")
+    with_header = claude_native.claude_catalog_fingerprint(None)
+
+    assert len({without_credential, first, second, with_header}) == 4
+    assert "sk-" not in first + second + with_header
+
+
 def test_catalog_fingerprint_includes_ambient_gateway_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
