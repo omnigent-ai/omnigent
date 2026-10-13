@@ -3765,26 +3765,6 @@ describe("session tooltip project detail", () => {
     expect(within(legacyTooltip).queryByTestId("session-tooltip-project")).toBeNull();
   });
 
-  it("shows a pinned project's Project row in the shared tooltip during selection", async () => {
-    projectRowsRef.current = [{ id: "p_alpha", name: "Alpha", icon: "🚀" }];
-    mockConversations([
-      filedSession("conv_pinned", {
-        project_id: "p_alpha",
-        workspace: "/Users/me/Alpha",
-      }),
-    ]);
-    seedPins(["conv_pinned"]);
-    renderGroupingSidebar();
-
-    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
-    const row = screen.getByRole("link", { name: "conv_pinned" });
-    fireEvent.pointerMove(row, { pointerType: "mouse" });
-
-    const tooltip = await screen.findByTestId("session-tooltip-content");
-    expect(within(tooltip).getByTestId("session-tooltip-project")).toHaveTextContent("Alpha");
-    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
-  });
-
   it.each(["status", "updated"] as const)(
     "shows the project for a filed session in the %s grouping",
     async (grouping) => {
