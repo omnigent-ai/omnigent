@@ -415,6 +415,23 @@ def test_stalled_helper_call_is_bounded(helper: UploadHelperClient) -> None:
         helper.interrupt()
 
 
+def test_short_operation_queue_budget(helper: UploadHelperClient) -> None:
+    import time
+
+    assert "error" not in begin(helper)
+    helper._lock.acquire()
+    release = threading.Timer(2, helper._lock.release)
+    release.start()
+    started = time.monotonic()
+    try:
+        result = helper.call({"op": "status", "id": UID})
+        assert result.get("code") == "busy"
+        assert time.monotonic() - started < 1.5
+    finally:
+        release.join()
+    assert helper.call({"op": "status", "id": UID})["offset"] == 0
+
+
 def test_helper_lock_wait_is_bounded(helper: UploadHelperClient) -> None:
     import time
 

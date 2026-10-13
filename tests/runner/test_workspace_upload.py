@@ -586,22 +586,98 @@ async def test_initial_save_failure_releases_admission(
     monkeypatch: pytest.MonkeyPatch,
     error_number: int,
     status: int,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     manager = client._transport.app.state.workspace_uploads
     manager.limits = UploadLimits(max_open_uploads=1, max_open_bytes=3)
 
     def fail() -> None:
-        raise OSError(error_number, "initial save failed")
+        raise OSError(error_number, "initial save failed", "/secret/path")
 
     with monkeypatch.context() as fault:
         fault.setattr(manager, "_save", fail)
         response = await create(client)
     assert response.status_code == status
     assert response.json()["error"]["code"] == ("no_space" if status == 507 else "io_error")
+    assert response.json()["error"]["message"] == "Upload index could not be saved"
+    assert "/secret/path" not in response.text
+    assert "/secret/path" in caplog.text
     assert not manager.records
     assert not manager.upload_locks
     assert not list((tmp_path / "workspace").iterdir())
     assert (await create(client)).status_code == 201
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry", ["immediate", "sweep", "save"])
+async def test_post_replace_save_failure_durably_releases_admission(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retry: str
+) -> None:
+    import stat
+
+    from omnigent.runner.workspace_upload import UploadDeclaration
+
+    manager = client._transport.app.state.workspace_uploads
+    manager.limits = UploadLimits(max_open_uploads=1, max_open_bytes=3)
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    original_call, original_save, original_fsync = helper.call, manager._save, os.fsync
+    operations = []
+    replaced = {}
+    saves = 0
+
+    def call(metadata, raw=b"", **kwargs):
+        operations.append(metadata["op"])
+        return original_call(metadata, raw, **kwargs)
+
+    def sync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode) and not replaced:
+            replaced.update(json.loads(manager.state_path.read_text()))
+            raise OSError(errno.ENOSPC, "directory sync failed", str(manager.state_path.parent))
+        return original_fsync(fd)
+
+    def save():
+        nonlocal saves
+        assert manager.lock.locked()
+        saves += 1
+        if saves > 1 and retry != "immediate":
+            raise OSError(errno.EIO, "corrective save failed")
+        return original_save()
+
+    with monkeypatch.context() as fault:
+        fault.setattr(helper, "call", call)
+        fault.setattr(manager, "_save", save)
+        fault.setattr(os, "fsync", sync)
+        response = await create(client)
+        assert response.status_code == 507
+        assert "begin" not in operations
+        assert not manager.records
+        assert not manager.upload_locks
+        assert len(replaced) == 1
+        assert next(iter(replaced.values()))["staging_dev"] == 0
+        assert not list((tmp_path / "workspace").iterdir())
+        if retry == "sweep":
+            await manager.sweep()
+        if retry != "immediate":
+            assert manager.index_dirty
+            assert json.loads(manager.state_path.read_text()) == replaced
+    if retry == "sweep":
+        await manager.sweep()
+    elif retry == "save":
+        await manager._persist()
+    fresh = restart(manager)
+    fresh.limits = manager.limits
+    try:
+        assert not fresh.records
+        assert json.loads(manager.state_path.read_text()) == {}
+        assert not manager.index_dirty
+        result = await fresh.create(
+            "session",
+            DEFAULT_ENVIRONMENT_ID,
+            UploadDeclaration(dir="", name="retry", size=3, created_by="alice"),
+        )
+        assert result["upload_id"] in fresh.records
+    finally:
+        await fresh.stop()
 
 
 @pytest.mark.asyncio
@@ -816,6 +892,14 @@ async def test_helper_cache_capacity(
     await manager._helper("three", DEFAULT_ENVIRONMENT_ID)
     assert first._closed
     assert len(manager.helpers) == 2
+    async with manager._using_helper("three", DEFAULT_ENVIRONMENT_ID) as active:
+        await asyncio.to_thread(active.close)
+        with pytest.raises(upload.RouteError) as exc:
+            await manager._helper("three", DEFAULT_ENVIRONMENT_ID)
+        assert exc.value.status == 429
+        assert exc.value.code == "busy"
+        assert exc.value.response().headers["Retry-After"] == "60"
+    await manager._helper("three", DEFAULT_ENVIRONMENT_ID)
 
 
 @pytest.mark.asyncio
@@ -1001,6 +1085,7 @@ async def test_all_pinned_helper_capacity_returns_429(
     with pytest.raises(upload.RouteError) as exc:
         await manager._helper("other", DEFAULT_ENVIRONMENT_ID)
     assert exc.value.status == 429
+    assert exc.value.code == "busy"
     assert exc.value.response().headers["Retry-After"] == "60"
     assert not helper._closed
     url = BASE + "/" + response.json()["upload_id"] + "?created_by=alice"
