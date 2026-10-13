@@ -95,7 +95,7 @@ def _write_frame(sock: socket.socket, kind: bytes, data: bytes) -> None:
     sock.sendall(kind + struct.pack("!I", len(data)) + data)
 
 
-class _TcpServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class _BoundedTcpServer(socketserver.ThreadingMixIn):
     daemon_threads = True
     broker: TcpEgressBroker
 
@@ -104,13 +104,26 @@ class _TcpServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             with contextlib.suppress(OSError):
                 request.settimeout(1)
                 request.sendall(b"\x01TCP egress connection limit reached")
-            self.shutdown_request(request)
+            with contextlib.suppress(OSError):
+                request.shutdown(socket.SHUT_RDWR)
+            request.close()
             return
         try:
             super().process_request(request, client_address)
         except BaseException:
             self.broker._slots.release()
             raise
+
+
+if sys.platform == "win32":
+
+    class _TcpServer(_BoundedTcpServer, socketserver.TCPServer):
+        pass
+
+else:
+
+    class _TcpServer(_BoundedTcpServer, socketserver.UnixStreamServer):
+        pass
 
 
 class _TcpHandler(socketserver.BaseRequestHandler):
