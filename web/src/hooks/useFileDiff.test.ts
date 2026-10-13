@@ -69,8 +69,9 @@ function renderDiff(
   conversationId: string | undefined,
   path: string | null,
   options: { requested?: boolean } = {},
+  retry: boolean | number = false,
 ) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry, retryDelay: 0 } } });
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client: queryClient }, children);
   return renderHook(() => useFileDiff(conversationId, path, options), { wrapper });
@@ -204,16 +205,27 @@ describe("useFileDiff — requested diff before discovery", () => {
           resolveResponse = resolve;
         }),
       );
-      const { result, rerender } = renderDiff("conv_1", "a.ts", { requested: true });
+      const { result, rerender } = renderDiff("conv_1", "a.ts", { requested: true }, 3);
       if (discoveryResolves) {
         setHooks({ serveable: true, changedPaths: ["a.ts"] });
         rerender();
       }
       resolveResponse(mockResponse({}, { ok: false, status: 404 }));
       await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(result.current.failureCount).toBe(1);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     },
   );
+
+  it("does not bypass discovery after the changed-files query fails", () => {
+    setHooks({ serveable: true });
+    changedFilesMock.mockReturnValue({
+      data: undefined,
+      isError: true,
+    } as ReturnType<typeof useWorkspaceChangedFiles>);
+    renderDiff("conv_1", "a.ts", { requested: true });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 
   it("does not request a diff for a client-only temporary session", () => {
     setHooks({ serveable: true });

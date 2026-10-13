@@ -80,7 +80,8 @@ export function useFileDiff(
   const environment = useWorkspaceEnvironment(conversationId);
   const isInChangedFiles = changedFiles.data?.data.some((f) => f.path === path) ?? false;
 
-  const requestedBeforeDiscovery = options.requested && changedFiles.data === undefined;
+  const requestedBeforeDiscovery =
+    options.requested && changedFiles.data === undefined && !changedFiles.isError;
 
   return useQuery({
     queryKey: ["file-diff", conversationId, path],
