@@ -31,9 +31,6 @@ it("renders consent, sign-in, retry, and completion", (t) => {
     cancel() {},
     resizeToContent: (size) => sizes.push(size),
   };
-  dom.window.ResizeObserver = class ResizeObserver {
-    observe() {}
-  };
   dom.window.Terminal = class Terminal {
     loadAddon() {}
     open() {}
@@ -250,16 +247,21 @@ describe("arca connect console flow", () => {
   });
   it("shows the command, runs only after confirm, streams output, resolves the result", async () => {
     const { world, flow } = flowHarness();
-    const resultPromise = flow.run(null, "https://srv.example.com");
+    let starts = 0;
+    const resultPromise = flow.run(null, "https://srv.example.com", {
+      onStarted: () => starts++,
+    });
     const win = world.windows[0];
 
     const init = win.webContents.sent.find(([c]) => c === "arca-connect:init");
     assert.equal(init[1].command, "arca ssh isaac omni host --server https://srv.example.com …");
     assert.equal(init[1].reason, null);
     assert.equal(world.connects.length, 0); // nothing ran yet — consent first
+    assert.equal(starts, 0);
 
     world.sendFrom(win, "arca-connect:confirm");
     assert.equal(world.connects.length, 1);
+    assert.equal(starts, 1);
     world.sendFrom(win, "arca-connect:resize", { height: 420, phase: "running" });
     assert.deepEqual(win.contentSize, [CONTENT_WIDTH, RUNNING_CONTENT_HEIGHT]);
     world.connects[0].onOutput("booting…\n");

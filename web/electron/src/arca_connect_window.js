@@ -40,7 +40,7 @@ const { arcaTarget } = require("./arcaIdentity");
  *   loginCommandLine: (serverUrl: string) => string,
  *   log?: (message: string) => void,
  * }} deps
- * @returns {{ run: (parentWin: unknown, serverUrl: string, options?: { reason?: "preview-reconnect" }) => Promise<object> }}
+ * @returns {{ run: (parentWin: unknown, serverUrl: string, options?: { reason?: "preview-reconnect", onStarted?: () => void }) => Promise<object> }}
  */
 function createArcaConnectFlow({
   BrowserWindow,
@@ -100,7 +100,7 @@ function createArcaConnectFlow({
    *
    * @param {unknown} parentWin
    * @param {string} serverUrl
-   * @param {{ reason?: "preview-reconnect" }} [options]
+   * @param {{ reason?: "preview-reconnect", onStarted?: () => void }} [options]
    */
   function run(parentWin, serverUrl, options = {}) {
     // Re-attach: an in-flight console survives an SPA refresh (it's a shell
@@ -150,6 +150,7 @@ function createArcaConnectFlow({
       const consoleId = win.webContents.id;
       let phase = "asking";
       let loginAttempted = false;
+      let started = false;
       let connect = null;
       let settled = false;
       const settle = (result) => {
@@ -169,6 +170,14 @@ function createArcaConnectFlow({
 
       const runCommand = (login = false) => {
         phase = "running";
+        if (!started) {
+          started = true;
+          try {
+            options.onStarted?.();
+          } catch {
+            // Recovery bookkeeping must not interrupt a consented command.
+          }
+        }
         connect = login
           ? startLogin(serverUrl)
           : startConnect(serverUrl, (text) => send("arca-connect:output", text));

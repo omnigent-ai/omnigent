@@ -528,14 +528,17 @@ a Databricks server.
 
 After restarting the desktop, launch-time auto-connect restores this identity
 for users who opted into it. Otherwise, the first loopback preview request from
-the remembered Arca host offers the shell-owned reconnect console; nothing runs
-until the user confirms. Opted-in recovery stays silent. Both paths run at most
-once per workspace per launch, capture the daemon identity, verify that its host
-ID matches the source session, and retry the navigation once. Requests from any
-other host never start recovery. A decline, failure, or unrecognized capture
-keeps localhost denied and tells the user to restart Omnigent before retrying.
-**Run on Arca** remains available only while the remembered Arca host is offline
-or missing from the host list.
+the remembered Arca host offers the shell-owned reconnect console and returns
+the denial immediately; nothing runs until the user confirms, and the agent
+retries after recovery finishes. Concurrent retries share the same prompt or
+run. Opted-in recovery stays silent and retries the original navigation once.
+Both paths capture the daemon identity and verify that its host ID matches the
+source session. The renderer-reported host match only decides when recovery may
+be offered; consent or auto-connect opt-in, the captured identity check, and the
+agent-context gate remain the trust boundaries. A decline briefly suppresses
+repeat prompts, while a failed consented run remains retryable. **Run on Arca**
+is hidden for an online remembered host only when the desktop advertises
+preview recovery; older shells keep the action visible.
 
 The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
 redirects and links that would open a new window (which stay in the same pane).

@@ -42,7 +42,7 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
-const { registerLocalhostCors } = require("./localhost_cors");
+const { isLocalhostUrl, registerLocalhostCors } = require("./localhost_cors");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
@@ -379,12 +379,10 @@ let arcaProbe = null;
  *
  * @returns {Promise<string | null>}
  */
-function refreshArcaBinary(force = false) {
-  // Launch-time auto-connect uses the cached binary; with the feature off,
-  // don't probe until an agent preview explicitly needs identity recovery.
-  // On-demand preview recovery passes force=true because the preview itself
-  // supplies the demand signal even when launch-time auto-connect is disabled.
-  if (!force && !arcaAutoConnectFeatureEnabled()) return Promise.resolve(null);
+function refreshArcaBinary({ previewRecoveryRequested = false } = {}) {
+  // With auto-connect off, wait to probe until a preview explicitly requests
+  // recovery; that request is the demand signal, not consent to run anything.
+  if (!previewRecoveryRequested && !arcaAutoConnectFeatureEnabled()) return Promise.resolve(null);
   if (cachedArcaPath.path && arca.isExecutableFile(cachedArcaPath.path)) {
     return Promise.resolve(cachedArcaPath.path);
   }
@@ -431,8 +429,6 @@ const arcaAutoConnect = createArcaAutoConnect({
     arcaAutoConnectFeatureEnabled() &&
     isDatabricksManagedServerUrl(serverUrl) &&
     cachedArcaBinary() !== null,
-  isRecoveryEligible: (serverUrl) =>
-    isDatabricksManagedServerUrl(serverUrl) && cachedArcaBinary() !== null,
   startConnect: (serverUrl, onOutput) =>
     startArcaHostConnect(serverUrl, { onOutput, resolveArcaPath: cachedArcaBinary }),
   commandLine: (serverUrl) => {
@@ -444,7 +440,10 @@ const arcaAutoConnect = createArcaAutoConnect({
   },
   log: (message) => console.log(`[omnigent] ${message}`),
 });
-const arcaPreviewRecoveryTargets = new Set();
+/** Agent retry bursts after a deliberate decline should not reopen the prompt immediately. */
+const ARCA_PREVIEW_DECLINE_COOLDOWN_MS = 10 * 1000;
+const arcaPreviewRecoveries = new Map();
+const arcaPreviewDeclinedUntil = new Map();
 
 /**
  * The auto-connect opt-in shared by overlapping onboarding connects: how many
@@ -3683,17 +3682,76 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
   });
 }
 
-/** Whether an agent URL names the loopback destinations Arca previews allow. */
-function isLoopbackPreviewUrl(url) {
-  try {
-    const parsed = new URL(url);
-    return (
-      ["http:", "https:"].includes(parsed.protocol) &&
-      ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
-    );
-  } catch {
-    return false;
+/**
+ * Main-owned recovery scope for a loopback preview request, excluding the
+ * renderer-supplied host match that decides whether this session may ask.
+ */
+function arcaPreviewRecoveryTargetForEvent(event, url) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (
+    !isLocalhostUrl(url) ||
+    !isPinnedOriginSender(event) ||
+    !win ||
+    win.isDestroyed() ||
+    !databricksInternalFeaturesEnabled()
+  ) {
+    return null;
   }
+  const target = windowArcaServerUrl(win);
+  if (
+    !isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) ||
+    !isDatabricksManagedServerUrl(target) ||
+    arcaIdentities.get(target)
+  ) {
+    return null;
+  }
+  return { win, target };
+}
+
+/** Recovery is offered only when the renderer reports one matching Arca host. */
+function arcaPreviewRecoveryContextForEvent(event, url, sourceHostId, rememberedArcaHostId) {
+  const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
+  if (
+    !targetContext ||
+    typeof sourceHostId !== "string" ||
+    typeof rememberedArcaHostId !== "string" ||
+    sourceHostId !== rememberedArcaHostId
+  ) {
+    return null;
+  }
+  return { ...targetContext, sourceHostId };
+}
+
+/** Open one shared consent flow and let the requesting agent retry afterward. */
+function startArcaPreviewConsentRecovery({ win, target, sourceHostId }) {
+  if (arcaPreviewRecoveries.has(target)) return;
+  const state = { kind: "consent", phase: "prompting", promise: null };
+  const promise = arcaConnectFlow
+    .run(win, target, {
+      reason: "preview-reconnect",
+      onStarted: () => {
+        state.phase = "running";
+      },
+    })
+    .then((result) => {
+      if (result?.canceled) {
+        arcaPreviewDeclinedUntil.set(target, Date.now() + ARCA_PREVIEW_DECLINE_COOLDOWN_MS);
+      }
+      const captured = arcaIdentities.get(target);
+      if (result?.ok && captured?.hostId !== sourceHostId) {
+        console.warn("[omnigent] Arca preview recovery captured a different host identity");
+      }
+      return result;
+    })
+    .catch((error) => {
+      console.warn(`[omnigent] Arca preview recovery failed: ${String(error)}`);
+      return { ok: false, error: String(error) };
+    })
+    .finally(() => {
+      if (arcaPreviewRecoveries.get(target) === state) arcaPreviewRecoveries.delete(target);
+    });
+  state.promise = promise;
+  arcaPreviewRecoveries.set(target, state);
 }
 
 /**
@@ -4676,6 +4734,7 @@ function registerIpc() {
     return {
       databricksInternalFeatures:
         databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(senderServerUrl(event)),
+      arcaPreviewRecovery: true,
     };
   });
 
@@ -4750,52 +4809,49 @@ function registerIpc() {
       sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
     }),
     recoverAgentNavigationForEvent: async (event, url, sourceHostId, rememberedArcaHostId) => {
-      const recoveryWin = BrowserWindow.fromWebContents(event.sender);
-      if (
-        typeof sourceHostId !== "string" ||
-        typeof rememberedArcaHostId !== "string" ||
-        sourceHostId !== rememberedArcaHostId ||
-        !isLoopbackPreviewUrl(url) ||
-        !isPinnedOriginSender(event) ||
-        !recoveryWin ||
-        recoveryWin.isDestroyed() ||
-        !databricksInternalFeaturesEnabled()
-      ) {
-        return false;
-      }
-      const target = windowArcaServerUrl(recoveryWin);
-      if (
-        !isDatabricksManagedServerUrl(windows.get(recoveryWin)?.serverUrl) ||
-        !isDatabricksManagedServerUrl(target) ||
-        arcaIdentities.get(target) ||
-        arcaPreviewRecoveryTargets.has(target)
-      ) {
-        return false;
-      }
-      arcaPreviewRecoveryTargets.add(target);
-      await refreshArcaBinary(true);
+      const context = arcaPreviewRecoveryContextForEvent(
+        event,
+        url,
+        sourceHostId,
+        rememberedArcaHostId,
+      );
+      if (!context) return false;
+      const { target } = context;
+      if (arcaPreviewRecoveries.has(target)) return false;
+      const declinedUntil = arcaPreviewDeclinedUntil.get(target) ?? 0;
+      if (declinedUntil > Date.now()) return false;
+      arcaPreviewDeclinedUntil.delete(target);
+      await refreshArcaBinary({ previewRecoveryRequested: true });
       if (cachedArcaBinary() === null) return false;
-      const recovered = arcaAutoConnectFeatureEnabled()
-        ? (await arcaAutoConnect.recover(target)).state === "online"
-        : (await arcaConnectFlow.run(recoveryWin, target, { reason: "preview-reconnect" })).ok ===
-          true;
+      if (!arcaAutoConnectFeatureEnabled()) {
+        startArcaPreviewConsentRecovery(context);
+        return false;
+      }
+      const recovered = (await arcaAutoConnect.ensure(target)).state === "online";
       return recovered && arcaIdentities.get(target)?.hostId === sourceHostId;
     },
-    getAgentNavigationHintForEvent: (event, url) => {
-      const win = BrowserWindow.fromWebContents(event.sender);
-      const target = windowArcaServerUrl(win);
-      if (
-        !databricksInternalFeaturesEnabled() ||
-        !isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) ||
-        !isDatabricksManagedServerUrl(target) ||
-        arcaIdentities.get(target)
-      ) {
-        return null;
+    getAgentNavigationHintForEvent: (event, url, sourceHostId, rememberedArcaHostId) => {
+      const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
+      if (!targetContext) return null;
+      if (typeof rememberedArcaHostId !== "string") {
+        return "Open New session > Host > Run on Arca to restore its connection details, then retry the preview.";
       }
-      if (isLoopbackPreviewUrl(url)) {
-        return "If this session runs on Arca, Omnigent couldn't restore its connection details automatically. Restart Omnigent and retry the preview. Other hosts remain ineligible.";
+      const context = arcaPreviewRecoveryContextForEvent(
+        event,
+        url,
+        sourceHostId,
+        rememberedArcaHostId,
+      );
+      if (!context) return null;
+      const { target } = context;
+      if ((arcaPreviewDeclinedUntil.get(target) ?? 0) > Date.now()) {
+        return "Reconnect was declined. Wait a moment, then retry the preview to show the prompt again.";
       }
-      return null;
+      const active = arcaPreviewRecoveries.get(target);
+      if (active?.kind === "consent") {
+        return "Confirm the Reconnect prompt in Omnigent, then retry the preview.";
+      }
+      return "Omnigent couldn't restore the Arca connection details. Retry the preview to reconnect.";
     },
   });
 }

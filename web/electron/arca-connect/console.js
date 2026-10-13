@@ -24,7 +24,6 @@ function resizeToContent() {
   });
 }
 
-new ResizeObserver(resizeToContent).observe(document.body);
 void document.fonts?.ready.then(resizeToContent);
 
 window.arcaConnect.onInit(({ serverUrl, command, reason }) => {

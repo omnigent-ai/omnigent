@@ -21,12 +21,11 @@ function fakeConnects() {
   return { runs, startConnect };
 }
 
-function harness({ eligible = true, recoveryEligible = eligible } = {}) {
+function harness({ eligible = true } = {}) {
   const connects = fakeConnects();
   const events = [];
   const auto = createArcaAutoConnect({
     isEligible: () => eligible,
-    isRecoveryEligible: () => recoveryEligible,
     startConnect: connects.startConnect,
     commandLine: () => "arca ssh isaac omni host",
     onStatus: (target, status) => events.push({ target, status }),
@@ -92,23 +91,6 @@ describe("arca auto-connect", () => {
     assert.equal(status.state, "online");
     assert.equal(status.alreadyRunning, true);
     assert.deepEqual(status.identity, identity);
-  });
-
-  it("recovers identity on demand when launch-time auto-connect is disabled", async () => {
-    const { auto, runs } = harness({ eligible: false, recoveryEligible: true });
-    assert.equal((await auto.ensure(SERVER)).state, "unavailable");
-    assert.equal(runs.length, 0);
-
-    const first = auto.recover(SERVER);
-    const second = auto.recover(SERVER);
-    assert.equal(runs.length, 1);
-    const identity = { serverUrl: SERVER, hostId: "a".repeat(32) };
-    runs[0].finish({ ok: true, alreadyRunning: true, identity });
-    assert.deepEqual((await first).identity, identity);
-    assert.deepEqual((await second).identity, identity);
-
-    await auto.recover(SERVER);
-    assert.equal(runs.length, 1);
   });
 
   it("keeps the failure kind and output tail, and retries only after a failure", async () => {

@@ -117,6 +117,38 @@ describe("browser IPC Arca context", () => {
     assert.equal(navigations, 2);
   });
 
+  it("leaves a denied navigation untouched when recovery captures no eligible identity", async () => {
+    const ipcMain = makeIpcMain();
+    let navigations = 0;
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        openOrNavigate: () => {
+          navigations++;
+          return { ok: false, error: "blocked", created: false };
+        },
+      }),
+      recoverAgentNavigationForEvent: async () => false,
+    });
+
+    const result = await ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "source",
+        url: "http://localhost:5173",
+        opts: {
+          agent: true,
+          sourceHostId: "arca-host",
+          rememberedArcaHostId: "arca-host",
+        },
+      },
+    );
+    assert.equal(result.ok, false);
+    assert.equal(navigations, 1);
+  });
+
   it("pairs the renderer's source host with main's context and ignores caller exception flags", () => {
     const ipcMain = makeIpcMain();
     const calls = [];

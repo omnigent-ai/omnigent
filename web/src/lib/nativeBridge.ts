@@ -275,6 +275,8 @@ export interface DesktopFeatures {
    * window's server is Databricks-managed.
    */
   databricksInternalFeatures?: boolean;
+  /** Shell can restore Arca preview identity after a desktop restart. */
+  arcaPreviewRecovery?: boolean;
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */
