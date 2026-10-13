@@ -66,6 +66,9 @@ from tests._helpers.compat import (
 )
 from tests._helpers.native_session import create_native_session
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
+from tests._helpers.workspace_geometry import (
+    workspace_bar_needs_collapse as workspace_bar_needs_collapse,
+)
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
 from tests.codex_parity.sidecar_harness import (
     CodexResponsesSidecar,
@@ -130,30 +133,6 @@ def fetch_with_retry(route: Route, *, attempts: int = 3) -> APIResponse:
     return route.fetch()
 
 
-def workspace_bar_needs_collapse(bar: Locator) -> bool:
-    """Whether the composer workspace bar's full labels would overflow or truncate.
-
-    Mirrors the bar's own rule (any ``[data-workspace-collapse-label]`` wider
-    than its box, or the row wider than the bar) by probing the expanded layout
-    in place and restoring the current verdict within the same evaluation, so a
-    test can assert the icon collapse is justified — and absent when everything fits.
-
-    :param bar: Locator for ``composer-workspace-controls``.
-    :returns: ``True`` when the bar must show icons only.
-    """
-    return bar.evaluate(
-        """bar => {
-          const verdict = bar.dataset.labels;
-          delete bar.dataset.labels;
-          const labels = [...bar.querySelectorAll('[data-workspace-collapse-label]')];
-          const cramped = bar.scrollWidth > bar.clientWidth + 1
-            || labels.some(el => el.scrollWidth > el.clientWidth + 1);
-          if (verdict !== undefined) bar.dataset.labels = verdict;
-          return cramped;
-        }"""
-    )
-
-
 def open_right_rail(page: Page) -> None:
     """Expand the right "Workspace" rail if it is collapsed.
 
@@ -192,6 +171,31 @@ def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> No
     """
     file_viewer.get_by_role("button", name=re.compile(r"^View mode")).first.click()
     page.get_by_role("menuitem", name=mode, exact=True).click()
+
+
+def open_previewable_files_in_preview(page: Page) -> None:
+    """Make Markdown, HTML, and notebook files open on the rendered Preview.
+
+    Seeds the stored FileViewer preferences before the app loads (Markdown
+    otherwise opens in the rich-text editor), so call it before ``page.goto``.
+
+    :param page: Playwright page that has not yet loaded the app.
+    :returns: None.
+    """
+    page.add_init_script(
+        """
+        window.localStorage.setItem(
+          "omnigent:file-view-preferences",
+          JSON.stringify({
+            diffActive: false,
+            diffLayout: "unified",
+            previewableViewMode: "preview",
+            hideWhitespace: false,
+            wrapLines: false,
+          }),
+        );
+        """
+    )
 
 
 # Populated by live_server for fixtures that need the server PID or runner ID.

@@ -106,16 +106,18 @@ same conversation.
 from __future__ import annotations
 
 import copy
+import logging
 import re
 import threading
 import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
+from omnigent.native.input_diagnostics import input_attributes, log_input_event
 
 # A pending entry is evicted this many seconds after it was recorded
 # if it was never drained by a matching persisted message. Covers the
@@ -186,6 +188,10 @@ class DrainedInput:
     stable_id: str | None = None
     background_titles_enabled: bool = True
     interrupted: bool = False
+    # Reconstructed entries without original delivery metadata must remain unknown.
+    input_enqueued_at_ms: int | None = None
+    delivery_attempt_id: str | None = None
+    last_delivery_stage: str = "unknown"
 
 
 @dataclass
@@ -208,6 +214,7 @@ class MatchedDrain:
     matched: DrainedInput | None
     skipped: list[DrainedInput]
     uncertain: list[DrainedInput] = field(default_factory=list)
+    match_method: str | None = None
 
 
 @dataclass
@@ -255,6 +262,9 @@ class _Entry:
     held: bool = False
     uncertain: bool = False
     interrupted: bool = False
+    input_enqueued_at_ms: int | None = field(default_factory=lambda: int(time.time() * 1000))
+    delivery_attempt_id: str | None = field(default_factory=lambda: uuid.uuid4().hex)
+    last_delivery_stage: str = "server_queued"
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -390,6 +400,52 @@ def pending_id_for_stable_id(conversation_id: str, stable_id: str) -> str | None
     return None
 
 
+def delivery_attributes(entry: DrainedInput | _Entry) -> dict[str, object]:
+    """Return correlation and age without exposing the queued content or author."""
+    attrs: dict[str, object] = dict(
+        input_attributes(
+            {
+                "input_stable_id": entry.stable_id,
+                "pending_id": entry.pending_id,
+                "delivery_attempt_id": entry.delivery_attempt_id,
+                "input_enqueued_at_ms": entry.input_enqueued_at_ms,
+            }
+        )
+    )
+    attrs["last_delivery_stage"] = entry.last_delivery_stage
+    if entry.input_enqueued_at_ms is not None:
+        attrs["pending_age_ms"] = max(0, int(time.time() * 1000) - entry.input_enqueued_at_ms)
+    return attrs
+
+
+def delivery_attributes_for(conversation_id: str, pending_id: str) -> dict[str, object]:
+    """Read one pending input's diagnostics without draining or changing its TTL."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        snapshot = copy.copy(entry) if entry is not None else None
+    return delivery_attributes(snapshot) if snapshot is not None else {}
+
+
+def mark_delivery_stage(
+    conversation_id: str,
+    pending_id: str,
+    stage: Literal["forward_requested", "forward_accepted"],
+) -> None:
+    """Remember the latest server-observed stage while an input is still pending."""
+    if stage not in {"forward_requested", "forward_accepted"}:
+        log_input_event(
+            logging.getLogger(__name__),
+            "native_input_invalid_delivery_stage",
+            session_id=conversation_id,
+            attributes={"pending_id": pending_id},
+        )
+        return
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is not None:
+            entry.last_delivery_stage = stage
+
+
 def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
     """
     Drop a pending entry by id and return it.
@@ -436,7 +492,7 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
     An entry the person cancelled by interrupting (see
     :func:`mark_interrupted`) is never the guess: it would hand its
     attachments and author to a later message, or take the place of the
-    entry a ``/btw`` or ``/clear`` means to settle.
+    entry a ``/clear`` means to settle.
 
     :param conversation_id: Conversation/session id the message was
         persisted on, e.g. ``"conv_abc123"``.
@@ -554,6 +610,9 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         stable_id=drained.stable_id,
         background_titles_enabled=drained.background_titles_enabled,
         interrupted=drained.interrupted,
+        input_enqueued_at_ms=drained.input_enqueued_at_ms,
+        delivery_attempt_id=drained.delivery_attempt_id,
+        last_delivery_stage=drained.last_delivery_stage,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -642,7 +701,9 @@ def resolve_matching_text(
         # with the entry's own text — typed marker-like text still counts.
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
+        match_method = "normalized_text"
         if match_index is None:
+            match_method = "attachment_normalized_text"
             marker_matches: list[int] = []
             for index, (_pid, entry) in enumerate(ordered):
                 attachments = 0 if shell_command else _attachment_count(entry.content)
@@ -682,6 +743,7 @@ def resolve_matching_text(
                 lost.append(_drained_input(entry))
         return MatchedDrain(
             matched=_drained_input(matched_entry),
+            match_method=match_method,
             skipped=lost,
             uncertain=uncertain,
         )
@@ -757,6 +819,9 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         stable_id=entry.stable_id,
         background_titles_enabled=entry.background_titles_enabled,
         interrupted=entry.interrupted,
+        input_enqueued_at_ms=entry.input_enqueued_at_ms,
+        delivery_attempt_id=entry.delivery_attempt_id,
+        last_delivery_stage=entry.last_delivery_stage,
     )
 
 

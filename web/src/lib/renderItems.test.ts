@@ -62,6 +62,184 @@ function mkExec(name: string, callId: string): ToolExecution {
   };
 }
 
+describe("shell command user turns", () => {
+  function shellInput(itemId: string, input: string | null): AnyBlock {
+    return {
+      type: "terminal_command",
+      ctx: ctx({ itemId, responseId: itemId, createdBy: "author@example.com", createdAtS: 100 }),
+      kind: "input",
+      input,
+      stdout: null,
+      stderr: null,
+    };
+  }
+
+  const output: AnyBlock = {
+    type: "terminal_command",
+    ctx: ctx({ itemId: "output", responseId: "command" }),
+    kind: "output",
+    input: null,
+    stdout: "hi\n",
+    stderr: "warning\n",
+  };
+
+  it("separates repeated commands from the preceding answer and each other", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "greeting" }),
+        content: [{ type: "input_text", text: "hey" }],
+      },
+      { type: "text_done", ctx: ctx(), fullText: "Hello!", hasCodeBlocks: false },
+    ];
+    const commands = ['echo "hi"', "ls", 'echo "hi"'];
+    for (const [i, command] of commands.entries()) {
+      blocks.push(
+        shellInput(`input-${i}`, command),
+        {
+          ...output,
+          ctx: ctx({ itemId: `output-${i}`, responseId: `input-${i}` }),
+        },
+        {
+          type: "text_done",
+          ctx: ctx({ itemId: `answer-${i}`, responseId: `input-${i}` }),
+          fullText: `Command ${i + 1} finished.`,
+          hasCodeBlocks: false,
+        },
+      );
+    }
+
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+    for (const [i, command] of commands.entries()) {
+      expect(bubbles[2 + 2 * i]).toMatchObject({
+        kind: "user",
+        itemId: `input-${i}`,
+        content: [{ type: "input_text", text: `!${command}` }],
+        createdBy: "author@example.com",
+        createdAtS: 100,
+      });
+      expect(bubbles[3 + 2 * i]).toMatchObject({
+        kind: "assistant",
+        items: [
+          { kind: "terminal_command", terminalKind: "output", stdout: "hi\n", stderr: "warning\n" },
+          { kind: "text", text: `Command ${i + 1} finished.` },
+        ],
+      });
+    }
+  });
+
+  it.each(["history", "live"])("renders a shell-only start from %s as a user prompt", (source) => {
+    const blocks =
+      source === "history"
+        ? itemsToBlocks([
+            {
+              id: "command",
+              response_id: "shell-turn",
+              status: "completed",
+              type: "terminal_command",
+              kind: "input",
+              input: "ls",
+            },
+            {
+              id: "output",
+              response_id: "shell-turn",
+              status: "completed",
+              type: "terminal_command",
+              kind: "output",
+              stdout: "README.md\n",
+            },
+          ])
+        : new BlockStream().reduceSync([
+            {
+              type: "terminal_command",
+              itemId: "command",
+              responseId: "shell-turn",
+              kind: "input",
+              input: "ls",
+              stdout: null,
+              stderr: null,
+            },
+            {
+              type: "terminal_command",
+              itemId: "output",
+              responseId: "shell-turn",
+              kind: "output",
+              input: null,
+              stdout: "README.md\n",
+              stderr: null,
+            },
+          ]);
+    expect(buildBubbles(blocks, null)).toMatchObject([
+      { kind: "user", itemId: "command", content: [{ type: "input_text", text: "!ls" }] },
+      {
+        kind: "assistant",
+        items: [{ kind: "terminal_command", terminalKind: "output", stdout: "README.md\n" }],
+      },
+    ]);
+  });
+
+  it("preserves shell turn boundaries as input and output arrive incrementally", () => {
+    const cache = createBubbleCache();
+    const blocks: AnyBlock[] = [
+      { type: "text_done", ctx: ctx(), fullText: "Hello!", hasCodeBlocks: false },
+      shellInput("command", "echo hi"),
+      output,
+      shellInput("repeat", "echo hi"),
+      { ...output, ctx: ctx({ itemId: "repeat-output", responseId: "repeat" }) },
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "next" }),
+        content: [{ type: "input_text", text: "Continue" }],
+      },
+    ];
+    for (let length = 1; length <= blocks.length; length++) {
+      const prefix = blocks.slice(0, length);
+      expect(buildBubbles(prefix, null, cache)).toEqual(buildBubbles(prefix, null));
+    }
+    expect(buildBubbles(blocks, null, cache).map((b) => b.kind)).toEqual([
+      "assistant",
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "user",
+    ]);
+  });
+
+  it("ends the previous tool's live phase when a shell prompt arrives", () => {
+    const tool: AnyBlock = {
+      type: "tool_group",
+      ctx: ctx({ itemId: "previous-tool" }),
+      executions: [mkExec("Read", "previous-call")],
+      iteration: 0,
+    };
+    const cache = createBubbleCache();
+    expect(buildBubbles([tool], null, cache, [], true)[0]).toMatchObject({
+      items: [{ kind: "tool", state: "input-available" }],
+    });
+    expect(buildBubbles([tool, shellInput("command", "ls")], null, cache, [], true)).toMatchObject([
+      { kind: "assistant", items: [{ kind: "tool", state: "no-output" }] },
+      { kind: "user", itemId: "command" },
+    ]);
+  });
+
+  it.each([null, "", " \t"])("does not invent a user turn for invalid input %s", (input) => {
+    expect(buildBubbles([shellInput("empty", input), output], null).map((b) => b.kind)).toEqual([
+      "assistant",
+    ]);
+  });
+});
+
 describe("sub-agent timeline events", () => {
   const notice = (): AnyBlock => ({
     type: "native_tool",

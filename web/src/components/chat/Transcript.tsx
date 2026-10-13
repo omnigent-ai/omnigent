@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { isSystemUserContent } from "@/lib/systemMessage";
+import { isTerminalCommandInput } from "@/lib/blocks";
 import {
   type Bubble,
   type BubbleCache,
@@ -171,8 +172,8 @@ function TranscriptImpl({
     const ids = new Set<string>();
     for (const block of blocks) {
       if (
-        block.type === "user_message" &&
-        !isSystemUserContent(block.content) &&
+        ((block.type === "user_message" && !isSystemUserContent(block.content)) ||
+          isTerminalCommandInput(block)) &&
         block.ctx.itemId !== null
       ) {
         ids.add(block.ctx.itemId);

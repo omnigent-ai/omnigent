@@ -113,7 +113,7 @@ async def register_worktree_host(
                 frame_text = await conn.outbound_queue.get()
                 if frame_text is None:
                     return
-                frame = decode_host_frame(frame_text)
+                frame = decode_host_frame(frame_text.data)
                 if isinstance(frame, HostStatFrame):
                     fut = conn.pending_stats.pop(frame.request_id, None)
                     if fut is not None and not fut.done():

@@ -586,7 +586,11 @@ def register_core_routes(
             encode_host_frame,
         )
         from omnigent.runner.identity import token_bound_runner_id
-        from omnigent.server.routes._host_launch import resolve_host_launch
+        from omnigent.server.routes._host_launch import (
+            LAUNCH_TIMEOUT_ENV_VAR,
+            resolve_host_launch,
+            resolve_launch_timeout_s,
+        )
 
         with creation_stage("create_acl_ms"):
             target = await asyncio.to_thread(
@@ -653,13 +657,20 @@ def register_core_routes(
                 ),
             )
         )
+        launch_timeout_s = resolve_launch_timeout_s()
         try:
             host_registry.send_text(conn, launch_frame)
-            launch_result = await asyncio.wait_for(future, timeout=30.0)
+            launch_result = await asyncio.wait_for(future, timeout=launch_timeout_s)
         except ConnectionError as exc:
             launch_result = {"status": "failed", "error": str(exc)}
         except asyncio.TimeoutError:
-            launch_result = {"status": "failed", "error": "host launch timed out"}
+            launch_result = {
+                "status": "failed",
+                "error": (
+                    f"host launch timed out after {launch_timeout_s:g}s "
+                    f"(raise {LAUNCH_TIMEOUT_ENV_VAR} if this launch needs longer)"
+                ),
+            }
         finally:
             conn.pending_launches.pop(request_id, None)
             if not future.done():

@@ -261,6 +261,7 @@ import {
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
+import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -294,7 +295,7 @@ export function SettingsPage() {
   useOmnigentPageView(`settings.${section}`);
 
   const pageWrapperSettings = useMemo(() => {
-    if (section === "harnesses") {
+    if (section === "harnesses" || section === "custom-agents") {
       return {
         maxWidthClassName: "max-w-4xl",
         contentClassName: "px-4 md:px-8",
@@ -336,6 +337,7 @@ export function SettingsPage() {
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
       {section === "harnesses" && <SettingsHarnessesSection />}
+      {section === "custom-agents" && <SettingsCustomAgentsSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
@@ -813,6 +815,8 @@ function AppearanceSection() {
   // replace it with a note (plus a link to the host's own theme settings when
   // one is provided). The color palette, terminal theme, and font controls are
   // per-device prefs that don't conflict with host light/dark, so they stay.
+  // The link opens a new tab: in place, it would replace the app with the
+  // host page, and desktop windows have no Back control.
   const isEmbedded = useIsEmbedded();
   const themeSettingsUrl = getOmnigentThemeSettingsUrl();
   const { setTheme } = useTheme();
@@ -934,6 +938,8 @@ function AppearanceSection() {
                           {" "}
                           <a
                             href={themeSettingsUrl}
+                            target="_blank"
+                            rel="noreferrer"
                             className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
                           >
                             Click to open Databricks user preferences page.
@@ -947,6 +953,8 @@ function AppearanceSection() {
                 {themeSettingsUrl && (
                   <a
                     href={themeSettingsUrl}
+                    target="_blank"
+                    rel="noreferrer"
                     className="text-sm font-medium text-primary underline underline-offset-2 md:hidden"
                   >
                     Open Databricks preferences

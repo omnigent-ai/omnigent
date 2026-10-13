@@ -25,11 +25,69 @@ route tests; this file tests the module in isolation.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
+from types import SimpleNamespace
 
 import pytest
 
 from omnigent.runtime import pending_inputs
+
+
+def test_unknown_delivery_stage_is_observable_without_overwriting_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=pending_inputs.__name__)
+    pending_id = pending_inputs.record("conv", [_text_block("hello")])
+    pending_inputs.mark_delivery_stage("conv", pending_id, "typo")  # type: ignore[arg-type]
+    assert (
+        pending_inputs.delivery_attributes_for("conv", pending_id)["last_delivery_stage"]
+        == "server_queued"
+    )
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_invalid_delivery_stage"
+    ]
+    assert record.attributes["pending_id"] == pending_id
+
+
+@pytest.mark.parametrize("hold", [True, False])
+@pytest.mark.parametrize("interrupted", [True, False])
+def test_delivery_identity_and_original_enqueue_time_survive_retry_and_restore(
+    hold: bool, interrupted: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 100.0
+    monkeypatch.setattr(
+        pending_inputs, "time", SimpleNamespace(time=lambda: now, monotonic=lambda: now)
+    )
+    first = pending_inputs.record("conv", [_text_block("private first")], stable_id="a" * 32)
+    original = pending_inputs.delivery_attributes_for("conv", first)
+    now = 101.0
+    assert (
+        pending_inputs.record("conv", [_text_block("private first")], stable_id="a" * 32) == first
+    )
+    pending_inputs.mark_delivery_stage("conv", first, "forward_accepted")
+    if interrupted:
+        pending_inputs.mark_interrupted("conv", [first])
+    pending_inputs.record("conv", [_text_block("second")], stable_id="b" * 32)
+    match = pending_inputs.resolve_matching_text("conv", " second  ", hold=hold)
+    assert match.match_method == "normalized_text"
+    [skipped] = match.uncertain if interrupted else match.skipped
+    assert skipped.pending_id == first
+    assert skipped.interrupted is interrupted
+    now = 105.0
+    pending_inputs.restore("conv", skipped)
+    restored = pending_inputs.delivery_attributes_for("conv", first)
+    assert restored == {
+        **original,
+        "pending_age_ms": 5000,
+        "last_delivery_stage": "forward_accepted",
+    }
+    assert restored["input_enqueued_at_ms"] == 100000
+    assert "private first" not in repr(restored)
+    redrained = pending_inputs.resolve("conv", first)
+    assert redrained is not None and redrained.interrupted is interrupted
 
 
 @pytest.fixture(autouse=True)
@@ -871,14 +929,13 @@ def test_interrupted_entry_still_answers_a_stable_id_retry() -> None:
 def test_resolve_oldest_skips_interrupted_entries() -> None:
     """A positional drain hands the mirror to a live entry, never to a cancelled one.
 
-    Otherwise a ``/btw`` typed after a cancelled message would settle the
-    cancelled entry and leave its own bubble pending, and a message typed in the
-    TUI would inherit the cancelled entry's attachments and author.
+    Otherwise a message typed in the TUI would inherit the cancelled entry's
+    attachments and author.
     """
     cancelled = pending_inputs.record(
         "conv_a", [_text_block("cancelled")], created_by="alice@example.com"
     )
-    live = pending_inputs.record("conv_a", [_text_block("/btw what is this")])
+    live = pending_inputs.record("conv_a", [_text_block("go on")])
     pending_inputs.mark_interrupted("conv_a", [cancelled])
 
     drained = pending_inputs.resolve_oldest("conv_a", hold=True)

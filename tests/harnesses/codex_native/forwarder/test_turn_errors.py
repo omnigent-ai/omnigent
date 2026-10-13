@@ -446,6 +446,42 @@ async def test_malformed_error_requires_an_explicit_correlated_terminal_edge(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("detail", [{"message": "child turn failed"}, None])
+async def test_child_thread_error_needs_no_bridge_to_fail_its_turn(
+    tmp_path: Path, detail: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child thread has no bridge: a detailed error fails its turn once."""
+    monkeypatch.chdir(tmp_path)
+    client = _RecordingClient()
+    forwarder_state = fwd._CodexForwarderState()
+    for _ in range(2):
+        assert await fwd._maybe_handle_turn_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_child",
+            bridge_dir=None,
+            method="error",
+            params={
+                "threadId": "thread_child",
+                "turnId": "turn_child",
+                "willRetry": False,
+                "error": detail,
+            },
+            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_child"),  # type: ignore[arg-type]
+            delta_coalescer=None,
+            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+            codex_client=None,
+            forwarder_state=forwarder_state,
+        )
+
+    statuses = [body["data"]["status"] for _, body in client.posts]
+    assert statuses == (["failed"] if detail is not None else [])
+    assert forwarder_state.surfaced_terminal_error_turns == (
+        {"turn_child"} if detail is not None else set()
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_correlated_error_recovers_a_missed_turn_start(tmp_path: Path) -> None:
     _seed_active_turn(tmp_path, "previous_turn")
     assert fwd.clear_active_turn_id_if_matches(tmp_path, "previous_turn")

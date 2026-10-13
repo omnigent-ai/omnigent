@@ -57,7 +57,14 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "arca_shutdown_warnings";
+export type FeatureKey =
+  | "usage_page"
+  | "harness_install"
+  | "canvas"
+  | "arca_shutdown_warnings"
+  | "import_review"
+  | "custom_agents_settings_ui"
+  | "sidebar_grouping_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -122,7 +129,7 @@ export interface ServerInfo {
    */
   sandbox_provider_capabilities?: Record<
     string,
-    { multi_repo?: boolean; inference_models?: boolean }
+    { multi_repo?: boolean; inference_models?: boolean; default_models?: boolean }
   >;
   /**
    * Connection providers this deploy has wired (config + store present),
@@ -144,6 +151,8 @@ export interface ServerInfo {
    * the "Public access" toggle. Fails open to ``true``.
    */
   public_sharing_enabled: boolean;
+  /** Public permission ceiling; older servers support Read only. */
+  public_sharing_max_level?: "read" | "edit";
   /**
    * Installed omnigent server version (same value as ``/api/version``),
    * e.g. ``"0.3.0.dev0"``. Shown in the session info popover's version
@@ -208,6 +217,8 @@ export interface ServerInfo {
    * and the Import bundle button. Absent on older servers (off).
    */
   agent_install?: boolean;
+  /** True when GET /v1/agents/{id} is available; absent on older servers (off). */
+  agent_detail?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -259,6 +270,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   // not silently disable sharing, so the sentinel is the permissive "on".
   sharing_mode: "on",
   public_sharing_enabled: true,
+  public_sharing_max_level: "read",
   server_version: null,
   smart_routing_enabled: false,
   smart_routing_sources: { external: false, oss: false },
@@ -302,6 +314,14 @@ function parseFeatures(raw: unknown, harnessInstallEnabled: boolean): FeatureVal
 /** Return whether a known release feature is enabled; missing/loading is off. */
 export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureKey): boolean {
   return info !== "loading" && info.features?.[feature] === true;
+}
+
+export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
+  return (
+    isFeatureEnabled(info, "custom_agents_settings_ui") &&
+    info !== "loading" &&
+    info.agent_install === true
+  );
 }
 
 let cachedServerInfo: ServerInfo | null = null;
@@ -356,6 +376,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : "on",
           // Fail open: only an explicit false disables the public toggle.
           public_sharing_enabled: data.public_sharing_enabled !== false,
+          public_sharing_max_level: data.public_sharing_max_level === "edit" ? "edit" : "read",
           server_version: typeof data.server_version === "string" ? data.server_version : null,
           smart_routing_enabled: smartRoutingEnabled,
           smart_routing_sources: parseSmartRoutingSources(
@@ -370,6 +391,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           agent_install: data.agent_install === true,
+          agent_detail: data.agent_detail === true,
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;

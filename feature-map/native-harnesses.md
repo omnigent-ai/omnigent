@@ -67,7 +67,8 @@ Probes run only on expansion.
 
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
-shown for a newly connected or requested host → See more.
+shown for a newly connected or requested host → See more. The modal auto-opens
+only when the server enables the `import_review` release feature.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
@@ -129,6 +130,15 @@ the extra fields. Resolver and raw-tunnel checks:
 
 Cross-harness journeys:
 
+- **`launch-cli` and `launch-web`, Pi CLI compatibility (own environment):**
+  `tests/e2e/test_pi_native_cli_version_floor_e2e.py::test_real_pi_cli_version_floor`
+  runs real unsupported and supported npm Pi installations through `omnigent pi`
+  and the server's native-terminal launch endpoint. Set
+  `OMNIGENT_E2E_PI_OLD_BINARY` and `OMNIGENT_E2E_PI_CURRENT_BINARY` to their
+  executable paths. The old release must report its version and upgrade command
+  before a terminal starts. The supported release must answer terminal and API
+  input through the real Pi process; only model replies are scripted locally.
+  Each case owns its stack and saves terminal recordings plus API evidence.
 - **`side-chat`, Codex:**
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   uses a real Codex CLI/app-server and the local mock model. It verifies inherited
@@ -140,11 +150,13 @@ Cross-harness journeys:
   `web/src/shell/settingsNav.test.tsx` and
   `tests/e2e_ui/onboarding/test_import_review_modal.py::test_import_modal_opens_once_and_links_to_harnesses`.
   Start the isolated instance without release flags. Check the Harnesses sidebar
-  link and direct links to the catalog and a harness detail page. Connect a new
-  host, then click See more beside Confirm. Check that the modal closes and
-  Harnesses opens. Open Import sessions and check that only session imports
-  remain. Older clients connected to an upgraded server keep these entry points
-  without deployment changes. The server response contract is covered by
+  link and direct links to the catalog and a harness detail page. Stop it, then
+  use `OMNIGENT_FEATURES=import_review verify-env start`; without that feature the
+  import review modal never opens. Connect a new host, then click See more
+  beside Confirm. Check that the modal closes and Harnesses opens. Open Import
+  sessions and check that only session imports remain. The Harnesses sidebar
+  and direct links remain available without the import-review flag. The server
+  response contract is covered by
   `tests/server/integration/test_utility_endpoints.py::test_info_returns_expected_fields`.
 
 - **`needs-auth`:**
@@ -153,8 +165,16 @@ Cross-harness journeys:
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
 - **`model-and-effort`:**
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_claude_picker_omits_aliases_the_cli_picker_does_not_offer`,
-  `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`;
+  `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
+  (real host API and Codex CLI, with custom/bundled catalogs and a hidden default; desktop and mobile);
   see also [composer](./composer.md) for effort.
+- **`model-and-effort`, managed sandbox before a host exists:**
+  `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py::test_sandbox_codex_picker_offers_gateway_models_before_a_host_exists`,
+  `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
+  The picker offers the sandbox gateway's models for native and SDK agents with
+  a Harness default row; efforts come from the listing's reasoning metadata, and
+  an unavailable listing keeps Harness default launchable. Connected-host
+  discovery and bound (`inference_models`) targets are unchanged.
 - **`model-and-effort`, Codex runtime settings:**
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_preserves_supported_effort`,
@@ -226,6 +246,15 @@ Cross-harness journeys:
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
+- **`resume`, Claude and Pi provider selection after a runner restart:**
+  `tests/e2e/test_native_resume_provider_e2e.py::test_connected_native_resume_routes_to_configured_provider`
+  (own environment, real server, runner, native CLI and tmux with local model
+  endpoints) changes the configured default and restarts the runner. Web/API
+  and terminal turns must reach the expected endpoint with the same session
+  identity and history. Unchanged defaults, Claude agent provider pins, and
+  Pi per-harness provider bindings are control cases. Claude requires an
+  environment without machine-wide managed settings; its test config and
+  onboarding state are isolated.
 - **`resume`, Codex persisted effort after a runner restart:**
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_resume_clamps_persisted_effort`
   (own environment, real Codex with mock model replies).
@@ -233,15 +262,30 @@ Cross-harness journeys:
   checks that a stalled settings connection, write, or close cannot block resume;
   `tests/harnesses/codex_native/app_server/test_reasoning_effort.py::test_resume_records_an_effort_its_config_write_lost`
   keeps a resumed effort whose config write failed for later updates.
+- **`resume`, Codex provider selection after a runner restart:**
+  `tests/e2e/test_codex_native_resume_provider_e2e.py::test_connected_codex_resume_routes_to_configured_provider`
+  (own environment, real server, runner, Codex and tmux with local model endpoints)
+  changes the configured default, restarts the runner, and checks routing from
+  chat and the terminal. Unchanged defaults and agent-specific provider choices
+  retain their endpoint; history, model, effort and permissions survive.
+  `tests/harnesses/codex_native/session/test_terminal_prepare.py::test_prepare_codex_terminal_resumes_with_launch_provider`
+  covers the CLI resume call site with configured and unpinned launches.
 - **`chat-render`, `steer`, per harness:** use the matrix.
 - **`chat-render`, Claude shell commands from the web composer:**
   `tests/browser_ui/chat/test_native_shell_settlement.py::test_shell_mirror_settles_its_bubble_before_the_next_prompt`
   drives the built SPA at desktop and phone widths with controlled backend
-  events, including a following prompt and reload.
+  events. The shell prompt remains one user bubble after settlement, with its
+  output below it; a following prompt and reload preserve both user turns.
   `tests/e2e_ui/messages/test_native_claude_shell_input.py::test_web_shell_command_settles_before_the_next_prompt`
   covers the real CLI and transcript forwarder through the repro environment.
   It requires Claude Code and tmux; machine-managed Claude settings need an
   isolated container for the scripted model endpoint.
+- **`chat-render`, Claude shell commands from the agent terminal:**
+  `tests/browser_ui/chat/test_native_shell_settlement.py::test_terminal_shell_commands_keep_their_user_turns`
+  replays terminal-origin records in the built SPA at desktop and phone widths.
+  After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
+  prompt must remain a separate user turn outside the assistant's folded work,
+  including after reload. This browser contract does not launch the Claude CLI.
 - **`skill-contents`:** run `tests/host/test_skill_content.py`,
   `tests/server/routes/test_skill_content.py`, and the real-host test
   `tests/e2e/test_host_skill_content_e2e.py::test_host_skill_content` with plain
@@ -276,6 +320,14 @@ Cross-harness journeys:
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
+- **`disconnect`, Claude startup (plain `uv run pytest`, no vendor CLI):**
+  `tests/harnesses/claude_native/test_claude_native_readiness_exit.py` delivers
+  a web message through the public bridge into a real retained dead tmux pane.
+  It checks prompt budgets equal to the hard cap and early exit detection with
+  longer budgets. `test_claude_native_slow_ready.py` checks successful delivery
+  after slow startup, an early crash, and the live-pane timeout. These tests
+  exercise the injection used by existing-session and first-message composers;
+  CLI typing bypasses the web injection gate. They do not run a vendor model.
 - **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**
   `tests/e2e/test_codex_native_event_stream_disconnect_e2e.py` covers waiting
   consumers, buffered events, explicit close, and startup discovery without a
@@ -304,6 +356,13 @@ Cross-harness journeys:
   including after reload. Run with plain `uv run pytest` and the browser
   prerequisites in the skill. Requires Claude Code and tmux; machine-managed
   Claude credentials need an isolated container for the scripted model endpoint.
+- **`disconnect`, an already failed session (own environment):**
+  `tests/e2e/test_runner_exit_preserves_failure_e2e.py` posts an actual native
+  failed-status event, then reports a never-connected runner's exit through
+  a real host WebSocket. It checks both a warm cache and a restarted server:
+  the original failure remains in the session response and durable labels,
+  with no additional turn-failure edge. Run with plain `uv run pytest`; no
+  vendor CLI, browser, or model is needed.
 
 - **`plugin-inventory` (component and host tests):**
   `tests/e2e/test_host_plugins_e2e.py::test_host_plugin_inventory` starts a real

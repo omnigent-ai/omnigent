@@ -44,6 +44,9 @@ reattach when the session moves to another host.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
+Sandbox-backed sessions, including Databricks Sandbox and Arclet, cannot switch
+hosts. Their "Switch host…" item is disabled; hover or focus it for the
+unsupported explanation.
 
 **Local terminal:** a native harness launched from the CLI runs in the user's
 own terminal; see [native harnesses](./native-harnesses.md).
@@ -60,9 +63,12 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 ```
 
 - **`agent-terminal-view`:**
-  `tests/e2e_ui/shells/test_new_shell.py::test_empty_terminal_view_remains_selectable_and_resumable`,
   `tests/e2e_ui/shells/test_new_shell.py::test_starting_terminal_view_shows_loading_without_resume`,
-  `tests/e2e_ui/shells/test_new_shell.py::test_stopped_terminal_view_keeps_resume`
+  `tests/e2e_ui/shells/test_new_shell.py::test_stopped_terminal_view_keeps_resume`.
+  The stopped state with a selectable empty terminal (own environment):
+  `tests/e2e_ui/shells/test_new_shell.py::test_empty_terminal_view_remains_selectable_and_resumable`
+  kills the session's runner, so it fails under `verify-env run`; run it with
+  plain `uv run pytest`.
 - **`user-shell`:**
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_launches_and_opens`,
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_accepts_typed_command`.

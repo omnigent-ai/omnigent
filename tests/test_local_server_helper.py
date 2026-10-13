@@ -85,3 +85,56 @@ raise SystemExit(23)
     assert "stack-startup-marker" in str(error.value)
     assert len(children) == (1 if failing_process == "server" else 2)
     assert all(child.poll() is not None for child in children)
+
+
+@pytest.mark.parametrize("exit_early", [True, False])
+def test_host_failed_readiness_reaps_child_and_retains_isolated_diagnostics(
+    tmp_path: Path, exit_early: bool
+):
+    import sys
+
+    import httpx
+
+    from tests._helpers.host import isolated_host
+
+    for key in ("HOME", "OMNIGENT_HOST_ID"):
+        with pytest.raises(ValueError):
+            with isolated_host(tmp_path, "http://127.0.0.1:1", env={key: "invalid"}):
+                pytest.fail("owned environment must be rejected before starting a host")
+        assert not (tmp_path / "home").exists()
+
+    handles = []
+
+    def ready(host):
+        handles.append(host)
+        with httpx.Client(base_url="http://127.0.0.1:1", trust_env=False) as client:
+            host.wait_online(client, timeout=2, poll_interval=0.02)
+
+    bootstrap = """
+import os, pathlib, time
+assert 'REMOVE_TEST_SETTING' not in os.environ
+assert os.environ['EXPLICIT_TEST_SETTING'] == 'kept'
+assert pathlib.Path(os.environ['HOME']).is_relative_to(pathlib.Path.cwd())
+assert pathlib.Path(os.environ['OMNIGENT_CONFIG_HOME'], 'config.yaml').exists()
+print('isolated-host-startup-marker', flush=True)
+with open(os.environ['OMNIGENT_PROCESS_LOG_FILE'], 'a') as log:
+    print('secondary-writer-marker', file=log)
+print('stdout-after-logger-marker', flush=True)
+""" + ("raise SystemExit(23)" if exit_early else "time.sleep(60)")
+    with pytest.raises(AssertionError, match="isolated-host-startup-marker"):
+        with isolated_host(
+            tmp_path,
+            "http://127.0.0.1:1",
+            base_env={"PATH": os.environ["PATH"], "REMOVE_TEST_SETTING": "parent"},
+            env={"REMOVE_TEST_SETTING": None, "EXPLICIT_TEST_SETTING": "kept"},
+            command=[sys.executable, "-c", bootstrap],
+            cwd=tmp_path,
+            ready=ready,
+        ):
+            pytest.fail("an unready host must not be yielded")
+    assert len(handles) == 1
+    log = handles[0].log_path.read_text()
+    assert "secondary-writer-marker" in log and "stdout-after-logger-marker" in log
+    assert handles[0].proc.poll() is not None
+    if exit_early:
+        assert handles[0].proc.returncode == 23

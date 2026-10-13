@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SelectionPopup } from "./SelectionPopup";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
@@ -25,6 +26,7 @@ import {
 import { ChatComposer, ComposerSendButton } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { isSlashCommandText } from "@/components/SlashCommandMenu";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import { Button } from "@/components/ui/button";
@@ -34,6 +36,7 @@ import {
   useChatStore,
 } from "@/store/chatStore";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
+import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useSession } from "@/hooks/useSession";
 import { usesNativeSideChatFork } from "@/lib/sideChat";
@@ -94,19 +97,31 @@ const EMPTY_STATE_BODY = "Ask a question here without affecting the main convers
  */
 export function SideChatPane({
   childId,
+  selectionParentId,
   onStart,
   readOnly: restoredReadOnly = false,
 }: {
   childId: string;
+  selectionParentId?: string;
   onStart?: (text: string) => Promise<void>;
   /** A dead, restored Codex side chat: show the transcript without a composer. */
   readOnly?: boolean;
 }) {
   const pending = isPendingSideChat(childId);
-  const [starting, setStarting] = useState(false);
+  const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
   // The server seals a side chat whose fork died with its runner.
   const { session } = useSession(pending ? null : childId);
   const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
+  useLayoutEffect(() => {
+    if (!selectionParentId || readOnly || starting) return;
+    const target = { childId, parentId: selectionParentId };
+    useChatStore.setState({ sideChatSelectionTarget: target });
+    return () => {
+      if (useChatStore.getState().sideChatSelectionTarget === target) {
+        useChatStore.setState({ sideChatSelectionTarget: null });
+      }
+    };
+  }, [childId, selectionParentId, readOnly, starting]);
   // Open the child's stream once (real tabs only) so it hydrates and streams
   // here. The store guards a double-bind and re-binds a failed entry, so
   // re-mounts / tab switches / retries are cheap.
@@ -220,6 +235,7 @@ export function SideChatPane({
 
   // Keep the newest content in view. A side chat is short and non-virtualized,
   // so a bottom sentinel scrolled on each change is enough.
+  const transcriptRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "end" });
@@ -230,21 +246,28 @@ export function SideChatPane({
 
   const startSideChat = async (text: string) => {
     if (!onStart) return;
-    setStarting(true);
+    // Keep the in-flight tab locked across tab switches and drawer remounts.
+    useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+      ...current,
+      starting: true,
+    }));
     try {
       await onStart(text);
       // The quoted selection now travels with the fork's first message.
       useChatStore.getState().clearSideChatDraft(childId);
     } catch {
       // Re-enable the composer while preserving the draft for retry.
-      setStarting(false);
+      useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+        ...current,
+        starting: false,
+      }));
     }
   };
 
   return (
     <ConversationScopeContext.Provider value={childId}>
       <div className="side-chat-backdrop flex h-full min-h-0 flex-col">
-        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4">
+        <div ref={transcriptRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4">
           {loadFailed ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
               <TriangleAlertIcon className="size-6 text-muted-foreground" />
@@ -284,6 +307,17 @@ export function SideChatPane({
             </div>
           )}
         </div>
+        {!readOnly && !starting && (
+          <SelectionPopup
+            containerRef={transcriptRef}
+            onReply={(text) => {
+              useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+                ...current,
+                quotes: [...(current.quotes ?? []), text],
+              }));
+            }}
+          />
+        )}
         <div className="shrink-0 px-3 pt-3 pb-5">
           {readOnly ? (
             <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-center text-sm text-muted-foreground">
@@ -358,14 +392,24 @@ function SideChatComposer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const voiceSnapshotRef = useRef("");
   const dictation = useDictationInsert(text, setText, textareaRef);
+  useAutoGrowTextarea(textareaRef, text);
+
   // This tab's seeded text: on a pending tab the "Ask in side chat" selection
   // to QUOTE, on a live tab the `/side` question to SEND.
   const draft = useChatStore((s) => s.sideChatDrafts[childId]);
   const quote = pending ? draft : undefined;
+  const quotes = [
+    ...(quote === undefined ? [] : [{ id: "seed", before: "", text: quote }]),
+    ...(composer?.quotes ?? []).map((selection, index) => ({
+      id: String(index),
+      before: "",
+      text: selection,
+    })),
+  ];
   const autoSend = pending ? undefined : draft;
   useEffect(() => {
-    if (quote !== undefined) textareaRef.current?.focus();
-  }, [quote]);
+    if (quote !== undefined || composer?.quotes?.length) textareaRef.current?.focus();
+  }, [quote, composer?.quotes]);
   // Re-read the labels so a side chat the server just sealed turns read-only.
   const refreshLabels = useCallback(
     () => void queryClient.invalidateQueries({ queryKey: ["session", childId] }),
@@ -401,23 +445,24 @@ function SideChatComposer({
   };
 
   const submit = () => {
-    const trimmed = text.trim();
+    const trimmed = isSlashCommandText(text) ? text.trim() : text.trimEnd();
     if (pending) {
       if (trimmed.length === 0 || starting || !onStart) return;
       // Keep the text so a failed fork can be retried without re-typing.
-      void onStart(
-        quote === undefined
-          ? trimmed
-          : serializeReplyDraft({ quotes: [{ before: "", text: quote }], text: trimmed }),
-      );
+      void onStart(serializeReplyDraft({ quotes, text: trimmed }));
       return;
     }
     if (busy || (trimmed.length === 0 && files.length === 0) || agentId === null) return;
     const outgoing = files;
     clearComposer(childId);
-    void send(trimmed, agentId, outgoing.length > 0 ? outgoing : undefined, {
-      pinnedConversationId: childId,
-    }).finally(refreshLabels);
+    void send(
+      serializeReplyDraft({ quotes, text: trimmed }),
+      agentId,
+      outgoing.length > 0 ? outgoing : undefined,
+      {
+        pinnedConversationId: childId,
+      },
+    ).finally(refreshLabels);
   };
 
   return (
@@ -455,14 +500,22 @@ function SideChatComposer({
         }}
         slots={{
           inputPrefix:
-            quote === undefined ? undefined : (
+            quotes.length === 0 ? undefined : (
               <ReplyDraftBlocks
-                quotes={[{ id: childId, before: "", text: quote }]}
+                quotes={quotes}
                 activeTextId={null}
+                showTextInputs={false}
                 keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
                 disabled={!ready}
                 inputFor={() => ({})}
-                onRemove={() => clearSideChatDraft(childId)}
+                onRemove={(id) => {
+                  if (id === "seed") clearSideChatDraft(childId);
+                  else
+                    updateComposer(childId, (current) => ({
+                      ...current,
+                      quotes: current.quotes?.filter((_, index) => String(index) !== id),
+                    }));
+                }}
               />
             ),
           attachments:
