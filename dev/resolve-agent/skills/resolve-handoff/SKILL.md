@@ -134,6 +134,11 @@ readiness; name pending publication/review steps in `remaining_work`.
   fixed?** Write plain, natural English for someone who uses the product but has
   not read the code. `problem_summary` describes what the person experiences and
   why it matters. `solution_summary` describes the corrected behavior and result.
+  When it describes the delivered screen — the order of rows, which entry is
+  first or checked, a label — take that description from the recorded
+  after-clip's final frame or the driver's assertions on the rendered page, and
+  use the same wording in the clip's caption and the PR body; do not write it
+  from the intended design and reuse it unchecked.
   Keep implementation symbols, filenames, commit/merge bookkeeping, test lists,
   and CI details out of both fields; those belong in the technical fields below.
   Include both fields even for review mode and no-change outcomes.

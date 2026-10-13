@@ -304,6 +304,18 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     assert "Do not block the fix or PR because footage is missing or rejected" in normalized
 
 
+def test_screen_descriptions_come_from_the_recorded_frame() -> None:
+    normalized = _normalized_resolve_instructions()
+
+    assert (
+        "take that description from the recorded after-clip's final frame "
+        "or the driver's assertions on the rendered page" in normalized
+    )
+    assert "do not write it from the intended design and reuse it unchecked" in normalized
+    assert "identical to the clip's caption and `solution_summary`" in normalized
+    assert "a description written from the intended design is not checked until" in normalized
+
+
 def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None:
     instructions = _normalized_resolve_instructions()
     review = instructions.split("### 4.3", 1)[1].split("### 4.4", 1)[0]
