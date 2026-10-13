@@ -412,8 +412,10 @@ class _HelperProcessClient:
         egress_rules: list[str] | None = None,
         egress_allow_private_destinations: bool = False,
         copy_on_write_environment: CopyOnWriteEnvironment | None = None,
+        upload_raw: bool = False,
     ) -> None:
         self._copy_on_write_environment = copy_on_write_environment
+        self._upload_raw = upload_raw
         self.cwd = cwd
         self.shell_path = shell_path
         self.sandbox = sandbox
@@ -618,6 +620,7 @@ class _HelperProcessClient:
             "cwd": str(helper_cwd),
             "shell_path": self.shell_path,
             "sandbox": sandbox.to_jsonable(),
+            "upload_raw": self._upload_raw,
         }
         # S4 (security): include the per-helper Proxy-Authorization
         # token IF egress is active. Delivered ONLY via the pipe FD,
@@ -2152,6 +2155,11 @@ def _run_helper(config: JsonValue) -> int:
 
     sandbox = SandboxPolicy.from_jsonable(sandbox_value)
     activate_sandbox(sandbox)
+
+    if config.get("upload_raw") is True:
+        from omnigent.inner.os_env_upload import serve_uploads
+
+        return serve_uploads(cwd, sandbox)
 
     for line in sys.stdin:
         line = line.strip()

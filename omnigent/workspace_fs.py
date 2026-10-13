@@ -45,6 +45,7 @@ from typing import TypeAlias, cast
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import paginate_in_memory
 from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
+from omnigent.inner.os_env_upload import is_upload_staging
 from omnigent.runner import pr_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -238,6 +239,7 @@ class WorkspaceReader:
             raise WorkspaceReaderError(
                 404, "not_found", f"Directory {rel!r} not found or not accessible"
             ) from exc
+        names = [name for name in names if not is_upload_staging(name)]
         for name in names:
             full = resolved / name
             child_rel = os.path.join(validated, name) if validated else name
@@ -430,6 +432,8 @@ class WorkspaceReader:
         def match(dirpath: str, name: str, *, is_dir: bool) -> None:
             # A directory carries no byte size; a file stats for size + mtime.
             p = rel(dirpath, name)
+            if is_upload_staging(p):
+                return
             if exc and any(r.match(p) for r in exc):
                 return
             if inc and not any(r.match(p) for r in inc):
@@ -572,6 +576,7 @@ class WorkspaceReader:
                 "lines_removed": rec.get("lines_removed"),
             }
             for rec in raw_changes
+            if not is_upload_staging(rec["path"])
         ]
         return {"object": "list", "data": data, "has_more": False}
 
