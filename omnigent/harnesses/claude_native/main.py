@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import hashlib
 import importlib.resources
 import json
 import logging
@@ -602,6 +603,21 @@ def _ambient_custom_headers() -> dict[str, str]:
     return headers
 
 
+def _ambient_credential_digest() -> str | None:
+    """A non-reversible digest of the ambient listing credential; ``None`` without one."""
+    values = [
+        os.environ.get(name, "")
+        for name in (
+            _ANTHROPIC_AUTH_TOKEN_ENV,
+            _ANTHROPIC_API_KEY_ENV,
+            _CLAUDE_CODE_CUSTOM_HEADERS_ENV,
+        )
+    ]
+    if not any(values):
+        return None
+    return hashlib.sha256("\x00".join(values).encode("utf-8")).hexdigest()
+
+
 def _ambient_gateway_serves_canonical_ids(
     *, transport: httpx.BaseTransport | None = None
 ) -> bool | None:
@@ -623,12 +639,14 @@ def _ambient_gateway_serves_canonical_ids(
     base_url = _ambient_claude_base_url()
     if not base_url:
         return None
-    headers = _ambient_custom_headers()
+    # Case-insensitive, and an explicit custom header wins over the derived
+    # one, as in Claude Code's own client.
+    headers = httpx.Headers(_ambient_custom_headers())
     auth_token = os.environ.get(_ANTHROPIC_AUTH_TOKEN_ENV)
     api_key = os.environ.get(_ANTHROPIC_API_KEY_ENV)
-    if auth_token:
+    if auth_token and "authorization" not in headers:
         headers["Authorization"] = f"Bearer {auth_token}"
-    if api_key:
+    if api_key and "x-api-key" not in headers:
         headers["x-api-key"] = api_key
     if not headers:
         return None
@@ -644,7 +662,7 @@ def _ambient_gateway_serves_canonical_ids(
             )
             response.raise_for_status()
             payload = response.json()
-    except (httpx.HTTPError, ValueError, OSError) as exc:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError) as exc:
         # The error text can carry the URL (userinfo, query tokens): log the
         # class and status only.
         status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
@@ -1623,6 +1641,10 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     # cloud transport is never read again once that setting is removed.
     uses_cli_settings = claude_config is None or claude_config.subscription_auth
     ambient_transport = claude_ambient_transport() if uses_cli_settings else None
+    ambient_gateway = (_ambient_claude_base_url() or None) if claude_config is None else None
+    # The ambient credential decides what the gateway's listing reveals, so a
+    # changed key or header re-probes; only its digest enters the key.
+    ambient_credentials = _ambient_credential_digest() if ambient_gateway else None
     return fingerprint_of(
         "claude-native",
         "control-picker-v4",
@@ -1636,6 +1658,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         binary_identity(command),
         binary_identity("claude"),
         ambient_transport,
+        ambient_credentials,
         claude_managed_model_picker() if uses_cli_settings else None,
     )
 
@@ -1703,7 +1726,10 @@ async def claude_model_catalog(
                 and listing_provider.base_url
                 and is_databricks_ai_gateway_url(listing_provider.base_url)
             )
-            _non_canonical = is_undetermined_databricks_gateway or not _serves_canonical_anthropic_ids(claude_config)
+            _non_canonical = (
+                is_undetermined_databricks_gateway
+                or not _serves_canonical_anthropic_ids(claude_config)
+            )
     else:
         _non_canonical = await _ambient_gateway_rejects_canonical_ids()
     if _non_canonical:
