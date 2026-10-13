@@ -1354,6 +1354,11 @@ async def test_hello_does_not_wait_for_blocked_probe_or_cleanup(
         ),
         pytest.param("gone-reply", {"error": "EOF", "code": "gone"}, id="gone-reply"),
         pytest.param(
+            "permanent-reply",
+            {"error": "Workspace is read-only", "code": "permission_denied"},
+            id="permanent-reply",
+        ),
+        pytest.param(
             "unknown-reply", {"error": "probe failed", "code": "unexpected"}, id="unknown-reply"
         ),
         pytest.param("error-only", {"error": "probe failed"}, id="error-only"),
@@ -1440,9 +1445,20 @@ async def test_hello_waits_for_upload_readiness_and_recovers(
             await manager.stop()
             await manager.start()
         await _send_hello(send, "test", app=app, connection_id="reconnected")
-        assert ("workspace_upload_v1" in frames[1].capabilities) == (mode != "unsupported")
-        assert resolutions == (1 if mode in ("ready", "unsupported") else 2)
-        assert calls == (1 if mode in ("ready", "unsupported", "resolver-error", "timeout") else 2)
+        retry = mode in (
+            "resolver-error",
+            "timeout",
+            "cleanup-error",
+            "lifecycle",
+            "busy-reply",
+            "timeout-reply",
+            "gone-reply",
+            "code-only",
+            "conflicting-reply",
+        )
+        assert ("workspace_upload_v1" in frames[1].capabilities) == (mode == "ready" or retry)
+        assert resolutions == (2 if retry else 1)
+        assert calls == (2 if retry and mode not in ("resolver-error", "timeout") else 1)
         assert frames[1].connection_id == "reconnected"
     finally:
         await manager.stop()

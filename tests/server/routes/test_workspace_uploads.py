@@ -23,6 +23,7 @@ from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, RequestFrame
 from omnigent.runner.transports.ws_tunnel.serve import _handle_tunnel_frame
 from omnigent.runner.workspace_upload import UploadLimits, register_upload_routes
 from omnigent.runtime import _globals
+from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.routes import routes_uploads as uploads
 from omnigent.server.routes._sessions import common as session_common
@@ -459,11 +460,12 @@ async def test_chunk_headers(scenario, headers, status):
         ({"created_by": "bob"}, "invalid_request"),
     ],
 )
-async def test_declaration_validation(scenario, fields, code):
+async def test_declaration_validation(scenario, db_uri, fields, code):
+    SqlAlchemyPermissionStore(db_uri).grant(ALICE, scenario.session_id, LEVEL_OWNER)
+    scenario.client.headers["X-Forwarded-Email"] = ALICE
     response = await scenario.create(**fields)
-    assert response.status_code in (400, 403)
-    if response.status_code == 400:
-        assert response.json()["error"]["code"] == code
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == code
     assert scenario.requests == []
 
 
