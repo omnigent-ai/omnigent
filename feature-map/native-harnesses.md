@@ -67,7 +67,8 @@ Probes run only on expansion.
 
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
-shown for a newly connected or requested host → See more.
+shown for a newly connected or requested host → See more. The modal auto-opens
+only when the server enables the `import_review` release feature.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
@@ -149,11 +150,13 @@ Cross-harness journeys:
   `web/src/shell/settingsNav.test.tsx` and
   `tests/e2e_ui/onboarding/test_import_review_modal.py::test_import_modal_opens_once_and_links_to_harnesses`.
   Start the isolated instance without release flags. Check the Harnesses sidebar
-  link and direct links to the catalog and a harness detail page. Connect a new
-  host, then click See more beside Confirm. Check that the modal closes and
-  Harnesses opens. Open Import sessions and check that only session imports
-  remain. Older clients connected to an upgraded server keep these entry points
-  without deployment changes. The server response contract is covered by
+  link and direct links to the catalog and a harness detail page. Stop it, then
+  use `OMNIGENT_FEATURES=import_review verify-env start`; without that feature the
+  import review modal never opens. Connect a new host, then click See more
+  beside Confirm. Check that the modal closes and Harnesses opens. Open Import
+  sessions and check that only session imports remain. The Harnesses sidebar
+  and direct links remain available without the import-review flag. The server
+  response contract is covered by
   `tests/server/integration/test_utility_endpoints.py::test_info_returns_expected_fields`.
 
 - **`needs-auth`:**
