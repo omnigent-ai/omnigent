@@ -6752,16 +6752,11 @@ _EFFORT_CHANGE_NOT_APPLIED_CODE = "effort_change_not_applied"
 
 def _runner_refusal_reason(runner_result: _RunnerForwardResult) -> str:
     """
-    Describe why the runner did not apply a forwarded settings change.
+    Reason the runner gave for not applying a forwarded settings change.
 
-    The runner's own ``detail`` names the concrete cause and the next step
-    (e.g. answer the pending Claude prompt), so it is preferred over the bare
-    HTTP status when present.
-
-    :param runner_result: Non-2xx HTTP result from the forward.
-    :returns: Reason text without a trailing period, e.g. ``"Claude is waiting
-        for an answer to a question or permission request. Answer it in the
-        terminal, then try again"``.
+    Prefer the runner's own ``detail``, which names the cause and the next
+    step; otherwise fall back to its HTTP status. The result has no trailing
+    period so callers can embed it in their own sentence.
     """
     with contextlib.suppress(ValueError, TypeError):
         parsed_body = json.loads(runner_result.body)

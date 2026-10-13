@@ -55,10 +55,13 @@ def _script_write_prompt(mock_url: str, go_token: str) -> None:
 
 
 def _decline_pending(base_url: str, session_id: str) -> None:
+    snap: dict[str, object] = {}
     with contextlib.suppress(httpx.HTTPError, ValueError):
         snap = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
-        for pending in snap.get("pending_elicitations") or []:
-            if eid := pending.get("elicitation_id"):
+    for pending in snap.get("pending_elicitations") or []:
+        if eid := pending.get("elicitation_id"):
+            # Decline each prompt independently so one failure still clears the rest.
+            with contextlib.suppress(httpx.HTTPError):
                 httpx.post(
                     f"{base_url}/v1/sessions/{session_id}/elicitations/{eid}/resolve",
                     json={"action": "decline"},
