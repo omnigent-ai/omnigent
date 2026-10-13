@@ -46,6 +46,10 @@ const mocks = vi.hoisted(() => ({
   projectNames: [] as string[],
   hasNextPage: false,
   fetchNextPage: vi.fn(),
+  enabledConnections: [] as string[],
+  fetchGitlabStatus: vi.fn(),
+  disconnectGitlab: vi.fn(),
+  beginGitlabConnect: vi.fn(),
 }));
 
 vi.mock("next-themes", () => ({
@@ -57,6 +61,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    enabled_connections: mocks.enabledConnections,
   }),
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
@@ -70,6 +75,11 @@ vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
+}));
+vi.mock("@/lib/gitlabIntegration", () => ({
+  fetchGitlabStatus: mocks.fetchGitlabStatus,
+  disconnectGitlab: mocks.disconnectGitlab,
+  beginGitlabConnect: mocks.beginGitlabConnect,
 }));
 vi.mock("@/hooks/useConversations", async () => {
   // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
@@ -237,6 +247,18 @@ beforeEach(() => {
   mocks.pages = undefined;
   mocks.projectNames = [];
   mocks.hasNextPage = false;
+  mocks.enabledConnections = [];
+  mocks.fetchGitlabStatus.mockReset();
+  mocks.fetchGitlabStatus.mockResolvedValue({
+    enabled: true,
+    connected: false,
+    login: null,
+    host: "https://gitlab.com",
+    scopes: null,
+    connected_at: null,
+  });
+  mocks.disconnectGitlab.mockReset();
+  mocks.beginGitlabConnect.mockReset();
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
 afterEach(() => {
@@ -254,6 +276,16 @@ afterEach(() => {
     if (property.startsWith("--custom-")) document.documentElement.style.removeProperty(property);
   }
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+});
+describe("GitLab integration", () => {
+  it("renders the configured GitLab connection panel", async () => {
+    mocks.enabledConnections = ["gitlab"];
+
+    renderPage("/settings/integrations");
+
+    expect(await screen.findByTestId("gitlab-connect")).toBeEnabled();
+    expect(screen.getByText(/Connect your GitLab account on https:\/\/gitlab\.com/)).toBeTruthy();
+  });
 });
 
 describe("Import sessions", () => {

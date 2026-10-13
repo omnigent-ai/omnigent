@@ -115,6 +115,12 @@ import {
   fetchDatabricksStatus,
   type DatabricksConnectionStatus,
 } from "@/lib/databricksIntegration";
+import {
+  beginGitlabConnect,
+  disconnectGitlab,
+  fetchGitlabStatus,
+  type GitlabConnectionStatus,
+} from "@/lib/gitlabIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
@@ -1148,6 +1154,7 @@ function GithubMark({ className }: { className?: string }) {
  */
 const CONNECTION_PANELS: Record<string, ComponentType> = {
   github: GithubIntegrationControl,
+  gitlab: GitlabIntegrationControl,
   databricks: DatabricksIntegrationControl,
 };
 
@@ -1302,6 +1309,101 @@ function GithubIntegrationControl() {
           .
         </p>
       )}
+    </div>
+  );
+}
+
+/** Connect / disconnect the account for the deployment-configured GitLab instance. */
+function GitlabIntegrationControl() {
+  const [status, setStatus] = useState<GitlabConnectionStatus | null | "loading">("loading");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<"connected" | "error" | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await fetchGitlabStatus());
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const params = new URLSearchParams(window.location.search);
+    const outcome = params.get("gitlab");
+    if (outcome === "connected" || outcome === "error") {
+      setNotice(outcome);
+      params.delete("gitlab");
+      const query = params.toString();
+      window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
+    }
+  }, [refresh]);
+
+  const onDisconnect = useCallback(async () => {
+    setBusy(true);
+    try {
+      await disconnectGitlab();
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  const returnTo = `${window.location.pathname}${window.location.search}`;
+  if (status === "loading") return <p className="text-sm text-muted-foreground">Checking…</p>;
+  if (status === null)
+    return <p className="text-sm text-muted-foreground">GitLab status is unavailable.</p>;
+
+  return (
+    <div className="flex flex-col gap-4">
+      {notice === "connected" && (
+        <div
+          role="status"
+          className="rounded-md border border-success/40 bg-success/10 px-3 py-2 text-sm"
+        >
+          GitLab account connected.
+        </div>
+      )}
+      {notice === "error" && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          Couldn't connect your GitLab account. Please try again.
+        </div>
+      )}
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-sm font-medium">GitLab</span>
+          <span className="text-sm text-muted-foreground">
+            {status.connected && status.login
+              ? `Connected as ${status.login}${status.host ? ` on ${status.host}` : ""}. New sandboxes authenticate glab and git as you.`
+              : `Connect your GitLab account${status.host ? ` on ${status.host}` : ""} so new sandboxes authenticate glab and git as you.`}
+          </span>
+        </div>
+        {status.connected ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-9"
+            disabled={busy}
+            data-testid="gitlab-disconnect"
+            onClick={() => void onDisconnect()}
+          >
+            Disconnect
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            className="h-9"
+            disabled={busy || !status.enabled}
+            data-testid="gitlab-connect"
+            onClick={() => beginGitlabConnect(returnTo)}
+          >
+            Connect GitLab
+          </Button>
+        )}
+      </div>
     </div>
   );
 }
