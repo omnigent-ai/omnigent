@@ -165,9 +165,14 @@ def register_permissions_routes(
                     "Public access has been disabled for this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
                 )
-            if body.level > LEVEL_READ:
+            from omnigent.server.sharing_settings import PublicSharingMaxLevel
+
+            ceiling = getattr(
+                request.app.state, "public_sharing_max_level", lambda: PublicSharingMaxLevel.READ
+            )()
+            if body.level > ceiling.level:
                 raise OmnigentError(
-                    "Public access is limited to read-only (level 1)",
+                    f"Public access is limited to {ceiling.value} (level {ceiling.level})",
                     code=ErrorCode.INVALID_INPUT,
                 )
         target = await asyncio.to_thread(permission_store.get_user, body.user_id)

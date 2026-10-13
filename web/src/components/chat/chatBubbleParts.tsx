@@ -93,7 +93,7 @@ import {
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
 // is the path. Global so all markers in a message are found / stripped.
-const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
+const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\][ \t]*(?:\r?\n)*/g;
 
 const COLLAPSE_THRESHOLD = 12000;
 
@@ -112,7 +112,7 @@ export function extractUserText(content: MessageContentBlock[]): string {
     .map((c) => c.text)
     .join("")
     .replace(ATTACHED_RE, "")
-    .trim();
+    .trimEnd();
 }
 
 // An absolute filesystem path in any form a native executor might materialize
@@ -1075,12 +1075,9 @@ function AssistantBubble({
         data-role="assistant"
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
-        className={
-          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
-        }
+        className={spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]"}
       >
-        {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap rather
-            than shrink-wrapping to the summary row's ~110px. */}
+        {/* Fold-only rows fill the prose width so their hairlines remain visible. */}
         <MessageContent
           className={cn(
             (spansFullColumn || foldOnly) && "w-full",

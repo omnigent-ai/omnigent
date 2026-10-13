@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
@@ -818,6 +820,124 @@ describe("ErrorBanner", () => {
     );
     expect(screen.getByTestId("error-diagnostics-content")).toHaveTextContent("pid: 99");
   });
+});
+
+describe("missing workspace recovery", () => {
+  beforeEach(() => useChatStore.setState({ conversationId: "conv_parent" }));
+  afterEach(() => useChatStore.setState({ conversationId: null }));
+
+  it.each([null, "conv_side_chat"])("continues the displayed conversation (%s)", (scope) => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ConversationScopeContext.Provider value={scope}>
+          <ErrorBanner
+            message="workspace path does not exist: /missing"
+            source="execution"
+            code="workspace_missing"
+          />
+        </ConversationScopeContext.Provider>
+      </ForkDialogContextProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({
+      sourceSessionId: scope ?? "conv_parent",
+      workspaceRecovery: true,
+    });
+    expect(screen.queryByText("Message")).not.toBeInTheDocument();
+    expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+  });
+
+  it("offers directory recovery for grouped workspace errors instead of retrying the missing path", () => {
+    const onRetry = vi.fn();
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ErrorBanner
+          message="The runner disconnected"
+          source="execution"
+          code="runner_disconnected"
+          onRetry={onRetry}
+          relatedErrors={[
+            {
+              itemId: "workspace-error",
+              code: "workspace_missing",
+              source: "execution",
+              message: "Missing directory",
+            },
+          ]}
+        />
+      </ForkDialogContextProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Resume session" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
+    expect(openForkDialog).toHaveBeenCalledOnce();
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { canFork: false, code: "workspace_missing" },
+    { canFork: true, code: "runner_error" },
+  ])("does not offer directory recovery for $code with canFork=$canFork", ({ canFork, code }) => {
+    render(
+      <ForkDialogContextProvider value={{ canFork, openForkDialog: vi.fn() }}>
+        <ErrorBanner message="Error details" source="execution" code={code} />
+      </ForkDialogContextProvider>,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Continue in another directory…" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the action disabled when forking is unavailable", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider
+        value={{
+          currentSessionId: "conv_parent",
+          canFork: true,
+          disabledReason: "Forking is unavailable",
+          openForkDialog,
+        }}
+      >
+        <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+      </ForkDialogContextProvider>,
+    );
+    const button = screen.getByRole("button", { name: "Continue in another directory…" });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(openForkDialog).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "lets a scoped child resolve its capabilities independently of root canFork=%s",
+    (canFork) => {
+      const openForkDialog = vi.fn();
+      render(
+        <ForkDialogContextProvider
+          value={{
+            currentSessionId: "conv_parent",
+            canFork,
+            disabledReason: "Forking this sandbox session is not supported yet.",
+            openForkDialog,
+          }}
+        >
+          <ConversationScopeContext.Provider value="conv_side_chat">
+            <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+          </ConversationScopeContext.Provider>
+        </ForkDialogContextProvider>,
+      );
+
+      const button = screen.getByRole("button", { name: "Continue in another directory…" });
+      expect(button).toBeEnabled();
+      fireEvent.click(button);
+      expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({
+        sourceSessionId: "conv_side_chat",
+        workspaceRecovery: true,
+      });
+    },
+  );
 });
 
 describe("RoutingDecisionCard — session-level auto-routing", () => {

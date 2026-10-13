@@ -21,7 +21,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
     from omnigent.harnesses.opencode_native.client import OpenCodeClient, OpenCodeSession
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
-    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
@@ -64,6 +64,8 @@ from omnigent.errors import (
     OmnigentError,
 )
 from omnigent.harness_plugins import native_provider_for_key
+from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
+from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -2563,6 +2565,17 @@ async def _auto_create_pi_terminal(
         tools=pi_tools,
     )
     pi_command = resolve_pi_executable()
+    # One ``pi --version`` probe feeds both the floor gate and the --approve
+    # feature check below. An unknown version fails open, as before.
+    from omnigent.harnesses.pi_native.main import (
+        PI_APPROVE_MIN_VERSION,
+        check_pi_cli_version_floor,
+        pi_version,
+    )
+
+    pi_cli_version = await asyncio.to_thread(pi_version, pi_command)
+    if pi_cli_version is not None:
+        check_pi_cli_version_floor(pi_cli_version)
     # Rebuild the local Pi session JSONL from committed Omnigent items so a
     # cold-resume or fork opens with prior conversation context (parity with
     # claude-native / codex-native). Returns the id to launch with via
@@ -2574,14 +2587,12 @@ async def _auto_create_pi_terminal(
         workspace=launch_config.workspace,
         server_client=server_client,
     )
-    from omnigent.harnesses.pi_native.main import pi_supports_approve
-
     pi_args = _build_pi_native_args(
         terminal_launch_args=launch_config.terminal_launch_args,
         extension_path=pi_extension,
         session_dir=session_dir,
         external_session_id=resume_session_id,
-        approve=await asyncio.to_thread(pi_supports_approve, pi_command),
+        approve=pi_cli_version is not None and pi_cli_version >= PI_APPROVE_MIN_VERSION,
     )
     pi_env = {
         PI_NATIVE_CONFIG_ENV_VAR: str(config),
@@ -4793,6 +4804,10 @@ async def _auto_create_codex_terminal(
     import socket as _socket
     from pathlib import Path
 
+    # A relaunch after an in-place upgrade must not import new code into an
+    # old process: the first launch loads the resume/fork module graph too.
+    import omnigent.harnesses.codex_native.main as _codex_native_main  # noqa: F401
+    import omnigent.harnesses.codex_native.process_registry as _process_registry  # noqa: F401
     from omnigent.harnesses.codex_native.app_server import (
         CodexAppServerClient,
         CodexAppServerResponseError,
@@ -4802,6 +4817,7 @@ async def _auto_create_codex_terminal(
         codex_session_meta_model_provider,
         fresh_codex_launch_catalog,
         is_unreadable_thread_error,
+        native_codex_launch_pins_model_provider,
         preload_codex_thread_for_resume,
         resolve_native_codex_launch,
     )
@@ -5367,6 +5383,11 @@ async def _auto_create_codex_terminal(
                 launch_config.external_session_id,
                 terminal_launch_args=launch_config.terminal_launch_args,
                 cwd=Path(workspace),
+                model_provider=(
+                    _session_meta_provider
+                    if native_codex_launch_pins_model_provider(_codex_launch)
+                    else None
+                ),
                 retain_client=codex_remote_resume_omits_permission_args(
                     app_server.codex_cli_version
                 ),
@@ -5581,15 +5602,17 @@ async def _auto_create_codex_terminal(
     return terminal_view
 
 
-def _codex_terminal_exit_summary(instance: TerminalInstance, *, before_thread: bool) -> str:
+def _terminal_exit_summary(
+    instance: TerminalInstance, runtime_name: str, *, before_thread: bool
+) -> str:
     """Describe a TUI startup exit without inventing an unavailable status."""
     exit_status = instance.last_exit_status()
     status_text = f" with status {exit_status}" if exit_status is not None else ""
     stage = "before starting a thread" if before_thread else "before becoming available"
-    return f"Codex terminal exited{status_text} {stage}."
+    return f"{runtime_name} terminal exited{status_text} {stage}."
 
 
-def _codex_startup_terminal_output(instance: TerminalInstance) -> str | None:
+def _startup_terminal_output(instance: TerminalInstance) -> str | None:
     """Apply the same capture gate and bounds to both startup-error paths."""
     from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
     from omnigent.process_logging import harness_stderr_capture_enabled
@@ -5605,7 +5628,7 @@ class _CodexTerminalExited(RuntimeError):
 
     def __init__(self, instance: TerminalInstance) -> None:
         self.instance = instance
-        super().__init__(_codex_terminal_exit_summary(instance, before_thread=True))
+        super().__init__(_terminal_exit_summary(instance, "Codex", before_thread=True))
 
 
 class _CodexSignInPromptSeen(RuntimeError):
@@ -5961,7 +5984,7 @@ async def _codex_discover_thread_and_forward(
                             ),
                         )
                         if harness_stderr_capture_enabled():
-                            diagnostics["terminal_last_output"] = _codex_startup_terminal_output(
+                            diagnostics["terminal_last_output"] = _startup_terminal_output(
                                 diag_instance
                             )
                 except Exception as diagnostics_error:  # noqa: BLE001
@@ -6031,7 +6054,7 @@ async def _codex_discover_thread_and_forward(
                 if isinstance(exc, _CodexTerminalExited):
                     # The app-server stayed healthy; lead with the TUI's actual
                     # failure instead of the generic thread-discovery wrapper.
-                    summary = _codex_terminal_exit_summary(exc.instance, before_thread=True)
+                    summary = _terminal_exit_summary(exc.instance, "Codex", before_thread=True)
                 else:
                     if isinstance(exc, TimeoutError):
                         timeout_seconds = (
@@ -7485,6 +7508,86 @@ def _claude_terminal_env_unset(
     return env_unset
 
 
+def _claude_terminal_launch_cwd(spec: TerminalEnvSpec, parent_os_env: OSEnvSpec | None) -> Path:
+    """
+    Return the directory the native Claude terminal pane starts in.
+
+    Resolves the spec's os_env the same way terminal creation does for this
+    launch, which passes no cwd or sandbox override and does not fork, then
+    applies an ``env -C``/``--chdir`` wrapper the way ``chdir(2)`` does.
+
+    :param spec: The Claude terminal launch spec.
+    :param parent_os_env: The agent's os_env the terminal inherits from, or
+        ``None``.
+    :returns: The resolved Claude cwd, e.g. ``Path("/home/user/repo")``.
+    :raises OmnigentError: If an ``env --chdir`` target is not an existing
+        directory the runner can enter; the real ``env`` would refuse to
+        launch, and seeding must not create it.
+    """
+    effective = build_terminal_os_env_spec(spec, parent_os_env_spec=parent_os_env)
+    cwd = Path(effective.cwd or os.getcwd()).resolve()
+    chdir = env_wrapper_chdir(
+        spec.command or "", list(spec.args), _claude_terminal_pre_wrapper_env(spec)
+    )
+    if chdir is None:
+        return cwd
+    target = (cwd / chdir).resolve()
+    # ``env`` refuses an empty, missing, or unsearchable target, so the launch would fail.
+    if not chdir or not target.is_dir() or not os.access(target, os.X_OK):
+        raise OmnigentError(
+            "The Claude terminal's env --chdir directory does not exist or cannot be entered.",
+            code=ErrorCode.WORKSPACE_MISSING,
+        )
+    return target
+
+
+def _claude_terminal_pre_wrapper_env(spec: TerminalEnvSpec) -> dict[str, str]:
+    """
+    Return the environment a Claude launch command starts with.
+
+    The pane environment the terminal builds (runner environment when
+    inherited, the spec's overrides and removals, runner-auth secrets removed,
+    and a UTF-8 locale default) before an ``env`` wrapper applies its own
+    changes; ``env -S`` expands ``${NAME}`` from it.
+
+    :param spec: The Claude terminal launch spec.
+    :returns: The pre-wrapper environment, e.g. ``{"HOME": "/home/user"}``.
+    """
+    return terminal_pane_environment(
+        inherit_env=spec.inherit_env, env=spec.env, env_unset=spec.env_unset
+    )
+
+
+def _claude_terminal_launch_env(spec: TerminalEnvSpec) -> dict[str, str]:
+    """
+    Return the environment the native Claude terminal process starts with.
+
+    Mirrors the pane launch: the runner environment (when inherited), the
+    spec's overrides and removals, then the options and assignments of an
+    ``env`` wrapper command. Trust seeding uses it so the runner writes the
+    global config file this Claude process will read.
+
+    :param spec: The Claude terminal launch spec, e.g. one with
+        ``command="env"`` and ``args=["CLAUDE_CONFIG_DIR=/srv/claude", "claude"]``.
+    :returns: The effective environment, e.g.
+        ``{"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/srv/claude"}``.
+    """
+    env = _claude_terminal_pre_wrapper_env(spec)
+    wrapper = env_wrapper_environment(spec.command or "", list(spec.args), env)
+    if wrapper is None and Path(spec.command or "").name == "env":
+        _logger.info(
+            "Claude terminal env wrapper form is not modeled; trust seeding uses the "
+            "pre-wrapper environment"
+        )
+    if wrapper is not None:
+        if not wrapper.inherit:
+            env = {}
+        for key in wrapper.unset:
+            env.pop(key, None)
+        env.update(wrapper.variables)
+    return env
+
+
 def _publish_terminal_pending(
     publish_event: Callable[[str, _JsonObject], None],
     session_id: str,
@@ -7619,6 +7722,7 @@ def _native_terminal_start_error_payload(
         if isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES
         else None
     )
+    os_error = _os_error_with_errno(exc)
     extra = debug_event(
         "native_terminal_start_failed",
         session_id=session_id,
@@ -7628,6 +7732,14 @@ def _native_terminal_start_error_payload(
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
         cause_code=exc.code if isinstance(exc, OmnigentError) else None,
+        native_launch_os_errno=os_error.errno if os_error is not None else None,
+        native_launch_os_errno_name=errno.errorcode.get(os_error.errno)
+        if os_error is not None and os_error.errno is not None
+        else None,
+        native_launch_winerror=getattr(os_error, "winerror", None),
+        exception_context_type=type(exc.__context__).__name__
+        if exc.__context__ is not None
+        else None,
         # The warning below carries no exc_info for a missing agent, so the
         # sink cannot derive its category.
         error_category=exc.category.value
@@ -7672,20 +7784,42 @@ def _native_terminal_start_error_payload(
         extra=extra,
     )
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeHookInterpreterMismatchError
+    from omnigent.harnesses.pi_native.main import PiNativeCliOutdatedError
     from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
-    if runtime_name == "Codex" and isinstance(exc, TerminalExitedDuringLaunch):
-        message = _codex_terminal_exit_summary(exc.instance, before_thread=False)
-        # A failed diagnostic read must not hide the known terminal-exit cause.
+    if isinstance(exc, TerminalExitedDuringLaunch):
+        # The exit status and captured output ride on the exception for every
+        # runtime. A failed diagnostic read must not hide the known
+        # terminal-exit cause.
+        output: str | None = None
+        diagnosis = None
         with contextlib.suppress(Exception):
-            if output := _codex_startup_terminal_output(exc.instance):
-                message += f"\nCodex startup terminal output:\n{output}"
+            from omnigent.runner.launch_failure import classify_terminal_failure
+
+            output = _startup_terminal_output(exc.instance)
+            diagnosis = classify_terminal_failure(
+                command=exc.instance.command,
+                exit_status=exc.instance.last_exit_status(),
+                output=output,
+            )
+        if diagnosis is not None:
+            message = f"{diagnosis.title}: {diagnosis.cause}"
+            if diagnosis.remediation:
+                message = f"{message} {diagnosis.remediation}"
+        else:
+            message = _terminal_exit_summary(exc.instance, runtime_name, before_thread=False)
+            if output:
+                message += f"\n{runtime_name} startup terminal output:\n{output}"
     elif isinstance(exc, ClaudeNativeHookInterpreterMismatchError):
         message = (
             "Claude Code is Windows-native, but Omnigent is running under WSL. "
             "Install @anthropic-ai/claude-code from WSL so a WSL-native `claude` "
             "binary wins PATH resolution, then retry."
         )
+    elif isinstance(exc, PiNativeCliOutdatedError):
+        # The raise site composes a client-safe message (versions + upgrade
+        # command), so it can be shown verbatim.
+        message = str(exc)
     elif IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
         # Give the client an actionable message instead of a log pointer.
@@ -8285,13 +8419,6 @@ async def _auto_create_claude_terminal(
         session_id,
         extra={"session_id": session_id},
     )
-    # Pre-accept Claude's first-run trust + onboarding TUI prompts for this
-    # workspace. They have no PermissionRequest hook, so on a host-spawned
-    # (web-UI-driven) session they would hang Claude in its terminal with
-    # nothing shown in the UI. Acute with per-session worktrees,
-    # which launch Claude in a brand-new, untrusted directory.
-    ensure_claude_workspace_trusted(Path(workspace))
-
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     # The Omnigent server URL + auth are needed in two places below: the
@@ -8394,7 +8521,7 @@ async def _auto_create_claude_terminal(
         # copied prefix (no double-render), and placing it in the clone's
         # own project dir means cwd-scoped ``--resume`` finds it in any
         # dir/worktree. Only viable when the source transcript exists on
-        # THIS host (same-host fork — CUJ 1 same-user); else launch fresh.
+        # THIS host; otherwise the stored-item fallback below rebuilds it.
         # See designs/FORK_SESSION_UX.md.
         from omnigent.harnesses.claude_native.main import _clone_claude_transcript
 
@@ -8406,10 +8533,11 @@ async def _auto_create_claude_terminal(
                 target_external_session_id=our_uuid,
                 clone_workspace=_clone_workspace,
             )
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
+        except Exception:  # noqa: BLE001 — best-effort; fall back to stored items
             _cloned = None
             _logger.warning(
-                "Could not clone source transcript for forked clone %s; launching fresh",
+                "Could not clone source transcript for forked clone %s; "
+                "trying item-history fallback",
                 session_id,
                 exc_info=True,
             )
@@ -8446,21 +8574,15 @@ async def _auto_create_claude_terminal(
                         session_id,
                         exc_info=True,
                     )
-    elif (
+    if (
         server_client is not None
         and fork_carry_history
         and session_external_id is None
-        and fork_source_external_id is None
+        and resume_external_session_id is None
     ):
-        # Forked clone bound to a native target with NO source native
-        # transcript to clone (an SDK or cross-family source): build the clone's
-        # native transcript from its OWN copied Omnigent items under a uuid we
-        # assign, then launch plain ``--resume <our_uuid>``. This reuses the
-        # same server-items→transcript converter the cross-machine cold
-        # resume path uses (``_ensure_local_claude_resume_transcript``), so
-        # the clone opens with the prior conversation (messages + tool
-        # history) as real Claude context. Best-effort: launch fresh on
-        # failure. See designs/FORK_SESSION_UX.md.
+        # A missing local transcript or cross-family source needs the fork's
+        # copied Omnigent items rebuilt into a resumable Claude transcript.
+        # The chosen workspace supplies its project directory and cwd fields.
         from omnigent.harnesses.claude_native.main import _ensure_local_claude_resume_transcript
 
         our_uuid = str(uuid.uuid4())
@@ -8918,6 +9040,37 @@ async def _auto_create_claude_terminal(
         # the watcher reports the exit deterministically via `#{pane_dead}`.
         keep_alive_after_exit=True,
     )
+    # Seed trust and onboarding in the config selected by the terminal's launch environment.
+    try:
+        ensure_claude_workspace_trusted(
+            _claude_terminal_launch_cwd(env_spec, agent_os_env),
+            env=_claude_terminal_launch_env(env_spec),
+        )
+    except BaseException as seed_error:
+        # No forwarder owns the routers yet, so release the ones this launch started.
+        # A ``None`` handle would shut down whichever router is registered now.
+        cleanups: list[Coroutine[Any, Any, None]] = []
+        if _subagent_router is not None:
+            cleanups.append(_shutdown_session_router_async(session_id, _subagent_router))
+        if _claude_turn_router is not None:
+            cleanups.append(_shutdown_session_turn_router_async(session_id, _claude_turn_router))
+        cancelled: asyncio.CancelledError | None = None
+        for cleanup in cleanups:
+            try:
+                await cleanup
+            except asyncio.CancelledError as exc:
+                # Release the other router before honoring the cancellation.
+                cancelled = exc
+            except Exception:  # noqa: BLE001 - keep the seeding failure as the error.
+                _logger.warning(
+                    "Router cleanup failed after Claude trust seeding failed: session=%s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+        if cancelled is not None:
+            raise cancelled from seed_error
+        raise
     _logger.info(
         "Claude terminal tmux launch requested: session=%s command=%s args_count=%d "
         "env_keys=%s cwd=%s scrollback=%d",
@@ -10166,6 +10319,8 @@ async def _session_labels_for_runner_spawn(
         ``"conv_abc123"``.
     :returns: String label mapping. Empty on lookup failure.
     """
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
     path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/labels"
     try:
         resp = await server_client.get(
@@ -10180,7 +10335,9 @@ async def _session_labels_for_runner_spawn(
             extra={"session_id": session_id},
         )
         return {}
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, DatabricksAuthError) as exc:
+        # DatabricksAuthError: the host credential service couldn't sign the
+        # request. Like any other lookup failure, that must not fail the turn.
         _logger.warning(
             "Failed to resolve session labels; session=%s error=%s",
             session_id,

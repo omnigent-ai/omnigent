@@ -348,6 +348,15 @@ daily_budget:
 
 Controls GitHub access across MCP tools and `git`/`gh` shell commands. Restricts reads to an allowlist (unless `read_all`) and writes to specific repos/branches. Shell commands with ambiguous targets return ASK.
 
+Shell comments, here-documents (including here-strings), line continuations, and
+command substitutions are not classified. Completed command segments before
+and after these regions retain their policy decisions when the parser can
+determine their boundaries, including commands surrounding a comment. Unsupported
+syntax adds an ASK decision; DENY takes precedence over ASK, which takes
+precedence over ALLOW. Substitutions inside double quotes
+also require approval, as do ANSI-C (`$'...'`) and locale-specific (`$"..."`)
+quoting. Ordinary single-quoted or escaped literal delimiters remain arguments.
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `read_all` | boolean | `true` | Allow all reads |
@@ -413,6 +422,13 @@ Controls Google Calendar access. Defaults to read-only.
 #### `block_working_dir_changes`
 
 Blocks shell commands that change the working directory (`cd`, `pushd`, `git -C`) or manage git worktrees. Parses chained and wrapped commands to prevent trivial bypasses.
+
+Shell comments, here-documents (including here-strings), line continuations, and
+command substitutions take the configured `action` because the parser cannot
+classify them reliably. This also applies when the visible command does not
+change directories. ANSI-C (`$'...'`) and locale-specific (`$"..."`) quoting also
+take this action; ordinary single-quoted or escaped literal delimiters remain
+arguments.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|

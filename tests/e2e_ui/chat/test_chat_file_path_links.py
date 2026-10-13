@@ -225,6 +225,48 @@ def test_chat_linkifies_workspace_paths_including_home_relative(
     expect(page.get_by_test_id("file-viewer").last).to_contain_text("localhost", timeout=15_000)
 
 
+def test_chat_link_opens_file_beyond_first_large_directory_page(
+    page: Page,
+    live_server: str,
+    runner_id: str,
+    tmp_path: Path,
+) -> None:
+    large = tmp_path / "large"
+    large.mkdir()
+    for i in range(500):
+        (large / (f"{i:04d}-" + "x" * 180 + ".txt")).touch()
+    target = large / "zzzz-target.md"
+    target.write_text("# File beyond the first page\n")
+
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", _agent_bundle(str(tmp_path)), timeout=30.0
+    )
+    create_resp.raise_for_status()
+    session_id = create_resp.json()["session_id"]
+    try:
+        bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
+        event_resp = httpx.post(
+            f"{live_server}/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_assistant_message",
+                "data": {"agent": _AGENT_NAME, "text": "See `large/zzzz-target.md`."},
+            },
+            timeout=10.0,
+        )
+        event_resp.raise_for_status()
+
+        page.goto(f"{live_server}/c/{session_id}")
+        link = page.get_by_role("button", name="large/zzzz-target.md")
+        expect(link).to_be_visible(timeout=30_000)
+        link.click()
+        page.wait_for_url(re.compile(r"[?&]file=large%2Fzzzz-target\.md(?:&|$)"))
+        expect(page.get_by_test_id("file-viewer").last).to_contain_text(
+            "File beyond the first page"
+        )
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+
+
 # A phone-sized touch context: no hover affordance exists there, so a file
 # link that does not react to a tap reads as simply broken.
 _MOBILE_CTX = {

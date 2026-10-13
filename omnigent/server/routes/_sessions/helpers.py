@@ -196,6 +196,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY,
     _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
     _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY,
+    _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY,
     _LAST_TASK_ERROR_TITLE_LABEL_KEY,
     _MAX_TERMINAL_LAUNCH_ARG_LEN,
     _MAX_TERMINAL_LAUNCH_ARGS,
@@ -5111,6 +5112,7 @@ async def _persist_session_status_error_labels(
     error: ErrorDetail | None,
     conversation_store: ConversationStore,
     *,
+    owner_runner_id: str | None = None,
     agent_name: str | None = None,
     item_id: str | None = None,
 ) -> None:
@@ -5127,6 +5129,9 @@ async def _persist_session_status_error_labels(
     :param error: Failure detail from a ``session.status: failed`` edge, or
         ``None`` to clear stale error labels on subsequent activity.
     :param conversation_store: Store used to upsert labels.
+    :param owner_runner_id: Runner this failure belongs to, so a later exit from a
+        replacement runner surfaces its own startup failure instead of this cause.
+        Callers pass the runner they already hold; ``None`` leaves it unattributed.
     :param agent_name: Agent responsible for this failure, captured before a rebind.
     :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
         a client whose POST answer was lost can match the refusal to its own send.
@@ -5144,6 +5149,7 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_CAUSE_LABEL_KEY: _truncate_label(error.cause or ""),
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: _truncate_label(error.remediation or ""),
             _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: _truncate_label(item_id or ""),
+            _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: _truncate_label(owner_runner_id or ""),
         }
         if error is not None
         else {
@@ -5154,6 +5160,7 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_CAUSE_LABEL_KEY: "",
             _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: "",
             _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: "",
+            _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: "",
         }
     )
     try:
@@ -5199,6 +5206,16 @@ def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | 
                 error[key] = value
         return error
     return None
+
+
+def _last_task_error_runner_id_from_labels(labels: Mapping[str, str]) -> str | None:
+    """Return the runner that owned the persisted failure, or ``None`` if unknown.
+
+    Older causes (and manually seeded labels) carry no owner, so ``None`` means
+    "attribute to the current runner" — the conservative choice that preserves
+    an existing cause rather than overwriting it.
+    """
+    return labels.get(_LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY) or None
 
 
 def _publish_terminal_pending(session_id: str, pending: bool) -> None:
@@ -5501,11 +5518,11 @@ def _publish_btw_sidechat(
     connects later never sees it (no SSE replay), matching the terminal
     overlay's Escape-to-close, leave-no-history behavior.
 
-    The oldest pending input is also discarded so a web composer's
-    optimistic ``/btw`` bubble does not linger as a stuck "queued" message —
-    the same reconciliation ``_publish_session_superseded`` performs.
     ``/btw`` is never committed as a user turn (no ``session.input.consumed``
-    is emitted); the overlay carries the request text instead.
+    is emitted); the overlay carries the request text instead. A web ``/btw``
+    is not queued as a pending input either, so nothing is settled here: a
+    message queued meanwhile keeps its entry, and the web client drops its own
+    optimistic bubble on this event.
 
     :param session_id: Conversation id whose stream receives the event.
     :param question: The ``/btw`` request line as typed.
@@ -5520,16 +5537,6 @@ def _publish_btw_sidechat(
         truncated=truncated,
     )
     session_stream.publish(session_id, event.model_dump())
-    # Drop the optimistic ``/btw`` bubble (the oldest unconsumed input) so it
-    # does not spin forever — ``/btw`` never round-trips through the transcript
-    # to earn a ``session.input.consumed``. Only the oldest is resolved so a
-    # follow-up the user queued after ``/btw`` is left intact.
-    if pending_inputs.resolve_oldest(session_id) is not None:
-        _logger.info(
-            "Discarded the pending /btw input on session %s",
-            session_id,
-            extra={"session_id": session_id},
-        )
 
 
 async def _get_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
@@ -11870,6 +11877,7 @@ __all__ = [
     "_is_devin_native_subagent",
     "_is_kiro_native_session",
     "_last_task_error_from_labels",
+    "_last_task_error_runner_id_from_labels",
     "_latest_assistant_text_from_store",
     "_latest_message_preview",
     "_launch_runner_on_host",

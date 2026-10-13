@@ -305,6 +305,8 @@ import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { ErrorBanner } from "@/components/blocks/StatusBlocks";
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
@@ -363,6 +365,15 @@ function ForkDialogProbe() {
         onClick={() => fork.openForkDialog({ upToResponseId: "resp_probe" })}
       >
         fork-from-here
+      </button>
+      <button
+        type="button"
+        data-testid="fork-probe-recover-workspace"
+        onClick={() =>
+          fork.openForkDialog({ sourceSessionId: "conv_abc", workspaceRecovery: true })
+        }
+      >
+        recover-workspace
       </button>
       <button
         type="button"
@@ -2829,6 +2840,28 @@ describe("Right workspace card visibility", () => {
     await waitFor(() => expect(screen.getByTitle("README.md")).toHaveFocus());
   });
 
+  it("focuses the workspace toolbar when its selected fixed tab is hidden", async () => {
+    writeSessionWorkspaceState("conv_compact_workspace", {
+      open: true,
+      rightRailTab: "changes",
+      openFiles: ["README.md"],
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_compact_workspace", permission_level: null }]);
+    renderShell("/c/conv_compact_workspace");
+    const selected = screen.getByRole("tab", { name: /changes/i });
+    Object.defineProperty(selected, "checkVisibility", { value: () => false });
+
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+
+    await waitFor(() =>
+      expect(screen.getByRole("toolbar", { name: "Workspace tabs" })).toHaveFocus(),
+    );
+  });
+
   it("mounts an expandable pending card for a temporary session", () => {
     writeSessionWorkspaceState("temp:12345678", { open: true });
     mockConversations([{ id: "temp:12345678", permission_level: null, provisional: true }]);
@@ -3988,6 +4021,89 @@ describe("Mobile session menu", () => {
 });
 
 describe("AppShell clone/fork action", () => {
+  it.each([false, true])(
+    "resolves a scoped recovery source's own restrictions under a blocked parent (child blocked=%s)",
+    (childBlocked) => {
+      const parent = sessionSnapshot({
+        id: "conv_parent",
+        labels: { "omnigent.host_type": "managed" },
+      });
+      const child = sessionSnapshot({
+        id: "conv_side_child",
+        workspace: "/missing/child",
+        hostId: "host_a",
+        labels: childBlocked ? { "omnigent.host_type": "managed" } : {},
+      });
+      mockConversations([{ id: "conv_parent", permission_level: 4 }]);
+      useSessionMock.mockImplementation((sessionId) => ({
+        session: sessionId === child.id ? child : sessionId === parent.id ? parent : null,
+        isLoading: false,
+        error: null,
+      }));
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_a", name: "Host A", owner: "owner", status: "online" }],
+      } as ReturnType<typeof useHosts>);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        sessionShellTree(
+          client,
+          "/c/conv_parent",
+          <ConversationScopeContext.Provider value="conv_side_child">
+            <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+          </ConversationScopeContext.Provider>,
+        ),
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
+
+      expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
+      if (childBlocked) {
+        expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
+          "Forking this sandbox session is not supported yet.",
+        );
+        expect(screen.queryByTestId("workspace-path-input")).not.toBeInTheDocument();
+        expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+      } else {
+        expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+        expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+        expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
+      }
+      expect(forkSessionMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("opens workspace recovery and resets it before a later normal fork", async () => {
+    const source = sessionSnapshot({
+      id: "conv_abc",
+      title: "Missing checkout",
+      workspace: "/missing/repo",
+      hostId: "host_a",
+    });
+    mockConversations([
+      { id: "conv_abc", permission_level: 4, host_id: "host_a", workspace: "/missing/repo" },
+    ]);
+    useSessionMock.mockReturnValue({ session: source, isLoading: false, error: null });
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_a", name: "Host A", owner: "owner", status: "online" }],
+    } as ReturnType<typeof useHosts>);
+
+    renderShell("/c/conv_abc");
+    fireEvent.click(screen.getByTestId("fork-probe-recover-workspace"));
+    expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
+    expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+    expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
+    expect(forkSessionMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByTestId("fork-probe-open"));
+    expect(screen.getByRole("heading", { name: /Fork from this response/ })).toBeVisible();
+    expect(screen.queryByText(/Files from the missing workspace/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("fork-session-advanced-toggle"));
+    await waitFor(() =>
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/missing/repo"),
+    );
+  });
+
   it("blocks direct current-session fork openers for an unsupported managed session", () => {
     mockConversations([{ id: "conv_managed", permission_level: 4 }]);
     useSessionMock.mockReturnValue({

@@ -705,7 +705,11 @@ export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionFor
           {!loading && (
             <DisabledActionTooltip reason={forkDisabledReason} label="Clone session">
               <Button data-testid="fork-session-submit" disabled>
-                {props.sourceWorkspace ? "Clone & start" : "Clone"}
+                {props.workspaceRecovery
+                  ? "Continue"
+                  : props.sourceWorkspace
+                    ? "Clone & start"
+                    : "Clone"}
               </Button>
             </DisabledActionTooltip>
           )}
@@ -723,6 +727,7 @@ function SupportedForkSessionForm({
   sourceHostId,
   sourceGitBranch,
   upToResponseId,
+  workspaceRecovery = false,
   onClose,
 }: {
   sourceSessionId: string;
@@ -731,6 +736,7 @@ function SupportedForkSessionForm({
   sourceHostId?: string | null;
   sourceGitBranch?: string | null;
   upToResponseId?: string | null;
+  workspaceRecovery?: boolean;
   onClose: () => void;
 }) {
   const navigate = useNavigate();
@@ -769,7 +775,7 @@ function SupportedForkSessionForm({
   // A coding source ran in a working directory; only then does the fork
   // need a host + directory to start. A non-coding source forks with just
   // name + agent (no directory to pick).
-  const isCodingSource = Boolean(sourceWorkspace);
+  const isCodingSource = workspaceRecovery || Boolean(sourceWorkspace);
 
   // Host/dir/worktree state — only meaningful for a coding source.
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
@@ -811,7 +817,8 @@ function SupportedForkSessionForm({
   // fails closed (rows hidden) until the boot probe resolves. Same gate
   // NewChatDialog uses for its own sandbox option.
   const info = useServerInfo();
-  const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const managedSandboxesEnabled =
+    !workspaceRecovery && info !== "loading" && info.managed_sandboxes_enabled;
   // One picker row per configured provider; a single-provider server
   // yields exactly one.
   const sandboxProviderRows = useMemo(
@@ -845,12 +852,16 @@ function SupportedForkSessionForm({
   // convention alone: a fork bound into an existing worktree carries no
   // gitBranch, so requiring one would miss fork-of-fork sources.
   const sourceWorktree =
-    sourceWorkspaceNorm !== null ? splitWorktreePath(sourceWorkspaceNorm) : null;
+    !workspaceRecovery && sourceWorkspaceNorm !== null
+      ? splitWorktreePath(sourceWorkspaceNorm)
+      : null;
   const sourceRepo = sourceWorktree?.repo ?? null;
   // Branch shown in the worktree field (and used as the new-branch base):
   // the session's recorded branch when present, else the worktree's
   // directory name — the sanitized branch it was created from.
-  const sourceBranch = sourceGitBranch ?? sourceWorktree?.branchDir ?? null;
+  const sourceBranch = workspaceRecovery
+    ? null
+    : (sourceGitBranch ?? sourceWorktree?.branchDir ?? null);
 
   // The source's bound agent, reduced to its ROOT name by peeling every
   // " (fork <id>)" / " (switch <id>)" clone suffix the fork/switch routes
@@ -990,14 +1001,14 @@ function SupportedForkSessionForm({
   // as its ORIGINAL repo + the source branch in the worktree field (the pair
   // its workspace was created from), not the raw worktree path.
   useEffect(() => {
-    if (!onSourceHost || workspace !== "" || !sourceWorkspace) return;
+    if (workspaceRecovery || !onSourceHost || workspace !== "" || !sourceWorkspace) return;
     if (sourceRepo !== null && sourceBranch !== null) {
       setWorkspace(sourceRepo);
       setBranchName(sourceBranch);
     } else {
       setWorkspace(sourceWorkspace);
     }
-  }, [onSourceHost, workspace, sourceWorkspace, sourceRepo, sourceBranch]);
+  }, [workspaceRecovery, onSourceHost, workspace, sourceWorkspace, sourceRepo, sourceBranch]);
 
   // Repository the SOURCE ran in, when it was itself a sandbox session.
   // Recorded by the server on the managed create and copied onto the fork.
@@ -1122,11 +1133,11 @@ function SupportedForkSessionForm({
   // force-opening Advanced, since cloning a *running* session always trips it
   // (the original is still in that directory).
   useEffect(() => {
-    if (onDifferentHost && !autoExpandedRef.current) {
+    if (!workspaceRecovery && onDifferentHost && !autoExpandedRef.current) {
       autoExpandedRef.current = true;
       setShowAdvanced(true);
     }
-  }, [onDifferentHost]);
+  }, [workspaceRecovery, onDifferentHost]);
 
   // Mismatched-directory warning: the transcript's file references were
   // grounded in the source's directory ON the source's host. A different
@@ -1149,7 +1160,8 @@ function SupportedForkSessionForm({
   // source's directory. Drives the "reuses the original's working directory"
   // indicator, which explains the default without forcing Advanced open. On a
   // different host this is false (the mismatch warning takes over instead).
-  const usingSourceDir = onSourceHost && workspaceTrimmed !== "" && !showMismatchWarning;
+  const usingSourceDir =
+    !workspaceRecovery && onSourceHost && workspaceTrimmed !== "" && !showMismatchWarning;
 
   function commitWorkspacePath(path: string): void {
     setWorkspace(path);
@@ -1307,6 +1319,45 @@ function SupportedForkSessionForm({
   // Suggested name shown as the input placeholder; blank input → the server
   // applies this same "Fork of <source title>" default.
   const namePlaceholder = defaultForkTitle(sourceTitle) || "Name the cloned session";
+  const directoryField = (
+    <div className="flex flex-col gap-2">
+      <span className="text-sm font-medium text-muted-foreground">Working directory</span>
+      {selectedHostId ? (
+        <>
+          <WorkspacePathField
+            hostId={selectedHostId}
+            value={workspace}
+            onChange={setWorkspace}
+            onBrowse={() => setBrowsing((v) => !v)}
+            onCommit={commitWorkspacePath}
+            recent={recent}
+            dropdownDisabled={browsing}
+          />
+          <WorkspacePickerDialog
+            open={browsing}
+            onOpenChange={setBrowsing}
+            hostId={selectedHostId}
+            initialPath={workspaceTrimmed}
+            onConfirm={setWorkspace}
+          />
+          {showMismatchWarning && (
+            <p
+              className="flex items-start gap-1.5 text-sm text-warning"
+              data-testid="fork-session-mismatch-warning"
+            >
+              <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+              <span>
+                This directory differs from the original session's. Earlier file references in the
+                transcript may not apply — the agent will need to re-orient.
+              </span>
+            </p>
+          )}
+        </>
+      ) : (
+        <p className="text-sm text-muted-foreground">Select a host to choose a directory.</p>
+      )}
+    </div>
+  );
 
   return (
     <>
@@ -1432,6 +1483,8 @@ function SupportedForkSessionForm({
             )}
           </div>
         )}
+
+        {workspaceRecovery && directoryField}
 
         <div className="flex flex-col gap-1.5">
           <label htmlFor="fork-session-agent" className="text-sm font-medium text-muted-foreground">
@@ -1564,9 +1617,14 @@ function SupportedForkSessionForm({
               {conflictingSessions.length === 1
                 ? "1 other agent is"
                 : `${conflictingSessions.length} other agents are`}{" "}
-              working in this directory, so writes may conflict. Name a{" "}
-              {usingSourceWorktree ? "different git branch" : "git branch"} under Advanced settings
-              to work in an isolated copy.
+              working in this directory, so writes may conflict.
+              {!workspaceRecovery && (
+                <>
+                  {" "}
+                  Name a {usingSourceWorktree ? "different git branch" : "git branch"} under
+                  Advanced settings to work in an isolated copy.
+                </>
+              )}
             </span>
           </p>
         )}
@@ -1705,50 +1763,9 @@ function SupportedForkSessionForm({
                 </>
               )}
 
-              {isCodingSource && !sandboxSelected && (
+              {isCodingSource && !sandboxSelected && !workspaceRecovery && (
                 <>
-                  <div className="flex flex-col gap-2">
-                    <span className="text-sm font-medium text-muted-foreground">
-                      Working directory
-                    </span>
-                    {selectedHostId ? (
-                      <>
-                        <WorkspacePathField
-                          hostId={selectedHostId}
-                          value={workspace}
-                          onChange={setWorkspace}
-                          onBrowse={() => setBrowsing((v) => !v)}
-                          onCommit={commitWorkspacePath}
-                          recent={recent}
-                          dropdownDisabled={browsing}
-                        />
-                        <WorkspacePickerDialog
-                          open={browsing}
-                          onOpenChange={setBrowsing}
-                          hostId={selectedHostId}
-                          initialPath={workspaceTrimmed}
-                          onConfirm={setWorkspace}
-                        />
-                        {showMismatchWarning && (
-                          <p
-                            className="flex items-start gap-1.5 text-sm text-warning"
-                            data-testid="fork-session-mismatch-warning"
-                          >
-                            <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
-                            <span>
-                              This directory differs from the original session's. Earlier file
-                              references in the transcript may not apply — the agent will need to
-                              re-orient.
-                            </span>
-                          </p>
-                        )}
-                      </>
-                    ) : (
-                      <p className="text-sm text-muted-foreground">
-                        Select a host to choose a directory.
-                      </p>
-                    )}
-                  </div>
+                  {directoryField}
 
                   <div className="flex flex-col gap-1">
                     <label
@@ -1799,7 +1816,7 @@ function SupportedForkSessionForm({
           loading={submitting}
           disabled={!canSubmit}
         >
-          {isCodingSource ? "Clone & start" : "Clone"}
+          {workspaceRecovery ? "Continue" : isCodingSource ? "Clone & start" : "Clone"}
         </Button>
       </DialogFooter>
     </>
@@ -1833,6 +1850,7 @@ export function ForkSessionDialog({
   sourceHostId,
   sourceGitBranch,
   upToResponseId,
+  workspaceRecovery = false,
   open,
   onOpenChange,
 }: {
@@ -1842,6 +1860,7 @@ export function ForkSessionDialog({
   sourceHostId?: string | null;
   sourceGitBranch?: string | null;
   upToResponseId?: string | null;
+  workspaceRecovery?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -1864,7 +1883,11 @@ export function ForkSessionDialog({
       >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-1.5">
-            {truncated ? "Fork from this response" : "Clone session"}
+            {workspaceRecovery
+              ? "Continue in another directory"
+              : truncated
+                ? "Fork from this response"
+                : "Clone session"}
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
@@ -1884,9 +1907,11 @@ export function ForkSessionDialog({
               <TooltipContent>{cloneDescription}</TooltipContent>
             </Tooltip>
           </DialogTitle>
-          {/* Description moved into the title's info tooltip; kept here visually
-              hidden so the dialog stays described for screen readers. */}
-          <DialogDescription className="sr-only">{cloneDescription}</DialogDescription>
+          <DialogDescription className={workspaceRecovery ? undefined : "sr-only"}>
+            {workspaceRecovery
+              ? "Choose an existing directory to continue this conversation in a new session. Files from the missing workspace won’t be restored."
+              : cloneDescription}
+          </DialogDescription>
         </DialogHeader>
         <ForkSessionForm
           sourceSessionId={sourceSessionId}
@@ -1895,6 +1920,7 @@ export function ForkSessionDialog({
           sourceHostId={sourceHostId}
           sourceGitBranch={sourceGitBranch}
           upToResponseId={upToResponseId}
+          workspaceRecovery={workspaceRecovery}
           onClose={() => onOpenChange(false)}
         />
       </DialogContent>

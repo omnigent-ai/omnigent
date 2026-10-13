@@ -276,6 +276,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_kiro_native_session,
     _is_native_interrupt_record,
     _last_task_error_from_labels,
+    _last_task_error_runner_id_from_labels,
     _latest_assistant_text_from_store,
     _latest_message_preview,
     _launch_runner_on_host,
@@ -2993,11 +2994,15 @@ async def _persist_external_conversation_item_unlocked(
                 update={"data": item.data.model_copy(update={"user_authored": True})}
             )
     elif item.type == "slash_command" and isinstance(item.data, SlashCommandData):
-        # A command typed in the web composer was queued as plain text but comes
-        # back as a slash_command item. Drain its own entry so it is not later
-        # mistaken for a lost message; older entries stay in place.
-        command_line = f"/{item.data.name} {item.data.arguments}".strip()
-        matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+        # A command typed in the web composer was queued as plain text but comes back
+        # as a slash_command item; a plugin skill typed ``/simplify`` is recorded as
+        # ``/<plugin>:simplify``. Drain its own entry so it is not mistaken for a lost message.
+        spellings = dict.fromkeys((item.data.name, item.data.name.rpartition(":")[2]))
+        for spelling in spellings:
+            command_line = f"/{spelling} {item.data.arguments}".strip()
+            matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+            if matched.matched is not None:
+                break
         drained = matched.matched
         match_method = matched.match_method
         if drained is not None:
@@ -3879,7 +3884,9 @@ async def _mark_runner_sessions_offline_once(
         await record_subagent_activity(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
         )
-        await _persist_session_status_error_labels(conv.id, error, conversation_store)
+        await _persist_session_status_error_labels(
+            conv.id, error, conversation_store, owner_runner_id=conv.runner_id
+        )
     return retry
 
 
@@ -5319,6 +5326,8 @@ async def _ensure_native_terminal_ready(
     waits up to ``_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S`` for the
     session's runner to reconnect and asks once more; the runner-side ensure
     is idempotent, so a terminal created before the drop is simply returned.
+    If the tunnel is still lost, a host-bound session's send is refused
+    with ``RUNNER_UNAVAILABLE`` rather than recorded as a boot failure.
 
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g.
@@ -5331,6 +5340,8 @@ async def _ensure_native_terminal_ready(
         reconnect after a tunnel drop. ``None`` fails a drop immediately.
     :returns: The probe outcome — a definitive ``error`` when the terminal
         could not start, else ``error=None``.
+    :raises OmnigentError: ``RUNNER_UNAVAILABLE`` when a host-bound session's
+        runner tunnel is lost and the probe cannot reach it.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     terminal_name = _native_terminal_name_for_harness(harness)
@@ -5347,6 +5358,11 @@ async def _ensure_native_terminal_ready(
             timeout=10.0,
         )
 
+    def _is_tunnel_loss(exc: httpx.HTTPError | ConnectionError) -> bool:
+        # A bare ConnectionError is a tunnel dropped under the request; a
+        # ConnectError is a runner already offline when it was sent.
+        return isinstance(exc, ConnectionError | httpx.ConnectError)
+
     def _transport_failure(exc: httpx.HTTPError | ConnectionError) -> _NativeTerminalEnsureOutcome:
         # WSTunnelTransport raises bare ConnectionError on tunnel close
         # ("tunnel closed before request completed"); without this clause
@@ -5360,6 +5376,13 @@ async def _ensure_native_terminal_ready(
             exc_info=exc,
             extra={"session_id": session_id},
         )
+        if conv.host_id is not None and _is_tunnel_loss(exc):
+            # A lost tunnel doesn't show the terminal failed to boot; refuse the send
+            # so the client keeps the message, instead of consuming it into a failed turn.
+            raise OmnigentError(
+                "The runner is unreachable. Reconnect the host and retry your message.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from exc
         return _NativeTerminalEnsureOutcome(
             error=_native_terminal_ensure_transport_error(exc, display_name=display_name),
         )
@@ -5367,11 +5390,7 @@ async def _ensure_native_terminal_ready(
     try:
         resp = await _post_ensure()
     except (httpx.HTTPError, ConnectionError) as exc:
-        if (
-            runner_router is None
-            or conv.runner_id is None
-            or not isinstance(exc, ConnectionError | httpx.ConnectError)
-        ):
+        if runner_router is None or conv.runner_id is None or not _is_tunnel_loss(exc):
             return _transport_failure(exc)
         _logger.warning(
             "%s terminal ensure lost the runner tunnel for session=%s; waiting up to "
@@ -6834,7 +6853,11 @@ async def _forward_event_to_runner(
             # The item id lets a client whose 503 was lost match the refusal to
             # its own send instead of to any message the snapshot holds.
             await _persist_session_status_error_labels(
-                session_id, _reject_error, conversation_store, item_id=persisted_items[0].id
+                session_id,
+                _reject_error,
+                conversation_store,
+                owner_runner_id=conv.runner_id,
+                item_id=persisted_items[0].id,
             )
             _publish_status(
                 session_id,
@@ -7344,7 +7367,20 @@ async def _dispatch_session_event_to_runner_impl(
                 "omnigent on the host (>= 0.15.0) and reconnect it, then try again.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        queues_message = isinstance(content, list) and bool(content) and not opens_side_chat
+        # A Claude /btw answers in a TUI overlay that never enters the transcript, so nothing
+        # mirrors it back to drain an entry (the web clears its own bubble). With an attachment
+        # pasted ahead of the text it is an ordinary prompt, so only text-only content counts.
+        is_btw = (
+            _native_pane_harness(conv) == "claude-native"
+            and isinstance(content, list)
+            and all(
+                isinstance(block, dict) and block.get("type") == "input_text" for block in content
+            )
+            and bool(re.match(r"\s*/btw(\s|$)", _extract_user_text_for_routing(body)))
+        )
+        queues_message = (
+            isinstance(content, list) and bool(content) and not opens_side_chat and not is_btw
+        )
         if queues_message and web_stable_id is not None:
             repeated_pending_id = pending_inputs.pending_id_for_stable_id(
                 session_id, web_stable_id
@@ -7698,7 +7734,8 @@ async def _runner_disconnect_requires_failure(
     If the read is unavailable, use the sweep or relay's adoption snapshot.
     Without any known state, preserve the session: a failed read does not
     establish that a turn was interrupted.
-    Only top-level sessions can fail before startup with ``fail_idle_top_level``.
+    Only top-level sessions can fail before startup with ``fail_idle_top_level``;
+    one that already failed with a persisted cause keeps that cause instead.
 
     A sub-agent mirrored from a native parent fails only on a turn in the
     cache: its saved status can still read mid-turn after its last idle edge.
@@ -7751,7 +7788,46 @@ async def _runner_disconnect_requires_failure(
     elif source == "unknown":
         decision = "unknown_no_failure"
     elif fail_idle_top_level and conv is not None and conv.kind != "sub_agent":
-        decision = "failed_before_start"
+        # A failed session keeps a cause its own runner recorded; a prior runner's
+        # cause is stale, so this exit records its own startup failure. A cached
+        # "failed" can precede the cause labels, so re-read a cause-less row first.
+        cause_conv = conv if isinstance(conv, Conversation) else None
+        read_failed = False
+        if live == "failed" and (
+            cause_conv is None or _last_task_error_from_labels(cause_conv.labels) is None
+        ):
+            try:
+                reread = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                # A missing row is as inconclusive as an unreadable one; keep the
+                # prior cause rather than treating absence as proof of no cause.
+                if reread is not None:
+                    cause_conv = reread
+            except Exception:  # noqa: BLE001 — an unreadable row cannot prove the cause absent
+                read_failed = True
+                _logger.warning(
+                    "Runner disconnect: cause re-read failed for session=%s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+        # The exiting runner owns the sweep snapshot; compare the cause against it,
+        # not a re-read a mid-sweep rebind could have moved to another runner.
+        exiting_runner = snapshot.runner_id if snapshot is not None else None
+        own_cause = False
+        if cause_conv is not None and _last_task_error_from_labels(cause_conv.labels) is not None:
+            cause_runner = _last_task_error_runner_id_from_labels(cause_conv.labels)
+            own_cause = cause_runner is None or cause_runner == exiting_runner
+        # Preserve the failure when the cause is this runner's own, an unreadable row
+        # leaves it inconclusive, or a rebind moved the session to another runner
+        # whose exit is not ours to settle.
+        rebound = (
+            exiting_runner is not None
+            and cause_conv is not None
+            and cause_conv.runner_id is not None
+            and cause_conv.runner_id != exiting_runner
+        )
+        preserve = own_cause or read_failed or rebound
+        decision = "already_failed" if live == "failed" and preserve else "failed_before_start"
     else:
         decision = "idle_no_failure"
 
@@ -8067,6 +8143,7 @@ async def _relay_runner_stream(
                     session_id,
                     disconnect_error,
                     conversation_store,
+                    owner_runner_id=runner_id,
                 )
             return
 
@@ -8291,6 +8368,7 @@ async def _relay_runner_stream_once(
                                     session_id,
                                     status_error,
                                     conversation_store,
+                                    owner_runner_id=runner_id,
                                     agent_name=failure_agent_name,
                                 )
                             elif status == "running":
@@ -12452,18 +12530,28 @@ async def _get_session_snapshot(
     if isinstance(raw_label, str) and raw_label.isdigit():
         last_total_tokens = int(raw_label)
     last_task_error = _last_task_error_from_labels(conv.labels)
-    # Runner-crash durability: if the session's bound runner reported an
-    # unexpected exit (host.runner_exited → RunnerExitReports), surface the
-    # cause as last_task_error so a reload/late-open still renders the error
-    # banner — the live session.status:failed push is gone by then. status
-    # already reads "failed" from the cache (set by _on_runner_exited). The
-    # report is keyed by the CURRENT runner_id, so a successful relaunch
-    # (new token-bound runner_id) naturally stops matching. Access is gated
-    # by the session-snapshot's own authorization, so the unscoped get is
-    # correct here (the report is this session's own runner).
+    # Runner-crash durability: when the bound runner reported an unexpected exit,
+    # surface its cause as last_task_error so a reload still renders the error
+    # banner. The report is keyed by the current runner_id, so a relaunch stops matching.
     if runner_exit_reports is not None and conv.runner_id is not None:
         exit_error = runner_exit_reports.get(conv.runner_id)
-        if exit_error is not None:
+        runner_ran = (
+            runner_exit_reports.was_connected(conv.runner_id)
+            or session_live_state.last_liveness_stamp(conv.runner_id) is not None
+        )
+        # A cause recorded by a previous runner attempt is stale once a new
+        # runner is bound; surface that runner's exit instead of hiding it.
+        cause_runner = _last_task_error_runner_id_from_labels(conv.labels)
+        stale_cause = (
+            last_task_error is not None
+            and cause_runner is not None
+            and cause_runner != conv.runner_id
+        )
+        if (
+            exit_error is not None
+            and (status != "idle" or not runner_ran)
+            and (status != "failed" or last_task_error is None or stale_cause)
+        ):
             last_task_error = {"code": "runner_failed_to_start", "message": exit_error}
             status = "failed"
     llm_model: str | None = None
@@ -12489,15 +12577,19 @@ async def _get_session_snapshot(
                     if conv.sub_agent_name:
                         _sub_spec = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
                         if _sub_spec is None:
-                            # Unresolvable sub_agent_name — fall back to parent spec.
-                            _logger.warning(
-                                "Sub-agent %r for session %s did not resolve in the parent "
-                                "spec; snapshot reports the parent's identity. Likely a "
-                                "renamed/removed sub-agent or stale session metadata.",
-                                conv.sub_agent_name,
-                                session_id,
-                                extra={"session_id": session_id},
-                            )
+                            # Unresolvable sub_agent_name — fall back to parent spec. A native
+                            # sub-agent (e.g. Claude Code's general-purpose) is named by the
+                            # CLI and never appears in the spec, so only warn for spec names.
+                            wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY, "")
+                            if not wrapper.endswith("-subagent"):
+                                _logger.warning(
+                                    "Sub-agent %r for session %s did not resolve in the parent "
+                                    "spec; snapshot reports the parent's identity. Likely a "
+                                    "renamed/removed sub-agent or stale session metadata.",
+                                    conv.sub_agent_name,
+                                    session_id,
+                                    extra={"session_id": session_id},
+                                )
                         else:
                             resolved_spec = _sub_spec
                     if resolved_spec is not None:
