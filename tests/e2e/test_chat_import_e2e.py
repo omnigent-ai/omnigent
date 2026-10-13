@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -254,6 +255,7 @@ def test_cli_imports_claude_chat_into_live_server(live_server: str, tmp_path: Pa
                         "type": "user",
                         "uuid": "user-1",
                         "cwd": "/repo",
+                        "timestamp": "2026-07-21T12:00:00.000Z",
                         "message": {"role": "user", "content": "inspect TODO.md"},
                     }
                 ),
@@ -262,6 +264,7 @@ def test_cli_imports_claude_chat_into_live_server(live_server: str, tmp_path: Pa
                     {
                         "type": "assistant",
                         "uuid": "assistant-1",
+                        "timestamp": "2026-07-21T13:31:00.000Z",
                         "message": {
                             "role": "assistant",
                             "content": [{"type": "text", "text": "Done."}],
@@ -319,6 +322,11 @@ def test_cli_imports_claude_chat_into_live_server(live_server: str, tmp_path: Pa
     items = httpx.get(f"{live_server}/v1/sessions/{session_id}/items", timeout=10)
     items.raise_for_status()
     assert [item["type"] for item in items.json()["data"]] == ["message", "message"]
+    # The source records' times, not the import moment, date the session and its items.
+    first_epoch = int(datetime.fromisoformat("2026-07-21T12:00:00+00:00").timestamp())
+    last_epoch = int(datetime.fromisoformat("2026-07-21T13:31:00+00:00").timestamp())
+    assert (session_data["created_at"], session_data["updated_at"]) == (first_epoch, last_epoch)
+    assert [item["created_at"] for item in items.json()["data"]] == [first_epoch, last_epoch]
 
 
 def test_cli_imports_recent_claude_chats_as_batch(live_server: str, tmp_path: Path) -> None:
