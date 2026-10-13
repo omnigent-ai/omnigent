@@ -2066,6 +2066,7 @@ function ProjectFolder({
         onToggleSelected={onToggleSelected}
         onProjectAssigned={onProjectAssigned}
         reorderGroup={reorderable ? `project:${name}` : undefined}
+        projectFolderName={name}
         emptyMessage={
           loadingFirstPage ? undefined : archived ? (
             "No archived sessions"
@@ -4782,6 +4783,7 @@ function ConversationSection({
   onProjectAssigned,
   reorderGroup,
   listRef,
+  projectFolderName,
 }: {
   headerDrag?: ProjectHeaderDrag;
   title?: string;
@@ -4838,6 +4840,8 @@ function ConversationSection({
   reorderGroup?: string;
   /** The rows list, for a project folder's Show more slide. */
   listRef?: RefObject<HTMLUListElement | null>;
+  /** The folder containing these rows, if this section is a project folder. */
+  projectFolderName?: string;
 }) {
   const location = useLocation();
   const rebasePath = useRebasePath();
@@ -5015,6 +5019,7 @@ function ConversationSection({
                   previousId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) - 1])}
                   nextId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) + 1])}
                   reorderIndex={reorderGroup ? reorderRows.indexOf(conv) : undefined}
+                  projectFolderName={projectFolderName}
                 />
               ))}
             </ul>
@@ -5661,11 +5666,13 @@ function SessionMetaLine({
 function SessionTooltipDetail({
   label,
   icon: Icon,
+  iconContent,
   testId,
   children,
 }: {
   label: string;
   icon: LucideIcon;
+  iconContent?: ReactNode;
   testId: string;
   children: ReactNode;
 }) {
@@ -5673,7 +5680,7 @@ function SessionTooltipDetail({
     <div data-testid={testId} className="flex items-center justify-between gap-3 text-sm">
       <span className="shrink-0 text-muted-foreground">{label}</span>
       <span className="flex min-w-0 items-center gap-1.5">
-        <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+        {iconContent ?? <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />}
         <span className="truncate">{children}</span>
       </span>
     </div>
@@ -5691,9 +5698,13 @@ function SessionTooltipDetailsBlock({ children }: { children: ReactNode }) {
 function SessionTooltipDetails({
   conversation,
   familyDetail,
+  projectName,
+  projectIcon,
 }: {
   conversation: Conversation;
   familyDetail?: ReactNode;
+  projectName: string | null;
+  projectIcon: string | null;
 }) {
   const viewerId = useContext(ViewerIdContext);
   // Only a workspace-bound session has a checkout to read GitHub state from.
@@ -5732,6 +5743,7 @@ function SessionTooltipDetails({
   if (
     !familyDetail &&
     createdBy === null &&
+    projectName === null &&
     repo === null &&
     prNumber === null &&
     branch === null
@@ -5748,6 +5760,16 @@ function SessionTooltipDetails({
           testId="session-tooltip-owner"
         >
           {createdBy}
+        </SessionTooltipDetail>
+      )}
+      {projectName !== null && (
+        <SessionTooltipDetail
+          label="Project"
+          icon={FolderIcon}
+          iconContent={<ProjectRowIcon icon={projectIcon} />}
+          testId="session-tooltip-project"
+        >
+          {projectName}
         </SessionTooltipDetail>
       )}
       {repo !== null && (
@@ -5867,12 +5889,16 @@ function SessionTooltipContent({
   hasError,
   shared,
   familyDetail,
+  projectName,
+  projectIcon,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
   shared: SessionSharing | null;
   familyDetail?: ReactNode;
+  projectName: string | null;
+  projectIcon: string | null;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -5908,7 +5934,12 @@ function SessionTooltipContent({
           <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
         </span>
       </p>
-      <SessionTooltipDetails conversation={conversation} familyDetail={familyDetail} />
+      <SessionTooltipDetails
+        conversation={conversation}
+        familyDetail={familyDetail}
+        projectName={projectName}
+        projectIcon={projectIcon}
+      />
       {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
@@ -5942,6 +5973,7 @@ function ConversationRowImpl({
   previousId,
   nextId,
   reorderIndex,
+  projectFolderName,
 }: {
   conversation: Conversation;
   familyIndented?: boolean;
@@ -5972,6 +6004,7 @@ function ConversationRowImpl({
   previousId?: string;
   nextId?: string;
   reorderIndex?: number;
+  projectFolderName?: string;
 }) {
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
@@ -6062,25 +6095,27 @@ function ConversationRowImpl({
     }) && runnerOnline !== false;
 
   // The session's current project NAME, or null when unfiled — drives the
-  // kebab submenu label ("Add to project" vs "Move session") and the pinned
-  // flyout. Dual-read: prefer the first-class membership (project_id → name via
+  // kebab submenu label ("Add to project" vs "Move session") and the tooltip.
+  // Dual-read: prefer the first-class membership (project_id → name via
   // the list-level map from context — no per-row query), falling back to the
   // legacy omni_project label.
   const projectNamesById = useContext(ProjectNamesContext);
   const firstClassProjectName =
     conversation.project_id != null ? projectNamesById.get(conversation.project_id) : undefined;
   const currentProject = firstClassProjectName ?? conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
-  // Pinned sessions are lifted OUT of their project folder into the flat
-  // "Pinned" section, so the row no longer shows which project it belongs to.
-  // For those rows only, surface the project in a hover flyout. Non-pinned
-  // rows already sit inside their project folder, so they don't need it.
+  const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
+  // Rows outside their project folder lose that visual cue; the grouped tooltip
+  // restores it while rows inside the matching folder avoid repeating it.
+  const projectTooltipName =
+    groupingUi && currentProject !== projectFolderName ? currentProject : null;
+  // Pinned rows use the legacy flyout only until the grouped tooltip is enabled.
   // Disabled on mobile: there's no hover, so a tap would open the HoverCard
   // and leave it overlaying the chat after navigation. Forcing null there
   // routes the row through the plain ContextMenu/link path and restores the
   // native `title` tooltip.
-  const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
+  const projectFlyoutName = !isMobile && !groupingUi && isPinned ? currentProject : null;
   // First-class projects can carry a chosen emoji; label-only projects have
-  // none, so the flyout falls back to the folder glyph for those.
+  // none, so the project icon falls back to the folder glyph.
   const projectIconsById = useContext(ProjectIconsContext);
   const projectFlyoutIcon =
     conversation.project_id != null
@@ -6634,6 +6669,8 @@ function ConversationRowImpl({
               hasError={sessionState?.kind === "error"}
               shared={sharing}
               familyDetail={familyDetail}
+              projectName={projectTooltipName}
+              projectIcon={projectFlyoutIcon}
             />
           </Tooltip>
         )
@@ -6694,6 +6731,8 @@ function ConversationRowImpl({
             hasError={sessionState?.kind === "error"}
             shared={sharing}
             familyDetail={familyDetail}
+            projectName={projectTooltipName}
+            projectIcon={projectFlyoutIcon}
           />
         </Tooltip>
       )}
@@ -6979,6 +7018,7 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     prev.gridsEnabled === next.gridsEnabled &&
     prev.isPinned === next.isPinned &&
     prev.shortcutSlot === next.shortcutSlot &&
+    prev.projectFolderName === next.projectFolderName &&
     prev.selectionMode === next.selectionMode &&
     prev.isSelected === next.isSelected &&
     prev.onClick === next.onClick &&
@@ -7031,15 +7071,8 @@ function SessionShortcutHint({ slot, overlayTop }: { slot: number; overlayTop: s
   );
 }
 
-/**
- * Hover flyout body for a pinned, project-owned conversation row.
- *
- * Pinning lifts a session out of its project folder into the flat "Pinned"
- * section, dropping the visual project cue the folder provided. Hovering the
- * row surfaces it again: the session title, project name, and optional branch.
- * Uses a Cursor-style placement (right / top-aligned) and the muted,
- * small-icon foreground used elsewhere in the sidebar.
- */
+// The pinned-row flyout before sidebar_grouping_ui; remove with the flag
+// (review by 0.19.0).
 function PinnedProjectFlyoutContent({
   title,
   projectName,
