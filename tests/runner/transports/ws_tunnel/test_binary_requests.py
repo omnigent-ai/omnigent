@@ -1236,9 +1236,6 @@ async def test_hello_workspace_upload_requires_routes_and_raw_helper(tmp_path, m
 
     try:
         serve_module._start_workspace_upload_hello_probe(app)
-        state = getattr(app.state, "workspace_upload_hello_capability", None)
-        if state is not None:
-            await asyncio.wait_for(state.probe, 2)
         for _ in range(2):
             serve_module._start_workspace_upload_hello_probe(app)
             await _send_hello(send, "test", app=app)
@@ -1249,7 +1246,9 @@ async def test_hello_workspace_upload_requires_routes_and_raw_helper(tmp_path, m
             for frame in frames
         )
         assert frames[0].frame_protocol_version == 1
-        assert resolutions == (0 if manager is None else 1)
+        assert resolutions == (
+            0 if manager is None else 2 if mode in ("runtime-error", "assertion-error") else 1
+        )
         if manager is not None:
             await manager.stop()
             await _send_hello(send, "test", app=app)
@@ -1310,9 +1309,7 @@ async def test_hello_does_not_wait_for_blocked_probe_or_cleanup(
     monkeypatch.setattr(os_env_upload, "UploadHelperClient", BlockedHelper)
     monkeypatch.setattr(workspace_upload, "UploadHelperClient", BlockedHelper)
     monkeypatch.setattr(serve_module, "runner_primary_session_id", lambda: "session")
-    monkeypatch.setattr(
-        serve_module, "_UPLOAD_HELLO_PROBE_TIMEOUT_S", 0.02 if blocked_probe else 0.2
-    )
+    monkeypatch.setattr(serve_module, "_UPLOAD_HELLO_PROBE_TIMEOUT_S", 0.04)
     frames = []
 
     async def send(raw):
@@ -1323,14 +1320,14 @@ async def test_hello_does_not_wait_for_blocked_probe_or_cleanup(
         serve_module._start_workspace_upload_hello_probe(app)
         assert await asyncio.to_thread(entered.wait, 0.5)
         started = time.monotonic()
-        await asyncio.wait_for(_send_hello(send, "test", app=app), 0.1)
-        assert time.monotonic() - started < 0.1
+        await asyncio.wait_for(_send_hello(send, "test", app=app), 0.25)
+        assert time.monotonic() - started < 0.25
         assert "workspace_upload_v1" not in frames[-1].capabilities
         assert await asyncio.to_thread(closing.wait, 0.5)
         assert interrupted.is_set()
         started = time.monotonic()
-        await asyncio.wait_for(_send_hello(send, "test", app=app), 0.1)
-        assert time.monotonic() - started < 0.1
+        await asyncio.wait_for(_send_hello(send, "test", app=app), 0.25)
+        assert time.monotonic() - started < 0.25
         assert "workspace_upload_v1" not in frames[-1].capabilities
         await asyncio.wait_for(app.state.workspace_upload_hello_capability.probe, 0.5)
     finally:
@@ -1340,4 +1337,78 @@ async def test_hello_does_not_wait_for_blocked_probe_or_cleanup(
         probe = getattr(app.state, "workspace_upload_hello_capability", None)
         if probe is not None:
             await asyncio.gather(probe.probe, return_exceptions=True)
+        env.close()
+
+
+@pytest.mark.parametrize(
+    "mode", ["ready", "resolver-error", "timeout", "cleanup-error", "lifecycle"]
+)
+async def test_hello_waits_for_upload_readiness_and_recovers(tmp_path, monkeypatch, mode):
+    from omnigent.inner import os_env_upload
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+    from omnigent.runner import workspace_upload
+
+    app = FastAPI()
+    env = create_os_environment(
+        OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    resolutions = 0
+    closes = 0
+
+    async def environment(sid, eid):
+        nonlocal resolutions
+        resolutions += 1
+        await asyncio.sleep(0.2 if mode == "timeout" and resolutions == 1 else 0.05)
+        if mode == "resolver-error" and resolutions == 1:
+            raise RuntimeError("server not ready")
+        return env
+
+    async def registry(sid):
+        return None
+
+    def close(client):
+        nonlocal closes
+        closes += 1
+        if mode == "cleanup-error" and closes == 1:
+            raise RuntimeError("helper cleanup failed")
+
+    monkeypatch.setattr(
+        os_env_upload.UploadHelperClient, "call", lambda *args, **kwargs: {"raw_upload": True}
+    )
+    monkeypatch.setattr(os_env_upload.UploadHelperClient, "close", close)
+    monkeypatch.setattr(serve_module, "runner_primary_session_id", lambda: "session")
+    monkeypatch.setattr(serve_module, "_UPLOAD_HELLO_PROBE_TIMEOUT_S", 0.1)
+    manager = workspace_upload.register_upload_routes(
+        app,
+        resolve_environment=environment,
+        resolve_registry=registry,
+        state_path=tmp_path / "index.json",
+    )
+    frames = []
+
+    async def send(raw):
+        frames.append(decode_frame(raw))
+
+    try:
+        await manager.start()
+        serve_module._start_workspace_upload_hello_probe(app)
+        initial = app.state.workspace_upload_hello_capability
+        assert not initial.probe.done()
+        await _send_hello(send, "test", app=app, connection_id="first")
+        assert ("workspace_upload_v1" in frames[0].capabilities) == (
+            mode in ("ready", "lifecycle")
+        )
+        await asyncio.wait_for(initial.probe, 0.5)
+        if mode == "lifecycle":
+            await manager.stop()
+            await manager.start()
+        await _send_hello(send, "test", app=app, connection_id="reconnected")
+        assert "workspace_upload_v1" in frames[1].capabilities
+        assert resolutions == (1 if mode == "ready" else 2)
+        assert frames[1].connection_id == "reconnected"
+    finally:
+        await manager.stop()
+        state = app.state.workspace_upload_hello_capability
+        await asyncio.gather(state.probe, return_exceptions=True)
         env.close()
