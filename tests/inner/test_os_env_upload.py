@@ -425,3 +425,69 @@ def test_helper_lock_wait_is_bounded(helper: UploadHelperClient) -> None:
         assert time.monotonic() - started < 0.15
     finally:
         release.join()
+
+
+def test_launch_and_ipc_share_deadline(
+    helper: UploadHelperClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    original = helper._ensure_started_locked
+
+    def delayed():
+        time.sleep(0.15)
+        original()
+
+    monkeypatch.setattr(helper, "_ensure_started_locked", delayed)
+    result = helper.call({"op": "probe"}, timeout_s=0.05)
+    assert result["code"] == "timeout"
+    assert helper._proc is None or helper._proc.poll() is not None
+
+
+def test_recovery_skips_fifo(helper: UploadHelperClient, tmp_path: Path) -> None:
+    prepared = helper.call({"op": "prepare", "id": UID, "dir": "", "name": "model.3mf"})
+    started = begin(helper, size=0)
+    os.mkfifo(tmp_path / "model.3mf")
+    result = helper.call(
+        {
+            "op": "recover",
+            "id": UID,
+            "dir": "",
+            "name": "model.3mf",
+            "on_conflict": "fail",
+            **prepared,
+            **started,
+        },
+        timeout_s=0.2,
+    )
+    assert result["code"] == "gone"
+    assert helper.call({"op": "status", "id": UID})["offset"] == 0
+
+
+def test_slow_complete_has_size_budget_and_keeps_other_upload(
+    helper: UploadHelperClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    import omnigent.inner.os_env_upload as upload
+
+    begin(helper, size=0)
+    second = "b" * 32
+    assert "error" not in helper.call(
+        {"op": "begin", "id": second, "dir": "", "name": "other", "size": 1, "on_conflict": "fail"}
+    )
+    original = upload.read_frame
+
+    def slow(stream):
+        time.sleep(0.15)
+        return original(stream)
+
+    monkeypatch.setattr(upload, "CALL_TIMEOUT_S", 0.05, raising=False)
+    monkeypatch.setattr(upload, "COMPLETE_TIMEOUT_FLOOR_S", 0.5, raising=False)
+    monkeypatch.setattr(upload, "read_frame", slow)
+    assert "error" not in helper.call({"op": "complete", "id": UID, "size": 1024**3})
+    monkeypatch.setattr(upload, "read_frame", original)
+    assert helper.call({"op": "append", "id": second, "offset": 0}, b"x")["offset"] == 1
+    assert upload.operation_timeout(
+        {"op": "complete", "size": 1024**3}
+    ) > upload.operation_timeout({"op": "complete", "size": 0})
