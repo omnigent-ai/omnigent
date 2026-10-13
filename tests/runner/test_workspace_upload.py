@@ -483,32 +483,63 @@ async def test_helper_cache_bounded_and_idle(
 
 @pytest.mark.asyncio
 async def test_sweep_drops_unresolvable_record(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from fastapi import HTTPException
+    from omnigent.errors import OmnigentError
 
     manager = client._transport.app.state.workspace_uploads
     response = await create(client)
     uid = response.json()["upload_id"]
+    record = manager.records[uid]
+    staging = Path(record.staging_path)
     original = manager.resolve_environment
 
-    async def broken(session: str, environment: str) -> CallerProcessOSEnvironment:
-        raise ValueError("Environment ended")
+    async def unavailable(session: str, environment: str) -> CallerProcessOSEnvironment:
+        raise OmnigentError("Session has no agent_id")
 
-    monkeypatch.setattr(manager, "resolve_environment", broken)
-    await manager.sweep(now=manager.records[uid].created_at + 86401)
+    monkeypatch.setattr(manager, "resolve_environment", unavailable)
+    await manager.sweep(now=record.created_at + manager.limits.max_age_s + 1)
+    await manager.sweep(now=record.created_at + manager.limits.max_age_s + 2)
     assert uid not in manager.records
+    assert uid not in manager.upload_locks
     assert uid not in json.loads(manager.state_path.read_text())
+    assert not manager._pinned(("session", DEFAULT_ENVIRONMENT_ID))
+    assert staging.read_bytes() == b""
+    assert caplog.text.count(uid) == 1
+    assert not any(log.levelname == "ERROR" for log in caplog.records)
+    monkeypatch.setattr(manager, "resolve_environment", original)
+    manager.limits = UploadLimits(max_open_uploads=1)
+    assert (await create(client, name="new")).status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_sweep_retains_unexpired_record_on_resolver_failure(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    uid = (await create(client)).json()["upload_id"]
+    record = manager.records[uid]
+    staging = Path(record.staging_path)
+    await manager.stop()
+    restored = restart(manager)
+    original = restored.resolve_environment
 
     async def unavailable(session: str, environment: str) -> CallerProcessOSEnvironment:
-        raise HTTPException(404, "Session ended")
+        raise ValueError("Temporarily unable to resolve the environment")
 
-    monkeypatch.setattr(manager, "resolve_environment", original)
-    response = await create(client, name="other")
-    uid = response.json()["upload_id"]
-    monkeypatch.setattr(manager, "resolve_environment", unavailable)
-    await manager.sweep(now=manager.records[uid].created_at + 86401)
-    assert uid not in manager.records
+    monkeypatch.setattr(restored, "resolve_environment", unavailable)
+    try:
+        await restored.sweep(now=record.created_at + 1)
+        await restored.sweep(now=record.created_at + 2)
+        assert uid in restored.records
+        assert uid in json.loads(restored.state_path.read_text())
+        assert restored._pinned(("session", DEFAULT_ENVIRONMENT_ID))
+        assert staging.read_bytes() == b""
+        assert not caplog.records
+        monkeypatch.setattr(restored, "resolve_environment", original)
+        assert await restored.resolve_environment("session", DEFAULT_ENVIRONMENT_ID)
+    finally:
+        await restored.stop()
 
 
 @pytest.mark.asyncio
@@ -2522,3 +2553,112 @@ async def test_finalizing_parent_loss_retires_upload(
     finally:
         if fresh is not None:
             await fresh.stop()
+
+
+@pytest.mark.asyncio
+async def test_distinct_helpers_preserve_default_executor_capacity(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from io import TextIOWrapper
+    from typing import cast
+
+    import omnigent.inner.os_env_upload as upload
+    from omnigent.runner.workspace_upload import UploadDeclaration
+
+    manager = client._transport.app.state.workspace_uploads
+    ids = [
+        (
+            await manager.create(
+                f"session-{i}",
+                DEFAULT_ENVIRONMENT_ID,
+                UploadDeclaration(dir="", name=f"distinct-{i}", size=0, created_by="alice"),
+            )
+        )["upload_id"]
+        for i in range(8)
+    ]
+    original = upload.read_frame
+    release = threading.Event()
+    entered = set()
+    guard = threading.Lock()
+
+    def slow(stream):
+        with guard:
+            entered.add(stream)
+        assert release.wait(10)
+        return original(stream)
+
+    monkeypatch.setattr(upload, "read_frame", slow)
+    previous_executor = asyncio.get_running_loop()._default_executor
+    assert previous_executor is not None
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        asyncio.get_running_loop().set_default_executor(executor)
+        tasks = [
+            asyncio.create_task(manager._call(uid, manager.records[uid], "plan")) for uid in ids
+        ]
+        background = []
+        try:
+            async with asyncio.timeout(5):
+                while len(entered) < 4 or not all(
+                    b.gate.locked() for b in manager.helpers.values()
+                ):
+                    await asyncio.sleep(0.01)
+            background = [
+                asyncio.create_task(asyncio.to_thread(lambda: 42)),
+                asyncio.create_task(manager._persist()),
+            ]
+            done, pending = await asyncio.wait(background, timeout=0.5)
+            assert not pending, "Distinct helpers starved executor work or an index save"
+            assert len(done) == 2
+            assert background[0].result() == 42
+            assert len(json.loads(manager.state_path.read_text())) == 8
+            assert len(entered) == 4
+            # Cancel both an admitted IPC and a waiter; only the waiter settles immediately.
+            active, queued = [], []
+            for uid, task in zip(ids, tasks, strict=True):
+                record = manager.records[uid]
+                binding = manager.helpers[(record.session_id, record.environment_id)]
+                assert binding.client._proc is not None
+                (
+                    active
+                    if cast(TextIOWrapper, binding.client._proc.stdout).buffer in entered
+                    else queued
+                ).append(task)
+            queued[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await queued[0]
+            active[0].cancel()
+            await asyncio.sleep(0)
+            assert not active[0].done()
+        finally:
+            release.set()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*background, return_exceptions=True)
+            asyncio.get_running_loop().set_default_executor(previous_executor)
+    assert sum(isinstance(result, asyncio.CancelledError) for result in results) == 2
+    assert all(
+        not binding.gate.locked() and binding.users == 0 for binding in manager.helpers.values()
+    )
+    assert (await manager._call(ids[0], manager.records[ids[0]], "plan"))["outcome"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_recreate_aborted_upload_lock(client: httpx.AsyncClient) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    first = (await create(client)).json()["upload_id"]
+    second = (await create(client, name="second")).json()["upload_id"]
+    lock = manager.upload_locks[first]
+    await lock.acquire()
+    sweep = asyncio.create_task(manager.sweep())
+    try:
+        await asyncio.sleep(0)
+        assert not sweep.done()
+        assert (await client.delete(BASE + "/" + second + "?created_by=alice")).status_code == 204
+        assert second not in manager.records
+        assert second not in manager.upload_locks
+    finally:
+        lock.release()
+        await sweep
+    assert second not in manager.upload_locks
+    assert first in manager.records
