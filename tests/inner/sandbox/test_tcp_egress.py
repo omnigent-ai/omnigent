@@ -480,6 +480,7 @@ def test_tcp_broker_enforces_byte_quota(
             if kind == b"Z":
                 kind, detail = _read_frame(client)
             assert kind == b"D" and b"transfer limit exceeded" in detail
+        broker.stop()
         assert "transfer limit exceeded" in caplog.text
         assert "closed after 7 bytes" in caplog.text
     finally:
