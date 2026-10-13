@@ -11,23 +11,28 @@ and agents defined in YAML. Use this skill to answer questions about the
 Omnigent installed here. Do not answer from memory. Omnigent changes quickly,
 and the installed version may differ from what you remember.
 
-## Find the answer, in this order
+## Find the answer
 
-1. **The installed CLI.** Run `omnigent --version`, then `omnigent --help`
-   and `omnigent <command> --help`. These always match the installed build.
-2. **Live state from Omnigent tools**, when your tool list has them:
+Go to the source that fits the question. Run commands and fetch pages with
+your shell tool (for example `sys_os_shell`).
+
+1. **Commands, flags, and the version.** Run `omnigent --version` or
+   `omnigent <command> --help`. These always match the installed build.
+2. **This machine and this session.** Call the Omnigent tools, when your tool
+   list has them:
    - `sys_session_get_info`: this session, its model, and the harnesses
-     that are ready on this machine.
+     that are ready on this machine. Use it for "what can I run here".
    - `sys_agent_list` and `sys_agent_get`: the agents you can start.
    - `sys_policy_registry`: policy templates. `sys_add_policy` attaches one
      to this session.
    - `sys_scheduled_task_create`: creates an automation.
-3. **The docs for the installed version.** Fetch
+3. **Agent config, policies, and other features.** Read the docs for the
+   installed version:
    `https://raw.githubusercontent.com/omnigent-ai/omnigent/v<version>/<path>`,
-   with `<version>` from step 1 and `<path>` from the docs map below. If the
-   tag does not exist (a source or dev build such as `0.19.0.dev0`), use
-   `main` in place of `v<version>`.
-4. **The website.** `https://omnigent.ai/llms.txt` lists every docs page;
+   with `<version>` from `omnigent --version` and `<path>` from the docs map
+   below. If the tag does not exist (a source or dev build such as
+   `0.19.0.dev0`), use `main` in place of `v<version>`.
+4. **Anything else.** `https://omnigent.ai/llms.txt` lists every docs page;
    fetch the page you need. The site describes the latest release, so compare
    it with the installed version. Release notes are at
    `https://omnigent.ai/releases/<version>`.
