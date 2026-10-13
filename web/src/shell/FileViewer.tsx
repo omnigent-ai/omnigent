@@ -1618,36 +1618,38 @@ function FileViewerBody({
               <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
                 Loading diff…
               </div>
-            ) : isActiveViewport ? (
+            ) : (
               // Keep viewer state on resize without computing the CSS-hidden copy's diff.
-              <Suspense
-                fallback={
-                  <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-                    Loading diff…
-                  </div>
-                }
-              >
-                {/* key={path} remounts per file so onMount re-runs (EOL + comment
+              isActiveViewport && (
+                <Suspense
+                  fallback={
+                    <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+                      Loading diff…
+                    </div>
+                  }
+                >
+                  {/* key={path} remounts per file so onMount re-runs (EOL + comment
                   wiring re-applied) and `ready` resets while the new grammar loads. */}
-                <MonacoDiffViewer
-                  position={filePosition}
-                  key={path}
-                  before={diffQuery.data.before}
-                  after={diffQuery.data.after}
-                  path={path}
-                  layout={diffLayout}
-                  hideWhitespace={hideWhitespace}
-                  wrapLines={wrapLines}
-                  conversationId={conversationId}
-                  comments={openComments}
-                  activeSelection={activeSelection}
-                  onSetActiveSelection={handleSetActiveSelection}
-                  pendingBodyRef={pendingBodyRef}
-                  searchOpen={searchOpen}
-                  onSearchHandled={handleSearchHandled}
-                />
-              </Suspense>
-            ) : null
+                  <MonacoDiffViewer
+                    position={filePosition}
+                    key={path}
+                    before={diffQuery.data.before}
+                    after={diffQuery.data.after}
+                    path={path}
+                    layout={diffLayout}
+                    hideWhitespace={hideWhitespace}
+                    wrapLines={wrapLines}
+                    conversationId={conversationId}
+                    comments={openComments}
+                    activeSelection={activeSelection}
+                    onSetActiveSelection={handleSetActiveSelection}
+                    pendingBodyRef={pendingBodyRef}
+                    searchOpen={searchOpen}
+                    onSearchHandled={handleSearchHandled}
+                  />
+                </Suspense>
+              )
+            )
           ) : (
             <CodeViewer
               position={filePosition}

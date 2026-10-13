@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from tests.browser_ui.conftest import BrowserContract
 
@@ -370,11 +371,18 @@ def test_diff_computes_once_per_viewport(
         editors = page.locator(".monaco-diff-editor")
         expect(editors).to_have_count(1, timeout=30_000)
         expect(editors).to_be_visible()
-        page.wait_for_function(
-            """count => window.diffComputations.length >= count &&
-              window.diffComputations.every(computation => computation.completed)""",
-            arg=expected_count,
-        )
+        try:
+            page.wait_for_function(
+                """count => window.diffComputations.length >= count &&
+                  window.diffComputations.every(computation => computation.completed)""",
+                arg=expected_count,
+            )
+        except PlaywrightTimeoutError:
+            pytest.fail(
+                f"Expected {expected_count} completed diff computations; observed "
+                f"{page.evaluate('window.diffComputations')}. "
+                "Instrumentation depends on Monaco worker $computeDiff/req/seq RPC fields."
+            )
         assert page.evaluate("window.diffComputations.length") == expected_count
         expect(page).to_have_url(re.compile(r"[?&]diff=1(?:&|$)"))
 
