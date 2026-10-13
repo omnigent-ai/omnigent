@@ -236,7 +236,9 @@ coverage; missing footage does not change which tests belong in the PR.
 The pane renders inside the web app, so record it the same way as `web`: the
 Playwright test drives the session page with the terminal view shown, and the
 pane's contents land in the browser video. Save `tmux capture-pane -e` text dumps
-alongside as machine-checkable evidence.
+alongside as machine-checkable evidence; they hold what the pane draws, so they
+are also how you check a caption's screen claims when you cannot view a frame.
+The attach WebSocket or PTY byte stream is not the screen.
 
 **For a native-harness pane** (claude/codex/cursor/goose/hermes/kiro/… — the bug
 is in a real harness CLI's output), don't hand-roll the launch: the existing
@@ -323,6 +325,24 @@ healthy state for a `fixed`/`after` clip; a final frame that shows teardown — 
 pane greyed out behind "Bridge closed: terminal session ended", a deleted
 session, a result list emptied by fixture cleanup — means the recording outlived
 the test body. Fix the stop point and re-record; do not caption around it.
+
+What the caption says is or is not on screen must come from the frames. That
+covers which program the pane shows (a `bash-5.2$` prompt, the Omnigent REPL, a
+harness TUI), whether a line, label, or overlay is drawn, and equally the
+negative: "not drawn", "not legible", "no overlay". Confirm each such statement
+against a frame you extracted and looked at
+(`ffmpeg -ss <seconds> -i <clip> -frames:v 1 -update 1 frame.png`; with no image
+viewer, OCR it — `rapidocr-onnxruntime` installs from wheels and reads terminal
+text) or against a text read of the rendered screen at that moment (a
+`tmux capture-pane` dump for a terminal pane, a driver assertion on the rendered
+element for the web). The program you expected the journey to open, the test's
+intent, and the attach WebSocket or PTY byte stream are not the screen: bytes
+that proved a `())` corruption say nothing about whether that line is visible.
+A statement you cannot confirm either way is dropped, not flipped into a
+negative: write "frames not inspected" and describe only the verified state, in
+the caption and everywhere else the clip is described —
+`recording_unavailable_reason`, `evidence`, the PR body, and the live-validation
+prompt. A reader told the line is not visible will not look for it.
 
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in

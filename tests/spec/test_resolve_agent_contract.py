@@ -325,3 +325,19 @@ def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None
     handoff = json.loads(output.split("```json\n", 1)[1].split("```", 1)[0])
     assert handoff["ocr_review"]
     assert set(handoff["review_cycle"]) == {"head_sha", "fingerprint", "dispositions"}
+
+
+def test_handoff_screen_claims_reuse_frame_wording_across_fields() -> None:
+    fields = _normalized_resolve_instructions().split("Field meanings:", 1)[1]
+    recordings = fields.split("- `recordings`", 1)[1].split("- `test_audit`", 1)[0]
+
+    assert (
+        "take it from an inspected or OCR'd frame or a rendered-screen read, "
+        "never from the surface you expected" in recordings
+    )
+    assert (
+        "repeat the same wording in `recording_unavailable_reason`, `evidence`, "
+        "the PR body, and `validation_prompt`" in recordings
+    )
+    assert "name the frame or rendered-screen read that established it" in recordings
+    assert "write `frames not inspected` and keep the claim out of this field" in recordings
