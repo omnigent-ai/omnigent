@@ -1602,11 +1602,9 @@ async def _probe_workspace_upload_hello(manager: object, state: _UploadHelloCapa
                 client.call, {"op": "probe"}, timeout_s=_UPLOAD_HELLO_PROBE_TIMEOUT_S
             )
             raw_upload = result.get("raw_upload")
-            # Only a successful boolean reply is a stable capability result.
-            state.failed = (
-                "error" in result or "code" in result or not isinstance(raw_upload, bool)
-            )
-            supported = not state.failed and raw_upload is True
+            # Reconnect retries transient helper failures; definitive rejection stays cached.
+            state.failed = result.get("code") in ("busy", "timeout", "gone")
+            supported = "error" not in result and "code" not in result and raw_upload is True
     except Exception:  # noqa: BLE001 — optional upload probing must never abort hello
         supported = False
         state.failed = True
