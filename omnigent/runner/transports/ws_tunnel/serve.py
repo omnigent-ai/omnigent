@@ -1601,7 +1601,12 @@ async def _probe_workspace_upload_hello(manager: object, state: _UploadHelloCapa
             result = await asyncio.to_thread(
                 client.call, {"op": "probe"}, timeout_s=_UPLOAD_HELLO_PROBE_TIMEOUT_S
             )
-            supported = result.get("raw_upload") is True
+            raw_upload = result.get("raw_upload")
+            # Only a successful boolean reply is a stable capability result.
+            state.failed = (
+                "error" in result or "code" in result or not isinstance(raw_upload, bool)
+            )
+            supported = not state.failed and raw_upload is True
     except Exception:  # noqa: BLE001 — optional upload probing must never abort hello
         supported = False
         state.failed = True

@@ -1341,9 +1341,40 @@ async def test_hello_does_not_wait_for_blocked_probe_or_cleanup(
 
 
 @pytest.mark.parametrize(
-    "mode", ["ready", "resolver-error", "timeout", "cleanup-error", "lifecycle"]
+    "mode,first_reply",
+    [
+        pytest.param("ready", None, id="ready"),
+        pytest.param("resolver-error", None, id="resolver-error"),
+        pytest.param("timeout", None, id="timeout"),
+        pytest.param("cleanup-error", None, id="cleanup-error"),
+        pytest.param("lifecycle", None, id="lifecycle"),
+        pytest.param("busy-reply", {"error": "launch delayed", "code": "busy"}, id="busy-reply"),
+        pytest.param(
+            "timeout-reply", {"error": "watchdog fired", "code": "timeout"}, id="timeout-reply"
+        ),
+        pytest.param("gone-reply", {"error": "EOF", "code": "gone"}, id="gone-reply"),
+        pytest.param(
+            "unknown-reply", {"error": "probe failed", "code": "unexpected"}, id="unknown-reply"
+        ),
+        pytest.param("error-only", {"error": "probe failed"}, id="error-only"),
+        pytest.param("code-only", {"code": "busy"}, id="code-only"),
+        pytest.param("empty-reply", {}, id="empty-reply"),
+        pytest.param("invalid-reply", {"raw_upload": 0}, id="invalid-reply"),
+        pytest.param(
+            "conflicting-reply",
+            {"raw_upload": True, "error": "probe failed", "code": "busy"},
+            id="conflicting-reply",
+        ),
+        pytest.param(
+            "unsupported",
+            {"raw_upload": False, "reason": "platform unsupported"},
+            id="unsupported",
+        ),
+    ],
 )
-async def test_hello_waits_for_upload_readiness_and_recovers(tmp_path, monkeypatch, mode):
+async def test_hello_waits_for_upload_readiness_and_recovers(
+    tmp_path, monkeypatch, mode, first_reply
+):
     from omnigent.inner import os_env_upload
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.os_env import create_os_environment
@@ -1355,6 +1386,7 @@ async def test_hello_waits_for_upload_readiness_and_recovers(tmp_path, monkeypat
     )
     resolutions = 0
     closes = 0
+    calls = 0
 
     async def environment(sid, eid):
         nonlocal resolutions
@@ -1373,9 +1405,13 @@ async def test_hello_waits_for_upload_readiness_and_recovers(tmp_path, monkeypat
         if mode == "cleanup-error" and closes == 1:
             raise RuntimeError("helper cleanup failed")
 
-    monkeypatch.setattr(
-        os_env_upload.UploadHelperClient, "call", lambda *args, **kwargs: {"raw_upload": True}
-    )
+    def call(client, metadata, *, timeout_s):
+        nonlocal calls
+        calls += 1
+        assert metadata == {"op": "probe"}
+        return first_reply if calls == 1 and first_reply is not None else {"raw_upload": True}
+
+    monkeypatch.setattr(os_env_upload.UploadHelperClient, "call", call)
     monkeypatch.setattr(os_env_upload.UploadHelperClient, "close", close)
     monkeypatch.setattr(serve_module, "runner_primary_session_id", lambda: "session")
     monkeypatch.setattr(serve_module, "_UPLOAD_HELLO_PROBE_TIMEOUT_S", 0.1)
@@ -1404,8 +1440,9 @@ async def test_hello_waits_for_upload_readiness_and_recovers(tmp_path, monkeypat
             await manager.stop()
             await manager.start()
         await _send_hello(send, "test", app=app, connection_id="reconnected")
-        assert "workspace_upload_v1" in frames[1].capabilities
-        assert resolutions == (1 if mode == "ready" else 2)
+        assert ("workspace_upload_v1" in frames[1].capabilities) == (mode != "unsupported")
+        assert resolutions == (1 if mode in ("ready", "unsupported") else 2)
+        assert calls == (1 if mode in ("ready", "unsupported", "resolver-error", "timeout") else 2)
         assert frames[1].connection_id == "reconnected"
     finally:
         await manager.stop()
