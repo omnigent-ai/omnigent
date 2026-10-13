@@ -20,3 +20,39 @@ from omnigent.policies.builtins._shell import split_command_segments
 )
 def test_split_command_segments(command: str, expected: list[str]) -> None:
     assert split_command_segments(command) == expected
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        r"echo \"",
+        r"echo \'",
+        r'echo "a\"b"',
+        r'echo "a\\"',
+        r"echo 'a\'",
+        r"echo one\;two",
+        r"echo one\&two",
+        r"echo one\|two",
+        r"echo \(one\)",
+        r"echo \{one\}",
+    ],
+)
+def test_escaped_arguments_preserve_command_boundaries(first: str) -> None:
+    assert split_command_segments(f"{first} && echo next") == [first, "echo next"]
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("echo dir/{one,two}; echo next", ["echo dir/{one,two}", "echo next"]),
+        ("echo {one,two} && echo next", ["echo {one,two}", "echo next"]),
+        ("echo ${VALUE}; echo next", ["echo ${VALUE}", "echo next"]),
+        ("echo pre{ mid }post", ["echo pre{ mid }post"]),
+        ("{ echo one;}; echo next", ["echo one", "echo next"]),
+        ("{(echo one);}", ["echo one"]),
+        (r"echo \ { text", [r"echo \ { text"]),
+        ("echo ''{ text", ["echo ''{ text"]),
+    ],
+)
+def test_braces_require_word_boundaries(command: str, expected: list[str]) -> None:
+    assert split_command_segments(command) == expected

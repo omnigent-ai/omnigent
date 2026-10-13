@@ -260,7 +260,7 @@ def split_command_segments(command: str) -> list[str]:
     return segments
 
 
-_SEGMENT_OPERATOR_CHARS: frozenset[str] = frozenset(";|&\n(){}")
+_SEGMENT_OPERATOR_CHARS: frozenset[str] = frozenset(";|&\n()")
 
 
 def _split_unquoted_operators(command: str) -> list[str]:
@@ -268,6 +268,7 @@ def _split_unquoted_operators(command: str) -> list[str]:
     segments: list[str] = []
     buf: list[str] = []
     in_single = in_double = False
+    at_word_start = True
     i, n = 0, len(command)
     while i < n:
         ch = command[i]
@@ -275,6 +276,11 @@ def _split_unquoted_operators(command: str) -> list[str]:
             if ch == "'":
                 in_single = False
             buf.append(ch)
+        elif ch == "\\" and i + 1 < n:
+            buf.extend(command[i : i + 2])
+            at_word_start = False
+            i += 2
+            continue
         elif in_double:
             if ch == '"':
                 in_double = False
@@ -288,13 +294,25 @@ def _split_unquoted_operators(command: str) -> list[str]:
         elif command[i : i + 2] in ("&&", "||"):
             segments.append("".join(buf))
             buf = []
+            at_word_start = True
             i += 2
             continue
-        elif ch in _SEGMENT_OPERATOR_CHARS:
+        elif ch in _SEGMENT_OPERATOR_CHARS or (
+            # Braces delimit groups only as separate words, not within expansions.
+            ch in "{}"
+            and at_word_start
+            and (
+                i + 1 == n or command[i + 1].isspace() or command[i + 1] in _SEGMENT_OPERATOR_CHARS
+            )
+        ):
             segments.append("".join(buf))
             buf = []
+            at_word_start = True
+            i += 1
+            continue
         else:
             buf.append(ch)
+        at_word_start = ch.isspace() and not (in_single or in_double)
         i += 1
     segments.append("".join(buf))
     return segments
