@@ -714,7 +714,9 @@ def test_list_recent_codex_sessions_excludes_non_interactive_sources(
     interactively (their first message is an injected instruction), so they are
     excluded; a rollout predating the ``source`` field defaults to interactive.
     """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
     sessions = tmp_path / "sessions" / "2026" / "07" / "16"
     sessions.mkdir(parents=True)
     cases = {
@@ -1193,17 +1195,21 @@ def test_load_codex_session_trims_at_real_two_mb_threshold(tmp_path: Path) -> No
     assert "post compaction question" in texts
 
 
-def _write_codex_rollout(tmp_path: Path, session_id: str, *, first_message: str) -> None:
+def _write_codex_rollout(
+    tmp_path: Path,
+    session_id: str,
+    *,
+    first_message: str,
+    archived: bool = False,
+) -> Path:
     """Write a minimal importable Codex rollout with one user message."""
-    rollout = (
-        tmp_path
-        / "sessions"
-        / "2026"
-        / "07"
-        / "15"
-        / f"rollout-2026-07-15T12-00-00-{session_id}.jsonl"
+    root = (
+        tmp_path / "archived_sessions"
+        if archived
+        else tmp_path / "sessions" / "2026" / "07" / "15"
     )
-    rollout.parent.mkdir(parents=True)
+    rollout = root / f"rollout-2026-07-15T12-00-00-{session_id}.jsonl"
+    rollout.parent.mkdir(parents=True, exist_ok=True)
     records = [
         {"type": "session_meta", "payload": {"id": session_id, "cwd": "/repo"}},
         {"type": "turn_context", "payload": {"turn_id": "turn_1", "cwd": "/repo"}},
@@ -1217,6 +1223,7 @@ def _write_codex_rollout(tmp_path: Path, session_id: str, *, first_message: str)
         },
     ]
     rollout.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+    return rollout
 
 
 def _write_codex_threads_db(
@@ -1340,7 +1347,9 @@ def test_list_recent_codex_sessions_includes_archived_and_deduplicates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Codex batch discovery combines active and archived rollout identities."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
     first_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     second_id = "019f680e-3edc-7fa3-9d50-1c4be395fa27"
     active_dir = tmp_path / "sessions" / "2026" / "07" / "16"
@@ -1360,6 +1369,110 @@ def test_list_recent_codex_sessions_includes_archived_and_deduplicates(
     recent = list_recent_local_session_ids("codex", limit=10)
 
     assert recent == (first_id, second_id)
+
+
+def test_codex_discovery_includes_configured_and_private_homes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery merges regular, explicit, and private Codex rollout roots."""
+    home = tmp_path / "home"
+    data_root = tmp_path / "data"
+    configured_home = tmp_path / "configured-codex"
+    private_home = data_root / "codex-native" / "private-bridge" / "codex-home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(data_root))
+    monkeypatch.setenv("CODEX_HOME", str(configured_home))
+
+    regular_id = "019f7777-0001-7000-8000-000000000011"
+    configured_id = "019f7777-0001-7000-8000-000000000012"
+    private_id = "019f7777-0001-7000-8000-000000000013"
+    archived_id = "019f7777-0001-7000-8000-000000000014"
+    duplicate_id = "019f7777-0001-7000-8000-000000000015"
+    rollouts = [
+        (_write_codex_rollout(home / ".codex", regular_id, first_message="regular"), 1),
+        (
+            _write_codex_rollout(configured_home, configured_id, first_message="configured"),
+            2,
+        ),
+        (_write_codex_rollout(private_home, private_id, first_message="private"), 3),
+        (
+            _write_codex_rollout(
+                private_home, archived_id, first_message="archived", archived=True
+            ),
+            4,
+        ),
+        (
+            _write_codex_rollout(home / ".codex", duplicate_id, first_message="regular newest"),
+            6,
+        ),
+        (
+            _write_codex_rollout(
+                private_home, duplicate_id, first_message="private older", archived=True
+            ),
+            5,
+        ),
+    ]
+    for path, modified_at in rollouts:
+        os.utime(path, (modified_at, modified_at))
+
+    assert list_recent_local_session_ids("codex", limit=10) == (
+        duplicate_id,
+        archived_id,
+        private_id,
+        configured_id,
+        regular_id,
+    )
+    imported = load_codex_session(private_id)
+    assert _codex_item_texts(imported) == ["private"]
+    newest_duplicate = load_codex_session(duplicate_id)
+    assert _codex_item_texts(newest_duplicate) == ["regular newest"]
+    scoped_duplicate = load_codex_session(duplicate_id, codex_home=private_home)
+    assert _codex_item_texts(scoped_duplicate) == ["private older"]
+
+
+def test_codex_explicit_home_does_not_expand_to_private_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit loader home remains the only Codex storage it reads."""
+    data_root = tmp_path / "data"
+    configured_home = tmp_path / "configured-codex"
+    private_home = data_root / "codex-native" / "private-bridge" / "codex-home"
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(data_root))
+    session_id = "019f7777-0001-7000-8000-000000000016"
+    _write_codex_rollout(private_home, session_id, first_message="private")
+
+    with pytest.raises(SessionImportNotFoundError, match="was not found"):
+        load_codex_session(session_id, codex_home=configured_home)
+
+
+def test_codex_private_discovery_uses_data_root_not_config_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The config-home override does not relocate runtime transcript data."""
+    data_root = tmp_path / "data"
+    config_root = tmp_path / "config"
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(data_root))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_root))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    data_id = "019f7777-0001-7000-8000-000000000017"
+    config_id = "019f7777-0001-7000-8000-000000000018"
+    _write_codex_rollout(
+        data_root / "codex-native" / "data-bridge" / "codex-home",
+        data_id,
+        first_message="data",
+    )
+    _write_codex_rollout(
+        config_root / "codex-native" / "config-bridge" / "codex-home",
+        config_id,
+        first_message="config",
+    )
+
+    assert list_recent_local_session_ids("codex", limit=10) == (data_id,)
 
 
 def test_load_qwen_session_normalizes_recorded_messages(tmp_path: Path) -> None:

@@ -133,6 +133,11 @@ Some native (TUI) harnesses keep resumable session state under `~/.omnigent`:
 and `pi-native/` **†** and `antigravity-native/` **†** (pinned to
 `~/.omnigent`).
 
+Each Codex-native session directory also contains a private `codex-home/` with
+its `sessions/` and `archived_sessions/` rollout JSONL. Local session import
+reads only those transcript trees; it does not scan the surrounding data
+directory or read Codex credential files.
+
 Within each, session state lives in a subdirectory named by a digest of the
 conversation id (a leading `conv_` is normalized before hashing, and a legacy
 prefixed digest is used when one is already present), holding e.g.
