@@ -410,12 +410,15 @@ async def test_creation_intent_reconciled_after_crash(
     )
     try:
         await fresh.start()
+        await fresh.sweep()
         assert not fresh.records
         if record_identity:
             assert not list((tmp_path / "workspace").iterdir())
         else:
             assert uid in fresh.quarantined
-            assert Path(intent[uid]["staging_path"]).exists()
+            assert not Path(intent[uid]["staging_path"]).exists()
+            assert Path(fresh.quarantined[uid].staging_path).exists()
+            assert fresh.quarantined[uid].staging_ino != 0
     finally:
         await fresh.stop()
 
@@ -837,9 +840,12 @@ async def test_pending_intent_preserves_unrelated_occupant(
     )
     try:
         await fresh.start()
-        assert staging.read_bytes() == b"unrelated"
+        await fresh.sweep()
+        assert not staging.exists()
         assert uid not in fresh.records
         assert uid in fresh.quarantined
+        assert Path(fresh.quarantined[uid].staging_path).read_bytes() == b"unrelated"
+        assert fresh.quarantined[uid].staging_ino != 0
     finally:
         await fresh.stop()
 
@@ -1190,3 +1196,421 @@ async def test_unpublished_finalize_timeout_can_retry(
     assert (await client.post(url)).status_code == 200
     registry = await manager.resolve_registry("session")
     assert registry.get_baseline("payload.bin") == "before timeout"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "conflict,expected", [("fail", "created"), ("replace", "replaced"), ("rename", "renamed")]
+)
+async def test_publication_plan_recovers_without_file_metadata(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict: str,
+    expected: str,
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    workspace = tmp_path / "workspace"
+    if conflict != "fail":
+        (workspace / "payload.bin").write_text("baseline")
+    response = await create(client, size=0, on_conflict=conflict)
+    uid = response.json()["upload_id"]
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    original = helper.call
+    durable = {}
+    committed = {}
+
+    def lose(metadata, raw=b"", **kwargs):
+        if metadata["op"] == "complete":
+            durable.update(json.loads(manager.state_path.read_text()))
+        result = original(metadata, raw, **kwargs)
+        if metadata["op"] == "complete":
+            committed.update(result)
+            helper.close()
+            return {"code": "gone", "error": "Lost publication response"}
+        return result
+
+    monkeypatch.setattr(helper, "call", lose)
+    url = BASE + "/" + uid + "/complete?created_by=alice"
+    result = await client.post(url)
+    assert result.status_code == 200
+    assert result.json() == committed
+    assert result.json()["outcome"] == expected
+    assert durable[uid].get("publication") is not None
+    target = workspace / result.json()["final_name"]
+    if sys.platform == "darwin":
+        import subprocess
+
+        assert "user.omnigent-upload-receipt" not in subprocess.check_output(
+            ["xattr", str(target)], text=True
+        )
+    else:
+        assert "user.omnigent-upload-receipt" not in os.listxattr(target)
+    await manager.stop()
+    manager.state_path.write_text(json.dumps(durable))
+    fresh = register_upload_routes(
+        FastAPI(),
+        resolve_environment=manager.resolve_environment,
+        resolve_registry=manager.resolve_registry,
+        state_path=manager.state_path,
+    )
+    try:
+        await fresh.start()
+        await fresh.sweep()
+        assert fresh.records[uid].result == committed
+    finally:
+        await fresh.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("op", ["complete", "status", "abort", "append"])
+async def test_request_reconciles_before_background_startup(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, op: str
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    response = await create(client, size=0)
+    uid = response.json()["upload_id"]
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    original = helper.call
+    durable = {}
+
+    def capture(metadata, raw=b"", **kwargs):
+        if metadata["op"] == "complete":
+            durable.update(json.loads(manager.state_path.read_text()))
+        return original(metadata, raw, **kwargs)
+
+    monkeypatch.setattr(helper, "call", capture)
+    committed = await client.post(BASE + "/" + uid + "/complete?created_by=alice")
+    assert committed.status_code == 200
+    await manager.stop()
+    manager.state_path.write_text(json.dumps(durable))
+    fresh = register_upload_routes(
+        FastAPI(),
+        resolve_environment=manager.resolve_environment,
+        resolve_registry=manager.resolve_registry,
+        state_path=manager.state_path,
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    real_sweep = fresh.sweep
+
+    async def delayed():
+        entered.set()
+        await release.wait()
+        await real_sweep()
+
+    monkeypatch.setattr(fresh, "sweep", delayed)
+    await fresh.start()
+    assert entered.is_set()
+    try:
+        if op == "append":
+            from omnigent.runner.workspace_upload import RouteError
+
+            with pytest.raises(RouteError) as exc:
+                await fresh.operate("session", DEFAULT_ENVIRONMENT_ID, uid, "alice", op)
+            assert exc.value.code == "already_complete"
+        else:
+            assert (
+                await fresh.operate("session", DEFAULT_ENVIRONMENT_ID, uid, "alice", op)
+                == committed.json()
+            )
+        assert fresh.records[uid].result == committed.json()
+    finally:
+        release.set()
+        await fresh.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stop_still_settles_and_closes(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    response = await create(client)
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    original = manager._call
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed(uid, record, op, *args, **kwargs):
+        if op == "append":
+            entered.set()
+            await release.wait()
+        return await original(uid, record, op, *args, **kwargs)
+
+    monkeypatch.setattr(manager, "_call", delayed)
+    request = asyncio.create_task(
+        client.patch(
+            BASE + "/" + response.json()["upload_id"] + "?created_by=alice",
+            headers=HEADERS,
+            content=b"a",
+        )
+    )
+    await entered.wait()
+    stopping = asyncio.create_task(manager.stop())
+    await asyncio.sleep(0)
+    stopping.cancel()
+    await asyncio.sleep(0.02)
+    waiting = not stopping.done()
+    release.set()
+    await request
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+    assert waiting
+    assert helper._closed
+    assert not manager.helpers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["open", "committed", "gone"])
+async def test_cross_session_upload_rejected(client: httpx.AsyncClient, phase: str) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    response = await create(client, size=0)
+    uid = response.json()["upload_id"]
+    if phase == "committed":
+        await manager.operate("session", DEFAULT_ENVIRONMENT_ID, uid, "alice", "complete")
+    if phase == "gone":
+        await manager.operate("session", DEFAULT_ENVIRONMENT_ID, uid, "alice", "abort")
+    from omnigent.runner.workspace_upload import RouteError
+
+    for op in ("status", "append", "complete", "abort"):
+        with pytest.raises(RouteError) as exc:
+            await manager.operate("session-b", DEFAULT_ENVIRONMENT_ID, uid, "alice", op)
+        assert exc.value.status == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_occupant", [False, True])
+async def test_quarantined_intent_expires_by_pinned_identity(
+    client: httpx.AsyncClient,
+    replace_occupant: bool,
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    response = await create(client)
+    uid = response.json()["upload_id"]
+    record = manager.records[uid]
+    await manager.stop()
+    record.pending = True
+    record.staging_dev = record.staging_ino = 0
+    await manager._persist()
+    fresh = register_upload_routes(
+        FastAPI(),
+        resolve_environment=manager.resolve_environment,
+        resolve_registry=manager.resolve_registry,
+        state_path=manager.state_path,
+    )
+    try:
+        await fresh.start()
+        await fresh.sweep()
+        quarantined = fresh.quarantined[uid]
+        assert quarantined.quarantine_id is not None
+        assert quarantined.staging_ino != 0
+        path = Path(quarantined.staging_path)
+        assert path.exists()
+        await fresh.sweep(now=quarantined.quarantined_at + fresh.limits.max_age_s - 1)
+        assert path.exists()
+        assert uid in fresh.quarantined
+        if replace_occupant:
+            other = path.with_name("replacement")
+            other.write_bytes(b"unrelated")
+            os.replace(other, path)
+        await fresh.sweep(now=quarantined.quarantined_at + fresh.limits.max_age_s + 1)
+        if replace_occupant:
+            assert path.read_bytes() == b"unrelated"
+            assert uid in fresh.quarantined
+        else:
+            assert not path.exists()
+            assert uid not in fresh.quarantined
+            assert uid not in json.loads(fresh.state_path.read_text())
+    finally:
+        await fresh.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", ["replace", "rename"])
+async def test_publication_target_changes_after_wal(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, conflict: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    if conflict == "rename":
+        (workspace / "payload.bin").write_text("original")
+    manager = client._transport.app.state.workspace_uploads
+    response = await create(client, size=0, on_conflict=conflict)
+    original = manager._call
+    first = True
+    planned = []
+
+    async def change(uid, record, op, *args, **kwargs):
+        nonlocal first
+        if op == "complete":
+            planned.append(json.loads(manager.state_path.read_text())[uid]["publication"])
+            if first:
+                first = False
+                (workspace / kwargs["publication"]["final_name"]).write_text("intervening")
+        return await original(uid, record, op, *args, **kwargs)
+
+    monkeypatch.setattr(manager, "_call", change)
+    result = await client.post(
+        BASE + "/" + response.json()["upload_id"] + "/complete?created_by=alice"
+    )
+    assert result.status_code == 200
+    assert len(planned) == 2
+    if conflict == "replace":
+        assert result.json()["outcome"] == "replaced"
+        registry = await manager.resolve_registry("session")
+        assert registry.get_baseline("payload.bin") == "intervening"
+    else:
+        assert result.json()["final_name"] == "payload (2).bin"
+        assert (workspace / "payload (1).bin").read_text() == "intervening"
+        assert (workspace / "payload.bin").read_text() == "original"
+
+
+@pytest.mark.asyncio
+async def test_restart_after_wal_before_publish_never_reports_commit(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runner.workspace_upload import RouteError
+
+    manager = client._transport.app.state.workspace_uploads
+    response = await create(client, size=0)
+    uid = response.json()["upload_id"]
+    original = manager._call
+
+    async def lost(uid, record, op, *args, **kwargs):
+        if op == "complete":
+            raise RouteError(410, "gone", "Lost helper before publication")
+        return await original(uid, record, op, *args, **kwargs)
+
+    monkeypatch.setattr(manager, "_call", lost)
+    assert (await client.post(BASE + "/" + uid + "/complete?created_by=alice")).status_code == 410
+    data = json.loads(manager.state_path.read_text())[uid]
+    assert data["publication"] is not None
+    staging = Path(data["staging_path"])
+    await manager.stop()
+    fresh = register_upload_routes(
+        FastAPI(),
+        resolve_environment=manager.resolve_environment,
+        resolve_registry=manager.resolve_registry,
+        state_path=manager.state_path,
+    )
+    try:
+        await fresh.start()
+        await fresh.sweep()
+        assert uid not in fresh.records
+        assert not staging.exists()
+        assert not (staging.parent / "payload.bin").exists()
+    finally:
+        await fresh.stop()
+
+
+@pytest.mark.asyncio
+async def test_lost_quarantine_response_replays_indexed_move(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.workspace_upload import RouteError
+
+    manager = client._transport.app.state.workspace_uploads
+    response = await create(client)
+    uid = response.json()["upload_id"]
+    record = manager.records[uid]
+    staging = Path(record.staging_path)
+    record.pending = True
+    record.staging_dev = record.staging_ino = 0
+    original = manager._call
+    durable = {}
+
+    async def lose(uid, record, op, *args, **kwargs):
+        if op == "quarantine":
+            durable.update(json.loads(manager.state_path.read_text()))
+            await original(uid, record, op, *args, **kwargs)
+            raise RouteError(410, "gone", "Lost quarantine response")
+        return await original(uid, record, op, *args, **kwargs)
+
+    monkeypatch.setattr(manager, "_call", lose)
+    await manager.sweep()
+    assert not staging.exists()
+    assert durable[uid]["quarantine_id"] is not None
+    assert durable[uid]["staging_ino"] == 0
+    await manager.stop()
+    manager.state_path.write_text(json.dumps(durable))
+    fresh = register_upload_routes(
+        FastAPI(),
+        resolve_environment=manager.resolve_environment,
+        resolve_registry=manager.resolve_registry,
+        state_path=manager.state_path,
+    )
+    try:
+        await fresh.start()
+        await fresh.sweep()
+        quarantined = fresh.quarantined[uid]
+        assert quarantined.staging_ino != 0
+        await fresh.sweep(now=quarantined.quarantined_at + fresh.limits.max_age_s + 1)
+        assert uid not in fresh.quarantined
+        assert not Path(quarantined.staging_path).exists()
+    finally:
+        await fresh.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["plan_response", "index_save"])
+async def test_publication_never_precedes_durable_plan(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    from omnigent.runner.workspace_upload import RouteError
+
+    manager = client._transport.app.state.workspace_uploads
+    response = await create(client, size=0)
+    uid = response.json()["upload_id"]
+    record = manager.records[uid]
+    staging = Path(record.staging_path)
+    original = manager._call
+    published = []
+
+    async def fail(uid, record, op, *args, **kwargs):
+        if op == "complete":
+            published.append(True)
+        result = await original(uid, record, op, *args, **kwargs)
+        if op == "plan" and failure == "plan_response":
+            raise RouteError(410, "gone", "Lost plan response")
+        return result
+
+    def save_failure():
+        raise OSError("Index storage failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(manager, "_call", fail)
+        if failure == "index_save":
+            patch.setattr(manager, "_save", save_failure)
+        result = await client.post(BASE + "/" + uid + "/complete?created_by=alice")
+    assert result.status_code == (410 if failure == "plan_response" else 500)
+    assert not published
+    assert staging.exists()
+    assert not (staging.parent / "payload.bin").exists()
+    assert (await client.post(BASE + "/" + uid + "/complete?created_by=alice")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_quarantine_move_waits_for_durable_destination(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    response = await create(client)
+    uid = response.json()["upload_id"]
+    record = manager.records[uid]
+    record.pending = True
+    record.staging_dev = record.staging_ino = 0
+    staging = Path(record.staging_path)
+
+    def failure():
+        raise OSError("Index storage failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(manager, "_save", failure)
+        await manager.sweep()
+        assert staging.exists()
+        await manager.sweep()
+        assert staging.exists()
+    await manager.sweep()
+    assert not staging.exists()
+    assert Path(manager.quarantined[uid].staging_path).exists()

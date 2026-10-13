@@ -1,4 +1,9 @@
-"""Dormant runner upload routes and an ownership-bound staging index."""
+"""Dormant runner uploads with an ownership-bound staging index.
+
+HELPER_CACHE_MAX bounds helpers across sessions and environments. Open uploads pin
+helpers until drained or max_age (24 hours); HEAD refreshes idle expiry only.
+When all helpers are pinned, new environments receive 429 with Retry-After.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
@@ -38,6 +43,8 @@ HELPER_CACHE_MAX = 32
 HELPER_IDLE_S = 300
 STARTUP_SWEEP_BUDGET_S = 0.5
 GONE_MAX = 4096
+PUBLICATION_ATTEMPTS = 3
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -83,9 +90,11 @@ class UploadRecord(BaseModel):
     staging_ino: int = 0
     parent_dev: int
     parent_ino: int
+    quarantine_id: str | None = None
+    quarantined_at: float | None = None
     pending: bool = False
     finalizing: bool = False
-    target_existed: bool = False
+    publication: dict[str, object] | None = None
     result: dict[str, object] | None = None
     snapshot: str | None = None
 
@@ -127,6 +136,7 @@ def _unwrap(result: dict[str, object]) -> dict[str, object]:
         "is_directory": 409,
         "offset_mismatch": 409,
         "incomplete": 409,
+        "plan_changed": 409,
         "checksum_mismatch": 409,
         "too_large": 413,
         "gone": 410,
@@ -307,7 +317,7 @@ class UploadManager:
         async with self._using_helper(record.session_id, record.environment_id) as helper:
             metadata = {"op": op, "id": uid, "size": record.size, **fields}
             result = await asyncio.to_thread(helper.call, metadata, raw)
-            if result.get("code") == "gone" and op in ("append", "status", "abort"):
+            if result.get("code") == "gone" and op in ("append", "status", "abort", "plan"):
                 _unwrap(
                     await asyncio.to_thread(
                         helper.call,
@@ -371,10 +381,9 @@ class UploadManager:
         async with self.lock:
             await self._save_settled()
 
-    def _expired(self, uid: str, record: UploadRecord, now: float) -> bool:
+    def _expired(self, record: UploadRecord, now: float) -> bool:
         return (
-            (uid in self.restored and record.result is None)
-            or now - record.last_activity >= self.limits.idle_ttl_s
+            now - record.last_activity >= self.limits.idle_ttl_s
             or now - record.created_at >= self.limits.max_age_s
         )
 
@@ -418,6 +427,46 @@ class UploadManager:
             record.snapshot = None
         await self._persist()
 
+    async def _quarantine(self, uid: str, record: UploadRecord) -> None:
+        if record.quarantine_id is None:
+            record.quarantine_id = uuid.uuid4().hex
+            record.quarantined_at = _now()
+            record.staging_dev = record.staging_ino = 0
+        async with self.lock:
+            self.quarantined[uid] = record
+            self.records.pop(uid, None)
+            await self._save_settled()
+        result = await self._call(
+            uid, record, "quarantine", **record.model_dump(exclude={"snapshot"})
+        )
+        async with self.lock:
+            if result.get("absent"):
+                self._drop(uid, record)
+            else:
+                record.staging_path = cast(str, result["staging_path"])
+                record.staging_dev = cast(int, result["staging_dev"])
+                record.staging_ino = cast(int, result["staging_ino"])
+                record.pending = False
+                self.restored.discard(uid)
+            await self._save_settled()
+
+    async def _reconcile(self, uid: str, record: UploadRecord) -> bool:
+        if record.pending and not record.staging_ino:
+            await self._quarantine(uid, record)
+            return False
+        if record.finalizing and record.result is None:
+            try:
+                await self._recover(uid, record)
+            except RouteError as exc:
+                if exc.code != "gone":
+                    raise
+        if uid in self.restored:
+            if record.result is None:
+                await self._remove(uid, record)
+                return False
+            self.restored.discard(uid)
+        return True
+
     @staticmethod
     def _track_change(record: UploadRecord, registry: FilesystemRegistry | None) -> None:
         try:
@@ -436,23 +485,23 @@ class UploadManager:
         for uid, record in list({**self.records, **self.quarantined}.items()):
             if uid not in self.records and uid not in self.quarantined:
                 continue
-            if uid in self.quarantined and not record.staging_ino:
-                continue
             async with self.upload_locks.setdefault(uid, asyncio.Lock()):
                 record = self.records.get(uid) or self.quarantined.get(uid)
                 if record is None:
                     continue
-                if uid not in self.quarantined and not self._expired(uid, record, instant):
-                    continue
                 try:
-                    if record.finalizing and record.result is None:
-                        try:
-                            await self._recover(uid, record)
-                        except RouteError as exc:
-                            if exc.code != "gone":
-                                raise
-                        if record.result is not None and not self._expired(uid, record, instant):
-                            continue
+                    if uid in self.quarantined and record.quarantine_id and not record.staging_ino:
+                        await self._quarantine(uid, record)
+                        continue
+                    if not await self._reconcile(uid, record):
+                        continue
+                    if record.quarantine_id and (
+                        record.quarantined_at is None
+                        or instant - record.quarantined_at < self.limits.max_age_s
+                    ):
+                        continue
+                    if uid not in self.quarantined and not self._expired(record, instant):
+                        continue
                     await self._remove(uid, record)
                 except Exception as exc:
                     logger.exception("Upload cleanup failed for %s", uid)
@@ -495,23 +544,31 @@ class UploadManager:
 
     async def stop(self) -> None:
         self.stopping = True
-        if self.task is not None:
-            self.task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.task
-            self.task = None
-        await asyncio.gather(
-            *(asyncio.shield(task) for task in list(self.inflight)), return_exceptions=True
-        )
+        task = asyncio.create_task(self._stop())
         try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await self._settle(task)
+            raise
+
+    async def _stop(self) -> None:
+        try:
+            if self.task is not None:
+                self.task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.task
+                self.task = None
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in list(self.inflight)), return_exceptions=True
+            )
+        finally:
             await asyncio.gather(
                 *(asyncio.to_thread(binding.client.close) for binding in self.helpers.values()),
                 return_exceptions=True,
             )
-        finally:
             self.helpers.clear()
 
-    async def _settle(self, task: asyncio.Task[dict[str, object]]) -> dict[str, object]:
+    async def _settle(self, task: asyncio.Task[T]) -> T:
         while True:
             try:
                 return await asyncio.shield(task)
@@ -700,7 +757,9 @@ class UploadManager:
                 owner,
             ):
                 raise RouteError(403, "upload_owner_mismatch", "Upload belongs to another caller")
-            if self._expired(uid, record, _now()):
+            if not await self._reconcile(uid, record):
+                raise RouteError(410, "gone", "Upload expired during reconciliation")
+            if self._expired(record, _now()):
                 await self._remove(uid, record)
                 raise RouteError(410, "gone", "Upload expired")
             if record.result is not None:
@@ -708,61 +767,10 @@ class UploadManager:
                     raise RouteError(409, "already_complete", "Upload already committed")
                 record.offset = record.size
                 return record.result
-            snapshot = None
-            registry = None
             if op == "complete":
-                if record.finalizing:
-                    try:
-                        await self._recover(uid, record)
-                        assert record.result is not None
-                        return record.result
-                    except RouteError as exc:
-                        if exc.code != "gone":
-                            raise
-                    await self._call(
-                        uid, record, "resume", **record.model_dump(exclude={"snapshot"})
-                    )
-                registry = await self.resolve_registry(session_id)
-                if (
-                    not record.finalizing
-                    and registry is not None
-                    and record.on_conflict == "replace"
-                ):
-                    env = await self.resolve_environment(session_id, environment_id)
-                    fs = CallerProcessFilesystem(env)
-                    try:
-                        existing = await fs.read(
-                            f"{record.dir}/{record.name}" if record.dir else record.name
-                        )
-                        if existing.encoding:
-                            snapshot = existing.data.decode(existing.encoding, errors="replace")
-                    except (ResourceError, OSError, UnicodeError, ValueError, RuntimeError):
-                        pass
-                if not record.finalizing:
-                    record.snapshot = snapshot
-                record.finalizing = True
-                await self._persist()
-            recovered = False
-            try:
+                result = await self._finalize(uid, record)
+            else:
                 result = await self._call(uid, record, op, raw, offset=offset)
-            except RouteError as exc:
-                if op != "complete" or exc.code not in ("gone", "timeout"):
-                    raise
-                try:
-                    await self._recover(uid, record)
-                except RouteError as recovery_error:
-                    if recovery_error.code != "gone":
-                        raise
-                    if exc.code == "timeout":
-                        raise exc from recovery_error
-                    await self._call(
-                        uid, record, "resume", **record.model_dump(exclude={"snapshot"})
-                    )
-                    result = await self._call(uid, record, op, raw, offset=offset)
-                else:
-                    assert record.result is not None
-                    result = record.result
-                    recovered = True
             if op == "abort":
                 async with self.lock:
                     self._drop(uid, record)
@@ -771,14 +779,50 @@ class UploadManager:
                 record.last_activity = _now()
                 if "offset" in result:
                     record.offset = cast(int, result["offset"])
-                if op == "complete":
-                    record.result = result
-                    record.offset = record.size
-                    record.finalizing = False
-                    if not recovered:
-                        self._track_change(record, registry)
-                    await self._persist()
             return result
+
+    async def _finalize(self, uid: str, record: UploadRecord) -> dict[str, object]:
+        registry = await self.resolve_registry(record.session_id)
+        for _ in range(PUBLICATION_ATTEMPTS):
+            publication = await self._call(uid, record, "plan")
+            record.snapshot = None
+            if registry is not None and publication["outcome"] == "replaced":
+                env = await self.resolve_environment(record.session_id, record.environment_id)
+                try:
+                    existing = await CallerProcessFilesystem(env).read(
+                        cast(str, publication["path"])
+                    )
+                    if existing.encoding:
+                        record.snapshot = existing.data.decode(existing.encoding, errors="replace")
+                except (ResourceError, OSError, UnicodeError, ValueError, RuntimeError):
+                    pass
+            record.publication = publication
+            record.finalizing = True
+            record.last_activity = _now()
+            await self._persist()
+            try:
+                result = await self._call(uid, record, "complete", publication=publication)
+            except RouteError as exc:
+                if exc.code == "plan_changed":
+                    continue
+                if exc.code in ("gone", "timeout"):
+                    try:
+                        await self._recover(uid, record)
+                    except RouteError as recovery_error:
+                        if recovery_error.code != "gone":
+                            raise
+                        raise exc from recovery_error
+                    assert record.result is not None
+                    return record.result
+                raise
+            record.result = result
+            record.offset = record.size
+            record.finalizing = False
+            record.last_activity = _now()
+            self._track_change(record, registry)
+            await self._persist()
+            return result
+        raise RouteError(409, "file_exists", "Destination keeps changing")
 
 
 def register_upload_routes(
