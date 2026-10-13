@@ -25,6 +25,7 @@ class Host:
     host_id: str
     home: Path
     log_path: Path
+    name: str = ""
 
     def wait_online(
         self, client: httpx.Client, *, timeout: float = 30, poll_interval: float = 0.5
@@ -63,10 +64,13 @@ def isolated_host(
     command: Sequence[str] | None = None,
     cwd: Path | None = None,
     ready: Callable[[Host], object] | None = None,
+    config_entries: Mapping[str, object] | None = None,
 ) -> Iterator[Host]:
     """Start a compat-aware daemon with owned HOME/config/data and a unique identity.
 
     ``command`` can preserve a CLI entry point or install a caller's fault.
+    ``config_entries`` seeds the host's user-level ``config.yaml`` (providers,
+    defaults, harness overrides) before the daemon starts; ``host`` stays owned.
     Use a fresh root for each host; existing identity files are rejected.
     Readiness is explicit: pass a callback or call wait_online with an authenticated
     client. Cleanup also runs when the callback or the test raises.
@@ -81,6 +85,8 @@ def isolated_host(
     }
     if owned & overrides.keys():
         raise ValueError(f"Host owns these environment keys: {sorted(owned & overrides.keys())}")
+    if config_entries and "host" in config_entries:
+        raise ValueError("Host owns the `host` identity section of config.yaml")
     process_env = isolated_process_env(home, overrides, base_env)
     home.mkdir(parents=True, exist_ok=True)
     config = home / ".omnigent"
@@ -88,7 +94,9 @@ def isolated_host(
     host_id = host_id or uuid.uuid4().hex
     name = name or f"e2e-host-{host_id[:12]}"
     with (config / "config.yaml").open("x") as identity:
-        yaml.safe_dump({"host": {"host_id": host_id, "name": name}}, identity)
+        yaml.safe_dump(
+            {**dict(config_entries or {}), "host": {"host_id": host_id, "name": name}}, identity
+        )
     log_path = root / "host.log"
     process_env.update(
         OMNIGENT_CONFIG_HOME=str(config), OMNIGENT_HOST_ID=host_id, OMNIGENT_HOST_NAME=name
@@ -110,7 +118,7 @@ def isolated_host(
             stderr=subprocess.STDOUT,
         )
         try:
-            host = Host(proc, host_id, home, log_path)
+            host = Host(proc, host_id, home, log_path, name)
             if ready is not None:
                 ready(host)
             yield host

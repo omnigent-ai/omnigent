@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import Literal, NamedTuple, Protocol
 
 from omnigent.onboarding.configure_models import (
@@ -80,27 +81,27 @@ def _config_writer() -> tuple[Callable[[], dict[str, object]], _ConfigSaver]:
     ``providers:`` block (adds/updates one entry without dropping siblings),
     matching ``omnigent setup``'s writer.
     """
-    import yaml
-
+    from omnigent.config import global_config_lock, write_global_config
     from omnigent.onboarding.provider_config import _config_path
 
     def _load() -> dict[str, object]:
         return load_config()
 
     def _save(settings: dict[str, object], *, deep_merge_providers: bool) -> None:
-        path = _config_path()
-        cfg = _load()
-        for key, value in settings.items():
-            if deep_merge_providers and key == "providers" and isinstance(value, dict):
-                existing = cfg.get("providers")
-                merged = dict(existing) if isinstance(existing, dict) else {}
-                merged.update(value)
-                cfg["providers"] = merged
-            else:
-                cfg[key] = value
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+        path = Path(_config_path())
+        # The host's settings sync and the CLI rewrite this file too: hold the
+        # shared lock from load to write and replace the file atomically.
+        with global_config_lock(path):
+            cfg = _load()
+            for key, value in settings.items():
+                if deep_merge_providers and key == "providers" and isinstance(value, dict):
+                    existing = cfg.get("providers")
+                    merged = dict(existing) if isinstance(existing, dict) else {}
+                    merged.update(value)
+                    cfg["providers"] = merged
+                else:
+                    cfg[key] = value
+            write_global_config(cfg, path)
 
     return _load, _save
 

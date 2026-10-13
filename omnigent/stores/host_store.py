@@ -240,6 +240,7 @@ class HostStore:
         :param storage_location: SQLAlchemy database URI, e.g.
             ``"sqlite:///hosts.db"``.
         """
+        self.storage_location = storage_location
         self._engine: Engine = get_or_create_engine(storage_location)
         self._session = make_named_managed_session_maker(
             self._engine,

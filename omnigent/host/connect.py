@@ -63,6 +63,8 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostConfigSyncFrame,
+    HostConfigUpdateFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -224,6 +226,13 @@ def _coerce_int(value: object) -> int:
 HARNESS_READINESS_REFRESH_INTERVAL_S = 5.0
 # Auth changes and removals need the full, potentially expensive readiness map.
 HARNESS_READINESS_FULL_REFRESH_INTERVAL_S = 60.0
+# How often the host re-reads its config for a local change to report, and how
+# often it asks the server for settings changed on the user's other machines.
+CONFIG_SYNC_CHECK_INTERVAL_S = 5.0
+CONFIG_SYNC_POLL_INTERVAL_S = 60.0
+# Reports repeated on the poll interval while the server has not answered one,
+# so a transient server failure recovers and an older server sees few unknown frames.
+CONFIG_SYNC_PROBE_ATTEMPTS = 3
 # How long a quick-probe verdict stays cached. New-CLI installs surface within
 # this window (a minute of badge staleness is invisible); the quick probe's
 # 5s cadence re-uses the cached verdict for free. Matches the full-refresh
@@ -1263,6 +1272,15 @@ class HostProcess:
         # runner_id → exit report for exits that could not be sent
         # (tunnel down at the time). Flushed after the next hello.
         self._unreported_exits: dict[str, HostRunnerExitedFrame] = {}
+        # Set once the current server answers a ``host.config_sync`` report; a
+        # server that never does predates config sync and is not polled.
+        self._config_sync_acked = False
+        # Reads for a report and writes of an applied update both run in worker
+        # threads; interleaving them could report stale settings as a local edit.
+        self._config_sync_lock = threading.Lock()
+        self._config_sync_report_error: str | None = None
+        # Updates are applied in arrival order even though each frame runs on its own task.
+        self._config_update_order = asyncio.Lock()
         # Strong refs to per-runner watcher tasks; asyncio only keeps
         # weak refs, so an unreferenced task can be GC'd mid-flight.
         self._watcher_tasks: set[asyncio.Task[None]] = set()
@@ -4708,7 +4726,9 @@ class HostProcess:
         # the server is offline. Successful or in-flight work is retained.
         self._ensure_model_options_prewarm()
         self._ws = ws
+        self._config_sync_acked = False
         readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
+        config_sync_task: asyncio.Task[None] | None = None
         try:
             # Reports raised while disconnected must wait until registration;
             # the server cannot route them before this connection owns the host.
@@ -4717,6 +4737,12 @@ class HostProcess:
                 await self._report_runner_exit(
                     runner_id, report.error, had_connected=report.had_connected
                 )
+            # Portable settings are reported once registration is ordered on
+            # the socket, then watched for local changes off this loop.
+            config_report = await asyncio.to_thread(self._build_config_sync_report)
+            if config_report is not None:
+                await self._send_text(ws, encode_host_frame(config_report))
+            config_sync_task = asyncio.create_task(self._config_sync_loop(ws, config_report))
             print(
                 f"✓ Connected as {self._identity.name!r} "
                 f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
@@ -4752,9 +4778,12 @@ class HostProcess:
         finally:
             if (diagnostics := self._diagnostics_for(ws)) is not None:
                 diagnostics.freeze()
-            readiness_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await readiness_task
+            for task in (readiness_task, config_sync_task):
+                if task is None:
+                    continue
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
 
     async def _harness_readiness_loop(
         self,
@@ -4808,6 +4837,76 @@ class HostProcess:
                 )
                 published_configured = configured
                 published_gateway = gateway
+
+    def _build_config_sync_report(self) -> HostConfigSyncFrame | None:
+        """Describe the local portable settings, or ``None`` when they cannot be reported."""
+        from omnigent.config_sync import validate_synced_settings
+        from omnigent.host.config_sync import build_sync_frame
+
+        try:
+            with self._config_sync_lock:
+                frame = build_sync_frame(self._server_url)
+            validate_synced_settings(frame.settings)
+        except ValueError as exc:
+            # The server would refuse this report; say so once per cause instead of every poll.
+            if self._config_sync_report_error != str(exc):
+                self._config_sync_report_error = str(exc)
+                _logger.warning("Host config sync: local settings were not reported: %s", exc)
+            return None
+        except Exception as exc:
+            cause = f"{type(exc).__name__}: {exc}"
+            if self._config_sync_report_error != cause:
+                self._config_sync_report_error = cause
+                _logger.exception("Host config sync: could not read the local config")
+            return None
+        self._config_sync_report_error = None
+        return frame
+
+    async def _config_sync_loop(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        sent: HostConfigSyncFrame | None,
+    ) -> None:
+        """Report local changes to portable settings and poll the server for newer ones.
+
+        :param sent: The report already sent on this connection, if any. It
+            doubles as a probe: until the server answers one, periodic reports
+            stop after ``CONFIG_SYNC_PROBE_ATTEMPTS`` and only local changes are
+            reported, so an older server sees a bounded number of unknown frames.
+        """
+        loop = asyncio.get_running_loop()
+        next_poll = loop.time() + CONFIG_SYNC_POLL_INTERVAL_S
+        probes = 1 if sent is not None else 0
+        while True:
+            await asyncio.sleep(CONFIG_SYNC_CHECK_INTERVAL_S)
+            frame = await asyncio.to_thread(self._build_config_sync_report)
+            now = loop.time()
+            if frame is None:
+                continue
+            poll_due = now >= next_poll and (
+                self._config_sync_acked or probes < CONFIG_SYNC_PROBE_ATTEMPTS
+            )
+            local_edit = sent is not None and frame.changed and frame != sent
+            if sent is None or local_edit or poll_due:
+                await self._send_text(ws, encode_host_frame(frame))
+                sent = frame
+                next_poll = now + CONFIG_SYNC_POLL_INTERVAL_S
+                # Local edits are always reported and do not use up the probe budget.
+                if not local_edit and not self._config_sync_acked:
+                    probes += 1
+
+    def _handle_config_update(self, frame: HostConfigUpdateFrame) -> None:
+        """Apply the user's settings from the server to this host's config."""
+        from omnigent.host.config_sync import apply_config_update
+
+        try:
+            with self._config_sync_lock:
+                changed = apply_config_update(frame, self._server_url)
+        except ValueError as exc:
+            _logger.warning("Ignoring malformed synced settings from the server: %s", exc)
+            return
+        if changed:
+            _logger.info("Applied synced user settings (revision %d)", frame.revision)
 
     def _raise_connection_error(self, frame: HostConnectionErrorFrame) -> None:
         """Raise the lifecycle exception requested by a server error frame."""
@@ -5040,6 +5139,10 @@ class HostProcess:
         elif isinstance(frame, HostHarnessStartupFrame):
             startup_result = await asyncio.to_thread(self._handle_harness_startup, frame)
             await self._send_text(ws, encode_host_frame(startup_result))
+        elif isinstance(frame, HostConfigUpdateFrame):
+            self._config_sync_acked = True
+            async with self._config_update_order:
+                await asyncio.to_thread(self._handle_config_update, frame)
         elif isinstance(frame, HostMcpServersFrame):
             mcp_result = await asyncio.to_thread(self._handle_mcp_servers, frame)
             await self._send_text(ws, encode_host_frame(mcp_result))

@@ -39,6 +39,8 @@ from omnigent.host.connect import (
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostConfigSyncFrame,
+    HostConfigUpdateFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -2146,6 +2148,7 @@ async def test_connect_watchdog_silent_on_intentional_stop(
 @pytest.mark.parametrize("send_fails", [False, True])
 async def test_unreported_exit_flushes_after_reconnect(
     capsys: pytest.CaptureFixture[str],
+    synced_config_home: Path,
     had_connected: bool | None,
     send_fails: bool,
 ) -> None:
@@ -2172,9 +2175,12 @@ async def test_unreported_exit_flushes_after_reconnect(
     with pytest.raises(ConnectionError, match="test disconnect"):
         await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
 
-    assert len(tunnel.sent) == 2
-    hello = decode_host_frame(tunnel.sent[0])
-    assert isinstance(hello, HostHelloFrame)
+    # The parked report is flushed before the connection's settings report.
+    assert [type(decode_host_frame(raw)) for raw in tunnel.sent] == [
+        HostHelloFrame,
+        HostRunnerExitedFrame,
+        HostConfigSyncFrame,
+    ]
     report = decode_host_frame(tunnel.sent[1])
     assert isinstance(report, HostRunnerExitedFrame)
     assert report.runner_id == "runner_parked"
@@ -2216,7 +2222,7 @@ async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
 
 
 async def test_fast_capability_discovery_is_included_in_hello(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, synced_config_home: Path
 ) -> None:
     """The first hello carries both readiness and gateway backing."""
     host = _make_host_process()
@@ -2231,12 +2237,15 @@ async def test_fast_capability_discovery_is_included_in_hello(
     serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
     try:
         await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+        # The settings report follows the hello after a worker-thread read.
+        await asyncio.wait_for(tunnel.second_send.wait(), timeout=2.0)
     finally:
         await _cancel(serve_task)
 
     hello = decode_host_frame(tunnel.sent[0])
     assert isinstance(hello, HostHelloFrame)
-    assert len(tunnel.sent) == 1
+    # No readiness refresh follows the hello; only the settings report does.
+    assert [type(decode_host_frame(raw)) for raw in tunnel.sent[1:]] == [HostConfigSyncFrame]
     assert hello.configured_harnesses == {"codex-native": True}
     assert hello.gateway_inference == {"codex-native": True}
 
@@ -6058,7 +6067,16 @@ async def test_host_diagnostics_correlate_real_socket_closes_and_reset_on_reconn
         assert isinstance(hello, HostHelloFrame)
         hellos.append(hello)
         await ws.send(encode_frame(PingFrame(ts=123)))
-        assert decode_frame(await ws.recv()) == PongFrame(ts=123)
+        while True:
+            raw = await ws.recv()
+            try:
+                keepalive = decode_frame(raw)
+            except ValueError:
+                # Host frames such as the connect-time settings report are not keepalives.
+                assert isinstance(decode_host_frame(raw), HostConfigSyncFrame)
+                continue
+            assert keepalive == PongFrame(ts=123)
+            break
         if abrupt:
             ws.transport.abort()
         else:
@@ -6860,7 +6878,9 @@ async def test_inbound_frame_resets_silent_connect_streak(
     assert not [record for record in caplog.records if record.levelno == logging.ERROR]
 
 
-async def test_connection_error_frame_fails_loudly_on_live_receive_path() -> None:
+async def test_connection_error_frame_fails_loudly_on_live_receive_path(
+    synced_config_home: Path,
+) -> None:
     """A non-retryable server error escapes the live receive loop."""
     host = _host()
     tunnel = _ConnectionErrorTunnel(
@@ -6874,8 +6894,10 @@ async def test_connection_error_frame_fails_loudly_on_live_receive_path() -> Non
     with pytest.raises(HostConnectError, match="registration: database unavailable"):
         await host._serve_frames(tunnel)  # type: ignore[arg-type]
 
-    assert len(tunnel.sent) == 1
-    assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
+    assert [type(decode_host_frame(raw)) for raw in tunnel.sent] == [
+        HostHelloFrame,
+        HostConfigSyncFrame,
+    ]
     assert host._frame_tasks == set()
 
 
@@ -8844,3 +8866,220 @@ def test_run_host_process_classifies_how_the_host_ended(
         )
 
     assert _host_exit_reasons(caplog) == [expected]
+
+
+# ── Portable user settings sync ───────────────────────────────────────────
+
+_SYNCED_CONFIG_YAML = "model: mock-model-from-machine-a\nproviders:\n  work:\n    kind: key\n"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_config_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """Keep every host under test away from the real ~/.omnigent/config.yaml.
+
+    Lives outside ``tmp_path`` so directory-listing tests keep their expected entries.
+    """
+    home = tmp_path_factory.mktemp("config-home")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(home))
+    return home
+
+
+@pytest.fixture
+def synced_config_home(_isolated_config_home: Path) -> Path:
+    """The isolated config home holding one portable setting."""
+    (_isolated_config_home / "config.yaml").write_text(_SYNCED_CONFIG_YAML)
+    return _isolated_config_home
+
+
+async def _poll_until(predicate: Callable[[], bool], *, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("condition not met in time")
+        await asyncio.sleep(0.01)
+
+
+async def test_serve_frames_reports_portable_settings_right_after_hello(
+    synced_config_home: Path,
+) -> None:
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    assert [type(decode_host_frame(raw)) for raw in tunnel.sent] == [
+        HostHelloFrame,
+        HostConfigSyncFrame,
+    ]
+    assert decode_host_frame(tunnel.sent[1]) == HostConfigSyncFrame(
+        0, {"model": "mock-model-from-machine-a"}, True
+    )
+    _cleanup_host(host)
+
+
+async def test_config_sync_loop_reports_local_edits_and_polls_only_once_acked(
+    monkeypatch: pytest.MonkeyPatch, synced_config_home: Path
+) -> None:
+    monkeypatch.setattr("omnigent.host.connect.CONFIG_SYNC_CHECK_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect.CONFIG_SYNC_POLL_INTERVAL_S", 0.05)
+    host, ws = _make_host_process(), _RecordingWS()
+    initial = host._build_config_sync_report()
+    assert initial == HostConfigSyncFrame(0, {"model": "mock-model-from-machine-a"}, True)
+
+    task = asyncio.create_task(host._config_sync_loop(ws, initial))
+    try:
+        # Unanswered, the report is repeated a bounded number of times: the
+        # server may predate config sync, or its first reconciliation failed.
+        await _poll_until(lambda: len(ws.sent) == 2)
+        await asyncio.sleep(0.3)
+        assert len(ws.sent) == 2
+        assert all(decode_host_frame(raw) == initial for raw in ws.sent)
+
+        # A local edit is still reported.
+        (synced_config_home / "config.yaml").write_text("model: edited-locally\n")
+        await _poll_until(lambda: len(ws.sent) == 3)
+        assert decode_host_frame(ws.sent[2]) == HostConfigSyncFrame(
+            0, {"model": "edited-locally"}, True
+        )
+        await asyncio.sleep(0.3)
+        assert len(ws.sent) == 3
+
+        # Once answered, the host keeps polling for the user's other machines' changes.
+        host._config_sync_acked = True
+        await _poll_until(lambda: len(ws.sent) >= 5)
+        assert decode_host_frame(ws.sent[-1]) == HostConfigSyncFrame(
+            0, {"model": "edited-locally"}, True
+        )
+    finally:
+        await _cancel(task)
+    _cleanup_host(host)
+
+
+async def test_config_update_frame_writes_the_local_config_and_sync_state(
+    synced_config_home: Path,
+) -> None:
+    from omnigent.config import load_global_config
+    from omnigent.host.config_sync import build_sync_frame
+
+    host, ws = _make_host_process(), _RecordingWS()
+    update = HostConfigUpdateFrame(
+        3,
+        {"model": "from-machine-b", "harness": {"codex-native": {"args": ["--profile", "b"]}}},
+    )
+
+    host._start_frame_task(ws, encode_host_frame(update))
+    await _drain_frame_tasks(host)
+
+    assert host._config_sync_acked is True
+    assert load_global_config(synced_config_home / "config.yaml") == {
+        "model": "from-machine-b",
+        "providers": {"work": {"kind": "key"}},
+        "harness": {"codex-native": {"args": ["--profile", "b"]}},
+    }
+    assert build_sync_frame(host._server_url) == HostConfigSyncFrame(3, update.settings, False)
+    assert ws.sent == []
+    _cleanup_host(host)
+
+
+async def test_malformed_config_update_leaves_the_local_config_alone(
+    synced_config_home: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    host, ws = _make_host_process(), _RecordingWS()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        host._start_frame_task(
+            ws, encode_host_frame(HostConfigUpdateFrame(3, {"providers": {"work": {}}}))
+        )
+        await _drain_frame_tasks(host)
+
+    assert (synced_config_home / "config.yaml").read_text() == _SYNCED_CONFIG_YAML
+    assert not (synced_config_home / "config-sync.json").exists()
+    assert "Ignoring malformed synced settings" in caplog.text
+    _cleanup_host(host)
+
+
+async def test_config_sync_report_and_update_share_one_lock(
+    monkeypatch: pytest.MonkeyPatch, synced_config_home: Path
+) -> None:
+    host = _make_host_process()
+    observed: list[bool] = []
+
+    def recording(wrapped: Callable[..., object]) -> Callable[..., object]:
+        def call(*args: object, **kwargs: object) -> object:
+            observed.append(host._config_sync_lock.locked())
+            return wrapped(*args, **kwargs)
+
+        return call
+
+    import omnigent.host.config_sync as config_sync
+
+    monkeypatch.setattr(config_sync, "build_sync_frame", recording(config_sync.build_sync_frame))
+    monkeypatch.setattr(
+        config_sync, "apply_config_update", recording(config_sync.apply_config_update)
+    )
+
+    assert host._build_config_sync_report() is not None
+    host._handle_config_update(HostConfigUpdateFrame(1, {"model": "from-server"}))
+
+    assert observed == [True, True]
+    assert not host._config_sync_lock.locked()
+    _cleanup_host(host)
+
+
+def test_oversized_local_settings_are_not_reported_and_warn_once(
+    synced_config_home: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (synced_config_home / "config.yaml").write_text(
+        "harness:\n  codex-native:\n    args:\n"
+        + "".join(f"      - {'x' * 200}\n" for _ in range(100))
+    )
+    host = _make_host_process()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        assert host._build_config_sync_report() is None
+        assert host._build_config_sync_report() is None
+
+    assert caplog.text.count("local settings were not reported") == 1
+    (synced_config_home / "config.yaml").write_text("model: small-again\n")
+    assert host._build_config_sync_report() == HostConfigSyncFrame(
+        0, {"model": "small-again"}, True
+    )
+
+    # A config that cannot be read at all is logged once per cause as well.
+    (synced_config_home / "config.yaml").write_text("model: [unterminated\n")
+    with caplog.at_level(logging.ERROR, logger="omnigent.host.connect"):
+        assert host._build_config_sync_report() is None
+        assert host._build_config_sync_report() is None
+    assert caplog.text.count("could not read the local config") == 1
+    _cleanup_host(host)
+
+
+async def test_config_updates_apply_in_arrival_order_even_when_the_first_is_slow(
+    monkeypatch: pytest.MonkeyPatch, synced_config_home: Path
+) -> None:
+    import omnigent.host.config_sync as config_sync
+    from omnigent.config import load_global_config
+
+    real_apply = config_sync.apply_config_update
+    applied: list[int] = []
+
+    def slow_first(frame: HostConfigUpdateFrame, server_url: str, config_path: Path | None = None):
+        if not applied:
+            time.sleep(0.3)
+        applied.append(frame.revision)
+        return real_apply(frame, server_url, config_path)
+
+    monkeypatch.setattr(config_sync, "apply_config_update", slow_first)
+    host, ws = _make_host_process(), _RecordingWS()
+
+    host._start_frame_task(ws, encode_host_frame(HostConfigUpdateFrame(2, {"model": "second"})))
+    host._start_frame_task(ws, encode_host_frame(HostConfigUpdateFrame(3, {"model": "third"})))
+    await _drain_frame_tasks(host)
+
+    assert applied == [2, 3]
+    assert load_global_config(synced_config_home / "config.yaml")["model"] == "third"
+    assert config_sync.build_sync_frame(host._server_url).revision == 3
+    _cleanup_host(host)

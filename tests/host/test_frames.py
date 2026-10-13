@@ -7,8 +7,12 @@ import json
 import pytest
 
 from omnigent.host.frames import (
+    CAP_CONFIG_SYNC,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_CAPABILITIES,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostConfigSyncFrame,
+    HostConfigUpdateFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -2454,3 +2458,45 @@ def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) ->
                 }
             )
         )
+
+
+def test_config_sync_capability_is_advertised() -> None:
+    assert CAP_CONFIG_SYNC in HOST_CAPABILITIES
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostConfigSyncFrame(revision=0, settings={}, changed=False),
+        HostConfigSyncFrame(
+            revision=3,
+            settings={"model": "gpt-5", "harness": {"codex-native": {"args": ["--profile", "a"]}}},
+            changed=True,
+        ),
+        HostConfigUpdateFrame(revision=4, settings={"auto_open_conversation": True}),
+    ],
+)
+def test_config_sync_frames_round_trip(frame: HostConfigSyncFrame | HostConfigUpdateFrame) -> None:
+    encoded = encode_host_frame(frame)
+    expected_kind = (
+        "host.config_sync" if isinstance(frame, HostConfigSyncFrame) else "host.config_update"
+    )
+    assert json.loads(encoded)["kind"] == expected_kind
+    assert decode_host_frame(encoded) == frame
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"kind": "host.config_sync", "revision": -1, "settings": {}, "changed": False},
+        {"kind": "host.config_sync", "revision": True, "settings": {}, "changed": False},
+        {"kind": "host.config_sync", "revision": 1, "settings": [], "changed": False},
+        {"kind": "host.config_sync", "revision": 1, "settings": {}, "changed": "no"},
+        {"kind": "host.config_sync", "revision": 1, "settings": {}},
+        {"kind": "host.config_update", "revision": "1", "settings": {}},
+        {"kind": "host.config_update", "revision": 1, "settings": None},
+    ],
+)
+def test_config_sync_frames_reject_malformed_fields(payload: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        decode_host_frame(json.dumps(payload))

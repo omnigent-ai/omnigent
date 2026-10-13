@@ -69,7 +69,8 @@ with isolated_host(tmp_path / "host", live_server, env=host_env) as host:
 
 `isolated_host` owns home/config/data, unique identity, logs and process cleanup.
 Use a fresh root. It accepts `host_id`, `name`, `command`, `cwd`, environment
-overrides/removals and an optional readiness callback. Readiness is explicit:
+overrides/removals, `config_entries` to seed the host's user-level `config.yaml`
+(providers, defaults, harness overrides) and an optional readiness callback. Readiness is explicit:
 call `wait_online` or provide the callback. Do not use its preseeded identity to
 test identity generation or malformed configuration. Keep those setups local.
 Set identity through `host_id` and `name`; `env` cannot override the helper-owned

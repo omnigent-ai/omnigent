@@ -17,8 +17,11 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
+    CAP_CONFIG_SYNC,
     CAP_MCP_TOOLS,
     CAP_SKILL_CONTENT,
+    HostConfigSyncFrame,
+    HostConfigUpdateFrame,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
@@ -49,6 +52,7 @@ from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.mcp_tools import create_mcp_tools_router
 from omnigent.server.routes.skill_content import create_skill_content_router
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.user_config_store import SyncedConfig, UserConfigStore
 from tests.budgets import budget
 
 pytestmark = pytest.mark.asyncio
@@ -1963,3 +1967,230 @@ async def test_malformed_mcp_tools_reply_returns_502(
     assert response.json() == {"detail": "host MCP tools lookup failed"}
     assert not conn.pending_mcp_tools
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+# ── Portable user settings sync ───────────────────────────────────────────
+
+_SYNC_HOST_A = "2a44b179a19322377dcc75cf7fcd1b01"
+_SYNC_HOST_B = "2a44b179a19322377dcc75cf7fcd1b02"
+_SYNC_HOST_C = "2a44b179a19322377dcc75cf7fcd1b03"
+_SYNC_HOST_LEGACY = "2a44b179a19322377dcc75cf7fcd1b04"
+_SYNC_HOST_BOB = "2a44b179a19322377dcc75cf7fcd1b05"
+_SETTINGS_A = {
+    "model": "mock-model-from-machine-a",
+    "harness": {"codex-native": {"args": ["--profile", "machine-a"]}},
+}
+
+
+def _sync_app(
+    db_uri: str, registry: HostRegistry, config_store: UserConfigStore, *, authed_user: str
+) -> FastAPI:
+    """Build a multi-user tunnel app for one authenticated user sharing *registry*."""
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(
+            registry,
+            HostStore(db_uri),
+            auth_provider=_FixedAuthProvider(authed_user),
+            local_single_user=False,
+            user_config_store=config_store,
+        ),
+        prefix="/v1",
+    )
+    return app
+
+
+async def _connect_sync_host(
+    app: FastAPI,
+    registry: HostRegistry,
+    host_id: str,
+    name: str,
+    *,
+    capabilities: list[str] | None = None,
+) -> ApplicationCommunicator:
+    """Connect a host advertising config sync (unless *capabilities* says otherwise)."""
+    comm = await _connect_route(app, f"/v1/hosts/{host_id}/tunnel")
+    hello = HostHelloFrame(
+        version="0.1.0-test",
+        frame_protocol_version=1,
+        name=name,
+        capabilities=[CAP_CONFIG_SYNC] if capabilities is None else capabilities,
+    )
+    await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(hello)})
+    await asyncio.wait_for(_wait_registered(registry, host_id), timeout=budget(2.0))
+    return comm
+
+
+async def _report_config(
+    comm: ApplicationCommunicator, revision: int, settings: dict[str, object], *, changed: bool
+) -> None:
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(HostConfigSyncFrame(revision, settings, changed)),
+        }
+    )
+
+
+async def _receive_config_update(comm: ApplicationCommunicator) -> HostConfigUpdateFrame:
+    """Read frames until the server's ``host.config_update`` arrives."""
+    while True:
+        message = await comm.receive_output(timeout=budget(2.0))
+        if message["type"] != "websocket.send":
+            continue
+        try:
+            frame = decode_host_frame(message["text"])
+        except ValueError:
+            continue
+        if isinstance(frame, HostConfigUpdateFrame):
+            return frame
+
+
+async def _assert_no_output(comm: ApplicationCommunicator, *, within: float = 0.3) -> None:
+    """Check that nothing reached the host; a timed-out ``receive_output`` would cancel its app."""
+    await asyncio.sleep(within)
+    assert comm.output_queue.empty(), await comm.receive_output(timeout=0.1)
+
+
+async def test_config_sync_seeds_the_store_and_fans_out_to_the_owners_hosts(db_uri: str) -> None:
+    registry = HostRegistry()
+    config_store = UserConfigStore(db_uri)
+    alice_app = _sync_app(db_uri, registry, config_store, authed_user="alice@example.com")
+    bob_app = _sync_app(db_uri, registry, config_store, authed_user="bob@example.com")
+    host_a = await _connect_sync_host(alice_app, registry, _SYNC_HOST_A, "machine-a")
+    host_b = await _connect_sync_host(alice_app, registry, _SYNC_HOST_B, "machine-b")
+    legacy = await _connect_sync_host(
+        alice_app, registry, _SYNC_HOST_LEGACY, "old-build", capabilities=[]
+    )
+    bob = await _connect_sync_host(bob_app, registry, _SYNC_HOST_BOB, "bob-laptop")
+
+    # A fresh machine with nothing to offer learns the server has nothing either.
+    await _report_config(host_b, 0, {}, changed=False)
+    assert await _receive_config_update(host_b) == HostConfigUpdateFrame(0, {})
+
+    await _report_config(host_a, 0, _SETTINGS_A, changed=True)
+    assert await _receive_config_update(host_a) == HostConfigUpdateFrame(1, _SETTINGS_A)
+    assert await _receive_config_update(host_b) == HostConfigUpdateFrame(1, _SETTINGS_A)
+    await _assert_no_output(legacy)
+    await _assert_no_output(bob)
+    assert config_store.get("alice@example.com") == SyncedConfig(_SETTINGS_A, 1)
+    assert config_store.get("bob@example.com") == SyncedConfig({}, 0)
+
+
+async def test_config_sync_never_synced_host_defers_to_the_users_existing_settings(
+    db_uri: str,
+) -> None:
+    registry = HostRegistry()
+    config_store = UserConfigStore(db_uri)
+    config_store.save("alice@example.com", _SETTINGS_A)
+    app = _sync_app(db_uri, registry, config_store, authed_user="alice@example.com")
+    host_c = await _connect_sync_host(app, registry, _SYNC_HOST_C, "machine-c")
+
+    await _report_config(host_c, 0, {"model": "stale-local-default"}, changed=True)
+
+    assert await _receive_config_update(host_c) == HostConfigUpdateFrame(1, _SETTINGS_A)
+    assert config_store.get("alice@example.com") == SyncedConfig(_SETTINGS_A, 1)
+
+
+async def test_config_sync_host_that_synced_before_reseeds_a_lost_store(db_uri: str) -> None:
+    registry = HostRegistry()
+    config_store = UserConfigStore(db_uri)
+    app = _sync_app(db_uri, registry, config_store, authed_user="alice@example.com")
+    host_a = await _connect_sync_host(app, registry, _SYNC_HOST_A, "machine-a")
+
+    await _report_config(host_a, 5, _SETTINGS_A, changed=False)
+
+    assert await _receive_config_update(host_a) == HostConfigUpdateFrame(1, _SETTINGS_A)
+    assert config_store.get("alice@example.com") == SyncedConfig(_SETTINGS_A, 1)
+
+
+async def test_config_sync_last_writer_wins_and_unchanged_reports_are_acked(db_uri: str) -> None:
+    registry = HostRegistry()
+    config_store = UserConfigStore(db_uri)
+    app = _sync_app(db_uri, registry, config_store, authed_user="alice@example.com")
+    host_a = await _connect_sync_host(app, registry, _SYNC_HOST_A, "machine-a")
+    host_b = await _connect_sync_host(app, registry, _SYNC_HOST_B, "machine-b")
+    await _report_config(host_a, 0, _SETTINGS_A, changed=True)
+    assert (await _receive_config_update(host_a)).revision == 1
+    assert (await _receive_config_update(host_b)).revision == 1
+
+    await _report_config(host_b, 1, {"model": "from-machine-b"}, changed=True)
+    expected = HostConfigUpdateFrame(2, {"model": "from-machine-b"})
+    assert await _receive_config_update(host_b) == expected
+    assert await _receive_config_update(host_a) == expected
+
+    # A periodic report with nothing new is acknowledged without waking the other host.
+    await _report_config(host_a, 2, {"model": "from-machine-b"}, changed=False)
+    assert await _receive_config_update(host_a) == expected
+    await _assert_no_output(host_b)
+
+    # Settings that must stay on one machine are refused outright.
+    await _report_config(host_a, 2, {"providers": {"work": {"kind": "key"}}}, changed=True)
+    await _assert_no_output(host_a)
+    assert config_store.get("alice@example.com") == SyncedConfig({"model": "from-machine-b"}, 2)
+
+
+async def test_config_sync_concurrent_reports_from_one_user_settle_in_revision_order(
+    db_uri: str,
+) -> None:
+    registry = HostRegistry()
+    config_store = UserConfigStore(db_uri)
+    config_store.save("alice@example.com", _SETTINGS_A)
+    app = _sync_app(db_uri, registry, config_store, authed_user="alice@example.com")
+    host_a = await _connect_sync_host(app, registry, _SYNC_HOST_A, "machine-a")
+    host_b = await _connect_sync_host(app, registry, _SYNC_HOST_B, "machine-b")
+
+    # Both machines edit at revision 1 before either hears about the other.
+    await _report_config(host_a, 1, {"model": "from-machine-a"}, changed=True)
+    await _report_config(host_b, 1, {"model": "from-machine-b"}, changed=True)
+
+    seen = {"a": [await _receive_config_update(host_a) for _ in range(2)]}
+    seen["b"] = [await _receive_config_update(host_b) for _ in range(2)]
+    final = config_store.get("alice@example.com")
+    assert final.revision == 3
+    for updates in seen.values():
+        assert [update.revision for update in updates] == [2, 3]
+        assert updates[-1].settings == final.settings
+
+
+async def test_config_sync_ignores_managed_sandbox_hosts(db_uri: str) -> None:
+    registry = HostRegistry()
+    store = HostStore(db_uri)
+    config_store = UserConfigStore(db_uri)
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(
+            registry,
+            store,
+            auth_provider=_FixedAuthProvider("alice@example.com"),
+            local_single_user=False,
+            user_config_store=config_store,
+        ),
+        prefix="/v1",
+    )
+    laptop = await _connect_sync_host(app, registry, _SYNC_HOST_A, "laptop")
+    _register_managed(store, host_id=_SYNC_HOST_B, token="sandbox-token")
+    sandbox = ApplicationCommunicator(
+        app, _managed_scope(f"/v1/hosts/{_SYNC_HOST_B}/tunnel", "sandbox-token")
+    )
+    await sandbox.send_input({"type": "websocket.connect"})
+    assert (await sandbox.receive_output(timeout=budget(1.0)))["type"] == "websocket.accept"
+    hello = HostHelloFrame(
+        version="0.1.0-test",
+        frame_protocol_version=1,
+        name=f"managed-{_SYNC_HOST_B}",
+        capabilities=[CAP_CONFIG_SYNC],
+    )
+    await sandbox.send_input({"type": "websocket.receive", "text": encode_host_frame(hello)})
+    await asyncio.wait_for(_wait_registered(registry, _SYNC_HOST_B), timeout=budget(2.0))
+    assert registry.get(_SYNC_HOST_B).registered_with_managed_token
+
+    # A sandbox template never becomes the user's settings, and gets no acknowledgement.
+    await _report_config(sandbox, 0, {"model": "template-model"}, changed=True)
+    await _assert_no_output(sandbox)
+    assert config_store.get("alice@example.com") == SyncedConfig({}, 0)
+
+    # The user's own machine seeds the store; the sandbox is left out of the fan-out.
+    await _report_config(laptop, 0, _SETTINGS_A, changed=True)
+    assert await _receive_config_update(laptop) == HostConfigUpdateFrame(1, _SETTINGS_A)
+    await _assert_no_output(sandbox)

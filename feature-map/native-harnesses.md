@@ -36,7 +36,11 @@ implements them separately, so a fix for one harness does not reach the others.
   Environment, and Arguments, unmasked and read-only, with the selected host's source.
   Env wrappers are split into these fields, without a duplicate raw invocation.
   Session and workspace config can add to or override these host defaults.
-  Other harnesses keep their credential card only.
+  Other harnesses keep their credential card only. The portable user settings
+  in `~/.omnigent/config.yaml` (`model`, `opencode_model`,
+  `auto_open_conversation`, `harness.default`, `harness.<id>.args`) follow the
+  user to their other connected hosts; credentials, the host identity and
+  `harness.<id>.command` stay on each machine.
 - `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
   with loading, truncation, unavailable-host, and older-server states.
 
@@ -127,6 +131,16 @@ grid and repeat. An older host shows an update message; an older server hides
 the extra fields. Resolver and raw-tunnel checks:
 `tests/host/test_harness_startup.py`,
 `tests/server/integration/test_host_tunnel_route.py::test_startup_http_through_real_tunnel`.
+
+**Synced settings (own environment):** start two isolated hosts for the same
+user against one server and seed `model` and `harness.codex-native.args` on the
+first only. Check that `omnigent config list` on the second machine and its
+Codex Startup configuration in Settings → Harnesses show the first machine's
+values, then change them on the first machine with `omnigent config set --global`
+and check that the second follows within a few seconds (a host connected to a
+different server replica catches up on its minute poll instead):
+`tests/e2e_ui/settings/test_host_config_follows_user.py::test_codex_startup_setting_made_on_one_machine_is_shown_for_the_users_other_machine`,
+`tests/server/integration/test_host_tunnel_route.py::test_config_sync_seeds_the_store_and_fans_out_to_the_owners_hosts`.
 
 Cross-harness journeys:
 
@@ -403,3 +417,7 @@ Cross-harness journeys:
   above do not cover other harnesses' transports or runner-tunnel recovery.
 - The harness registry declares which harness supports effort, approvals, and
   resume. Check it before assuming a column applies.
+- Settings sync travels through connected `omnigent host` daemons: a runner
+  started with `omnigent run --server`, or a machine whose host is offline, does
+  not take part, and a machine that never synced adopts the user's existing
+  settings instead of overwriting them.

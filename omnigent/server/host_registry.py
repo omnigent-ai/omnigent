@@ -23,8 +23,8 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -193,6 +193,14 @@ def _fail_pending_mcp_servers(conn: HostConnection) -> None:
 # invalidation — the TTL is purely a memory bound.
 _EXIT_REPORT_TTL_S = 600.0
 _EXIT_REPORT_MAX_ENTRIES = 1024
+
+
+@dataclass
+class _ConfigSyncLock:
+    """A user's reconcile lock and how many reconciles currently reference it."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
 
 
 @dataclass
@@ -498,6 +506,11 @@ class HostConnection:
     pending_import_local: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]] = field(
         default_factory=dict,
     )
+    # Settings reports reconcile in order on a background chain so waits never stall
+    # this tunnel's other frames; ``config_sync_task`` is the tail, and every live
+    # link stays in the set so a disconnect cancels them all.
+    config_sync_task: asyncio.Task[None] | None = None
+    config_sync_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
     def enqueue(self, data: str, *, app_ping_ts: int | None = None) -> None:
         """Queue a frame on the socket loop, retaining local timing metadata."""
@@ -532,6 +545,9 @@ class HostRegistry:
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
+        # One lock per (workspace, owner) serializes a user's settings reconciliation on
+        # this replica; dropped once their last connection is gone and no reconcile uses it.
+        self._config_sync_locks: dict[tuple[int, str | None], _ConfigSyncLock] = {}
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
@@ -655,7 +671,48 @@ class HostRegistry:
         _fail_pending_mcp_tools(removed)
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
+        self._maybe_release_config_sync_lock((removed.workspace_id, removed.owner))
         return True
+
+    @asynccontextmanager
+    async def reconcile_config_sync(
+        self, owner: str | None, workspace_id: int | None = None
+    ) -> AsyncIterator[None]:
+        """Hold the lock that serializes one user's settings reconciliation here.
+
+        Every reconcile for the same owner and workspace shares one lock while
+        any of their hosts is connected or a reconcile is in progress.
+
+        :param owner: Authenticated owner, or ``None`` on a single-user server.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        """
+        key = (current_workspace_id() if workspace_id is None else workspace_id, owner)
+        with self._lock:
+            entry = self._config_sync_locks.setdefault(key, _ConfigSyncLock())
+            entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            with self._lock:
+                entry.users -= 1
+            self._maybe_release_config_sync_lock(key)
+
+    def config_sync_lock_count(self) -> int:
+        """Return how many owners currently hold a reconcile lock entry."""
+        with self._lock:
+            return len(self._config_sync_locks)
+
+    def _maybe_release_config_sync_lock(self, key: tuple[int, str | None]) -> None:
+        """Drop an owner's reconcile lock once no connection or reconcile of theirs remains."""
+        with self._lock:
+            entry = self._config_sync_locks.get(key)
+            if entry is None or entry.users:
+                return
+            if any((conn.workspace_id, conn.owner) == key for conn in self._hosts.values()):
+                return
+            del self._config_sync_locks[key]
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:
         """Record that a frame arrived for ``conn``.
@@ -694,6 +751,24 @@ class HostRegistry:
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
         with self._lock:
             return [hid for (ws, hid) in self._hosts if ws == ws_id]
+
+    def connections_for_owner(
+        self, owner: str | None, workspace_id: int | None = None
+    ) -> list[HostConnection]:
+        """Return the live connections one user holds in a workspace.
+
+        :param owner: Authenticated owner, or ``None`` on a single-user server.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: Every connection registered to *owner*, in registration order.
+        """
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        with self._lock:
+            return [
+                conn
+                for (ws, _hid), conn in self._hosts.items()
+                if ws == ws_id and conn.owner == owner
+            ]
 
     def is_host_telemetry_opted_out(self, host_id: str, workspace_id: int | None = None) -> bool:
         """Return whether the host has opted out of telemetry.

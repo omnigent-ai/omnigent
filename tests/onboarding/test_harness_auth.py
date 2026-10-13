@@ -247,3 +247,49 @@ def test_detect_adoptable_credentials_never_raises(monkeypatch: pytest.MonkeyPat
         lambda: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     assert ha.detect_adoptable_credentials() == []
+
+
+def test_config_writer_replaces_atomically_under_the_shared_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon's credential write never truncates config.yaml and waits for other writers."""
+    import threading
+
+    import omnigent.config as config_module
+    from omnigent.config import global_config_lock, load_global_config
+
+    path = tmp_path / "config.yaml"
+    path.write_text("model: keep-me\nproviders:\n  old:\n    kind: key\n")
+    load, save = ha._config_writer()
+    observed_mid_write: list[dict[str, object]] = []
+    real_dump = config_module.yaml.safe_dump
+
+    def observing_dump(data, stream=None, **kwargs):
+        observed_mid_write.append(load_global_config(path))
+        return real_dump(data, stream, **kwargs)
+
+    monkeypatch.setattr(config_module.yaml, "safe_dump", observing_dump)
+
+    order: list[str] = []
+    lock_held = threading.Event()
+
+    def hold_lock() -> None:
+        with global_config_lock(path):
+            lock_held.set()
+            threading.Event().wait(0.3)
+            order.append("other-writer-done")
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert lock_held.wait(2.0)
+    save({"providers": {"new": {"kind": "key"}}}, deep_merge_providers=True)
+    order.append("credential-write-done")
+    holder.join(2.0)
+
+    # The credential write waited for the lock holder and never exposed a truncated file.
+    assert order == ["other-writer-done", "credential-write-done"]
+    assert observed_mid_write == [{"model": "keep-me", "providers": {"old": {"kind": "key"}}}]
+    assert load() == {
+        "model": "keep-me",
+        "providers": {"old": {"kind": "key"}, "new": {"kind": "key"}},
+    }

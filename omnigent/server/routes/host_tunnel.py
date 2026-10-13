@@ -27,11 +27,15 @@ from typing import Any
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
+from omnigent.config_sync import validate_synced_settings
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
+    CAP_CONFIG_SYNC,
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
+    HostConfigSyncFrame,
+    HostConfigUpdateFrame,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -79,6 +83,7 @@ from omnigent.server.host_registry import (
 )
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.user_config_store import UserConfigStore
 
 _logger = logging.getLogger(__name__)
 
@@ -140,6 +145,7 @@ def create_host_tunnel_router(
     on_runner_exited: RunnerExitedCallback | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
+    user_config_store: UserConfigStore | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
 
@@ -183,6 +189,8 @@ def create_host_tunnel_router(
     :param runner_exit_reports: Shared store for ``host.runner_exited``
         reports, read by the runner status endpoint. ``None`` (e.g.
         minimal test wiring) drops the reports.
+    :param user_config_store: Store for the portable user settings hosts
+        report in ``host.config_sync``. ``None`` ignores those frames.
     :returns: A FastAPI router with the host tunnel endpoint.
     """
     from omnigent.server.auth import local_single_user_enabled
@@ -446,6 +454,7 @@ def create_host_tunnel_router(
                         runner_exit_reports,
                         on_runner_exited,
                         on_host_update,
+                        user_config_store,
                     ),
                     name=f"host-receive:{host_id}",
                 )
@@ -489,6 +498,11 @@ def create_host_tunnel_router(
                         heartbeat_task,
                         return_exceptions=True,
                     )
+                    if conn.config_sync_tasks:
+                        pending_syncs = list(conn.config_sync_tasks)
+                        for task in pending_syncs:
+                            task.cancel()
+                        await asyncio.gather(*pending_syncs, return_exceptions=True)
                     # If the host already reconnected, this handler's connection
                     # was replaced; only the current one may mark it offline.
                     if host_registry.deregister(host_id, conn=conn):
@@ -672,6 +686,7 @@ async def _receive_loop(
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: RunnerExitedCallback | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
+    user_config_store: UserConfigStore | None = None,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
@@ -690,6 +705,8 @@ async def _receive_loop(
         logs the session-less ``runner_exited`` event here instead.
     :param on_host_update: Callback fired after readiness changes persist;
         ``None`` skips it.
+    :param user_config_store: Store reconciling ``host.config_sync`` reports;
+        ``None`` ignores them.
     """
     # Per-request reassembly of chunked import sessions; buffers die with the
     # connection, so a tunnel drop can never leak a partial session.
@@ -762,6 +779,27 @@ async def _receive_loop(
                     await on_host_update(host_id, conn.owner)
                 except Exception:
                     _logger.exception("on_host_update callback failed for %s", host_id)
+            continue
+
+        if isinstance(frame, HostConfigSyncFrame):
+            # A server-provisioned sandbox carries an operator template, not the
+            # user's own settings; it neither seeds nor receives them.
+            if user_config_store is not None and not conn.registered_with_managed_token:
+                # Reconcile off this loop: waiting for another of the user's hosts must
+                # not delay the result frames and readiness updates behind it.
+                conn.config_sync_task = asyncio.create_task(
+                    _sync_user_config_after(
+                        conn.config_sync_task,
+                        conn,
+                        frame,
+                        host_id,
+                        user_config_store,
+                        host_registry,
+                    ),
+                    name=f"host-config-sync:{host_id}",
+                )
+                conn.config_sync_tasks.add(conn.config_sync_task)
+                conn.config_sync_task.add_done_callback(conn.config_sync_tasks.discard)
             continue
 
         if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -1066,6 +1104,80 @@ async def _receive_loop(
             host_id,
             type(frame).__name__,
         )
+
+
+async def _sync_user_config_after(
+    previous: asyncio.Task[None] | None,
+    conn: HostConnection,
+    frame: HostConfigSyncFrame,
+    host_id: str,
+    store: UserConfigStore,
+    host_registry: HostRegistry,
+) -> None:
+    """Reconcile one report after this connection's earlier one, keeping them ordered."""
+    if previous is not None:
+        # Only ordering matters here: the earlier reconcile contains its own
+        # failures, and a disconnect cancels every link of the chain directly.
+        await asyncio.wait([previous])
+    await _sync_user_config(conn, frame, host_id, store, host_registry)
+
+
+async def _sync_user_config(
+    conn: HostConnection,
+    frame: HostConfigSyncFrame,
+    host_id: str,
+    store: UserConfigStore,
+    host_registry: HostRegistry,
+) -> None:
+    """Reconcile one host's portable settings and answer with the user's current state.
+
+    A host that synced before and changed its settings locally wins (last
+    writer); any host seeds an empty store, including one whose server-side
+    state was lost. A host that never synced defers to settings the user
+    already has. Adopted changes fan out to the user's other connected hosts.
+
+    :param conn: The reporting host's connection; its owner scopes the settings.
+    :param frame: The host's report.
+    :param host_id: Host id for logging.
+    :param store: Per-user settings store.
+    :param host_registry: Registry used to reach the owner's other hosts.
+    """
+    try:
+        settings = validate_synced_settings(frame.settings)
+    except Exception as exc:  # noqa: BLE001 — a bad report must never escape the chain task
+        _logger.warning("Host %s sent invalid synced settings; ignoring: %s", host_id, exc)
+        return
+    try:
+        # One user's hosts reconcile one at a time, so acks and fan-outs leave in revision order.
+        async with host_registry.reconcile_config_sync(conn.owner, conn.workspace_id):
+            current, adopted = await asyncio.to_thread(
+                store.reconcile,
+                conn.owner,
+                settings,
+                revision=frame.revision,
+                changed=frame.changed,
+                workspace_id=conn.workspace_id,
+            )
+            if adopted:
+                update = encode_host_frame(
+                    HostConfigUpdateFrame(current.revision, current.settings)
+                )
+                for peer in host_registry.connections_for_owner(conn.owner, conn.workspace_id):
+                    if (
+                        peer is conn
+                        or peer.registered_with_managed_token
+                        or CAP_CONFIG_SYNC not in peer.hello.capabilities
+                    ):
+                        continue
+                    with contextlib.suppress(ConnectionError):
+                        host_registry.send_text(peer, update)
+            with contextlib.suppress(ConnectionError):
+                host_registry.send_text(
+                    conn,
+                    encode_host_frame(HostConfigUpdateFrame(current.revision, current.settings)),
+                )
+    except Exception:
+        _logger.exception("Host %s synced settings could not be reconciled", host_id)
 
 
 async def _heartbeat_loop(

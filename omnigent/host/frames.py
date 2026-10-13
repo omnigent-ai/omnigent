@@ -58,6 +58,8 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+# The host keeps its portable user settings in step with the server:
+CAP_CONFIG_SYNC = "config_sync"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -68,6 +70,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_TOOLS,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
+    CAP_CONFIG_SYNC,
 ]
 
 
@@ -161,6 +164,8 @@ class HostFrameKind(str, Enum):
     MCP_TOOLS_RESULT = "host.mcp_tools_result"
     HARNESS_STARTUP = "host.harness_startup"
     HARNESS_STARTUP_RESULT = "host.harness_startup_result"
+    CONFIG_SYNC = "host.config_sync"
+    CONFIG_UPDATE = "host.config_update"
     MCP_SERVERS = "host.mcp_servers"
     MCP_SERVERS_RESULT = "host.mcp_servers_result"
     IMPORT_LOCAL = "host.import_local"
@@ -1058,6 +1063,29 @@ class HostHarnessStartupResultFrame:
 
 
 @dataclass
+class HostConfigSyncFrame:
+    """Host → server: the portable settings this host holds and their sync state.
+
+    :param revision: Revision the host last applied; ``0`` before any sync.
+    :param settings: The host's current portable settings
+        (see :mod:`omnigent.config_sync`).
+    :param changed: Whether *settings* differ from what the host last synced.
+    """
+
+    revision: int
+    settings: dict[str, object]
+    changed: bool
+
+
+@dataclass
+class HostConfigUpdateFrame:
+    """Server → host: the user's current portable settings."""
+
+    revision: int
+    settings: dict[str, object]
+
+
+@dataclass
 class HostMcpServersFrame:
     """Server → host: list the user-level MCP servers each harness loads."""
 
@@ -1302,6 +1330,8 @@ HostFrame = (
     | HostMcpToolsResultFrame
     | HostHarnessStartupFrame
     | HostHarnessStartupResultFrame
+    | HostConfigSyncFrame
+    | HostConfigUpdateFrame
     | HostMcpServersFrame
     | HostMcpServersResultFrame
     | HostImportLocalFrame
@@ -1789,6 +1819,23 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "startup": frame.startup.model_dump() if frame.startup is not None else None,
             }
         )
+    if isinstance(frame, HostConfigSyncFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CONFIG_SYNC.value,
+                "revision": frame.revision,
+                "settings": frame.settings,
+                "changed": frame.changed,
+            }
+        )
+    if isinstance(frame, HostConfigUpdateFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CONFIG_UPDATE.value,
+                "revision": frame.revision,
+                "settings": frame.settings,
+            }
+        )
     if isinstance(frame, HostMcpServersFrame):
         return _encode_payload(
             {"kind": HostFrameKind.MCP_SERVERS.value, "request_id": frame.request_id}
@@ -2187,6 +2234,17 @@ def _decode_known_host_frame(
                 # Keep correlation so malformed replies fail promptly instead of timing out.
                 startup = None
             return HostHarnessStartupResultFrame(request_id, startup)
+        case HostFrameKind.CONFIG_SYNC:
+            changed = msg.get("changed")
+            if not isinstance(changed, bool):
+                raise ValueError("frame field must be a bool: 'changed'")
+            return HostConfigSyncFrame(
+                revision=_config_revision(msg), settings=_config_settings(msg), changed=changed
+            )
+        case HostFrameKind.CONFIG_UPDATE:
+            return HostConfigUpdateFrame(
+                revision=_config_revision(msg), settings=_config_settings(msg)
+            )
         case HostFrameKind.MCP_SERVERS:
             return HostMcpServersFrame(request_id=_required_str(msg, "request_id"))
         case HostFrameKind.MCP_SERVERS_RESULT:
@@ -2225,6 +2283,20 @@ def _decode_known_host_frame(
         case HostFrameKind.IMPORT_LOCAL_DONE:
             return _decode_import_local_done(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
+
+
+def _config_revision(msg: _JsonObject) -> int:
+    revision = msg.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("frame field must be a non-negative int: 'revision'")
+    return revision
+
+
+def _config_settings(msg: _JsonObject) -> dict[str, object]:
+    settings = msg.get("settings")
+    if not isinstance(settings, dict):
+        raise ValueError("frame field must be a JSON object: 'settings'")
+    return settings
 
 
 def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:

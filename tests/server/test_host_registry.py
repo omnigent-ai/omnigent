@@ -643,3 +643,61 @@ def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
     # Deregistering by any spelling removes the entry.
     registry.deregister(prefixed)
     assert registry.get(bare) is None
+
+
+def test_connections_for_owner_filters_by_owner_and_workspace() -> None:
+    registry = HostRegistry()
+    alice_a = registry.register(uuid.uuid4().hex, FakeWebSocket(), _make_hello("a"), owner="alice")
+    alice_b = registry.register(uuid.uuid4().hex, FakeWebSocket(), _make_hello("b"), owner="alice")
+    registry.register(uuid.uuid4().hex, FakeWebSocket(), _make_hello("c"), owner="bob")
+    with workspace_scope(7):
+        alice_ws7 = registry.register(
+            uuid.uuid4().hex, FakeWebSocket(), _make_hello("d"), owner="alice"
+        )
+
+    assert registry.connections_for_owner("alice") == [alice_a, alice_b]
+    assert registry.connections_for_owner("alice", workspace_id=7) == [alice_ws7]
+    assert registry.connections_for_owner(None) == []
+    assert registry.deregister(alice_a.host_id)
+    assert registry.connections_for_owner("alice") == [alice_b]
+
+
+async def test_config_sync_lock_is_shared_per_owner_and_released_with_the_last_use() -> None:
+    registry = HostRegistry()
+    alice_a = registry.register(uuid.uuid4().hex, FakeWebSocket(), _make_hello("a"), owner="alice")
+    alice_b = registry.register(uuid.uuid4().hex, FakeWebSocket(), _make_hello("b"), owner="alice")
+    bob = registry.register(uuid.uuid4().hex, FakeWebSocket(), _make_hello("c"), owner="bob")
+    order: list[str] = []
+
+    async def reconcile(name: str, owner: str, hold: asyncio.Event | None = None) -> None:
+        async with registry.reconcile_config_sync(owner):
+            order.append(f"{name}:start")
+            if hold is not None:
+                await hold.wait()
+            order.append(f"{name}:end")
+
+    release = asyncio.Event()
+    first = asyncio.create_task(reconcile("a1", "alice", release))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(reconcile("a2", "alice"))
+    other = asyncio.create_task(reconcile("bob", "bob"))
+    await other
+    # Bob's reconcile ran while Alice's first one still holds her lock.
+    assert order == ["a1:start", "bob:start", "bob:end"]
+    assert registry.config_sync_lock_count() == 2
+
+    # Alice's last connections leave while a reconcile is still queued on her lock.
+    registry.deregister(alice_a.host_id)
+    registry.deregister(alice_b.host_id)
+    assert registry.config_sync_lock_count() == 2
+    release.set()
+    await asyncio.gather(first, second)
+    assert order[3:] == ["a1:end", "a2:start", "a2:end"]
+    # The entry goes once the queued reconcile finished; Bob's stays with his connection.
+    assert registry.config_sync_lock_count() == 1
+    registry.deregister(bob.host_id)
+    assert registry.config_sync_lock_count() == 0
+    with workspace_scope(7):
+        async with registry.reconcile_config_sync("alice"):
+            assert registry.config_sync_lock_count() == 1
+    assert registry.config_sync_lock_count() == 0
