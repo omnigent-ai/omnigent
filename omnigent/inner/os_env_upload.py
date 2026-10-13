@@ -29,6 +29,7 @@ from omnigent.inner.sandbox import SandboxPolicy
 
 MAX_RENAME_ATTEMPTS = 1000
 CALL_TIMEOUT_S = 30
+SHORT_OP_QUEUE_WAIT_S = 1
 COMPLETE_TIMEOUT_FLOOR_S = 120
 COMPLETE_TIMEOUT_PER_GIB_S = 300
 
@@ -178,7 +179,10 @@ class UploadHelperClient(_HelperProcessClient):
         """A busy result guarantees no request frame could have been sent."""
         timeout_s = operation_timeout(metadata) if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout_s
-        if not self._lock.acquire(timeout=max(0, timeout_s)):
+        queue_wait = timeout_s
+        if metadata.get("op") not in ("plan", "complete", "recover"):
+            queue_wait = min(queue_wait, SHORT_OP_QUEUE_WAIT_S)
+        if not self._lock.acquire(timeout=max(0, queue_wait)):
             return {"error": "Upload helper queue timed out", "code": "busy"}
         try:
             if self._closed:

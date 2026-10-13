@@ -214,6 +214,7 @@ class UploadManager:
         self.records: dict[str, UploadRecord] = {}
         self.helpers: dict[tuple[str, str], HelperBinding] = {}
         self.lock = asyncio.Lock()
+        self.index_dirty = False
         self.helper_lock = asyncio.Lock()
         self.upload_locks: dict[str, asyncio.Lock] = {}
         self.inflight: set[asyncio.Task[object]] = set()
@@ -275,7 +276,7 @@ class UploadManager:
                 or binding.client._closed
             ):
                 if binding.users:
-                    raise RouteError(429, "upload_limit", "Retired upload helper is still in use")
+                    raise RouteError(429, "busy", "Retired upload helper is still in use")
                 await asyncio.to_thread(binding.client.close)
                 del self.helpers[key]
             await self._evict_helpers()
@@ -287,7 +288,7 @@ class UploadManager:
                         if not self._pinned(k) and not v.users and not v.client._lock.locked()
                     ]
                     if not idle:
-                        raise RouteError(429, "upload_limit", "Upload helper cache is busy")
+                        raise RouteError(429, "busy", "Upload helper cache is busy")
                     oldest, old = min(idle, key=lambda item: item[1].used)
                     await asyncio.to_thread(old.client.close)
                     del self.helpers[oldest]
@@ -353,12 +354,15 @@ class UploadManager:
 
     async def _save_settled(self) -> None:
         # The index lock must outlive its save thread, even during shutdown.
+        self.index_dirty = True
         task = asyncio.create_task(asyncio.to_thread(self._save))
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
             await self._settle(task)
+            self.index_dirty = False
             raise
+        self.index_dirty = False
 
     async def _persist(self) -> None:
         async with self.lock:
@@ -446,6 +450,12 @@ class UploadManager:
             record.snapshot = None
 
     async def sweep(self, *, now: float | None = None) -> None:
+        async with self.lock:
+            if self.index_dirty:
+                try:
+                    await self._save_settled()
+                except OSError:
+                    logger.exception("Unable to retry upload index save")
         self._prune_gone()
         instant = _now() if now is None else now
         for uid in list(self.records):
@@ -622,12 +632,18 @@ class UploadManager:
                     try:
                         await self._save_settled()
                     except OSError as exc:
+                        logger.exception("Unable to save new upload intent")
                         # Begin has not run, so there is no allocation to preserve.
                         del self.records[uid]
                         del self.upload_locks[uid]
+                        try:
+                            await self._save_settled()
+                        except OSError:
+                            logger.exception("Unable to persist upload intent rollback")
+                        message = "Upload index could not be saved"
                         if exc.errno in (errno.ENOSPC, errno.EDQUOT):
-                            raise RouteError(507, "no_space", str(exc)) from exc
-                        raise RouteError(500, "io_error", str(exc)) from exc
+                            raise RouteError(507, "no_space", message) from exc
+                        raise RouteError(500, "io_error", message) from exc
                 try:
                     result = await self._call(
                         uid,
