@@ -305,6 +305,9 @@ async def test_startup_cleanup_under_real_sandbox(tmp_path: Path, sandbox_type: 
         second = register(FastAPI())
         assert uid in second.restored
         await second.start()
+        async with asyncio.timeout(5):
+            while uid in second.records or uid in json.loads(second.state_path.read_text()):
+                await asyncio.sleep(0.01)
         assert not staging.exists()
         assert uid not in second.records
         assert uid not in json.loads(second.state_path.read_text())
@@ -506,6 +509,8 @@ async def test_sweep_drops_unresolvable_record(
     assert not manager._pinned(("session", DEFAULT_ENVIRONMENT_ID))
     assert staging.read_bytes() == b""
     assert caplog.text.count(uid) == 1
+    assert len(caplog.records) == 1 and caplog.records[0].exc_info is not None
+    assert "Session has no agent_id" in caplog.text
     assert not any(log.levelname == "ERROR" for log in caplog.records)
     monkeypatch.setattr(manager, "resolve_environment", original)
     manager.limits = UploadLimits(max_open_uploads=1)
@@ -524,13 +529,26 @@ async def test_sweep_retains_unexpired_record_on_resolver_failure(
     restored = restart(manager)
     original = restored.resolve_environment
 
+    entered, release = asyncio.Event(), asyncio.Event()
+    sweep = None
+
     async def unavailable(session: str, environment: str) -> CallerProcessOSEnvironment:
+        if asyncio.current_task() is sweep:
+            entered.set()
+            await release.wait()
         raise ValueError("Temporarily unable to resolve the environment")
 
     monkeypatch.setattr(restored, "resolve_environment", unavailable)
     try:
-        await restored.sweep(now=record.created_at + 1)
+        sweep = asyncio.create_task(restored.sweep(now=record.created_at + 1))
+        await entered.wait()
+        with pytest.raises(ValueError, match="Temporarily unable"):
+            await restored._helper("session", DEFAULT_ENVIRONMENT_ID)
+        release.set()
+        await sweep
         await restored.sweep(now=record.created_at + 2)
+        with pytest.raises(ValueError, match="Temporarily unable"):
+            await restored._helper("session", DEFAULT_ENVIRONMENT_ID)
         assert uid in restored.records
         assert uid in json.loads(restored.state_path.read_text())
         assert restored._pinned(("session", DEFAULT_ENVIRONMENT_ID))
@@ -539,6 +557,9 @@ async def test_sweep_retains_unexpired_record_on_resolver_failure(
         monkeypatch.setattr(restored, "resolve_environment", original)
         assert await restored.resolve_environment("session", DEFAULT_ENVIRONMENT_ID)
     finally:
+        release.set()
+        if sweep is not None:
+            await sweep
         await restored.stop()
 
 
@@ -2231,8 +2252,6 @@ async def test_helper_deadline_includes_executor_queue(
 
     manager = client._transport.app.state.workspace_uploads
     uid = (await create(client)).json()["upload_id"]
-    previous_executor = asyncio.get_running_loop()._default_executor
-    assert previous_executor is not None
     entered, release = threading.Event(), threading.Event()
     written = []
     original = upload.write_frame
@@ -2247,9 +2266,9 @@ async def test_helper_deadline_includes_executor_queue(
 
     monkeypatch.setattr(upload, "CALL_TIMEOUT_S", 0.05)
     monkeypatch.setattr(upload, "write_frame", write)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        asyncio.get_running_loop().set_default_executor(executor)
-        blocker = asyncio.create_task(asyncio.to_thread(blocked))
+    with ThreadPoolExecutor(max_workers=1) as executor, monkeypatch.context() as fault:
+        fault.setattr(manager, "ipc_executor", executor)
+        blocker = asyncio.get_running_loop().run_in_executor(executor, blocked)
         while not entered.is_set():
             await asyncio.sleep(0.001)
         timer = threading.Timer(0.15, release.set)
@@ -2264,7 +2283,6 @@ async def test_helper_deadline_includes_executor_queue(
             timer.cancel()
             timer.join()
             await blocker
-            asyncio.get_running_loop().set_default_executor(previous_executor)
 
 
 @pytest.mark.asyncio
@@ -2556,16 +2574,18 @@ async def test_finalizing_parent_loss_retires_upload(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("default_workers", [4, 8])
 async def test_distinct_helpers_preserve_default_executor_capacity(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, default_workers: int
 ) -> None:
     import threading
+    import time
     from concurrent.futures import ThreadPoolExecutor
     from io import TextIOWrapper
     from typing import cast
 
     import omnigent.inner.os_env_upload as upload
-    from omnigent.runner.workspace_upload import UploadDeclaration
+    from omnigent.runner.workspace_upload import RouteError, UploadDeclaration
 
     manager = client._transport.app.state.workspace_uploads
     ids = [
@@ -2576,33 +2596,38 @@ async def test_distinct_helpers_preserve_default_executor_capacity(
                 UploadDeclaration(dir="", name=f"distinct-{i}", size=0, created_by="alice"),
             )
         )["upload_id"]
-        for i in range(8)
+        for i in range(9)
     ]
     original = upload.read_frame
     release = threading.Event()
     entered = set()
     guard = threading.Lock()
+    held_streams = set()
+    for i in range(8):
+        proc = manager.helpers[(f"session-{i}", DEFAULT_ENVIRONMENT_ID)].client._proc
+        assert proc is not None
+        held_streams.add(cast(TextIOWrapper, proc.stdout).buffer)
 
     def slow(stream):
-        with guard:
-            entered.add(stream)
-        assert release.wait(10)
+        if stream in held_streams:
+            with guard:
+                entered.add(stream)
+            assert release.wait(10)
         return original(stream)
 
     monkeypatch.setattr(upload, "read_frame", slow)
     previous_executor = asyncio.get_running_loop()._default_executor
     assert previous_executor is not None
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=default_workers) as executor:
         asyncio.get_running_loop().set_default_executor(executor)
         tasks = [
-            asyncio.create_task(manager._call(uid, manager.records[uid], "plan")) for uid in ids
+            asyncio.create_task(manager._call(uid, manager.records[uid], "plan"))
+            for uid in ids[:8]
         ]
         background = []
         try:
             async with asyncio.timeout(5):
-                while len(entered) < 4 or not all(
-                    b.gate.locked() for b in manager.helpers.values()
-                ):
+                while len(entered) < 4:
                     await asyncio.sleep(0.01)
             background = [
                 asyncio.create_task(asyncio.to_thread(lambda: 42)),
@@ -2612,31 +2637,36 @@ async def test_distinct_helpers_preserve_default_executor_capacity(
             assert not pending, "Distinct helpers starved executor work or an index save"
             assert len(done) == 2
             assert background[0].result() == 42
-            assert len(json.loads(manager.state_path.read_text())) == 8
-            assert len(entered) == 4
-            # Cancel both an admitted IPC and a waiter; only the waiter settles immediately.
-            active, queued = [], []
-            for uid, task in zip(ids, tasks, strict=True):
-                record = manager.records[uid]
-                binding = manager.helpers[(record.session_id, record.environment_id)]
-                assert binding.client._proc is not None
-                (
-                    active
-                    if cast(TextIOWrapper, binding.client._proc.stdout).buffer in entered
-                    else queued
-                ).append(task)
-            queued[0].cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await queued[0]
-            active[0].cancel()
+            assert len(json.loads(manager.state_path.read_text())) == 9
+            idle = ids[8]
+            assert (
+                await asyncio.wait_for(manager._call(idle, manager.records[idle], "status"), 0.5)
+            )["offset"] == 0
+            async with asyncio.timeout(0.5):
+                while len(entered) < 8:
+                    await asyncio.sleep(0.01)
+            # A short call only waits briefly behind a long call on its own binding.
+            started = time.monotonic()
+            with pytest.raises(RouteError) as busy:
+                await asyncio.wait_for(
+                    manager._call(ids[0], manager.records[ids[0]], "status"), 1.5
+                )
+            assert busy.value.code == "busy"
+            assert 0.8 <= time.monotonic() - started < 1.5
+            queued = asyncio.create_task(manager._call(ids[0], manager.records[ids[0]], "status"))
             await asyncio.sleep(0)
-            assert not active[0].done()
+            queued.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await queued
+            tasks[0].cancel()
+            await asyncio.sleep(0)
+            assert not tasks[0].done()
         finally:
             release.set()
             results = await asyncio.gather(*tasks, return_exceptions=True)
             await asyncio.gather(*background, return_exceptions=True)
             asyncio.get_running_loop().set_default_executor(previous_executor)
-    assert sum(isinstance(result, asyncio.CancelledError) for result in results) == 2
+    assert sum(isinstance(result, asyncio.CancelledError) for result in results) == 1
     assert all(
         not binding.gate.locked() and binding.users == 0 for binding in manager.helpers.values()
     )
@@ -2662,3 +2692,130 @@ async def test_sweep_does_not_recreate_aborted_upload_lock(client: httpx.AsyncCl
         await sweep
     assert second not in manager.upload_locks
     assert first in manager.records
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["idle", "inflight", "blocked_worker"])
+async def test_ipc_executor_shutdown(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    import threading
+
+    import omnigent.inner.os_env_upload as upload
+
+    manager = client._transport.app.state.workspace_uploads
+    uid = (await create(client, size=0)).json()["upload_id"]
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    executor = manager.ipc_executor
+    entered, release = threading.Event(), threading.Event()
+    original = upload.read_frame
+    request = stopping = worker = None
+
+    def slow(stream):
+        entered.set()
+        assert release.wait(5)
+        return original(stream)
+
+    def blocked_worker():
+        entered.set()
+        assert release.wait(5)
+
+    try:
+        if state == "inflight":
+            monkeypatch.setattr(upload, "read_frame", slow)
+            request = asyncio.create_task(
+                client.post(BASE + "/" + uid + "/complete?created_by=alice")
+            )
+            assert await asyncio.to_thread(entered.wait, 5)
+            stopping = asyncio.create_task(manager.stop())
+            await asyncio.sleep(0.02)
+            assert not stopping.done()
+            release.set()
+            assert (await request).status_code == 200
+            await asyncio.wait_for(stopping, 0.5)
+        else:
+            if state == "blocked_worker":
+                worker = executor.submit(blocked_worker)
+                assert await asyncio.to_thread(entered.wait, 5)
+            await asyncio.wait_for(manager.stop(), 0.5)
+            if worker is not None:
+                assert not worker.done(), "Teardown joined the blocked executor worker"
+        assert helper._closed and not manager.helpers
+        with pytest.raises(RuntimeError, match="shutdown"):
+            executor.submit(lambda: None)
+    finally:
+        release.set()
+        if request is not None:
+            await request
+        if stopping is not None:
+            await stopping
+        if worker is not None:
+            await asyncio.wrap_future(worker)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure,status",
+    [
+        ("not_found", 404),
+        ("missing_agent", 410),
+        ("value_error", 400),
+        ("http_exception", 404),
+        ("bug", 500),
+    ],
+)
+async def test_upload_resolver_errors_match_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, status: int
+) -> None:
+    from fastapi import HTTPException
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runner import create_runner_app
+
+    def snapshot(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/session"
+        return httpx.Response(200, json={"id": "session", "agent_id": "agent"})
+
+    async def resolve(agent_id: str, session_id: str | None = None):
+        assert agent_id == "agent"
+        if failure in ("not_found", "missing_agent"):
+            raise OmnigentError(
+                "Missing session agent",
+                code=ErrorCode.NOT_FOUND
+                if failure == "not_found"
+                else ErrorCode.SESSION_AGENT_MISSING,
+            )
+        if failure == "value_error":
+            raise ValueError("Invalid session environment")
+        if failure == "http_exception":
+            raise HTTPException(404, "No OS environment")
+        raise RuntimeError("Resolver programming error")
+
+    monkeypatch.setattr(
+        "omnigent.runner.workspace_upload.upload_state_path", lambda _: tmp_path / "index.json"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(snapshot), base_url="http://server"
+    ) as server:
+        app = create_runner_app(server_client=server, spec_resolver=resolve)
+        manager = app.state.workspace_uploads
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://runner",
+            ) as c:
+                filesystem = await c.get(BASE.replace("/uploads", "/filesystem"))
+                capabilities = await c.get(BASE)
+                creation = await create(c)
+            assert (
+                filesystem.status_code
+                == capabilities.status_code
+                == creation.status_code
+                == status
+            )
+            if failure in ("not_found", "missing_agent"):
+                assert filesystem.json() == capabilities.json() == creation.json()
+            assert not manager.records and not manager.upload_locks
+            assert not manager.state_path.exists()
+        finally:
+            await manager.stop()
