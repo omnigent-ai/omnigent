@@ -730,7 +730,9 @@ async def test_scheduled_dispatch_obeys_revocation_boundary(setup_app, monkeypat
         assert tasks.get(task.id).state == "deleted"
         resume.set()
         if admitted:
-            frame = json.loads(await asyncio.wait_for(conn.outbound_queue.get(), timeout=10))
+            frame = json.loads(
+                (await asyncio.wait_for(conn.outbound_queue.get(), timeout=10)).data
+            )
             assert frame["kind"] == "host.launch_runner"
             conn.pending_launches.pop(frame["request_id"]).set_result(
                 {"status": "failed", "error": "test transport: runner was not started"}

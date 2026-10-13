@@ -51,6 +51,7 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
 import rehypeSlug from "rehype-slug";
 import { createMathPlugin } from "@streamdown/math";
+import { ExternalPreviewLink } from "./ExternalPreviewLink";
 import { MermaidPreview } from "./MermaidPreview";
 import type { Comment } from "@/hooks/useComments";
 import {
@@ -182,7 +183,8 @@ const MarkdownPreviewPathContext = createContext<string | null>(null);
  * Anchor for the Markdown preview. A link to another workspace file (`notes.md`,
  * `../docs/`) opens in the FileViewer: as a plain anchor the browser resolves it
  * against the app URL (`/c/<id>` → `/c/notes.md`) and loads a session that
- * doesn't exist. URLs, `mailto:` and in-page `#` links keep their href.
+ * doesn't exist. URLs and `mailto:` links open outside the app window (see
+ * ExternalPreviewLink); in-page `#` links keep their href.
  */
 function MarkdownPreviewLink({
   href,
@@ -192,7 +194,14 @@ function MarkdownPreviewLink({
 }: ComponentPropsWithoutRef<"a"> & { node?: unknown }) {
   const openFile = useFileViewer();
   const filePath = useContext(MarkdownPreviewPathContext);
-  if (!href || href.startsWith("#") || !isWorkspaceRelativeSrc(href)) {
+  if (href && !isWorkspaceRelativeSrc(href)) {
+    return (
+      <ExternalPreviewLink href={href} {...props}>
+        {children}
+      </ExternalPreviewLink>
+    );
+  }
+  if (!href || href.startsWith("#")) {
     return (
       <a href={href} {...props}>
         {children}
