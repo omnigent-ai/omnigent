@@ -92,10 +92,13 @@ def test_offset_and_overflow(helper: UploadHelperClient, tmp_path: Path) -> None
 def test_no_clobber_publish_race(helper: UploadHelperClient, tmp_path: Path) -> None:
     begin(helper)
     helper.call({"op": "append", "id": UID, "offset": 0}, b"new")
+    publication = helper.call({"op": "plan", "id": UID})
+    assert "error" not in publication
     target = tmp_path / "model.3mf"
     target.write_bytes(b"winner")
-    assert helper.call({"op": "complete", "id": UID})["code"] == "file_exists"
+    result = helper.call({"op": "complete", "id": UID, "publication": publication})
     assert target.read_bytes() == b"winner"
+    assert result["code"] == "file_exists"
 
 
 def test_replace_atomic(helper: UploadHelperClient, tmp_path: Path) -> None:
@@ -491,3 +494,37 @@ def test_slow_complete_has_size_budget_and_keeps_other_upload(
     assert upload.operation_timeout(
         {"op": "complete", "size": 1024**3}
     ) > upload.operation_timeout({"op": "complete", "size": 0})
+
+
+def test_xattr_unavailable_upload_still_supported(
+    helper: UploadHelperClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import errno
+
+    import omnigent.inner.os_env_upload as upload
+    from omnigent.inner.os_env_upload import UploadEngine
+
+    def unsupported(*args):
+        raise OSError(errno.ENOTSUP, "No extended attributes")
+
+    monkeypatch.setattr(upload, "_set_receipt", unsupported, raising=False)
+    monkeypatch.setattr(upload.os, "setxattr", unsupported, raising=False)
+    engine = UploadEngine(tmp_path.resolve(), helper.sandbox)
+    try:
+        assert engine.dispatch({"op": "probe"}, b"") == {"raw_upload": True}
+        result = engine.dispatch(
+            {
+                "op": "begin",
+                "id": UID,
+                "dir": "",
+                "name": "no-xattr",
+                "size": 0,
+                "on_conflict": "fail",
+            },
+            b"",
+        )
+        assert "error" not in result
+        assert "error" not in engine.dispatch({"op": "complete", "id": UID}, b"")
+        assert (tmp_path / "no-xattr").exists()
+    finally:
+        engine.close()
