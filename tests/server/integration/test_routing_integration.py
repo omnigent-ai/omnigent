@@ -29,8 +29,10 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from tests.server.helpers import (
     FakeCaps,
     FakeRoutingClient,
+    RoutingCaptureRunnerClient,
     create_test_agent,
     echo_runner_client,
+    routing_decisions,
 )
 
 ROUTED_MODEL = "databricks-claude-opus-4-8"
@@ -87,14 +89,6 @@ def _host_reporting_gateway(gateway: dict[str, bool]) -> Any:  # type: ignore[ex
     return SimpleNamespace(host_id=_GATEWAY_HOST_ID)
 
 
-def _routing_decisions(conv_store: SqlAlchemyConversationStore, session_id: str) -> list[Any]:
-    return [
-        item
-        for item in conv_store.list_items(session_id).data
-        if getattr(item, "type", None) == "routing_decision"
-    ]
-
-
 # ── 1. Child spawn: the router wins over ``args.model`` ─────────────
 
 
@@ -131,7 +125,7 @@ async def test_router_overrides_llm_supplied_child_model(
     assert refreshed is not None
     # The router's pick replaced the orchestrator's ``args.model``.
     assert refreshed.model_override == ROUTED_MODEL
-    decisions = _routing_decisions(conv_store, child.id)
+    decisions = routing_decisions(conv_store, child.id)
     assert len(decisions) == 1
     data = decisions[0].data
     assert data.model == ROUTED_MODEL
@@ -176,7 +170,7 @@ async def test_another_spelling_of_the_routed_model_is_no_override(
                 runner_client,
             )
 
-    decisions = _routing_decisions(conv_store, child.id)
+    decisions = routing_decisions(conv_store, child.id)
     assert len(decisions) == 1
     assert decisions[0].data.model == GLM_MODEL
     assert decisions[0].data.attempted_override is None
@@ -275,7 +269,7 @@ async def test_the_router_source_reaches_the_transcript_item_and_the_sse(
                 runner_client,
             )
 
-    decisions = _routing_decisions(conv_store, child.id)
+    decisions = routing_decisions(conv_store, child.id)
     assert len(decisions) == 1
     assert decisions[0].data.router_source == "databricks-aigw"
     chips = [
@@ -339,7 +333,7 @@ async def test_the_subagent_relay_falls_back_to_the_judge_off_the_gateway(
     assert resp.json()["router_source"] == "oss-llm"
     # The workspace router's picks are unreachable from this pane; never asked.
     assert external.calls == []
-    decisions = _routing_decisions(conv_store, parent["id"])
+    decisions = routing_decisions(conv_store, parent["id"])
     assert decisions[-1].data.router_source == "oss-llm"
 
 
@@ -370,7 +364,7 @@ async def test_native_subagent_relay_persists_decision_and_joins_child_row(
     assert decision["action"] == "rewrite"
     assert decision["model"] == ROUTED_MODEL
 
-    decisions = _routing_decisions(conv_store, parent["id"])
+    decisions = routing_decisions(conv_store, parent["id"])
     assert len(decisions) == 1
     data = decisions[0].data
     assert data.scope == "native_subagent"
@@ -430,7 +424,7 @@ async def test_dead_router_allows_the_spawn_unchanged(
 
     # The outage still leaves a decision item behind.
     conv_store = SqlAlchemyConversationStore(db_uri)
-    assert len(_routing_decisions(conv_store, session_id)) == 1
+    assert len(routing_decisions(conv_store, session_id)) == 1
 
 
 # ── 5. Per-session subagent-routing gate ───────────────────────────
@@ -509,7 +503,7 @@ async def test_subagent_gate_follows_the_session_setting(
         assert decision["action"] == "rewrite"
         assert decision["model"] == ROUTED_MODEL
         assert len(routing_client.calls) == 1
-        assert len(_routing_decisions(conv_store, session_id)) == 1
+        assert len(routing_decisions(conv_store, session_id)) == 1
         # A pinned session is offered its own family only, so no verdict it can
         # receive is ever a cross-harness redirect. `candidate_models` is pinned
         # per harness in tests/server/test_subagent_routing.py; this is the
@@ -521,7 +515,7 @@ async def test_subagent_gate_follows_the_session_setting(
         assert decision["model"] is None
         assert decision["rationale"] == DISABLED_RATIONALE
         assert routing_client.calls == []
-        assert _routing_decisions(conv_store, session_id) == []
+        assert routing_decisions(conv_store, session_id) == []
 
 
 async def test_patch_round_trips_the_subagent_setting_and_rejects_junk(
@@ -826,12 +820,12 @@ async def test_child_of_a_pinned_parent_is_routed_in_the_parents_family(
     assert refreshed is not None
     assert refreshed.model_override == picked
     assert refreshed.harness_override != "auto"
-    decisions = _routing_decisions(conv_store, child.id)
+    decisions = routing_decisions(conv_store, child.id)
     assert len(decisions) == 1
     assert decisions[0].data.scope == "child_session"
     assert decisions[0].data.harness in expected_harnesses
     # The parent's mirrored copy names the same in-family harness.
-    parent_decisions = _routing_decisions(conv_store, parent_id)
+    parent_decisions = routing_decisions(conv_store, parent_id)
     assert [d.data.harness for d in parent_decisions] == [decisions[0].data.harness]
 
 
@@ -1000,7 +994,7 @@ async def test_named_worker_child_of_an_auto_parent_stays_on_its_own_harness(
     refreshed = conv_store.get_conversation(child_conv.id)
     assert refreshed is not None
     assert refreshed.harness_override in (None, "pi")
-    decisions = _routing_decisions(conv_store, child_conv.id)
+    decisions = routing_decisions(conv_store, child_conv.id)
     assert len(decisions) == 1
     assert decisions[0].data.scope == "child_session"
     assert decisions[0].data.harness in (None, "pi")
@@ -1122,11 +1116,11 @@ async def test_child_spawn_gate_follows_the_parents_subagent_switch(
     if routed:
         assert len(routing_client.calls) == 1
         assert refreshed.model_override == ROUTED_MODEL
-        assert len(_routing_decisions(conv_store, child.id)) == 1
+        assert len(routing_decisions(conv_store, child.id)) == 1
     else:
         assert routing_client.calls == []
         assert refreshed.model_override is None
-        assert _routing_decisions(conv_store, child.id) == []
+        assert routing_decisions(conv_store, child.id) == []
 
 
 @pytest.mark.parametrize(
@@ -1329,7 +1323,7 @@ async def _route_one_turn(conv: Any, conv_store: SqlAlchemyConversationStore) ->
                 conv_store,
                 runner_client,
             )
-    decisions = _routing_decisions(conv_store, conv.id)
+    decisions = routing_decisions(conv_store, conv.id)
     assert len(decisions) == 1
     return decisions[0].data
 
@@ -1498,7 +1492,7 @@ async def _dispatch_native_turn(
                 file_store=None,
                 artifact_store=None,
             )
-    return _routing_decisions(conv_store, conv.id)[-1].data, forwarded
+    return routing_decisions(conv_store, conv.id)[-1].data, forwarded
 
 
 async def test_a_childs_second_spawn_cannot_pin_a_model_the_pane_rejects(
@@ -1774,6 +1768,374 @@ async def test_turn_candidates_come_from_the_panes_own_vocabulary(
     ]
 
 
+def _claude_sdk_spec(tmp_path: Any, auth_block: str) -> Any:
+    """Load a top-level ``claude-sdk`` spec with the given auth block.
+
+    The ``auth:`` block decides the resolved provider kind, and therefore
+    whether a routed gateway-hosted pick is runnable on the pane: an
+    ``api_key`` block talks direct to the vendor (``key`` kind), a
+    ``databricks`` block reaches models over the gateway.
+
+    :param tmp_path: A scratch directory to hold the one-file bundle.
+    :param auth_block: The YAML ``executor.auth:`` block, indented two spaces.
+    :returns: The parsed :class:`~omnigent.spec.types.AgentSpec`.
+    """
+    from omnigent.spec import load as load_spec
+
+    bundle = tmp_path / "sdk_agent"
+    bundle.mkdir()
+    (bundle / "config.yaml").write_text(
+        "spec_version: 1\n"
+        "name: offgateway-sdk\n"
+        "prompt: terse.\n"
+        "executor:\n"
+        "  config:\n"
+        "    harness: claude-sdk\n"
+        "  model: claude-sonnet-4-20250514\n" + auth_block
+    )
+    return load_spec(bundle)
+
+
+_API_KEY_AUTH = "  auth:\n    type: api_key\n    api_key: mock-key\n"
+
+
+@pytest.mark.parametrize(
+    ("case", "auth_block", "routed_model", "pinned"),
+    [
+        # Direct-to-vendor api_key pane: the gateway-hosted pick is unrunnable,
+        # so it must not be pinned and the turn runs unrouted — under every
+        # spelling the catalog uses for gateway-only models.
+        ("offgateway-api-key", _API_KEY_AUTH, ROUTED_MODEL, False),
+        ("offgateway-api-key-slash", _API_KEY_AUTH, "databricks/claude-opus-4-8", False),
+        ("offgateway-api-key-system-ai", _API_KEY_AUTH, "system.ai.claude-opus-4-8", False),
+        # Gateway-backed api_key pane: the key names a custom gateway base_url,
+        # so the launch path enables the gateway and the same pick runs — it is
+        # pinned like the databricks pane.
+        (
+            "gateway-api-key-base-url",
+            _API_KEY_AUTH + "    base_url: https://gw.example.invalid/v1\n",
+            ROUTED_MODEL,
+            True,
+        ),
+        # Gateway-backed databricks pane: the same pick runs, so it is pinned.
+        (
+            "gateway-databricks",
+            "  auth:\n    type: databricks\n    profile: DEFAULT\n",
+            ROUTED_MODEL,
+            True,
+        ),
+    ],
+    ids=[
+        "offgateway-api-key",
+        "offgateway-api-key-slash",
+        "offgateway-api-key-system-ai",
+        "gateway-api-key-base-url",
+        "gateway-databricks",
+    ],
+)
+async def test_a_routed_gateway_pick_is_pinned_only_when_the_pane_can_run_it(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Any,
+    case: str,
+    auth_block: str,
+    routed_model: str,
+    pinned: bool,
+) -> None:
+    """The router may only pin a gateway-hosted model a pane can actually run.
+
+    With no host reporting gateway backing the pane defaults to gateway-backed,
+    so the static fallback offers ``databricks-*`` candidates the judge can
+    pick. Pinning one as ``model_override`` on a direct-to-vendor pane makes
+    the ``claude-sdk`` executor raise (``gateway=False``) on this and every
+    later turn. Such a pick must run unrouted with the reason on its card and
+    the row left clear so the next turn routes again; a gateway-backed pane
+    takes the same pick normally.
+    """
+    agent = await create_test_agent(client, name=f"routing-offgateway-{case}")
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert resp.status_code == 201, resp.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(resp.json()["id"])
+    assert conv is not None
+    assert conv.model_override is None
+
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=routed_model, rationale="deep refactor", harness="claude_code")
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                conv.id,
+                conv,
+                body,
+                conv_store,
+                runner_client,
+                agent_spec=_claude_sdk_spec(tmp_path, auth_block),
+            )
+
+    refreshed = conv_store.get_conversation(conv.id)
+    assert refreshed is not None
+    decisions = routing_decisions(conv_store, conv.id)
+    assert len(decisions) == 1
+    assert decisions[0].data.scope == "turn"
+    assert decisions[0].data.applied is pinned
+    if pinned:
+        assert refreshed.model_override == routed_model
+    else:
+        # The row stays clear, so the next turn routes again rather than
+        # failing on a model the pane cannot run, and the card says why.
+        assert refreshed.model_override is None
+        assert "gateway" in decisions[0].data.rationale.lower()
+
+
+async def test_the_events_route_threads_the_spec_so_an_offgateway_pick_is_declined(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real ``POST /events`` route resolves the spec and declines a bad pin.
+
+    The unit veto test calls ``_forward_event_to_runner`` with a hand-built
+    spec; this drives the whole route, so the spec must be loaded from the
+    agent cache and threaded to the forwarder. A direct-vendor ``claude-sdk``
+    session with Smart Routing on draws a ``databricks-*`` pick it cannot run
+    on both turns: the row must stay clear so each turn routes again, and no
+    gateway model may reach the runner body.
+    """
+    from omnigent.server.routes import sessions as sessions_mod
+
+    agent = await create_test_agent(
+        client,
+        name="offgateway-events",
+        include_llm=False,
+        executor={
+            "config": {"harness": "claude-sdk"},
+            "model": "claude-sonnet-4-20250514",
+            "auth": {"type": "api_key", "api_key": "mock-key"},
+        },
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert resp.status_code == 201, resp.text
+    sid = resp.json()["id"]
+
+    forwarded: list[dict[str, Any]] = []
+
+    async def _stub_runner(*_: Any, **__: Any) -> RoutingCaptureRunnerClient:
+        return RoutingCaptureRunnerClient(forwarded)
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub_runner)
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
+    )
+
+    async def _post_turn(text: str) -> None:
+        turn = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            },
+        )
+        assert turn.status_code == 202, turn.text
+
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        await _post_turn("refactor auth")
+        await _post_turn("now the tests")
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    refreshed = conv_store.get_conversation(sid)
+    assert refreshed is not None
+    # The unrunnable gateway pick was never pinned, on either turn.
+    assert refreshed.model_override is None
+
+    decisions = routing_decisions(conv_store, sid)
+    assert len(decisions) == 2, (
+        f"Expected one declined decision per turn; got {len(decisions)}. "
+        "The spec must thread through POST /events so each turn routes and vetoes."
+    )
+    for decision in decisions:
+        assert decision.data.scope == "turn"
+        assert decision.data.applied is False
+        assert "gateway" in decision.data.rationale.lower()
+
+    assert forwarded, "The route never forwarded a turn to the runner."
+    assert all(body.get("model_override") != ROUTED_MODEL for body in forwarded), (
+        "An unrunnable gateway pick reached the runner body: "
+        f"{[body.get('model_override') for body in forwarded]!r}"
+    )
+
+
+def _root_with_offgateway_child(tmp_path: Any) -> Any:
+    """Load a root spec whose transport differs from its sub-agent's.
+
+    The root talks over the gateway (``databricks`` auth), but the
+    declared ``offchild`` sub-agent talks direct to the vendor
+    (``api_key`` auth). A declared sub-agent session runs the child's
+    spec, so a routed gateway pick must be judged against the child, not
+    the root — the root alone would wrongly accept it.
+
+    :param tmp_path: A scratch directory to hold the bundle.
+    :returns: The parsed root :class:`~omnigent.spec.types.AgentSpec`.
+    """
+    from omnigent.spec import load as load_spec
+
+    bundle = tmp_path / "parent_agent"
+    (bundle / "agents" / "offchild").mkdir(parents=True)
+    (bundle / "config.yaml").write_text(
+        "spec_version: 1\n"
+        "name: offgateway-parent\n"
+        "prompt: terse.\n"
+        "executor:\n"
+        "  config:\n"
+        "    harness: claude-sdk\n"
+        "  model: claude-sonnet-4-20250514\n"
+        "  auth:\n"
+        "    type: databricks\n"
+        "    profile: DEFAULT\n"
+        "tools:\n"
+        "  agents:\n"
+        "    - offchild\n"
+    )
+    (bundle / "agents" / "offchild" / "config.yaml").write_text(
+        "spec_version: 1\n"
+        "name: offchild\n"
+        "prompt: terse child.\n"
+        "executor:\n"
+        "  config:\n"
+        "    harness: claude-sdk\n"
+        "  model: claude-sonnet-4-20250514\n"
+        "  auth:\n"
+        "    type: api_key\n"
+        "    api_key: mock-key\n"
+    )
+    return load_spec(bundle)
+
+
+async def test_the_forwarder_reads_a_sub_agent_sessions_child_transport_for_the_veto(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Any,
+) -> None:
+    """A sub-agent session judges the routed pick against the child spec.
+
+    A declared sub-agent session runs its own child spec, whose executor
+    auth can differ from the root's, and callers hand the forwarder the
+    root spec. The forwarder must resolve the child from
+    ``conv.sub_agent_name`` before deciding whether a routed gateway pick
+    is runnable. Here the root talks over the gateway but ``offchild``
+    talks direct to the vendor, so the gateway pick is unrunnable on the
+    child and must be declined — the root spec alone would have pinned it,
+    so a decline is proof the child's transport decided.
+    """
+    agent = await create_test_agent(client, name="routing-subagent-child")
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert resp.status_code == 201, resp.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(resp.json()["id"])
+    assert conv is not None
+    assert conv.model_override is None
+    # Run the turn as the declared sub-agent: the forwarder resolves the
+    # child's transport off this name while the root spec stays threaded.
+    conv.sub_agent_name = "offchild"
+
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                conv.id,
+                conv,
+                body,
+                conv_store,
+                runner_client,
+                agent_spec=_root_with_offgateway_child(tmp_path),
+            )
+
+    refreshed = conv_store.get_conversation(conv.id)
+    assert refreshed is not None
+    decisions = routing_decisions(conv_store, conv.id)
+    assert len(decisions) == 1
+    assert decisions[0].data.scope == "turn"
+    # The child is off-gateway, so the gateway pick is declined even though
+    # the root talks over the gateway: proof the child's transport decided.
+    assert decisions[0].data.applied is False
+    assert refreshed.model_override is None
+    assert "gateway" in decisions[0].data.rationale.lower()
+
+
+async def test_an_unresolvable_sub_agent_name_judges_the_root_transport(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Any,
+) -> None:
+    """A stale sub-agent name falls back to the root spec for the veto.
+
+    When ``conv.sub_agent_name`` resolves to no declared sub-agent, the
+    runner boots the child as a clone of the root spec (see
+    ``_find_spec_by_name`` callers in runtime/workflow.py). The veto must
+    therefore judge the root transport, not read the unresolved name as
+    unknown: here the root talks direct to the vendor, so the gateway pick
+    is declined. Dropping the root fallback would wrongly pin it.
+    """
+    agent = await create_test_agent(client, name="routing-stale-child")
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert resp.status_code == 201, resp.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(resp.json()["id"])
+    assert conv is not None
+    # No sub-agent of this name is declared, so the runner would clone the root.
+    conv.sub_agent_name = "does-not-exist"
+
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
+    )
+    direct_api_key = "  auth:\n    type: api_key\n    api_key: mock-key\n"
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                conv.id,
+                conv,
+                body,
+                conv_store,
+                runner_client,
+                agent_spec=_claude_sdk_spec(tmp_path, direct_api_key),
+            )
+
+    refreshed = conv_store.get_conversation(conv.id)
+    assert refreshed is not None
+    decisions = routing_decisions(conv_store, conv.id)
+    assert len(decisions) == 1
+    assert decisions[0].data.applied is False
+    assert refreshed.model_override is None
+    assert "gateway" in decisions[0].data.rationale.lower()
+
+
 # ── 10. A routed child's harness is chosen once, not per message ─────
 
 
@@ -1866,7 +2228,7 @@ async def test_a_follow_up_message_cannot_flip_a_routed_childs_harness(
     assert len(routing_client.calls) == 1, "the follow-up must not re-run the judge"
     assert after_second.harness_override == first_harness
     assert after_second.model_override == GPT_MODEL
-    assert len(_routing_decisions(conv_store, child.id)) == 1
+    assert len(routing_decisions(conv_store, child.id)) == 1
 
 
 # ── A routing OUTAGE never costs the user their turn ────────────────
@@ -1961,7 +2323,7 @@ async def test_a_routing_outage_still_delivers_the_turn(
     assert item_id
 
     # And the outage is on the record rather than swallowed.
-    decisions = _routing_decisions(conv_store, conv.id)
+    decisions = routing_decisions(conv_store, conv.id)
     assert len(decisions) == 1
     assert decisions[0].data.model == UNAVAILABLE_MODEL
     assert decisions[0].data.applied is False
@@ -2030,7 +2392,7 @@ async def test_a_routing_outage_still_delivers_a_native_pane_turn(
     assert len(forwarded) == 1
     assert forwarded[0].get("model_override") is None
 
-    decisions = _routing_decisions(conv_store, conv.id)
+    decisions = routing_decisions(conv_store, conv.id)
     assert len(decisions) == 1
     assert decisions[0].data.model == UNAVAILABLE_MODEL
     assert decisions[0].data.applied is False
@@ -2078,7 +2440,7 @@ async def test_a_routing_outage_still_allows_the_spawn(
     assert not payload.get("model")
 
     conv_store = SqlAlchemyConversationStore(db_uri)
-    assert len(_routing_decisions(conv_store, session_id)) == 1
+    assert len(routing_decisions(conv_store, session_id)) == 1
 
 
 @pytest.mark.parametrize(
@@ -2162,7 +2524,7 @@ async def test_a_routing_outage_still_delivers_a_child_spawns_turn(
     assert refreshed.model_override is None
     assert not refreshed.labels.get(ROUTING_DECISION_LABEL_KEY)
 
-    decisions = _routing_decisions(conv_store, child.id)
+    decisions = routing_decisions(conv_store, child.id)
     assert len(decisions) == 1
     assert decisions[0].data.model == UNAVAILABLE_MODEL
     assert decisions[0].data.applied is False
@@ -2210,7 +2572,7 @@ async def test_an_auto_harness_outage_leaves_the_route_once_label_unclaimed(
     after_outage = conv_store.get_conversation(session_id)
     assert after_outage is not None
     # The failure is visible…
-    decisions = _routing_decisions(conv_store, session_id)
+    decisions = routing_decisions(conv_store, session_id)
     assert len(decisions) == 1
     assert decisions[0].data.model == UNAVAILABLE_MODEL
     assert decisions[0].data.applied is False

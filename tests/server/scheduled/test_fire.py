@@ -99,8 +99,12 @@ class FakeAgentCache:
     ) -> None:
         self._harness = harness
         self._reasoning_effort = reasoning_effort
+        # (agent_id, bundle_location, expand_env) for each load, so tests can
+        # assert the immutable provenance is threaded into a cold load.
+        self.load_calls: list[tuple[str, str, Any]] = []
 
-    def load(self, agent_id: str, bundle_location: str, **_: Any) -> _FakeLoadedAgent:
+    def load(self, agent_id: str, bundle_location: str, **kwargs: Any) -> _FakeLoadedAgent:
+        self.load_calls.append((agent_id, bundle_location, kwargs.get("expand_env")))
         return _FakeLoadedAgent(self._harness, self._reasoning_effort)
 
 
@@ -913,6 +917,7 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
 
     async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> None:
         captured["agent_revision"] = kwargs.get("agent_revision")
+        captured["agent_spec"] = kwargs.get("agent_spec")
 
     monkeypatch.setattr(host_launch, "resolve_host_launch", _resolve_host_launch)
     monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _launch_runner_on_host)
@@ -936,6 +941,7 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
             host_store=FakeHostStore({"host_1": _FakeHost("host_1", RESERVED_USER_LOCAL)}),
             host_registry=FakeHostRegistry(online={"host_1"}),
             agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/rev1")}),
+            agent_cache=FakeAgentCache(harness="claude-sdk"),
         )
     )
 
@@ -944,6 +950,150 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
     assert captured["user_id"] == RESERVED_USER_LOCAL
     # The kickoff names the bundle it runs, so the runner sees a later reinstall.
     assert captured["agent_revision"] == "ag_1/rev1"
+    # The scheduled turn routes like any other, so the forwarder gets the
+    # resolved spec to decline a gateway pick this pane cannot run.
+    assert captured["agent_spec"] is not None
+    assert captured["agent_spec"].executor.config["harness"] == "claude-sdk"
+
+
+@pytest.mark.asyncio
+async def test_managed_sandbox_dispatch_threads_resolved_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The managed-sandbox seam threads the resolved spec, like the connected one.
+
+    Both launch seams route the scheduled turn, so each must hand the
+    forwarder the resolved spec to decline a gateway pick this pane cannot
+    run. This drives the managed seam to its dispatch tail and asserts the
+    spec (and bundle revision) reach it, mirroring the connected-host test.
+    """
+    import omnigent.server.routes.sessions as sessions_routes
+
+    captured: dict[str, Any] = {}
+
+    async def _run_managed_launch(**kwargs: Any) -> None:
+        return None
+
+    async def _wait_for_runner_client(*args: Any, **kwargs: Any) -> object:
+        return object()
+
+    async def _ensure_runner_session_initialized(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> None:
+        captured["agent_revision"] = kwargs.get("agent_revision")
+        captured["agent_spec"] = kwargs.get("agent_spec")
+
+    monkeypatch.setattr(sessions_routes, "_run_managed_launch", _run_managed_launch)
+    monkeypatch.setattr(sessions_routes, "_wait_for_runner_client", _wait_for_runner_client)
+    monkeypatch.setattr(
+        sessions_routes,
+        "_ensure_runner_session_initialized",
+        _ensure_runner_session_initialized,
+    )
+    monkeypatch.setattr(
+        sessions_routes,
+        "_dispatch_session_event_to_runner",
+        _dispatch_session_event_to_runner,
+    )
+
+    class _BoundConvStore(FakeConversationStore):
+        # The managed launch binds a runner before the seam re-reads the row;
+        # stand that in so the dispatch tail runs.
+        def get_conversation(self, conversation_id: str) -> _FakeConversation:
+            return _FakeConversation(id=conversation_id, agent_id="ag_1", runner_id="runner_1")
+
+    class _NoopManagedLaunches:
+        def begin(self, session_id: str) -> None:
+            return None
+
+        def get(self, session_id: str) -> None:
+            return None
+
+    agent_cache = FakeAgentCache(harness="claude-sdk")
+    operator_agent = _FakeAgent("ag_1", bundle_location="ag_1/rev1")
+    assert operator_agent.operator_authored is True
+    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+    dispatch = fire_mod._make_managed_sandbox_dispatch(
+        _deps(
+            store,
+            conversation_store=_BoundConvStore(),
+            host_store=FakeHostStore({"host_1": _FakeHost("host_1", RESERVED_USER_LOCAL)}),
+            host_registry=FakeHostRegistry(online={"host_1"}),
+            agent_store=FakeAgentStore({"ag_1": operator_agent}),
+            agent_cache=agent_cache,
+            sandbox_config=_FakeSandboxConfig(managed_launch_supported=True),
+            managed_launches=_NoopManagedLaunches(),
+        )
+    )
+
+    await dispatch(_FakeConversation(id="conv_1", agent_id="ag_1"), _task(user_id=None))
+
+    # Names the bundle it runs, so the runner sees a later reinstall.
+    assert captured["agent_revision"] == "ag_1/rev1"
+    # The scheduled turn routes like any other, so the managed seam gets the
+    # resolved spec to decline a gateway pick this pane cannot run.
+    assert captured["agent_spec"] is not None
+    assert captured["agent_spec"].executor.config["harness"] == "claude-sdk"
+    # The spec is loaded with the agent's immutable provenance, so a cold
+    # Tier-1 cache load is not poisoned with unexpanded ``${VAR}`` values.
+    assert agent_cache.load_calls == [("ag_1", "ag_1/rev1", True)]
+
+
+@pytest.mark.asyncio
+async def test_session_authored_agent_loads_its_spec_unexpanded() -> None:
+    """A session-authored agent threads ``expand_env=False`` into the load.
+
+    Provenance is immutable per agent, so the scheduled spec load must forward
+    the agent's own ``operator_authored`` value rather than a fixed default;
+    otherwise a cold Tier-1 cache first-loads a user agent with the wrong
+    expansion and serves it to later callers.
+    """
+    session_agent = _FakeAgent(
+        "ag_1", bundle_location="ag_1/rev1", session_id="sess_1", created_by="user_1"
+    )
+    assert session_agent.operator_authored is False
+    agent_cache = FakeAgentCache(harness="claude-sdk")
+    deps = _deps(
+        FakeScheduledTaskStore(rows={"task_1": _task()}),
+        agent_store=FakeAgentStore({"ag_1": session_agent}),
+        agent_cache=agent_cache,
+    )
+
+    revision, spec = await fire_mod._agent_binding(
+        deps, _FakeConversation(id="conv_1", agent_id="ag_1")
+    )
+
+    assert revision == "ag_1/rev1"
+    assert spec is not None
+    assert agent_cache.load_calls == [("ag_1", "ag_1/rev1", False)]
+
+
+@pytest.mark.asyncio
+async def test_agent_binding_fails_open_when_the_spec_load_raises() -> None:
+    """A spec-load failure still names the bundle and dispatches with no spec.
+
+    Routing must never block a scheduled turn, so a cache that raises leaves
+    the resolved revision intact and the spec ``None`` — the forwarder then
+    runs the turn without the transport hint rather than failing.
+    """
+
+    class _RaisingCache:
+        def load(self, *_: Any, **__: Any) -> Any:
+            raise RuntimeError("bundle unavailable")
+
+    deps = _deps(
+        FakeScheduledTaskStore(rows={"task_1": _task()}),
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/rev1")}),
+        agent_cache=_RaisingCache(),
+    )
+
+    revision, spec = await fire_mod._agent_binding(
+        deps, _FakeConversation(id="conv_1", agent_id="ag_1")
+    )
+
+    assert revision == "ag_1/rev1"
+    assert spec is None
 
 
 @pytest.mark.asyncio
@@ -1972,3 +2122,41 @@ async def test_public_grant_failure_does_not_cancel_run() -> None:
     assert len(launched) == 1
     assert store.runs and store.runs[0]["status"] == "running"
     assert not any(r.get("error_code") == "owner_grant_failed" for r in store.runs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent", "expand_env"),
+    [
+        (_FakeAgent("ag_1", bundle_location="ag_1/rev1"), True),
+        (
+            _FakeAgent(
+                "ag_1", bundle_location="ag_1/rev1", session_id="sess_1", created_by="user_1"
+            ),
+            False,
+        ),
+    ],
+    ids=["operator-authored", "session-authored"],
+)
+async def test_launch_arg_spec_loads_match_the_agents_provenance(
+    agent: _FakeAgent, expand_env: bool
+) -> None:
+    """The permission-mode and reasoning-effort loads use the agent's provenance.
+
+    They share the spec cache with the routing load, and a tier-1 hit ignores
+    ``expand_env``, so whichever load runs first fixes the expansion for all.
+    """
+    agent_cache = FakeAgentCache(harness="claude-native", reasoning_effort="high")
+    deps = _deps(
+        FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="acceptEdits")}),
+        agent_store=FakeAgentStore({"ag_1": agent}),
+        agent_cache=agent_cache,
+    )
+    task = _task(permission_mode="acceptEdits")
+
+    launch_args = await fire_mod._permission_mode_launch_args(deps, task)
+    effort = await fire_mod._spec_reasoning_effort(deps, task)
+
+    assert launch_args == ["--permission-mode", "acceptEdits"]
+    assert effort == "high"
+    assert agent_cache.load_calls == [("ag_1", "ag_1/rev1", expand_env)] * 2

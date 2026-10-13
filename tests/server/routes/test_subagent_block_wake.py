@@ -63,11 +63,14 @@ class _DispatchCall:
     :param session_id: Session the event was dispatched to.
     :param text: The ``input_text`` body the wake injected.
     :param agent_revision: The parent agent's bundle the wake named.
+    :param agent_spec: The parent spec the wake loaded for the routing
+        veto, or ``None`` when no agent cache was wired.
     """
 
     session_id: str
     text: str
     agent_revision: str | None = None
+    agent_spec: Any = None
 
 
 @pytest_asyncio.fixture
@@ -163,12 +166,14 @@ async def test_record_publish_delivers_wake_message_to_parent(
         # TypeErrors inside the notifier task and no wake lands.
         runner_router: Any | None = None,
         agent_revision: str | None = None,
+        agent_spec: Any | None = None,
     ) -> str:
         delivered.append(
             _DispatchCall(
                 session_id=session_id,
                 text=body.data["content"][0]["text"],
                 agent_revision=agent_revision,
+                agent_spec=agent_spec,
             )
         )
         fired.set()
@@ -203,6 +208,9 @@ async def test_record_publish_delivers_wake_message_to_parent(
         # The wake names the parent's current bundle, so its runner drops a
         # spec cached before the reinstall.
         assert call.agent_revision == f"{parent_agent_id}/v2"
+        # No agent cache was wired, so the wake carries no routing-veto spec
+        # hint and the veto fails open (nothing is pinned on the wake turn).
+        assert call.agent_spec is None
 
         # Resolving the block sends the woken parent a follow-up through
         # the same wiring, so it stops acting on the stale block notice.
@@ -295,3 +303,184 @@ async def test_record_publish_no_wake_when_no_runner_bound(
     # server-layer retry actually re-tries the unroutable parent rather than
     # giving up after the first miss.
     assert lookups == expected_attempts
+
+
+async def test_wake_threads_the_parent_spec_for_the_routing_veto(
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wake loads the parent spec and hands it to the dispatch.
+
+    The wake posts a user message the parent routes like any later turn,
+    so the routing veto must be able to decline a gateway pick the parent
+    pane cannot run. That needs the parent's spec: the wake loads it from
+    the agent cache (by the parent's current bundle) and threads it as
+    ``agent_spec`` to the dispatch.
+    """
+    parent_agent_id = "0123456789abcdef0123456789abcdef"
+    parent = conv_store.create_conversation(
+        kind="default", title="parent", agent_id=parent_agent_id
+    )
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="codex:demo", parent_conversation_id=parent.id
+    )
+    parent_agent = type(
+        "Agent",
+        (),
+        {
+            "id": parent_agent_id,
+            "bundle_location": f"{parent_agent_id}/v2",
+            "operator_authored": True,
+        },
+    )()
+    agents = {parent_agent_id: parent_agent}
+    agent_store = type("Agents", (), {"get": staticmethod(agents.get)})()
+
+    # Identity sentinel: the wake must hand this exact object to dispatch.
+    sentinel_spec = object()
+    load_calls: list[tuple[str, str, bool | None]] = []
+
+    class _Cache:
+        def load(self, agent_id: str, bundle_location: str, **kw: Any) -> Any:
+            load_calls.append((agent_id, bundle_location, kw.get("expand_env")))
+            return type("Loaded", (), {"spec": sentinel_spec})()
+
+    delivered: list[_DispatchCall] = []
+    fired = asyncio.Event()
+    sentinel_client = object()
+
+    async def _fake_get_runner_client(session_id: str, runner_router: Any) -> object:
+        return sentinel_client
+
+    async def _record_dispatch(
+        session_id: str,
+        conv: Conversation,
+        body: SessionEventInput,
+        conversation_store: SqlAlchemyConversationStore,
+        runner_client: object,
+        *,
+        agent_name: str | None = None,
+        file_store: Any | None = None,
+        artifact_store: Any | None = None,
+        has_mcp_servers: bool = False,
+        runner_router: Any | None = None,
+        agent_revision: str | None = None,
+        agent_spec: Any | None = None,
+    ) -> str:
+        delivered.append(
+            _DispatchCall(
+                session_id=session_id,
+                text=body.data["content"][0]["text"],
+                agent_revision=agent_revision,
+                agent_spec=agent_spec,
+            )
+        )
+        fired.set()
+        return "item_wake"
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(sessions_module, "_dispatch_session_event_to_runner", _record_dispatch)
+
+    uninstall = sessions_module.configure_subagent_block_notifier(
+        conv_store, None, agent_store=agent_store, agent_cache=_Cache()
+    )
+    try:
+        pending_elicitations.record_publish(
+            child.id, _request_event("elicit_demo", "Codex wants to run 'git fetch'")
+        )
+        await asyncio.wait_for(fired.wait(), timeout=2.0)
+    finally:
+        uninstall()
+
+    assert len(delivered) == 1
+    # The cache was consulted with the parent's CURRENT bundle and the
+    # provenance-derived expansion flag, and that exact spec rode to the
+    # dispatch so the veto can judge the pick.
+    assert load_calls == [(parent_agent_id, f"{parent_agent_id}/v2", True)]
+    assert delivered[0].agent_spec is sentinel_spec
+
+
+async def test_wake_fails_open_when_the_parent_spec_cannot_load(
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spec-load failure never blocks the wake; the veto fails open.
+
+    Loading the parent spec is only a routing hint. If the cache raises,
+    the wake still delivers the block notice to the parent carrying no
+    spec, so the veto declines nothing rather than the notice being lost.
+    """
+    parent_agent_id = "0123456789abcdef0123456789abcdef"
+    parent = conv_store.create_conversation(
+        kind="default", title="parent", agent_id=parent_agent_id
+    )
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="codex:demo", parent_conversation_id=parent.id
+    )
+    parent_agent = type(
+        "Agent",
+        (),
+        {
+            "id": parent_agent_id,
+            "bundle_location": f"{parent_agent_id}/v2",
+            "operator_authored": True,
+        },
+    )()
+    agents = {parent_agent_id: parent_agent}
+    agent_store = type("Agents", (), {"get": staticmethod(agents.get)})()
+
+    class _BrokenCache:
+        def load(self, agent_id: str, bundle_location: str, **_: Any) -> Any:
+            raise RuntimeError("bundle unavailable")
+
+    delivered: list[_DispatchCall] = []
+    fired = asyncio.Event()
+
+    async def _fake_get_runner_client(session_id: str, runner_router: Any) -> object:
+        return object()
+
+    async def _record_dispatch(
+        session_id: str,
+        conv: Conversation,
+        body: SessionEventInput,
+        conversation_store: SqlAlchemyConversationStore,
+        runner_client: object,
+        *,
+        agent_name: str | None = None,
+        file_store: Any | None = None,
+        artifact_store: Any | None = None,
+        has_mcp_servers: bool = False,
+        runner_router: Any | None = None,
+        agent_revision: str | None = None,
+        agent_spec: Any | None = None,
+    ) -> str:
+        delivered.append(
+            _DispatchCall(
+                session_id=session_id,
+                text=body.data["content"][0]["text"],
+                agent_revision=agent_revision,
+                agent_spec=agent_spec,
+            )
+        )
+        fired.set()
+        return "item_wake"
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(sessions_module, "_dispatch_session_event_to_runner", _record_dispatch)
+
+    uninstall = sessions_module.configure_subagent_block_notifier(
+        conv_store, None, agent_store=agent_store, agent_cache=_BrokenCache()
+    )
+    try:
+        pending_elicitations.record_publish(
+            child.id, _request_event("elicit_demo", "Codex wants to run 'git fetch'")
+        )
+        await asyncio.wait_for(fired.wait(), timeout=2.0)
+    finally:
+        uninstall()
+
+    # The notice still reached the parent (never dropped on a hint failure),
+    # and it carried no spec, so the veto declines nothing on the wake turn.
+    assert len(delivered) == 1
+    assert delivered[0].session_id == parent.id
+    assert delivered[0].agent_spec is None

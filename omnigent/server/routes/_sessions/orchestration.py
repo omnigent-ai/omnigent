@@ -6099,21 +6099,67 @@ def _routed_turn_model_spelling(
     return spelling
 
 
-def _unapplied_routed_verdict(model: str, verdict: dict[str, Any]) -> dict[str, Any]:
+def _unapplied_routed_verdict(
+    model: str, verdict: dict[str, Any], reason: str | None = None
+) -> dict[str, Any]:
     """
-    Record on a verdict that the terminal cannot switch to *model*.
+    Record on a verdict that the pick was not applied, with the reason.
 
-    :param model: The routed model id the pane has no spelling for.
+    :param model: The routed model id that was not applied.
     :param verdict: Router verdict about to be recorded as a chip.
+    :param reason: The user-facing note; defaults to the claude-native
+        pane's vocabulary case when the caller gives none.
     :returns: The verdict with ``applied`` cleared and the reason noted.
     """
     rationale = verdict.get("rationale")
-    note = f"Not applied: this Claude terminal cannot switch to {model}."
+    note = reason or f"Not applied: this Claude terminal cannot switch to {model}."
     return {
         **verdict,
         "applied": False,
         "rationale": f"{rationale} {note}" if isinstance(rationale, str) and rationale else note,
     }
+
+
+#: Model-id spellings only the Databricks AI-Gateway serves; a pane whose
+#: executor talks direct to the vendor cannot run them. Serving-endpoints list
+#: ``databricks-`` ids; Unity Catalog model services spell the same endpoints
+#: ``system.ai.`` (see :mod:`omnigent.models.databricks_model_discovery`).
+_GATEWAY_MODEL_PREFIXES: tuple[str, ...] = ("databricks-", "databricks/", "system.ai.")
+
+
+def _session_uses_direct_vendor_transport(spec: AgentSpec, harness: str | None) -> bool:
+    """Whether this session reaches its model direct from the vendor.
+
+    Follows the launch-path resolution
+    (:func:`~omnigent.models.model_catalog.resolve_model_provider`) with no
+    second credential read: subscription providers are direct; key providers
+    are direct when their launch endpoint (``launch_base_url``, else
+    ``base_url``) is the family's vendor default. Other kinds fail open.
+
+    :param spec: The session's resolved agent spec.
+    :param harness: The session's harness id, e.g. ``"claude-sdk"``.
+    :returns: ``True`` when the session reaches its model direct from the vendor.
+    """
+    from omnigent.models.model_catalog import (
+        KEY_KIND,
+        SUBSCRIPTION_KIND,
+        resolve_model_provider,
+    )
+    from omnigent.onboarding.configure_models import default_base_url_for_family
+
+    provider = resolve_model_provider(spec, harness)
+    if provider.kind == SUBSCRIPTION_KIND:
+        return True
+    if provider.kind != KEY_KIND or not provider.family:
+        return False
+    endpoint = provider.launch_base_url or provider.base_url
+    if not endpoint:
+        return False
+    try:
+        vendor_default = default_base_url_for_family(provider.family)
+    except KeyError:
+        return False
+    return endpoint.rstrip("/").lower() == vendor_default.rstrip("/").lower()
 
 
 #: Placeholder model on a decision card for a routing call that never answered.
@@ -6329,6 +6375,7 @@ async def _forward_event_to_runner(
     created_by: str | None = None,
     host_store: HostStore | None = None,
     agent_revision: str | None = None,
+    agent_spec: AgentSpec | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -6362,6 +6409,12 @@ async def _forward_event_to_runner(
         ``None`` reads as unknown, which counts as backed.
     :param agent_revision: The agent's current ``bundle_location``; the
         runner rebuilds the session's spec when it changes.
+    :param agent_spec: The session's resolved *root* agent spec, read only
+        to learn whether a routed gateway-hosted pick is runnable on this
+        session before pinning it. For a declared sub-agent session this
+        resolves the child spec from ``conv.sub_agent_name``, so callers
+        pass the root spec unchanged. ``None`` reads as unknown and never
+        vetoes a pick.
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
@@ -6617,6 +6670,9 @@ async def _forward_event_to_runner(
     # Set when the pick has no spelling this session can be switched to, so
     # nothing was pinned and the chip must say so.
     _turn_unapplied = False
+    # The user-facing reason the pick was not applied; ``None`` keeps the
+    # chip's default claude-native wording.
+    _unapplied_reason: str | None = None
     # Set when the routing call itself failed — on either branch below. The
     # chip then carries the "unavailable" placeholder rather than a model,
     # nothing is pinned, and the route-once label is left unclaimed.
@@ -6768,13 +6824,35 @@ async def _forward_event_to_runner(
                     _routed_model, _verdict = _unavailable_routing_card(_turn_route_err)
                     _route_failed = True
                 if _routed_model is not None and not _route_failed:
-                    # Whether the session can actually be switched onto the
-                    # pick decides everything downstream: an unapplicable
-                    # model must not be pinned (the pin disables routing for
-                    # every later turn) nor reported as this turn's model.
                     _turn_spelling = _routed_turn_model_spelling(session_id, conv, _routed_model)
-                    if _turn_spelling is None:
+                    # A declared sub-agent session runs its own child spec,
+                    # whose executor auth can differ from the parent's; resolve
+                    # it here so callers can hand down the root spec unchanged.
+                    _veto_spec = agent_spec
+                    if _veto_spec is not None and conv.sub_agent_name:
+                        # A stale/renamed name resolves to nothing; the runner
+                        # then clones the root spec, so judge the root too.
+                        _veto_spec = (
+                            _find_spec_by_name(_veto_spec, conv.sub_agent_name) or _veto_spec
+                        )
+                    # Static fallback can offer a gateway-hosted pick a
+                    # direct-vendor pane cannot run (the executor raises at
+                    # construction), so decline the pin and run unrouted.
+                    _pick_off_gateway = (
+                        _routed_model.startswith(_GATEWAY_MODEL_PREFIXES)
+                        and _veto_spec is not None
+                        and await asyncio.to_thread(
+                            _session_uses_direct_vendor_transport, _veto_spec, _harness
+                        )
+                    )
+                    if _turn_spelling is None or _pick_off_gateway:
                         _turn_unapplied = True
+                        if _pick_off_gateway:
+                            _unapplied_reason = (
+                                "Not applied: this session reaches its model direct "
+                                f"from the vendor and cannot run {_routed_model}, "
+                                "which needs the Databricks gateway."
+                            )
                     else:
                         effective_runner_override = _routed_model
                         # Persist as the session's model_override so all
@@ -6918,7 +6996,9 @@ async def _forward_event_to_runner(
         if _routed_model is not None and _verdict is not None:
             _decision_scope = "child_session" if _parent_routing_on else "turn"
             if _turn_unapplied:
-                _verdict = _unapplied_routed_verdict(_routed_model, _verdict)
+                _verdict = _unapplied_routed_verdict(
+                    _routed_model, _verdict, reason=_unapplied_reason
+                )
             # The router wins over the orchestrator's own pick; the attempt is
             # recorded so the UI can show what it overrode. Compared on the bare
             # arm, so another spelling of the same model (a spawn's
@@ -7215,6 +7295,7 @@ async def _dispatch_session_event_to_runner_impl(
     host_registry: HostRegistry | None = None,
     background_titles_enabled: bool = True,
     agent_revision: str | None = None,
+    agent_spec: AgentSpec | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -7289,6 +7370,9 @@ async def _dispatch_session_event_to_runner_impl(
         an older host row gets.
     :param agent_revision: The agent's current ``bundle_location``, stamped on
         non-native forwards (see :func:`_forward_event_to_runner`).
+    :param agent_spec: The session's resolved agent spec, forwarded so the
+        router can tell whether a gateway-hosted pick is runnable on this
+        session before pinning it (see :func:`_forward_event_to_runner`).
     :returns: A :class:`_SessionEventDispatchResult` carrying the
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
@@ -7630,6 +7714,7 @@ async def _dispatch_session_event_to_runner_impl(
         created_by=created_by,
         host_store=host_store,
         agent_revision=agent_revision,
+        agent_spec=agent_spec,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -9510,6 +9595,7 @@ async def _wake_parent_for_blocked_child(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
 ) -> bool:
     """
     Deliver a parent-wake notice when a sub-agent blocks on an approval.
@@ -9534,6 +9620,9 @@ async def _wake_parent_for_blocked_child(
         consulted as a fallback).
     :param agent_store: Resolves the parent agent's current bundle, so a
         reinstall since the parent's last turn reaches this wake turn too.
+    :param agent_cache: Loads the parent's spec so the routing veto can
+        decline a gateway pick this pane cannot run. ``None`` leaves the
+        spec unknown, which never vetoes a pick (fail open).
     :returns: ``True`` when the notice was dispatched to the parent's runner;
         ``False`` when delivery could not happen (parent gone, no runner bound,
         or the forward raised a transport error).
@@ -9578,6 +9667,26 @@ async def _wake_parent_for_blocked_child(
         if agent_store is not None and parent_conv.agent_id
         else None
     )
+    # The wake posts a user message the parent routes like any turn, so load its
+    # spec to decline a gateway pick this direct-vendor pane cannot run.
+    _parent_spec: AgentSpec | None = None
+    if agent_cache is not None and parent_agent is not None and parent_agent.bundle_location:
+        try:
+            _parent_spec = (
+                await asyncio.to_thread(
+                    agent_cache.load,
+                    parent_agent.id,
+                    parent_agent.bundle_location,
+                    expand_env=parent_agent.operator_authored,
+                )
+            ).spec
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "subagent block notifier: could not load spec for parent %s; "
+                "wake proceeds without the transport hint",
+                parent_id,
+                exc_info=True,
+            )
     try:
         # None args: a system notice carries no agent/files/artifacts; the runner
         # recomputes has_mcp_servers from the parent's cached spec.
@@ -9592,6 +9701,7 @@ async def _wake_parent_for_blocked_child(
             artifact_store=None,
             runner_router=runner_router,
             agent_revision=parent_agent.bundle_location if parent_agent is not None else None,
+            agent_spec=_parent_spec,
         )
     except (httpx.HTTPError, OmnigentError):
         _logger.warning(
@@ -9608,6 +9718,7 @@ def configure_subagent_block_notifier(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
 ) -> Callable[[], None]:
     """
     Install the parent-wake notifier on the elicitation publish path.
@@ -9627,6 +9738,8 @@ def configure_subagent_block_notifier(
     :param runner_router: Router used by the wake to reach the parent's
         bound runner. ``None`` in in-process setups.
     :param agent_store: Lets each wake name the parent agent's current bundle.
+    :param agent_cache: Lets each wake load the parent's spec so the routing
+        veto can decline a gateway pick the parent pane cannot run.
     :returns: A callable that uninstalls the observer and cancels any
         in-flight wake futures. Call from the lifespan teardown.
     """
@@ -9653,6 +9766,7 @@ def configure_subagent_block_notifier(
             conversation_store=conversation_store,
             runner_router=runner_router,
             agent_store=agent_store,
+            agent_cache=agent_cache,
         )
 
     notifier = SubagentBlockNotifier(
@@ -11255,6 +11369,24 @@ async def _create_session_from_existing_agent(
             )
             # Dispatch (not a plain forward) so native-terminal sessions take the
             # single-writer bypass — otherwise the forwarder's echo duplicates the kickoff.
+            # Kickoff turns route too, so hand the forwarder the root spec.
+            _kickoff_spec: AgentSpec | None = None
+            if agent_cache is not None and agent.bundle_location:
+                try:
+                    _kickoff_spec = (
+                        await asyncio.to_thread(
+                            agent_cache.load,
+                            agent.id,
+                            agent.bundle_location,
+                            expand_env=agent.operator_authored,
+                        )
+                    ).spec
+                except Exception:  # noqa: BLE001
+                    _logger.warning(
+                        "Failed to load agent spec for routing hint for session=%s",
+                        conv.id,
+                        exc_info=True,
+                    )
             for item in body.initial_items:
                 pending_background_title = prepare_background_session_title(
                     coordinator=background_title_coordinator,
@@ -11276,6 +11408,7 @@ async def _create_session_from_existing_agent(
                     host_store=getattr(request.app.state, "host_store", None),
                     background_titles_enabled=background_session_titles_enabled(request.headers),
                     agent_revision=agent.bundle_location,
+                    agent_spec=_kickoff_spec,
                 )
                 if pending_background_title is not None:
                     pending_background_title.schedule(expected_seed_title=conv.title)

@@ -544,6 +544,37 @@ def test_resolve_provider_spec_api_key_auth(
     assert provider.api_key == "sk-ant-inline"
 
 
+def test_resolve_provider_api_key_base_url_is_reported_as_launch_endpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A legacy ``api_key`` ``base_url`` surfaces as ``launch_base_url``.
+
+    Listings keep the vendor default in ``base_url`` (the apiKeyHelper path
+    lists from the vendor API), while the claude-sdk launch builder points the
+    harness gateway at ``auth.base_url`` when set; consumers judging the
+    launch transport read the latter.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    direct = resolve_model_provider(
+        _worker_spec("claude-sdk", auth=ApiKeyAuth(api_key="sk-ant-inline")), "claude-sdk"
+    )
+    assert direct.kind == "key"
+    assert direct.launch_base_url is None
+    gateway = resolve_model_provider(
+        _worker_spec(
+            "claude-sdk",
+            auth=ApiKeyAuth(api_key="sk-ant-inline", base_url="https://gw.example.com/v1"),
+        ),
+        "claude-sdk",
+    )
+    assert gateway.kind == "key"
+    assert gateway.base_url == "https://api.anthropic.com"
+    assert gateway.launch_base_url == "https://gw.example.com/v1"
+
+
 def test_resolve_provider_legacy_profile(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A legacy ``executor.config["profile"]`` resolves to databricks.
 

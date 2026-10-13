@@ -254,6 +254,10 @@ class ResolvedModelProvider:
     :param model_provider: Codex config.toml provider id for ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
+    :param launch_base_url: Endpoint the launch builder points the harness
+        at when it differs from ``base_url``: the claude-sdk legacy
+        ``api_key`` path lists models from the vendor default but launches
+        through ``auth.base_url`` (enabling the harness gateway) when set.
     """
 
     kind: str
@@ -265,6 +269,7 @@ class ResolvedModelProvider:
     cli: str | None = None
     model_provider: str | None = None
     detail: str = ""
+    launch_base_url: str | None = None
 
 
 def _model_configuration_host(base_url: str) -> str | None:
@@ -752,6 +757,7 @@ def _legacy_claude_sdk_provider(spec: AgentSpec) -> ResolvedModelProvider:
             base_url=default_base_url_for_family(ANTHROPIC_FAMILY),
             api_key=auth.api_key,
             detail="api_key auth",
+            launch_base_url=auth.base_url or None,
         )
     if legacy_profile:
         return ResolvedModelProvider(

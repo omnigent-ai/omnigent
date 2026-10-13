@@ -272,6 +272,7 @@ from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     MAX_SESSION_EVENT_REQUEST_BYTES,
 )
+from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
@@ -2856,6 +2857,7 @@ def register_events_routes(
         # asyncio.to_thread wrapper covers the rare cold-cache path
         # where the bundle is extracted from disk for the first time.
         _has_mcp_servers = False
+        _agent_spec: AgentSpec | None = None
         _legacy_skill_names: dict[str, str] = {}
         if _agent is not None and agent_cache is not None and _agent.bundle_location:
             try:
@@ -2863,9 +2865,13 @@ def register_events_routes(
                     agent_cache.load,
                     _agent.id,
                     _agent.bundle_location,
+                    expand_env=_agent.operator_authored,
                 )
+                _agent_spec = _loaded_agent.spec
                 _has_mcp_servers = bool(_loaded_agent.spec.mcp_servers)
-                # A declared sub-agent session resolves skills from its own child spec.
+                # A declared sub-agent session resolves skills from its own child
+                # spec; the forwarder reads the routing-hint transport off the
+                # same child, so the root spec is threaded unchanged.
                 _skill_spec = _loaded_agent.spec
                 if conv.sub_agent_name:
                     from omnigent.runtime.workflow import _find_spec_by_name
@@ -2941,6 +2947,9 @@ def register_events_routes(
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
             agent_revision=_agent.bundle_location if _agent else None,
+            # Read only so the router can tell whether a gateway-hosted pick is
+            # runnable on this session before pinning it; absent, no pick is vetoed.
+            agent_spec=_agent_spec,
             background_titles_enabled=background_session_titles_enabled(request.headers),
             # Read only for the gateway-backing check that decides which router
             # serves this turn; absent, routing keeps its default posture.

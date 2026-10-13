@@ -68,6 +68,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_permission_mode,
 )
 from omnigent.server.schemas import SessionEventInput
+from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger(__name__)
 
@@ -727,7 +728,12 @@ async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> l
         agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
         if agent is None or getattr(agent, "bundle_location", None) is None:
             return None
-        loaded = await asyncio.to_thread(deps.agent_cache.load, agent.id, agent.bundle_location)
+        loaded = await asyncio.to_thread(
+            deps.agent_cache.load,
+            agent.id,
+            agent.bundle_location,
+            expand_env=agent.operator_authored,
+        )
         executor = getattr(loaded.spec, "executor", None)
         raw_harness = (executor.config.get("harness") or executor.type) if executor else None
         harness = canonicalize_harness(raw_harness) or raw_harness
@@ -756,7 +762,12 @@ async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | N
         agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
         if agent is None or getattr(agent, "bundle_location", None) is None:
             return None
-        loaded = await asyncio.to_thread(deps.agent_cache.load, agent.id, agent.bundle_location)
+        loaded = await asyncio.to_thread(
+            deps.agent_cache.load,
+            agent.id,
+            agent.bundle_location,
+            expand_env=agent.operator_authored,
+        )
         executor = getattr(loaded.spec, "executor", None)
         return getattr(executor, "reasoning_effort", None) if executor else None
     except Exception:
@@ -839,10 +850,37 @@ async def _own_task_agent(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
     return replace(task, agent_id=bound.id)
 
 
-async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
-    """The bundle the kickoff runs, so the runner can tell when it later changes."""
+async def _agent_binding(
+    deps: FireDeps, conv: Conversation
+) -> tuple[str | None, AgentSpec | None]:
+    """The bundle the kickoff runs and the agent's resolved spec.
+
+    The runner tells from the revision when the bundle later changes; routing
+    reads the spec to decline a gateway pick this pane cannot run. Fail-open:
+    a missing agent or cache, or a load error, leaves the spec ``None`` and
+    routing untouched.
+    """
     agent = await asyncio.to_thread(deps.agent_store.get, conv.agent_id) if conv.agent_id else None
-    return agent.bundle_location if agent is not None else None
+    if agent is None:
+        return None, None
+    spec: AgentSpec | None = None
+    if deps.agent_cache is not None and agent.bundle_location:
+        try:
+            loaded = await asyncio.to_thread(
+                deps.agent_cache.load,
+                agent.id,
+                agent.bundle_location,
+                expand_env=agent.operator_authored,
+            )
+            spec = loaded.spec
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "scheduled fire: could not load spec for session %s; "
+                "routing proceeds without the transport hint",
+                conv.id,
+                exc_info=True,
+            )
+    return agent.bundle_location, spec
 
 
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
@@ -1193,6 +1231,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         await _ensure_runner_session_initialized(
             conv.id, conv_for_dispatch, runner_client, deps.conversation_store
         )
+        revision, spec = await _agent_binding(deps, conv_for_dispatch)
         await _dispatch_session_event_to_runner(
             conv.id,
             conv_for_dispatch,
@@ -1204,7 +1243,8 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             artifact_store=deps.artifact_store,
             created_by=owner,
             runner_router=deps.runner_router,
-            agent_revision=await _agent_revision(deps, conv_for_dispatch),
+            agent_revision=revision,
+            agent_spec=spec,
         )
 
     return _dispatch
@@ -1274,6 +1314,7 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
         await _ensure_runner_session_initialized(
             conv.id, fresh, runner_client, deps.conversation_store
         )
+        revision, spec = await _agent_binding(deps, fresh)
         await _dispatch_session_event_to_runner(
             conv.id,
             fresh,
@@ -1285,7 +1326,8 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
             artifact_store=deps.artifact_store,
             created_by=owner,
             runner_router=deps.runner_router,
-            agent_revision=await _agent_revision(deps, fresh),
+            agent_revision=revision,
+            agent_spec=spec,
         )
 
     return _dispatch

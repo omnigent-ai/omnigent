@@ -1652,6 +1652,7 @@ def create_app(
             conversation_store,
             runner_router,
             agent_store=agent_store,
+            agent_cache=agent_cache,
         )
 
         from omnigent.runner.resource_registry import (
