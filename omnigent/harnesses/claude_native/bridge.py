@@ -5348,6 +5348,7 @@ def _run_tmux(socket_path: str, *args: str) -> None:
 
     _check_injection_cancelled()
     cmd = ["tmux", "-S", socket_path, *args]
+    operation = args[0] if args else ""
     try:
         proc = subprocess.run(
             cmd,
@@ -5357,8 +5358,13 @@ def _run_tmux(socket_path: str, *args: str) -> None:
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired as exc:
+        delivery_diagnostics.record_tmux_failure(operation, timeout_s=_TMUX_SEND_TIMEOUT_S)
         raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s") from exc
+    except OSError as exc:
+        delivery_diagnostics.record_tmux_failure(operation, os_errno=exc.errno)
+        raise
     if proc.returncode != 0:
+        delivery_diagnostics.record_tmux_failure(operation, returncode=proc.returncode)
         detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 

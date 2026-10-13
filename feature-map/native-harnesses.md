@@ -325,7 +325,8 @@ Cross-harness journeys:
   a web message through the public bridge into a real retained dead tmux pane.
   It checks prompt budgets equal to the hard cap and early exit detection with
   longer budgets. `test_claude_native_slow_ready.py` checks successful delivery
-  after slow startup, an early crash, and the live-pane timeout. These tests
+  after slow startup, an early crash, the live-pane timeout, and content-free
+  failing-operation evidence when tmux exits after readiness. These tests
   exercise the injection used by existing-session and first-message composers;
   CLI typing bypasses the web injection gate. They do not run a vendor model.
 - **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**
