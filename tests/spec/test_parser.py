@@ -4553,6 +4553,33 @@ def test_config_loader_does_not_mutate_shared_safeloader_resolvers() -> None:
     assert yaml.load("false", loader) is False
 
 
+def test_config_yaml_parsed_with_libyaml_when_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Use the libyaml-backed loader for config.yaml when available."""
+    if not yaml.__with_libyaml__:
+        pytest.skip("libyaml C bindings not available in this interpreter")
+
+    (tmp_path / "config.yaml").write_text(yaml.dump({"spec_version": 1, "name": "libyaml-probe"}))
+
+    captured: dict[str, type] = {}
+    real_load = yaml.load
+
+    def _capturing_load(stream: object, Loader: type) -> object:
+        captured.setdefault("loader", Loader)
+        return real_load(stream, Loader=Loader)
+
+    monkeypatch.setattr(parser.yaml, "load", _capturing_load)
+    parse(tmp_path)
+
+    assert "loader" in captured, "parse() did not hand config.yaml to yaml.load"
+    loader = captured["loader"]
+    assert issubclass(loader, yaml.CSafeLoader), (
+        f"config.yaml parsed with pure-Python {loader.__name__} "
+        f"({[c.__name__ for c in loader.__mro__]}); expected a libyaml-backed loader"
+    )
+
+
 # ── Sub-agent bundle provenance (``source_rel_dir``) ──────────
 
 

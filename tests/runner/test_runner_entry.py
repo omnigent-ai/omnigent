@@ -7,6 +7,7 @@ import importlib
 import io
 import logging
 import os
+import shutil
 import signal
 import sys
 import tarfile
@@ -2752,6 +2753,365 @@ async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
         True,
         True,
     ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_memoizes_parse_across_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parse a shared bundle once; return deep copies so session edits stay isolated."""
+    import omnigent.spec as spec_pkg
+    import omnigent.spec.parser as spec_parser
+
+    config_bytes = (
+        b"spec_version: 1\nname: cached-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+        b"params:\n  shared_key: original\n"
+    )
+    child_bytes = b"spec_version: 1\nname: child\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        for member_name, member_bytes in (
+            ("config.yaml", config_bytes),
+            ("agents/child/config.yaml", child_bytes),
+        ):
+            info = tarfile.TarInfo(name=member_name)
+            info.size = len(member_bytes)
+            tf.addfile(info, io.BytesIO(member_bytes))
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=bundle_buf.getvalue(), headers={"X-Agent-Version": "7"})
+
+    parse_roots: list[Path] = []
+    real_parse = spec_parser.parse
+
+    def _counting_parse(root: Path, **kwargs: Any) -> Any:
+        parse_roots.append(root)
+        return real_parse(root, **kwargs)
+
+    # ``load`` resolves ``parse`` through ``omnigent.spec``; sub-agent discovery
+    # goes through ``omnigent.spec.parser``. Patch both so every parse is counted.
+    monkeypatch.setattr(spec_parser, "parse", _counting_parse)
+    monkeypatch.setattr(spec_pkg, "parse", _counting_parse)
+    cache: dict[tuple[str, Path, bool], Any] = {}
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_PARSE_CACHE", cache)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server.test",
+    ) as client:
+        first = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_cached", session_id="conv_a"
+        )
+        second = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_cached", session_id="conv_b"
+        )
+
+    assert first is not None
+    assert second is not None
+    # One top-level parse (whose sub-agent discovery parses ``agents/child``);
+    # the second session is served from the memo.
+    assert [root.relative_to(first.workdir) for root in parse_roots] == [
+        Path("."),
+        Path("agents/child"),
+    ]
+    assert list(cache) == [("ag_cached", first.workdir, False)]
+    # Each resolve gets an independent deepcopy, so a per-session in-place edit
+    # does not leak into the cached master or the other session's spec.
+    assert first.spec is not second.spec
+    assert first.spec.params is not second.spec.params
+    first.spec.params["injected"] = "session-a"
+    assert "injected" not in second.spec.params
+    # The real hazard: a builtin appends to sub_agents per conversation
+    # (WebFetchTool adds __web_researcher), so the list must not be shared
+    # and the cached master must never grow.
+    assert first.spec.sub_agents is not second.spec.sub_agents
+    first.spec.sub_agents.append(first.spec.sub_agents[0])
+    assert len(second.spec.sub_agents) == 1
+    assert len(cache[("ag_cached", first.workdir, False)].sub_agents) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("versions", "names"),
+    [
+        pytest.param(("7", "8"), ("cached-agent", "cached-agent"), id="version-bump"),
+        pytest.param(("1", "1"), ("cached-agent", "re-added"), id="same-version-new-content"),
+    ],
+)
+async def test_resolve_agent_spec_from_server_evicts_prior_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    versions: tuple[str, str],
+    names: tuple[str, str],
+) -> None:
+    """A new bundle revision replaces that agent's memoized spec.
+
+    A reinstall keeps the agent id and may keep the version header, so the
+    content digest in the extracted directory name is what tells revisions apart.
+    """
+
+    def _bundle(name: str) -> bytes:
+        config = f"spec_version: 1\nname: {name}\nexecutor:\n  config:\n    harness: claude-sdk\n"
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            info = tarfile.TarInfo(name="config.yaml")
+            info.size = len(config)
+            tf.addfile(info, io.BytesIO(config.encode()))
+        return buf.getvalue()
+
+    served = [(versions[0], _bundle(names[0])), (versions[1], _bundle(names[1]))]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        version, content = served.pop(0)
+        return httpx.Response(200, content=content, headers={"X-Agent-Version": version})
+
+    cache: dict[tuple[str, Path, bool], Any] = {}
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_PARSE_CACHE", cache)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://server.test"
+    ) as client:
+        first = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_x", session_id="conv_a"
+        )
+        assert first is not None
+        assert list(cache) == [("ag_x", first.workdir, False)]
+        second = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_x", session_id="conv_a"
+        )
+    assert second is not None
+    assert second.spec.name == names[1]
+    assert second.workdir != first.workdir
+    assert list(cache) == [("ag_x", second.workdir, False)]
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_separates_env_expansion_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session-scoped resolve never reuses the env-expanded parse of the same bytes."""
+
+    monkeypatch.setenv("SPEC_MEMO_SECRET", "expanded-secret")
+    config_bytes = (
+        b"spec_version: 1\nname: cached-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+        b"llm:\n  model: openai/gpt-5.4\n  connection:\n    api_key: ${SPEC_MEMO_SECRET}\n"
+    )
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+
+    # The same bytes served first as an operator template, then session-scoped.
+    scoped = iter(["false", "true"])
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=bundle_buf.getvalue(),
+            headers={"X-Agent-Version": "1", "X-Agent-Session-Scoped": next(scoped)},
+        )
+
+    cache: dict[tuple[str, Path, bool], Any] = {}
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_PARSE_CACHE", cache)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://server.test"
+    ) as client:
+        template = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_env", session_id="conv_template"
+        )
+        tenant = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_env", session_id="conv_tenant"
+        )
+    assert template is not None and tenant is not None
+    assert template.workdir == tenant.workdir
+    assert template.spec.llm is not None and tenant.spec.llm is not None
+    assert template.spec.llm.connection == {"api_key": "expanded-secret"}
+    assert tenant.spec.llm.connection == {"api_key": "${SPEC_MEMO_SECRET}"}
+    # Both modes of the same revision stay cached; neither evicts the other.
+    assert list(cache) == [
+        ("ag_env", template.workdir, True),
+        ("ag_env", tenant.workdir, False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_reextracts_a_pruned_bundle_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A memo hit whose extracted directory vanished re-extracts instead of pointing at nothing."""
+    import omnigent.spec as spec_pkg
+    import omnigent.spec.parser as spec_parser
+
+    config_bytes = (
+        b"spec_version: 1\nname: cached-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    )
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=bundle_buf.getvalue(), headers={"X-Agent-Version": "1"})
+
+    parse_roots: list[Path] = []
+    real_parse = spec_parser.parse
+
+    def _counting_parse(root: Path, **kwargs: Any) -> Any:
+        parse_roots.append(root)
+        return real_parse(root, **kwargs)
+
+    monkeypatch.setattr(spec_parser, "parse", _counting_parse)
+    monkeypatch.setattr(spec_pkg, "parse", _counting_parse)
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_PARSE_CACHE", {})
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://server.test"
+    ) as client:
+        first = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_pruned", session_id="conv_a"
+        )
+        assert first is not None
+        shutil.rmtree(first.workdir)
+        second = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_pruned", session_id="conv_b"
+        )
+    assert second is not None
+    assert second.workdir == first.workdir
+    assert (second.workdir / "config.yaml").is_file()
+    assert parse_roots == [first.workdir, first.workdir]
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_discards_a_failed_extraction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle that fails to extract leaves no half-extracted directory behind."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not a tarball", headers={"X-Agent-Version": "1"})
+
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_PARSE_CACHE", {})
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://server.test"
+    ) as client:
+        with pytest.raises(Exception, match=r"(?i)tar|extract|bundle"):
+            await _resolve_agent_spec_from_server(
+                client, tmp_path, "ag_broken", session_id="conv_a"
+            )
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_bounds_memo_across_agents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bound the per-agent parse memo with LRU eviction; refresh recency on a hit."""
+
+    config_bytes = (
+        b"spec_version: 1\nname: cached-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    )
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=bundle_buf.getvalue(), headers={"X-Agent-Version": "1"})
+
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_PARSE_CACHE_MAX_ENTRIES", 2)
+    cache: dict[tuple[str, Path, bool], Any] = {}
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_PARSE_CACHE", cache)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://server.test"
+    ) as client:
+
+        async def _resolve(agent_id: str) -> None:
+            resolved = await _resolve_agent_spec_from_server(
+                client, tmp_path, agent_id, session_id="conv_a"
+            )
+            assert resolved is not None
+
+        await _resolve("ag_a")
+        await _resolve("ag_b")
+        await _resolve("ag_c")  # exceeds the cap of 2: ag_a is least recent
+        assert [key[0] for key in cache] == ["ag_b", "ag_c"]
+        await _resolve("ag_b")  # memo hit refreshes ag_b's recency
+        await _resolve("ag_d")  # evicts ag_c, not the just-used ag_b
+    assert [key[0] for key in cache] == ["ag_b", "ag_d"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_does_not_reparse_cached_bundle_per_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new session resolving an already-extracted bundle must not re-parse its YAML."""
+    import omnigent.spec as spec_pkg
+    import omnigent.spec.parser as spec_parser
+
+    def _bundle() -> bytes:
+        files = {
+            "config.yaml": (
+                "spec_version: 1\nname: fanout-parent\n"
+                "executor:\n  type: omnigent\n  model: m\n  config:\n    harness: openai-agents\n"
+                "tools:\n  agents:\n    - alpha\n    - beta\n    - gamma\n"
+            ),
+        }
+        for sub in ("alpha", "beta", "gamma"):
+            files[f"agents/{sub}/config.yaml"] = (
+                f"spec_version: 1\nname: {sub}\n"
+                "executor:\n  type: omnigent\n  model: m\n  config:\n    harness: openai-agents\n"
+            )
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            for arc, data in files.items():
+                info = tarfile.TarInfo(name=arc)
+                encoded = data.encode()
+                info.size = len(encoded)
+                tf.addfile(info, io.BytesIO(encoded))
+        return buf.getvalue()
+
+    content = _bundle()
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=content, headers={"X-Agent-Version": "1"})
+
+    parse_calls: list[str] = []
+    real_parse = spec_parser.parse
+
+    def _counting_parse(root: Path, *, expand_env: bool = True) -> Any:
+        parse_calls.append(str(root))
+        return real_parse(root, expand_env=expand_env)
+
+    # ``load`` calls ``parse`` through the ``omnigent.spec`` namespace; sub-agent
+    # discovery calls it through ``omnigent.spec.parser``. Patch both entry points.
+    monkeypatch.setattr(spec_parser, "parse", _counting_parse)
+    monkeypatch.setattr(spec_pkg, "parse", _counting_parse)
+    monkeypatch.setattr("omnigent.runner._entry._SPEC_PARSE_CACHE", {})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server.test",
+    ) as client:
+        first = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_fanout", session_id="conv_parent"
+        )
+        parses_after_first = len(parse_calls)
+        second = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_fanout", session_id="conv_child"
+        )
+        parses_during_second = len(parse_calls) - parses_after_first
+
+    assert first is not None and second is not None
+    # Same already-extracted bundle, so the directory is reused ...
+    assert first.workdir == second.workdir
+    # ... but the second session must not re-parse the YAML it already parsed.
+    assert parses_during_second == 0, (
+        f"second session re-parsed the cached bundle "
+        f"({parses_during_second} parse calls: {parse_calls[parses_after_first:]!r})"
+    )
 
 
 @pytest.mark.asyncio

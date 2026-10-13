@@ -40,6 +40,8 @@ from typing import TYPE_CHECKING
 
 import yaml
 
+from omnigent._yaml_compat import load as _yaml_load
+from omnigent._yaml_compat import safe_load as _yaml_safe_load
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import (
@@ -239,7 +241,7 @@ def is_omnigent_yaml(path: Path) -> bool:
     if path.suffix.lower() not in {".yaml", ".yml"}:
         return False
     try:
-        raw = yaml.safe_load(path.read_text())
+        raw = _yaml_safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError:
         return False
     if not isinstance(raw, dict):
@@ -278,12 +280,16 @@ def diagnose_yaml_rejection(path: Path) -> str:
     """
     if path.suffix.lower() not in {".yaml", ".yml"}:
         return f"file extension is {path.suffix!r}, expected '.yaml' or '.yml'"
+    text = path.read_text(encoding="utf-8")
     try:
-        raw = yaml.safe_load(path.read_text())
+        raw = yaml.safe_load(text)
+        # ``is_omnigent_yaml`` parses with the libyaml-backed loader; a document
+        # only that loader rejects must still read as a parse error here.
+        _yaml_safe_load(text)
     except yaml.YAMLError as exc:
-        # Strip trailing whitespace so the message stays one line —
-        # PyYAML embeds the source location in its error string,
-        # which is exactly what the user needs to fix the typo.
+        # Pure-Python loader first on purpose: its error echoes the offending
+        # source line with a caret, which libyaml drops. Strip trailing
+        # whitespace so the message (with its source location) stays one line.
         return f"YAML parse error: {exc!s}".replace("\n", " ").rstrip()
     if raw is None:
         return "file is empty (or contains only YAML comments / null)"
@@ -369,8 +375,6 @@ def load_omnigent_yaml(
             code=ErrorCode.INVALID_INPUT,
         ) from exc
 
-    import yaml as _yaml
-
     from omnigent.inner.loader import _OmnigentYamlLoader
     from omnigent.spec.omnigent import agent_def_to_agent_spec
     from omnigent.spec.validator import validate
@@ -383,11 +387,9 @@ def load_omnigent_yaml(
     # ``match_tools``, ``action``, ``reason``, ``set_labels``).
     # Non-mapping roots are tolerated as an empty dict — the
     # omnigent loader would already have rejected them above.
-    # Use _OmnigentYamlLoader (not yaml.safe_load) so this raw
-    # read resolves booleans the same way load_agent_def's YAML
-    # parsing did — both loaders keep on/off as plain strings
-    # instead of the YAML 1.1 bool aliases.
-    raw = _yaml.load(path.read_text(), Loader=_OmnigentYamlLoader) or {}
+    # Use _OmnigentYamlLoader so this raw read resolves on/off as
+    # strings, matching load_agent_def's YAML parsing.
+    raw = _yaml_load(path.read_text(encoding="utf-8"), _OmnigentYamlLoader) or {}
     if not isinstance(raw, dict):
         raw = {}
     spec = agent_def_to_agent_spec(agent_def, raw_yaml=raw)
