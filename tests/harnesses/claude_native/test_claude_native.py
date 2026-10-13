@@ -13050,9 +13050,16 @@ def test_catalog_fingerprint_tracks_the_ambient_credential(
     second = claude_native.claude_catalog_fingerprint(None)
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "x-litellm-api-key: sk-virtual")
     with_header = claude_native.claude_catalog_fingerprint(None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-api")
+    with_api_key = claude_native.claude_catalog_fingerprint(None)
+    managed = tmp_path / "managed-settings.json"
+    managed.write_text(json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "sk-managed"}}))
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed,))
+    managed_credential = claude_native.claude_catalog_fingerprint(None)
 
-    assert len({without_credential, first, second, with_header}) == 4
-    assert "sk-" not in first + second + with_header
+    keys = [without_credential, first, second, with_header, with_api_key, managed_credential]
+    assert len(set(keys)) == len(keys)
+    assert "sk-" not in "".join(keys)
 
 
 def test_catalog_fingerprint_includes_ambient_gateway_url(
