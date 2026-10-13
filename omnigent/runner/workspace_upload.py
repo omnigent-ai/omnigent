@@ -25,7 +25,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypeVar, cast
@@ -36,8 +36,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.environment_filesystem import InvalidPath, ResourceError
+from omnigent.inner import os_env_upload
 from omnigent.inner.os_env import CallerProcessOSEnvironment, OSEnvironment
-from omnigent.inner.os_env_upload import UploadHelperClient, upload_support_reason, valid_name
+from omnigent.inner.os_env_upload import (
+    LONG_OPS,
+    SHORT_OP_QUEUE_WAIT_S,
+    UploadHelperClient,
+    upload_support_reason,
+    valid_name,
+)
 from omnigent.install_ledger import state_dir
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, _validate_path
 from omnigent.runtime.filesystem_registry import FilesystemRegistry
@@ -143,6 +150,7 @@ def _unwrap(result: dict[str, object]) -> dict[str, object]:
         "checksum_mismatch": 409,
         "too_large": 413,
         "gone": 410,
+        "parent_gone": 410,
         "no_space": 507,
         "timeout": 504,
         "busy": 429,
@@ -198,6 +206,8 @@ class HelperBinding:
     policy: str
     used: float
     users: int = 0
+    gate: asyncio.Lock = field(default_factory=asyncio.Lock)
+    active_op: object = None
 
 
 class UploadManager:
@@ -317,18 +327,60 @@ class UploadManager:
     async def _call(
         self, uid: str, record: UploadRecord, op: str, raw: bytes = b"", **fields: object
     ) -> dict[str, object]:
-        async with self._using_helper(record.session_id, record.environment_id) as helper:
+        async with self._using_helper(record.session_id, record.environment_id):
+            binding = self.helpers[(record.session_id, record.environment_id)]
             metadata = {"op": op, "id": uid, "size": record.size, **fields}
-            result = await asyncio.to_thread(helper.call, metadata, raw)
+            result = await self._helper_rpc(binding, metadata, raw)
             if result.get("code") == "gone" and op in ("append", "status", "abort", "plan"):
                 _unwrap(
-                    await asyncio.to_thread(
-                        helper.call,
+                    await self._helper_rpc(
+                        binding,
                         {"op": "resume", "id": uid, **record.model_dump(exclude={"snapshot"})},
                     )
                 )
-                result = await asyncio.to_thread(helper.call, metadata, raw)
+                result = await self._helper_rpc(binding, metadata, raw)
             return _unwrap(result)
+
+    async def _helper_rpc(
+        self, binding: HelperBinding, metadata: dict[str, object], raw: bytes = b""
+    ) -> dict[str, object]:
+        """Queue without executor threads and hold admission until IPC settles."""
+        deadline = time.monotonic() + os_env_upload.operation_timeout(metadata)
+        queue_deadline = deadline
+        while True:
+            now = time.monotonic()
+            if (
+                binding.gate.locked()
+                and metadata.get("op") not in LONG_OPS
+                and binding.active_op in LONG_OPS
+            ):
+                queue_deadline = min(queue_deadline, now + SHORT_OP_QUEUE_WAIT_S)
+            else:
+                queue_deadline = deadline
+            remaining = queue_deadline - now
+            if remaining <= 0:
+                return {"code": "busy", "error": "Upload helper queue timed out"}
+            try:
+                async with asyncio.timeout(min(remaining, 0.05)):
+                    await binding.gate.acquire()
+                break
+            except TimeoutError:
+                continue
+        binding.active_op = metadata.get("op")
+        task = asyncio.create_task(
+            asyncio.to_thread(binding.client.call, metadata, raw, deadline=deadline)
+        )
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await self._settle(task)
+            except Exception:
+                logger.exception("Upload helper operation failed during cancellation")
+            raise
+        finally:
+            binding.active_op = None
+            binding.gate.release()
 
     def _save(self) -> None:
         self.state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -399,8 +451,14 @@ class UploadManager:
         self.upload_locks.pop(uid, None)
 
     async def _remove(self, uid: str, record: UploadRecord) -> None:
-        if record.result is None and record.staging_dev and record.staging_ino:
-            await self._call(uid, record, "cleanup", **record.model_dump(exclude={"snapshot"}))
+        try:
+            if record.result is not None:
+                await self._call(uid, record, "forget")
+            elif record.staging_dev and record.staging_ino:
+                await self._call(uid, record, "cleanup", **record.model_dump(exclude={"snapshot"}))
+        except RouteError as exc:
+            if exc.code != "parent_gone":
+                raise
         async with self.lock:
             self._drop(uid, record)
             await self._save_settled()
@@ -480,7 +538,10 @@ class UploadManager:
                     if (
                         isinstance(exc, ValueError)
                         or (isinstance(exc, HTTPException) and exc.status_code in (404, 410))
-                        or (isinstance(exc, RouteError) and exc.code == "unverified_intent")
+                        or (
+                            isinstance(exc, RouteError)
+                            and exc.code in ("unverified_intent", "parent_gone")
+                        )
                     ):
                         async with self.lock:
                             self._drop(uid, record)
@@ -596,10 +657,11 @@ class UploadManager:
         if declaration.size > self.limits.max_file_bytes:
             raise RouteError(413, "too_large", "File exceeds runner limit")
         async with self._using_helper(session_id, environment_id) as helper:
+            binding = self.helpers[(session_id, environment_id)]
             uid = uuid.uuid4().hex
             prepared = _unwrap(
-                await asyncio.to_thread(
-                    helper.call,
+                await self._helper_rpc(
+                    binding,
                     {"op": "prepare", "id": uid, **declaration.model_dump(), "dir": directory},
                 )
             )

@@ -531,7 +531,6 @@ class WorkspaceReader:
             raise WorkspaceReaderError(
                 404, "not_found", f"Directory {rel!r} not found or not accessible"
             ) from exc
-        names = [name for name in names if not is_upload_staging(name)]
         for name in names:
             if not is_utf8_encodable(name):
                 # A non-UTF-8 name comes back surrogate-escaped; no JSON or protobuf
@@ -540,6 +539,8 @@ class WorkspaceReader:
             child_rel = os.path.join(validated, name) if validated else name
             entry = _describe_entry(resolved / name, name, child_rel)
             if entry is not None:
+                if entry["type"] == "file" and is_upload_staging(name):
+                    continue
                 entries.append(entry)
         return entries
 
@@ -651,7 +652,9 @@ class WorkspaceReader:
         )
 
         def keep_entry(path: str) -> bool:
-            return not is_upload_staging(path)
+            # Hide upload staging files; a directory with a staging-like
+            # name is still a real directory.
+            return not is_upload_staging(path) or (self._root / path).is_dir()
 
         results, truncated = walk_search(
             self._root, q, inc, exc, limit, budget=_SEARCH_SCAN_BUDGET, emit=keep_entry
