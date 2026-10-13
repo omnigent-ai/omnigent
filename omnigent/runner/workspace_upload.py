@@ -2,7 +2,11 @@
 
 HELPER_CACHE_MAX bounds helpers across sessions and environments. Open uploads pin
 helpers until drained or max_age (24 hours); HEAD refreshes idle expiry only.
-When all helpers are pinned, new environments receive 429 with Retry-After.
+When capacity is fully pinned, new environments receive 429 with Retry-After.
+
+A lost begin response can leave an empty .part staging file without a recorded
+allocation identity. It stays hidden from listings and is never moved, adopted
+or deleted automatically; only its intent record expires after max_age.
 """
 
 from __future__ import annotations
@@ -90,8 +94,6 @@ class UploadRecord(BaseModel):
     staging_ino: int = 0
     parent_dev: int
     parent_ino: int
-    quarantine_id: str | None = None
-    quarantined_at: float | None = None
     pending: bool = False
     finalizing: bool = False
     publication: dict[str, object] | None = None
@@ -209,7 +211,6 @@ class UploadManager:
         self.state_path = state_path
         self.limits = limits
         self.records: dict[str, UploadRecord] = {}
-        self.quarantined: dict[str, UploadRecord] = {}
         self.helpers: dict[tuple[str, str], HelperBinding] = {}
         self.lock = asyncio.Lock()
         self.helper_lock = asyncio.Lock()
@@ -223,11 +224,14 @@ class UploadManager:
                 values = json.loads(state_path.read_text())
                 for uid, value in values.items():
                     record = UploadRecord.model_validate(value)
-                    (self.quarantined if value.get("quarantined") else self.records)[uid] = record
+                    if value.get("quarantined"):
+                        # Observing an inode does not establish allocation ownership.
+                        record.staging_dev = record.staging_ino = 0
+                        record.pending = True
+                    self.records[uid] = record
             except (OSError, ValueError, AttributeError, TypeError):
                 logger.exception("Unreadable upload index; starting with an empty index")
                 self.records.clear()
-                self.quarantined.clear()
                 try:
                     state_path.rename(
                         state_path.with_name(f"index.corrupt-{uuid.uuid4().hex}.json")
@@ -339,17 +343,6 @@ class UploadManager:
                     )
                     for uid, record in self.records.items()
                 }
-                values.update(
-                    {
-                        uid: {
-                            **record.model_dump(
-                                exclude={"snapshot"} if record.result is not None else set()
-                            ),
-                            "quarantined": True,
-                        }
-                        for uid, record in self.quarantined.items()
-                    }
-                )
                 json.dump(values, stream)
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -402,12 +395,11 @@ class UploadManager:
         )
         self._prune_gone()
         self.records.pop(uid, None)
-        self.quarantined.pop(uid, None)
         self.restored.discard(uid)
         self.upload_locks.pop(uid, None)
 
     async def _remove(self, uid: str, record: UploadRecord) -> None:
-        if record.result is None:
+        if record.result is None and record.staging_dev and record.staging_ino:
             await self._call(uid, record, "cleanup", **record.model_dump(exclude={"snapshot"}))
         async with self.lock:
             self._drop(uid, record)
@@ -427,32 +419,16 @@ class UploadManager:
             record.snapshot = None
         await self._persist()
 
-    async def _quarantine(self, uid: str, record: UploadRecord) -> None:
-        if record.quarantine_id is None:
-            record.quarantine_id = uuid.uuid4().hex
-            record.quarantined_at = _now()
-            record.staging_dev = record.staging_ino = 0
-        async with self.lock:
-            self.quarantined[uid] = record
-            self.records.pop(uid, None)
-            await self._save_settled()
-        result = await self._call(
-            uid, record, "quarantine", **record.model_dump(exclude={"snapshot"})
-        )
-        async with self.lock:
-            if result.get("absent"):
-                self._drop(uid, record)
-            else:
-                record.staging_path = cast(str, result["staging_path"])
-                record.staging_dev = cast(int, result["staging_dev"])
-                record.staging_ino = cast(int, result["staging_ino"])
-                record.pending = False
-                self.restored.discard(uid)
-            await self._save_settled()
-
-    async def _reconcile(self, uid: str, record: UploadRecord) -> bool:
-        if record.pending and not record.staging_ino:
-            await self._quarantine(uid, record)
+    async def _reconcile(
+        self, uid: str, record: UploadRecord, *, now: float | None = None
+    ) -> bool:
+        if record.result is None and (not record.staging_dev or not record.staging_ino):
+            logger.warning(
+                "Leaving upload intent %s untouched: allocation identity is unknown", uid
+            )
+            instant = _now() if now is None else now
+            if instant - record.created_at >= self.limits.max_age_s:
+                await self._remove(uid, record)
             return False
         if record.finalizing and record.result is None:
             try:
@@ -482,25 +458,15 @@ class UploadManager:
     async def sweep(self, *, now: float | None = None) -> None:
         self._prune_gone()
         instant = _now() if now is None else now
-        for uid, record in list({**self.records, **self.quarantined}.items()):
-            if uid not in self.records and uid not in self.quarantined:
-                continue
+        for uid in list(self.records):
             async with self.upload_locks.setdefault(uid, asyncio.Lock()):
-                record = self.records.get(uid) or self.quarantined.get(uid)
+                record = self.records.get(uid)
                 if record is None:
                     continue
                 try:
-                    if uid in self.quarantined and record.quarantine_id and not record.staging_ino:
-                        await self._quarantine(uid, record)
+                    if not await self._reconcile(uid, record, now=instant):
                         continue
-                    if not await self._reconcile(uid, record):
-                        continue
-                    if record.quarantine_id and (
-                        record.quarantined_at is None
-                        or instant - record.quarantined_at < self.limits.max_age_s
-                    ):
-                        continue
-                    if uid not in self.quarantined and not self._expired(record, instant):
+                    if not self._expired(record, instant):
                         continue
                     await self._remove(uid, record)
                 except Exception as exc:
@@ -511,8 +477,7 @@ class UploadManager:
                         or (isinstance(exc, RouteError) and exc.code == "unverified_intent")
                     ):
                         async with self.lock:
-                            self.quarantined[uid] = record
-                            self.records.pop(uid, None)
+                            self._drop(uid, record)
                             await self._save_settled()
         async with self.helper_lock:
             await self._evict_helpers()
