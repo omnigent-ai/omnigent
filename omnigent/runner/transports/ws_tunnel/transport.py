@@ -22,6 +22,7 @@ abort propagates as a ``ConnectionError`` from the body iterator.
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from collections.abc import AsyncIterator
 
@@ -36,6 +37,34 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
+
+
+async def _cancel_and_forget_request(
+    registry: TunnelRegistry,
+    runner_id: str,
+    req_id: str,
+    state: RequestState,
+    *,
+    cancel: bool,
+) -> None:
+    """Forget a tunnel request, first telling the runner to abort if ``cancel``.
+
+    The ``request_is_open`` guard keeps this idempotent: whichever teardown path
+    runs first sends the lone cancel frame; a later caller finds the request
+    already closed and only re-confirms removal.
+    """
+    try:
+        if cancel and registry.request_is_open(state.session, req_id):
+            # send_text enqueues onto the session loop before awaiting its ack,
+            # so a cancelling consumer still delivers the cancel frame; a failed
+            # send is best-effort (CancelledError still propagates).
+            with contextlib.suppress(Exception):
+                await registry.send_text(
+                    state.session,
+                    encode_frame(RequestCancelFrame(id=req_id, reason="client_disconnected")),
+                )
+    finally:
+        registry.close_request(runner_id, req_id, session=state.session)
 
 
 class _TunneledByteStream(httpx.AsyncByteStream):
@@ -55,6 +84,7 @@ class _TunneledByteStream(httpx.AsyncByteStream):
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         state = self._state
+        completed = False
         try:
             while True:
                 item = await state.body_queue.get()
@@ -62,40 +92,33 @@ class _TunneledByteStream(httpx.AsyncByteStream):
                     raise state.aborted_with
                 if item is None:
                     # Sentinel: end-event signalled, no more chunks.
+                    completed = True
                     break
+                # Draining this frame frees a server buffer slot; let the
+                # registry grant the runner more send credit so the stream
+                # keeps flowing without the undelivered tail piling up.
+                await self._registry.note_body_consumed(state, item)
                 # Mypy/runtime: item must be a ResponseBodyFrame here.
                 if isinstance(item, ResponseBodyFrame):
                     yield decode_body(item.body, item.encoding)
         finally:
-            self._registry.close_request(
-                self._runner_id,
-                self._req_id,
-                session=state.session,
-            )
+            # A consumer that abandons the stream mid-body (disconnect/cancel)
+            # must cancel the runner, or a flow-controlled dispatch blocks on
+            # exhausted send credit forever, stranding its open upstream body.
+            await self._finish(cancel=not completed)
 
     async def aclose(self) -> None:
-        # Close the request from the caller side — typically called
-        # when the consumer's ``async with`` exits early (e.g. SSE
-        # client disconnect). The transport translates this into a
-        # request.cancel frame so the runner aborts.
-        state = self._state
-        if self._registry.request_is_open(state.session, self._req_id):
-            try:  # noqa: SIM105 — contextlib.suppress doesn't work with await
-                await self._registry.send_text(
-                    state.session,
-                    encode_frame(
-                        RequestCancelFrame(
-                            id=self._req_id,
-                            reason="client_disconnected",
-                        )
-                    ),
-                )
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
-        self._registry.close_request(
+        # Early caller-side close (e.g. SSE client disconnect); the shared helper
+        # keeps teardown to a single cancel whichever path runs first.
+        await self._finish(cancel=True)
+
+    async def _finish(self, *, cancel: bool) -> None:
+        await _cancel_and_forget_request(
+            self._registry,
             self._runner_id,
             self._req_id,
-            session=state.session,
+            self._state,
+            cancel=cancel,
         )
 
 
@@ -170,6 +193,7 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                         # Best-effort hint for streaming responses;
                         # not load-bearing on the runner side.
                         stream=True,
+                        flow_window=state.flow_window,
                     )
                 ),
             )
@@ -177,9 +201,12 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             # aborts the request).
             head = await state.head_future
         except BaseException:
-            # If we failed before getting head, clean up the slot so
-            # we don't leak in_flight state.
-            self._registry.close_request(self._runner_id, req_id, session=state.session)
+            # A failure or cancellation after the request frame was sent must
+            # also cancel the runner; otherwise a flow-controlled dispatch blocks
+            # on exhausted send credit and strands its open upstream body.
+            await _cancel_and_forget_request(
+                self._registry, self._runner_id, req_id, state, cancel=True
+            )
             raise
 
         # Wrap the body queue as an httpx AsyncByteStream. The stream

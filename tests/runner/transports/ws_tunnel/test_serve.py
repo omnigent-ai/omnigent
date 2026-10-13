@@ -31,8 +31,12 @@ from omnigent.runner.identity import (
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
 from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
+    RESPONSE_BODY_FRAME_MAX_BYTES,
+    RESPONSE_FLOW_CAPABILITY,
+    RESPONSE_FLOW_WINDOW_FRAMES,
     PingFrame,
     RequestCancelFrame,
+    RequestFlowFrame,
     RequestFrame,
     WSCloseFrame,
     WSFrame,
@@ -40,7 +44,10 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.serve import (
+    _graceful_drain,
     _handle_tunnel_frame,
+    _iter_body_fragments,
+    _SendWindow,
     _serve_tunnel_once,
     _websocket_auth_redirect_url,
     _websocket_close_code,
@@ -870,6 +877,7 @@ async def test_serve_tunnel_once_sends_bearer_header(
     hello = decode_frame(captured["sent"])
     assert isinstance(hello, HelloFrame)
     assert CAP_FILESYSTEM_ATTACHMENTS in hello.capabilities
+    assert RESPONSE_FLOW_CAPABILITY in hello.capabilities
 
     # A reconnect's row carries the id the loop minted, the streak position
     # and the outage it ended, measured from when the previous connection
@@ -1230,6 +1238,7 @@ async def test_graceful_drain_fires_hook_and_awaits_inflight_task() -> None:
     await asyncio.wait_for(
         serve_module._graceful_drain(
             dispatch_tasks=dispatch_tasks,
+            flow_credits={},
             on_graceful_shutdown=_on_graceful_shutdown,
         ),
         timeout=5.0,
@@ -1264,6 +1273,7 @@ async def test_graceful_drain_bounded_when_task_never_finishes(
         await asyncio.wait_for(
             serve_module._graceful_drain(
                 dispatch_tasks={"req-stuck": task},
+                flow_credits={},
                 on_graceful_shutdown=lambda: None,
             ),
             timeout=2.0,
@@ -3125,3 +3135,287 @@ async def test_serve_tunnel_keeps_escalating_after_brief_connection(
     # Attempt 3 (brief_drop): connected for 2 s < 5 s; no reset → sleep 2.0
     # Attempt 4 (stop): CancelledError before sleep
     assert sleeps == [0.5, 1.0, 2.0]
+
+
+def test_iter_body_fragments_small_chunk_is_single_frame() -> None:
+    """A chunk at or below the cap is yielded unchanged as one fragment."""
+    small = b"x" * (RESPONSE_BODY_FRAME_MAX_BYTES - 1)
+    exact = b"y" * RESPONSE_BODY_FRAME_MAX_BYTES
+
+    assert list(_iter_body_fragments(small, "application/octet-stream")) == [small]
+    assert list(_iter_body_fragments(exact, "application/octet-stream")) == [exact]
+
+
+def test_iter_body_fragments_binary_splits_and_reassembles() -> None:
+    """A large binary chunk splits into capped frames that rejoin exactly."""
+    chunk = os.urandom(RESPONSE_BODY_FRAME_MAX_BYTES * 3 + 123)
+
+    fragments = list(_iter_body_fragments(chunk, "application/octet-stream"))
+
+    assert len(fragments) == 4
+    assert all(len(f) <= RESPONSE_BODY_FRAME_MAX_BYTES for f in fragments)
+    assert all(len(f) > 0 for f in fragments)
+    assert b"".join(fragments) == chunk
+
+
+def test_iter_body_fragments_text_cuts_on_utf8_boundaries() -> None:
+    """Text frames never tear a multi-byte character across the boundary."""
+    # "€" is three bytes (E2 82 AC); repeating it guarantees a character
+    # straddles every 64 KiB cut, so a naive byte split would be invalid utf-8.
+    chunk = "€".encode() * (RESPONSE_BODY_FRAME_MAX_BYTES)
+
+    fragments = list(_iter_body_fragments(chunk, "text/plain; charset=utf-8"))
+
+    assert len(fragments) > 1
+    assert all(len(f) <= RESPONSE_BODY_FRAME_MAX_BYTES for f in fragments)
+    # Each fragment decodes on its own: no fragment ends mid-character.
+    for fragment in fragments:
+        fragment.decode("utf-8")
+    assert b"".join(fragments) == chunk
+
+
+def test_iter_body_fragments_invalid_text_still_advances() -> None:
+    """Invalid UTF-8 text is cut near the cap instead of stalling on continuation bytes."""
+    chunk = b"\x80" * (RESPONSE_BODY_FRAME_MAX_BYTES * 2 + 7)
+
+    fragments = _iter_body_fragments(chunk, "text/plain")
+    first_three = [next(fragments) for _ in range(3)]
+
+    assert all(0 < len(f) <= RESPONSE_BODY_FRAME_MAX_BYTES for f in first_three)
+    assert next(fragments, None) is None
+    assert b"".join(first_three) == chunk
+
+
+@pytest.mark.asyncio
+async def test_handle_tunnel_frame_opens_send_window_only_when_requested() -> None:
+    """A request's flow_window opens its credit window; requests without one stay unthrottled."""
+
+    async def _send_text(text: str) -> None:
+        del text
+
+    dispatch_tasks: dict[str, asyncio.Task[None]] = {}
+    flow_credits: dict[str, _SendWindow] = {}
+    windowed = RequestFrame(id="req-windowed", method="GET", path="/health", flow_window=4)
+    legacy = RequestFrame(id="req-legacy", method="GET", path="/health")
+
+    for frame in (windowed, legacy):
+        await _handle_tunnel_frame(
+            _noop_app,
+            encode_frame(frame),
+            _send_text,
+            dispatch_tasks,
+            {},
+            flow_credits=flow_credits,
+        )
+
+    assert set(flow_credits) == {"req-windowed"}
+    await asyncio.gather(*dispatch_tasks.values(), return_exceptions=True)
+    assert flow_credits == {}
+
+
+@pytest.mark.asyncio
+async def test_legacy_request_streams_unthrottled_past_one_window() -> None:
+    """A request without flow_window (old server) streams past a window with no gating."""
+    from omnigent.runner.transports.ws_tunnel.frames import ResponseBodyFrame, decode_frame
+
+    fragment_count = RESPONSE_FLOW_WINDOW_FRAMES + 8
+    body = os.urandom(fragment_count * RESPONSE_BODY_FRAME_MAX_BYTES)
+
+    async def _streaming_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        del receive
+        assert scope["type"] == "http"
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/octet-stream")],
+            }
+        )
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    body_frames = 0
+
+    async def _send_text(text: str) -> None:
+        nonlocal body_frames
+        if isinstance(decode_frame(text), ResponseBodyFrame):
+            body_frames += 1
+
+    dispatch_tasks: dict[str, asyncio.Task[None]] = {}
+    flow_credits: dict[str, _SendWindow] = {}
+    raw = encode_frame(RequestFrame(id="req-legacy-stream", method="GET", path="/stream"))
+
+    await _handle_tunnel_frame(
+        _streaming_app, raw, _send_text, dispatch_tasks, {}, flow_credits=flow_credits
+    )
+
+    # No credit window is opened for a legacy request...
+    assert flow_credits == {}
+    await asyncio.wait_for(dispatch_tasks["req-legacy-stream"], timeout=5)
+    # ...yet the whole body streams, past one window, with no credit grants.
+    assert body_frames == fragment_count > RESPONSE_FLOW_WINDOW_FRAMES
+
+
+@pytest.mark.asyncio
+async def test_handle_tunnel_frame_marks_flow_grant_activity() -> None:
+    """A request.flow credit grant counts as activity so a slow download is not reaped."""
+    activities: list[str] = []
+
+    async def _send_text(text: str) -> None:
+        del text
+
+    flow_credits: dict[str, _SendWindow] = {"req-flow": _SendWindow(1)}
+    raw = encode_frame(RequestFlowFrame(id="req-flow", credits=2))
+
+    await _handle_tunnel_frame(
+        _noop_app,
+        raw,
+        _send_text,
+        {},
+        {},
+        flow_credits=flow_credits,
+        on_activity=lambda: activities.append("activity"),
+    )
+
+    assert activities == ["activity"]
+
+
+@pytest.mark.asyncio
+async def test_send_window_grant_drain_allowance_unblocks_but_stays_bounded() -> None:
+    """The drain allowance wakes a parked dispatch yet keeps the window bounded.
+
+    A stalled bulk response flushes at most one more window during the drain and
+    then re-parks, instead of draining its whole upstream unbounded.
+    """
+    window = _SendWindow(1)
+    await window.acquire()  # exhaust the window
+    parked = asyncio.create_task(window.acquire())
+    await asyncio.sleep(0)
+    assert not parked.done()
+
+    window.grant_drain_allowance()  # releases exactly one window of credit
+
+    await asyncio.wait_for(parked, timeout=1)
+    # Bounded: once the one-window allowance is spent, acquire re-parks.
+    reparked = asyncio.create_task(window.acquire())
+    await asyncio.sleep(0)
+    assert not reparked.done()
+    reparked.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reparked
+
+
+@pytest.mark.asyncio
+async def test_graceful_drain_releases_credit_starved_dispatch() -> None:
+    """Graceful drain grants a drain allowance so a credit-starved stream finishes."""
+    window = _SendWindow(1)
+    await window.acquire()  # exhaust the window
+    finished = asyncio.Event()
+
+    async def _blocked_dispatch() -> None:
+        await window.acquire()
+        finished.set()
+
+    task = asyncio.create_task(_blocked_dispatch())
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    await _graceful_drain({"req": task}, {"req": window}, None)
+
+    assert finished.is_set()
+    assert task.done() and not task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_send_window_release_clamped_caps_available_credit() -> None:
+    """Repeated or oversized credit grants never inflate the window past its bound."""
+    window = _SendWindow(2)
+    await window.acquire()
+    await window.acquire()  # window exhausted
+
+    window.release_clamped(100)  # a malformed server over-granting
+
+    # Only one window of credit is restored, not 100.
+    await asyncio.wait_for(window.acquire(), timeout=1)
+    await asyncio.wait_for(window.acquire(), timeout=1)
+    parked = asyncio.create_task(window.acquire())
+    await asyncio.sleep(0)
+    assert not parked.done()
+    parked.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await parked
+
+
+@pytest.mark.asyncio
+async def test_flow_grant_only_releases_the_named_request() -> None:
+    """A credit grant resumes only its own request, never another request's window."""
+
+    async def _send_text(text: str) -> None:
+        del text
+
+    granted = _SendWindow(1)
+    other = _SendWindow(1)
+    await granted.acquire()
+    await other.acquire()
+    flow_credits = {"req-granted": granted, "req-other": other}
+
+    await _handle_tunnel_frame(
+        _noop_app,
+        encode_frame(RequestFlowFrame(id="req-granted", credits=1)),
+        _send_text,
+        {},
+        {},
+        flow_credits=flow_credits,
+    )
+
+    # The grant resumes only its own request...
+    await asyncio.wait_for(granted.acquire(), timeout=1)
+    # ...while an unrelated request's exhausted window stays parked.
+    parked = asyncio.create_task(other.acquire())
+    await asyncio.sleep(0)
+    assert not parked.done()
+    parked.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await parked
+
+
+@pytest.mark.asyncio
+async def test_request_dispatch_caps_oversized_flow_window() -> None:
+    """A server advertising a window beyond the runner's bound is capped on dispatch."""
+
+    async def _send_text(text: str) -> None:
+        del text
+
+    dispatch_tasks: dict[str, asyncio.Task[None]] = {}
+    flow_credits: dict[str, _SendWindow] = {}
+    raw = encode_frame(
+        RequestFrame(
+            id="req-big-window",
+            method="GET",
+            path="/health",
+            flow_window=RESPONSE_FLOW_WINDOW_FRAMES * 1000,
+        )
+    )
+
+    await _handle_tunnel_frame(
+        _noop_app,
+        raw,
+        _send_text,
+        dispatch_tasks,
+        {},
+        flow_credits=flow_credits,
+    )
+
+    # Behavioral: only one window of credit is honored, not the advertised
+    # multiple. The no-op app sends no body, so it spends no credit itself.
+    window = flow_credits["req-big-window"]
+    task = dispatch_tasks["req-big-window"]
+    for _ in range(RESPONSE_FLOW_WINDOW_FRAMES):
+        await asyncio.wait_for(window.acquire(), timeout=1)
+    parked = asyncio.create_task(window.acquire())
+    await asyncio.sleep(0)
+    assert not parked.done()
+    parked.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await parked
+
+    await asyncio.gather(task, return_exceptions=True)
