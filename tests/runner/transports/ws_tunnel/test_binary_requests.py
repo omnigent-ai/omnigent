@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -15,10 +16,13 @@ from fastapi import FastAPI
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.asyncio.server import serve
 
+from omnigent.runner.transports.ws_tunnel import registry as registry_module
+from omnigent.runner.transports.ws_tunnel import serve as serve_module
 from omnigent.runner.transports.ws_tunnel.binary_requests import encode_binary_request
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     PingFrame,
+    RequestCancelFrame,
     RequestFrame,
     ResponseEndFrame,
     ResponseHeadFrame,
@@ -274,15 +278,23 @@ async def test_decoder_rejects_over_limit(caplog) -> None:
 
 @asynccontextmanager
 async def _runner_dispatch(
-    ws: ClientConnection, app, binary_sizes: list[int] | None = None
+    ws: ClientConnection,
+    app,
+    binary_sizes: list[int] | None = None,
+    sent_frames: list | None = None,
 ) -> AsyncIterator[dict[str, asyncio.Task[None]]]:
     dispatches: dict[str, asyncio.Task[None]] = {}
+
+    async def send(raw: str) -> None:
+        if sent_frames is not None:
+            sent_frames.append(decode_frame(raw))
+        await ws.send(raw)
 
     async def receive() -> None:
         async for raw in ws:
             if isinstance(raw, bytes) and binary_sizes is not None:
                 binary_sizes.append(len(raw))
-            await _handle_tunnel_frame(app, raw, ws.send, dispatches, {})
+            await _handle_tunnel_frame(app, raw, send, dispatches, {})
 
     receiver = asyncio.create_task(receive())
     try:
@@ -410,6 +422,7 @@ async def test_cancelled_requests_keep_admission_until_runner_finishes(
     uploads_finish = asyncio.Event()
     active_uploads = 0
     peak_uploads = 0
+    cancellations_received = 0
     original_sender = runner_tunnel._sender_loop
 
     async def paused_sender(ws, session) -> None:
@@ -417,7 +430,7 @@ async def test_cancelled_requests_keep_admission_until_runner_finishes(
         await original_sender(ws, session)
 
     async def app(scope, receive, send) -> None:
-        nonlocal active_uploads, peak_uploads
+        nonlocal active_uploads, peak_uploads, cancellations_received
         if scope["path"] == "/upload":
             await receive()
             active_uploads += 1
@@ -425,7 +438,12 @@ async def test_cancelled_requests_keep_admission_until_runner_finishes(
             if active_uploads == 2:
                 uploads_started.set()
             try:
-                await uploads_finish.wait()
+                try:
+                    await uploads_finish.wait()
+                except asyncio.CancelledError:
+                    # Delayed runner cleanup must keep admission after a cancel is written.
+                    cancellations_received += 1
+                    await uploads_finish.wait()
                 await send({"type": "http.response.start", "status": 204, "headers": []})
                 if terminal_error:
                     raise RuntimeError("blocked upload failed")
@@ -474,9 +492,12 @@ async def test_cancelled_requests_keep_admission_until_runner_finishes(
                                 ),
                                 1,
                             )
-                        assert session.outbound_queue.qsize() == 2
+                        assert len(session.binary_pending_sends) == 2
                     writer_resume.set()
                     await asyncio.wait_for(uploads_started.wait(), 10)
+                async with asyncio.timeout(2):
+                    while cancellations_received < 2:
+                        await asyncio.sleep(0.01)
                 # Cancellation has removed both consumers, but ASGI work is still blocked.
                 assert active_uploads == 2
                 for _ in range(3):
@@ -503,6 +524,7 @@ async def test_cancelled_requests_keep_admission_until_runner_finishes(
                     while session.binary_requests:
                         await asyncio.sleep(0.01)
                 assert active_uploads == 0
+                assert not session.binary_deadlines
                 assert not session.binary_pending_sends
                 response = await asyncio.wait_for(
                     client.patch(
@@ -567,3 +589,303 @@ async def test_binary_request_across_consumer_loop() -> None:
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_post_head_close_recovers_binary_admission() -> None:
+    blocked = asyncio.Event()
+    started = 0
+
+    async def app(scope, receive, send) -> None:
+        nonlocal started
+        await receive()
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        if scope["path"] == "/upload":
+            started += 1
+            await blocked.wait()
+        await send({"type": "http.response.body", "body": b""})
+
+    frames: list = []
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        session = registry.get(_RUNNER)
+        assert session is not None
+        async with _runner_dispatch(ws, app, sent_frames=frames) as dispatches:
+            responses = []
+            try:
+                for _ in range(2):
+                    response = await asyncio.wait_for(
+                        client.send(
+                            client.build_request(
+                                "PATCH",
+                                "/upload",
+                                content=b"chunk",
+                                extensions={"runner_tunnel_binary_request_body": True},
+                            ),
+                            stream=True,
+                        ),
+                        2,
+                    )
+                    responses.append(response)
+                assert started == 2
+                with pytest.raises(httpx.PoolTimeout):
+                    await client.patch(
+                        "/health", extensions={"runner_tunnel_binary_request_body": True}
+                    )
+                for response in responses:
+                    await response.aclose()
+                async with asyncio.timeout(2):
+                    while dispatches:
+                        await asyncio.sleep(0.01)
+                async with asyncio.timeout(2):
+                    while session.binary_requests:
+                        await asyncio.sleep(0.01)
+                assert not session.binary_deadlines
+                ends = [frame for frame in frames if isinstance(frame, ResponseEndFrame)]
+                assert len(ends) == 2
+                assert len({frame.id for frame in ends}) == 2
+                assert all(frame.error == "runner_request_cancelled" for frame in ends)
+                response = await asyncio.wait_for(
+                    client.patch(
+                        "/health",
+                        extensions={"runner_tunnel_binary_request_body": True},
+                    ),
+                    2,
+                )
+                assert response.status_code == 204
+            finally:
+                blocked.set()
+                for response in responses:
+                    await response.aclose()
+
+
+async def test_cancel_after_completed_response_emits_no_duplicate_end() -> None:
+    cleanup = asyncio.Event()
+
+    async def app(scope, receive, send) -> None:
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+        await cleanup.wait()
+
+    frames: list = []
+    async with _tunnel([_CAPABILITY]) as (client, ws, _):
+        async with _runner_dispatch(ws, app, sent_frames=frames) as dispatches:
+            response = await asyncio.wait_for(
+                client.send(
+                    client.build_request(
+                        "PATCH",
+                        "/upload",
+                        content=b"chunk",
+                        extensions={"runner_tunnel_binary_request_body": True},
+                    ),
+                    stream=True,
+                ),
+                2,
+            )
+            try:
+                async with asyncio.timeout(2):
+                    while not any(isinstance(frame, ResponseEndFrame) for frame in frames):
+                        await asyncio.sleep(0.01)
+                await response.aclose()
+                async with asyncio.timeout(2):
+                    while dispatches:
+                        await asyncio.sleep(0.01)
+                ends = [frame for frame in frames if isinstance(frame, ResponseEndFrame)]
+                assert len(ends) == 1
+                assert ends[0].error is None
+            finally:
+                cleanup.set()
+                await response.aclose()
+
+
+async def test_pre_head_relay_timeout_sends_cancel_and_recovers_admission() -> None:
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def app(scope, receive, send) -> None:
+        started.set()
+        await blocked.wait()
+
+    async def relay(client) -> None:
+        async with asyncio.timeout(0.1):
+            await client.patch(
+                "/upload", content=b"chunk", extensions={"runner_tunnel_binary_request_body": True}
+            )
+
+    frames: list = []
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        session = registry.get(_RUNNER)
+        assert session is not None
+        async with _runner_dispatch(ws, app, sent_frames=frames) as dispatches:
+            task = asyncio.create_task(relay(client))
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                with pytest.raises(TimeoutError):
+                    await task
+                async with asyncio.timeout(2):
+                    while session.binary_requests or dispatches:
+                        await asyncio.sleep(0.01)
+                ends = [frame for frame in frames if isinstance(frame, ResponseEndFrame)]
+                assert len(ends) == 1 and ends[0].error == "runner_request_cancelled"
+            finally:
+                blocked.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_cancel_queued_before_dispatch_starts_emits_one_end() -> None:
+    async def app(scope, receive, send) -> None:
+        await asyncio.Event().wait()
+
+    # Request and cancel are processed in the same receive-loop turn, before
+    # the newly created dispatch task has had a chance to start.
+    async def peer(ws) -> None:
+        tasks: dict[str, asyncio.Task[None]] = {}
+        raw = await ws.recv()
+        request = _envelope_header(raw)
+        await _handle_tunnel_frame(app, raw, ws.send, tasks, {})
+        await _handle_tunnel_frame(
+            app, encode_frame(RequestCancelFrame(request["id"])), ws.send, tasks, {}
+        )
+        try:
+            await asyncio.gather(*list(tasks.values()), return_exceptions=True)
+            await ws.send(encode_frame(PingFrame(345)))
+        finally:
+            for task in list(tasks.values()):
+                task.cancel()
+
+    async with serve(peer, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        async with connect(f"ws://127.0.0.1:{port}") as ws:
+            await ws.send(
+                encode_binary_request(RequestFrame("queued-cancel", "PATCH", "/upload"), b"chunk")
+            )
+            frame = decode_frame(await asyncio.wait_for(ws.recv(), 2))
+            assert isinstance(frame, ResponseEndFrame)
+            assert frame.id == "queued-cancel" and frame.error == "runner_request_cancelled"
+            assert isinstance(decode_frame(await asyncio.wait_for(ws.recv(), 2)), PingFrame)
+
+
+async def test_binary_dispatch_deadline_recovers_slot_with_healthy_pings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(serve_module, "BINARY_REQUEST_DISPATCH_TIMEOUT_S", 0.3, raising=False)
+    monkeypatch.setattr(registry_module, "BINARY_REQUEST_ADMISSION_TIMEOUT_S", 0.5, raising=False)
+    blocked = asyncio.Event()
+    started = asyncio.Event()
+
+    async def app(scope, receive, send) -> None:
+        if scope["path"] == "/upload":
+            started.set()
+            await blocked.wait()
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    frames: list = []
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        session = registry.get(_RUNNER)
+        assert session is not None
+        async with _runner_dispatch(ws, app, sent_frames=frames):
+            task = asyncio.create_task(
+                client.patch(
+                    "/upload",
+                    content=b"chunk",
+                    extensions={"runner_tunnel_binary_request_body": True},
+                )
+            )
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                await registry.send_text(session, encode_frame(PingFrame(567)), app_ping_ts=567)
+                async with asyncio.timeout(2):
+                    while session.diagnostics.snapshot()["last_app_pong_received_age_s"] is None:
+                        await asyncio.sleep(0.01)
+                response = await asyncio.wait_for(task, 2)
+                assert response.status_code == 504
+                assert registry.get(_RUNNER) is session and not session.binary_requests
+                assert not session.binary_deadlines
+                await asyncio.sleep(0.25)
+                assert registry.get(_RUNNER) is session
+                ends = [frame for frame in frames if isinstance(frame, ResponseEndFrame)]
+                assert len(ends) == 1
+                response = await client.patch(
+                    "/health", extensions={"runner_tunnel_binary_request_body": True}
+                )
+                assert response.status_code == 204
+            finally:
+                blocked.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("capable", [True, False], ids=["uncooperative-binary", "old-json-runner"])
+async def test_missing_terminal_retires_tunnel_with_bounded_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    capable: bool,
+) -> None:
+    monkeypatch.setattr(registry_module, "BINARY_REQUEST_ADMISSION_TIMEOUT_S", 0.5, raising=False)
+    monkeypatch.setattr(serve_module, "BINARY_REQUEST_DISPATCH_TIMEOUT_S", 0.1, raising=False)
+    release = asyncio.Event()
+    started = asyncio.Event()
+    active = 0
+
+    async def app(scope, receive, send) -> None:
+        nonlocal active
+        active += 1
+        if active == 2:
+            started.set()
+        try:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    # This fixture models a handler that won't terminate on cancellation.
+                    continue
+        finally:
+            active -= 1
+
+    frames: list = []
+    binary_sizes: list[int] = []
+    async with _tunnel([_CAPABILITY] if capable else []) as (client, ws, registry):
+        session = registry.get(_RUNNER)
+        assert session is not None
+        async with _runner_dispatch(ws, app, binary_sizes=binary_sizes, sent_frames=frames):
+            since = time.monotonic()
+            tasks = [
+                asyncio.create_task(
+                    client.patch(
+                        "/upload",
+                        content=b"chunk",
+                        extensions={"runner_tunnel_binary_request_body": True},
+                    )
+                )
+                for _ in range(2)
+            ]
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                assert len(binary_sizes) == (2 if capable else 0)
+                with pytest.raises(httpx.PoolTimeout):
+                    await client.patch(
+                        "/upload", extensions={"runner_tunnel_binary_request_body": True}
+                    )
+                for token in (678, 679, 680):
+                    await registry.send_text(
+                        session, encode_frame(PingFrame(token)), app_ping_ts=token
+                    )
+                    async with asyncio.timeout(2):
+                        while (
+                            session.diagnostics.snapshot()["last_app_pong_received_age_s"] is None
+                        ):
+                            await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.05)
+                assert session.diagnostics.snapshot()["last_app_pong_received_age_s"] is not None
+                assert len(session.binary_requests) == 2 and active == 2
+                results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 2)
+                assert all(isinstance(result, ConnectionError) for result in results)
+                assert time.monotonic() - since < 2
+                assert registry.get(_RUNNER) is None
+                assert not session.binary_requests and not session.binary_pending_sends
+                assert not session.binary_waiting_response and not session.binary_deadlines
+                await asyncio.wait_for(ws.wait_closed(), 2)
+            finally:
+                release.set()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
