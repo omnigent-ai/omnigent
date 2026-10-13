@@ -48,6 +48,23 @@ def _image_bytes(image_format: str, *, size: tuple[int, int] = (2, 2)) -> bytes:
     return output.getvalue()
 
 
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [("", True), ("true", True), ("false", False), ('"false"', True), ("0", True)],
+    ids=["default", "enabled", "disabled", "invalid-string", "invalid-number"],
+)
+def test_runner_tunnel_binary_setting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setting: str,
+    expected: bool,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(f"runner_tunnel_binary_request_body: {setting}\n" if setting else "{}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    assert server_config_module.runner_tunnel_binary_request_body() is expected
+
+
 def _ico_bytes(entries: list[tuple[tuple[int, int], bytes]]) -> bytes:
     directory_end = 6 + len(entries) * 16
     directory = bytearray(b"\x00\x00\x01\x00" + len(entries).to_bytes(2, "little"))
