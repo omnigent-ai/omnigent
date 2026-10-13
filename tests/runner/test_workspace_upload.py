@@ -411,14 +411,18 @@ async def test_creation_intent_reconciled_after_crash(
     try:
         await fresh.start()
         await fresh.sweep()
-        assert not fresh.records
         if record_identity:
+            assert not fresh.records
             assert not list((tmp_path / "workspace").iterdir())
         else:
-            assert uid in fresh.quarantined
-            assert not Path(intent[uid]["staging_path"]).exists()
-            assert Path(fresh.quarantined[uid].staging_path).exists()
-            assert fresh.quarantined[uid].staging_ino != 0
+            staging = Path(intent[uid]["staging_path"])
+            assert staging.exists()
+            assert uid in fresh.records
+            assert fresh.records[uid].staging_ino == 0
+            await fresh.sweep(now=fresh.records[uid].created_at + fresh.limits.max_age_s + 1)
+            assert uid not in fresh.records
+            assert staging.exists()
+            assert uid not in json.loads(fresh.state_path.read_text())
     finally:
         await fresh.stop()
 
@@ -470,7 +474,7 @@ async def test_helper_cache_bounded_and_idle(
 
 
 @pytest.mark.asyncio
-async def test_sweep_quarantines_unresolvable_record(
+async def test_sweep_drops_unresolvable_record(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from fastapi import HTTPException
@@ -486,7 +490,7 @@ async def test_sweep_quarantines_unresolvable_record(
     monkeypatch.setattr(manager, "resolve_environment", broken)
     await manager.sweep(now=manager.records[uid].created_at + 86401)
     assert uid not in manager.records
-    assert uid in manager.quarantined
+    assert uid not in json.loads(manager.state_path.read_text())
 
     async def unavailable(session: str, environment: str) -> CallerProcessOSEnvironment:
         raise HTTPException(404, "Session ended")
@@ -817,9 +821,14 @@ async def test_late_replace_target_lost_response_preserves_outcome(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_adoption", [False, True])
 async def test_pending_intent_preserves_unrelated_occupant(
-    client: httpx.AsyncClient, tmp_path: Path
+    client: httpx.AsyncClient,
+    legacy_adoption: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    from omnigent.runner.workspace_upload import RouteError
+
     manager = client._transport.app.state.workspace_uploads
     response = await create(client)
     uid = response.json()["upload_id"]
@@ -831,7 +840,15 @@ async def test_pending_intent_preserves_unrelated_occupant(
     staging.chmod(0o600)
     record.pending = True
     record.staging_dev = record.staging_ino = 0
-    await manager._persist()
+    data = record.model_dump()
+    if legacy_adoption:
+        data.update(
+            quarantined=True,
+            quarantine_id="b" * 32,
+            staging_dev=staging.stat().st_dev,
+            staging_ino=staging.stat().st_ino,
+        )
+    manager.state_path.write_text(json.dumps({uid: data}))
     fresh = register_upload_routes(
         FastAPI(),
         resolve_environment=manager.resolve_environment,
@@ -841,11 +858,17 @@ async def test_pending_intent_preserves_unrelated_occupant(
     try:
         await fresh.start()
         await fresh.sweep()
-        assert not staging.exists()
+        await fresh.sweep(now=record.created_at + fresh.limits.max_age_s + 1)
+        assert staging.read_bytes() == b"unrelated"
+        assert list(staging.parent.iterdir()) == [staging]
+        assert "allocation identity is unknown" in caplog.text
         assert uid not in fresh.records
-        assert uid in fresh.quarantined
-        assert Path(fresh.quarantined[uid].staging_path).read_bytes() == b"unrelated"
-        assert fresh.quarantined[uid].staging_ino != 0
+        assert uid not in json.loads(fresh.state_path.read_text())
+        for op in ("status", "append", "complete", "abort"):
+            with pytest.raises(RouteError) as exc:
+                await fresh.operate("session", DEFAULT_ENVIRONMENT_ID, uid, "alice", op)
+            assert exc.value.status == 410
+        assert staging.read_bytes() == b"unrelated"
     finally:
         await fresh.stop()
 
@@ -1377,53 +1400,6 @@ async def test_cross_session_upload_rejected(client: httpx.AsyncClient, phase: s
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("replace_occupant", [False, True])
-async def test_quarantined_intent_expires_by_pinned_identity(
-    client: httpx.AsyncClient,
-    replace_occupant: bool,
-) -> None:
-    manager = client._transport.app.state.workspace_uploads
-    response = await create(client)
-    uid = response.json()["upload_id"]
-    record = manager.records[uid]
-    await manager.stop()
-    record.pending = True
-    record.staging_dev = record.staging_ino = 0
-    await manager._persist()
-    fresh = register_upload_routes(
-        FastAPI(),
-        resolve_environment=manager.resolve_environment,
-        resolve_registry=manager.resolve_registry,
-        state_path=manager.state_path,
-    )
-    try:
-        await fresh.start()
-        await fresh.sweep()
-        quarantined = fresh.quarantined[uid]
-        assert quarantined.quarantine_id is not None
-        assert quarantined.staging_ino != 0
-        path = Path(quarantined.staging_path)
-        assert path.exists()
-        await fresh.sweep(now=quarantined.quarantined_at + fresh.limits.max_age_s - 1)
-        assert path.exists()
-        assert uid in fresh.quarantined
-        if replace_occupant:
-            other = path.with_name("replacement")
-            other.write_bytes(b"unrelated")
-            os.replace(other, path)
-        await fresh.sweep(now=quarantined.quarantined_at + fresh.limits.max_age_s + 1)
-        if replace_occupant:
-            assert path.read_bytes() == b"unrelated"
-            assert uid in fresh.quarantined
-        else:
-            assert not path.exists()
-            assert uid not in fresh.quarantined
-            assert uid not in json.loads(fresh.state_path.read_text())
-    finally:
-        await fresh.stop()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("conflict", ["replace", "rename"])
 async def test_publication_target_changes_after_wal(
     client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, conflict: str
@@ -1501,55 +1477,6 @@ async def test_restart_after_wal_before_publish_never_reports_commit(
 
 
 @pytest.mark.asyncio
-async def test_lost_quarantine_response_replays_indexed_move(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from omnigent.runner.workspace_upload import RouteError
-
-    manager = client._transport.app.state.workspace_uploads
-    response = await create(client)
-    uid = response.json()["upload_id"]
-    record = manager.records[uid]
-    staging = Path(record.staging_path)
-    record.pending = True
-    record.staging_dev = record.staging_ino = 0
-    original = manager._call
-    durable = {}
-
-    async def lose(uid, record, op, *args, **kwargs):
-        if op == "quarantine":
-            durable.update(json.loads(manager.state_path.read_text()))
-            await original(uid, record, op, *args, **kwargs)
-            raise RouteError(410, "gone", "Lost quarantine response")
-        return await original(uid, record, op, *args, **kwargs)
-
-    monkeypatch.setattr(manager, "_call", lose)
-    await manager.sweep()
-    assert not staging.exists()
-    assert durable[uid]["quarantine_id"] is not None
-    assert durable[uid]["staging_ino"] == 0
-    await manager.stop()
-    manager.state_path.write_text(json.dumps(durable))
-    fresh = register_upload_routes(
-        FastAPI(),
-        resolve_environment=manager.resolve_environment,
-        resolve_registry=manager.resolve_registry,
-        state_path=manager.state_path,
-    )
-    try:
-        await fresh.start()
-        await fresh.sweep()
-        quarantined = fresh.quarantined[uid]
-        assert quarantined.staging_ino != 0
-        await fresh.sweep(now=quarantined.quarantined_at + fresh.limits.max_age_s + 1)
-        assert uid not in fresh.quarantined
-        assert not Path(quarantined.staging_path).exists()
-    finally:
-        await fresh.stop()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["plan_response", "index_save"])
 async def test_publication_never_precedes_durable_plan(
     client: httpx.AsyncClient,
@@ -1587,30 +1514,3 @@ async def test_publication_never_precedes_durable_plan(
     assert staging.exists()
     assert not (staging.parent / "payload.bin").exists()
     assert (await client.post(BASE + "/" + uid + "/complete?created_by=alice")).status_code == 200
-
-
-@pytest.mark.asyncio
-async def test_quarantine_move_waits_for_durable_destination(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager = client._transport.app.state.workspace_uploads
-    response = await create(client)
-    uid = response.json()["upload_id"]
-    record = manager.records[uid]
-    record.pending = True
-    record.staging_dev = record.staging_ino = 0
-    staging = Path(record.staging_path)
-
-    def failure():
-        raise OSError("Index storage failure")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(manager, "_save", failure)
-        await manager.sweep()
-        assert staging.exists()
-        await manager.sweep()
-        assert staging.exists()
-    await manager.sweep()
-    assert not staging.exists()
-    assert Path(manager.quarantined[uid].staging_path).exists()
