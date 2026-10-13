@@ -1,7 +1,7 @@
 # Sandbox providers
 
 Omnigent supports running agent hosts in remote sandboxes. Built-in providers
-(Modal, Daytona, Blaxel, CoreWeave Sandbox, E2B, Gensee, Islo, OpenShell,
+(Modal, Daytona, Boat, Blaxel, CoreWeave Sandbox, E2B, Gensee, Islo, OpenShell,
 Boxlite, Kubernetes, microsandbox)
 ship with the core package. Third-party packages can add new providers through
 the `omnigent.sandbox_providers` entrypoint group.
@@ -313,3 +313,43 @@ a network policy can allowlist by exact host+port:
 Every endpoint on these servers (other than `GET /health`) requires a
 per-relay bearer token, so allowlisting their coordinates does not expose
 unauthenticated functionality.
+
+## Boat.dev
+
+Boat supports server-managed sessions with persistent resume, command execution,
+file upload, and the standard multi-repository clone policy. No optional SDK is
+required. Set `BOAT_API_KEY` in the **server process environment**, then configure:
+
+```yaml
+sandbox:
+  provider: boat
+  server_url: https://your-omnigent-server.example
+  reaper:
+    enabled: true
+    terminate_after_offline_days: 1
+```
+
+New sandboxes use `noEnv: true`, so Boat account secrets and repositories are
+not inherited. Omnigent launches its own host rather than Boat's prompt API.
+Monitoring is disabled to avoid persisting launch tokens in Boat command history.
+Automatic archival is disabled while the host runs; configure the Omnigent reaper
+and delete unused sandboxes to release compute. Provider authentication remains
+on the server and is never injected into the sandbox.
+
+Boat's standard image must provide `uv`, passwordless `sudo`, Git, and network
+access to the server and package registry. The launcher installs the published
+`omnigent` package pinned to the server's version into an isolated Python 3.12
+environment. Set `OMNIGENT_BOAT_HOST_PACKAGE` to override it with another
+package requirement or an accessible wheel URL. Set `BOAT_API_URL` to point the
+launcher at a different Boat API base URL. Harness credentials must be configured through
+Omnigent's host configuration/inference gateway. Interactive CLI bootstrap and
+local port forwarding are not supported by this provider.
+
+### Verify
+
+Select a managed host in a new chat and send a message. The Boat dashboard
+shows the sandbox and the Omnigent host comes online. Archive the sandbox in
+Boat and send another message to check resume; delete it and send another
+message to check that a replacement is provisioned.
+
+API reference: [Boat Public API v1](https://docs.boat.dev/api/v1).
