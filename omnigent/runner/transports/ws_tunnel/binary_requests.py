@@ -10,6 +10,7 @@ from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
 BINARY_REQUEST_BODY_CAPABILITY = "binary_request_body_v1"
 _MAGIC = b"OTB\x01"
+_PREFIX_LEN = len(_MAGIC) + 4
 
 
 class BinaryRequestError(ValueError):
@@ -25,26 +26,29 @@ def encode_binary_request(frame: RequestFrame, body: bytes) -> bytes:
     header = json.loads(encode_frame(replace(frame, body=None)))
     del header["body"]
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    if 8 + len(header_bytes) + len(body) > RUNNER_TUNNEL_MAX_MESSAGE_BYTES:
+    if _PREFIX_LEN + len(header_bytes) + len(body) > RUNNER_TUNNEL_MAX_MESSAGE_BYTES:
         raise ValueError("binary request exceeds tunnel message limit")
     return _MAGIC + len(header_bytes).to_bytes(4, "big") + header_bytes + body
 
 
 def decode_binary_request(data: bytes) -> tuple[RequestFrame, bytes]:
     """Validate an envelope and reuse the text protocol's RequestFrame validation."""
-    if len(data) < 8:
+    if len(data) < _PREFIX_LEN:
         raise BinaryRequestError("truncated binary request prefix")
-    header_len = int.from_bytes(data[4:8], "big")
-    if header_len > RUNNER_TUNNEL_MAX_MESSAGE_BYTES - 8 or header_len > len(data) - 8:
+    header_len = int.from_bytes(data[len(_MAGIC) : _PREFIX_LEN], "big")
+    if (
+        header_len > RUNNER_TUNNEL_MAX_MESSAGE_BYTES - _PREFIX_LEN
+        or header_len > len(data) - _PREFIX_LEN
+    ):
         raise BinaryRequestError("binary request header length exceeds message")
     try:
-        header_text = data[8 : 8 + header_len].decode("utf-8")
+        header_text = data[_PREFIX_LEN : _PREFIX_LEN + header_len].decode("utf-8")
         header = json.loads(header_text)
     except (UnicodeDecodeError, ValueError) as exc:
         raise BinaryRequestError("invalid binary request JSON header") from exc
     request_id = header.get("id") if isinstance(header, dict) else None
     request_id = request_id if isinstance(request_id, str) and request_id else None
-    if data[:4] != _MAGIC:
+    if not data.startswith(_MAGIC):
         raise BinaryRequestError("bad binary request magic/version", request_id)
     if len(data) > RUNNER_TUNNEL_MAX_MESSAGE_BYTES:
         raise BinaryRequestError("binary request exceeds tunnel message limit", request_id)
@@ -56,4 +60,4 @@ def decode_binary_request(data: bytes) -> tuple[RequestFrame, bytes]:
             raise ValueError("binary envelope header must be a request")
     except ValueError as exc:
         raise BinaryRequestError(str(exc), request_id) from exc
-    return frame, data[8 + header_len :]
+    return frame, data[_PREFIX_LEN + header_len :]
