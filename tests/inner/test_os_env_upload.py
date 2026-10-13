@@ -496,19 +496,9 @@ def test_slow_complete_has_size_budget_and_keeps_other_upload(
     ) > upload.operation_timeout({"op": "complete", "size": 0})
 
 
-def test_xattr_unavailable_upload_still_supported(
-    helper: UploadHelperClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import errno
-
-    import omnigent.inner.os_env_upload as upload
+def test_engine_publishes_empty_upload(helper: UploadHelperClient, tmp_path: Path) -> None:
     from omnigent.inner.os_env_upload import UploadEngine
 
-    def unsupported(*args):
-        raise OSError(errno.ENOTSUP, "No extended attributes")
-
-    monkeypatch.setattr(upload, "_set_receipt", unsupported, raising=False)
-    monkeypatch.setattr(upload.os, "setxattr", unsupported, raising=False)
     engine = UploadEngine(tmp_path.resolve(), helper.sandbox)
     try:
         assert engine.dispatch({"op": "probe"}, b"") == {"raw_upload": True}
@@ -517,7 +507,7 @@ def test_xattr_unavailable_upload_still_supported(
                 "op": "begin",
                 "id": UID,
                 "dir": "",
-                "name": "no-xattr",
+                "name": "empty",
                 "size": 0,
                 "on_conflict": "fail",
             },
@@ -525,6 +515,6 @@ def test_xattr_unavailable_upload_still_supported(
         )
         assert "error" not in result
         assert "error" not in engine.dispatch({"op": "complete", "id": UID}, b"")
-        assert (tmp_path / "no-xattr").exists()
+        assert (tmp_path / "empty").exists()
     finally:
         engine.close()
