@@ -1000,6 +1000,14 @@ _CODEX_THREAD_STORE_ERROR = "thread-store internal error"
 _CODEX_PAGINATED_LINEAGE_ERROR = "source rollout is not paginated"
 
 
+def is_server_draining_error(error: CodexAppServerResponseError) -> bool:
+    """Whether Codex explicitly refused this RPC before submitting its input."""
+    return (
+        error.code == _CODEX_INVALID_REQUEST_CODE
+        and error.message == "Server is draining; retry after reconnecting"
+    )
+
+
 def is_unreadable_thread_error(exc: BaseException) -> bool:
     """
     Whether a ``thread/resume`` failure means codex cannot load the thread.
