@@ -89,6 +89,19 @@ describe("nativeCodingAgentForHarness", () => {
     ).toBe(false);
   });
 
+  it("gives cursor-native a launch-time model picker alongside its mode picker", () => {
+    expect(nativeCodingAgentForHarness("cursor-native")?.capabilities).toEqual([
+      "cursorMode",
+      "modelPicker",
+    ]);
+    expect(
+      nativeAgentHasCapability({ name: "cursor-native-ui", harness: null }, "modelPicker"),
+    ).toBe(true);
+    expect(
+      nativeAgentHasCapability({ name: "cursor-native-ui", harness: null }, "permissionMode"),
+    ).toBe(false);
+  });
+
   it("leaves unknown / non-native harnesses unresolved", () => {
     expect(nativeCodingAgentForHarness("claude-sdk")).toBeUndefined();
     // The in-process Antigravity SDK harness is not a native CLI wrapper.

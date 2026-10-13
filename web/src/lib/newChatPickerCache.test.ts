@@ -61,6 +61,14 @@ const options: NewChatPickerOptions = {
       },
     ],
     pi: [],
+    cursor: [
+      {
+        id: "grok-4.7",
+        displayName: "Grok 4.7",
+        isDefault: false,
+        source: { kind: "subscription", label: "Subscription", name: "cursor-agent" },
+      },
+    ],
   },
 };
 let key: string;
@@ -94,19 +102,22 @@ describe("newChatPickerCache", () => {
   it("preserves missing catalogs separately from successfully fetched empty catalogs", () => {
     const partialOptions = {
       ...options,
-      models: { claude: undefined, codex: [], pi: options.models.pi },
+      models: { claude: undefined, codex: [], pi: options.models.pi, cursor: undefined },
     };
     writeNewChatPickerOptionsCache(key, partialOptions);
     expect(readNewChatPickerOptionsCache(key)).toEqual(partialOptions);
   });
 
   it("treats legacy empty catalogs as unknown while retaining populated catalogs", () => {
-    writeNewChatPickerOptionsCache(key, options);
+    writeNewChatPickerOptionsCache(key, { ...options, models: { ...options.models, cursor: [] } });
     const record = JSON.parse(localStorage.getItem(`${key}:options`)!);
     delete record.preview.catalogVersion;
     localStorage.setItem(`${key}:options`, JSON.stringify(record));
 
-    const migrated = { ...options, models: { ...options.models, pi: undefined } };
+    const migrated = {
+      ...options,
+      models: { ...options.models, pi: undefined, cursor: undefined },
+    };
     expect(readNewChatPickerOptionsCache(key)).toEqual(migrated);
     writeNewChatPickerOptionsCache(key, readNewChatPickerOptionsCache(key));
     expect(readNewChatPickerOptionsCache(key)).toEqual(migrated);

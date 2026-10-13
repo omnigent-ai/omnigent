@@ -403,6 +403,13 @@ function ForkRunConfig({
   useEffect(() => {
     if (!touched.mode) setMode(seededModeValue);
   }, [seededModeValue, touched.mode]);
+  // A pick the current host's catalog does not offer must not ride the fork
+  // (e.g. after switching hosts). Once that catalog has resolved, fall back to
+  // the explicit Default rather than letting the source model be inherited.
+  useEffect(() => {
+    if (!touched.model || modelsLoading || model === MODEL_SELECT_DEFAULT) return;
+    if (!modelOptions.some((m) => m.id === model)) setModel(MODEL_SELECT_DEFAULT);
+  }, [touched.model, modelsLoading, model, modelOptions]);
 
   // Report the ready-to-send value on every change. Each field is included
   // ONLY when its control was touched (see `touched` above); an untouched

@@ -399,6 +399,66 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_1" }));
   });
 
+  // Cursor's picker is host-resolved only (no static vocabulary): the control
+  // lists what the host's `cursor-agent models` returned, and without a catalog
+  // it stays disabled so Save cannot store a default the harness never offered.
+  const cursorAgent = () =>
+    pickerAgent({
+      id: "ag_cursor",
+      name: "cursor-native-ui",
+      display_name: "Cursor",
+      harness: "cursor-native",
+    });
+
+  it("offers the host's Cursor catalog as the model default and saves a pick from it", async () => {
+    availableAgentsMock.mockReturnValue({ data: [pickerAgent(), cursorAgent()] });
+    hostModelOptionsMock.mockReturnValue({
+      data: [
+        { id: "auto", displayName: "Auto", isDefault: true },
+        { id: "grok-4.7", displayName: "Grok 4.7" },
+      ],
+    });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_cursor", model: "grok-4.7" },
+    });
+    renderDialog();
+    // The stored id is labelled from the host catalog, not kept as a raw fallback.
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-model")).toHaveTextContent("Grok 4.7"),
+    );
+    expect(hostModelOptionsMock).toHaveBeenCalledWith("h1", "cursor-native", true);
+
+    // A model only the catalog knows is offered and can become the default.
+    fireEvent.click(screen.getByTestId("project-settings-model"));
+    fireEvent.click(screen.getByRole("option", { name: "Auto" }));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_cursor", model: "auto" }),
+    );
+  });
+
+  it("disables the Cursor model default without a host catalog and stores none", async () => {
+    availableAgentsMock.mockReturnValue({ data: [pickerAgent(), cursorAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_cursor" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    expect(screen.getByTestId("project-settings-model")).toBeDisabled();
+    expect(screen.getByText(/No model catalog available/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_cursor" }));
+  });
+
   it("preserves a stored model when the default agent hasn't resolved from discovery", async () => {
     // While agent discovery is loading/failing, the stored agent's model
     // capability is unknowable — an unrelated save in that window must not

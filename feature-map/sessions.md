@@ -32,7 +32,10 @@ the header menu), and each place is a separate entry point.
 - `delete`: confirmed, then removed from the list and the server.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
-  their files, elapsed "worked for" time, and can switch agent or host.
+  their files, elapsed "worked for" time, and can switch agent or host. For a
+  native target with a model picker (including Cursor) the run-config section
+  lists the chosen host's models; an untouched Model row sends no override, so
+  a failed or missing catalog cannot pin a model.
 - `fork-custom-agent`: switch to one of your custom agents (installed, imported,
   or discovered from an existing session), as well as to a built-in agent; the
   fork uses the chosen agent.
@@ -299,6 +302,11 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/server/integration/test_sessions_permissions.py::test_fork_switch_denies_session_scoped_target_without_access`.
   These exercise authenticated routes and stores; the single-user browser
   recipe cannot prove cross-user access rules.
+- **`fork`, model row for a native target:**
+  `web/src/shell/ForkSessionDialog.test.tsx` ("Cursor target") covers the
+  host-resolved Cursor model row next to the mode: an explicit pick is sent as
+  the fork's model override; a failed lookup with only the mode touched sends
+  no model.
 - **`clone`:**
   `tests/e2e_ui/sessions/test_clone_session.py::test_clone_session_copies_transcript_and_navigates`,
   `tests/e2e_ui/fork_session/test_typed_workspace_enables_clone.py::test_typed_tilde_workspace_enables_clone`

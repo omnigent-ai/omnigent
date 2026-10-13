@@ -67,6 +67,7 @@ const pickerOptionsSchema = z.object({
     claude: z.array(modelOptionSchema).optional(),
     codex: z.array(modelOptionSchema).optional(),
     pi: z.array(modelOptionSchema).optional(),
+    cursor: z.array(modelOptionSchema).optional(),
   }),
 });
 const storedPickerOptionsSchema = pickerOptionsSchema.extend({
@@ -169,7 +170,7 @@ export function readNewChatPickerOptionsCache(key: string | null): NewChatPicker
   const { catalogVersion, ...options } = cached;
   if (catalogVersion === undefined) {
     // Older caches stored missing catalogs as empty arrays; only populated lists are known.
-    for (const harness of ["claude", "codex", "pi"] as const) {
+    for (const harness of ["claude", "codex", "pi", "cursor"] as const) {
       if (options.models[harness]?.length === 0) options.models[harness] = undefined;
     }
   }

@@ -706,6 +706,134 @@ describe("ForkSessionDialog", () => {
     });
   });
 
+  describe("Cursor target", () => {
+    // Cursor's model row is host-resolved, so these fork a coding source whose
+    // host answers the catalog query.
+    const CURSOR_SOURCE = {
+      sourceTitle: "My session",
+      sourceWorkspace: "/repo",
+      sourceHostId: "host_1",
+    };
+    const CURSOR_AGENT = testAgent("ag_cursor_native", "cursor-native-ui", {
+      display_name: "Cursor",
+      harness: "cursor-native",
+    });
+    const CURSOR_MODELS = [
+      { id: "auto", displayName: "Auto", isDefault: true },
+      { id: "grok-4.7", displayName: "Grok 4.7" },
+    ];
+
+    beforeEach(() => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      setAgents([...AVAILABLE_AGENTS, CURSOR_AGENT], "claude-sdk");
+    });
+
+    it("lists the host's Cursor models next to the mode and sends only an explicit pick", async () => {
+      useHostModelOptionsMock.mockReturnValue({
+        data: CURSOR_MODELS,
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useHostModelOptions>);
+      renderDialog(CURSOR_SOURCE);
+      openAgentSelect();
+      fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_cursor_native"));
+
+      expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "cursor-native", true);
+      expect(screen.getByTestId("fork-session-config-model")).toHaveTextContent("Default (Auto)");
+      expect(screen.getByTestId("fork-session-config-cursor-mode")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId("fork-session-config-model"));
+      fireEvent.click(screen.getByRole("option", { name: "Grok 4.7" }));
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock).toHaveBeenCalledWith(
+        "conv_src",
+        expect.objectContaining({
+          agentId: "ag_cursor_native",
+          config: { modelOverride: "grok-4.7" },
+        }),
+      );
+    });
+
+    it("sends no model when the host's Cursor lookup failed and only the mode was touched", async () => {
+      useHostModelOptionsMock.mockReturnValue({
+        data: undefined,
+        isLoading: false,
+        error: new Error("cursor-agent models exited with status 1"),
+      } as unknown as ReturnType<typeof useHostModelOptions>);
+      renderDialog(CURSOR_SOURCE);
+      openAgentSelect();
+      fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_cursor_native"));
+      expect(screen.getByTestId("fork-session-config-model")).toHaveTextContent("Default");
+
+      fireEvent.click(screen.getByTestId("fork-session-config-cursor-mode"));
+      fireEvent.click(screen.getByRole("option", { name: "Plan" }));
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      // The untouched Model row sends nothing, so the fork cannot carry an
+      // override the host never offered; the mode flag still rides along.
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock).toHaveBeenCalledWith(
+        "conv_src",
+        expect.objectContaining({
+          agentId: "ag_cursor_native",
+          config: { terminalLaunchArgs: ["--mode", "plan"] },
+        }),
+      );
+    });
+
+    it("drops a picked Cursor model when the switched host's catalog lacks it", async () => {
+      setHosts([host(), host({ host_id: "host_2", name: "other-laptop" })]);
+      useHostModelOptionsMock.mockImplementation(
+        (hostId) =>
+          ({
+            data: hostId === "host_2" ? CURSOR_MODELS.slice(0, 1) : CURSOR_MODELS,
+            isLoading: false,
+            error: null,
+          }) as unknown as ReturnType<typeof useHostModelOptions>,
+      );
+      renderDialog(CURSOR_SOURCE);
+      openAgentSelect();
+      fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_cursor_native"));
+      fireEvent.click(screen.getByTestId("fork-session-config-model"));
+      fireEvent.click(screen.getByRole("option", { name: "Grok 4.7" }));
+      expect(screen.getByTestId("fork-session-config-model")).toHaveTextContent("Grok 4.7");
+
+      // host_2's Cursor catalog has no grok-4.7, so the pick falls back to an
+      // explicit Default: neither the stale id nor the source model rides the fork.
+      const hostTrigger = screen.getByTestId("fork-session-host-select");
+      fireEvent.pointerDown(
+        hostTrigger,
+        new MouseEvent("pointerdown", { bubbles: true, button: 0 }),
+      );
+      fireEvent.click(hostTrigger);
+      fireEvent.click(screen.getByTestId("fork-session-host-option-host_2"));
+      await waitFor(() =>
+        expect(screen.getByTestId("fork-session-config-model")).toHaveTextContent("Default (Auto)"),
+      );
+
+      // A different host needs a directory before the fork can start.
+      const input = await screen.findByTestId("workspace-path-input");
+      fireEvent.change(input, { target: { value: "~/git/omnigent" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      fireEvent.click(screen.getByTestId("mock-pick-workspace"));
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock).toHaveBeenCalledWith(
+        "conv_src",
+        expect.objectContaining({
+          agentId: "ag_cursor_native",
+          config: { modelOverride: "default" },
+        }),
+      );
+    });
+  });
+
   it("labels the keep-current option with the source agent's name, not generic text", () => {
     // The source is bound to the claude-sdk built-in ("Claude"). The
     // keep-current option reads "<agent> (same as original session)" so the
