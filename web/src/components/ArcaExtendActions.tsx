@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { offersWorkweek } from "@/lib/arcaShutdownWarning";
+import { offersWorkweek, persistDismissalToday } from "@/lib/arcaShutdownWarning";
 import {
   extendArca,
   getDesktopFeatures,
@@ -39,19 +39,23 @@ export function ArcaExtendActions({
   const [error, setError] = useState<{ message: string; mode: ArcaExtendMode } | null>(null);
   const [confirmation, setConfirmation] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mounted = useRef(true);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
       if (timer.current) clearTimeout(timer.current);
-    },
-    [],
-  );
+    };
+  }, []);
 
   const run = async (mode: ArcaExtendMode) => {
     if (pending) return;
     setPending(mode);
     setError(null);
     const result = await extendArca(mode);
+    if (result.ok) persistDismissalToday(new Date());
+    if (!mounted.current) return;
     setPending(null);
     if (!result.ok) {
       setError({ message: result.error, mode });
@@ -90,8 +94,8 @@ export function ArcaExtendActions({
         )}
       </div>
       {error && (
-        <div className="mt-1 text-destructive" role="alert">
-          <p>{error.message}</p>
+        <div className="mt-1" role="alert">
+          <p className="text-destructive">{error.message}</p>
           <p>Run the command on your laptop instead:</p>
           {fallback(error.mode)}
         </div>

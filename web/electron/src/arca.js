@@ -39,7 +39,7 @@ const STATUS_TIMEOUT_MS = 60_000;
 const EXTEND_TIMEOUT_MS = 120_000;
 const ARCA_EXTEND_MODES = Object.freeze(["overnight", "workweek"]);
 const ARCA_AUTH_RE = /arca (auth )?login|certificate.*expired|permission denied \(publickey/i;
-const MAX_CLI_STDOUT_BYTES = 256 * 1024;
+const MAX_CLI_OUTPUT_BYTES = 256 * 1024;
 
 /**
  * The only characters allowed in the server URL that rides inside the ssh
@@ -254,7 +254,7 @@ function describeConnectFailure(run) {
   }
   // This machine's arca credentials are missing or expired, so ssh never
   // reached the instance.
-  if (/arca (auth )?login|certificate.*expired|permission denied \(publickey/i.test(output)) {
+  if (ARCA_AUTH_RE.test(output)) {
     return {
       ok: false,
       errorKind: "arca-auth",
@@ -302,6 +302,15 @@ function lastLine(text) {
  * @returns {{ state: string | null, hasInstance: boolean, shutdownAt: number | null, rawShutdownTime: string | null } | null}
  */
 function parseArcaStatus(stdout) {
+  const isStatus = (value) => {
+    const hasInstance =
+      Object.hasOwn(value, "instance") &&
+      (value.instance === null ||
+        (typeof value.instance === "object" && !Array.isArray(value.instance)));
+    return (
+      typeof value.status === "string" && (hasInstance || Object.hasOwn(value, "shutdown_time"))
+    );
+  };
   const parseObject = (text) => {
     try {
       const value = JSON.parse(text);
@@ -311,6 +320,7 @@ function parseArcaStatus(stdout) {
     }
   };
   let status = parseObject(stdout.trim());
+  if (status && !isStatus(status)) status = null;
   if (!status) {
     let start = -1;
     let depth = 0;
@@ -335,17 +345,8 @@ function parseArcaStatus(stdout) {
         depth++;
       } else if (char === "}" && --depth === 0) {
         const candidate = parseObject(stdout.slice(start, i + 1));
-        const hasInstance =
-          candidate &&
-          Object.hasOwn(candidate, "instance") &&
-          (candidate.instance === null ||
-            (typeof candidate.instance === "object" && !Array.isArray(candidate.instance)));
-        if (
-          candidate &&
-          typeof candidate.status === "string" &&
-          (hasInstance || Object.hasOwn(candidate, "shutdown_time"))
-        ) {
-          if (hasInstance) {
+        if (candidate && isStatus(candidate)) {
+          if (Object.hasOwn(candidate, "instance")) {
             status = candidate;
             break;
           }
@@ -379,14 +380,17 @@ function parseArcaStatus(stdout) {
  * Run a headless Arca command and capture both output streams.
  * @param {string} arcaPath
  * @param {string[]} args
- * @param {{ spawn?: typeof spawn, timeoutMs: number, maxStdoutBytes?: number }} options
+ * @param {{ spawn?: typeof spawn, timeoutMs: number, killGraceMs?: number, maxOutputBytes?: number }} options
  * @returns {Promise<{ code: number | null, stdout: string, stderr: string, timedOut?: boolean, spawnError?: Error }>}
  */
 function runArca(arcaPath, args, options) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = (options.spawn || spawn)(arcaPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+      child = (options.spawn || spawn)(arcaPath, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
+      });
     } catch (error) {
       resolve({ code: null, stdout: "", stderr: "", spawnError: error });
       return;
@@ -401,17 +405,31 @@ function runArca(arcaPath, args, options) {
     let exited = false;
     let exitCode = null;
     let exitGraceTimer;
+    let killTimer;
+    let timedOut = false;
+    const killTree = (signal) => {
+      try {
+        if (typeof child.pid === "number") process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch {
+        try {
+          child.kill(signal);
+        } catch {
+          // Already gone.
+        }
+      }
+    };
     const onStdout = (chunk) => {
-      if (stdoutBytes >= (options.maxStdoutBytes ?? Infinity)) return;
+      if (stdoutBytes >= (options.maxOutputBytes ?? Infinity)) return;
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-      const retained = bytes.subarray(0, (options.maxStdoutBytes ?? Infinity) - stdoutBytes);
+      const retained = bytes.subarray(0, (options.maxOutputBytes ?? Infinity) - stdoutBytes);
       stdout += stdoutDecoder.write(retained);
       stdoutBytes += retained.length;
     };
     const onStderr = (chunk) => {
-      if (stderrBytes >= (options.maxStdoutBytes ?? Infinity)) return;
+      if (stderrBytes >= (options.maxOutputBytes ?? Infinity)) return;
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-      const retained = bytes.subarray(0, (options.maxStdoutBytes ?? Infinity) - stderrBytes);
+      const retained = bytes.subarray(0, (options.maxOutputBytes ?? Infinity) - stderrBytes);
       stderr += stderrDecoder.write(retained);
       stderrBytes += retained.length;
     };
@@ -420,6 +438,7 @@ function runArca(arcaPath, args, options) {
       settled = true;
       clearTimeout(timer);
       clearTimeout(exitGraceTimer);
+      clearTimeout(killTimer);
       stdout += stdoutDecoder.end();
       stderr += stderrDecoder.end();
       if (!fromClose) {
@@ -435,21 +454,20 @@ function runArca(arcaPath, args, options) {
           }
         }
       }
-      resolve({ code: result.code, stdout, stderr, ...result });
+      resolve({ code: result.code, stdout, stderr, timedOut, ...result });
     };
     const timer = setTimeout(() => {
       if (exited) {
         settle({ code: exitCode });
         return;
       }
-      try {
-        child.kill();
-      } catch {
-        // Already gone.
-      }
-      settle({ code: null, timedOut: true });
+      timedOut = true;
+      killTree("SIGTERM");
+      killTimer = setTimeout(() => {
+        killTree("SIGKILL");
+        settle({ code: null, timedOut: true });
+      }, options.killGraceMs ?? 5000);
     }, options.timeoutMs);
-    if (typeof timer.unref === "function") timer.unref();
     child.stdout?.on("data", onStdout);
     child.stderr?.on("data", onStderr);
     child.on("error", (error) => settle({ code: null, spawnError: error }));
@@ -458,7 +476,6 @@ function runArca(arcaPath, args, options) {
       exited = true;
       exitCode = code;
       exitGraceTimer = setTimeout(() => settle({ code }), 500);
-      if (typeof exitGraceTimer.unref === "function") exitGraceTimer.unref();
     });
     child.on("close", (code) => settle({ code: exited ? exitCode : code }, true));
   });
@@ -530,12 +547,12 @@ function describeArcaCliFailure(run, action) {
 
 /**
  * Read this machine's Arca instance state and shutdown time.
- * @param {{ resolveArcaPath?: () => string | null, spawn?: typeof spawn, timeoutMs?: number }} [deps]
+ * @param {{ resolveArcaPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number }} [deps]
  * @returns {Promise<{ ok: true, state: string | null, hasInstance: boolean, shutdownAt: number | null, rawShutdownTime: string | null } | { ok: false, errorKind: ArcaErrorKind, error: string }>}
  */
 async function readArcaStatus(deps = {}) {
   try {
-    const arcaPath = (deps.resolveArcaPath || resolveArcaPath)();
+    const arcaPath = await (deps.resolveArcaPath || resolveArcaPathAsync)();
     if (!arcaPath)
       return {
         ok: false,
@@ -545,7 +562,8 @@ async function readArcaStatus(deps = {}) {
     const run = await runArca(arcaPath, ["status", "--json"], {
       spawn: deps.spawn,
       timeoutMs: deps.timeoutMs ?? STATUS_TIMEOUT_MS,
-      maxStdoutBytes: MAX_CLI_STDOUT_BYTES,
+      killGraceMs: deps.killGraceMs,
+      maxOutputBytes: MAX_CLI_OUTPUT_BYTES,
     });
     if (run.spawnError)
       return {
@@ -571,14 +589,14 @@ async function readArcaStatus(deps = {}) {
 /**
  * Extend this machine's Arca instance using an approved mode.
  * @param {string} mode
- * @param {{ resolveArcaPath?: () => string | null, spawn?: typeof spawn, timeoutMs?: number }} [deps]
+ * @param {{ resolveArcaPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number }} [deps]
  * @returns {Promise<{ ok: true, shutdownAt: number | null } | { ok: false, errorKind: ArcaErrorKind, error: string }>}
  */
 async function runArcaExtend(mode, deps = {}) {
   if (!ARCA_EXTEND_MODES.includes(mode))
     return { ok: false, errorKind: "unknown", error: "Unsupported arca extend mode." };
   try {
-    const arcaPath = (deps.resolveArcaPath || resolveArcaPath)();
+    const arcaPath = await (deps.resolveArcaPath || resolveArcaPathAsync)();
     if (!arcaPath)
       return {
         ok: false,
@@ -597,7 +615,8 @@ async function runArcaExtend(mode, deps = {}) {
     const run = await runArca(arcaPath, ["extend", mode], {
       spawn: deps.spawn,
       timeoutMs: deps.timeoutMs ?? EXTEND_TIMEOUT_MS,
-      maxStdoutBytes: MAX_CLI_STDOUT_BYTES,
+      killGraceMs: deps.killGraceMs,
+      maxOutputBytes: MAX_CLI_OUTPUT_BYTES,
     });
     if (run.spawnError)
       return {
@@ -607,6 +626,7 @@ async function runArcaExtend(mode, deps = {}) {
       };
     if (run.code !== 0 || run.timedOut) return describeArcaCliFailure(run, "extend");
     const updated = await readArcaStatus({ ...deps, resolveArcaPath: () => arcaPath });
+    if (!updated.ok) console.warn("[arca] status verification after extend failed:", updated.error);
     return { ok: true, shutdownAt: updated.ok ? updated.shutdownAt : null };
   } catch (error) {
     return { ok: false, errorKind: "unknown", error: `Couldn't run arca: ${error.message}` };

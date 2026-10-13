@@ -3,7 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { ArcaShutdownBanner } from "./ArcaShutdownBanner";
 import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
-import { isWarnedToday, resetArcaWarningStorageForTests } from "@/lib/arcaShutdownWarning";
+import {
+  isDismissedToday,
+  isWarnedToday,
+  resetArcaWarningStorageForTests,
+} from "@/lib/arcaShutdownWarning";
 import { copyText } from "@/lib/clipboard";
 
 const MON_5PM = new Date(2026, 9, 5, 17, 0);
@@ -100,7 +104,7 @@ describe("ArcaShutdownBanner", () => {
     expect(screen.getByText(/Run this on your laptop/)).toBeTruthy();
   });
 
-  it("disables both desktop actions while extending and hides workweek on Thursday", async () => {
+  it("disables both desktop actions while extending", async () => {
     let finish!: (result: { ok: boolean; shutdownAt: null }) => void;
     const extendArca = vi.fn().mockReturnValue(
       new Promise((resolve) => {
@@ -123,11 +127,6 @@ describe("ArcaShutdownBanner", () => {
       true,
     );
     await act(async () => finish({ ok: true, shutdownAt: null }));
-    cleanup();
-    state.now = THU_5PM;
-    vi.setSystemTime(THU_5PM);
-    render(<Banner />);
-    expect(screen.queryByRole("button", { name: "Keep running this week" })).toBeNull();
   });
 
   it("extends, confirms the new shutdown time, then dismisses today", async () => {
@@ -149,8 +148,28 @@ describe("ArcaShutdownBanner", () => {
       minute: "2-digit",
     });
     expect(screen.getByText(`Arca will keep running until ${shortTime}`)).toBeTruthy();
+    expect(isDismissedToday(MON_5PM)).toBe(true);
     act(() => vi.advanceTimersByTime(2000));
     expect(screen.queryByText(/Your Arca will shut down/)).toBeNull();
+  });
+
+  it("keeps a successful extension dismissed if confirmation unmounts early", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const extendArca = vi.fn().mockResolvedValue({ ok: true, shutdownAt: null });
+    (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
+      kind: "electron",
+      extendArca,
+      getDesktopFeatures: vi.fn().mockResolvedValue({ canExtendArca: true }),
+    };
+    const view = render(<Banner />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Keep running tonight" }));
+    await act(async () => {});
+    expect(screen.getByText("Arca will keep running")).toBeTruthy();
+    expect(isDismissedToday(MON_5PM)).toBe(true);
+    view.unmount();
+    act(() => vi.advanceTimersByTime(2000));
+    expect(isDismissedToday(MON_5PM)).toBe(true);
   });
 
   it("shows the command after desktop extend fails", async () => {

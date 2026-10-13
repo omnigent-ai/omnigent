@@ -445,7 +445,7 @@ function loadNavigationHarness({
       resolveArcaPathAsync: async () => arcaPath,
       runArcaExtend: async (mode) => {
         calls.arcaExtends.push(mode);
-        return arcaExtendResult;
+        return typeof arcaExtendResult === "function" ? arcaExtendResult(mode) : arcaExtendResult;
       },
       isExecutableFile: (p) => p === arcaPath,
       startArcaConnect: (url) => {
@@ -669,6 +669,29 @@ function loadNavigationHarness({
 }
 
 describe("Arca extend IPC", () => {
+  it("rejects a second extension until the first finishes", async (t) => {
+    let finish;
+    const pending = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const serverUrl = "https://workspace.cloud.databricks.com/omnigent";
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaExtendResult: () => pending,
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const extend = h.ipc.get("omnigent:arca-extend");
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    const first = extend(event, "overnight");
+    assert.match((await extend(event, "workweek")).error, /already in progress/);
+    assert.deepEqual(h.calls.arcaExtends, ["overnight"]);
+    finish({ ok: true, shutdownAt: null });
+    assert.equal((await first).ok, true);
+    assert.equal((await extend(event, "workweek")).ok, true);
+    assert.deepEqual(h.calls.arcaExtends, ["overnight", "workweek"]);
+  });
   it("accepts only the connected page's pinned origin and managed server", async (t) => {
     const serverUrl = "https://workspace.cloud.databricks.com/omnigent";
     const h = loadNavigationHarness({ serverUrl, internalFeatures: true });

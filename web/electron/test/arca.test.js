@@ -22,8 +22,10 @@ function fakeConnectChild() {
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.killed = false;
-  child.kill = () => {
+  child.signals = [];
+  child.kill = (signal) => {
     child.killed = true;
+    child.signals.push(signal);
   };
   return child;
 }
@@ -53,6 +55,11 @@ describe("arca extend command", () => {
     const notices = Array.from({ length: 24 }, (_, index) => `notice {${index}}`).join("\n");
     const deps = commandDeps([{ stdout: `${notices}\n${running}` }]);
     assert.equal((await readArcaStatus(deps)).state, "running");
+  });
+  it("rejects a JSON error object even when status exits zero", async () => {
+    const result = await readArcaStatus(commandDeps([{ stdout: '{"error":"failed"}' }]));
+    assert.equal(result.ok, false);
+    assert.match(result.error, /Unexpected arca status output/);
   });
   it("checks a running instance first and reports the updated shutdown time", async () => {
     const updated = '{"status":"running","instance":{"shutdown_time":"2026-10-07T01:00:00Z"}}';
@@ -87,13 +94,19 @@ describe("arca extend command", () => {
 
   it("times out a stuck status check", async () => {
     const child = fakeConnectChild();
-    const result = await readArcaStatus({
-      resolveArcaPath: () => "/bin/arca",
-      spawn: () => child,
-      timeoutMs: 5,
-    });
-    assert.equal(result.errorKind, "timeout");
-    assert.equal(child.killed, true);
+    const keepAlive = setTimeout(() => {}, 1000);
+    try {
+      const result = await readArcaStatus({
+        resolveArcaPath: () => "/bin/arca",
+        spawn: () => child,
+        timeoutMs: 5,
+        killGraceMs: 5,
+      });
+      assert.equal(result.errorKind, "timeout");
+      assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+    } finally {
+      clearTimeout(keepAlive);
+    }
   });
 
   it("times out a stuck extend after the status precheck", async () => {
@@ -101,9 +114,33 @@ describe("arca extend command", () => {
     const deps = commandDeps([{ stdout: running }]);
     const firstSpawn = deps.spawn;
     deps.spawn = (path, args) => (args[0] === "extend" ? child : firstSpawn(path, args));
-    const result = await runArcaExtend("overnight", { ...deps, timeoutMs: 5 });
-    assert.equal(result.errorKind, "timeout");
-    assert.equal(child.killed, true);
+    const keepAlive = setTimeout(() => {}, 1000);
+    try {
+      const result = await runArcaExtend("overnight", { ...deps, timeoutMs: 5, killGraceMs: 5 });
+      assert.equal(result.errorKind, "timeout");
+      assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+    } finally {
+      clearTimeout(keepAlive);
+    }
+  });
+
+  it("classifies failed extend commands", async () => {
+    await Promise.all(
+      [
+        ["No running Arca instance", "no-instance"],
+        ["Runtime limit reached", "runtime-limit"],
+        ["certificate expired; run arca login", "arca-auth"],
+        ["unexpected failure", "unknown"],
+      ].map(async ([stderr, errorKind]) => {
+        const deps = commandDeps([{ stdout: running }, { code: 1, stderr }]);
+        const result = await runArcaExtend("overnight", deps);
+        assert.equal(result.errorKind, errorKind);
+        assert.deepEqual(deps.calls, [
+          ["status", "--json"],
+          ["extend", "overnight"],
+        ]);
+      }),
+    );
   });
 });
 

@@ -57,10 +57,14 @@ export function isDismissedToday(now: Date): boolean {
 }
 
 export function dismissToday(now: Date): void {
-  write(DISMISSED_KEY, dateKey(now));
+  persistDismissalToday(now);
   if (typeof window !== "undefined") {
     window.dispatchEvent(new Event(ARCA_WARNING_PREFERENCES_CHANGED));
   }
+}
+
+export function persistDismissalToday(now: Date): void {
+  write(DISMISSED_KEY, dateKey(now));
 }
 
 export function isWarnedToday(now: Date): boolean {

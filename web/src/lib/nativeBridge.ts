@@ -1029,7 +1029,11 @@ export async function extendArca(mode: ArcaExtendMode): Promise<ArcaExtendResult
   try {
     return await bridge(mode);
   } catch (error) {
-    return { ok: false, error: String(error) };
+    console.warn("[nativeBridge] electron extendArca failed:", error);
+    return {
+      ok: false,
+      error: "Could not extend Arca from this app.",
+    };
   }
 }
 

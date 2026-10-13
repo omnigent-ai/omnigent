@@ -4716,6 +4716,7 @@ function registerIpc() {
     return arcaConnectFlow.run(win, arcaServerUrl);
   });
 
+  let arcaExtendInFlight = false;
   ipcMain.handle("omnigent:arca-extend", async (event, mode) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("arca-extend is only available to a connected server page");
@@ -4726,7 +4727,13 @@ function registerIpc() {
     if (!arca.ARCA_EXTEND_MODES.includes(mode)) {
       return { ok: false, error: "Unsupported arca extend mode." };
     }
-    return arca.runArcaExtend(mode);
+    if (arcaExtendInFlight) return { ok: false, error: "Arca extension is already in progress." };
+    arcaExtendInFlight = true;
+    try {
+      return await arca.runArcaExtend(mode);
+    } finally {
+      arcaExtendInFlight = false;
+    }
   });
 
   // Push a status ping when a host child connects or exits on its own (no

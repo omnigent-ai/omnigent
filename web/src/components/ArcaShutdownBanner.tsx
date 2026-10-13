@@ -81,15 +81,14 @@ export function ArcaShutdownBanner({
             Your Arca will shut down at about 6 PM unless you keep it running.
           </p>
           <div className="mt-1.5 flex flex-wrap gap-2">
-            {desktopExtend ? (
+            {desktopExtend && (
               <ArcaExtendActions
                 day={warning.day}
                 onSuccess={warning.dismissToday}
                 fallback={() => copyCommands}
               />
-            ) : desktopExtend === false ? (
-              copyCommands
-            ) : null}
+            )}
+            {desktopExtend === false && copyCommands}
           </div>
           {desktopExtend === false && (
             <p className="mt-1.5 text-muted-foreground">
