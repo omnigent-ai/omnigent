@@ -449,13 +449,15 @@ _TELEMETRY_OPTOUTS = [
 
 
 @pytest.mark.parametrize(("name", "value"), _TELEMETRY_OPTOUTS)
-def test_local_daemon_preserves_usage_telemetry_opt_out_for_server(
+@pytest.mark.parametrize("via_daemon", [True, False], ids=["daemon", "direct-server"])
+def test_local_server_preserves_usage_telemetry_opt_out(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     name: str,
     value: str,
+    via_daemon: bool,
 ) -> None:
-    """The local server reads the original CI marker or opt-out at startup."""
+    """Daemon-backed and direct server launches preserve startup suppression."""
     import omnigent.telemetry.client as telemetry
     from omnigent.host import local_server
 
@@ -468,14 +470,15 @@ def test_local_daemon_preserves_usage_telemetry_opt_out_for_server(
         "UNRELATED_SECRET": "private-value",
     }
     with patch.dict(os.environ, source, clear=True):
-        daemon_env = _build_host_daemon_env(server_url=None)
-    assert daemon_env[name] == value
-    assert "UNRELATED_SECRET" not in daemon_env
+        server_parent_env = _build_host_daemon_env(server_url=None) if via_daemon else source
+    assert server_parent_env[name] == value
+    if via_daemon:
+        assert "UNRELATED_SECRET" not in server_parent_env
     if name != "OMNIGENT_DISABLE_TELEMETRY":
-        assert "OMNIGENT_DISABLE_TELEMETRY" not in daemon_env
+        assert "OMNIGENT_DISABLE_TELEMETRY" not in server_parent_env
 
     with (
-        patch.dict(os.environ, daemon_env, clear=True),
+        patch.dict(os.environ, server_parent_env, clear=True),
         patch.object(local_server.subprocess, "Popen") as popen,
     ):
         local_server._spawn_local_server(8765, "")
