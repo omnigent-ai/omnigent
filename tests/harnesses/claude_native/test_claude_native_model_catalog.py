@@ -792,6 +792,15 @@ def _unreachable(request: httpx.Request) -> httpx.Response:
     raise httpx.ConnectError("connection refused", request=request)
 
 
+def _answers(**response: Any) -> Callable[[httpx.Request], httpx.Response]:
+    """A 200 with an arbitrary body, for listings that do not parse as a model list."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, **response)
+
+    return respond
+
+
 @pytest.mark.parametrize(
     ("respond", "url", "env", "kept", "asked"),
     [
@@ -817,6 +826,20 @@ def _unreachable(request: httpx.Request) -> httpx.Response:
         pytest.param(_unreachable, _LITELLM_URL, None, True, True, id="unreachable"),
         pytest.param(_rejects(401), _LITELLM_URL, None, True, True, id="rejected-401"),
         pytest.param(_lists(), _LITELLM_URL, None, True, True, id="empty-listing"),
+        pytest.param(
+            _answers(content=b"not json"), _LITELLM_URL, None, True, True, id="invalid-json"
+        ),
+        pytest.param(
+            _answers(json=["claude-*"]), _LITELLM_URL, None, True, True, id="non-object-json"
+        ),
+        pytest.param(
+            _answers(json={"data": {"id": "claude-*"}}),
+            _LITELLM_URL,
+            None,
+            True,
+            True,
+            id="data-not-a-list",
+        ),
         pytest.param(_lists("claude-*"), _LITELLM_URL, {}, True, False, id="no-credential"),
         pytest.param(
             _lists("claude-*"), f"{_LITELLM_URL}:bad", None, True, False, id="malformed-base-url"

@@ -89,6 +89,7 @@ def _isolate_ambient_anthropic_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "ANTHROPIC_CUSTOM_HEADERS",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
 
 
 def _test_bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:

@@ -205,13 +205,23 @@ def _cli_picker(env: dict[str, str], home: Path) -> tuple[list[dict[str, str]], 
         except ValueError:
             continue
         if event.get("type") == "control_response":
-            for model in (event.get("response") or {}).get("response", {}).get("models") or []:
+            models = (event.get("response") or {}).get("response", {}).get("models") or []
+            # Like the harness, an enabled alias resolving to a disabled model is withheld.
+            disabled = {
+                value
+                for model in models
+                if model.get("disabled") is True
+                for value in (model.get("value"), model.get("resolvedModel"))
+                if value
+            }
+            for model in models:
                 alias, resolved = model.get("value"), model.get("resolvedModel")
                 model_id = resolved or alias
                 if (
                     not model_id
                     or alias == "default"
                     or model.get("disabled") is True
+                    or model_id in disabled
                     or model_id in seen
                 ):
                     continue
