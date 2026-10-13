@@ -559,7 +559,7 @@ async def test_shared_helper_bounds_wait_during_slow_finalize(
             client.head(BASE + "/" + second.json()["upload_id"] + "?created_by=alice"), 0.5
         )
         assert response.status_code == 429
-        assert response.headers["Retry-After"] == "60"
+        assert 1 <= int(response.headers["Retry-After"]) <= 5
     finally:
         release.set()
         completed = await task
@@ -712,7 +712,7 @@ async def test_begin_queue_timeout_releases_admission(
     finally:
         helper._lock.release()
     assert response.status_code == 429
-    assert response.headers["Retry-After"] == "60"
+    assert 1 <= int(response.headers["Retry-After"]) <= 5
     assert response.json()["error"]["code"] == "busy"
     assert not manager.records
     assert not manager.upload_locks
@@ -898,7 +898,7 @@ async def test_helper_cache_capacity(
             await manager._helper("three", DEFAULT_ENVIRONMENT_ID)
         assert exc.value.status == 429
         assert exc.value.code == "busy"
-        assert exc.value.response().headers["Retry-After"] == "60"
+        assert 1 <= int(exc.value.response().headers["Retry-After"]) <= 5
     await manager._helper("three", DEFAULT_ENVIRONMENT_ID)
 
 
@@ -1086,7 +1086,7 @@ async def test_all_pinned_helper_capacity_returns_429(
         await manager._helper("other", DEFAULT_ENVIRONMENT_ID)
     assert exc.value.status == 429
     assert exc.value.code == "busy"
-    assert exc.value.response().headers["Retry-After"] == "60"
+    assert 1 <= int(exc.value.response().headers["Retry-After"]) <= 5
     assert not helper._closed
     url = BASE + "/" + response.json()["upload_id"] + "?created_by=alice"
     assert (await client.patch(url, headers=HEADERS, content=b"a")).status_code == 204
@@ -1685,3 +1685,124 @@ async def test_publication_never_precedes_durable_plan(
     assert staging.exists()
     assert not (staging.parent / "payload.bin").exists()
     assert (await client.post(BASE + "/" + uid + "/complete?created_by=alice")).status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage",
+    ["post_begin", "begin_failure_drop", "abort", "plan", "complete", "recovery", "expiry"],
+)
+@pytest.mark.parametrize(
+    "error_number,status,code", [(errno.ENOSPC, 507, "no_space"), (errno.EIO, 500, "io_error")]
+)
+async def test_non_initial_index_error_hides_host_path(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stage: str,
+    error_number: int,
+    status: int,
+    code: str,
+) -> None:
+    import omnigent.runner.workspace_upload as upload
+
+    manager = client._transport.app.state.workspace_uploads
+    if stage != "post_begin":
+        created = await create(client, size=0)
+        assert created.status_code == 201
+        uid = created.json()["upload_id"]
+        url = BASE + "/" + uid + "?created_by=alice"
+        complete_url = BASE + "/" + uid + "/complete?created_by=alice"
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    original_call, original_save = helper.call, manager._save
+    saves = 0
+    fail_at = 2 if stage in ("post_begin", "begin_failure_drop", "complete", "recovery") else 1
+    published = False
+
+    def call(metadata, raw=b"", **kwargs):
+        nonlocal published
+        if stage == "begin_failure_drop" and metadata["op"] == "begin":
+            return {"code": "invalid_request", "error": "Begin refused"}
+        result = original_call(metadata, raw, **kwargs)
+        if metadata["op"] == "complete":
+            published = True
+            if stage == "recovery":
+                helper.close()
+                return {"code": "gone", "error": "Lost finalize response"}
+        return result
+
+    def fail_save():
+        nonlocal saves
+        saves += 1
+        if saves == fail_at:
+            raise OSError(error_number, "x", "/secret/path")
+        original_save()
+
+    with monkeypatch.context() as fault:
+        fault.setattr(helper, "call", call)
+        fault.setattr(manager, "_save", fail_save)
+        if stage in ("post_begin", "begin_failure_drop"):
+            response = await create(client, name="new")
+        elif stage == "abort":
+            response = await client.delete(url)
+        elif stage == "expiry":
+            manager.records[uid].last_activity = upload._now() - manager.limits.idle_ttl_s - 1
+            response = await client.post(complete_url)
+        else:
+            response = await client.post(complete_url)
+    assert saves == fail_at
+    assert response.status_code == status
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["message"] == (
+        "Insufficient storage" if code == "no_space" else "Upload I/O failed"
+    )
+    assert "/secret/path" not in response.text
+    assert "/secret/path" in caplog.text
+    assert published == (stage in ("complete", "recovery"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_number", [errno.ENOSPC, errno.EIO])
+async def test_cancelled_failing_save_preserves_cancellation(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, error_number: int
+) -> None:
+    import threading
+
+    manager = client._transport.app.state.workspace_uploads
+    await create(client)
+    entered, release = threading.Event(), threading.Event()
+
+    def fail_save():
+        entered.set()
+        assert release.wait(5)
+        raise OSError(error_number, "settled save failed")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(manager, "_save", fail_save)
+        task = asyncio.create_task(manager._persist())
+        assert await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert manager.lock.locked()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert manager.index_dirty
+    assert not manager.lock.locked()
+    await manager._persist()
+    assert not manager.index_dirty
+
+
+def test_retry_after_distinguishes_busy_from_upload_limit() -> None:
+    from omnigent.runner.workspace_upload import RouteError
+
+    for _ in range(20):
+        assert (
+            1
+            <= int(RouteError(429, "busy", "Helper is busy").response().headers["Retry-After"])
+            <= 5
+        )
+    assert (
+        RouteError(429, "upload_limit", "Session limit reached").response().headers["Retry-After"]
+        == "60"
+    )
