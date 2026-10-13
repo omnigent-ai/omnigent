@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import errno
 import hashlib
 import io
@@ -28,6 +29,62 @@ from omnigent.inner.os_env import (
 from omnigent.inner.sandbox import SandboxPolicy
 
 MAX_RENAME_ATTEMPTS = 1000
+CALL_TIMEOUT_S = 30
+COMPLETE_TIMEOUT_FLOOR_S = 120
+COMPLETE_TIMEOUT_PER_GIB_S = 300
+RECEIPT_XATTR = "user.omnigent-upload-receipt"
+
+
+def _set_receipt(fd: int, data: bytes) -> None:
+    if sys.platform != "darwin":
+        os.setxattr(fd, RECEIPT_XATTR, data)
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    setxattr = libc.fsetxattr
+    setxattr.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_int,
+    ]
+    setxattr.restype = ctypes.c_int
+    if setxattr(fd, RECEIPT_XATTR.encode(), data, len(data), 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _get_receipt(fd: int) -> bytes:
+    if sys.platform != "darwin":
+        return os.getxattr(fd, RECEIPT_XATTR)
+    libc = ctypes.CDLL(None, use_errno=True)
+    getxattr = libc.fgetxattr
+    getxattr.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_int,
+    ]
+    getxattr.restype = ctypes.c_ssize_t
+    buffer = ctypes.create_string_buffer(MAX_METADATA_BYTES)
+    length = getxattr(fd, RECEIPT_XATTR.encode(), buffer, len(buffer), 0, 0)
+    if length < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return buffer.raw[:length]
+
+
+def operation_timeout(metadata: dict[str, object]) -> float:
+    if metadata.get("op") in ("complete", "recover"):
+        size = metadata.get("size", 0)
+        return COMPLETE_TIMEOUT_FLOOR_S + COMPLETE_TIMEOUT_PER_GIB_S * (
+            max(0, size) / 1024**3 if isinstance(size, int) else 0
+        )
+    return CALL_TIMEOUT_S
+
 
 MAX_RAW_BYTES = 16 * 1024 * 1024
 MAX_METADATA_BYTES = 64 * 1024
@@ -59,6 +116,10 @@ def upload_support_reason() -> str | None:
         return "Workspace upload requires POSIX filesystem primitives"
     if any(not hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "pwrite", "pread")):
         return "Required upload filesystem primitives are unavailable"
+    if sys.platform != "darwin" and not all(
+        hasattr(os, name) for name in ("setxattr", "getxattr")
+    ):
+        return "Durable publication metadata is unavailable"
     if not {os.open, os.stat, os.unlink, os.link, os.rename} <= os.supports_dir_fd:
         return "Required directory-relative filesystem operations are unavailable"
     return None
@@ -160,25 +221,34 @@ class UploadHelperClient(_HelperProcessClient):
                 proc.kill()
 
     def call(
-        self, metadata: dict[str, object], raw: bytes = b"", *, timeout_s: float = 30
+        self, metadata: dict[str, object], raw: bytes = b"", *, timeout_s: float | None = None
     ) -> dict[str, object]:
+        timeout_s = operation_timeout(metadata) if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout_s
         if not self._lock.acquire(timeout=max(0, timeout_s)):
             return {"error": "Upload helper queue timed out", "code": "timeout"}
         try:
             if self._closed:
                 return {"error": "Upload helper closed", "code": "gone"}
-            timed_out = threading.Event()
+            timed_out, done = threading.Event(), threading.Event()
 
-            def expire() -> None:
+            def watch() -> None:
+                if done.wait(max(0, deadline - time.monotonic())):
+                    return
                 timed_out.set()
-                self.interrupt()
+                # Launch can assign the process after the deadline has elapsed.
+                while not done.is_set():
+                    self.interrupt()
+                    done.wait(0.01)
 
-            timer = threading.Timer(max(0, deadline - time.monotonic()), expire)
-            timer.daemon = True
-            timer.start()
+            watchdog = threading.Thread(target=watch, daemon=True)
+            watchdog.start()
             try:
                 self._ensure_started_locked()
+                if timed_out.is_set() or time.monotonic() >= deadline:
+                    self.interrupt()
+                    self._stop_locked()
+                    return {"error": "Upload helper launch timed out", "code": "timeout"}
                 assert self._proc is not None
                 assert self._proc.stdin is not None and self._proc.stdout is not None
                 write_frame(cast(io.TextIOWrapper, self._proc.stdin).buffer, metadata, raw)
@@ -188,7 +258,8 @@ class UploadHelperClient(_HelperProcessClient):
                 self._stop_locked()
                 return {"error": str(exc), "code": "timeout" if timed_out.is_set() else "gone"}
             finally:
-                timer.cancel()
+                done.set()
+                watchdog.join()
 
         finally:
             self._lock.release()
@@ -305,6 +376,8 @@ class UploadEngine:
             return self._recover(uid, m)
         if op == "begin":
             return self._begin(uid, m)
+        if op == "resume":
+            return self._resume(uid, m)
         if op == "cleanup":
             return self._cleanup(uid, m)
         upload = self.uploads.get(uid)
@@ -330,7 +403,7 @@ class UploadEngine:
                 written += count
             return {"offset": offset + written}
         if op == "complete":
-            return self._complete(upload, offset)
+            return self._complete(uid, upload, offset)
         if op == "abort":
             os.unlink(upload.staging, dir_fd=upload.parent_fd)
             os.close(upload.fd)
@@ -376,7 +449,7 @@ class UploadEngine:
                 name = rename_basename(original, n) if n else original
                 self._grant(directory, name, staging_basename(original, uid))
                 try:
-                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
                 except FileNotFoundError:
                     continue
                 try:
@@ -384,11 +457,21 @@ class UploadEngine:
                         continue
                     if not stat.S_ISREG(os.fstat(fd).st_mode):
                         continue
-                    digest = hashlib.sha256()
-                    position = 0
-                    while block := os.pread(fd, 1024 * 1024, position):
-                        digest.update(block)
-                        position += len(block)
+                    receipt = json.loads(_get_receipt(fd))
+                    if receipt["id"] != uid:
+                        raise UploadError(
+                            "invalid_path", "Publication receipt belongs to another upload"
+                        )
+                    result = receipt["result"]
+                    expected_path = f"{directory}/{name}" if directory else name
+                    if (
+                        result["final_name"] != name
+                        or result["path"] != expected_path
+                        or result["outcome"] not in ("created", "replaced", "renamed")
+                        or result["size"] != m["size"]
+                        or not re.fullmatch(r"[0-9a-f]{64}", str(result["sha256"]))
+                    ):
+                        raise UploadError("invalid_path", "Publication receipt changed")
                     os.fchmod(fd, self.mode)
                     staging = staging_basename(original, uid)
                     try:
@@ -400,17 +483,7 @@ class UploadEngine:
                             os.unlink(staging, dir_fd=parent)
                     with contextlib.suppress(OSError):
                         os.fsync(parent)
-                    return {
-                        "path": f"{directory}/{name}" if directory else name,
-                        "final_name": name,
-                        "size": position,
-                        "sha256": digest.hexdigest(),
-                        "outcome": "renamed"
-                        if n
-                        else "replaced"
-                        if m["on_conflict"] == "replace" and m.get("target_existed")
-                        else "created",
-                    }
+                    return result
                 finally:
                     os.close(fd)
             raise UploadError("gone", "No published inode matches this upload")
@@ -470,6 +543,44 @@ class UploadEngine:
             "parent_ino": pino,
         }
 
+    def _resume(self, uid: str, m: dict[str, object]) -> dict[str, object]:
+        if uid in self.uploads:
+            self._check(self.uploads[uid])
+            return {"offset": os.fstat(self.uploads[uid].fd).st_size}
+        directory, name = str(m["dir"]), str(m["name"])
+        if not valid_name(name):
+            raise UploadError("invalid_name", "Invalid basename")
+        staging = staging_basename(name, uid)
+        self._grant(directory, name, staging)
+        parent = _parent(self.cwd, directory)
+        fd = -1
+        try:
+            if _identity(parent) != (m["parent_dev"], m["parent_ino"]):
+                raise UploadError("invalid_path", "Destination directory changed")
+            fd = os.open(staging, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            if not stat.S_ISREG(os.fstat(fd).st_mode) or _identity(fd) != (
+                m["staging_dev"],
+                m["staging_ino"],
+            ):
+                raise UploadError("invalid_path", "Staging file changed")
+            self.uploads[uid] = _Upload(
+                directory,
+                name,
+                staging,
+                fd,
+                parent,
+                _identity(parent),
+                int(str(m["size"])),
+                str(m["on_conflict"]),
+                cast(str | None, m.get("sha256")),
+            )
+            return {"offset": os.fstat(fd).st_size}
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            os.close(parent)
+            raise
+
     @staticmethod
     def _exists(parent: int, name: str) -> bool:
         try:
@@ -480,10 +591,11 @@ class UploadEngine:
             raise UploadError("is_directory", "Destination is a directory")
         return True
 
-    def _complete(self, upload: _Upload, offset: int) -> dict[str, object]:
+    def _complete(self, uid: str, upload: _Upload, offset: int) -> dict[str, object]:
         """Length and SHA256 describe bytes at verification time, before publication.
 
         Other workspace writers can edit this inode during or after publication.
+        Publication requires inode extended attributes for durable response recovery.
         """
         if offset != upload.size:
             raise UploadError("incomplete", "Upload is incomplete")
@@ -499,16 +611,31 @@ class UploadEngine:
         self._check(upload)
         name = upload.name
         existed = self._exists(upload.parent_fd, name)
+
+        def receipt(final_name: str, outcome: str) -> dict[str, object]:
+            result: dict[str, object] = {
+                "path": f"{upload.directory}/{final_name}" if upload.directory else final_name,
+                "size": upload.size,
+                "sha256": checksum,
+                "outcome": outcome,
+                "final_name": final_name,
+            }
+            # This inode carries the publication-time result through a lost response.
+            _set_receipt(upload.fd, json.dumps({"id": uid, "result": result}).encode())
+            os.fsync(upload.fd)
+            return result
+
         if upload.conflict == "replace":
+            result = receipt(name, "replaced" if existed else "created")
             os.replace(
                 upload.staging, name, src_dir_fd=upload.parent_fd, dst_dir_fd=upload.parent_fd
             )
-            outcome = "replaced" if existed else "created"
         else:
             n = 0
             while True:
                 self._grant(upload.directory, name, upload.staging)
                 try:
+                    result = receipt(name, "renamed" if n else "created")
                     os.link(
                         upload.staging,
                         name,
@@ -525,17 +652,10 @@ class UploadEngine:
                     n += 1
                     name = rename_basename(upload.name, n)
             os.unlink(upload.staging, dir_fd=upload.parent_fd)
-            outcome = "renamed" if n else "created"
         os.fchmod(upload.fd, self.mode)
         with contextlib.suppress(OSError):
             os.fsync(upload.parent_fd)
-        upload.result = {
-            "path": f"{upload.directory}/{name}" if upload.directory else name,
-            "size": upload.size,
-            "sha256": checksum,
-            "outcome": outcome,
-            "final_name": name,
-        }
+        upload.result = result
         os.close(upload.fd)
         os.close(upload.parent_fd)
         upload.fd = upload.parent_fd = -1
@@ -559,15 +679,19 @@ class UploadEngine:
                 info = os.stat(staging, dir_fd=parent, follow_symlinks=False)
             except FileNotFoundError:
                 return {"aborted": True}
-            fd = os.open(staging, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            fd = os.open(staging, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             try:
                 if not stat.S_ISREG(info.st_mode) or _identity(fd) != (info.st_dev, info.st_ino):
                     raise UploadError("invalid_path", "Staging file changed")
-                if m.get("pending"):
-                    if info.st_mode & 0o777 != 0o600:
-                        raise UploadError("invalid_path", "Intent staging mode changed")
-                elif _identity(fd) != (m["staging_dev"], m["staging_ino"]):
+                if not m.get("staging_dev") or not m.get("staging_ino"):
+                    raise UploadError(
+                        "unverified_intent", "Leaving staging intent without an inode identity"
+                    )
+                if _identity(fd) != (m["staging_dev"], m["staging_ino"]):
                     raise UploadError("invalid_path", "Staging file changed")
+                current = os.stat(staging, dir_fd=parent, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != _identity(fd):
+                    raise UploadError("invalid_path", "Staging file changed before cleanup")
                 os.unlink(staging, dir_fd=parent)
             finally:
                 os.close(fd)
