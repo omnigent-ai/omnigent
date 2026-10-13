@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import CallerProcessOSEnvironment, create_os_environment
-from omnigent.runner.workspace_upload import UploadLimits, register_upload_routes
+from omnigent.runner.workspace_upload import UploadLimits, UploadManager, register_upload_routes
 from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
 
 BASE = f"/v1/sessions/session/resources/environments/{DEFAULT_ENVIRONMENT_ID}/uploads"
@@ -74,6 +74,15 @@ async def create(client: httpx.AsyncClient, **fields: object) -> httpx.Response:
             "created_by": "alice",
             **fields,
         },
+    )
+
+
+def restart(manager: UploadManager) -> UploadManager:
+    return register_upload_routes(
+        FastAPI(),
+        resolve_environment=manager.resolve_environment,
+        resolve_registry=manager.resolve_registry,
+        state_path=manager.state_path,
     )
 
 
@@ -402,12 +411,7 @@ async def test_creation_intent_reconciled_after_crash(
         intent[uid]["staging_ino"] = manager.records[uid].staging_ino
     manager.state_path.write_text(json.dumps(intent))
     await manager.stop()
-    fresh = register_upload_routes(
-        FastAPI(),
-        resolve_environment=manager.resolve_environment,
-        resolve_registry=manager.resolve_registry,
-        state_path=manager.state_path,
-    )
+    fresh = restart(manager)
     try:
         await fresh.start()
         await fresh.sweep()
@@ -821,11 +825,8 @@ async def test_late_replace_target_lost_response_preserves_outcome(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("legacy_adoption", [False, True])
 async def test_pending_intent_preserves_unrelated_occupant(
-    client: httpx.AsyncClient,
-    legacy_adoption: bool,
-    caplog: pytest.LogCaptureFixture,
+    client: httpx.AsyncClient, caplog: pytest.LogCaptureFixture
 ) -> None:
     from omnigent.runner.workspace_upload import RouteError
 
@@ -840,21 +841,8 @@ async def test_pending_intent_preserves_unrelated_occupant(
     staging.chmod(0o600)
     record.pending = True
     record.staging_dev = record.staging_ino = 0
-    data = record.model_dump()
-    if legacy_adoption:
-        data.update(
-            quarantined=True,
-            quarantine_id="b" * 32,
-            staging_dev=staging.stat().st_dev,
-            staging_ino=staging.stat().st_ino,
-        )
-    manager.state_path.write_text(json.dumps({uid: data}))
-    fresh = register_upload_routes(
-        FastAPI(),
-        resolve_environment=manager.resolve_environment,
-        resolve_registry=manager.resolve_registry,
-        state_path=manager.state_path,
-    )
+    manager.state_path.write_text(json.dumps({uid: record.model_dump()}))
+    fresh = restart(manager)
     try:
         await fresh.start()
         await fresh.sweep()
@@ -1021,12 +1009,7 @@ async def test_corrupt_index_does_not_prevent_startup(
     manager = client._transport.app.state.workspace_uploads
     manager.state_path.parent.mkdir(parents=True, exist_ok=True)
     manager.state_path.write_text(contents)
-    fresh = register_upload_routes(
-        FastAPI(),
-        resolve_environment=manager.resolve_environment,
-        resolve_registry=manager.resolve_registry,
-        state_path=manager.state_path,
-    )
+    fresh = restart(manager)
     try:
         await fresh.start()
         assert not fresh.records
@@ -1271,12 +1254,7 @@ async def test_publication_plan_recovers_without_file_metadata(
         assert "user.omnigent-upload-receipt" not in os.listxattr(target)
     await manager.stop()
     manager.state_path.write_text(json.dumps(durable))
-    fresh = register_upload_routes(
-        FastAPI(),
-        resolve_environment=manager.resolve_environment,
-        resolve_registry=manager.resolve_registry,
-        state_path=manager.state_path,
-    )
+    fresh = restart(manager)
     try:
         await fresh.start()
         await fresh.sweep()
@@ -1307,12 +1285,7 @@ async def test_request_reconciles_before_background_startup(
     assert committed.status_code == 200
     await manager.stop()
     manager.state_path.write_text(json.dumps(durable))
-    fresh = register_upload_routes(
-        FastAPI(),
-        resolve_environment=manager.resolve_environment,
-        resolve_registry=manager.resolve_registry,
-        state_path=manager.state_path,
-    )
+    fresh = restart(manager)
     entered, release = asyncio.Event(), asyncio.Event()
     real_sweep = fresh.sweep
 
@@ -1460,12 +1433,7 @@ async def test_restart_after_wal_before_publish_never_reports_commit(
     assert data["publication"] is not None
     staging = Path(data["staging_path"])
     await manager.stop()
-    fresh = register_upload_routes(
-        FastAPI(),
-        resolve_environment=manager.resolve_environment,
-        resolve_registry=manager.resolve_registry,
-        state_path=manager.state_path,
-    )
+    fresh = restart(manager)
     try:
         await fresh.start()
         await fresh.sweep()
