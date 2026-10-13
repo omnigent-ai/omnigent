@@ -53,7 +53,6 @@ def main() -> int:
     children = set()
     user = "boat-e2e-" + secrets.token_hex(4)
     password = secrets.token_urlsafe(32)
-    cookie_secret = secrets.token_hex(32)
     secret = os.environ["BOAT_API_KEY"]
     root = "/home/user/boat-e2e"
     db = "sqlite:////home/user/boat-e2e/server.db"
@@ -187,7 +186,6 @@ def main() -> int:
             "OMNIGENT_DATA_DIR": root + "/data",
             "OMNIGENT_AUTH_PROVIDER": "accounts",
             "OMNIGENT_ACCOUNTS_ENABLED": "1",
-            "OMNIGENT_ACCOUNTS_COOKIE_SECRET": cookie_secret,
             "OMNIGENT_ACCOUNTS_BASE_URL": base,
             "OMNIGENT_ACCOUNTS_INIT_ADMIN_USERNAME": user,
             "OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD": password,
