@@ -69,7 +69,7 @@ async def test_runner_exit_preserves_original_failure(tmp_path: Path, restart: b
             )
             async with asyncio.timeout(10):
                 while True:
-                    log = log_path.read_text(errors="replace")
+                    log = log_path.read_text(errors="replace") if log_path.exists() else ""
                     decisions = [
                         line
                         for line in log.splitlines()

@@ -2977,6 +2977,54 @@ async def test_offline_sweep_records_startup_failure_for_failed_session_without_
 
 
 @pytest.mark.asyncio
+async def test_offline_sweep_rereads_cause_when_cache_outruns_labels(db_uri: str) -> None:
+    """A cached "failed" edge does not overwrite a cause the sweep snapshot predates.
+
+    The live-status cache can read "failed" before the failure labels persist, so a
+    sweep snapshot captured in that window carries no cause. Taking it at face value
+    would record a startup failure and clobber the real cause; a fresh row re-read
+    keeps it.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-cache-outruns-labels")
+    store.set_session_live_status(conv.id, "failed")
+    # The snapshot is read before the cause labels land: failed, but cause-less.
+    stale = store.get_conversation(conv.id)
+    assert stale is not None
+    assert sessions_module._last_task_error_from_labels(stale.labels) is None
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    store.set_labels(
+        conv.id,
+        {
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+        },
+    )
+    sessions_module._session_status_cache[conv.id] = "failed"
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [stale],
+                ErrorDetail(code="runner_failed_to_start", message="Synthetic runner exit"),
+                store,
+                fail_idle_top_level=True,
+            )
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        assert sessions_module._last_task_error_from_labels(refreshed.labels) == original
+        assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+        decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert decision["attributes"]["decision"] == "already_failed"
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("labels", "fail_idle_top_level", "decision"),
     [

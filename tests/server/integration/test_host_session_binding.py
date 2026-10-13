@@ -2108,6 +2108,7 @@ async def _answer_host_launch(comm: ApplicationCommunicator) -> None:
         await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(reply)})
         if isinstance(reply, HostLaunchRunnerResultFrame):
             return
+    raise AssertionError("host launch was not requested within 40 frames")
 
 
 async def _failed_native_session_on_never_connected_runner(

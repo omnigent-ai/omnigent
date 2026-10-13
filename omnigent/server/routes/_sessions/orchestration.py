@@ -7782,11 +7782,21 @@ async def _runner_disconnect_requires_failure(
         decision = "unknown_no_failure"
     elif fail_idle_top_level and conv is not None and conv.kind != "sub_agent":
         # A failed session that already carries a cause keeps it; one without a
-        # saved cause still records this exit as its startup failure.
+        # saved cause records this exit as its startup failure. The status cache
+        # can read "failed" before labels persist, so confirm against a fresh row.
         has_cause = (
             isinstance(conv, Conversation)
             and _last_task_error_from_labels(conv.labels) is not None
         )
+        if live == "failed" and not has_cause and persisted is None:
+            try:
+                refreshed = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+            except Exception:  # noqa: BLE001 — a failed read cannot prove the cause absent
+                refreshed = None
+            if refreshed is not None:
+                has_cause = _last_task_error_from_labels(refreshed.labels) is not None
         decision = "already_failed" if live == "failed" and has_cause else "failed_before_start"
     else:
         decision = "idle_no_failure"
@@ -12493,9 +12503,8 @@ async def _get_session_snapshot(
     # cause as last_task_error so a reload/late-open still renders the error
     # banner — the live session.status:failed push is gone by then. status
     # reads "failed" from the cache (set by _on_runner_exited), except an idle
-    # session whose runner connected (it lost no work and stays idle) and a
-    # failed session that already carries its own cause, which keeps it. The
-    # report is keyed by the CURRENT runner_id, so a successful relaunch
+    # session whose runner connected: it lost no work and stays
+    # idle. The report is keyed by the CURRENT runner_id, so a successful relaunch
     # (new token-bound runner_id) naturally stops matching. Access is gated
     # by the session-snapshot's own authorization, so the unscoped get is
     # correct here (the report is this session's own runner).
