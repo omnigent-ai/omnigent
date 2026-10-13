@@ -28,7 +28,7 @@ from dev.evals.omnigent_guide.record import INFRA_ERROR, RunRecord
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.live_server import find_free_port
 from tests._helpers.session import bundle_files, post_session_bundle
-from tests.harness_bench.driver import ProvisioningError
+from tests.harness_bench.driver import ProvisioningError, TurnResult, infra_failure_reason
 from tests.harness_bench.full_server import SharedFullServer, spawn_omnigent_server
 from tests.harness_bench.native_tui_driver import NativeTuiDriver
 from tests.harness_bench.profile import resolve_profile
@@ -391,8 +391,11 @@ def ask(
             if status in _BUSY:
                 seen_busy, settled_count = True, -1
             elif status == "failed":
-                record.status = "failed"
-                record.error = str(snapshot.get("last_task_error") or snapshot.get("error"))
+                error = snapshot.get("last_task_error") or snapshot.get("error")
+                # An expired token or a gateway outage says nothing about the agent.
+                infra = infra_failure_reason(TurnResult(failed=True, error=error))
+                record.status = INFRA_ERROR if infra else "failed"
+                record.error = str(error)
                 break
             elif status == "idle":
                 items = _items(client, session_id)
