@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import struct
+import sys
 from collections.abc import Buffer
 from dataclasses import dataclass
 from pathlib import Path
@@ -308,11 +309,11 @@ class UploadEngine:
         except BaseException:
             os.close(parent)
             raise
+        pdev, pino = parent_identity = _identity(parent)
         self.uploads[uid] = _Upload(
-            directory, name, staging, fd, parent, _identity(parent), size, conflict, digest
+            directory, name, staging, fd, parent, parent_identity, size, conflict, digest
         )
         dev, ino = _identity(fd)
-        pdev, pino = _identity(parent)
         return {
             "offset": 0,
             "staging_path": str(self.cwd / directory / staging),
@@ -392,8 +393,7 @@ class UploadEngine:
     def _cleanup(self, uid: str, m: dict[str, object]) -> dict[str, object]:
         if uid in self.uploads:
             result = self._dispatch({"op": "abort", "id": uid}, b"")
-            if uid in self.uploads:
-                del self.uploads[uid]
+            self.uploads.pop(uid, None)
             return result
         directory, name = str(m["dir"]), str(m["name"])
         if not valid_name(name):
@@ -428,8 +428,6 @@ class UploadEngine:
 
 
 def serve_uploads(cwd: Path, sandbox: SandboxPolicy) -> int:
-    import sys
-
     engine = UploadEngine(cwd, sandbox)
     try:
         while True:

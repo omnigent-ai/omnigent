@@ -18,6 +18,8 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import CallerProcessOSEnvironment, create_os_environment
 from omnigent.inner.os_env_upload import UploadHelperClient, read_frame, write_frame
 
+UID = "a" * 32
+
 
 @pytest.fixture
 def helper(tmp_path: Path) -> Iterator[UploadHelperClient]:
@@ -35,7 +37,7 @@ def begin(helper: UploadHelperClient, **kwargs: object) -> dict[str, object]:
     return helper.call(
         {
             "op": "begin",
-            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "id": UID,
             "dir": "",
             "name": "model.3mf",
             "size": 3,
@@ -52,23 +54,19 @@ def test_raw_wire_and_binary_roundtrip(helper: UploadHelperClient, tmp_path: Pat
     payload = buf.getvalue()
     digest = hashlib.sha256(payload).hexdigest()
     wire = io.BytesIO()
-    write_frame(
-        wire, {"op": "append", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offset": 0}, payload
-    )
+    write_frame(wire, {"op": "append", "id": UID, "offset": 0}, payload)
     assert wire.getvalue().endswith(payload)
     wire.seek(0)
     metadata, raw = read_frame(wire)
     assert metadata["op"] == "append"
     assert raw == payload
     assert "error" not in begin(helper, size=len(payload), sha256=digest)
-    assert helper.call(
-        {"op": "append", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offset": 0}, payload
-    )["offset"] == len(payload)
-    result = helper.call({"op": "complete", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+    assert helper.call({"op": "append", "id": UID, "offset": 0}, payload)["offset"] == len(payload)
+    result = helper.call({"op": "complete", "id": UID})
     assert result["sha256"] == digest
     assert (tmp_path / "model.3mf").read_bytes() == payload
-    assert helper.call({"op": "complete", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}) == result
-    helper.call({"op": "abort", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+    assert helper.call({"op": "complete", "id": UID}) == result
+    helper.call({"op": "abort", "id": UID})
     assert (tmp_path / "model.3mf").read_bytes() == payload
 
 
@@ -81,18 +79,11 @@ def test_exclusive_staging(helper: UploadHelperClient, tmp_path: Path) -> None:
 
 def test_offset_and_overflow(helper: UploadHelperClient, tmp_path: Path) -> None:
     begin(helper)
-    helper.call({"op": "append", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offset": 0}, b"ab")
-    result = helper.call(
-        {"op": "append", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offset": 0}, b"x"
-    )
+    helper.call({"op": "append", "id": UID, "offset": 0}, b"ab")
+    result = helper.call({"op": "append", "id": UID, "offset": 0}, b"x")
     assert result["code"] == "offset_mismatch"
     assert result["offset"] == 2
-    assert (
-        helper.call(
-            {"op": "append", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offset": 2}, b"cd"
-        )["code"]
-        == "too_large"
-    )
+    assert helper.call({"op": "append", "id": UID, "offset": 2}, b"cd")["code"] == "too_large"
     assert (
         tmp_path / "model.3mf.omnigent-upload-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.part"
     ).read_bytes() == b"ab"
@@ -100,13 +91,10 @@ def test_offset_and_overflow(helper: UploadHelperClient, tmp_path: Path) -> None
 
 def test_no_clobber_publish_race(helper: UploadHelperClient, tmp_path: Path) -> None:
     begin(helper)
-    helper.call({"op": "append", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offset": 0}, b"new")
+    helper.call({"op": "append", "id": UID, "offset": 0}, b"new")
     target = tmp_path / "model.3mf"
     target.write_bytes(b"winner")
-    assert (
-        helper.call({"op": "complete", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})["code"]
-        == "file_exists"
-    )
+    assert helper.call({"op": "complete", "id": UID})["code"] == "file_exists"
     assert target.read_bytes() == b"winner"
 
 
@@ -115,7 +103,7 @@ def test_replace_atomic(helper: UploadHelperClient, tmp_path: Path) -> None:
     old, new = b"a" * 500_000, b"b" * 500_000
     target.write_bytes(old)
     begin(helper, size=len(new), on_conflict="replace")
-    helper.call({"op": "append", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offset": 0}, new)
+    helper.call({"op": "append", "id": UID, "offset": 0}, new)
     stop = threading.Event()
     seen: list[bytes] = [target.read_bytes()]
 
@@ -126,7 +114,7 @@ def test_replace_atomic(helper: UploadHelperClient, tmp_path: Path) -> None:
     reader = threading.Thread(target=read)
     reader.start()
     try:
-        result = helper.call({"op": "complete", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+        result = helper.call({"op": "complete", "id": UID})
         seen.append(target.read_bytes())
     finally:
         stop.set()
@@ -141,8 +129,8 @@ def test_rename_and_abort(helper: UploadHelperClient, tmp_path: Path) -> None:
     (tmp_path / "model.3mf").write_bytes(b"old")
     (tmp_path / "model (1).3mf").write_bytes(b"old1")
     begin(helper, on_conflict="rename")
-    helper.call({"op": "append", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offset": 0}, b"new")
-    result = helper.call({"op": "complete", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+    helper.call({"op": "append", "id": UID, "offset": 0}, b"new")
+    result = helper.call({"op": "complete", "id": UID})
     assert result["final_name"] == "model (2).3mf"
     assert result["outcome"] == "renamed"
     assert (tmp_path / "model (2).3mf").read_bytes() == b"new"
@@ -167,12 +155,7 @@ def test_parent_identity_and_owned_staging(helper: UploadHelperClient, tmp_path:
     begin(helper, dir="folder")
     (tmp_path / "folder").rename(tmp_path / "moved")
     (tmp_path / "folder").mkdir()
-    assert (
-        helper.call(
-            {"op": "append", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offset": 0}, b"new"
-        )["code"]
-        == "invalid_path"
-    )
+    assert helper.call({"op": "append", "id": UID, "offset": 0}, b"new")["code"] == "invalid_path"
     assert not list((tmp_path / "folder").iterdir())
 
 
@@ -185,7 +168,7 @@ def test_grants_gate_every_operation(helper: UploadHelperClient, tmp_path: Path,
     tmp_path.mkdir()
     try:
         result = helper.call(
-            {"op": op, "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offset": 0},
+            {"op": op, "id": UID, "offset": 0},
             b"new" if op == "append" else b"",
         )
         assert result["code"] == "invalid_path"
@@ -196,15 +179,9 @@ def test_grants_gate_every_operation(helper: UploadHelperClient, tmp_path: Path,
 
 def test_incomplete_and_digest_mismatch(helper: UploadHelperClient) -> None:
     begin(helper, sha256="0" * 64)
-    assert (
-        helper.call({"op": "complete", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})["code"]
-        == "incomplete"
-    )
-    helper.call({"op": "append", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offset": 0}, b"new")
-    assert (
-        helper.call({"op": "complete", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})["code"]
-        == "checksum_mismatch"
-    )
+    assert helper.call({"op": "complete", "id": UID})["code"] == "incomplete"
+    helper.call({"op": "append", "id": UID, "offset": 0}, b"new")
+    assert helper.call({"op": "complete", "id": UID})["code"] == "checksum_mismatch"
 
 
 def test_directory_conflict(helper: UploadHelperClient, tmp_path: Path) -> None:
@@ -214,7 +191,7 @@ def test_directory_conflict(helper: UploadHelperClient, tmp_path: Path) -> None:
 
 def test_umask(helper: UploadHelperClient, tmp_path: Path) -> None:
     begin(helper, size=0)
-    helper.call({"op": "complete", "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+    helper.call({"op": "complete", "id": UID})
     mask = os.umask(0)
     os.umask(mask)
     assert (tmp_path / "model.3mf").stat().st_mode & 0o777 == 0o666 & ~mask
@@ -228,7 +205,7 @@ def test_staging_identity(helper: UploadHelperClient, tmp_path: Path) -> None:
     staging.write_bytes(b"keep")
     for op in ("append", "complete", "abort"):
         result = helper.call(
-            {"op": op, "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "offset": 0},
+            {"op": op, "id": UID, "offset": 0},
             b"new" if op == "append" else b"",
         )
         assert result["code"] == "invalid_path"

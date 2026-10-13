@@ -260,11 +260,7 @@ class UploadManager:
     ) -> dict[str, object]:
         if not valid_name(declaration.name):
             raise RouteError(400, "invalid_name", "Invalid basename")
-        if (
-            declaration.dir.startswith(("/", "\\"))
-            or "\\" in declaration.dir
-            or "\0" in declaration.dir
-        ):
+        if declaration.dir.startswith("/") or "\\" in declaration.dir or "\0" in declaration.dir:
             raise RouteError(400, "invalid_path", "Destination must be workspace-relative")
         try:
             directory = _validate_path(declaration.dir)
