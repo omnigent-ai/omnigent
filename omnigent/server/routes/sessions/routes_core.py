@@ -160,6 +160,7 @@ from omnigent.server.routes._sessions.helpers import (
     _same_provider_family,
     _session_status_cache,
     _set_read_state,
+    _surface_effort_change_forward_failure,
     _surface_model_change_forward_failure,
     _title_content_from_item,
     _validate_terminal_launch_args,
@@ -2948,6 +2949,12 @@ def register_core_routes(
                     if restore_model
                     else "The terminal did not apply the reasoning effort change. Please try again.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            if not codex_native and _is_native_terminal_session(updated):
+                # The PATCH keeps its 200; a live pane that refused ``/effort``
+                # (e.g. Claude is waiting on a prompt) is reported in the chat.
+                _surface_effort_change_forward_failure(
+                    session_id, updated.reasoning_effort, effort_forward
                 )
         if live_model_change:
             if not combined_model_forward:

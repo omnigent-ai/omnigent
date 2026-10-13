@@ -6746,6 +6746,86 @@ def _publish_error_event(session_id: str, error: ErrorData) -> None:
 
 #: Error code for a model change the terminal never applied.
 _MODEL_CHANGE_NOT_APPLIED_CODE = "model_change_not_applied"
+#: Error code for a reasoning-effort change the terminal never applied.
+_EFFORT_CHANGE_NOT_APPLIED_CODE = "effort_change_not_applied"
+
+
+def _runner_refusal_reason(runner_result: _RunnerForwardResult) -> str:
+    """
+    Describe why the runner did not apply a forwarded settings change.
+
+    The runner's own ``detail`` names the concrete cause and the next step
+    (e.g. answer the pending Claude prompt), so it is preferred over the bare
+    HTTP status when present.
+
+    :param runner_result: Non-2xx HTTP result from the forward.
+    :returns: Reason text without a trailing period, e.g. ``"Claude is waiting
+        for an answer to a question or permission request. Answer it in the
+        terminal, then try again"``.
+    """
+    with contextlib.suppress(ValueError, TypeError):
+        parsed_body = json.loads(runner_result.body)
+        detail = parsed_body.get("detail") if isinstance(parsed_body, dict) else None
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip().rstrip(".")
+    return f"the runner returned status {runner_result.status_code}"
+
+
+def _surface_setting_change_forward_failure(
+    session_id: str,
+    runner_result: _RunnerForwardResult | None,
+    *,
+    setting: str,
+    target: str,
+    code: str,
+    message: str,
+) -> bool:
+    """
+    Publish *message* when a reachable runner refused a native settings change.
+
+    Silent when no runner answered at all (the relaunch reads the persisted
+    value off the row) and when the runner accepted the change.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param runner_result: HTTP result from the forward, or ``None`` when no
+        runner was reachable.
+    :param setting: Log label for the setting, e.g. ``"Model"``.
+    :param target: The persisted value, for the log, e.g. ``"opus"``.
+    :param code: Error code of the notice, e.g.
+        :data:`_MODEL_CHANGE_NOT_APPLIED_CODE`.
+    :param message: Notice text with a ``{reason}`` placeholder for the
+        runner's reason.
+    :returns: ``True`` when the runner rejected the change; ``False`` when it
+        accepted the change or no runner answered.
+    """
+    if runner_result is None:
+        _logger.info(
+            "%s change for session=%s value=%r reached no runner; the launch will read it "
+            "off the row",
+            setting,
+            session_id,
+            target,
+            extra={"session_id": session_id},
+        )
+        return False
+    if 200 <= runner_result.status_code < 300:
+        return False
+    reason = _runner_refusal_reason(runner_result)
+    _logger.warning(
+        "%s change not applied to the terminal for session=%s value=%r: %s (status=%s body=%s)",
+        setting,
+        session_id,
+        target,
+        reason,
+        runner_result.status_code,
+        runner_result.body,
+        extra={"session_id": session_id},
+    )
+    _publish_error_event(
+        session_id,
+        ErrorData(source="execution", code=code, message=message.format(reason=reason)),
+    )
+    return True
 
 
 def _surface_model_change_forward_failure(
@@ -6778,46 +6858,55 @@ def _surface_model_change_forward_failure(
     :returns: ``True`` when the runner rejected the change; ``False`` when it
         accepted the change or no runner answered.
     """
-    if runner_result is None:
-        _logger.info(
-            "Model change for session=%s model=%r reached no runner; the launch will read it "
-            "off the row",
-            session_id,
-            model,
-            extra={"session_id": session_id},
-        )
-        return False
-    if 200 <= runner_result.status_code < 300:
-        return False
-    reason = f"the runner returned status {runner_result.status_code}"
-    # The runner's own detail names the concrete cause (e.g. "a dialog may
-    # be open in the pane"); carry it into the visible notice when present.
-    with contextlib.suppress(ValueError, TypeError):
-        parsed_body = json.loads(runner_result.body)
-        detail = parsed_body.get("detail") if isinstance(parsed_body, dict) else None
-        if isinstance(detail, str) and detail.strip():
-            reason = f"{reason} ({detail.strip()})"
-    _logger.warning(
-        "Model change not applied to the terminal for session=%s model=%r: %s (body=%s)",
-        session_id,
-        model,
-        reason,
-        runner_result.body,
-        extra={"session_id": session_id},
-    )
     target = model or "its default model"
-    _publish_error_event(
+    return _surface_setting_change_forward_failure(
         session_id,
-        ErrorData(
-            source="execution",
-            code=_MODEL_CHANGE_NOT_APPLIED_CODE,
-            message=(
-                f"The terminal was not switched to {target}: {reason}. "
-                "It is still running on its previous model."
-            ),
+        runner_result,
+        setting="Model",
+        target=target,
+        code=_MODEL_CHANGE_NOT_APPLIED_CODE,
+        message=(
+            f"The terminal was not switched to {target}: {{reason}}. "
+            "It is still running on its previous model."
         ),
     )
-    return True
+
+
+def _surface_effort_change_forward_failure(
+    session_id: str,
+    effort: str | None,
+    runner_result: _RunnerForwardResult | None,
+) -> bool:
+    """
+    Publish a visible notice when a native pane never took an effort change.
+
+    The effort counterpart of :func:`_surface_model_change_forward_failure`.
+    The PATCH keeps its 200 and the persisted value (the next launch reads it
+    off the row), but on a native terminal the ``/effort`` injection is the
+    only thing that moves the live pane, so a runner that answered and still
+    refused (e.g. Claude is waiting on a permission prompt) would otherwise
+    leave the picker claiming a level the pane is not on, silently.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param effort: The effort that was persisted, e.g. ``"high"``, or
+        ``None`` when cleared.
+    :param runner_result: HTTP result from the forward, or ``None`` when no
+        runner was reachable.
+    :returns: ``True`` when the runner rejected the change; ``False`` when it
+        accepted the change or no runner answered.
+    """
+    target = effort or "its default effort"
+    return _surface_setting_change_forward_failure(
+        session_id,
+        runner_result,
+        setting="Effort",
+        target=target,
+        code=_EFFORT_CHANGE_NOT_APPLIED_CODE,
+        message=(
+            f"The terminal's reasoning effort was not switched to {target}: {{reason}}. "
+            "It is still running at its previous effort level."
+        ),
+    )
 
 
 async def _persist_native_policy_notice(

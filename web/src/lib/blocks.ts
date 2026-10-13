@@ -525,6 +525,7 @@ const SPECIFIC_ERROR_CODES = new Set([
   "wrong_replica",
   "native_policy_not_enforced",
   "model_change_not_applied",
+  "effort_change_not_applied",
 ]);
 
 /** The server is retrying. */

@@ -193,8 +193,9 @@ def _claude_command_failure(
 
     :param conv_id: Session the command was for, e.g. ``"conv_abc123"``.
     :param exc: The failure from ``inject_slash_command``.
-    :param error: Error code for any other failure, e.g.
-        ``"claude_native_model_failed"``.
+    :param error: Error code naming the failed control, e.g.
+        ``"claude_native_model_failed"``. Refusals keep it too; the reason
+        rides in ``detail``.
     :param context: Operator-facing label for the log, e.g.
         ``"claude-native model change"``.
     :returns: A 503 response whose ``detail`` is safe to show the person.
@@ -205,13 +206,11 @@ def _claude_command_failure(
     )
 
     if isinstance(exc, ClaudeUserPromptPending):
-        error = "claude_native_prompt_pending"
         detail = (
             "Claude is waiting for an answer to a question or permission request. "
             "Answer it in the terminal, then try again."
         )
     elif isinstance(exc, ClaudeTerminalDialog):
-        error = "claude_native_terminal_dialog"
         detail = (
             "A dialog is open in Claude's terminal. Open the terminal, dismiss it, then try again."
         )

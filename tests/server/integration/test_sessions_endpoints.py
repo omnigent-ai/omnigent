@@ -11970,6 +11970,101 @@ async def test_patch_reasoning_effort_swallows_runner_failure(
     )
 
 
+async def test_patch_reasoning_effort_surfaces_a_refused_native_forward(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A LIVE native pane the effort change never reached must say so.
+
+    The PATCH keeps its 200 and the persisted value (the next launch reads it
+    off the row), but ``/effort`` is the only thing that moves a live pane, so
+    a refusal — here Claude waiting on a permission prompt — is reported in the
+    chat with the runner's own next step instead of staying silent.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+
+    async def _runner_refused(*_args: Any, **_kwargs: Any) -> _RunnerForwardResult:
+        """The runner is up and answered that it could not type into the pane."""
+        return _RunnerForwardResult(
+            status_code=503,
+            body=json.dumps(
+                {
+                    "error": "claude_native_effort_failed",
+                    "detail": (
+                        "Claude is waiting for an answer to a question or permission "
+                        "request. Answer it in the terminal, then try again."
+                    ),
+                }
+            ),
+        )
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _runner_refused,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+    )
+
+    patch = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"reasoning_effort": "high"},
+    )
+    assert patch.status_code == 200, patch.text
+    assert patch.json()["reasoning_effort"] == "high"
+    errors = [
+        event
+        for _sid, event in published
+        if event.get("type") == "response.error"
+        and event.get("error", {}).get("code") == "effort_change_not_applied"
+    ]
+    assert len(errors) == 1, f"Expected one visible failure notice; got {published!r}"
+    message = errors[0]["error"]["message"]
+    assert "high" in message
+    # The runner's next step is the notice, not a bare status code.
+    assert "Answer it in the terminal, then try again" in message
+    assert "returned status" not in message
+
+
+async def test_patch_reasoning_effort_stays_quiet_when_no_runner_answers(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stopped or detached native session has no live pane to be wrong about."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+
+    async def _no_runner(*_args: Any, **_kwargs: Any) -> None:
+        """No runner is bound; the relaunch reads the effort off the row."""
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _no_runner,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+    )
+
+    patch = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"reasoning_effort": "high"},
+    )
+    assert patch.status_code == 200, patch.text
+    assert [
+        event
+        for _sid, event in published
+        if event.get("error", {}).get("code") == "effort_change_not_applied"
+    ] == []
+
+
 # ── POST /v1/sessions/{id}/events with client-side tools ────
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -2520,7 +2521,7 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
                 "Answer the pending Claude question or permission request "
                 "before sending a message."
             ),
-            "claude_native_prompt_pending",
+            "claude_native_model_failed",
             "Answer it in the terminal",
             id="model-behind-question",
         ),
@@ -2529,7 +2530,7 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
             claude_native_bridge.ClaudeUserPromptPending(
                 "Claude is waiting for an explicit answer; settings command not sent."
             ),
-            "claude_native_prompt_pending",
+            "claude_native_effort_failed",
             "Answer it in the terminal",
             id="effort-behind-question",
         ),
@@ -2538,7 +2539,7 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
             claude_native_bridge.ClaudeTerminalDialog(
                 "Claude Code's input box is occupied by an overlay, so the command was not sent."
             ),
-            "claude_native_terminal_dialog",
+            "claude_native_compact_failed",
             "dismiss it",
             id="compact-behind-dialog",
         ),
@@ -2556,7 +2557,7 @@ async def test_events_claude_command_refused_by_the_pane_says_what_to_clear(
 
     A pending question, permission prompt or dialog blocks ``/model``,
     ``/effort`` and ``/compact`` before any keystroke. The person can fix that
-    from the terminal, so the reply says so.
+    from the terminal, so the reply says so, under the control's usual code.
     """
 
     def _refuse(bridge_dir: Any, **kwargs: Any) -> None:
@@ -3412,3 +3413,87 @@ async def test_events_compact_on_claude_sdk_buffered_compact_failed_fallback() -
         f"swallowed); got {len(in_progress)} from types {[e.get('type') for e in events]}"
     )
     assert completed == [], "no completed should appear when nothing compacted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "error_code"),
+    [
+        ({"type": "model_change", "model": "claude-opus-4-7"}, "claude_native_model_failed"),
+        ({"type": "effort_change", "effort": "high"}, "claude_native_effort_failed"),
+        ({"type": "compact"}, "claude_native_compact_failed"),
+    ],
+    ids=["model_change", "effort_change", "compact"],
+)
+@pytest.mark.parametrize(
+    ("refusal", "names_the_blocker"),
+    [
+        (
+            claude_native_bridge.ClaudeUserPromptPending(
+                "Answer the pending Claude question or permission request "
+                "before changing settings."
+            ),
+            re.compile(r"question|permission", re.IGNORECASE),
+        ),
+        (
+            claude_native_bridge.ClaudeTerminalDialog(
+                "Claude Code's input box is occupied by a dialog, so the command was not sent. "
+                "Open the terminal, dismiss it, then retry."
+            ),
+            re.compile(r"dialog|input box", re.IGNORECASE),
+        ),
+    ],
+    ids=["pending_prompt", "terminal_dialog"],
+)
+async def test_events_claude_native_control_refused_by_pending_prompt_names_the_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+    event: dict[str, Any],
+    error_code: str,
+    refusal: RuntimeError,
+    names_the_blocker: re.Pattern[str],
+) -> None:
+    """A control refused because Claude is waiting on a person must say so, not 'see the log'."""
+
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del bridge_dir, command, timeout_s, auto_confirm, confirm_hint
+        raise refusal
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
+    )
+
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "4f0d1c3b6e8a4b9c8d7e6f5a4b3c2d1e",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            "/v1/sessions/4f0d1c3b6e8a4b9c8d7e6f5a4b3c2d1e/events", json=event
+        )
+
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body.get("error") == error_code, body
+    detail = body.get("detail") or ""
+    assert "Request failed on the runner" not in detail, (
+        f"the refusal reason was swallowed into the generic runner failure: {detail!r}"
+    )
+    assert names_the_blocker.search(detail), (
+        f"detail must name what blocks the change so the person can answer it: {detail!r}"
+    )
