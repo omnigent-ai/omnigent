@@ -12,8 +12,10 @@ import re
 import stat
 import struct
 import sys
+import threading
+import time
 from collections.abc import Buffer
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -24,6 +26,8 @@ from omnigent.inner.os_env import (
     _HelperProcessClient,
 )
 from omnigent.inner.sandbox import SandboxPolicy
+
+MAX_RENAME_ATTEMPTS = 1000
 
 MAX_RAW_BYTES = 16 * 1024 * 1024
 MAX_METADATA_BYTES = 64 * 1024
@@ -40,6 +44,24 @@ def staging_basename(name: str, uid: str) -> str:
     prefix = name.lstrip(".") or "upload"
     prefix = prefix.encode("utf-8")[: 255 - len(suffix)].decode("utf-8", errors="ignore")
     return prefix + suffix
+
+
+def rename_basename(name: str, n: int) -> str:
+    base, extension = os.path.splitext(name)
+    suffix = f" ({n})"
+    extension = extension.encode()[: 255 - len(suffix) - 1].decode(errors="ignore")
+    base = base.encode()[: 255 - len(suffix) - len(extension.encode())].decode(errors="ignore")
+    return base + suffix + extension
+
+
+def upload_support_reason() -> str | None:
+    if sys.platform == "win32":
+        return "Workspace upload requires POSIX filesystem primitives"
+    if any(not hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "pwrite", "pread")):
+        return "Required upload filesystem primitives are unavailable"
+    if not {os.open, os.stat, os.unlink, os.link, os.rename} <= os.supports_dir_fd:
+        return "Required directory-relative filesystem operations are unavailable"
+    return None
 
 
 def valid_name(name: str) -> bool:
@@ -118,17 +140,43 @@ class UploadHelperClient(_HelperProcessClient):
         super().__init__(
             cwd=env.cwd,
             shell_path=env.shell_path,
-            sandbox=env.sandbox,
-            egress_rules=env._egress_rules,
-            egress_allow_private_destinations=env._egress_allow_private_destinations,
+            sandbox=replace(
+                env.sandbox,
+                allow_network=False,
+                credential_proxy=None,
+                egress_relay_port=None,
+                egress_socket_path=None,
+            ),
+            egress_rules=None,
+            egress_allow_private_destinations=False,
             copy_on_write_environment=env.copy_on_write_environment,
             upload_raw=True,
         )
 
-    def call(self, metadata: dict[str, object], raw: bytes = b"") -> dict[str, object]:
-        with self._lock:
+    def interrupt(self) -> None:
+        proc = self._proc
+        if proc is not None:
+            with contextlib.suppress(OSError):
+                proc.kill()
+
+    def call(
+        self, metadata: dict[str, object], raw: bytes = b"", *, timeout_s: float = 30
+    ) -> dict[str, object]:
+        deadline = time.monotonic() + timeout_s
+        if not self._lock.acquire(timeout=max(0, timeout_s)):
+            return {"error": "Upload helper queue timed out", "code": "timeout"}
+        try:
             if self._closed:
                 return {"error": "Upload helper closed", "code": "gone"}
+            timed_out = threading.Event()
+
+            def expire() -> None:
+                timed_out.set()
+                self.interrupt()
+
+            timer = threading.Timer(max(0, deadline - time.monotonic()), expire)
+            timer.daemon = True
+            timer.start()
             try:
                 self._ensure_started_locked()
                 assert self._proc is not None
@@ -138,7 +186,12 @@ class UploadHelperClient(_HelperProcessClient):
                 return result
             except (OSError, EOFError, ValueError) as exc:
                 self._stop_locked()
-                return {"error": str(exc), "code": "gone"}
+                return {"error": str(exc), "code": "timeout" if timed_out.is_set() else "gone"}
+            finally:
+                timer.cancel()
+
+        finally:
+            self._lock.release()
 
 
 class UploadError(Exception):
@@ -222,7 +275,14 @@ class UploadEngine:
         except PermissionError as exc:
             return {"code": "permission_denied", "error": str(exc)}
         except OSError as exc:
-            code = "no_space" if exc.errno in (errno.ENOSPC, errno.EDQUOT) else "invalid_path"
+            code = (
+                "no_space"
+                if exc.errno in (errno.ENOSPC, errno.EDQUOT)
+                else "invalid_path"
+                if exc.errno
+                in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG, errno.EINVAL)
+                else "io_error"
+            )
             return {"code": code, "error": str(exc)}
         except (KeyError, TypeError, ValueError) as exc:
             return {"code": "invalid_request", "error": str(exc)}
@@ -230,12 +290,19 @@ class UploadEngine:
     def _dispatch(self, m: dict[str, object], raw: bytes) -> dict[str, object]:
         op = m["op"]
         if op == "probe":
+            reason = upload_support_reason()
+            if reason:
+                return {"raw_upload": False, "reason": reason}
             _assert_within_reach(self.cwd, self.sandbox, self.cwd, need_write=True)
             _assert_write_allowed(self.sandbox, self.cwd)
             return {"raw_upload": True}
         uid = str(m["id"])
         if not re.fullmatch(r"[0-9a-f]{32}", uid):
             raise UploadError("invalid_request", "Invalid upload id")
+        if op == "prepare":
+            return self._prepare(uid, m)
+        if op == "recover":
+            return self._recover(uid, m)
         if op == "begin":
             return self._begin(uid, m)
         if op == "cleanup":
@@ -272,6 +339,84 @@ class UploadEngine:
             return {"aborted": True}
         raise UploadError("invalid_request", "Unknown upload operation")
 
+    def _prepare(self, uid: str, m: dict[str, object]) -> dict[str, object]:
+        directory, name = str(m["dir"]), str(m["name"])
+        if not valid_name(name):
+            raise UploadError("invalid_name", "Invalid basename")
+        staging = staging_basename(name, uid)
+        self._grant(directory, name, staging)
+        parent = _parent(self.cwd, directory)
+        try:
+            existed = self._exists(parent, name)
+            try:
+                os.stat(staging, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise UploadError("file_exists", "Staging path exists")
+            dev, ino = _identity(parent)
+            return {
+                "parent_dev": dev,
+                "parent_ino": ino,
+                "staging_path": str(self.cwd / directory / staging),
+                "target_existed": existed,
+            }
+        finally:
+            os.close(parent)
+
+    def _recover(self, uid: str, m: dict[str, object]) -> dict[str, object]:
+        directory, original = str(m["dir"]), str(m["name"])
+        if not valid_name(original):
+            raise UploadError("invalid_name", "Invalid basename")
+        parent = _parent(self.cwd, directory)
+        try:
+            if _identity(parent) != (m["parent_dev"], m["parent_ino"]):
+                raise UploadError("invalid_path", "Destination directory changed")
+            for n in range(MAX_RENAME_ATTEMPTS + 1 if m["on_conflict"] == "rename" else 1):
+                name = rename_basename(original, n) if n else original
+                self._grant(directory, name, staging_basename(original, uid))
+                try:
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+                except FileNotFoundError:
+                    continue
+                try:
+                    if _identity(fd) != (m["staging_dev"], m["staging_ino"]):
+                        continue
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        continue
+                    digest = hashlib.sha256()
+                    position = 0
+                    while block := os.pread(fd, 1024 * 1024, position):
+                        digest.update(block)
+                        position += len(block)
+                    os.fchmod(fd, self.mode)
+                    staging = staging_basename(original, uid)
+                    try:
+                        info = os.stat(staging, dir_fd=parent, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        if (info.st_dev, info.st_ino) == _identity(fd):
+                            os.unlink(staging, dir_fd=parent)
+                    with contextlib.suppress(OSError):
+                        os.fsync(parent)
+                    return {
+                        "path": f"{directory}/{name}" if directory else name,
+                        "final_name": name,
+                        "size": position,
+                        "sha256": digest.hexdigest(),
+                        "outcome": "renamed"
+                        if n
+                        else "replaced"
+                        if m["on_conflict"] == "replace" and m.get("target_existed")
+                        else "created",
+                    }
+                finally:
+                    os.close(fd)
+            raise UploadError("gone", "No published inode matches this upload")
+        finally:
+            os.close(parent)
+
     def _begin(self, uid: str, m: dict[str, object]) -> dict[str, object]:
         directory, name = str(m["dir"]), str(m["name"])
         if not valid_name(name):
@@ -295,6 +440,8 @@ class UploadEngine:
         self._grant(directory, name, staging)
         parent = _parent(self.cwd, directory)
         try:
+            if "parent_dev" in m and _identity(parent) != (m["parent_dev"], m["parent_ino"]):
+                raise UploadError("invalid_path", "Destination directory changed")
             if self._exists(parent, name) and conflict == "fail":
                 raise UploadError("file_exists", "Destination exists")
             try:
@@ -334,6 +481,10 @@ class UploadEngine:
         return True
 
     def _complete(self, upload: _Upload, offset: int) -> dict[str, object]:
+        """Length and SHA256 describe bytes at verification time, before publication.
+
+        Other workspace writers can edit this inode during or after publication.
+        """
         if offset != upload.size:
             raise UploadError("incomplete", "Upload is incomplete")
         digest = hashlib.sha256()
@@ -367,12 +518,12 @@ class UploadEngine:
                     )
                     break
                 except FileExistsError as exc:
-                    self._exists(upload.parent_fd, name)
                     if upload.conflict == "fail":
                         raise UploadError("file_exists", "Destination appeared") from exc
+                    if n >= MAX_RENAME_ATTEMPTS:
+                        raise UploadError("file_exists", "No free conflict name") from exc
                     n += 1
-                    base, ext = os.path.splitext(upload.name)
-                    name = f"{base} ({n}){ext}"
+                    name = rename_basename(upload.name, n)
             os.unlink(upload.staging, dir_fd=upload.parent_fd)
             outcome = "renamed" if n else "created"
         os.fchmod(upload.fd, self.mode)
@@ -408,12 +559,18 @@ class UploadEngine:
                 info = os.stat(staging, dir_fd=parent, follow_symlinks=False)
             except FileNotFoundError:
                 return {"aborted": True}
-            if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != (
-                m["staging_dev"],
-                m["staging_ino"],
-            ):
-                raise UploadError("invalid_path", "Staging file changed")
-            os.unlink(staging, dir_fd=parent)
+            fd = os.open(staging, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                if not stat.S_ISREG(info.st_mode) or _identity(fd) != (info.st_dev, info.st_ino):
+                    raise UploadError("invalid_path", "Staging file changed")
+                if m.get("pending"):
+                    if info.st_mode & 0o777 != 0o600:
+                        raise UploadError("invalid_path", "Intent staging mode changed")
+                elif _identity(fd) != (m["staging_dev"], m["staging_ino"]):
+                    raise UploadError("invalid_path", "Staging file changed")
+                os.unlink(staging, dir_fd=parent)
+            finally:
+                os.close(fd)
             return {"aborted": True}
         finally:
             os.close(parent)

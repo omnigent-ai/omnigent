@@ -623,7 +623,7 @@ class _HelperProcessClient:
             if self.start_in_scratch:
                 helper_cwd = self._tmpdir
                 env["PWD"] = str(self._tmpdir)
-            if sandbox.credential_proxy is not None:
+            if sandbox.credential_proxy is not None and not self._upload_raw:
                 # Resolve real secrets in the parent. Real secrets stay
                 # here and are attached to outbound requests by the egress
                 # proxy (swap-on-access). Only entries that opted into
@@ -656,7 +656,11 @@ class _HelperProcessClient:
 
         # Model inference always uses the relay; ordinary HTTP access needs rules.
         # The helper bridges private loopback to the parent's Unix socket.
-        if (self._egress_rules or self._model_access is not None) and self._tmpdir is not None:
+        if (
+            (self._egress_rules or self._model_access is not None)
+            and self._tmpdir is not None
+            and not self._upload_raw
+        ):
             sandbox = self._start_egress_proxy_locked(
                 sandbox,
                 env,
