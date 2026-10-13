@@ -1739,7 +1739,7 @@ async def test_run_turn_marks_a_prompt_held_message_undelivered_only_before_subm
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    pane = "❯ "
+    pane = "──────\n❯ \n──────\n"
     enters = 0
     prompt_pending = False
     killed: list[Path] = []
@@ -1748,7 +1748,7 @@ async def test_run_turn_marks_a_prompt_held_message_undelivered_only_before_subm
         nonlocal pane, enters, prompt_pending
         del socket_path
         if args[0] == "paste-buffer":
-            pane = "❯ review this function"
+            pane = "──────\n❯ review this function\n──────\n"
             prompt_pending = not submitted
         elif args[-1] == "Enter":
             # The draft stays visible, so submit verification looks to retry.

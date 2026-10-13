@@ -304,6 +304,15 @@ _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
+# Ctrl+K and Ctrl+U as CSI-u sequences, so Claude Code reads them as keys
+# rather than as text when they arrive in one burst.
+_COMPOSER_KILL_TO_LINE_END = "\x1b[107;5u"
+_COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
+# Clearing repeats per visible window of a tall draft; a box unchanged this
+# long is stuck (the grace a stalled TUI gets at submit), and even a shrinking
+# one must empty within the cap.
+_COMPOSER_CLEAR_TIMEOUT_S = 10.0
+_COMPOSER_CLEAR_MAX_S = 20.0
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
 # rapid stdin bursts into a paste, so an Enter sent while the TUI is
@@ -4255,11 +4264,11 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
+    delivery_diagnostics.set_stage("clearing_composer")
+    # Clear stale text first, or the paste lands inside the person's draft and
+    # Enter submits both together.
+    _clear_composer(socket_path, tmux_target)
     delivery_diagnostics.set_stage("pasting")
-    # Clear stale text first: raw controls can otherwise become pasted text.
-    # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -4646,7 +4655,7 @@ def inject_slash_command(
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
     # Same reclaim as inject_user_message: a surface left occupying the
-    # composer would swallow the C-u and the typed command.
+    # composer would swallow the clearing keys and the typed command.
     surface = _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
     if surface is not None:
         # No readiness gate follows; a blind Enter would answer the dialog.
@@ -4658,11 +4667,10 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings."
         )
-    # ``C-u`` clears any draft the user is mid-typing; otherwise the
-    # paste below concatenates with their text and Enter submits
-    # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
+    # Clear any mid-typed draft so the command does not concatenate with it
+    # and submit as a turn; unlike Escape this does not interrupt an
+    # in-flight generation.
+    _clear_composer(socket_path, tmux_target)
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
     # Same delivery hazards as inject_user_message: a coalesced or dropped
@@ -5831,6 +5839,107 @@ def _composer_row(pane: str) -> str | None:
         if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
             return row
     return None
+
+
+def _composer_box_rows(pane: str) -> list[str] | None:
+    """
+    Return every row of Claude Code's live input box, or ``None``.
+
+    The box is located as in :func:`_composer_row`: its first row sits
+    directly under the opening rule, led by a composer glyph. The rows run to
+    the closing rule, or to the bottom of the pane when a draft taller than
+    the pane pushes the closing rule off screen. Blank lines between the rule
+    and the glyph row are skipped, as :func:`_composer_row` skips them; blank
+    rows inside the box are kept, since a draft's empty lines are lines too.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The box's rows, e.g. ``["❯ fix the bug", "  in foo.py"]``, or
+        ``None`` when no input box is on screen.
+    """
+    lines = pane.splitlines()
+    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    if not rules:
+        return None
+    candidates = [(rules[-1] + 1, len(lines))]
+    if len(rules) >= 2:
+        candidates.insert(0, (rules[-2] + 1, rules[-1]))
+    for first, end in candidates:
+        while first < end and not lines[first].strip():
+            first += 1
+        if first < end and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
+            return lines[first:end]
+    return None
+
+
+def _clear_composer(socket_path: str, tmux_target: str) -> None:
+    """
+    Delete the whole draft in Claude Code's input box.
+
+    Ctrl+K deletes to the end of the line and, at the end of a line, the
+    line break after it; Ctrl+U does the same towards the start. Two of each
+    per row of the box therefore empty a draft from any cursor position,
+    while presses beyond the draft do nothing. Clearing only the cursor's
+    line would leave the rest of a multi-line draft to be submitted with the
+    next message. The box shows at most a window of a tall draft, so a round
+    only clears the rows on screen; rounds repeat while the box keeps
+    changing, until a frame captured after a burst shows it empty. A torn
+    capture is re-polled rather than read as an empty box. A box that stops
+    changing for :data:`_COMPOSER_CLEAR_TIMEOUT_S`, or is still not empty
+    after :data:`_COMPOSER_CLEAR_MAX_S`, fails the injection, since
+    submitting would send the person's unsent draft to the model; Claude
+    Code renders an empty box as a bare glyph, so surviving text is a draft.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :raises ClaudeTerminalDialog: If the box could not be read or emptied in
+        time, or is in shell mode, where a paste would run as a command;
+        nothing was pasted or submitted.
+    :raises RuntimeError: If a ``tmux`` invocation fails.
+    """
+    started = last_change = time.monotonic()
+    previous: list[str] | None = None
+    bursts = 0
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        rows = _composer_box_rows(pane) if pane.strip() else None
+        if rows is not None:
+            first = rows[0].strip()
+            if first.startswith(_SHELL_MODE_GLYPH):
+                raise ClaudeTerminalDialog(
+                    "Claude Code's input box is in shell mode, so nothing was sent. "
+                    "Leave shell mode in the terminal, then retry."
+                )
+            # The row's text follows the chat glyph. A burst always precedes
+            # the check: a frame captured before the TUI drew the person's
+            # last keystroke would otherwise pass as empty.
+            if bursts and len(rows) == 1 and not first[1:].strip():
+                return
+        now = time.monotonic()
+        if rows is not None and rows != previous:
+            previous, last_change = rows, now
+        if (
+            now - last_change >= _COMPOSER_CLEAR_TIMEOUT_S
+            or now - started >= _COMPOSER_CLEAR_MAX_S
+        ):
+            if rows is None:
+                raise ClaudeTerminalDialog(
+                    "Claude Code's input box could not be read, so nothing was sent. "
+                    "Open the terminal and retry."
+                )
+            raise ClaudeTerminalDialog(
+                "Claude Code's input box still holds a draft that could not be cleared, "
+                "so nothing was sent. Open the terminal, clear it, then retry."
+            )
+        if rows is not None:
+            presses = 2 * len(rows)
+            keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
+            # tmux caps one client→server command at ~16KB; a very tall pane's burst is split.
+            for start in range(0, len(keys), 8192):
+                _run_tmux(
+                    socket_path, "send-keys", "-l", "-t", tmux_target, keys[start : start + 8192]
+                )
+            bursts += 1
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
 def _claude_prompt_rendered(pane: str) -> bool:
