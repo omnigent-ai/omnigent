@@ -120,6 +120,11 @@ def has_any_pending() -> bool:
     return any(not fut.done() for fut in _pending.values())
 
 
+def has_pending_elicitation(elicitation_id: str) -> bool:
+    """Return whether a verdict is registered for a specific elicitation id."""
+    return elicitation_id in _pending
+
+
 def register(
     elicitation_id: str,
     *,
@@ -165,6 +170,11 @@ def cleanup(elicitation_id: str) -> None:
 def current_server_generation() -> int:
     """Return the number of successful server reconnections observed."""
     return _server_generation
+
+
+def has_reconnect_waiters() -> bool:
+    """Report whether any call is waiting for the tunnel to rebind."""
+    return bool(_server_reconnect_waiters)
 
 
 async def wait_for_server_reconnect(

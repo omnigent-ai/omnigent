@@ -90,3 +90,50 @@ async def test_tunnel_disconnect_marks_retained_execution_as_detached(
         "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
         "message": RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
     }
+
+
+@pytest.mark.asyncio
+async def test_unbound_runner_marks_retained_execution_as_detached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner whose tunnel has not re-bound yet is told to wait, not that its call failed."""
+    engine = _AllowPolicyEngine()
+    monkeypatch.setattr(
+        sessions_mod,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: object(),
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        lambda spec, session_id, conversation_store, conversation=None: engine,
+    )
+
+    async def _no_runner_client(session_id: str, runner_router: Any) -> None:
+        del session_id, runner_router
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _no_runner_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+
+    async def _call(params: dict[str, Any]) -> dict[str, Any]:
+        response = await _handle_mcp_tools_call(
+            rpc_id=8,
+            session_id=_SESSION_ID,
+            params=params,
+            conversation_store=_ConversationStore(),  # type: ignore[arg-type]
+            agent_store=object(),  # type: ignore[arg-type]
+            runner_router=object(),  # type: ignore[arg-type]
+        )
+        return json.loads(bytes(response.body))
+
+    retained = await _call(
+        {"name": "sys_os_shell", "arguments": {}, MCP_OPERATION_ID_PARAM: "mcpop_unbound"}
+    )
+    assert retained["error"] == {
+        "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
+        "message": RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
+    }
+
+    plain = await _call({"name": "sys_os_shell", "arguments": {}})
+    assert plain["error"]["code"] == -32000
+    assert "No runner bound" in plain["error"]["message"]
