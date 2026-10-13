@@ -8,6 +8,7 @@ for ``admins`` / ``allowed_domains``.
 
 from __future__ import annotations
 
+import builtins
 import logging
 import os
 from collections.abc import Callable
@@ -90,6 +91,36 @@ def test_binary_kill_switch_caches_unchanged_config_and_reloads_changes(
     assert len(loads) == 2
     config.unlink()
     assert server_config_module.runner_tunnel_binary_request_body() is True
+
+
+def test_binary_kill_switch_retries_transient_read_failure_at_same_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("runner_tunnel_binary_request_body: false\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    before = config.stat()
+    failed = False
+    real_open = builtins.open
+
+    def flaky_open(path, *args, **kwargs):
+        nonlocal failed
+        if Path(path) == config and not failed:
+            failed = True
+            raise OSError("transient config read failure")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(server_config_module, "open", flaky_open, raising=False)
+    assert server_config_module.runner_tunnel_binary_request_body() is True
+    assert server_config_module.runner_tunnel_binary_request_body() is False
+    after = config.stat()
+    assert (after.st_mtime_ns, after.st_ctime_ns, after.st_size, after.st_ino) == (
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_size,
+        before.st_ino,
+    )
 
 
 def _ico_bytes(entries: list[tuple[tuple[int, int], bytes]]) -> bytes:
