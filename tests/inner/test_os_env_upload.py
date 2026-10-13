@@ -601,3 +601,22 @@ def test_helper_rejects_control_character_paths(
         assert result["code"] == ("invalid_name" if field == "name" else "invalid_path")
     assert not list(tmp_path.rglob("*.part"))
     assert "error" not in begin(helper)
+
+
+def test_valid_name_rejects_staging_basename() -> None:
+    from omnigent.inner.os_env_upload import valid_name
+
+    assert not valid_name(f"payload.omnigent-upload-{UID}.part")
+    assert valid_name("payload.omnigent-upload-notanid.part")
+
+
+def test_begin_rejects_out_of_reach_path(helper: UploadHelperClient, tmp_path: Path) -> None:
+    outside = tmp_path.with_name(tmp_path.name + "-outside")
+    outside.mkdir()
+    try:
+        result = begin(helper, dir=str(outside), size=0)
+        assert result["code"] == "permission_denied"
+        assert not list(outside.iterdir())
+        assert helper.call({"op": "status", "id": UID})["code"] == "gone"
+    finally:
+        outside.rmdir()

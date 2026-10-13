@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypeVar, cast
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
 
@@ -52,6 +52,8 @@ from omnigent.runtime.filesystem_registry import FilesystemRegistry
 WORKSPACE_UPLOAD_CAPABILITY = "workspace_upload_v1"
 logger = logging.getLogger(__name__)
 HELPER_CACHE_MAX = 32
+# Leave headroom in the runner's eight-thread default executor.
+HELPER_IPC_MAX = 4
 HELPER_IDLE_S = 300
 STARTUP_SWEEP_BUDGET_S = 0.5
 GONE_MAX = 4096
@@ -153,6 +155,10 @@ class RouteError(Exception):
         )
 
 
+class EnvironmentResolutionError(RouteError):
+    """The environment resolver failed before any helper operation."""
+
+
 def _unwrap(result: dict[str, object]) -> dict[str, object]:
     if "error" not in result:
         return result
@@ -245,6 +251,7 @@ class UploadManager:
         self.lock = asyncio.Lock()
         self.index_dirty = False
         self.helper_lock = asyncio.Lock()
+        self.ipc_slots = asyncio.Semaphore(HELPER_IPC_MAX)
         self.upload_locks: dict[str, asyncio.Lock] = {}
         self.inflight: set[asyncio.Task[object]] = set()
         self.stopping = False
@@ -285,7 +292,12 @@ class UploadManager:
     async def _helper(
         self, session_id: str, environment_id: str, *, reserve: bool = False
     ) -> UploadHelperClient:
-        env = await self.resolve_environment(session_id, environment_id)
+        try:
+            env = await self.resolve_environment(session_id, environment_id)
+        except Exception as exc:
+            raise EnvironmentResolutionError(
+                503, "environment_unavailable", "Upload environment cannot be resolved"
+            ) from exc
         if not isinstance(env, CallerProcessOSEnvironment) or env._helper._closed:
             raise RouteError(
                 503, "runner_capability_mismatch", "Environment lacks raw upload support"
@@ -388,17 +400,26 @@ class UploadManager:
             except TimeoutError:
                 continue
         binding.active_op = metadata.get("op")
-        task = asyncio.create_task(
-            asyncio.to_thread(binding.client.call, metadata, raw, deadline=deadline)
-        )
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
             try:
-                await self._settle(task)
-            except Exception:
-                logger.exception("Upload helper operation failed during cancellation")
-            raise
+                async with asyncio.timeout(max(0, deadline - time.monotonic())):
+                    await self.ipc_slots.acquire()
+            except TimeoutError:
+                return {"code": "busy", "error": "Upload helper queue timed out"}
+            try:
+                task = asyncio.create_task(
+                    asyncio.to_thread(binding.client.call, metadata, raw, deadline=deadline)
+                )
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    try:
+                        await self._settle(task)
+                    except Exception:
+                        logger.exception("Upload helper operation failed during cancellation")
+                    raise
+            finally:
+                self.ipc_slots.release()
         finally:
             binding.active_op = None
             binding.gate.release()
@@ -558,7 +579,10 @@ class UploadManager:
         self._prune_gone()
         instant = _now() if now is None else now
         for uid in list(self.records):
-            async with self.upload_locks.setdefault(uid, asyncio.Lock()):
+            if uid not in self.records:
+                continue
+            lock = self.upload_locks.setdefault(uid, asyncio.Lock())
+            async with lock:
                 record = self.records.get(uid)
                 if record is None:
                     continue
@@ -568,15 +592,18 @@ class UploadManager:
                     if not self._expired(record, instant):
                         continue
                     await self._remove(uid, record)
+                except EnvironmentResolutionError:
+                    if instant - record.created_at >= self.limits.max_age_s:
+                        logger.warning("Retiring expired upload %s: environment unavailable", uid)
+                        async with self.lock:
+                            self._drop(uid, record)
+                            await self._save_settled()
                 except Exception as exc:
                     logger.exception("Upload cleanup failed for %s", uid)
-                    if (
-                        isinstance(exc, ValueError)
-                        or (isinstance(exc, HTTPException) and exc.status_code in (404, 410))
-                        or (
-                            isinstance(exc, RouteError)
-                            and exc.code in ("unverified_intent", "parent_gone", "staging_gone")
-                        )
+                    if isinstance(exc, RouteError) and exc.code in (
+                        "unverified_intent",
+                        "parent_gone",
+                        "staging_gone",
                     ):
                         async with self.lock:
                             self._drop(uid, record)
