@@ -1279,6 +1279,83 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     return dest
 
 
+# Backoff schedule for transient agent-bundle fetch failures; see _get_agent_contents_with_retry.
+_SPEC_FETCH_RETRY_DELAYS_S: tuple[float, ...] = (0.5, 1.0, 2.0)
+# The 5xx statuses a retry can plausibly change (restarting backend, intermediary blip).
+_SPEC_FETCH_TRANSIENT_STATUSES: frozenset[int] = frozenset({500, 502, 503, 504})
+
+
+async def _get_agent_contents_with_retry(
+    server_client: httpx.AsyncClient,
+    path: str,
+    session_id: str,
+) -> httpx.Response:
+    """
+    GET the agent bundle, retrying transient failures with backoff.
+
+    Retries the transient server statuses in
+    :data:`_SPEC_FETCH_TRANSIENT_STATUSES` and transport errors — a
+    restarting backend, a proxy blip, a dropped connection — once per delay
+    in :data:`_SPEC_FETCH_RETRY_DELAYS_S`. Any other response (the 404 miss
+    the caller maps to ``None``, a 4xx, a deterministic 5xx such as 501)
+    returns immediately: it is an answer a retry cannot change.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param path: Bundle route, e.g. ``"/v1/sessions/conv_ab/agent/contents"``.
+    :param session_id: Session identifier, for log correlation.
+    :returns: The first response outside the transient set, or the final
+        transient 5xx once the retry budget is exhausted (the caller raises
+        on it).
+    :raises httpx.TransportError: When the final attempt fails at the
+        transport level.
+    """
+    attempts = len(_SPEC_FETCH_RETRY_DELAYS_S) + 1
+    for attempt, delay_s in enumerate(_SPEC_FETCH_RETRY_DELAYS_S, start=1):
+        try:
+            resp = await server_client.get(path)
+        except httpx.TransportError as exc:
+            failure = repr(exc)
+        else:
+            if resp.status_code not in _SPEC_FETCH_TRANSIENT_STATUSES:
+                return resp
+            failure = f"HTTP {resp.status_code}"
+        _logger.warning(
+            "spec_resolver: GET %s attempt %d/%d failed (%s); retrying in %.1fs",
+            path,
+            attempt,
+            attempts,
+            failure,
+            delay_s,
+            extra={"session_id": session_id},
+        )
+        await asyncio.sleep(delay_s)
+    # Final attempt: a transport error propagates and a transient 5xx is
+    # returned for the caller's status check to raise the canonical error.
+    # Log either outcome so the exhausted budget is visible like the retries.
+    try:
+        resp = await server_client.get(path)
+    except httpx.TransportError as exc:
+        _logger.warning(
+            "spec_resolver: GET %s attempt %d/%d failed (%s); retry budget exhausted",
+            path,
+            attempts,
+            attempts,
+            repr(exc),
+            extra={"session_id": session_id},
+        )
+        raise
+    if resp.status_code in _SPEC_FETCH_TRANSIENT_STATUSES:
+        _logger.warning(
+            "spec_resolver: GET %s attempt %d/%d failed (HTTP %s); retry budget exhausted",
+            path,
+            attempts,
+            attempts,
+            resp.status_code,
+            extra={"session_id": session_id},
+        )
+    return resp
+
+
 async def _resolve_agent_spec_from_server(
     server_client: httpx.AsyncClient,
     spec_cache_root: Path,
@@ -1302,7 +1379,10 @@ async def _resolve_agent_spec_from_server(
         directory, or ``None`` when the server returns 404 for the
         requested agent.
     :raises RuntimeError: If the server returns a non-200 status
-        other than 404.
+        other than 404. Transient failures (the 5xx statuses in
+        :data:`_SPEC_FETCH_TRANSIENT_STATUSES`, transport errors) are
+        retried with backoff first — see
+        :func:`_get_agent_contents_with_retry`.
     """
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
@@ -1315,7 +1395,7 @@ async def _resolve_agent_spec_from_server(
         )
         return None
     path = f"/v1/sessions/{session_id}/agent/contents"
-    resp = await server_client.get(path)
+    resp = await _get_agent_contents_with_retry(server_client, path, session_id)
     if resp.status_code == 404:
         _logger.info(
             "spec_resolver: GET %s returned 404 for missing agent",
