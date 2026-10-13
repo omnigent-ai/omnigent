@@ -22,7 +22,8 @@ be able to write resources without a separate Omnigent account.
   person's own profile wins over a service principal.
 - `expired-credential`: an expired or revoked Databricks credential leads to a
   re-authentication prompt, not a raw 403 from the workspace edge.
-- `proxy-env`: login detects the right mode even with HTTP proxy variables set.
+- `proxy-env`: login detects the right mode and host tunnels connect with HTTP
+  proxy variables set; loopback servers stay direct.
 - `host-lifecycle`: register in the foreground or background, run as a per-user
   system service, and check status, stop, stop a session, or reset the host ID.
 - `host-inline-login`: `omnigent host` against a Databricks-fronted server that
@@ -90,6 +91,12 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
 - **`proxy-env`:**
   `tests/e2e/test_login_accounts_proxy_env.py::test_login_detects_accounts_auth_despite_proxy_env`
   (starts its own accounts server; run with plain `uv run pytest`).
+  `tests/e2e/test_host_tunnel_mandatory_proxy_e2e.py::test_host_comes_online_through_mandatory_proxy`
+  starts its own server and CONNECT proxy and checks host and session-runner
+  connectivity with plain `uv run pytest`. It explicitly opts runners into
+  proxy inheritance through `OMNIGENT_RUNNER_ENV_PASSTHROUGH`; host proxy
+  credentials are excluded from runners by default. List the proxy variable
+  names to forward, including any `NO_PROXY` or empty lowercase overrides.
 - **`profile-selection`:**
   `tests/e2e/test_host_auth_prefers_user_over_m2m_sp_e2e.py::test_resolve_auth_for_host_must_not_select_m2m_sp_over_user_profile`
 - **`expired-credential`:**
