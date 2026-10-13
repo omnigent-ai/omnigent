@@ -146,6 +146,7 @@ class RunnerSession:
     in_flight: dict[str, RequestState] = field(default_factory=dict)
     binary_requests: set[str] = field(default_factory=set)
     binary_pending_sends: set[str] = field(default_factory=set)
+    binary_waiting_response: set[str] = field(default_factory=set)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
     # 8-char hex channel ids; values hold the inbound queue consumed
     # by whichever side terminated the attach.
@@ -462,6 +463,7 @@ class TunnelRegistry:
         session.in_flight.clear()
         session.binary_requests.clear()
         session.binary_pending_sends.clear()
+        session.binary_waiting_response.clear()
         for channel in list(session.ws_channels.values()):
             _call_channel_soon_threadsafe(channel, partial(channel.inbound_queue.put_nowait, None))
         session.ws_channels.clear()
@@ -682,7 +684,7 @@ class TunnelRegistry:
         req_id: str,
         session: RunnerSession | None = None,
     ) -> None:
-        """Drop reassembly state for a completed (or aborted) request.
+        """Drop consumer state; enqueued binary admission awaits a terminal response.
 
         :param runner_id: Runner id that owns the request, e.g.
             ``"runner_0123456789abcdef"``.
@@ -698,7 +700,10 @@ class TunnelRegistry:
             if target is None:
                 return
             target.in_flight.pop(req_id, None)
-            if req_id not in target.binary_pending_sends:
+            if (
+                req_id not in target.binary_pending_sends
+                and req_id not in target.binary_waiting_response
+            ):
                 target.binary_requests.discard(req_id)
 
     def request_is_open(self, session: RunnerSession, req_id: str) -> bool:
@@ -825,13 +830,13 @@ class TunnelRegistry:
     async def send_request(
         self, session: RunnerSession, data: str | bytes, *, request_id: str
     ) -> None:
-        """Enqueue one request; retain its admission slot until the writer has sent it."""
+        """Enqueue one request; retain admission until runner completion or retirement."""
         await self._send(session, data, request_id=request_id)
 
     def _request_sent(self, session: RunnerSession, req_id: str) -> None:
         with self._lock:
             session.binary_pending_sends.discard(req_id)
-            if req_id not in session.in_flight:
+            if req_id not in session.binary_waiting_response:
                 session.binary_requests.discard(req_id)
 
     async def _send(
@@ -869,6 +874,7 @@ class TunnelRegistry:
                     on_sent = None
                     if request_id is not None and request_id in session.binary_requests:
                         session.binary_pending_sends.add(request_id)
+                        session.binary_waiting_response.add(request_id)
                         on_sent = partial(self._request_sent, session, request_id)
                     frame = OutboundFrame(
                         data,
@@ -915,8 +921,8 @@ class TunnelRegistry:
         :param session: Optional session-generation guard. When set,
             frames from stale route handlers are ignored instead of
             being routed into a newer session for the same runner id.
-        :returns: True if the frame's req_id matches a tracked
-            in-flight request; False otherwise (orphan frame —
+        :returns: True if the frame's req_id matches tracked consumer state
+            or binary runner work; False otherwise (orphan frame —
             logged but not raised; could be a late frame for a
             request that was already cancelled).
         """
@@ -928,9 +934,15 @@ class TunnelRegistry:
             if not isinstance(frame, ResponseHeadFrame | ResponseBodyFrame | ResponseEndFrame):
                 return False
             req_id = frame.id
+            # Caller cancellation drops reassembly, but runner work still occupies admission.
+            tracked_binary = req_id in current.binary_waiting_response
+            if isinstance(frame, ResponseEndFrame):
+                current.binary_waiting_response.discard(req_id)
+                if req_id not in current.binary_pending_sends:
+                    current.binary_requests.discard(req_id)
             state = current.in_flight.get(req_id)
             if state is None:
-                return False
+                return tracked_binary
         if isinstance(frame, ResponseHeadFrame):
             if _call_soon_threadsafe(state, lambda: _set_response_head(state, frame)):
                 return True
