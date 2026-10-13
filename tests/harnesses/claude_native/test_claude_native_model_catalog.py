@@ -814,6 +814,22 @@ def _unreachable(request: httpx.Request) -> httpx.Response:
             _lists("claude-*"), f"{_LITELLM_URL}:bad", None, True, False, id="malformed-base-url"
         ),
         pytest.param(
+            _lists("claude-*"),
+            _LITELLM_URL,
+            {"ANTHROPIC_CUSTOM_HEADERS": "x-user: José"},
+            True,
+            False,
+            id="non-ascii-custom-header",
+        ),
+        pytest.param(
+            _lists("claude-*"),
+            _LITELLM_URL,
+            {"ANTHROPIC_AUTH_TOKEN": "sk-ant-ünïcode"},
+            True,
+            False,
+            id="non-ascii-token",
+        ),
+        pytest.param(
             _unreachable,
             _DATABRICKS_GATEWAY_URL,
             _BEARER_ONLY,

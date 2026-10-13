@@ -638,19 +638,20 @@ def _ambient_gateway_serves_canonical_ids(
     base_url = _ambient_claude_base_url()
     if not base_url:
         return None
-    # Case-insensitive, and an explicit custom header wins over the derived
-    # one, as in Claude Code's own client.
-    headers = httpx.Headers(_ambient_custom_headers())
-    auth_token = os.environ.get(_ANTHROPIC_AUTH_TOKEN_ENV)
-    api_key = os.environ.get(_ANTHROPIC_API_KEY_ENV)
-    if auth_token and "authorization" not in headers:
-        headers["Authorization"] = f"Bearer {auth_token}"
-    if api_key and "x-api-key" not in headers:
-        headers["x-api-key"] = api_key
-    if not headers:
-        return None
-    headers.setdefault("anthropic-version", model_catalog._ANTHROPIC_API_VERSION)
     try:
+        # Case-insensitive, and an explicit custom header wins over the derived
+        # one, as in Claude Code's own client. Built inside the handler: a
+        # non-ASCII header value fails here, before any request.
+        headers = httpx.Headers(_ambient_custom_headers())
+        auth_token = os.environ.get(_ANTHROPIC_AUTH_TOKEN_ENV)
+        api_key = os.environ.get(_ANTHROPIC_API_KEY_ENV)
+        if auth_token and "authorization" not in headers:
+            headers["Authorization"] = f"Bearer {auth_token}"
+        if api_key and "x-api-key" not in headers:
+            headers["x-api-key"] = api_key
+        if not headers:
+            return None
+        headers.setdefault("anthropic-version", model_catalog._ANTHROPIC_API_VERSION)
         with httpx.Client(
             transport=transport, timeout=_AMBIENT_GATEWAY_LISTING_TIMEOUT_S
         ) as client:
