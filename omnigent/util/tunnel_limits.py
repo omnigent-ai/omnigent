@@ -36,6 +36,11 @@ RUNNER_TUNNEL_MAX_MESSAGE_BYTES = 100 * 1024 * 1024
 TUNNEL_KEEPALIVE_PING_INTERVAL_S = 30.0
 TUNNEL_KEEPALIVE_PING_TIMEOUT_S = 90.0
 
+# Longest the host waits without any server frame before it presumes its tunnel
+# dead and reconnects: above one 30 s ``host_tunnel.PING_INTERVAL_S`` so a late
+# application ping is tolerated, yet low enough to redial within the 60 s target.
+HOST_TUNNEL_SILENCE_TIMEOUT_S = 50.0
+
 
 class UvicornTunnelKwargs(TypedDict):
     """The uvicorn settings that terminate omnigent tunnels; see :func:`uvicorn_tunnel_kwargs`."""
