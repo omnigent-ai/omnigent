@@ -172,11 +172,15 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             state = self._registry.open_request(
                 self._runner_id,
                 req_id,
-                generation=session.generation if generation is None else generation,
+                generation=session.generation if use_binary and generation is None else generation,
                 binary_body=use_binary,
             )
         except KeyError as exc:
             raise httpx.ConnectError(f"runner {self._runner_id!r} is offline") from exc
+        except ConnectionError as exc:
+            if use_binary:
+                raise httpx.ConnectError(str(exc), request=request) from exc
+            raise
         try:
             body = await request.aread()
             frame = RequestFrame(
@@ -218,6 +222,8 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                         )
             finally:
                 self._registry.close_request(self._runner_id, req_id, session=state.session)
+            if use_binary and isinstance(exc, ConnectionError):
+                raise httpx.ConnectError(str(exc), request=request) from exc
             raise
 
         # Wrap the body queue as an httpx AsyncByteStream. The stream
