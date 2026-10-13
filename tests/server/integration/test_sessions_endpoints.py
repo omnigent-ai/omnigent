@@ -44,6 +44,7 @@ from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
 from omnigent.server.routes._sessions.helpers import (
     _NativeTerminalEnsureOutcome,
+    _runner_refusal_reason,
     _RunnerForwardResult,
 )
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
@@ -12072,6 +12073,49 @@ async def test_patch_reasoning_effort_stays_quiet_when_no_runner_answers(
         for _sid, event in published
         if event.get("error", {}).get("code") == "effort_change_not_applied"
     ] == []
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        pytest.param(
+            json.dumps({"detail": "Answer the pending prompt, then try again."}),
+            "Answer the pending prompt, then try again",
+            id="detail-trailing-period",
+        ),
+        pytest.param(
+            json.dumps({"detail": "wait for it..."}),
+            "wait for it",
+            id="detail-ellipsis",
+        ),
+        pytest.param(
+            json.dumps({"detail": "  spaced detail  "}),
+            "spaced detail",
+            id="detail-trimmed",
+        ),
+        pytest.param("not json at all", "the runner returned status 503", id="non-json-body"),
+        pytest.param(
+            json.dumps(["detail"]), "the runner returned status 503", id="non-object-json"
+        ),
+        pytest.param(
+            json.dumps({"detail": 42}), "the runner returned status 503", id="non-string-detail"
+        ),
+        pytest.param(
+            json.dumps({"other": "x"}), "the runner returned status 503", id="missing-detail"
+        ),
+        pytest.param(
+            json.dumps({"detail": "   "}), "the runner returned status 503", id="blank-detail"
+        ),
+        pytest.param(
+            json.dumps({"detail": "..."}),
+            "the runner returned status 503",
+            id="punctuation-only-detail",
+        ),
+    ],
+)
+async def test_runner_refusal_reason_prefers_detail_else_status(body: str, expected: str) -> None:
+    """The reason uses the runner's detail; otherwise it explains the HTTP status."""
+    assert _runner_refusal_reason(_RunnerForwardResult(status_code=503, body=body)) == expected
 
 
 # ── POST /v1/sessions/{id}/events with client-side tools ────
