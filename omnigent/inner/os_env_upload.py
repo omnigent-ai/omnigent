@@ -678,24 +678,31 @@ class UploadEngine:
             except FileNotFoundError:
                 self._forget(uid)
                 return {"aborted": True}
+            if not m.get("staging_dev") or not m.get("staging_ino"):
+                raise UploadError(
+                    "unverified_intent", "Leaving staging intent without an inode identity"
+                )
+            if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != (
+                m["staging_dev"],
+                m["staging_ino"],
+            ):
+                raise UploadError("staging_gone", "Staging file changed")
             fd = os.open(staging, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             try:
-                if not stat.S_ISREG(info.st_mode) or _identity(fd) != (info.st_dev, info.st_ino):
-                    raise UploadError("invalid_path", "Staging file changed")
-                if not m.get("staging_dev") or not m.get("staging_ino"):
-                    raise UploadError(
-                        "unverified_intent", "Leaving staging intent without an inode identity"
-                    )
-                if _identity(fd) != (m["staging_dev"], m["staging_ino"]):
-                    raise UploadError("invalid_path", "Staging file changed")
+                if _identity(fd) != (info.st_dev, info.st_ino):
+                    raise UploadError("staging_gone", "Staging file changed")
                 current = os.stat(staging, dir_fd=parent, follow_symlinks=False)
                 if (current.st_dev, current.st_ino) != _identity(fd):
-                    raise UploadError("invalid_path", "Staging file changed before cleanup")
+                    raise UploadError("staging_gone", "Staging file changed before cleanup")
                 os.unlink(staging, dir_fd=parent)
             finally:
                 os.close(fd)
             self._forget(uid)
             return {"aborted": True}
+        except UploadError as exc:
+            if exc.result["code"] == "staging_gone":
+                self._forget(uid)
+            raise
         finally:
             os.close(parent)
 
