@@ -40,7 +40,7 @@ const { arcaTarget } = require("./arcaIdentity");
  *   loginCommandLine: (serverUrl: string) => string,
  *   log?: (message: string) => void,
  * }} deps
- * @returns {{ run: (parentWin: unknown, serverUrl: string, options?: { reason?: "preview-reconnect", onStarted?: () => void }) => Promise<object> }}
+ * @returns {{ run: (parentWin: unknown, serverUrl: string, options?: { reason?: "preview-reconnect" }) => Promise<object> }}
  */
 function createArcaConnectFlow({
   BrowserWindow,
@@ -59,7 +59,7 @@ function createArcaConnectFlow({
    * must still route after the result promise settled. Only messages from a
    * registered console's own webContents are honored — a server page
    * (different webContents) can't spoof consent.
-   * @type {Map<number, { win: Electron.BrowserWindow, onConfirm: () => void, onCancel: () => void }>}
+   * @type {Map<number, { win: Electron.BrowserWindow, phase: () => string, onConfirm: () => void, onCancel: () => void }>}
    */
   const consoles = new Map();
   /**
@@ -77,10 +77,12 @@ function createArcaConnectFlow({
     consoles.get(event.sender.id)?.onCancel();
   });
   ipcMain.on(RESIZE_CHANNEL, (event, payload) => {
-    const consoleWindow = consoles.get(event.sender.id)?.win;
+    const consoleState = consoles.get(event.sender.id);
+    const consoleWindow = consoleState?.win;
     const measured = Number(payload?.height);
     if (!consoleWindow || !Number.isFinite(measured) || measured <= 0) return;
-    const minimum = payload?.phase === "running" ? RUNNING_CONTENT_HEIGHT : MIN_CONTENT_HEIGHT;
+    const minimum =
+      consoleState.phase() === "running" ? RUNNING_CONTENT_HEIGHT : MIN_CONTENT_HEIGHT;
     const height = Math.min(MAX_CONTENT_HEIGHT, Math.max(minimum, Math.ceil(measured)));
     try {
       if (!consoleWindow.isDestroyed()) {
@@ -100,7 +102,7 @@ function createArcaConnectFlow({
    *
    * @param {unknown} parentWin
    * @param {string} serverUrl
-   * @param {{ reason?: "preview-reconnect", onStarted?: () => void }} [options]
+   * @param {{ reason?: "preview-reconnect" }} [options]
    */
   function run(parentWin, serverUrl, options = {}) {
     // Re-attach: an in-flight console survives an SPA refresh (it's a shell
@@ -115,6 +117,7 @@ function createArcaConnectFlow({
       }
       try {
         if (!activeRun.win.isDestroyed()) {
+          activeRun.updateReason(options.reason);
           activeRun.win.show();
           activeRun.win.focus();
         }
@@ -135,6 +138,7 @@ function createArcaConnectFlow({
         minimizable: false,
         maximizable: false,
         fullscreenable: false,
+        resizable: false,
         show: false,
         title: options.reason === "preview-reconnect" ? "Reconnect Arca" : "Connect Arca",
         webPreferences: {
@@ -150,9 +154,21 @@ function createArcaConnectFlow({
       const consoleId = win.webContents.id;
       let phase = "asking";
       let loginAttempted = false;
-      let started = false;
       let connect = null;
       let settled = false;
+      const sendInit = (reason) => {
+        try {
+          if (win.isDestroyed()) return;
+          win.setTitle?.(reason === "preview-reconnect" ? "Reconnect Arca" : "Connect Arca");
+          win.webContents.send("arca-connect:init", {
+            serverUrl,
+            command: commandLine(serverUrl),
+            reason: reason ?? null,
+          });
+        } catch {
+          // Window torn down mid-send; the close handler settles the flow.
+        }
+      };
       const settle = (result) => {
         if (settled) return;
         settled = true;
@@ -170,14 +186,6 @@ function createArcaConnectFlow({
 
       const runCommand = (login = false) => {
         phase = "running";
-        if (!started) {
-          started = true;
-          try {
-            options.onStarted?.();
-          } catch {
-            // Recovery bookkeeping must not interrupt a consented command.
-          }
-        }
         connect = login
           ? startLogin(serverUrl)
           : startConnect(serverUrl, (text) => send("arca-connect:output", text));
@@ -215,6 +223,7 @@ function createArcaConnectFlow({
 
       consoles.set(consoleId, {
         win,
+        phase: () => phase,
         onConfirm: () => {
           if (phase === "auth-required") {
             loginAttempted = true;
@@ -257,17 +266,20 @@ function createArcaConnectFlow({
       // did-finish-load fires after the page's top-level script ran, so its
       // IPC listeners exist before init arrives (ready-to-show can race them).
       win.webContents.once("did-finish-load", () => {
-        send("arca-connect:init", {
-          serverUrl,
-          command: commandLine(serverUrl),
-          reason: options.reason ?? null,
-        });
+        sendInit(options.reason);
       });
       win.once("ready-to-show", () => {
         win.show();
       });
       void win.loadFile(pagePath);
-      activeRun = { win, promise: null, target: arcaTarget(serverUrl) };
+      activeRun = {
+        win,
+        promise: null,
+        target: arcaTarget(serverUrl),
+        updateReason: (reason) => {
+          if (phase === "asking") sendInit(reason);
+        },
+      };
     });
     if (activeRun) activeRun.promise = promise;
     return promise;

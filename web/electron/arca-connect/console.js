@@ -24,17 +24,20 @@ function resizeToContent() {
   });
 }
 
-void document.fonts?.ready.then(resizeToContent);
+void document.fonts?.ready.then(resizeToContent).catch(() => {});
 
 window.arcaConnect.onInit(({ serverUrl, command, reason }) => {
   // textContent only: the server URL is remote-influenced data.
   serverEl.textContent = serverUrl;
   commandEl.textContent = command;
-  if (reason === "preview-reconnect") {
-    titleEl.textContent = "Reconnect Arca for this preview?";
-    introEl.textContent = "To load this preview, run the command below over ";
-    confirmBtn.textContent = "Reconnect";
-  }
+  const reconnect = reason === "preview-reconnect";
+  titleEl.textContent = reconnect
+    ? "Reconnect Arca for this preview?"
+    : "Connect your Arca instance?";
+  introEl.textContent = reconnect
+    ? "To load this preview, run the command below over "
+    : "This runs the command below over ";
+  confirmBtn.textContent = reconnect ? "Reconnect" : "Connect";
   resizeToContent();
 });
 

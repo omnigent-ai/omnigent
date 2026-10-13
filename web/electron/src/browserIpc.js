@@ -298,28 +298,33 @@ function registerBrowserIpc({
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const navigate = () =>
-      g.registry.openOrNavigate(conversationId, url, bounds, {
+    const navigate = (registry) =>
+      registry.openOrNavigate(conversationId, url, bounds, {
         force: !!opts?.force,
         agent: !!opts?.agent,
         // The first-party renderer supplies the source-session host; main owns
         // the target and eligibility. Caller exception flags never establish identity.
         agentContext: opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null,
       });
-    let r = navigate();
-    if (
-      !r.ok &&
-      opts?.agent &&
-      (await recoverAgentNavigationForEvent(
-        event,
-        url,
-        opts?.sourceHostId,
-        opts?.rememberedArcaHostId,
-      ))
-    ) {
+    let r = navigate(g.registry);
+    let recovered = false;
+    if (!r.ok && opts?.agent) {
+      try {
+        recovered = await recoverAgentNavigationForEvent(
+          event,
+          url,
+          opts?.sourceHostId,
+          opts?.rememberedArcaHostId,
+        );
+      } catch {
+        recovered = false;
+      }
+    }
+    if (recovered) {
       // Recovery updates main-owned identity, so rebuild the context and ask
       // the registry to evaluate the same navigation once more.
-      r = navigate();
+      const refreshed = gateRegistry(event);
+      if (!refreshed.error) r = navigate(refreshed.registry);
     }
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.

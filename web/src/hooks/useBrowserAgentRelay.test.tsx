@@ -20,7 +20,7 @@ vi.mock("@/lib/sessionsApi", () => ({
   getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
 }));
 import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
-import { writeArcaHostId } from "@/lib/arcaHost";
+import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
@@ -318,6 +318,23 @@ describe("useBrowserAgentRelay — action dispatch", () => {
       },
     );
     expect(getSessionSlim.mock.calls.map(([id]) => id)).toEqual(["conv_background_A", "parent"]);
+  });
+
+  it("corrects a mismatched remembered Arca host after an authorized preview retry", async () => {
+    installBridge();
+    writeArcaHostId("remembered-host-a");
+    setSessionHost("conv_background_A", "actual-arca-host-b");
+    getSessionSlim.mockResolvedValue({
+      id: "conv_background_A",
+      hostId: "actual-arca-host-b",
+      parentSessionId: null,
+    });
+
+    await runAction(actionEvent("navigate", { url: "http://localhost:5173" }), {
+      source: "conv_background_A",
+    });
+
+    expect(readArcaHostId()).toBe("actual-arca-host-b");
   });
 
   it("loads a child's own host before granting eligibility from a parent-list hint", async () => {

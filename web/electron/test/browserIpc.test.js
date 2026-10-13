@@ -149,6 +149,56 @@ describe("browser IPC Arca context", () => {
     assert.equal(navigations, 1);
   });
 
+  it("returns a structured denial when recovery rejects", async () => {
+    const ipcMain = makeIpcMain();
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        openOrNavigate: () => ({ ok: false, error: "blocked", created: false }),
+      }),
+      recoverAgentNavigationForEvent: async () => {
+        throw new Error("recovery failed");
+      },
+    });
+
+    const result = await ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "source",
+        url: "http://localhost:5173",
+        opts: { agent: true, sourceHostId: "arca-host", rememberedArcaHostId: "arca-host" },
+      },
+    );
+    assert.deepEqual(result, { ok: false, created: false, error: "blocked" });
+  });
+
+  it("re-gates the sender registry after awaited recovery", async () => {
+    const ipcMain = makeIpcMain();
+    let registryCalls = 0;
+    const first = { openOrNavigate: () => ({ ok: false, error: "blocked" }) };
+    const second = { openOrNavigate: () => ({ ok: true, created: false }) };
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => (++registryCalls === 1 ? first : second),
+      recoverAgentNavigationForEvent: async () => true,
+    });
+
+    const result = await ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "source",
+        url: "http://localhost:5173",
+        opts: { agent: true, sourceHostId: "arca-host", rememberedArcaHostId: "arca-host" },
+      },
+    );
+    assert.equal(result.ok, true);
+    assert.equal(registryCalls, 2);
+  });
+
   it("pairs the renderer's source host with main's context and ignores caller exception flags", () => {
     const ipcMain = makeIpcMain();
     const calls = [];
