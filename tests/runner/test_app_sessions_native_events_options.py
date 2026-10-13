@@ -2585,6 +2585,47 @@ async def test_events_claude_command_refused_by_the_pane_says_what_to_clear(
 
 
 @pytest.mark.asyncio
+async def test_events_claude_command_unexpected_error_stays_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unexpected failure keeps the generic, client-safe detail.
+
+    Only a pending prompt or a terminal dialog earns a specific message; any
+    other exception falls back to the sanitized detail so raw ``str(exc)``
+    text — absolute paths, internal hostnames, PIDs — never reaches the caller.
+    """
+    sensitive = "SECRET-/srv/internal-host-7f3a9c pid=424242"
+
+    def _raise_unexpected(bridge_dir: Any, **kwargs: Any) -> None:
+        """Fail with text that must not leak into the response."""
+        del bridge_dir, kwargs
+        raise RuntimeError(sensitive)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _raise_unexpected)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    session_id = uuid.uuid4().hex
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "model_change", "model": "claude-opus-4-7"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["error"] == "claude_native_model_failed"
+    detail = body["detail"]
+    assert detail.strip(), f"the fallback must still return a detail: {body!r}"
+    assert sensitive not in detail, f"raw exception text leaked to the client: {detail!r}"
+
+
+@pytest.mark.asyncio
 async def test_events_model_change_on_non_native_session_is_204_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
