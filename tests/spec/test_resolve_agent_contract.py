@@ -18,6 +18,7 @@ def _resolve_procedures() -> str:
         [
             build_instructions(spec, None, []),
             skills["resolve-inputs"],
+            skills["resolve-investigate"],
             resource("resolve-inputs", "review-remediation.md"),
             resource("resolve-inputs", "ticket-only.md"),
             resource("resolve-inputs", "reproduction.md"),
@@ -236,10 +237,13 @@ def test_output_outcomes_include_repro_audit_blockers() -> None:
         "`needs_more_info`",
         "reliable reproduction",
         "evidence is unsafe",
-        "intended behavior is ambiguous",
+        "required inputs/authorization are missing",
         "setup/environment blocks verification",
     ):
         assert requirement in outcomes
+
+    assert "unresolved design choice is `partially_fixed`" in outcomes
+    assert "choice in `remaining_work`" in outcomes
 
 
 def test_repro_audit_preserves_non_repro_mode_contracts() -> None:

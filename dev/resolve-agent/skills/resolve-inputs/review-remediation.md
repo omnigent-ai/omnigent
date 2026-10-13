@@ -10,8 +10,11 @@ and candidate-PR discovery instructions below.
    current checks, Polly and OCR feedback, and recent failed job logs. Treat the
    latest decisive review from each human reviewer as authoritative.
 3. Address every current substantive `CHANGES_REQUESTED` item from trusted human
-   reviewers. If a request is ambiguous, contradictory, unsafe, or requires
-   product judgment, explain the blocker on the PR and stop.
+   reviewers. Use `resolve-investigate` for ambiguous intent or product judgment
+   and put a supported proposal on this PR. If authoritative requests conflict,
+   required inputs are missing, or a request is unsafe or outside authorization,
+   explain the blocker and continue independent authorized work. Do not dismiss
+   or silently override human reviews.
 4. Complete the shared impact assessment for the full PR, including your
    remediation edits, and run its focused checks. Commit as
    `omni-resolve-agent[bot]`, and push directly to the existing PR branch using

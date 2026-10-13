@@ -436,10 +436,9 @@ def test_interjected_answer_starts_worked_fold_expanded(
 
     Native harnesses can persist a user steering message inside the response
     already doing work. The assistant may answer that message, resume its prior
-    work, and finish with a separate wrap-up. The ordinary process/final split
-    puts the intermediate answer inside the ``Worked`` disclosure; it must start
-    open so the answer is visible, while preserving the user's ability to close
-    the disclosure.
+    work, and finish with a separate wrap-up. Each work run starts expanded
+    because the response contains an interjection. All assistant messages stay
+    visible when either disclosure closes.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server.
@@ -507,31 +506,38 @@ def test_interjected_answer_starts_worked_fold_expanded(
         has=page.get_by_text("Merge complete.", exact=True),
     ).first
     expect(continuation).to_be_visible(timeout=20_000)
-    fold = continuation.locator(_FOLD)
-    expect(fold).to_be_visible()
-    trigger = fold.locator('[data-slot="collapsible-trigger"]').first
-    expect(trigger).to_have_attribute("aria-expanded", "true")
+    folds = continuation.locator(_FOLD)
+    expect(folds).to_have_count(2)
+    first_trigger = folds.nth(0).locator('[data-slot="collapsible-trigger"]').first
+    second_trigger = folds.nth(1).locator('[data-slot="collapsible-trigger"]').first
+    expect(first_trigger).to_have_attribute("aria-expanded", "true")
+    expect(second_trigger).to_have_attribute("aria-expanded", "true")
+    expect(continuation.get_by_text("Checking the overlap.", exact=True)).to_be_visible()
     expect(continuation.get_by_text("No code conflict.", exact=True)).to_be_visible()
 
-    trigger.click()
-    expect(trigger).to_have_attribute("aria-expanded", "false")
-    expect(continuation.get_by_text("No code conflict.", exact=True)).to_be_hidden()
+    first_trigger.click()
+    expect(first_trigger).to_have_attribute("aria-expanded", "false")
+    expect(second_trigger).to_have_attribute("aria-expanded", "true")
+    second_trigger.click()
+    expect(second_trigger).to_have_attribute("aria-expanded", "false")
+    expect(continuation.get_by_text("Checking the overlap.", exact=True)).to_be_visible()
+    expect(continuation.get_by_text("No code conflict.", exact=True)).to_be_visible()
     expect(continuation.get_by_text("Merge complete.", exact=True)).to_be_visible()
 
 
-def test_stepwise_step_edges_fold_once(
+def test_stepwise_step_edges_keep_one_bubble_with_three_work_folds(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
     """
-    A codex goal-mode turn folds once despite per-step status edges.
+    A codex goal-mode turn stays in one bubble despite per-step status edges.
 
     Goal mode publishes a DISTINCT response id on every step's
     running/idle edge while all conversation items carry ONE thread id.
     Each between-step idle used to settle a per-step bubble, so a
-    multi-step goal grew one "Worked for" fold per step and the folds
-    flickered while later steps ran. The whole thread must render as one
-    bubble that folds exactly once when the goal settles.
+    multi-step goal grew one bubble per step and the folds flickered while
+    later steps ran. The whole thread must render as one bubble, with one
+    stable work disclosure for each step after the goal settles.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server.
@@ -583,7 +589,10 @@ def test_stepwise_step_edges_fold_once(
 
     expect(page.locator(_FOLD).first).to_be_visible(timeout=15_000)
     assert page.locator(_ASSISTANT_BUBBLE).count() == 1
-    assert page.locator(_FOLD).count() == 1
+    expect(page.locator(_FOLD)).to_have_count(3)
+    for step in (1, 2, 3):
+        expect(page.get_by_text(f"Step {step}: narration.", exact=True)).to_be_visible()
+    expect(page.get_by_text("All three steps are done.", exact=True)).to_be_visible()
 
 
 def test_distinct_item_rids_fold_once_per_user_message(

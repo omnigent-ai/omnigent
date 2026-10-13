@@ -12,17 +12,24 @@ per-family provider. Unknown harnesses fall back to the generic host walk
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from omnigent.errors import OmnigentError
-from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
+from omnigent.spec.parser import (
+    _discover_skills,
+    _parse_skill,
+    discover_host_skills,
+    skill_matches_names,
+)
 from omnigent.spec.types import AgentSpec, SkillSpec
 
 _log = logging.getLogger(__name__)
@@ -89,7 +96,7 @@ class SkillSourceContext:
         the terminal, which honors ``$CODEX_HOME`` for its skills.
     :param is_native: Whether the session's harness is a native CLI harness.
         Set by :func:`resolve_harness_skills` from the harness id. Gates the
-        terminal-matching resolution (config-home tiers, ``.agents`` exclusion)
+        terminal-matching resolution (including config-home tiers)
         so it applies only to native harnesses, never the in-process SDK ones.
     """
 
@@ -168,16 +175,19 @@ def _claude_user_dir(ctx: SkillSourceContext) -> Path:
     return ctx.home / ".claude"
 
 
-def _claude_code_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+def _claude_code_skills(
+    ctx: SkillSourceContext, dotdir: Literal[".claude", ".agents"] = ".claude"
+) -> list[SkillSpec]:
     """
-    The skill tiers Claude Code itself loads, and no others.
+    Discover standalone skills for Claude, workspace-first then user-global.
 
-    Claude Code reads workspace/ancestor ``.claude/skills`` plus the user
-    tier ``$CLAUDE_CONFIG_DIR/skills`` (default ``~/.claude/skills``). It
-    does NOT read ``.agents/skills`` (live-verified against its slash
-    menu), so the generic host walk over-reports for this family: a menu
-    entry the CLI can't expand just fails, since a native session sends
-    ``/name`` to the CLI as plaintext.
+    Claude reads ``.claude/skills`` itself; Omnigent exposes ``.agents/skills``
+    through a session-local additional directory at launch. Both use this
+    scanner so launch selection and the menu agree.
+
+    :param ctx: Discovery roots, user home and skill filter.
+    :param dotdir: Native Claude skills or portable skills to bridge.
+    :returns: Skills with the nearest occurrence of each name winning.
     """
     if ctx.skills_filter == "none":
         return []
@@ -193,23 +203,32 @@ def _claude_code_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         seen_dirs.add(candidate)
         dirs.append(candidate)
 
-    # Workspace-first: each root's .claude/skills, then its ancestors'.
-    for root in ctx.roots:
+    # Only workspace ancestors are skill sources; materialized bundles are local-only.
+    roots = ctx.roots[:1] if dotdir == ".claude" else ctx.roots
+    bundle_root = ctx.bundle_dir.resolve() if dotdir == ".agents" and ctx.bundle_dir else None
+    for index, root in enumerate(roots):
         current = root.resolve()
         while True:
-            _add(current / ".claude" / "skills")
+            _add(current / dotdir / "skills")
             parent = current.parent
-            if parent == current:
+            if index > 0 or parent == current or current == bundle_root:
                 break
             current = parent
     # User tier last, so a workspace skill wins a name collision.
-    _add(_claude_user_dir(ctx) / "skills")
+    user_dir = _claude_user_dir(ctx) if dotdir == ".claude" else ctx.home / dotdir
+    _add(user_dir / "skills")
 
     out: list[SkillSpec] = []
     for skills_dir in dirs:
         skipped: list[str] = []
         for spec in _discover_skills(skills_dir, skipped=skipped):
-            if filter_names is not None and spec.name not in filter_names:
+            # Portable command names become directory names in the launch overlay.
+            if dotdir == ".agents" and not re.fullmatch(r"[A-Za-z0-9_-]{1,255}", spec.name):
+                _log.warning(
+                    "Skipping portable skill with invalid command name: %s", spec.skill_dir
+                )
+                continue
+            if filter_names is not None and not skill_matches_names(spec, filter_names):
                 continue
             out.append(spec)
         # Surface dropped skills so a missing command is diagnosable.
@@ -377,8 +396,15 @@ def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
     return enabled | _managed_plugin_keys(ctx)
 
 
-def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[str, Path]:
-    """Map ``<plugin>@<marketplace>`` → installPath for enabled+installed plugins."""
+def _plugin_asset_id(key: str, kind: str, source: str = "") -> str:
+    """Stable inventory identity without exposing a plugin asset's filesystem path."""
+    return hashlib.sha256(json.dumps([key, kind, source]).encode()).hexdigest()
+
+
+def _plugin_install_paths(
+    ctx: SkillSourceContext, enabled: set[str] | None = None
+) -> dict[str, Path]:
+    """Map installed plugin keys to trusted paths, optionally filtering by enablement."""
     data = _read_json(_claude_user_dir(ctx) / "plugins" / "installed_plugins.json")
     if data is None:
         return {}
@@ -392,7 +418,7 @@ def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[st
     plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
     out: dict[str, Path] = {}
     for key, entries in plugins.items():
-        if key not in enabled or not isinstance(entries, list):
+        if (enabled is not None and key not in enabled) or not isinstance(entries, list):
             continue
         # A plugin may have multiple scope entries (user/project); take the
         # first one carrying a usable installPath rather than assuming it's
@@ -442,7 +468,7 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         plugin = key.split("@", 1)[0]
         skipped: list[str] = []
         for spec in _discover_skills(install_path / "skills", skipped=skipped):
-            if filter_names is not None and spec.name not in filter_names:
+            if filter_names is not None and not skill_matches_names(spec, filter_names):
                 continue
             out.append(replace(spec, name=f"{plugin}:{spec.name}"))
         # Surface dropped skills with the plugin key so a missing command is
@@ -452,22 +478,44 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return out
 
 
+def select_claude_portable_skills(
+    portable: list[SkillSpec], native: list[SkillSpec]
+) -> list[SkillSpec]:
+    """Keep native names/aliases and one portable spelling per case-insensitive name."""
+    seen = {skill.name.casefold() for skill in native}
+    seen.update(skill.skill_dir.name.casefold() for skill in native if skill.skill_dir)
+    selected: list[SkillSpec] = []
+    for skill in portable:
+        name = skill.name.casefold()
+        if name not in seen:
+            seen.add(name)
+            selected.append(skill)
+    return selected
+
+
 def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
-    Claude host skills, gated by native vs SDK, plus enabled plugins.
+    Claude host skills plus enabled plugins.
 
-    A native ``claude-native`` session types ``/name`` into the Claude CLI
-    as plaintext, so its menu must mirror exactly the tiers that CLI loads
-    (:func:`_claude_code_skills`: ``.claude/skills`` and the
-    ``$CLAUDE_CONFIG_DIR`` user tier, never ``.agents``). The in-process
-    ``claude-sdk`` harness has no such terminal to match, so it keeps the
-    generic host walk it used before this scoping — the terminal-matching
-    behavior only affects native harnesses. Enabled plugin slash-commands are
-    added in both cases (config-dir-resolved for native, ``~/.claude`` for SDK
-    via :func:`_claude_user_dir`).
+    Native Claude loads its own tiers before the bridged ``.agents`` skills,
+    so an existing Claude command wins a collision. SDK discovery retains
+    the generic host walk.
     """
-    walk = _claude_code_skills if ctx.is_native else _generic_host_skills
-    return walk(ctx) + _claude_plugin_skills(ctx)
+    if ctx.is_native:
+        # Claude still loads every native skill when a named subset is requested.
+        native_ctx = (
+            replace(ctx, skills_filter="all") if isinstance(ctx.skills_filter, list) else ctx
+        )
+        native = _claude_code_skills(native_ctx)
+        standalone = [
+            skill
+            for skill in native
+            if not isinstance(ctx.skills_filter, list)
+            or skill_matches_names(skill, ctx.skills_filter)
+        ] + select_claude_portable_skills(_claude_code_skills(ctx, ".agents"), native)
+    else:
+        standalone = _generic_host_skills(ctx)
+    return standalone + _claude_plugin_skills(ctx)
 
 
 def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
@@ -668,10 +716,12 @@ def antigravity_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
                 spec = _parse_skill(child / "SKILL.md")
             except (OmnigentError, OSError):  # best-effort discovery
                 continue
-            name = spec.name if namespace is None else f"{namespace}:{spec.name}"
+            # agy is not confirmed to invoke by directory, so keep its frontmatter-name keying.
+            base = spec.display_name or spec.name
+            name = base if namespace is None else f"{namespace}:{base}"
             if filter_names is not None and name not in filter_names:
                 continue
-            out.append(spec if namespace is None else replace(spec, name=name))
+            out.append(replace(spec, name=name, display_name=None))
     return out
 
 

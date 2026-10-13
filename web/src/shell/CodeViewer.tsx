@@ -10,18 +10,22 @@
 //   Existing comments highlight the lines they span. Clicking inside a
 //   highlighted range navigates to that comment in CommentsPanel.
 
-import type { FilePosition } from "./FileViewerContext";
+import { useFileViewer, type FilePosition } from "./FileViewerContext";
 import { isFilePositionPending } from "./filePositionState";
 import { createPortal } from "react-dom";
+import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
 import {
+  createContext,
   isValidElement,
   lazy,
   Suspense,
   useCallback,
+  useContext,
   useEffect,
   useMemo,
   useRef,
   useState,
+  type ComponentPropsWithoutRef,
   type ReactNode,
   type RefObject,
   type UIEvent,
@@ -57,6 +61,7 @@ import {
 import { useCanEdit } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
+import { isWorkspaceRelativeSrc, resolveWorkspacePath } from "./TipTapWorkspaceImage";
 import {
   type ActiveSelection,
   type SaveStatus,
@@ -170,7 +175,61 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
 // which does win the cascade — for the one image being rendered. This runs
 // after sanitize (React components render the already-sanitized tree), so it
 // adds no attack surface. Only literal integer pixel values are forwarded.
+// Path of the previewed file, so a relative link resolves against its directory.
+const MarkdownPreviewPathContext = createContext<string | null>(null);
+
+/**
+ * Anchor for the Markdown preview. A link to another workspace file (`notes.md`,
+ * `../docs/`) opens in the FileViewer: as a plain anchor the browser resolves it
+ * against the app URL (`/c/<id>` → `/c/notes.md`) and loads a session that
+ * doesn't exist. URLs, `mailto:` and in-page `#` links keep their href.
+ */
+function MarkdownPreviewLink({
+  href,
+  children,
+  node: _node,
+  ...props
+}: ComponentPropsWithoutRef<"a"> & { node?: unknown }) {
+  const openFile = useFileViewer();
+  const filePath = useContext(MarkdownPreviewPathContext);
+  if (!href || href.startsWith("#") || !isWorkspaceRelativeSrc(href)) {
+    return (
+      <a href={href} {...props}>
+        {children}
+      </a>
+    );
+  }
+  const target = filePath === null ? "" : resolveWorkspacePath(filePath, href);
+  if (!openFile || !target) {
+    return (
+      <span className={props.className} title={href}>
+        {children}
+      </span>
+    );
+  }
+  // No href, so a modified or middle click can't open the bogus app URL either.
+  return (
+    <a
+      {...props}
+      role="button"
+      tabIndex={0}
+      title={props.title ?? href}
+      className={cn("cursor-pointer", props.className)}
+      onClick={() => openFile(target)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          openFile(target);
+        }
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
 const MARKDOWN_COMPONENTS: Components = {
+  a: MarkdownPreviewLink,
   pre({ children, ...props }) {
     const child = isValidElement(children) ? children : null;
     if (
@@ -197,12 +256,15 @@ const MARKDOWN_COMPONENTS: Components = {
 
 function MarkdownPreview({
   content,
+  path,
   rootRef,
   onScroll,
   tocOpen,
   onTocOpenChange,
 }: {
   content: string;
+  /** Workspace path of the previewed file, e.g. ``"docs/README.md"``. */
+  path: string | null;
   rootRef?: RefObject<HTMLDivElement | null>;
   onScroll?: (event: UIEvent<HTMLElement>) => void;
   tocOpen: boolean;
@@ -220,13 +282,15 @@ function MarkdownPreview({
         onScroll={onScroll}
         className="markdown-preview flex-1 px-6 py-4 overflow-auto prose dark:prose-invert prose-sm max-w-none"
       >
-        <ReactMarkdown
-          remarkPlugins={MARKDOWN_REMARK_PLUGINS}
-          rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
-          components={MARKDOWN_COMPONENTS}
-        >
-          {rendered}
-        </ReactMarkdown>
+        <MarkdownPreviewPathContext.Provider value={path}>
+          <ReactMarkdown
+            remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+            rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+            components={MARKDOWN_COMPONENTS}
+          >
+            {rendered}
+          </ReactMarkdown>
+        </MarkdownPreviewPathContext.Provider>
       </div>
       {tocOpen && (
         <aside className="w-64 shrink-0">
@@ -248,6 +312,7 @@ function MarkdownPreview({
 // recompute when the rendered document changes.
 function PreviewWithSearch({
   content,
+  path,
   isNotebook,
   truncated,
   searchOpen,
@@ -260,6 +325,8 @@ function PreviewWithSearch({
   commentHint,
 }: {
   content: string;
+  /** Workspace path of the previewed file, for resolving relative links. */
+  path: string | null;
   isNotebook: boolean;
   truncated: boolean;
   searchOpen: boolean;
@@ -296,6 +363,7 @@ function PreviewWithSearch({
   ) : (
     <MarkdownPreview
       content={content}
+      path={path}
       rootRef={previewRef}
       onScroll={handleScroll}
       tocOpen={tocOpen}
@@ -417,6 +485,11 @@ export interface CodeViewerProps {
   panelOpen: boolean;
   searchOpen: boolean;
   setSearchOpen: (open: boolean) => void;
+  /**
+   * Bumped by FileViewer on each Cmd+F. Forwarded to the Monaco editor so a
+   * press with the find widget already open refocuses its input.
+   */
+  searchFocusNonce?: number;
   searchInputRef: RefObject<HTMLInputElement | null>;
   viewMode: "editor" | "preview" | "source" | "diff";
   onDirtyChange?: (isDirty: boolean) => void;
@@ -452,6 +525,7 @@ export function CodeViewer({
   panelOpen,
   searchOpen,
   setSearchOpen,
+  searchFocusNonce,
   searchInputRef,
   viewMode,
   onDirtyChange,
@@ -512,8 +586,18 @@ export function CodeViewer({
   // Non-markdown files render in Monaco (read-only or editable by permission);
   // markdown keeps TipTap (editor) / Shiki (source) and HTML keeps its preview.
   const showMonaco = lang !== "markdown" && viewMode !== "preview";
-  // Only the Shiki DOM path needs the per-line split; skip it in Monaco mode.
-  const rawLines = useMemo(() => (showMonaco ? [] : content.split("\n")), [content, showMonaco]);
+  // HTML, markdown, and notebook previews render through their own surfaces and
+  // never read the Shiki tokens, so skipping them avoids a wasted full-file pass.
+  const isHtmlPreview = viewMode === "preview" && lang === "html";
+  const isMarkdownOrNotebookPreview =
+    viewMode === "preview" && (lang === "markdown" || isNotebookPath(path));
+  const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview;
+  // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
+  // rendered previews, which never render these lines.
+  const rawLines = useMemo(
+    () => (showMonaco || isRenderedPreview ? [] : content.split("\n")),
+    [content, showMonaco, isRenderedPreview],
+  );
 
   const revealedPositionRef = useRef<FilePosition | undefined>(undefined);
   useEffect(() => {
@@ -546,6 +630,12 @@ export function CodeViewer({
   useEffect(() => {
     if (showMonaco) return; // Monaco does its own highlighting.
     if (viewMode === "editor" && lang === "markdown") return;
+    if (isRenderedPreview) {
+      // Drop stale tokens so a later switch to source view can't briefly render
+      // the previous file's highlighted text.
+      setTokenLines(null);
+      return;
+    }
     let cancelled = false;
     setTokenLines(null);
     if (!content) return;
@@ -556,7 +646,7 @@ export function CodeViewer({
     return () => {
       cancelled = true;
     };
-  }, [content, lang, viewMode, showMonaco]);
+  }, [content, lang, viewMode, showMonaco, isRenderedPreview]);
 
   // Scroll to the line containing the active selection when it changes
   // (e.g. user clicked a comment in the panel).
@@ -839,7 +929,7 @@ export function CodeViewer({
   // HTML preview gets its own comment-enabled viewer (selection capture +
   // highlights relayed over a bridge into the still-sandboxed iframe), so it
   // owns the truncated banner internally.
-  if (viewMode === "preview" && lang === "html") {
+  if (isHtmlPreview) {
     return (
       <HtmlCommentViewer
         conversationId={conversationId}
@@ -852,11 +942,12 @@ export function CodeViewer({
     );
   }
 
-  if (viewMode === "preview" && (lang === "markdown" || isNotebookPath(path))) {
+  if (isMarkdownOrNotebookPreview) {
     const isNotebook = isNotebookPath(path);
     return (
       <PreviewWithSearch
         content={content}
+        path={path}
         isNotebook={isNotebook}
         truncated={truncated}
         searchOpen={searchOpen}
@@ -894,6 +985,7 @@ export function CodeViewer({
           onDirtyChange={onDirtyChange}
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}
+          searchFocusNonce={searchFocusNonce}
           onSearchHandled={handleSearchHandled}
           comments={comments}
           activeSelection={activeSelection}
@@ -1151,7 +1243,7 @@ export function CodeViewer({
             <button
               data-add-comment-btn
               type="button"
-              className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+              className={ADD_COMMENT_BUTTON_CLASS_NAME}
               onClick={() => {
                 onSetActiveSelection({
                   start_index: selectionAnchor.start_index,

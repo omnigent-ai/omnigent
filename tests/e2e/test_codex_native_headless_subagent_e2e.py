@@ -29,12 +29,7 @@ credential)::
 from __future__ import annotations
 
 import os
-import secrets
 import shutil
-import signal
-import socket
-import subprocess
-import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -42,6 +37,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -81,12 +77,6 @@ _STARTUP_TIMEOUT_MARKER = "startup timed out"
 _THREAD_NEVER_STARTED_MARKER = "never started a thread"
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 # Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars
 # that must not intercept loopback requests to the spawned server.
 _client = httpx.Client(trust_env=False)
@@ -96,15 +86,6 @@ _client = httpx.Client(trust_env=False)
 # proxy at import time.
 for _var in ("NO_PROXY", "no_proxy"):
     os.environ[_var] = ",".join(filter(None, [os.environ.get(_var, ""), "127.0.0.1,localhost"]))
-
-
-def _no_proxy_env() -> dict[str, str]:
-    """Ambient env with loopback excluded from any forced HTTP(S) proxy."""
-    env = os.environ.copy()
-    for var in ("NO_PROXY", "no_proxy"):
-        existing = env.get(var, "")
-        env[var] = ",".join(filter(None, [existing, "127.0.0.1,localhost"]))
-    return env
 
 
 @pytest.fixture
@@ -124,108 +105,34 @@ def credential_less_codex_rig(
     if shutil.which("codex") is None:
         pytest.skip("codex CLI is required for the codex-native headless repro")
 
-    from omnigent.runner.identity import token_bound_runner_id
-
     work = tmp_path_factory.mktemp("codex_headless_subagent")
     config_home = work / "config-home"
     codex_home = work / "codex-home"
-    home_dir = work / "home"
     state_dir = work / "codex-native-state"
-    artifacts = work / "artifacts"
-    for path in (config_home, codex_home, home_dir, state_dir, artifacts):
-        path.mkdir(parents=True, exist_ok=True)
-
-    port = _free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    binding_token = secrets.token_urlsafe(32)
-    runner_id = token_bound_runner_id(binding_token)
-
-    shared_env = {
-        **_no_proxy_env(),
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+    for path in (config_home, codex_home, state_dir):
+        path.mkdir(parents=True)
+    base_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"PATH", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
+    }
+    env = {
         "OMNIGENT_CONFIG_HOME": str(config_home),
         "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
         "CODEX_HOME": str(codex_home),
-        "HOME": str(home_dir),
     }
-    server_env = {**shared_env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}
-    runner_env = {
-        **shared_env,
-        "OMNIGENT_RUNNER_ID": runner_id,
-        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-        "RUNNER_SERVER_URL": base_url,
-    }
-
-    server_log = work / "server.log"
-    runner_log = work / "runner.log"
-    server_handle = server_log.open("w")
-    runner_handle = runner_log.open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
-    runner_proc: subprocess.Popen[bytes] | None = None
-    try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                f"sqlite:///{work}/test.db",
-                "--artifact-location",
-                str(artifacts),
-            ],
-            env=server_env,
-            stdout=server_handle,
-            stderr=subprocess.STDOUT,
-            cwd=str(_REPO_ROOT),
-        )
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=runner_env,
-            stdout=runner_handle,
-            stderr=subprocess.STDOUT,
-            cwd=str(_REPO_ROOT),
-        )
-
-        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        online = False
-        while time.monotonic() < deadline:
-            if server_proc.poll() is not None or runner_proc.poll() is not None:
-                break
-            try:
-                if _client.get(f"{base_url}/health", timeout=2).status_code == 200:
-                    status = _client.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
-                    if status.status_code == 200 and status.json().get("online"):
-                        online = True
-                        break
-            except httpx.HTTPError:
-                pass
-            time.sleep(0.5)
-        if not online:
-            raise RuntimeError(
-                "credential-less codex rig did not come online within "
-                f"{_HEALTH_TIMEOUT_S:.0f}s.\nServer log:\n{server_log.read_text()[-3000:]}\n"
-                f"Runner log:\n{runner_log.read_text()[-3000:]}"
-            )
-        yield (base_url, runner_id, runner_log)
-    finally:
-        for proc in (runner_proc, server_proc):
-            if proc is not None and proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-        for proc in (runner_proc, server_proc):
-            if proc is not None:
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
-        server_handle.close()
-        runner_handle.close()
+    with server_runner(
+        work,
+        server_cwd=_REPO_ROOT,
+        base_env=base_env,
+        server_env=env,
+        health_timeout=_HEALTH_TIMEOUT_S,
+        poll_interval=0.5,
+        wait_ready=False,
+    ) as stack:
+        # Preserve cwd fallback: this rig has no runner-wide workspace.
+        stack.start_runner(cwd=_REPO_ROOT, env={**env, "OMNIGENT_RUNNER_WORKSPACE": None})
+        yield stack.base_url, stack.runner_id, stack.log_path("runner")
 
 
 def _spec_bundle() -> bytes:

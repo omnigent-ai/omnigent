@@ -18,7 +18,9 @@ from omnigent.harnesses.claude_native.bridge import (
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
     ClaudeSignInPending,
+    ClaudeTerminalDialog,
     ClaudeTerminalExited,
+    ClaudeUserPromptPending,
     TmuxSessionNotAdvertised,
     cancellable_injection,
     inject_slash_command,
@@ -288,6 +290,27 @@ class ClaudeNativeExecutor(Executor):
                 remediation=exc.remediation,
                 undelivered=True,
             )
+            return
+        except ClaudeTerminalDialog as exc:
+            # The pane is parked on a surface the person clears from the
+            # embedded terminal; reaping it would destroy that. Both raisers
+            # (the readiness gate, and the slash-command refusal ahead of a
+            # routed /model) fail before the first keystroke, so the sender's
+            # queued copy is the only record of the message.
+            _logger.warning(
+                "claude-native: terminal surface blocks delivery; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            return
+        except ClaudeUserPromptPending as exc:
+            # A question or permission prompt held the message before its submit
+            # Enter; the pane stays for the person to answer it.
+            _logger.warning(
+                "claude-native: pending Claude prompt blocks delivery; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc), undelivered=True)
             return
         except RuntimeError as exc:
             _logger.exception(

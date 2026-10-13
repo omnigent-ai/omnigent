@@ -244,6 +244,35 @@ def test_refresh_effort_prefers_pushed_settings_effort_over_stale_config(
     assert state.effort == "low"
 
 
+def test_refresh_effort_retries_a_rewrite_that_races_the_first_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-value rewrite during the baseline read still retries the mirror next pass."""
+    config = _write_codex_config(tmp_path, 'model_reasoning_effort = "low"\n')
+    state = fwd._CodexForwarderState()
+    real_read = fwd.read_codex_config_effort
+
+    def _read_then_rewrite(bridge_dir: Path) -> str | None:
+        value = real_read(bridge_dir)
+        replacement = config.with_name("config.toml.new")
+        replacement.write_text('model_reasoning_effort = "low"\n')
+        replacement.replace(config)
+        return value
+
+    monkeypatch.setattr(fwd, "read_codex_config_effort", _read_then_rewrite)
+    fwd._refresh_effort_from_config(tmp_path, state)
+    monkeypatch.setattr(fwd, "read_codex_config_effort", real_read)
+    state.posted_effort_known = True
+
+    fwd._refresh_effort_from_config(tmp_path, state)
+
+    assert state.posted_effort_known is False
+    state.posted_effort_known = True
+    fwd._refresh_effort_from_config(tmp_path, state)
+    # An unchanged file does not repeat the mirror.
+    assert state.posted_effort_known is True
+
+
 def test_refresh_effort_noop_when_config_has_no_effort(tmp_path: Path) -> None:
     """A config.toml without an effort key preserves the prior value.
 

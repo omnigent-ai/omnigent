@@ -92,7 +92,9 @@ async def test_owner_gets_host_inventory(
         response = await task
     assert response.status_code == status
     if status == 200:
-        assert response.json() == {"mcp_servers": [{**_GITHUB, "plugin": None, "url_host": None}]}
+        assert response.json() == {
+            "mcp_servers": [{**_GITHUB, "plugin": None, "url_host": None, "source_id": None}]
+        }
     assert not conn.pending_mcp_servers
 
 

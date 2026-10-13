@@ -51,9 +51,10 @@ live facet, the **exact fail reason** — the "from" half of your fail→pass pr
 
 ### 2B.2 — Root-cause
 
-Find *why* the test fails. Read the code the journey and `evidence` point at. Use
-repro-agent's root-cause leads as hypotheses, but confirm them against the code.
-State the root cause concretely before you change anything.
+Apply `resolve-investigate`: match the reported path and configuration, check
+competing explanations, and find the historical rationale. State the supported
+cause before editing. If policy must change, distinguish that proposal from
+repairing an implementation defect and retain unresolved choices for PR review.
 
 ### 2B.3 — Implement the fix
 
@@ -62,6 +63,12 @@ surrounding conventions, as small as the root cause allows. Do not touch the tes
 to make it pass; the *code* must change to satisfy it.
 
 ### 2B.4 — Select permanent regression coverage
+
+Read `tests/README.md` and `tests/_helpers/README.md` in the product checkout
+before writing setup (or nearby fixtures when that repository has no catalog).
+Follow its API examples and the selection policy below. In `test_audit`, name
+the nearest test/helper considered, explain any new setup, and report permanent
+test/support additions and deletions including helper changes.
 
 Choose which tests belong in the final PR. Search existing tests by behavior
 and fixture, and read the nearest scenarios. If one already drives the relevant

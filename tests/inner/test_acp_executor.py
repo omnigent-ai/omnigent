@@ -31,6 +31,7 @@ from omnigent.inner.acp_executor import (
     AcpAgentConfig,
     AcpExecutor,
     _is_auth_required_error,
+    _resolve_cwd,
     _unattended_auth_method_id,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -2616,3 +2617,129 @@ async def test_model_reset_without_configured_default_restores_initial_agent_mod
         "model-a",
     ]
     assert ex._active_model == "model-a"
+
+
+# ---------------------------------------------------------------------------
+# _resolve_cwd: deleted-directory guard
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_cwd_explicit_missing_raises_with_path(tmp_path: Path) -> None:
+    """An explicit cwd that no longer exists raises RuntimeError naming the path."""
+    missing = str(tmp_path / "gone")
+    with pytest.raises(RuntimeError, match="gone"):
+        _resolve_cwd(missing)
+
+
+def test_resolve_cwd_explicit_valid_returns_unchanged(tmp_path: Path) -> None:
+    """An explicit cwd that exists is returned as-is."""
+    assert _resolve_cwd(str(tmp_path)) == str(tmp_path)
+
+
+def test_resolve_cwd_none_returns_process_cwd(tmp_path: Path) -> None:
+    """No explicit cwd returns the current process working directory."""
+    with patch("omnigent.inner.acp_executor.os.getcwd", return_value=str(tmp_path)):
+        result = _resolve_cwd(None)
+    assert result == str(tmp_path)
+
+
+def test_resolve_cwd_deleted_process_cwd_raises_clear_error() -> None:
+    """No explicit cwd and a deleted process cwd raises RuntimeError with a message."""
+    with patch(
+        "omnigent.inner.acp_executor.os.getcwd",
+        side_effect=FileNotFoundError(2, "No such file or directory"),
+    ):
+        with patch(
+            "omnigent.inner.acp_executor.os.readlink", return_value="/deleted/path (deleted)"
+        ):
+            with pytest.raises(RuntimeError, match="deleted"):
+                _resolve_cwd(None)
+
+
+def test_resolve_cwd_deleted_process_cwd_includes_proc_path() -> None:
+    """/proc/self/cwd path is included in the error when readable."""
+    with patch(
+        "omnigent.inner.acp_executor.os.getcwd",
+        side_effect=FileNotFoundError(2, "No such file or directory"),
+    ):
+        with patch(
+            "omnigent.inner.acp_executor.os.readlink",
+            return_value="/workspace/project (deleted)",
+        ):
+            with pytest.raises(RuntimeError, match=r"was deleted \(/workspace/project\);"):
+                _resolve_cwd(None)
+
+
+def test_resolve_cwd_deleted_process_cwd_readlink_failure_still_raises() -> None:
+    """RuntimeError is raised even when /proc/self/cwd readlink fails."""
+    with patch(
+        "omnigent.inner.acp_executor.os.getcwd",
+        side_effect=FileNotFoundError(2, "No such file or directory"),
+    ):
+        with patch(
+            "omnigent.inner.acp_executor.os.readlink", side_effect=OSError("not available")
+        ):
+            with pytest.raises(RuntimeError, match="deleted"):
+                _resolve_cwd(None)
+
+
+def test_acp_executor_init_raises_on_deleted_explicit_cwd(tmp_path: Path) -> None:
+    """AcpExecutor.__init__ raises RuntimeError when an explicit cwd is missing."""
+    missing = str(tmp_path / "workspace")
+    with pytest.raises(RuntimeError, match="workspace"):
+        AcpExecutor(AcpAgentConfig(command="agent"), cwd=missing)
+
+
+@pytest.mark.asyncio
+async def test_start_process_guard_raises_clear_error_on_deleted_cwd(
+    tmp_path: Path,
+) -> None:
+    """Deleting the cwd after __init__ yields an ExecutorError naming the path.
+
+    Without the guard at the top of _start_process(), the error would be the raw
+    ``asyncio.create_subprocess_exec`` OS error ("[Errno 2] No such file or directory:
+    '/path'"), which lacks ACP-specific context. With the guard, the message says
+    "ACP executor working directory does not exist".
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=str(workspace))
+    assert ex._cwd == str(workspace)
+
+    # Simulate the workspace being deleted after the executor was constructed.
+    workspace.rmdir()
+
+    events = []
+    async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+        events.append(ev)
+    await ex.close()
+
+    assert events, "expected at least one ExecutorError event"
+    error_events = [e for e in events if isinstance(e, ExecutorError)]
+    assert error_events, f"expected ExecutorError, got: {[type(e).__name__ for e in events]}"
+    msg = error_events[0].message
+    assert "working directory" in msg, f"expected 'working directory' in: {msg!r}"
+    assert str(workspace) in msg, f"expected path in: {msg!r}"
+
+
+@pytest.mark.asyncio
+async def test_start_process_guard_deleted_process_cwd_relative_cwd() -> None:
+    """Relative cwd with deleted process cwd yields a clear 'Runner working directory' error."""
+    ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=".")
+
+    fnfe = FileNotFoundError(2, "No such file or directory")
+    with patch("omnigent.inner.acp_executor.os.getcwd", side_effect=fnfe):
+        with patch(
+            "omnigent.inner.acp_executor.os.readlink",
+            return_value="/workspace/project (deleted)",
+        ):
+            events = []
+            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                events.append(ev)
+    await ex.close()
+
+    error_events = [e for e in events if isinstance(e, ExecutorError)]
+    assert error_events
+    msg = error_events[0].message
+    assert "deleted" in msg, f"expected 'deleted' in: {msg!r}"
+    assert "/workspace/project" in msg, f"expected path in: {msg!r}"

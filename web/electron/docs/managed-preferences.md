@@ -12,10 +12,10 @@ ai.omnigent.desktop
 
 ## Keys
 
-| Key                                 | Type             | Required | Default | Description                                                                                                                                                                                     |
-| ----------------------------------- | ---------------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `serverUrls`                        | Array of strings | No       | `[]`    | Server URLs to offer, most-preferred first. Each must use `https://`. At most 10.                                                                                                               |
-| `databricksInternalFeaturesEnabled` | Boolean          | No       | `false` | Enables Databricks-internal features (e.g. the Arca host option) on windows connected to a Databricks-managed server. Fails closed — anything but an explicit boolean `true` reads as disabled. |
+| Key                                 | Type             | Required | Default | Description                                                                                                                                     |
+| ----------------------------------- | ---------------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `serverUrls`                        | Array of strings | No       | `[]`    | Server URLs to offer, most-preferred first. Each must use `https://`. At most 10.                                                               |
+| `databricksInternalFeaturesEnabled` | Boolean          | No       | `false` | Defaults macOS apps to V2 onboarding and enables Databricks-internal features on supported servers. Only an explicit boolean `true` enables it. |
 
 A schemeless host is accepted and interpreted as `https://`. Paths are
 preserved, so an administrator can provide a workspace mount directly:
@@ -56,12 +56,19 @@ is opened or the connect screen is loaded.
 
 ## Databricks-internal features
 
+When `databricksInternalFeaturesEnabled` is `true`, macOS apps, including unpackaged
+development, default to V2 onboarding for new and existing profiles. This does not require
+`serverUrls` or a connected server. An explicit selector choice still wins,
+and saved servers still reconnect on launch. Other platforms
+keep the legacy default; `OMNIGENT_SERVER_SELECTOR_V2=1` still
+forces V2.
+
 When `databricksInternalFeaturesEnabled` is `true` **and** the window is
 connected to a Databricks-managed server (a workspace mount on
 `*.databricks.com` / `*.azuredatabricks.net`, or a Databricks App on
 `*.databricksapps.com`, https only), the new-session host picker offers
 **Run on Arca**: connecting the user's Arca dev instance to the current
-server as a host. On any other server the flag reads as disabled. Selecting it
+server as a host. On any other server the Arca option is disabled. Selecting it
 opens a shell-owned connect console that shows the exact command — `arca ssh`
 with a remote `isaac omni host --background --non-interactive` — and, after
 confirmation, streams the command's live output into an embedded terminal
@@ -73,6 +80,23 @@ keeps its own outbound tunnel from the Arca box. Once connected, the option
 disappears and the box's host row is tagged **Arca instance** (recognized by
 the host id remembered at connect time). Like the server list, the flag is read from
 macOS on demand, so profile changes apply without a restart.
+
+Remote hosts need their own renewable **Omnigent** OAuth grant. Desktop browser
+sign-in and generic Arca credentials do not replace it. During explicit runner
+setup, an authentication-required result starts `isaac omni login <server-url>`
+on Arca and retries the noninteractive host command once after sign-in. The
+manual connect console asks **Sign in and retry** before doing the same.
+Arca Companion opens the browser and routes its callback to the remote CLI;
+tokens and login output are not forwarded to the desktop renderer. Closing
+the sign-in console cancels the command. Passive auto-connect never starts login.
+
+Use an Isaac release that supports Omnigent-app login and the
+`OMNIGENT_AUTH_REQUIRED` startup diagnostic before deploying this flow.
+SPOG entries can include `/omnigent?o=<workspace-id>` to select the workspace;
+the same full server URL is used for remote login and host startup.
+Connection status and overlapping setup sign-ins are shared only for the same
+full target, including `?o=`. Closing one setup window leaves a shared sign-in
+running for the others; closing the last waiting window cancels it.
 
 ## MDM profile example
 

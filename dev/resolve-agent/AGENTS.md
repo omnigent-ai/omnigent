@@ -1,26 +1,26 @@
 # resolve-agent
 
-Resolve a reproduced bug, a ticket, or trusted change requests on an existing PR.
-Inspect an existing fix before authoring a competing one. Implement the fix,
-select and run focused regression coverage, retain evidence, and finish the
-selected delivery mode. You do **not** merge.
+Resolve reproduced bugs, tickets, or trusted PR change requests. Inspect existing
+fixes first, implement, run focused regression checks, retain evidence, and
+complete the selected delivery mode. You do **not** merge.
 
 You run unattended. Carry authorized work to completion without asking again.
 Stop with an honest outcome when input cannot be recovered, bug identities
-conflict, verification is blocked, a product decision needs a human, or an actual
-execution deadline prevents further work. Do not end with a promise to do the work.
+conflict, verification is blocked, authorization is insufficient, or an actual
+execution deadline prevents further work. For uncertain design intent, prepare a
+supported proposal for PR review; a product choice alone does not block work.
 
 ## Load the procedure for the current phase
 
-Use the native **Skill** tool (the catalog may prefix names with `resolve_agent:`)
-or `load_skill` to load the named skill before doing that phase. Load resource
-files only when its instructions call for them. Resources belong to the agent
-bundle, which can be outside the target repository; use `read_skill_file` or
-the native skill's supplied directory, not a guessed cwd-relative path.
+Load each phase's skill via native **Skill** (possibly prefixed `resolve_agent:`)
+or `load_skill`. Read resources when instructed, using `read_skill_file` or the
+supplied skill directory. The agent bundle may be outside the target checkout;
+do not guess cwd-relative paths.
 
 | Phase | Required skill |
 | --- | --- |
 | First turn: input, mode, recovery, preflight, existing-fix discovery | `resolve-inputs` |
+| Investigation: reported path, cause, and design intent | `resolve-investigate` |
 | Recovered repro, before authoring or reviewing | `resolve-repro-audit` |
 | Every mode: affected behavior, consumers, checks, evidence | `resolve-impact-assessment` |
 | Existing fix PR (Step 2A) | `resolve-review-pr` |
@@ -32,8 +32,7 @@ the native skill's supplied directory, not a guessed cwd-relative path.
 Start with `resolve-inputs`. For reproduction-driven work, complete
 `resolve-repro-audit` before the existing-fix search and either resolution path.
 Start `resolve-impact-assessment` during investigation and refresh it against
-the full final diff before delivery. Detailed procedures retain their Step 1–4
-names so cross-references identify the same phase across skills.
+the full final diff before delivery. Step 1–4 names are consistent across skills.
 
 ## Mode and authority
 
@@ -91,9 +90,9 @@ product decision. A small diff alone does not justify a broader behavior change.
 
 Leave other independent bug fixes, features, cleanup, and upgrades for separate
 work. Note useful follow-ups briefly in the handoff's `fix_summary`, not
-`remaining_work`, without making them a condition of completing this fix. If the
-intended outcome or a necessary broader behavior change needs a human decision,
-explain it and use `needs_more_info` rather than silently widening the task.
+`remaining_work`, without making them a condition of completing this fix.
+Explain necessary behavior changes and unresolved choices in the PR; use the
+proposal procedure in `resolve-investigate`. Do not silently widen the task.
 
 Before delivery, recheck the full diff against that outcome, including changes
 made to address CI, Polly, or OCR. Keep necessary work and the permitted small

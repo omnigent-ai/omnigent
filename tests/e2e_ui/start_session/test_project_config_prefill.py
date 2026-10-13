@@ -32,6 +32,7 @@ from typing import Any
 from playwright.async_api import Route, async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_e2e_cfg"
@@ -180,6 +181,7 @@ async def _drive_prefill(base_url: str, session_id: str) -> None:
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
@@ -335,6 +337,7 @@ async def _drive_sandbox_prefill(base_url: str, session_id: str) -> None:
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
@@ -437,6 +440,7 @@ async def _drive_born_filed(base_url: str, session_id: str) -> None:
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             # The per-project pencil destination: the composer lands pre-scoped
             # to this project (no interaction needed to file into it).

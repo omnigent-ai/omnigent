@@ -11,7 +11,7 @@ via [Databricks Asset Bundles](https://docs.databricks.com/aws/en/dev-tools/bund
 > **Most Databricks users want the managed offering instead.**
 > [Omnigent on Databricks](https://docs.databricks.com/aws/en/omnigent/)
 > (Beta) runs the server for you, wired to workspace identity,
-> Foundation Models, AI Gateway, and MLflow Tracing out of the box.
+> Foundation Models, Unity Gateway, and MLflow Tracing out of the box.
 > Enable the **Omnigent** preview in your workspace settings and follow
 > the quickstart there. Use this directory only when you need to
 > self-manage the deployment: the managed service is not in your region
@@ -258,6 +258,7 @@ Environment variables read by `src/app.py`:
 | `AP_ARTIFACT_VOLUME_PATH` | app resource `valueFrom: artifact_volume` | UC Volume path for artifacts |
 | `DATABRICKS_APP_PORT` | Databricks runtime | App port (default 8000) |
 | `AP_POOL_RECYCLE_SECONDS` | Optional | Connection pool recycle interval (default 300) |
+| `OMNIGENT_CONFIG` | Optional | Path to a server config YAML. Its `sandbox:` section enables managed sandbox hosts (`host_type: "managed"`), parsed exactly as `omnigent server` parses it; a malformed section fails startup. Branding and title keys are read from the same file. |
 
 ## Multi-app safety — one bundle, many apps
 

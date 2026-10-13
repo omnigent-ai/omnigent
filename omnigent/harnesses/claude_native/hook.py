@@ -219,6 +219,12 @@ def main(argv: list[str] | None = None) -> int:
         print("omnigent claude hook: expected JSON object", file=sys.stderr)
         return 0
     bridge_dir = Path(args.bridge_dir)
+    from omnigent.harnesses.claude_native.lifecycle import record_hook_lifecycle
+
+    record_hook_lifecycle(bridge_dir, payload, time.time())
+    if payload.get("hook_event_name") == "SessionEnd":
+        # SessionEnd is diagnostic evidence, not a status or transcript change.
+        return 0
     _annotate_resume_session_context(bridge_dir, payload)
     if payload.get("hook_event_name") == "SessionStart" and payload.get("source") == "clear":
         rotated_session_id = _rotate_session_on_clear(bridge_dir)

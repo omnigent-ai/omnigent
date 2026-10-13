@@ -889,11 +889,13 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
+    record_at_forwarding: list[str | None] = []
+
     async def _wait(_client: object, *, timeout: float | None = 30.0) -> str:
         return "thread_after_signin"
 
     async def _forward(**_kwargs: object) -> None:
-        return None
+        record_at_forwarding.append(read_bridge_startup_error(bridge_dir))
 
     monkeypatch.setattr(_fwd, "wait_for_thread_started", _wait)
     monkeypatch.setattr(_fwd, "supervise_forwarder", _forward)
@@ -916,7 +918,7 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
         )
     )
 
-    assert read_bridge_startup_error(bridge_dir) is None
+    assert record_at_forwarding == [None]
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.thread_id == "thread_after_signin"
