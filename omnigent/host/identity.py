@@ -19,6 +19,7 @@ import yaml
 
 from omnigent.config import global_config_path
 from omnigent.host import identity_env
+from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
 
@@ -80,8 +81,6 @@ def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
     :returns: The normalized (to bare hex, legacy-prefix-stripped) host id.
     :raises ValueError: If *host_id* is not a valid uuid-shaped host id.
     """
-    from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
-
     try:
         # Validate and normalize to bare hex (16 bytes -> 32-char hex string)
         normalized = uuid_to_bytes(host_id).hex()

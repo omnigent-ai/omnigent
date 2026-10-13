@@ -64,7 +64,7 @@ def _run_without_database_imports(tmp_path: Path, code: str, *args: str) -> None
 def test_startup_modules_do_not_import_database(tmp_path: Path, module: str) -> None:
     """Host/runner imports must stay cheap regardless of which entry point runs first."""
     _run_without_database_imports(
-        tmp_path, "import importlib\nimportlib.import_module(sys.argv[1])\n", module
+        tmp_path, "import importlib\nimport sys\nimportlib.import_module(sys.argv[1])\n", module
     )
 
 
@@ -95,6 +95,7 @@ def test_host_identity_does_not_import_database(tmp_path: Path, source: str) -> 
     """Managed IDs and saved/generated local IDs share DB-free UUID validation."""
     code = dedent("""\
         import os
+        import sys
         from pathlib import Path
         from uuid import UUID, uuid4
 

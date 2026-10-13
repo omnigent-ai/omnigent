@@ -73,6 +73,9 @@ class Uuid16(TypeDecorator[str]):
     legacy-prefixed uuids; results always come back as bare lowercase hex.
     Result values guard the same driver variance ``CompressedText`` does:
     ``bytes``, ``memoryview`` (some drivers), or ``str`` (already hex).
+
+    Malformed binds raise ``InvalidUuidError``, wrapped by SQLAlchemy in
+    ``StatementError``. The server maps these invalid URL ids to a 404.
     """
 
     impl = LargeBinary(16)

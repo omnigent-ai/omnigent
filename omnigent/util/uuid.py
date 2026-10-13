@@ -7,10 +7,8 @@ import uuid
 # Hex length of a bare uuid4 id, the canonical Python-side form.
 _UUID_HEX_LEN = 32
 
-# Prefixes ids carried before they became bare 32-char hex. ``uuid_to_bytes``
-# strips exactly these (so old URLs/clients keep resolving) and nothing else —
-# an unknown prefix fails loud rather than silently storing a wrong-typed id's
-# hex tail (e.g. a ``resp_``/``runner_token_`` value mis-passed to a uuid column).
+# Accept historical prefixes so old URLs and clients keep resolving; reject
+# unknown prefixes so a different ID type cannot silently become a UUID.
 _LEGACY_ID_PREFIXES = frozenset(
     {
         "ag",
@@ -41,14 +39,12 @@ class InvalidUuidError(ValueError):
     """An id string could not be normalised to a 32-char hex uuid.
 
     Subclasses ``ValueError`` so existing ``except ValueError`` sites keep
-    working. Surfaced (wrapped in ``sqlalchemy.exc.StatementError``) when a
-    malformed id reaches a ``Uuid16`` column bind; the server maps it to a 404
-    so a bad id in a URL is not-found rather than a 500.
+    working.
     """
 
 
 def uuid_to_bytes(value: str | uuid.UUID) -> bytes:
-    """Normalise an id to the 16 raw bytes stored in a ``Uuid16`` column.
+    """Normalise a supported UUID spelling to its 16 raw bytes.
 
     Accepts, reducing them all to the same 16 bytes: a :class:`uuid.UUID`
     object; the bare 32-char hex form (what generators emit); the dashed
