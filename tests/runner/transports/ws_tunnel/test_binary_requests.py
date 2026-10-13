@@ -13,7 +13,9 @@ import pytest
 import uvicorn
 from fastapi import FastAPI
 from websockets.asyncio.client import ClientConnection, connect
+from websockets.asyncio.server import serve
 
+from omnigent.runner.transports.ws_tunnel.binary_requests import encode_binary_request
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     PingFrame,
@@ -75,6 +77,10 @@ async def _tunnel(
         finally:
             server.should_exit = True
             await asyncio.wait_for(server_task, 5)
+
+
+def _envelope_header(raw: bytes) -> dict:
+    return json.loads(raw[8 : 8 + int.from_bytes(raw[4:8], "big")])
 
 
 async def _reply(ws: ClientConnection, req_id: str) -> None:
@@ -141,8 +147,6 @@ async def test_wire_decision(
 
 
 async def test_hello_advertises_binary_without_version_bump() -> None:
-    from websockets.asyncio.server import serve
-
     hello_received: asyncio.Future[HelloFrame] = asyncio.get_running_loop().create_future()
 
     async def receive_hello(ws) -> None:
@@ -163,8 +167,6 @@ async def test_hello_advertises_binary_without_version_bump() -> None:
     "size", [0, RUNNER_TUNNEL_MAX_MESSAGE_BYTES - 512], ids=["empty", "maximum"]
 )
 async def test_envelope_dispatch_round_trip(size: int) -> None:
-    from omnigent.runner.transports.ws_tunnel.binary_requests import encode_binary_request
-
     frame = RequestFrame("round-trip", "PATCH", "/upload", headers=[["x-test", "value"]])
     overhead = len(encode_binary_request(frame, b""))
     payload = b"\xff" * (RUNNER_TUNNEL_MAX_MESSAGE_BYTES - overhead if size else 0)
@@ -199,10 +201,8 @@ async def test_envelope_dispatch_round_trip(size: int) -> None:
     ["magic", "prefix", "truncated-header", "overflow", "json", "utf8", "body", "fields", "kind"],
 )
 async def test_malformed_envelope_is_diagnosed(fault: str, caplog) -> None:
-    from omnigent.runner.transports.ws_tunnel.binary_requests import encode_binary_request
-
     wire = encode_binary_request(RequestFrame("bad-request", "PATCH", "/upload"), b"payload")
-    header = json.loads(wire[8 : 8 + int.from_bytes(wire[4:8], "big")])
+    header = _envelope_header(wire)
     recoverable = fault in {"magic", "body", "fields", "kind"}
     if fault == "magic":
         wire = b"BAD!" + wire[4:]
@@ -244,8 +244,6 @@ async def test_malformed_envelope_is_diagnosed(fault: str, caplog) -> None:
 
 
 def test_encoder_rejects_over_limit() -> None:
-    from omnigent.runner.transports.ws_tunnel.binary_requests import encode_binary_request
-
     frame = RequestFrame("limit", "PATCH", "/")
     overhead = len(encode_binary_request(frame, b""))
     with pytest.raises(ValueError, match="message limit"):
@@ -253,10 +251,6 @@ def test_encoder_rejects_over_limit() -> None:
 
 
 async def test_decoder_rejects_over_limit(caplog) -> None:
-    from websockets.asyncio.server import serve
-
-    from omnigent.runner.transports.ws_tunnel.binary_requests import encode_binary_request
-
     wire = encode_binary_request(RequestFrame("limit", "PATCH", "/"), b"")
     wire += b"x" * (RUNNER_TUNNEL_MAX_MESSAGE_BYTES - len(wire) + 1)
 
@@ -294,7 +288,7 @@ async def test_binary_admission_bounds_buffering_and_keeps_pings_flowing() -> No
             for _ in range(2):
                 raw = await asyncio.wait_for(ws.recv(), 5)
                 assert isinstance(raw, bytes)
-                ids.append(json.loads(raw[8 : 8 + int.from_bytes(raw[4:8], "big")])["id"])
+                ids.append(_envelope_header(raw)["id"])
             for _ in range(8):
                 with pytest.raises(httpx.PoolTimeout, match="binary"):
                     await asyncio.wait_for(
@@ -336,7 +330,7 @@ async def test_binary_admission_bounds_buffering_and_keeps_pings_flowing() -> No
             tasks.append(resumed)
             raw = await asyncio.wait_for(ws.recv(), 5)
             assert isinstance(raw, bytes)
-            req_id = json.loads(raw[8 : 8 + int.from_bytes(raw[4:8], "big")])["id"]
+            req_id = _envelope_header(raw)["id"]
             await _reply(ws, req_id)
             assert (await resumed).status_code == 204
         finally:
@@ -409,7 +403,7 @@ async def test_cancelled_queued_requests_keep_buffer_bounded(
             tasks.append(retry)
             raw = await asyncio.wait_for(ws.recv(), 5)
             assert isinstance(raw, bytes)
-            req_id = json.loads(raw[8 : 8 + int.from_bytes(raw[4:8], "big")])["id"]
+            req_id = _envelope_header(raw)["id"]
             await _reply(ws, req_id)
             assert (await retry).status_code == 204
         finally:
@@ -439,7 +433,7 @@ async def test_binary_request_across_consumer_loop() -> None:
         try:
             raw = await asyncio.wait_for(ws.recv(), 5)
             assert isinstance(raw, bytes)
-            req_id = json.loads(raw[8 : 8 + int.from_bytes(raw[4:8], "big")])["id"]
+            req_id = _envelope_header(raw)["id"]
             await _reply(ws, req_id)
             assert await asyncio.wait_for(task, 5) == 204
         finally:
