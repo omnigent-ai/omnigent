@@ -43,3 +43,13 @@ def test_repro_recording_rules_match_the_shared_guide() -> None:
     assert "Text-only CLI output is not a reason to skip recording" in instructions
     assert "name the specific blocker in `recording_unavailable_reason`" in instructions
     assert "Do not block the verdict because footage is missing or rejected" in instructions
+
+
+def test_lane_rules_treat_evidence_directory_clips_as_undeclared() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+
+    assert "The stable path is `recordings/<slug>/` in the workspace" in lanes
+    assert (
+        "a clip left under an evidence directory such as `.omnigent/repro-evidence/` "
+        "is neither attached nor flagged as unreferenced" in lanes
+    )

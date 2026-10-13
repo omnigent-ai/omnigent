@@ -67,7 +67,10 @@ the desktop harness, `vhs_user_command` for a VHS tape that types the real user
 command, and `screen` for a direct device/screen capture. Do not declare a raw
 recorder output: copy the selected clip to a stable `<kind>-<facet>.<ext>` path
 first, then declare only that path. Undeclared media remains available in the CI
-artifact for debugging but is not attached to Linear or a PR.
+artifact for debugging but is not attached to Linear or a PR. The stable path is
+`recordings/<slug>/` in the workspace; a clip left under an evidence directory
+such as `.omnigent/repro-evidence/` is neither attached nor flagged as
+unreferenced, so move it to the stable path and declare it.
 
 ## The recorder needs its own local server
 
