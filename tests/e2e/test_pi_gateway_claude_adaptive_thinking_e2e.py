@@ -1,36 +1,7 @@
-"""in-process pi: Databricks Claude models 400 with ``thinking.type.enabled``.
+"""Verify an unpinned Pi agent sends adaptive thinking to a gateway that rejects legacy thinking.
 
-The journey
------------
-A user configures Databricks workspace credentials (``~/.databrickscfg``) and
-launches a ``harness: pi`` agent with **no** ``model:`` pinned (``omnigent run
-agent.yaml -p ...``). The executor resolves the default model from the
-workspace's Claude catalog, so the run lands on a Claude-4+/5 model routed
-through the ``databricks-anthropic`` provider (``api: anthropic-messages``).
-``_build_models_json`` in ``omnigent/inner/pi_executor.py`` writes that
-provider with no ``compat`` block, so Pi (0.84.2+) sends the legacy
-``thinking: {type: "enabled", budget_tokens: ...}`` payload, which the
-Databricks AI gateway rejects for Claude-4+/5::
-
-    400 {"message": "\\"thinking.type.enabled\\" is not supported for this
-    model. Use \\"thinking.type.adaptive\\" and \\"output_config.effort\\" to
-    control thinking behavior."}
-
-The very first turn of an unpinned pi agent therefore fails. pi-native already
-pairs ``api: anthropic-messages`` with ``compat: {forceAdaptiveThinking: true}``
-(``omnigent/harnesses/pi_native/credentials.py``); the in-process path never
-received the same treatment.
-
-The fail -> pass contract
--------------------------
-The fake workspace/gateway implements the documented Claude-4+/5 contract: it
-rejects ``thinking.type == "enabled"`` with the exact 400 above and streams a
-normal Anthropic Messages SSE completion for any other thinking mode. The live
-journey test fails on the current build (Pi posts the legacy payload, the CLI
-run exits non-zero with the 400) and passes once the provider forces adaptive
-thinking (Pi posts ``thinking.type: adaptive`` and the turn completes). The
-render-level test pins the provider-compat half deterministically, without
-needing the ``pi`` CLI.
+The fake gateway mirrors the Databricks Claude 4+/5 contract: ``thinking.type == "enabled"``
+gets a 400, adaptive thinking gets a normal completion.
 
 Usage::
 
@@ -51,7 +22,6 @@ from typing import Any
 
 import pytest
 
-from omnigent.inner.pi_executor import _build_models_json
 from tests.e2e._harness_probes import cli_unavailable_reason
 
 # tests/e2e/<this file> -> parents[2] is the repo root; threaded onto the CLI
@@ -98,16 +68,7 @@ _STALE_ENV_VARS = (
 # Fake Databricks workspace + AI gateway                                      #
 # --------------------------------------------------------------------------- #
 class _FakeWorkspaceHandler(BaseHTTPRequestHandler):
-    """Play a Databricks workspace whose gateway serves one Claude-5 model.
-
-    - Unity Catalog model-services listing -> the single Claude entry (with
-      its Anthropic Messages wire surface), so both the unpinned default
-      resolution and the executor's catalog fetch see it.
-    - Anthropic gateway model listing -> the same model id.
-    - ``POST .../serving-endpoints/anthropic/v1/messages`` -> the documented
-      Claude-4+/5 contract: 400 on ``thinking.type == "enabled"``, a normal
-      SSE completion otherwise.
-    """
+    """Fake workspace + AI gateway serving one Claude model; 400s ``thinking.type.enabled``."""
 
     protocol_version = "HTTP/1.1"
     # Populated per test run: every request the CLI sent, with parsed bodies.
@@ -158,7 +119,7 @@ class _FakeWorkspaceHandler(BaseHTTPRequestHandler):
         elif path.startswith("/ai-gateway/anthropic/v1/models"):
             self._send_json(200, {"data": [{"id": _CLAUDE_MODEL}]})
         else:
-            self._send_json(200, {})
+            self._send_json(404, {"message": f"no handler for {path}"})
 
     def do_POST(self) -> None:
         body = self._read_body()
@@ -273,33 +234,6 @@ def _thinking_types(bodies: list[dict[str, Any]]) -> list[object]:
 
 
 # --------------------------------------------------------------------------- #
-# Render contract (deterministic, no pi CLI needed)                           #
-# --------------------------------------------------------------------------- #
-def test_models_json_databricks_anthropic_forces_adaptive_thinking() -> None:
-    """The ``databricks-anthropic`` provider must force adaptive thinking.
-
-    Its Claude model entries carry ``reasoning: true`` (Pi's thinking-level
-    controls), and Pi only sends ``thinking.type.adaptive`` — required by
-    Claude-4+/5 on the Databricks gateway — when the provider compat block
-    sets ``forceAdaptiveThinking``; without it Pi sends the legacy
-    ``thinking.type.enabled`` payload the gateway 400s. pi-native already
-    pairs the two (``omnigent/harnesses/pi_native/credentials.py``).
-    """
-    config = _build_models_json("https://workspace.example.com", "test-token")
-    provider = config["providers"]["databricks-anthropic"]
-    compat = provider.get("compat")
-    force_adaptive = compat.get("forceAdaptiveThinking") if isinstance(compat, dict) else None
-    assert force_adaptive is True, (
-        "the in-process pi models.json wires the 'databricks-anthropic' provider "
-        f"(api: anthropic-messages) with compat={compat!r} — no forceAdaptiveThinking. "
-        "Pi therefore sends the legacy thinking.type.enabled payload and every "
-        "Claude-4+/5 first turn 400s against the Databricks AI gateway with "
-        f"{_ADAPTIVE_REJECT_MSG!r}. Mirror pi-native: add "
-        "compat={'forceAdaptiveThinking': True} to this provider in _build_models_json."
-    )
-
-
-# --------------------------------------------------------------------------- #
 # Live CLI journey (unpinned pi agent -> first turn)                          #
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(
@@ -313,16 +247,7 @@ def test_models_json_databricks_anthropic_forces_adaptive_thinking() -> None:
 def test_unpinned_pi_agent_first_turn_survives_claude_thinking_contract(
     fake_workspace: str, tmp_path: Path
 ) -> None:
-    """Drive the real one-shot CLI journey and require the first turn to land.
-
-    Journey: Databricks credentials in ``~/.databrickscfg`` -> ``harness: pi``
-    agent with no ``model:`` pinned -> ``omnigent run agent.yaml -p ...`` ->
-    the default model resolves to the workspace's Claude model and the first
-    turn must complete. Fails on the current build: Pi posts
-    ``thinking.type.enabled`` (no provider compat), the gateway answers the
-    documented 400, and the run exits non-zero showing that error. Passes once
-    the provider forces adaptive thinking.
-    """
+    """Unpinned ``harness: pi`` agent -> ``omnigent run -p`` -> adaptive first turn completes."""
     home = tmp_path / "home"
     home.mkdir()
     (home / ".databrickscfg").write_text(
@@ -387,16 +312,11 @@ def test_unpinned_pi_agent_first_turn_survives_claude_thinking_contract(
     )
 
     thinking_types = _thinking_types(bodies)
-    legacy_payload_sent = "enabled" in thinking_types
-    assert not legacy_payload_sent and result.returncode == 0, (
-        "an unpinned `harness: pi` agent's FIRST TURN failed against a Databricks "
-        f"gateway serving Claude-4+/5 (resolved model: {bodies[-1].get('model')!r}).\n"
-        f"  thinking payloads posted: {thinking_types!r} (Claude-4+/5 reject 'enabled' "
-        f"with 400 {_ADAPTIVE_REJECT_MSG!r})\n"
+    assert set(thinking_types) == {"adaptive"} and result.returncode == 0, (
+        "expected every messages request to use adaptive thinking and the run to succeed.\n"
+        f"  thinking payloads posted: {thinking_types!r}\n"
+        f"  resolved model: {bodies[-1].get('model')!r}\n"
         f"  exit_code: {result.returncode}\n"
         f"  stdout tail: {result.stdout[-1500:]!r}\n"
-        f"  stderr tail: {result.stderr[-1500:]!r}\n"
-        "The 'databricks-anthropic' provider in _build_models_json must set "
-        "compat={'forceAdaptiveThinking': True} (as pi-native does) so Pi sends "
-        "thinking.type.adaptive and the turn completes."
+        f"  stderr tail: {result.stderr[-1500:]!r}"
     )
