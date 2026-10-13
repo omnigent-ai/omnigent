@@ -17,6 +17,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     read_transcript_items_from_offset,
 )
+from omnigent.harnesses.codex_native.bridge import bridge_root
 from omnigent.harnesses.codex_native.main import _CODEX_THREAD_ID_RE
 from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
 from omnigent.harnesses.kimi_native.forwarder import (
@@ -32,7 +33,6 @@ from omnigent.harnesses.opencode_native.app_server import (
     find_opencode_cli,
 )
 from omnigent.harnesses.opencode_native.forwarder import opencode_tool_output_text
-from omnigent.process_logging import data_dir
 from omnigent.session_import.models import (
     ImportSource,
     LocalSessionImport,
@@ -256,20 +256,23 @@ def _unique_paths(paths: Sequence[Path]) -> tuple[Path, ...]:
 
 
 def _codex_native_storage_homes() -> tuple[Path, ...]:
-    """Return private Codex homes under the configured Omnigent data root."""
-    root = data_dir() / "codex-native"
+    """Return private Codex homes under the producer's bridge root."""
+    root = bridge_root()
     try:
         bridge_dirs = tuple(root.iterdir())
     except OSError:
         return ()
-    return tuple(
-        codex_home
-        for bridge_dir in bridge_dirs
-        if bridge_dir.is_dir()
-        and not bridge_dir.is_symlink()
-        and (codex_home := bridge_dir / "codex-home").is_dir()
-        and not codex_home.is_symlink()
-    )
+    homes: list[Path] = []
+    for bridge_dir in bridge_dirs:
+        try:
+            if not bridge_dir.is_dir() or bridge_dir.is_symlink():
+                continue
+            codex_home = bridge_dir / "codex-home"
+            if codex_home.is_dir() and not codex_home.is_symlink():
+                homes.append(codex_home)
+        except OSError:
+            continue
+    return tuple(homes)
 
 
 def _codex_storage_homes(codex_home: Path | None = None) -> tuple[Path, ...]:
@@ -689,20 +692,6 @@ def _codex_response_item(
         response_id=response_id[:64],
         data=parse_item_data(normalized_type, data),
     )
-
-
-def _find_archived_codex_rollout(codex_home: Path, session_id: str) -> Path | None:
-    """Return the newest archived Codex rollout matching a session id."""
-    archived_sessions = codex_home / "archived_sessions"
-    if not archived_sessions.is_dir():
-        return None
-    suffix = f"-{session_id}.jsonl"
-    matches = [
-        path
-        for path in archived_sessions.glob("rollout-*.jsonl")
-        if path.name.endswith(suffix) and path.is_file()
-    ]
-    return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
 
 
 def _find_codex_rollout_in_homes(
