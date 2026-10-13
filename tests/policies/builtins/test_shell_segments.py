@@ -60,12 +60,12 @@ def test_braces_require_word_boundaries(command: str, expected: list[str]) -> No
 @pytest.mark.parametrize(
     "command,completed",
     [
-        ("echo ready # today's status\necho done", ["echo ready"]),
-        ("# status $(with delimiters\necho done", []),
-        ("echo ready;# status\necho done", ["echo ready"]),
-        ("echo \\\n# status\necho done", []),
+        ("echo ready # today's status\necho done", ["echo ready", "echo done"]),
+        ("# status $(with delimiters\necho done", ["echo done"]),
+        ("echo ready;# status\necho done", ["echo ready", "echo done"]),
+        ("echo \\\n# status\necho done", ["echo done"]),
         ("echo \\\nready", []),
-        ("cat <<DATA\ntoday's status\nDATA\necho done", []),
+        ("cat <<DATA\ntoday's status\nDATA\necho done", ["echo done"]),
         ("cat <<'DATA'\nplain text\nDATA", []),
         ("cat <<-DATA\n\tplain text\n\tDATA", []),
         ("cat <<<text", []),
@@ -85,6 +85,38 @@ def test_unsupported_shell_syntax_requires_approval(
         split_command_segments(prefix + command)
     expected = ["echo first", *completed] if prefix else completed
     assert error.value.completed_segments == expected
+
+
+@pytest.mark.parametrize(
+    "command,completed",
+    [
+        ("echo $(echo one); echo next", ["echo next"]),
+        ('echo "$(echo one)"; echo next', ["echo next"]),
+        ("echo $(echo $(echo one)); echo next", ["echo next"]),
+        ("echo $(echo ')'); echo next", ["echo next"]),
+        ("echo $(echo ready # unmatched )\n); echo next", ["echo next"]),
+        ("echo `echo one`; echo next", ["echo next"]),
+        ("echo $'one\\'two'; echo next", ["echo next"]),
+        ('echo $"one;two"; echo next', ["echo next"]),
+        ("echo \\\nready; echo next", ["echo next"]),
+        ("cat <<<text; echo next", ["echo next"]),
+        ("cat <<'DATA'; echo same\nquoted ) body\nDATA\necho next", ["echo same", "echo next"]),
+        ("cat <<-DATA\n\tplain text\n\tDATA\necho next", ["echo next"]),
+        ("cat <<ONE <<TWO\nfirst\nONE\nsecond\nTWO\necho next", ["echo next"]),
+        ("echo $(echo one", []),
+        ("echo $'unclosed", []),
+        ("cat <<DATA\nunterminated body", []),
+        ("cat <<E'O'F\nopaque body", []),
+        ("echo $(case x in x) echo ready;; esac); echo next", []),
+        ("echo $(cat <<DATA\nopaque body\nDATA\n); echo next", []),
+    ],
+)
+def test_opaque_regions_preserve_only_completed_segments(
+    command: str, completed: list[str]
+) -> None:
+    with pytest.raises(UnsupportedShellSyntax) as error:
+        split_command_segments("echo first; " + command)
+    assert error.value.completed_segments == ["echo first", *completed]
 
 
 @pytest.mark.parametrize(

@@ -201,7 +201,7 @@ def is_shell_interpreter(tokens: list[str]) -> bool:
 
 
 class UnsupportedShellSyntax(ValueError):
-    """Unsupported syntax with the fully delimited commands preceding it."""
+    """Unsupported syntax with fully delimited commands outside opaque regions."""
 
     def __init__(self, reason: str, completed_segments: list[str]) -> None:
         super().__init__(reason)
@@ -214,6 +214,93 @@ def split_command_segments(command: str) -> list[str]:
 
 
 _SEGMENT_OPERATOR_CHARS: frozenset[str] = frozenset(";|&\n()")
+_HEREDOC_DELIMITER = re.compile(
+    r"<<(?P<tabs>-?)[ \t]*(?P<delimiter>'[^'\n]*'|\"[^\"\n$`\\]*\"|[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?=$|[\s;|&()<>])"
+)
+
+
+def _skip_escaped_delimiter(command: str, start: int, delimiter: str) -> int | None:
+    """Find an opaque quoted region's end without evaluating escapes."""
+    i = start
+    while i < len(command):
+        if command[i] == "\\":
+            i += 2
+        elif command[i] == delimiter:
+            return i + 1
+        else:
+            i += 1
+    return None
+
+
+def _skip_command_substitution(command: str, start: int, depth: int = 0) -> int | None:
+    """Bound a substitution; return None when its grammar is ambiguous."""
+    if depth > MAX_SHELL_NESTING:
+        return None
+    if command[start] == "`":
+        return _skip_escaped_delimiter(command, start + 1, "`")
+    i, nesting = start + 2, 1
+    quote: str | None = None
+    at_word_start = True
+    while i < len(command):
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+        elif ch == "\\":
+            if i + 1 < len(command) and command[i + 1] != "\n":
+                at_word_start = False
+            i += 2
+            continue
+        elif ch == "`" or command[i : i + 2] == "$(":
+            end = _skip_command_substitution(command, i, depth + 1)
+            if end is None:
+                return None
+            i = end
+            at_word_start = False
+            continue
+        elif quote == '"':
+            if ch == '"':
+                quote = None
+        elif command[i : i + 2] in ("<<", "$'", '$"') or (
+            at_word_start and re.match(r"case(?:\s|$)", command[i:])
+        ):
+            # Here-documents and case patterns need grammar beyond balanced groups.
+            return None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and at_word_start:
+            end = command.find("\n", i)
+            if end < 0:
+                return None
+            i = end
+            continue
+        elif ch == "(":
+            nesting += 1
+        elif ch == ")":
+            nesting -= 1
+            if nesting == 0:
+                return i + 1
+        at_word_start = (ch.isspace() or ch in _SEGMENT_OPERATOR_CHARS) and quote is None
+        i += 1
+    return None
+
+
+def _skip_heredoc_bodies(
+    command: str, start: int, delimiters: list[tuple[str, bool]]
+) -> int | None:
+    """Locate literal here-document terminators without parsing their contents."""
+    i = start
+    for delimiter, strip_tabs in delimiters:
+        while i < len(command):
+            end = command.find("\n", i)
+            line = command[i:] if end < 0 else command[i:end]
+            i = len(command) if end < 0 else end + 1
+            if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                break
+        else:
+            return None
+    return i
 
 
 def _split_unquoted_operators(command: str) -> list[str]:
@@ -222,6 +309,9 @@ def _split_unquoted_operators(command: str) -> list[str]:
     buf: list[str] = []
     in_single = in_double = False
     at_word_start = True
+    unsupported_reason: str | None = None
+    unsupported_segment = False
+    heredocs: list[tuple[str, bool]] = []
     i, n = 0, len(command)
     while i < n:
         ch = command[i]
@@ -231,15 +321,40 @@ def _split_unquoted_operators(command: str) -> list[str]:
             buf.append(ch)
         elif ch == "\\" and i + 1 < n:
             if command[i + 1] == "\n":
-                raise UnsupportedShellSyntax("Shell line continuations require approval", segments)
+                unsupported_reason = (
+                    unsupported_reason or "Shell line continuations require approval"
+                )
+                unsupported_segment = True
+                i += 2
+                continue
             buf.extend(command[i : i + 2])
             at_word_start = False
             i += 2
             continue
         elif ch == "`" or command[i : i + 2] == "$(":
-            raise UnsupportedShellSyntax("Shell command substitutions require approval", segments)
+            unsupported_reason = (
+                unsupported_reason or "Shell command substitutions require approval"
+            )
+            end = _skip_command_substitution(command, i)
+            if end is None:
+                raise UnsupportedShellSyntax(unsupported_reason, segments)
+            unsupported_segment = True
+            at_word_start = False
+            i = end
+            continue
         elif not in_double and command[i : i + 2] in ("$'", '$"'):
-            raise UnsupportedShellSyntax("Shell extended quoting requires approval", segments)
+            unsupported_reason = unsupported_reason or "Shell extended quoting requires approval"
+            unsupported_segment = True
+            at_word_start = False
+            if command[i + 1] == "'":
+                end = _skip_escaped_delimiter(command, i + 2, "'")
+                if end is None:
+                    raise UnsupportedShellSyntax(unsupported_reason, segments)
+                i = end
+            else:
+                in_double = True
+                i += 2
+            continue
         elif in_double:
             if ch == '"':
                 in_double = False
@@ -251,15 +366,34 @@ def _split_unquoted_operators(command: str) -> list[str]:
             in_double = True
             buf.append(ch)
         elif ch == "#" and at_word_start:
-            # A comment ends the current command's arguments; its body stays opaque.
-            raise UnsupportedShellSyntax(
-                "Shell comments require approval", [*segments, "".join(buf)]
-            )
+            unsupported_reason = unsupported_reason or "Shell comments require approval"
+            end = command.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        elif command[i : i + 3] == "<<<":
+            unsupported_reason = unsupported_reason or "Shell here-strings require approval"
+            unsupported_segment = True
+            at_word_start = True
+            i += 3
+            continue
         elif command[i : i + 2] == "<<":
-            raise UnsupportedShellSyntax("Shell here-documents require approval", segments)
+            unsupported_reason = unsupported_reason or "Shell here-documents require approval"
+            match = _HEREDOC_DELIMITER.match(command, i)
+            if match is None:
+                raise UnsupportedShellSyntax(unsupported_reason, segments)
+            delimiter = match.group("delimiter")
+            if delimiter.startswith(("'", '"')):
+                delimiter = delimiter[1:-1]
+            heredocs.append((delimiter, bool(match.group("tabs"))))
+            unsupported_segment = True
+            at_word_start = False
+            i = match.end()
+            continue
         elif command[i : i + 2] in ("&&", "||"):
-            segments.append("".join(buf))
+            if not unsupported_segment:
+                segments.append("".join(buf))
             buf = []
+            unsupported_segment = False
             at_word_start = True
             i += 2
             continue
@@ -271,16 +405,29 @@ def _split_unquoted_operators(command: str) -> list[str]:
                 i + 1 == n or command[i + 1].isspace() or command[i + 1] in _SEGMENT_OPERATOR_CHARS
             )
         ):
-            segments.append("".join(buf))
+            if not unsupported_segment:
+                segments.append("".join(buf))
             buf = []
+            unsupported_segment = False
             at_word_start = True
             i += 1
+            if ch == "\n" and heredocs:
+                end = _skip_heredoc_bodies(command, i, heredocs)
+                if end is None:
+                    raise UnsupportedShellSyntax(
+                        unsupported_reason or "Shell here-documents require approval", segments
+                    )
+                i = end
+                heredocs = []
             continue
         else:
             buf.append(ch)
         at_word_start = (ch.isspace() or ch in "<>") and not (in_single or in_double)
         i += 1
-    segments.append("".join(buf))
+    if not unsupported_segment:
+        segments.append("".join(buf))
+    if unsupported_reason:
+        raise UnsupportedShellSyntax(unsupported_reason, segments)
     return segments
 
 

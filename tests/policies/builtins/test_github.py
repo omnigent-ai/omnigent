@@ -592,6 +592,27 @@ def test_completed_segments_keep_stricter_decisions(
     assert _action(github_policy(read_all=read_all)(_sh(command))) == expected
 
 
+@pytest.mark.parametrize("read_all,expected", [(False, "DENY"), (True, "ASK")])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ready # status\n{read}",
+        "{read} # status\necho done",
+        "echo $(echo ready) && {read}",
+        '{read}; echo "$(echo ready)"',
+        "echo $'ready'; {read}",
+        "echo \\\nready; {read}",
+        "cat <<DATA\nplain text\nDATA\n{read}",
+        "sh -c 'echo $(echo ready); {read}'",
+    ],
+)
+def test_completed_segments_are_classified_across_unsupported_regions(
+    read_all: bool, expected: str, command: str
+) -> None:
+    command = command.format(read="gh repo view --repo octo/hello")
+    assert _action(github_policy(read_all=read_all)(_sh(command))) == expected
+
+
 @pytest.mark.parametrize("command", ["echo '$(text)'", "echo '`text`'", r'echo "\$(text)"'])
 def test_literal_substitution_text_abstains(command: str) -> None:
     assert github_policy()(_sh(command)) is None
