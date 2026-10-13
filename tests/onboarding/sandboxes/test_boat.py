@@ -265,3 +265,41 @@ def test_resume_active_sandbox_does_not_restart_it(monkeypatch: pytest.MonkeyPat
     _patch_request(monkeypatch, request)
     BoatSandboxLauncher().resume("bx_test")
     assert methods == ["GET", "GET"]
+
+
+@pytest.mark.parametrize(
+    "status,payload,retry",
+    [
+        (409, {"code": "sandbox_starting"}, True),
+        (502, {"code": "sandbox_direct_failed", "error": {"details": {"retryable": True}}}, True),
+        (502, {"code": "sandbox_direct_failed", "message": "sandbox_restoring"}, True),
+        (
+            502,
+            {"code": "sandbox_direct_failed", "error": {"details": {"retryable": False}}},
+            False,
+        ),
+        (502, {"code": "sandbox_direct_failed", "message": "connection_lost"}, False),
+    ],
+)
+def test_commands_retry_only_before_execution(
+    monkeypatch: pytest.MonkeyPatch, status: int, payload: dict, retry: bool
+) -> None:
+    monkeypatch.setenv("BOAT_API_KEY", "test-secret")
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append(kwargs["json"]["command"])
+        if len(calls) == 1:
+            return httpx.Response(status, json=payload)
+        return httpx.Response(200, json={"ok": True, "exitCode": 0, "stdout": "once"})
+
+    _patch_request(monkeypatch, request)
+    monkeypatch.setattr("omnigent.onboarding.sandboxes.boat.time.sleep", lambda _: None)
+    launcher = BoatSandboxLauncher()
+    if retry:
+        assert launcher.run("bx_test", "side-effect").stdout == "once"
+        assert calls == ["side-effect", "side-effect"]
+    else:
+        with pytest.raises(click.ClickException):
+            launcher.run("bx_test", "side-effect")
+        assert calls == ["side-effect"]
