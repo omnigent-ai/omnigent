@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 # the SQLAlchemy store both import it.
 FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 
+WORKTREE_KEPT_LABEL_KEY = "omnigent.worktree_kept"
+
 # One-shot fork directive: the SOURCE session's runtime-native session id
 # (e.g. the source claude-native Claude Code session uuid), stamped on the
 # clone at fork time when the source had one. A native harness launching

@@ -578,6 +578,66 @@ def _main_repo_for_worktree(worktree_path: str) -> str:
     return str(common_dir.parent)
 
 
+@dataclass(frozen=True)
+class WorktreeInspection:
+    dirty_files: int
+    unpushed_commits: int
+    merged: bool | None
+    default_ref: str | None
+
+
+def _default_branch_ref(repo_root: str) -> str | None:
+    sym = _run_git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd=repo_root)
+    if sym.returncode == 0:
+        ref = sym.stdout.strip()
+        prefix = "refs/remotes/"
+        if ref.startswith(prefix):
+            return ref[len(prefix) :]
+    for candidate in ("main", "master"):
+        if _local_branch_exists(repo_root, candidate):
+            return candidate
+    return None
+
+
+def inspect_worktree(*, worktree_path: str, branch: str) -> WorktreeInspection:
+    validate_branch_name(branch)
+    main_repo = _main_repo_for_worktree(worktree_path)
+    if not _local_branch_exists(main_repo, branch):
+        raise WorktreeError(f"branch does not exist: {branch!r}")
+
+    status = _run_git(
+        ["status", "--porcelain", "--untracked-files=all"],
+        cwd=worktree_path,
+    )
+    if status.returncode != 0:
+        raise _git_error("git status failed", status)
+    dirty_files = sum(1 for line in status.stdout.splitlines() if line.strip())
+
+    rev_list = _run_git(
+        ["rev-list", "--count", branch, "--not", "--remotes"],
+        cwd=main_repo,
+    )
+    if rev_list.returncode != 0:
+        raise _git_error("git rev-list failed", rev_list)
+    unpushed_commits = int(rev_list.stdout.strip())
+
+    merged: bool | None = None
+    default_ref = _default_branch_ref(main_repo)
+    if default_ref is not None:
+        probe = _run_git(["merge-base", "--is-ancestor", branch, default_ref], cwd=main_repo)
+        if probe.returncode == 0:
+            merged = True
+        elif probe.returncode == 1:
+            merged = False
+
+    return WorktreeInspection(
+        dirty_files=dirty_files,
+        unpushed_commits=unpushed_commits,
+        merged=merged,
+        default_ref=default_ref,
+    )
+
+
 def remove_worktree(
     *,
     worktree_path: str,

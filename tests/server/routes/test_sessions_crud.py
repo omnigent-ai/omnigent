@@ -839,3 +839,18 @@ async def test_patch_rejects_forged_worktree_identity(
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert WORKTREE_ROOT_LABEL_KEY not in conv.labels
+
+
+async def test_patch_rejects_forged_worktree_kept_reason(
+    client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    from omnigent.stores.conversation_store import WORKTREE_KEPT_LABEL_KEY
+
+    response = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {WORKTREE_KEPT_LABEL_KEY: '{"reason":"unknown"}'}},
+    )
+    assert response.status_code == 400, response.text
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert WORKTREE_KEPT_LABEL_KEY not in conv.labels
