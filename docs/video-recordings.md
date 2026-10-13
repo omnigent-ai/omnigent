@@ -2,7 +2,10 @@
 
 Save a browser-supported video in the session workspace and link it in the
 agent's response: `[Screen recording](recordings/verification.webm)`.
-Users can play the recording in chat or open it in the file viewer.
+Users can play a compact, fixed-height recording in chat or open a larger
+preview in the file viewer. Chat recordings show no action list. For an
+annotated recording, use its panel button to open navigation in the file side
+panel; the chat card keeps its height as that panel opens.
 
 ## Optional clickable actions
 
@@ -44,8 +47,8 @@ Confirmation appears
   displayed label. These are UI limits, not WebVTT format requirements.
 
 The player reads chapters through the authenticated workspace file API.
-Actions appear beside the video when the preview has room, and below it in
-narrow panels and mobile layouts. Click an action, or focus it and press Enter,
+In the file preview, actions appear beside the video when there is room, and
+below it in narrow panels and mobile layouts. Click an action, or focus it and press Enter,
 to seek. Selecting an action before loading starts the video at that offset.
 Seeking an already loaded video preserves its paused or playing state.
 The highlighted action follows playback and native seeking. Actions beyond a

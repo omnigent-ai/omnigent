@@ -29,6 +29,7 @@ type VideoSource = { conversationId: string; path: string } | { src: string };
 export type VideoPlayerProps = VideoSource & {
   title: string;
   className?: string;
+  compact?: boolean;
   onOpenFile?: () => void;
 };
 
@@ -39,7 +40,7 @@ export function VideoPlayer(props: VideoPlayerProps) {
 }
 
 function VideoPlayerContent(props: VideoPlayerProps) {
-  const { title, className, onOpenFile } = props;
+  const { title, className, compact = false, onOpenFile } = props;
   const remoteSrc = "src" in props ? props.src : undefined;
   const conversationId = "conversationId" in props ? props.conversationId : undefined;
   const path = "path" in props ? props.path : undefined;
@@ -115,7 +116,8 @@ function VideoPlayerContent(props: VideoPlayerProps) {
     <span
       ref={cardRef}
       className={cn(
-        "my-2 inline-flex w-[64rem] max-w-full flex-col overflow-hidden rounded-xl border border-border bg-card align-top text-sm text-foreground",
+        "my-2 inline-flex max-w-full flex-col overflow-hidden rounded-xl border border-border bg-card align-top text-sm text-foreground",
+        compact ? "w-[28rem]" : "w-[64rem]",
         className,
       )}
     >
@@ -201,20 +203,26 @@ function VideoPlayerContent(props: VideoPlayerProps) {
               <DownloadIcon className="size-4" />
             </button>
           )}
-          {chapters.length > 0 && (
+          {chapters.length > 0 && (!compact || onOpenFile) && (
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon-xs"
-                  aria-label={actionsOpen ? "Hide recording actions" : "Show recording actions"}
-                  aria-expanded={actionsOpen}
-                  aria-controls={actionsId}
+                  aria-label={
+                    compact
+                      ? "Open recording actions"
+                      : actionsOpen
+                        ? "Hide recording actions"
+                        : "Show recording actions"
+                  }
+                  aria-expanded={compact ? undefined : actionsOpen}
+                  aria-controls={compact ? undefined : actionsId}
                   className="border-none text-muted-foreground hover:text-foreground"
-                  onClick={() => setActionsOpen((open) => !open)}
+                  onClick={() => (compact ? onOpenFile?.() : setActionsOpen((open) => !open))}
                 >
-                  {actionsOpen ? (
+                  {!compact && actionsOpen ? (
                     <PanelRightCloseIcon aria-hidden="true" className="size-4" />
                   ) : (
                     <PanelRightIcon aria-hidden="true" className="size-4" />
@@ -222,7 +230,13 @@ function VideoPlayerContent(props: VideoPlayerProps) {
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
-                <span>{actionsOpen ? "Collapse actions" : "Expand actions"}</span>
+                <span>
+                  {compact
+                    ? "Open recording actions in side panel"
+                    : actionsOpen
+                      ? "Collapse actions"
+                      : "Expand actions"}
+                </span>
               </TooltipContent>
             </Tooltip>
           )}
@@ -231,7 +245,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
       <span
         className={cn(
           "grid min-w-0",
-          chapters.length && actionsOpen && wide && "grid-cols-[minmax(0,1fr)_18rem]",
+          !compact && chapters.length && actionsOpen && wide && "grid-cols-[minmax(0,1fr)_18rem]",
         )}
       >
         <span className="flex min-w-0 flex-col">
@@ -243,7 +257,10 @@ function VideoPlayerContent(props: VideoPlayerProps) {
               controls
               playsInline
               preload="metadata"
-              className="aspect-video max-h-[70vh] w-full bg-black object-contain"
+              className={cn(
+                "w-full bg-black object-contain",
+                compact ? "h-48" : "aspect-video max-h-[70vh]",
+              )}
               onError={() => setFailed(true)}
               onTimeUpdate={(event) => setTime(event.currentTarget.currentTime)}
               onSeeked={(event) => setTime(event.currentTarget.currentTime)}
@@ -267,7 +284,12 @@ function VideoPlayerContent(props: VideoPlayerProps) {
               }}
             />
           ) : (
-            <span className="flex aspect-video max-h-[70vh] w-full flex-col items-center justify-center gap-3 bg-muted p-4 text-muted-foreground">
+            <span
+              className={cn(
+                "flex w-full flex-col items-center justify-center gap-3 bg-muted p-4 text-muted-foreground",
+                compact ? "h-48" : "aspect-video max-h-[70vh]",
+              )}
+            >
               {failed ? (
                 <>
                   <VideoIcon className="size-8" />
@@ -304,7 +326,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
             </span>
           )}
         </span>
-        {chapters.length > 0 && (
+        {!compact && chapters.length > 0 && (
           <span
             id={actionsId}
             hidden={!actionsOpen}

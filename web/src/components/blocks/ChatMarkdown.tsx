@@ -271,6 +271,7 @@ function WorkspaceFileLink({
     if (typeof href === "string" && isRemoteVideoUrl(href)) {
       return (
         <VideoPlayer
+          compact
           src={href}
           title={typeof children === "string" ? children : "Video recording"}
         />
@@ -361,6 +362,7 @@ function WorkspaceFileLink({
   if (conversationId && isVideoFile(resolvedPath)) {
     return (
       <VideoPlayer
+        compact
         conversationId={conversationId}
         path={resolvedPath}
         title={

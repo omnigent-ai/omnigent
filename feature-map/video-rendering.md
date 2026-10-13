@@ -4,13 +4,13 @@ Recordings linked in chat and opened from Files render in an inline player with 
 
 ## Sub-features
 
-- `recording-chat`: Markdown links to reachable workspace recordings show a player and retain the link to the file viewer.
+- `recording-chat`: Markdown links to reachable workspace recordings show a compact, fixed-height player and retain the link to the file viewer.
 - `recording-remote`: Direct HTTP links ending in a video extension show a player, including URLs with signed query strings.
 - `recording-files`: Video files open in the file viewer rather than the editor or binary placeholder.
 - `recording-playback`: Play, pause, seek, and fullscreen use the browser's media controls without automatic playback on mount.
 - `recording-failure`: Failed reads and unsupported codecs show a download fallback and Retry.
 - `recording-lifecycle`: Workspace bytes load only on Play; switching files cancels pending reads and releases loaded media.
-- `recording-actions`: Optional WebVTT chapters seek to agent actions and highlight the current step during playback.
+- `recording-actions`: Optional WebVTT chapters open in the file side panel, seek to agent actions, and highlight the current step during playback.
 - `recording-actions-scroll`: Long action lists scroll within a bounded panel instead of stretching the video card.
 - `recording-actions-download`: Download the original optional WebVTT from the recording download menu, with actions open or hidden.
 - `recording-actions-collapse`: Hide the action panel to enlarge the video, and reopen it from the shared header without resetting playback.
@@ -23,15 +23,15 @@ Recordings linked in chat and opened from Files render in an inline player with 
 - Files: open the Files panel, choose Explore or Changes, and select a recording.
 - Deep link: open a conversation URL with `?file=demo.webm`.
 - Mobile web: use the same deep link or file selection at a narrow viewport; playback stays inline.
-- Annotated recording: save a `.chapters.vtt` file beside the video using the [annotation format](../docs/video-recordings.md), then select an action beside or below the player.
-- Action panel: use the toggle in the shared video header to hide or reopen it. Choose Download annotations (.vtt) in the recording download menu.
+- Annotated recording: save a `.chapters.vtt` file beside the video using the [annotation format](../docs/video-recordings.md), then choose the recording panel button in chat to open its file preview. Select an action beside or below the preview player.
+- File-preview action panel: use the toggle in the shared video header to hide or reopen it. Choose Download annotations (.vtt) in the recording download menu.
 
 ## Driving it with the repro environment
 
 Preconditions: build this checkout and install its Playwright Chromium. The browser-contract lane uses a sealed mock backend and a generated, decodable WebM, so it needs no running server.
 
 - Chat, chat file link, Files browsing, deep link, and mobile playback: `tests/browser_ui/files/test_video_rendering.py::test_workspace_recording_playback`.
-- Equal plain/annotated card width, collapsed media dimensions, and optional annotation download controls: `tests/browser_ui/files/test_video_rendering.py::test_recording_header_size_and_optional_controls`.
+- Compact chat cards, equal plain/annotated dimensions, stable chat height when navigation opens in the side panel, and optional annotation download controls: `tests/browser_ui/files/test_video_rendering.py::test_recording_header_size_and_optional_controls`.
 - Desktop and mobile chat header layout and keyboard file opening: `tests/browser_ui/files/test_video_rendering.py::test_chat_recording_label_stays_inside_header`.
 - Desktop and mobile action navigation, scrolling long action lists, keyboard collapse/reopen, and playback preservation in chat, file links, Files, Changes, and deep links: `tests/browser_ui/files/test_video_rendering.py::test_recording_action_navigation`.
 - Optional annotations: `tests/browser_ui/files/test_video_rendering.py::test_optional_recording_annotations` covers malformed and truncated WebVTT; the ordinary playback checks cover missing annotations.

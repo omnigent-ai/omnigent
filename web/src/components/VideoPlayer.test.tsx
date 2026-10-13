@@ -114,6 +114,21 @@ describe("VideoPlayer", () => {
     expect(downloadWorkspaceFile).toHaveBeenLastCalledWith("sess_1", "demo.webm");
   });
 
+  it("opens compact recording navigation in the file panel without loading video bytes", async () => {
+    vi.mocked(useFileContent).mockReturnValue({
+      data: { encoding: "utf-8", content: "WEBVTT\n" },
+    } as ReturnType<typeof useFileContent>);
+    vi.mocked(parseVideoChapters).mockResolvedValue([{ time: 0, end: 5, title: "Open the app" }]);
+    const onOpenFile = vi.fn();
+    render(<VideoPlayer {...props} compact onOpenFile={onOpenFile} />);
+    const navigation = await screen.findByRole("button", { name: "Open recording actions" });
+    expect(screen.queryByRole("group")).toBeNull();
+    expect(navigation).not.toHaveAttribute("aria-controls");
+    fireEvent.click(navigation);
+    expect(onOpenFile).toHaveBeenCalledOnce();
+    expect(fetchBlob).not.toHaveBeenCalled();
+  });
+
   it("leaves malformed or truncated annotations out of the player", () => {
     vi.mocked(useFileContent).mockReturnValue({
       data: {

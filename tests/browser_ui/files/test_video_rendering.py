@@ -126,7 +126,9 @@ def test_recording_action_navigation(
         f"{session.contract.base_url}/c/{session.session_id}"
         + ("?file=demo.webm" if entry == "deep-link" else "")
     )
-    if entry == "file-link":
+    if entry == "chat":
+        page.get_by_role("button", name="Open recording actions", exact=True).click()
+    elif entry == "file-link":
         page.get_by_role("button", name="Screen recording", exact=True).click()
     elif entry in {"files", "changes"}:
         if width == 390:
@@ -142,7 +144,7 @@ def test_recording_action_navigation(
                 "tab", name="Files" if entry == "files" else re.compile(r"^Changes")
             ).click()
         page.get_by_role("button", name=re.compile(r"^demo.webm\b")).click()
-    title = "Screen recording" if entry == "chat" else "demo.webm"
+    title = "demo.webm"
     actions = page.get_by_role("group", name=f"Recording actions: {title}", exact=True).filter(
         visible=True
     )
@@ -176,11 +178,9 @@ def test_recording_action_navigation(
     assert vb is not None and ab is not None
     if width == 390:
         assert ab["y"] >= vb["y"] + vb["height"]
-    elif entry == "chat":
-        assert ab["x"] >= vb["x"] + vb["width"]
     scrolling = actions.get_by_role("button", name=re.compile("Recorded action 20:")).locator("..")
     assert scrolling.evaluate("el => el.scrollHeight > el.clientHeight")
-    if width == 1600 and entry == "chat":
+    if ab["x"] >= vb["x"] + vb["width"] - 1:
         media_box = player.bounding_box()
         assert media_box is not None
         assert abs(ab["height"] - media_box["height"]) < 2
@@ -214,8 +214,6 @@ def test_recording_action_navigation(
     assert abs(show.bounding_box()["y"] - card.bounding_box()["y"] - header_offset) < 1
     expect(show).to_be_focused()
     expect(show).to_have_attribute("aria-expanded", "false")
-    if width == 1600 and entry == "chat":
-        assert player.bounding_box()["width"] > vb["width"]
     assert media.evaluate(
         "el => el.isConnected && el.paused && Math.abs(el.currentTime - 0.5) < 0.1"
     )
@@ -277,39 +275,35 @@ def test_recording_header_size_and_optional_controls(
     _post_message(session, "[Annotated](demo.webm)\n\n[Plain](plain.webm)")
     page.set_viewport_size({"width": width, "height": 1000})
     page.goto(f"{session.contract.base_url}/c/{session.session_id}")
-    toggle = page.get_by_role("button", name="Hide recording actions", exact=True)
-    expect(toggle).to_be_visible()
+    navigation = page.get_by_role("button", name="Open recording actions", exact=True)
+    expect(navigation).to_be_visible()
     annotated = page.get_by_role("button", name="Annotated", exact=True)
     plain = page.get_by_role("button", name="Plain", exact=True)
     acard, pcard = annotated.locator("../../.."), plain.locator("../../..")
+    expect(acard.get_by_role("group")).to_have_count(0)
+    expect(pcard.get_by_role("button", name="Open recording actions")).to_have_count(0)
     assert acard.bounding_box()["width"] == pcard.bounding_box()["width"]
-    expect(acard.get_by_text("Recording actions", exact=True)).to_have_count(0)
-    download = acard.get_by_role("button", name="Download recording: Annotated", exact=True)
-    db, tb = download.bounding_box(), toggle.bounding_box()
-    assert 0 <= tb["x"] - db["x"] - db["width"] <= 8
-    toggle_box = toggle.bounding_box()
-    toggle.click()
-    show = acard.get_by_role("button", name="Show recording actions", exact=True)
-    assert show.bounding_box() == toggle_box
-    db, tb = download.bounding_box(), show.bounding_box()
-    assert 0 <= tb["x"] - db["x"] - db["width"] <= 8
-    expect(acard.get_by_text("Recording actions", exact=True)).not_to_be_visible()
-    expect(
-        acard.get_by_role("button", name="Download recording: Annotated", exact=True)
-    ).to_be_visible()
-    expect(pcard.get_by_role("button", name="Download recording: Plain")).to_have_count(0)
+    assert acard.bounding_box()["width"] <= 450
+    initial_height = acard.bounding_box()["height"]
     for title in ["Annotated", "Plain"]:
         page.get_by_role("button", name=f"Play video: {title}", exact=True).click()
         _assert_playback(page, page.locator(f'video[aria-label="{title}"]'))
     avideo, pvideo = acard.locator("video").bounding_box(), pcard.locator("video").bounding_box()
-    assert avideo["width"] == pvideo["width"]
-    assert avideo["height"] == pvideo["height"]
-    assert annotated.bounding_box()["y"] < avideo["y"]
-    assert plain.bounding_box()["y"] < pvideo["y"]
-    assert acard.evaluate("el => el.scrollWidth <= el.clientWidth")
-    show.click()
-    expect(acard.get_by_role("group", name="Recording actions: Annotated")).to_be_visible()
-    assert acard.bounding_box()["width"] == pcard.bounding_box()["width"]
+    assert avideo["height"] == pvideo["height"] == 192
+    assert acard.bounding_box()["height"] == initial_height
+    media = acard.locator("video").element_handle()
+    navigation.click()
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(viewer).to_be_visible()
+    actions = viewer.get_by_role("group", name="Recording actions: demo.webm", exact=True)
+    expect(actions).to_be_visible()
+    expect(acard.get_by_role("group")).to_have_count(0)
+    if width == 1600:
+        assert acard.bounding_box()["height"] == initial_height
+    assert media.evaluate("el => el.isConnected && el.paused")
+    actions.get_by_role("button", name=re.compile("Open the app")).click()
+    _assert_playback(page, viewer.locator("video"))
+    expect(viewer.get_by_role("button", name="Download recording: demo.webm")).to_be_visible()
 
 
 @pytest.mark.parametrize("truncated", [False, True])
