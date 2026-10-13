@@ -235,7 +235,7 @@ export function PermissionsModal({
               <SelectTrigger className="h-8 w-28 shrink-0" aria-label="General access">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent>
+              <SelectContent position="popper" align="start">
                 <SelectItem value="0">No access</SelectItem>
                 <SelectItem value="1" disabled={workspaceBlocked || !publicSharingEnabled}>
                   Read
@@ -337,7 +337,7 @@ export function PermissionsModal({
               <SelectTrigger className="mt-1 w-24" aria-label="New user permission">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent>
+              <SelectContent position="popper" align="start">
                 <SelectItem value="1">Read</SelectItem>
                 {/* Read-only sharing caps new grants at view; hide Edit. */}
                 {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
@@ -732,7 +732,7 @@ function GrantRow({
           >
             <SelectValue />
           </SelectTrigger>
-          <SelectContent>
+          <SelectContent position="popper" align="start">
             <SelectItem value="1">Read</SelectItem>
             <SelectItem value="2">Edit</SelectItem>
           </SelectContent>

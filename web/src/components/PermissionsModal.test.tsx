@@ -166,6 +166,35 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("PermissionsModal", () => {
+  it.each(["General access", "New user permission", "Permission level for bob@example.com"])(
+    "anchors the %s menu below the start of its trigger",
+    async (label) => {
+      listMock.mockResolvedValue([
+        { user_id: "bob@example.com", conversation_id: "conv_abc", level: 2 },
+      ]);
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createSharingWrapper("on"),
+      });
+
+      const trigger = await screen.findByRole("combobox", { name: label });
+      await waitFor(() => expect(trigger).toBeEnabled());
+      trigger.focus();
+      fireEvent.keyDown(trigger, { key: "Enter" });
+
+      const menu = await screen.findByRole("listbox");
+      await waitFor(() => {
+        expect(menu).toHaveAttribute("data-side", "bottom");
+        expect(menu).toHaveAttribute("data-align", "start");
+      });
+      expect(within(menu).getByRole("option", { name: "Read" })).toBeInTheDocument();
+
+      fireEvent.keyDown(menu, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByRole("listbox")).not.toBeInTheDocument());
+      await waitFor(() => expect(trigger).toHaveFocus());
+    },
+  );
+
   it("fetches and displays grants when opened", async () => {
     listMock.mockResolvedValue([
       { user_id: "alice@example.com", conversation_id: "conv_abc", level: 3 },
