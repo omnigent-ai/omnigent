@@ -57,11 +57,15 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function renderDiff(conversationId: string | undefined, path: string | null) {
+function renderDiff(
+  conversationId: string | undefined,
+  path: string | null,
+  options?: { enabled?: boolean },
+) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client: queryClient }, children);
-  return renderHook(() => useFileDiff(conversationId, path), { wrapper });
+  return renderHook(() => useFileDiff(conversationId, path, options), { wrapper });
 }
 
 describe("useFileDiff — enable gate", () => {
@@ -151,6 +155,14 @@ describe("useFileDiff — enable gate", () => {
     const { result } = renderDiff("conv_1", "a.ts");
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fetch when the caller disables it, even for a changed file", () => {
+    // The file viewer opts out for media/binary files it never diffs; the
+    // other gates all passing must not override that.
+    setHooks({ serveable: true, changedPaths: ["report.png"] });
+    renderDiff("conv_1", "report.png", { enabled: false });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
