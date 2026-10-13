@@ -404,7 +404,8 @@ class UploadEngine:
         name = str(publication["final_name"])
         if not valid_name(original) or not valid_name(name):
             raise UploadError("invalid_name", "Invalid basename")
-        self._grant(directory, name, staging_basename(original, uid))
+        staging = staging_basename(original, uid)
+        self._grant(directory, name, staging)
         parent = _parent(self.cwd, directory)
         try:
             if _identity(parent) != (m["parent_dev"], m["parent_ino"]):
@@ -420,7 +421,6 @@ class UploadEngine:
                 ):
                     raise UploadError("gone", "No published inode matches this upload")
                 os.fchmod(fd, self.mode)
-                staging = staging_basename(original, uid)
                 try:
                     info = os.stat(staging, dir_fd=parent, follow_symlinks=False)
                 except FileNotFoundError:
@@ -630,9 +630,7 @@ class UploadEngine:
 
     def _cleanup(self, uid: str, m: dict[str, object]) -> dict[str, object]:
         if uid in self.uploads:
-            result = self._dispatch({"op": "abort", "id": uid}, b"")
-            self.uploads.pop(uid, None)
-            return result
+            return self._dispatch({"op": "abort", "id": uid}, b"")
         directory, name = str(m["dir"]), str(m["name"])
         if not valid_name(name):
             raise UploadError("invalid_name", "Invalid basename")

@@ -223,12 +223,7 @@ class UploadManager:
             try:
                 values = json.loads(state_path.read_text())
                 for uid, value in values.items():
-                    record = UploadRecord.model_validate(value)
-                    if value.get("quarantined"):
-                        # Observing an inode does not establish allocation ownership.
-                        record.staging_dev = record.staging_ino = 0
-                        record.pending = True
-                    self.records[uid] = record
+                    self.records[uid] = UploadRecord.model_validate(value)
             except (OSError, ValueError, AttributeError, TypeError):
                 logger.exception("Unreadable upload index; starting with an empty index")
                 self.records.clear()
@@ -358,17 +353,11 @@ class UploadManager:
     async def _save_settled(self) -> None:
         # The index lock must outlive its save thread, even during shutdown.
         task = asyncio.create_task(asyncio.to_thread(self._save))
-        cancelled = False
-        while True:
-            try:
-                await asyncio.shield(task)
-                break
-            except asyncio.CancelledError:
-                cancelled = True
-                if task.cancelled():
-                    raise
-        if cancelled:
-            raise asyncio.CancelledError
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await self._settle(task)
+            raise
 
     async def _persist(self) -> None:
         async with self.lock:
@@ -565,12 +554,11 @@ class UploadManager:
         finally:
             self.inflight.discard(request)
 
-    async def _abort_creation(self, uid: str) -> dict[str, object]:
+    async def _abort_creation(self, uid: str) -> None:
         async with self.upload_locks.setdefault(uid, asyncio.Lock()):
             record = self.records.get(uid)
             if record is not None:
                 await self._remove(uid, record)
-        return {}
 
     async def _create(
         self, session_id: str, environment_id: str, declaration: UploadDeclaration
