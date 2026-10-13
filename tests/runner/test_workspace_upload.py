@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -2271,3 +2272,165 @@ async def test_cancelled_helper_call_keeps_gate_until_settled(
     assert isinstance(result[0], asyncio.CancelledError)
     assert result[1] == {"offset": 0, "size": 3}
     assert reads == ["start", "end", "start", "end"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value,code",
+    [
+        ("dir", "/".join(["\x01" * 250] * 15), "invalid_path"),
+        ("dir", "sub\x7f", "invalid_path"),
+        ("name", "file\x01", "invalid_name"),
+        ("name", "file\x7f", "invalid_name"),
+    ],
+    ids=["long-control-dir", "del-dir", "control-name", "del-name"],
+)
+async def test_control_character_paths_rejected_before_admission(
+    client: httpx.AsyncClient, field: str, value: str, code: str
+) -> None:
+    from omnigent.runner.workspace_upload import RouteError, UploadDeclaration
+
+    manager = client._transport.app.state.workspace_uploads
+    with pytest.raises(RouteError) as exc:
+        UploadDeclaration.model_validate(
+            {"dir": "", "name": "file", "size": 0, "created_by": "alice", field: value}
+        )
+    assert exc.value.status == 400 and exc.value.code == code
+    response = await create(client, **{field: value})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == code
+    assert not manager.records and not manager.upload_locks and not manager.helpers
+    assert not manager.inflight and not manager.state_path.exists()
+    assert (await create(client, name="first")).status_code == 201
+    assert (await create(client, name="second")).status_code == 201
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("op", ["resume", "recover", "cleanup"])
+async def test_maximum_record_frames_fit(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, op: str
+) -> None:
+    from omnigent.inner.os_env_upload import MAX_METADATA_BYTES, staging_basename, write_frame
+    from omnigent.runner.workspace_upload import UploadDeclaration, UploadRecord
+
+    manager = client._transport.app.state.workspace_uploads
+    uid = "f" * 32
+    directory = "/".join(["\U00010000" * 60] * 17)
+    name = "\U00010000" * 63 + "abc"
+    assert len(directory.encode()) == 4096 and len(name.encode()) == 255
+    declaration = UploadDeclaration(
+        dir=directory,
+        name=name,
+        size=1024**3,
+        created_by="\x01" * 256,
+        on_conflict="replace",
+        sha256="f" * 64,
+    )
+    # A workspace prefix is not governed by the declaration's path validation.
+    cwd = "/" + "/".join(["\x01" * 255] * 16)
+    publication = {
+        "path": directory + "/" + name,
+        "final_name": name,
+        "size": declaration.size,
+        "sha256": "f" * 64,
+        "outcome": "replaced",
+        "target_dev": 2**64 - 1,
+        "target_ino": 2**64 - 1,
+    }
+    record = UploadRecord(
+        **declaration.model_dump(),
+        session_id="session",
+        environment_id=DEFAULT_ENVIRONMENT_ID,
+        created_at=9999999999.0,
+        last_activity=9999999999.0,
+        staging_path=cwd + "/" + directory + "/" + staging_basename(name, uid),
+        staging_dev=2**64 - 1,
+        staging_ino=2**64 - 1,
+        parent_dev=2**64 - 1,
+        parent_ino=2**64 - 1,
+        finalizing=True,
+        publication=publication,
+    )
+    manager.records[uid] = record
+    frames: list[dict[str, object]] = []
+
+    async def rpc(
+        binding: object, metadata: dict[str, object], raw: bytes = b""
+    ) -> dict[str, object]:
+        frames.append(metadata)
+        if metadata["op"] == "status" and len(frames) == 1:
+            return {"code": "gone", "error": "Helper restarted"}
+        if metadata["op"] == "recover":
+            return {k: publication[k] for k in ("path", "final_name", "size", "sha256", "outcome")}
+        return {"offset": 0}
+
+    async def registry_for(session: str) -> None:
+        return None
+
+    monkeypatch.setattr(manager, "_helper_rpc", rpc)
+    monkeypatch.setattr(manager, "resolve_registry", registry_for)
+    if op == "resume":
+        await manager._call(uid, record, "status")
+    elif op == "recover":
+        await manager._recover(uid, record)
+    else:
+        await manager._remove(uid, record)
+    metadata = next(frame for frame in frames if frame["op"] == op)
+    encoded = json.dumps(metadata, separators=(",", ":")).encode()
+    assert len(encoded) <= MAX_METADATA_BYTES
+    write_frame(io.BytesIO(), metadata)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_number", [errno.ENAMETOOLONG, errno.ELOOP])
+async def test_advisory_path_errors_are_client_errors(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error_number: int,
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+
+    def fail(path: Path) -> None:
+        raise OSError(error_number, "Invalid client path", str(path))
+
+    monkeypatch.setattr("omnigent.runner.workspace_upload.shutil.disk_usage", fail)
+    response = await create(client)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_path"
+    assert not [r for r in caplog.records if r.levelname in ("ERROR", "CRITICAL")]
+    assert not manager.records and not manager.upload_locks and not manager.state_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_over_path_max_directory_is_client_error(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    workspace = tmp_path / "workspace"
+    path_max = os.pathconf(workspace, "PC_PATH_MAX")
+    part = "d" * 200
+    count = (path_max - len(str(workspace).encode())) // (len(part) + 1) + 1
+    directory = "/".join([part] * count)
+    assert len(directory.encode()) <= 4096
+    assert len(str(workspace / directory).encode()) >= path_max
+    fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+    parents = []
+    try:
+        for _ in range(count):
+            os.mkdir(part, dir_fd=fd)
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            parents.append(fd)
+            fd = child
+        response = await create(client, dir=directory)
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_path"
+        assert not [r for r in caplog.records if r.levelname in ("ERROR", "CRITICAL")]
+        assert not manager.records and not manager.upload_locks and not manager.state_path.exists()
+    finally:
+        os.close(fd)
+        for parent in reversed(parents):
+            os.rmdir(part, dir_fd=parent)
+            os.close(parent)

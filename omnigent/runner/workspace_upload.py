@@ -118,6 +118,14 @@ class UploadDeclaration(BaseModel):
     sha256: str | None = None
     created_by: str = Field(min_length=1)
 
+    @field_validator("dir", "name")
+    @classmethod
+    def path_text(cls, value: str, info: ValidationInfo) -> str:
+        if re.search(r"[\x00-\x1f\x7f]", value):
+            code = "invalid_name" if info.field_name == "name" else "invalid_path"
+            raise RouteError(400, code, "Upload path contains control characters")
+        return value
+
     @field_validator("dir", "created_by")
     @classmethod
     def bounded_text(cls, value: str, info: ValidationInfo) -> str:
@@ -344,7 +352,11 @@ class UploadManager:
                 _unwrap(
                     await self._helper_rpc(
                         binding,
-                        {"op": "resume", "id": uid, **record.model_dump(exclude={"snapshot"})},
+                        {
+                            "op": "resume",
+                            "id": uid,
+                            **record.model_dump(exclude={"snapshot", "staging_path"}),
+                        },
                     )
                 )
                 result = await self._helper_rpc(binding, metadata, raw)
@@ -464,7 +476,12 @@ class UploadManager:
             if record.result is not None:
                 await self._call(uid, record, "forget")
             elif record.staging_dev and record.staging_ino:
-                await self._call(uid, record, "cleanup", **record.model_dump(exclude={"snapshot"}))
+                await self._call(
+                    uid,
+                    record,
+                    "cleanup",
+                    **record.model_dump(exclude={"snapshot", "staging_path"}),
+                )
         except RouteError as exc:
             if exc.code not in ("parent_gone", "staging_gone"):
                 raise
@@ -474,7 +491,7 @@ class UploadManager:
 
     async def _recover(self, uid: str, record: UploadRecord) -> None:
         record.result = await self._call(
-            uid, record, "recover", **record.model_dump(exclude={"snapshot"})
+            uid, record, "recover", **record.model_dump(exclude={"snapshot", "staging_path"})
         )
         record.offset = record.size
         record.finalizing = False
@@ -674,7 +691,12 @@ class UploadManager:
                     {"op": "prepare", "id": uid, **declaration.model_dump(), "dir": directory},
                 )
             )
-            free = await asyncio.to_thread(shutil.disk_usage, helper.cwd / directory)
+            try:
+                free = await asyncio.to_thread(shutil.disk_usage, helper.cwd / directory)
+            except OSError as exc:
+                if exc.errno in (errno.ENAMETOOLONG, errno.ELOOP):
+                    raise RouteError(400, "invalid_path", "Invalid upload path") from exc
+                raise
             if declaration.size > free.free:
                 raise RouteError(507, "no_space", "Insufficient free disk space")
             now = _now()
