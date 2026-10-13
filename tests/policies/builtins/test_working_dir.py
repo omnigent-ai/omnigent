@@ -453,6 +453,23 @@ def test_untokenizable_gated_segment_surfaces_action() -> None:
     assert result is not None and result["result"] == "DENY"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ready # today's status\necho done",
+        "cat <<DATA\ntoday's status\nDATA\necho done",
+        "sh -c 'echo ready # status'",
+        "echo \\\nready",
+    ],
+)
+@pytest.mark.parametrize("action,expected", [("deny", "DENY"), ("ask", "ASK")])
+def test_unsupported_shell_syntax_takes_configured_action(
+    command: str, action: str, expected: str
+) -> None:
+    policy = block_working_dir_changes(action=action)
+    assert _action(policy(_sh(command))) == expected
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Layer 1 — abstention (composition) and tool selection
 # ══════════════════════════════════════════════════════════════════════════════

@@ -252,9 +252,14 @@ def _extract_command_substitutions(command: str) -> tuple[str, list[str]]:
 
 
 def split_command_segments(command: str) -> list[str]:
-    """Separate commands and nested groups while preserving quoted arguments."""
+    """Separate commands, raising ValueError for unsupported shell syntax."""
+    # Validate before extracting substitutions, whose delimiters may occur in
+    # unsupported syntax without representing commands.
+    segments = _split_unquoted_operators(command)
     outer, bodies = _extract_command_substitutions(command)
-    segments = [seg.strip() for seg in _split_unquoted_operators(outer) if seg.strip()]
+    if bodies:
+        segments = _split_unquoted_operators(outer)
+    segments = [seg.strip() for seg in segments if seg.strip()]
     for body in bodies:
         segments.extend(split_command_segments(body))
     return segments
@@ -277,6 +282,8 @@ def _split_unquoted_operators(command: str) -> list[str]:
                 in_single = False
             buf.append(ch)
         elif ch == "\\" and i + 1 < n:
+            if command[i + 1] == "\n":
+                raise ValueError("Shell line continuations require approval")
             buf.extend(command[i : i + 2])
             at_word_start = False
             i += 2
@@ -291,6 +298,8 @@ def _split_unquoted_operators(command: str) -> list[str]:
         elif ch == '"':
             in_double = True
             buf.append(ch)
+        elif (ch == "#" and at_word_start) or command[i : i + 2] == "<<":
+            raise ValueError("Shell comments and here-documents require approval")
         elif command[i : i + 2] in ("&&", "||"):
             segments.append("".join(buf))
             buf = []
@@ -312,7 +321,7 @@ def _split_unquoted_operators(command: str) -> list[str]:
             continue
         else:
             buf.append(ch)
-        at_word_start = ch.isspace() and not (in_single or in_double)
+        at_word_start = (ch.isspace() or ch in "<>") and not (in_single or in_double)
         i += 1
     segments.append("".join(buf))
     return segments

@@ -348,6 +348,10 @@ daily_budget:
 
 Controls GitHub access across MCP tools and `git`/`gh` shell commands. Restricts reads to an allowlist (unless `read_all`) and writes to specific repos/branches. Shell commands with ambiguous targets return ASK.
 
+Shell comments, here-documents (including here-strings), and line continuations are not classified;
+commands containing them return ASK, even when the visible command is benign.
+Quoted or escaped literal characters remain ordinary arguments.
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `read_all` | boolean | `true` | Allow all reads |
@@ -413,6 +417,10 @@ Controls Google Calendar access. Defaults to read-only.
 #### `block_working_dir_changes`
 
 Blocks shell commands that change the working directory (`cd`, `pushd`, `git -C`) or manage git worktrees. Parses chained and wrapped commands to prevent trivial bypasses.
+
+Shell comments, here-documents (including here-strings), and line continuations take the configured
+`action` because the parser cannot classify them reliably. This also applies
+when the visible command does not change directories.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|

@@ -567,6 +567,26 @@ a private broker for renewable credentials instead.
 
 Tools are declared under `tools` by name.
 
+### Uploaded-agent compatibility in 0.18.0
+
+On multi-user servers, uploaded agent bundles cannot declare server-side Python
+or TypeScript source-file tools. This includes tools in nested agents. Existing
+uploaded agents using these tools also fail bundle validation when adding,
+updating, or deleting MCP-server settings.
+
+To migrate an existing uploaded agent:
+
+1. Expose its custom tools through an MCP server and replace the source-file
+   tool entries with `type: mcp` entries, as shown below. Update nested agents too.
+2. Upload the corrected bundle and start a new session with it. Re-uploading
+   creates a new agent version; it does not rewrite existing sessions.
+3. Make subsequent MCP configuration changes on the migrated agent. Removing an
+   MCP server from an old agent does not bypass bundle validation.
+
+Operator-authored bundles on trusted single-user/local servers retain their
+Python and TypeScript tool support. Changing a tool's declared runtime alone is
+not a migration: client tools require a client-provided implementation.
+
 ### MCP server
 
 ```yaml

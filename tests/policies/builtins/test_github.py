@@ -550,6 +550,19 @@ def test_shell_unparseable_git_command_asks() -> None:
     assert result is not None and result["result"] == "ASK"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ready # today's status\necho done",
+        "cat <<DATA\ntoday's status\nDATA\necho done",
+        "sh -c 'echo ready # status'",
+        "echo \\\nready",
+    ],
+)
+def test_unsupported_shell_syntax_asks_even_for_benign_commands(command: str) -> None:
+    assert _action(github_policy()(_sh(command))) == "ASK"
+
+
 def test_shell_tools_param_overrides_default_tool() -> None:
     """A custom shell tool name is parsed when listed in ``shell_tools``.
 

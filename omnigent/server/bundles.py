@@ -130,7 +130,7 @@ def validate_agent_bundle(
     :raises OmnigentError: If the bundle is invalid, the spec is
         missing a name, or (when *enforce_handler_allowlist*) a policy
         names an unregistered handler, ``os_env.cwd`` is an absolute or
-        escaping path, or a tool declares a server-side Python ``callable:``.
+        escaping path, or a tool declares a server-side callable or Python/TS source file.
     """
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -167,12 +167,7 @@ def validate_agent_bundle(
         # Terminals and nested agents can override the session working directory.
         _reject_uploaded_escaping_cwd(spec)
 
-        # Untrusted uploads may not declare server-side Python ``callable:``
-        # tools (GHSA-756x-9hf6-q4h4): the runner imports the dotted path and
-        # invokes it, so a bundle pointing one at e.g. ``subprocess.check_output``
-        # is authenticated RCE on shared runner infrastructure. Bundled tool
-        # *files* (``tools/python/*.py``) are unaffected: they ship the agent's
-        # own code, not an arbitrary server-installed module.
+        # Server-side callables and source-file tools require operator-authored bundles.
         _reject_uploaded_callable_tools(spec)
 
     return spec

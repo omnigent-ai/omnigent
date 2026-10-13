@@ -56,3 +56,37 @@ def test_escaped_arguments_preserve_command_boundaries(first: str) -> None:
 )
 def test_braces_require_word_boundaries(command: str, expected: list[str]) -> None:
     assert split_command_segments(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ready # today's status\necho done",
+        "# status $(with delimiters\necho done",
+        "echo ready;# status\necho done",
+        "echo \\\n# status\necho done",
+        "echo \\\nready",
+        "cat <<DATA\ntoday's status\nDATA\necho done",
+        "cat <<'DATA'\nplain text\nDATA",
+        "cat <<-DATA\n\tplain text\n\tDATA",
+        "cat <<<text",
+    ],
+)
+def test_unsupported_shell_syntax_requires_approval(command: str) -> None:
+    with pytest.raises(ValueError, match="require approval"):
+        split_command_segments(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'echo "# text"',
+        "echo '# text'",
+        r"echo \#text",
+        "echo word#suffix",
+        'echo "<<DATA"',
+        "echo 'line\\\nbreak'",
+    ],
+)
+def test_literal_comment_and_redirection_characters_remain_arguments(command: str) -> None:
+    assert split_command_segments(command) == [command]

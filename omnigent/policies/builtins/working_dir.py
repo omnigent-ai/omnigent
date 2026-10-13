@@ -363,7 +363,11 @@ def block_working_dir_changes(
         if _depth > MAX_SHELL_NESTING:
             return _violation("Blocked: shell command exceeds the nesting limit.")
         worst: PolicyResponse | None = None
-        for segment in split_command_segments(command):
+        try:
+            segments = split_command_segments(command)
+        except ValueError as exc:
+            return _violation(f"Blocked: could not classify shell syntax ({exc}).")
+        for segment in segments:
             unreadable = False
             try:
                 tokens = shlex.split(segment)

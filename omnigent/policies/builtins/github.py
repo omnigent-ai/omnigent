@@ -969,7 +969,19 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
             )
         ]
     ops: list[_ShellOp] = []
-    for segment in split_command_segments(command):
+    try:
+        segments = split_command_segments(command)
+    except ValueError as exc:
+        return [
+            _ShellOp(
+                kind="unparseable",
+                repo=None,
+                branches=frozenset(),
+                branch_targeted=False,
+                detail=str(exc),
+            )
+        ]
+    for segment in segments:
         unreadable = False
         try:
             tokens = shlex.split(segment)
