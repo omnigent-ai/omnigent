@@ -351,6 +351,7 @@ def create_imports_router(
         native_title: str | None = None,
         project_id: str | None = None,
         host_id: str | None = None,
+        replace_conversation_id: str | None = None,
     ) -> tuple[str, str | None]:
         """Create the conversation, append items, stamp import labels, grant owner.
 
@@ -362,8 +363,8 @@ def create_imports_router(
         session to the host that read the transcript (``/imports/local``), so
         resuming defaults to the machine the workspace lives on; bound only
         alongside a workspace (the ``ck_conversations_workspace_required_for_host``
-        check constraint). Caller handles the already-imported / force decision
-        first. Returns ``(conversation id, title)``.
+        check constraint). Caller authorizes any ``replace_conversation_id``;
+        replacement waits until validation succeeds. Returns ``(conversation id, title)``.
         """
         native_agent = native_coding_agent_for_harness(f"{source}-native")
         if native_agent is None:
@@ -406,6 +407,8 @@ def create_imports_router(
         workspace = resolved_create.body.workspace
         resolved_host_id = resolved_create.body.host_id
         title = (native_title or "").strip() or title_from_items(items)
+        if replace_conversation_id is not None:
+            await conversation_store.delete_conversation(replace_conversation_id)
         try:
             conversation = await asyncio.to_thread(
                 conversation_store.create_conversation,
@@ -483,9 +486,6 @@ def create_imports_router(
                     code=ErrorCode.CONFLICT,
                 )
 
-        if existing is not None:
-            await conversation_store.delete_conversation(existing.id)
-
         session_id, _title = await _persist_import(
             source=body.source,
             external_session_id=body.external_session_id,
@@ -495,6 +495,7 @@ def create_imports_router(
             native_title=body.title,
             project_id=body.project_id,
             host_id=body.host_id,
+            replace_conversation_id=existing.id if existing is not None else None,
         )
 
         response.status_code = 201
