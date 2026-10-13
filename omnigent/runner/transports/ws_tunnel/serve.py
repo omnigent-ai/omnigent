@@ -45,6 +45,11 @@ from omnigent.runner.identity import (
     mark_sign_in_pending,
     touch_connect_marker,
 )
+from omnigent.runner.transports.ws_tunnel.binary_requests import (
+    BINARY_REQUEST_BODY_CAPABILITY,
+    BinaryRequestError,
+    decode_binary_request,
+)
 from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -217,6 +222,8 @@ async def dispatch_via_asgi(
     app: _ASGIApp,
     frame: RequestFrame,
     send_text: Callable[[str], Awaitable[None]],
+    *,
+    raw_body: bytes | None = None,
 ) -> None:
     """Run a tunneled ``request`` frame through the runner's ASGI app
     and stream the response back as frames via ``send_text``.
@@ -225,8 +232,11 @@ async def dispatch_via_asgi(
     :param frame: The incoming ``request`` frame the server sent.
     :param send_text: Async callback that writes a frame onto the
         WebSocket back to the server (typically ``ws.send_text``).
+    :param raw_body: Raw envelope bytes, bypassing JSON body decoding when present.
     """
-    body_bytes = decode_body(frame.body, frame.encoding) if frame.body is not None else b""
+    body_bytes = raw_body
+    if body_bytes is None:
+        body_bytes = decode_body(frame.body, frame.encoding) if frame.body is not None else b""
 
     scope: Scope = {
         "type": "http",
@@ -1517,7 +1527,7 @@ async def _send_hello(
                 capabilities=[
                     CAP_FILESYSTEM_ATTACHMENTS,
                     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
-                    CAP_MCP_REGISTRY,
+                    BINARY_REQUEST_BODY_CAPABILITY,
                     CAP_SIDE_CHAT_SETTINGS,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
@@ -1553,8 +1563,8 @@ async def _handle_tunnel_frame(
 ) -> None:
     """Handle one server-to-runner tunnel frame.
 
-    Malformed frames (bad JSON, unknown ``kind``, missing required
-    fields, non-utf8 bytes) are logged and skipped.
+    Malformed frames are logged; binary envelopes with a recoverable
+    request id also receive an HTTP 400 response.
 
     :param app: Runner ASGI application.
     :param raw: Raw WebSocket message from the server.
@@ -1570,9 +1580,22 @@ async def _handle_tunnel_frame(
     """
     if diagnostics is not None:
         diagnostics.frame_received()
+    raw_body = None
     try:
-        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-        frame = decode_frame(text)
+        if isinstance(raw, bytes):
+            frame, raw_body = decode_binary_request(raw)
+        else:
+            frame = decode_frame(raw)
+    except BinaryRequestError as exc:
+        _logger.warning(
+            "runner received malformed binary request: %s",
+            exc,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        if exc.request_id is not None:
+            await send_text(encode_frame(ResponseHeadFrame(id=exc.request_id, status=400)))
+            await send_text(encode_frame(ResponseEndFrame(id=exc.request_id)))
+        return
     except ValueError as exc:
         _logger.warning(
             "runner received malformed tunnel frame; dropping: %s",
@@ -1596,7 +1619,7 @@ async def _handle_tunnel_frame(
         if on_activity is not None:
             on_activity()
         task = asyncio.create_task(
-            dispatch_via_asgi(app, frame, send_text),
+            dispatch_via_asgi(app, frame, send_text, raw_body=raw_body),
             name=f"ws-tunnel-dispatch:{frame.id}",
         )
         dispatch_tasks[frame.id] = task

@@ -144,6 +144,8 @@ class RunnerSession:
     generation: int = field(default_factory=lambda: next(_connection_generations))
     superseded: bool = field(default=False, init=False)
     in_flight: dict[str, RequestState] = field(default_factory=dict)
+    binary_requests: set[str] = field(default_factory=set)
+    binary_pending_sends: set[str] = field(default_factory=set)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
     # 8-char hex channel ids; values hold the inbound queue consumed
     # by whichever side terminated the attach.
@@ -441,6 +443,8 @@ class TunnelRegistry:
         for state in list(session.in_flight.values()):
             _call_soon_threadsafe(state, partial(_abort_request_state, state, error))
         session.in_flight.clear()
+        session.binary_requests.clear()
+        session.binary_pending_sends.clear()
         for channel in list(session.ws_channels.values()):
             _call_channel_soon_threadsafe(channel, partial(channel.inbound_queue.put_nowait, None))
         session.ws_channels.clear()
@@ -616,7 +620,12 @@ class TunnelRegistry:
     # ── Per-request lifecycle ────────────────────────────
 
     def open_request(
-        self, runner_id: str, req_id: str, *, generation: int | None = None
+        self,
+        runner_id: str,
+        req_id: str,
+        *,
+        generation: int | None = None,
+        binary_body: bool = False,
     ) -> RequestState:
         """Allocate reassembly state for a new outgoing request.
 
@@ -625,6 +634,8 @@ class TunnelRegistry:
         :raises ValueError: If a request with this ``req_id`` is
             already in flight on this runner. req_ids must be unique
             per session.
+        :param binary_body: Reserve one of two opted-in body slots before buffering.
+        :raises httpx.PoolTimeout: If both opted-in body slots are occupied.
         """
         loop = asyncio.get_running_loop()
         with self._lock:
@@ -635,6 +646,8 @@ class TunnelRegistry:
                 raise ConnectionError("runner tunnel changed before request was sent")
             if req_id in session.in_flight:
                 raise ValueError(f"req_id {req_id!r} already in flight on runner {runner_id!r}")
+            if binary_body and len(session.binary_requests) >= 2:
+                raise httpx.PoolTimeout("runner tunnel binary request capacity exhausted (2)")
             state = RequestState(
                 loop=loop,
                 session=session,
@@ -642,6 +655,8 @@ class TunnelRegistry:
                 body_queue=asyncio.Queue(),
             )
             session.in_flight[req_id] = state
+            if binary_body:
+                session.binary_requests.add(req_id)
             return state
 
     def close_request(
@@ -666,6 +681,8 @@ class TunnelRegistry:
             if target is None:
                 return
             target.in_flight.pop(req_id, None)
+            if req_id not in target.binary_pending_sends:
+                target.binary_requests.discard(req_id)
 
     def request_is_open(self, session: RunnerSession, req_id: str) -> bool:
         """Return whether a request is still in flight on ``session``.
@@ -785,6 +802,29 @@ class TunnelRegistry:
     async def send_text(
         self, session: RunnerSession, data: str, *, app_ping_ts: int | None = None
     ) -> None:
+        """Enqueue a JSON frame, preserving heartbeat diagnostics."""
+        await self._send(session, data, app_ping_ts=app_ping_ts)
+
+    async def send_request(
+        self, session: RunnerSession, data: str | bytes, *, request_id: str
+    ) -> None:
+        """Enqueue one request; retain its admission slot until the writer has sent it."""
+        await self._send(session, data, request_id=request_id)
+
+    def _request_sent(self, session: RunnerSession, req_id: str) -> None:
+        with self._lock:
+            session.binary_pending_sends.discard(req_id)
+            if req_id not in session.in_flight:
+                session.binary_requests.discard(req_id)
+
+    async def _send(
+        self,
+        session: RunnerSession,
+        data: str | bytes,
+        *,
+        app_ping_ts: int | None = None,
+        request_id: str | None = None,
+    ) -> None:
         """Enqueue one outbound WebSocket frame on the session's owner loop.
 
         :param session: Current session generation that should send
@@ -807,8 +847,17 @@ class TunnelRegistry:
                 with self._lock:
                     if self._sessions.get(session.runner_id) is not session:
                         raise ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
+                    if request_id is not None and request_id not in session.in_flight:
+                        raise ConnectionError("request closed before tunnel enqueue")
+                    on_sent = None
+                    if request_id is not None and request_id in session.binary_requests:
+                        session.binary_pending_sends.add(request_id)
+                        on_sent = partial(self._request_sent, session, request_id)
                     frame = OutboundFrame(
-                        data, queued_at=session.diagnostics.timestamp(), app_ping_ts=app_ping_ts
+                        data,
+                        queued_at=session.diagnostics.timestamp(),
+                        app_ping_ts=app_ping_ts,
+                        on_sent=on_sent,
                     )
                     session.outbound_queue.put_nowait(frame)
                     # Recording or logging failures cannot undo an accepted frame.
