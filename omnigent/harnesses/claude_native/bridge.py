@@ -4157,7 +4157,7 @@ def inject_user_message(
     rejects that guess ("Unknown command: /<name>") it drops the whole
     message without calling the model, so after such a submit the pane
     is watched briefly for the rejection and the message is re-delivered
-    escaped (zero-width prefix) as plain user text — the message is never
+    escaped (space prefix) as plain user text — the message is never
     silently swallowed. A recognized skill prints no rejection and runs
     exactly as before.
 
@@ -8344,15 +8344,16 @@ def _escape_slash_command_text(content: str) -> str:
     """
     Return *content* escaped so it is treated as plain user text.
 
-    Inserts a zero-width no-break space (U+FEFF) immediately before the
-    leading slash. Claude Code sees a non-slash first character, so the
-    input is submitted as a regular message, while the user still sees
-    their original slash.
+    Inserts a space immediately before the leading slash. Claude Code sees
+    a non-slash first character, so the input is submitted as a regular
+    message, while the user still sees their original slash. An invisible
+    prefix does not work: Claude Code strips invisible characters before
+    it parses the command.
     """
     match = re.match(r"^(\s*)(/)(.*)$", content, re.DOTALL)
     if not match:
         return content
-    return f"{match.group(1)}\ufeff{match.group(2)}{match.group(3)}"
+    return f"{match.group(1)} {match.group(2)}{match.group(3)}"
 
 
 def _escape_unsupported_slash_command(content: str) -> str:

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from http.client import BadStatusLine, RemoteDisconnected
@@ -37,6 +38,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _LOGIN_GUIDANCE,
     _build_tools,
     _claude_prompt_rendered,
+    _escape_slash_command_text,
     _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
     _is_box_rule,
@@ -4187,10 +4189,10 @@ def test_inject_user_message_pastes_content_then_submits(
     ("content", "expected"),
     [
         ("plain text", "plain text"),
-        ("/help", "\ufeff/help"),
-        ("/exit", "\ufeff/exit"),
-        ("/quit now", "\ufeff/quit now"),
-        ("  /help", "  \ufeff/help"),
+        ("/help", " /help"),
+        ("/exit", " /exit"),
+        ("/quit now", " /quit now"),
+        ("  /help", "   /help"),
         ("/clear", "/clear"),
         ("/compact", "/compact"),
         ("/model sonnet-4", "/model sonnet-4"),
@@ -4207,6 +4209,20 @@ def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
     supported commands and skills are left untouched.
     """
     assert _escape_unsupported_slash_command(content) == expected
+
+
+@pytest.mark.parametrize("content", ["/help", "/exit now", "/not-a-real-skill hello"])
+def test_escaped_slash_command_survives_invisible_character_removal(content: str) -> None:
+    """
+    Claude Code drops invisible characters from a draft before it parses a
+    command, so the escaped text must still not lead with ``/`` after that.
+    Its transcript echo must also still match the queued message once
+    leading whitespace is ignored.
+    """
+    escaped = _escape_slash_command_text(content)
+    visible = "".join(ch for ch in escaped if unicodedata.category(ch) != "Cf")
+    assert not visible.startswith("/")
+    assert escaped.lstrip() == content
 
 
 @pytest.mark.parametrize(
@@ -4238,7 +4254,7 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
 ) -> None:
     """
     Unsupported slash commands land in the tmux buffer with a leading
-    zero-width escape so Claude Code treats them as user text.
+    space so Claude Code treats them as user text.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -4272,10 +4288,10 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
     monkeypatch.setattr("subprocess.run", _fake_run)
 
     inject_user_message(bridge_dir, content="/help")
-    assert loaded_payloads[0].startswith("\ufeff/help".encode("utf-8"))
+    assert loaded_payloads[0].startswith(b" /help")
 
     inject_user_message(bridge_dir, content="/clear")
-    assert not loaded_payloads[1].startswith("\ufeff".encode("utf-8"))
+    assert loaded_payloads[1].startswith(b"/clear")
 
 
 def _rejection_pane(name: str, draft: str = "") -> str:
@@ -4373,7 +4389,7 @@ def test_unknown_command_rejection_redelivers_escaped(
     Claude Code drops a message whose leading ``/name`` it does not
     recognize without ever calling the model — the message would be
     silently swallowed. The bridge must watch for the rejection and paste
-    the message again with the zero-width escape so it reaches the model
+    the message again with the space escape so it reaches the model
     as plain user text.
     """
     payloads = _run_unknown_command_injection(
@@ -4387,7 +4403,7 @@ def test_unknown_command_rejection_redelivers_escaped(
         f"got {len(payloads)} paste(s)."
     )
     assert payloads[0].startswith(b"/not-a-real-skill")
-    assert payloads[1].startswith("\ufeff/not-a-real-skill hello world".encode("utf-8"))
+    assert payloads[1].startswith(b" /not-a-real-skill hello world")
 
 
 def test_unknown_name_accepted_as_skill_is_not_redelivered(
