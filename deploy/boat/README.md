@@ -65,15 +65,16 @@ shows the sandbox and the Omnigent host comes online. Archive the sandbox in
 Boat and send another message to check resume; delete it and send another
 message to check that a replacement is provisioned.
 
-
 ### Real cloud E2E
 
 The live lifecycle test uses Boat's service and a real authenticated server.
 It builds a controller from your checkout's wheels, launches separate child
 sandboxes, verifies the host tunnel and repository clone, archives/resumes the
 same disk, replaces a deleted sandbox, and removes its temporary resources.
-It creates paid sandboxes and requires `BOAT_API_KEY`; model-backed agent turns
-are a separate verification requiring model credentials.
+The controller uses server-generated session signing keys and temporary login
+credentials. The managed child hosts never receive the Boat API key. It creates
+paid sandboxes and requires `BOAT_API_KEY`; model-backed agent turns are a
+separate verification requiring model credentials.
 
 From the repository root:
 
@@ -91,7 +92,6 @@ host requirement supports unreleased development controllers whose version is
 not yet on PyPI. The fast API stand-in lives in
 `tests/onboarding/sandboxes/test_boat_transport.py`; it verifies the HTTP contract
 without cloud credentials or provisioning.
-
 
 To run the same scenario through pytest, which builds isolated wheels itself:
 
