@@ -20,6 +20,7 @@ import httpx
 
 from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
@@ -169,6 +170,17 @@ _HTTP_POST_RETRY_MAX_DELAY_S = 30.0
 # range for any realistic max_delay_s / base_delay_s ratio.
 _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT = 32
 _HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
+_FORWARDER_REJECTION_REASONS = frozenset(
+    {
+        ErrorCode.FORBIDDEN,
+        ErrorCode.INVALID_INPUT,
+        ErrorCode.NOT_FOUND,
+        "event batch exceeds count or size limit",
+        "event type is not allowed on runner tunnel",
+        "source_id required for tunnel replay",
+        "invalid session event",
+    }
+)
 # A 503 ``subagent_delivery_not_confirmed`` means the runner could not deliver a
 # terminal sub-agent result to the parent inbox. It is retried (the work entry can
 # be created slightly after the child reports terminal — a short dispatch race), but
@@ -181,6 +193,10 @@ _SUBAGENT_DROPPED_ITEM_REASON = "sub-agent transcript incomplete: an item could 
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
+# A poll that keeps failing (e.g. host credentials unavailable) backs off up to
+# this delay and logs its traceback once per streak, then at most this often.
+_LOOP_FAILURE_MAX_BACKOFF_S = 30.0
+_LOOP_FAILURE_LOG_INTERVAL_S = 300.0
 
 # Claude Code hook event names → Omnigent session-status values
 # published on the per-conversation SSE stream. Unmapped events emit
@@ -1275,6 +1291,8 @@ async def forward_claude_transcript_to_session(
             event_dispatcher=event_dispatcher,
         ) as subagent_client,
     ):
+        loop_failures = 0
+        loop_failure_logged_at = 0.0
         while True:
             try:
                 if subagent_task is not None and subagent_task.done():
@@ -1564,16 +1582,48 @@ async def forward_claude_transcript_to_session(
                     extra={"session_id": session_id},
                 )
             except Exception:
-                _logger.exception(
-                    "Claude transcript forwarder loop failed; session=%s",
-                    session_id,
-                    extra={"session_id": session_id},
-                )
+                loop_failures += 1
+                now = time.monotonic()
+                if (
+                    loop_failures == 1
+                    or now - loop_failure_logged_at >= _LOOP_FAILURE_LOG_INTERVAL_S
+                ):
+                    loop_failure_logged_at = now
+                    _logger.exception(
+                        "Claude transcript forwarder loop failed; session=%s failures=%d",
+                        session_id,
+                        loop_failures,
+                        extra={"session_id": session_id},
+                    )
+            else:
+                if loop_failures:
+                    _logger.info(
+                        "Claude transcript forwarder loop recovered after %d failures; session=%s",
+                        loop_failures,
+                        session_id,
+                        extra={"session_id": session_id},
+                    )
+                loop_failures = 0
             try:
-                await asyncio.sleep(poll_interval_s)
+                await asyncio.sleep(_loop_retry_delay_s(poll_interval_s, loop_failures))
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
                 raise
+
+
+def _loop_retry_delay_s(poll_interval_s: float, consecutive_failures: int) -> float:
+    """
+    Return how long the forwarder loop sleeps before its next poll.
+
+    :param poll_interval_s: The configured delay between healthy polls.
+    :param consecutive_failures: Polls that have failed in a row.
+    :returns: ``poll_interval_s`` while healthy, then doubling per failure
+        up to :data:`_LOOP_FAILURE_MAX_BACKOFF_S`.
+    """
+    if consecutive_failures <= 0:
+        return poll_interval_s
+    backoff_s = poll_interval_s * 2 ** min(consecutive_failures, 16)
+    return min(backoff_s, max(poll_interval_s, _LOOP_FAILURE_MAX_BACKOFF_S))
 
 
 def _subagents_dir_for_transcript(transcript_path: Path) -> Path:
@@ -4269,6 +4319,7 @@ async def _forward_available_status_events(
                         session_id=session_id,
                         reason=f"hook status {status} rejected",
                         source_id=retry_key,
+                        http_error=exc,
                         response_id=response_id,
                     )
                 durable = next_durable
@@ -4808,6 +4859,7 @@ async def _forward_available_items(
                         session_id=session_id,
                         reason=f"transcript item {item.source_id} rejected",
                         source_id=retry_key,
+                        http_error=exc,
                         response_id=current_response_id,
                     )
                 seen.add(item.source_id)
@@ -6256,12 +6308,28 @@ async def _maybe_sync_effort_from_slash_command(
         )
 
 
+def _forwarder_rejection_context(error: httpx.HTTPError) -> FailureContext:
+    """Retain rejection metadata without copying echoed transcript content."""
+    if not isinstance(error, httpx.HTTPStatusError):
+        return {}
+    context: FailureContext = {"http_status": error.response.status_code}
+    try:
+        body = error.response.json()
+    except ValueError:
+        return context
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, str) and detail in _FORWARDER_REJECTION_REASONS:
+        context["forwarder_rejection_reason"] = detail
+    return context
+
+
 async def _post_forwarder_failed_status(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     reason: str,
     source_id: str,
+    http_error: httpx.HTTPError,
     response_id: str | None = None,
 ) -> None:
     """
@@ -6272,6 +6340,7 @@ async def _post_forwarder_failed_status(
     :param reason: Diagnostic reason for the failure event, e.g.
         ``"transcript item item-1 rejected"``.
     :param source_id: Retry key of the rejected hook or transcript item.
+    :param http_error: The rejection that exhausted the delivery retry budget.
     :param response_id: Active turn's response id, so this ``failed``
         edge closes the streaming ``activeResponse`` for the matching
         turn rather than leaving its tool cards spinning. ``None`` when
@@ -6293,6 +6362,7 @@ async def _post_forwarder_failed_status(
                 "detail_source": "forwarder_delivery_error",
                 "failure_decision": "session_failed",
                 "runner_version": VERSION,
+                **_forwarder_rejection_context(http_error),
             },
         )
     except httpx.HTTPError:

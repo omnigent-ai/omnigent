@@ -43,9 +43,14 @@ describe("rewriteFileUriLinks", () => {
     });
   });
 
-  it("decodes percent-escapes so the path matches the file on disk", () => {
+  it("keeps percent-escapes for markWorkspaceFileLinks to decode exactly once", () => {
+    // Decoding here too would double-decode: `report%2520final.md` names a
+    // file literally called `report%20final.md`, not `report final.md`.
     expect(rewriteHref("file:///tmp/my%20notes/report.md")).toEqual({
-      href: "/tmp/my notes/report.md",
+      href: "/tmp/my%20notes/report.md",
+    });
+    expect(rewriteHref("file:///ws/report%2520final.md")).toEqual({
+      href: "/ws/report%2520final.md",
     });
   });
 

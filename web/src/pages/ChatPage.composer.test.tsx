@@ -538,6 +538,22 @@ describe("Composer growth layout", () => {
 });
 
 describe("Composer send shortcut", () => {
+  it("preserves list indentation when sending auto-formatted bullets", () => {
+    const props = composerProps();
+    render(<Composer {...props} />);
+    const input = textarea();
+    fireEvent.change(input, { target: { value: "-" } });
+    input.setSelectionRange(1, 1);
+    fireEvent.keyDown(input, { key: " " });
+    expect(input).toHaveValue("  - ");
+    fireEvent.change(input, { target: { value: input.value + "First" } });
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    fireEvent.change(input, { target: { value: input.value + "Second" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith("  - First\n  - Second", undefined);
+  });
+
   beforeEach(() => {
     localStorage.clear();
     clearSessionDrafts();
@@ -3891,7 +3907,7 @@ describe("Composer reply quotes", () => {
       expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(0);
       expect(textarea()).toHaveValue(text);
       fireEvent.keyDown(textarea(), { key: "Enter" });
-      expect(props.onSend).toHaveBeenCalledWith(text.trim(), undefined);
+      expect(props.onSend).toHaveBeenCalledWith(text.trimEnd(), undefined);
     },
   );
 

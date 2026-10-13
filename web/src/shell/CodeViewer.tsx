@@ -10,19 +10,22 @@
 //   Existing comments highlight the lines they span. Clicking inside a
 //   highlighted range navigates to that comment in CommentsPanel.
 
-import type { FilePosition } from "./FileViewerContext";
+import { useFileViewer, type FilePosition } from "./FileViewerContext";
 import { isFilePositionPending } from "./filePositionState";
 import { createPortal } from "react-dom";
 import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
 import {
+  createContext,
   isValidElement,
   lazy,
   Suspense,
   useCallback,
+  useContext,
   useEffect,
   useMemo,
   useRef,
   useState,
+  type ComponentPropsWithoutRef,
   type ReactNode,
   type RefObject,
   type UIEvent,
@@ -48,6 +51,7 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
 import rehypeSlug from "rehype-slug";
 import { createMathPlugin } from "@streamdown/math";
+import { ExternalPreviewLink } from "./ExternalPreviewLink";
 import { MermaidPreview } from "./MermaidPreview";
 import type { Comment } from "@/hooks/useComments";
 import {
@@ -58,6 +62,7 @@ import {
 import { useCanEdit } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
+import { isWorkspaceRelativeSrc, resolveWorkspacePath } from "./TipTapWorkspaceImage";
 import {
   type ActiveSelection,
   type SaveStatus,
@@ -171,7 +176,69 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
 // which does win the cascade — for the one image being rendered. This runs
 // after sanitize (React components render the already-sanitized tree), so it
 // adds no attack surface. Only literal integer pixel values are forwarded.
+// Path of the previewed file, so a relative link resolves against its directory.
+const MarkdownPreviewPathContext = createContext<string | null>(null);
+
+/**
+ * Anchor for the Markdown preview. A link to another workspace file (`notes.md`,
+ * `../docs/`) opens in the FileViewer: as a plain anchor the browser resolves it
+ * against the app URL (`/c/<id>` → `/c/notes.md`) and loads a session that
+ * doesn't exist. URLs and `mailto:` links open outside the app window (see
+ * ExternalPreviewLink); in-page `#` links keep their href.
+ */
+function MarkdownPreviewLink({
+  href,
+  children,
+  node: _node,
+  ...props
+}: ComponentPropsWithoutRef<"a"> & { node?: unknown }) {
+  const openFile = useFileViewer();
+  const filePath = useContext(MarkdownPreviewPathContext);
+  if (href && !isWorkspaceRelativeSrc(href)) {
+    return (
+      <ExternalPreviewLink href={href} {...props}>
+        {children}
+      </ExternalPreviewLink>
+    );
+  }
+  if (!href || href.startsWith("#")) {
+    return (
+      <a href={href} {...props}>
+        {children}
+      </a>
+    );
+  }
+  const target = filePath === null ? "" : resolveWorkspacePath(filePath, href);
+  if (!openFile || !target) {
+    return (
+      <span className={props.className} title={href}>
+        {children}
+      </span>
+    );
+  }
+  // No href, so a modified or middle click can't open the bogus app URL either.
+  return (
+    <a
+      {...props}
+      role="button"
+      tabIndex={0}
+      title={props.title ?? href}
+      className={cn("cursor-pointer", props.className)}
+      onClick={() => openFile(target)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          openFile(target);
+        }
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
 const MARKDOWN_COMPONENTS: Components = {
+  a: MarkdownPreviewLink,
   pre({ children, ...props }) {
     const child = isValidElement(children) ? children : null;
     if (
@@ -198,12 +265,15 @@ const MARKDOWN_COMPONENTS: Components = {
 
 function MarkdownPreview({
   content,
+  path,
   rootRef,
   onScroll,
   tocOpen,
   onTocOpenChange,
 }: {
   content: string;
+  /** Workspace path of the previewed file, e.g. ``"docs/README.md"``. */
+  path: string | null;
   rootRef?: RefObject<HTMLDivElement | null>;
   onScroll?: (event: UIEvent<HTMLElement>) => void;
   tocOpen: boolean;
@@ -221,13 +291,15 @@ function MarkdownPreview({
         onScroll={onScroll}
         className="markdown-preview flex-1 px-6 py-4 overflow-auto prose dark:prose-invert prose-sm max-w-none"
       >
-        <ReactMarkdown
-          remarkPlugins={MARKDOWN_REMARK_PLUGINS}
-          rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
-          components={MARKDOWN_COMPONENTS}
-        >
-          {rendered}
-        </ReactMarkdown>
+        <MarkdownPreviewPathContext.Provider value={path}>
+          <ReactMarkdown
+            remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+            rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+            components={MARKDOWN_COMPONENTS}
+          >
+            {rendered}
+          </ReactMarkdown>
+        </MarkdownPreviewPathContext.Provider>
       </div>
       {tocOpen && (
         <aside className="w-64 shrink-0">
@@ -249,6 +321,7 @@ function MarkdownPreview({
 // recompute when the rendered document changes.
 function PreviewWithSearch({
   content,
+  path,
   isNotebook,
   truncated,
   searchOpen,
@@ -261,6 +334,8 @@ function PreviewWithSearch({
   commentHint,
 }: {
   content: string;
+  /** Workspace path of the previewed file, for resolving relative links. */
+  path: string | null;
   isNotebook: boolean;
   truncated: boolean;
   searchOpen: boolean;
@@ -297,6 +372,7 @@ function PreviewWithSearch({
   ) : (
     <MarkdownPreview
       content={content}
+      path={path}
       rootRef={previewRef}
       onScroll={handleScroll}
       tocOpen={tocOpen}
@@ -418,6 +494,11 @@ export interface CodeViewerProps {
   panelOpen: boolean;
   searchOpen: boolean;
   setSearchOpen: (open: boolean) => void;
+  /**
+   * Bumped by FileViewer on each Cmd+F. Forwarded to the Monaco editor so a
+   * press with the find widget already open refocuses its input.
+   */
+  searchFocusNonce?: number;
   searchInputRef: RefObject<HTMLInputElement | null>;
   viewMode: "editor" | "preview" | "source" | "diff";
   onDirtyChange?: (isDirty: boolean) => void;
@@ -453,6 +534,7 @@ export function CodeViewer({
   panelOpen,
   searchOpen,
   setSearchOpen,
+  searchFocusNonce,
   searchInputRef,
   viewMode,
   onDirtyChange,
@@ -874,6 +956,7 @@ export function CodeViewer({
     return (
       <PreviewWithSearch
         content={content}
+        path={path}
         isNotebook={isNotebook}
         truncated={truncated}
         searchOpen={searchOpen}
@@ -911,6 +994,7 @@ export function CodeViewer({
           onDirtyChange={onDirtyChange}
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}
+          searchFocusNonce={searchFocusNonce}
           onSearchHandled={handleSearchHandled}
           comments={comments}
           activeSelection={activeSelection}

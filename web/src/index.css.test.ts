@@ -996,7 +996,7 @@ describe("index.css electron-mac window drag region", () => {
 
   it("covers the full width and height of the desktop header", () => {
     expect(dragRule).toContain("inset: 0 0 auto 0");
-    expect(dragRule).toContain("height: 3rem");
+    expect(dragRule).toContain("height: var(--mac-titlebar-height)");
     expect(dragRule).toContain("-webkit-app-region: drag");
   });
 
@@ -1153,7 +1153,7 @@ describe("index.css electron-mac sidebar header", () => {
   });
 
   it("reserves the entire drag band before the sidebar content", () => {
-    expect(headerRowRule).toContain("height: 3rem");
+    expect(headerRowRule).toContain("height: var(--mac-titlebar-height)");
   });
 
   it("hides the sidebar's own cluster in favour of the title-bar copy", () => {
@@ -1193,7 +1193,7 @@ describe("index.css electron-mac sidebar header", () => {
   });
 
   it("floats the peek card below the title-bar controls", () => {
-    expect(peekCardRule).toContain("top: 3.5rem");
+    expect(peekCardRule).toContain("top: calc(var(--mac-titlebar-height) + 0.5rem)");
   });
 
   it("drops the header row inside the peek card", () => {
@@ -1211,7 +1211,7 @@ describe("index.css electron-mac sidebar header", () => {
   it("pushes the settings sidebar's Back row below the lights", () => {
     // /settings swaps the header row out entirely; without this its Back row
     // would sit underneath the window controls.
-    expect(settingsHeaderRule).toContain("padding-top: 3.5rem");
+    expect(settingsHeaderRule).toContain("padding-top: calc(var(--mac-titlebar-height) + 0.5rem)");
   });
 
   it("keeps every header rule scoped to the desktop shell", () => {
@@ -1284,7 +1284,7 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
 
   it("has the clearance rule this test exists to protect", () => {
     expect(rule, "the maximized rail tab-strip padding rule is gone from index.css").toBeDefined();
-    expect(rule).toMatch(/padding-left:\s*10\.5rem/);
+    expect(rule).toContain("padding-left: calc(var(--mac-traffic-light-width) + 5rem)");
   });
 
   it("clears the lights on the mac shell while the sidebar is collapsed", () => {

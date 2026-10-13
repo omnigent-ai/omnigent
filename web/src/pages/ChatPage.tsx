@@ -3333,7 +3333,8 @@ function ComposerImpl(
       };
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
-      onSend(mentionPreamble + trimmed, sendFiles);
+      const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
+      onSend(mentionPreamble + message, sendFiles);
     }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);

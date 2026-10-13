@@ -650,6 +650,10 @@ async def _retry_session_single_flight(
     return await asyncio.shield(task)
 
 
+class _RunnerNotBoundError(OmnigentError):
+    """A runner sent events for a session that is now bound to another runner."""
+
+
 @dataclass(frozen=True)
 class _RunnerEventContext:
     """Authenticated tunnel identity for runner-originated external events."""
@@ -724,7 +728,9 @@ def register_events_routes(
             if conv is None:
                 raise _session_not_found()
         if isinstance(request, _RunnerEventContext) and conv.runner_id != request.runner_id:
-            raise OmnigentError("session is not bound to this runner", code=ErrorCode.FORBIDDEN)
+            raise _RunnerNotBoundError(
+                "session is not bound to this runner", code=ErrorCode.FORBIDDEN
+            )
         return user_id, conv
 
     @event_router.post(
@@ -821,6 +827,24 @@ def register_events_routes(
             try:
                 body = SessionEventInput.model_validate(payload)
                 await _post_event_impl(request, batch.session_id, body)
+            except _RunnerNotBoundError:
+                # The session moved to another runner, which mirrors its own
+                # transcript. Acknowledge this runner's late events as handled:
+                # older runners turn any rejection into a session failure.
+                _logger.info(
+                    "Discarding events for session %s from runner %s it was moved off",
+                    batch.session_id,
+                    runner_id,
+                    extra=debug_event(
+                        "runner_event_batch_superseded",
+                        session_id=batch.session_id,
+                        runner_id=runner_id,
+                        batch_id=batch.id,
+                        batch_size=len(batch.events),
+                        event_type=event_type,
+                    ),
+                )
+                return EventAckFrame(batch.id, len(batch.events))
             except OmnigentError as exc:
                 return EventAckFrame(
                     batch.id,
@@ -1965,6 +1989,7 @@ def register_events_routes(
                     session_id,
                     status_error,
                     conversation_store,
+                    owner_runner_id=conv.runner_id,
                     agent_name=failed_agent_name,
                 )
             elif status == "running":
@@ -2609,6 +2634,22 @@ def register_events_routes(
                     and not relaunched_launch_refused
                     and await _session_host_offline(conv, request.app.state)
                 )
+                if (
+                    conv.host_id is not None
+                    and conv.kind != "sub_agent"
+                    and not exit_cause
+                    and not host_offline
+                    and not relaunched_launch_acknowledged
+                    and not relaunched_launch_refused
+                ):
+                    # A connected host that never took the launch shows no runner failed
+                    # to start. Refuse the send so the client keeps the message, as for a
+                    # dropped tunnel, instead of consuming it into a failed turn.
+                    raise OmnigentError(
+                        "The host for this session is not responding. "
+                        "Wait for it to reconnect and send the message again.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
                 if exit_cause:
                     failure_message = exit_cause
                 elif host_offline:

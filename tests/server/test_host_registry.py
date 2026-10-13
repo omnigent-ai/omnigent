@@ -400,7 +400,9 @@ def test_send_text_enqueues_frame() -> None:
 
     # Frame should be on the outbound queue.
     frame = conn.outbound_queue.get_nowait()
-    assert frame == '{"kind": "host.launch_runner"}'
+    assert frame is not None
+    assert frame.data == '{"kind": "host.launch_runner"}'
+    assert conn.diagnostics.snapshot()["outbound_queue_depth"] == 1
 
 
 def test_send_text_raises_if_connection_replaced() -> None:
@@ -463,8 +465,8 @@ def test_same_host_id_isolated_across_workspaces() -> None:
     # send_text routes to the right workspace's tunnel (no "replaced" error).
     registry.send_text(conn_a, "a")
     registry.send_text(conn_b, "b")
-    assert conn_a.outbound_queue.get_nowait() == "a"
-    assert conn_b.outbound_queue.get_nowait() == "b"
+    assert conn_a.outbound_queue.get_nowait().data == "a"
+    assert conn_b.outbound_queue.get_nowait().data == "b"
 
     # Deregister is workspace-scoped: removing A leaves B live.
     with workspace_scope(111):

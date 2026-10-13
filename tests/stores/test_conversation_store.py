@@ -4525,6 +4525,146 @@ def test_fork_conversation_copies_items(
         assert fork_item.data == src_item.data
 
 
+@pytest.mark.parametrize("last_error_code", ["workspace_missing", "runner_disconnected"])
+def test_fork_marks_source_workspace_failures_as_notices(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    last_error_code: str,
+) -> None:
+    """A new unbound fork leaves the source's missing-workspace diagnosis behind."""
+    host_id = "1" * 32
+    _register_host(db_uri, host_id)
+    source = conversation_store.create_conversation(
+        workspace="/missing-workspace", host_id=host_id, runner_id="source-runner"
+    )
+    source_labels = {
+        "omnigent.last_task_error_code": last_error_code,
+        "omnigent.last_task_error_message": "Source launch failed",
+        "omnigent.last_task_error_item_id": "source-error",
+        "omnigent.last_task_error_title": "Source failure",
+        "kept": "yes",
+    }
+    conversation_store.set_labels(source.id, source_labels)
+    missing = NewConversationItem(
+        type="error",
+        response_id="failed_launch",
+        data=ErrorData(
+            source="execution",
+            code="workspace_missing",
+            message="workspace path does not exist: /missing-workspace",
+            title="Workspace missing",
+            cause="The source working directory was deleted.",
+            remediation="Restore the original directory.",
+        ),
+    )
+    source_items = conversation_store.append(
+        source.id,
+        [
+            _user_message("Earlier context", "earlier"),
+            NewConversationItem(
+                type="error",
+                response_id="earlier",
+                data=ErrorData(source="llm", code="rate_limit_exceeded", message="Retry later"),
+            ),
+            missing,
+            _user_message("Please continue", "failed_launch"),
+            missing,
+        ],
+    )
+    calls = _count_encode_hooks(conversation_store, monkeypatch)
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert calls == {"item": 0, "batch": 1, "decode_batch": 1}
+    assert fork.workspace is None and fork.host_id is None and fork.runner_id is None
+    assert fork.labels["kept"] == "yes"
+    if last_error_code == "workspace_missing":
+        assert not any(key.startswith("omnigent.last_task_error_") for key in fork.labels)
+    else:
+        assert all(fork.labels[key] == value for key, value in source_labels.items())
+    fork_items = conversation_store.list_items(fork.id).data
+    for original_item, fork_item in zip(source_items, fork_items, strict=True):
+        assert original_item.id != fork_item.id
+        assert original_item.response_id == fork_item.response_id
+        if original_item.data == missing.data:
+            assert isinstance(fork_item.data, ErrorData)
+            assert fork_item.data.code == "source_workspace_missing"
+            assert fork_item.data.level == "info"
+            assert fork_item.data.title == "The original session’s workspace was unavailable."
+            assert fork_item.data.message == missing.data.message
+            assert fork_item.data.cause is None and fork_item.data.remediation is None
+        else:
+            assert fork_item.data == original_item.data
+    assert _stored_positions(conversation_store, fork.id) == list(range(5))
+    assert conversation_store.list_items(source.id).data == source_items
+    original = conversation_store.get_conversation(source.id)
+    assert original is not None
+    assert original.workspace == "/missing-workspace" and original.host_id == host_id
+    assert original.labels == source_labels
+    assert len(conversation_store.search("source_workspace_missing", conversation_id=fork.id)) == 2
+    assert conversation_store.search("source_workspace_missing", conversation_id=source.id) == []
+
+    [new_failure] = conversation_store.append(fork.id, [missing])
+    assert conversation_store.list_items(fork.id).data[-1] == new_failure
+    assert isinstance(new_failure.data, ErrorData)
+    assert new_failure.data.code == "workspace_missing" and new_failure.data.level is None
+    assert _stored_positions(conversation_store, fork.id) == list(range(6))
+
+
+@pytest.mark.parametrize("has_prior_item", [False, True])
+def test_fork_preserves_compaction_boundary_at_workspace_error(
+    conversation_store: SqlAlchemyConversationStore,
+    has_prior_item: bool,
+) -> None:
+    """A historical workspace notice keeps later, unsummarized messages after its cursor."""
+    source = conversation_store.create_conversation()
+    if has_prior_item:
+        conversation_store.append(source.id, [_user_message("Earlier context", "earlier")])
+    [boundary] = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="error",
+                response_id="failed_launch",
+                data=ErrorData(
+                    source="execution", code="workspace_missing", message="Directory missing"
+                ),
+            ),
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            _user_message("Intervening message", "between"),
+            NewConversationItem(
+                type="compaction",
+                response_id="compacted",
+                data=CompactionData(
+                    summary="Prior context", last_item_id=boundary.id, token_count=3
+                ),
+            ),
+            _user_message("Continue", "latest"),
+        ],
+    )
+    original_items = conversation_store.list_items(source.id).data
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    items = conversation_store.list_items(fork.id).data
+    compaction = next(item for item in items if item.type == "compaction")
+    assert isinstance(compaction.data, CompactionData)
+    fork_boundary = next(item for item in items if item.type == "error")
+    assert compaction.data.last_item_id == fork_boundary.id
+    assert isinstance(fork_boundary.data, ErrorData)
+    assert fork_boundary.data.code == "source_workspace_missing"
+    recent_items = conversation_store.list_items(fork.id, after=compaction.data.last_item_id).data
+    assert [
+        item.data.content[0]["text"] for item in recent_items if isinstance(item.data, MessageData)
+    ] == ["Intervening message", "Continue"]
+    assert conversation_store.list_items(source.id).data == original_items
+
+
 def test_fork_conversation_remaps_file_references(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,

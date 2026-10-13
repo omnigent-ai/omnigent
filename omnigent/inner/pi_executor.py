@@ -1579,12 +1579,8 @@ def _try_sandbox_pi(
         # Pi needs to read its own installation + node_modules.
         pi_dir = pathlib.Path(pi_path).resolve().parent.parent
         sandbox = with_additional_read_roots(sandbox, [pi_dir])
-        # Pi writes to ~/.pi, /tmp, and $TMPDIR (on macOS $TMPDIR is a
-        # per-user dir under /var/folders/, not /tmp — grant both so
-        # PI_CODING_AGENT_DIR (created via tempfile.mkdtemp) is reachable.
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
-        sys_tmpdir = pathlib.Path(tempfile.gettempdir())
-        sandbox = with_additional_write_roots(sandbox, [home_pi, pathlib.Path("/tmp"), sys_tmpdir])
+        sandbox = with_additional_write_roots(sandbox, [home_pi])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
         launcher = create_exec_launcher(pi_path, sandbox)
         return SandboxedPiCli(launch_path=launcher, sandboxed=True)
@@ -2290,7 +2286,11 @@ class PiExecutor(Executor):
             is pinned (Pi picks its own default).
         """
         env = dict(self._env)
-        tmp_dir = tempfile.mkdtemp(prefix="omnigent_pi_")
+        tmp_parent = None
+        if self._sandboxed:
+            tmp_parent = pathlib.Path.home() / ".pi"
+            tmp_parent.mkdir(parents=True, exist_ok=True)
+        tmp_dir = tempfile.mkdtemp(prefix="omnigent_pi_", dir=tmp_parent)
         extra_args: list[str] = list(self._extra_args)
 
         if self._gateway:

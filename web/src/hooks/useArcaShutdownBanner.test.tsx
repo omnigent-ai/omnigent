@@ -63,12 +63,9 @@ describe("useArcaShutdownBanner", () => {
     expect(view.result.current.showForHost("arca")).toBe(true);
   });
 
-  it("stays hidden after opt out", () => {
+  it("ignores the unused opt-out storage key", () => {
+    localStorage.setItem("omnigent:arca-shutdown:opted-out", "true");
     const view = renderHook(() => useArcaShutdownBanner());
-    act(() => view.result.current.optOut());
-    state.now = TUE_5PM;
-    vi.setSystemTime(TUE_5PM);
-    view.rerender();
-    expect(view.result.current.showForHost("arca")).toBe(false);
+    expect(view.result.current.showForHost("arca")).toBe(true);
   });
 });

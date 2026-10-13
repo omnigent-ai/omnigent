@@ -63,7 +63,8 @@ export type FeatureKey =
   | "canvas"
   | "arca_shutdown_warnings"
   | "import_review"
-  | "custom_agents_settings_ui";
+  | "custom_agents_settings_ui"
+  | "sidebar_grouping_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -128,7 +129,7 @@ export interface ServerInfo {
    */
   sandbox_provider_capabilities?: Record<
     string,
-    { multi_repo?: boolean; inference_models?: boolean }
+    { multi_repo?: boolean; inference_models?: boolean; default_models?: boolean }
   >;
   /**
    * Connection providers this deploy has wired (config + store present),

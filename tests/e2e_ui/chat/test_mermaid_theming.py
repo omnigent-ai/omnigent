@@ -16,6 +16,8 @@ import time
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import open_previewable_files_in_preview
+
 _AGENT_NAME = "hello_world"
 
 # Wide enough (six participants) that its natural width exceeds the chat
@@ -236,20 +238,7 @@ def test_file_preview_diagram_is_legible_in_dark_mode(
     ).raise_for_status()
 
     page.emulate_media(color_scheme="dark")
-    page.add_init_script(
-        """
-        window.localStorage.setItem(
-          "omnigent:file-view-preferences",
-          JSON.stringify({
-            diffActive: false,
-            diffLayout: "unified",
-            previewableViewMode: "preview",
-            hideWhitespace: false,
-            wrapLines: false,
-          }),
-        );
-        """
-    )
+    open_previewable_files_in_preview(page)
     page.goto(f"{base_url}/c/{session_id}?file={_PREVIEW_FILE}")
 
     preview = page.locator('[data-testid="file-viewer"]:visible [data-testid="mermaid-preview"]')

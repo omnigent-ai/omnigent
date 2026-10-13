@@ -490,7 +490,7 @@ def picker_rig(
 
 _MODEL_ROW_PREFIX = "new-chat-landing-agent-model-"
 # Non-catalog controls sharing the row testid prefix: the smart-routing
-# toggle, the "Harness default" sentinel, the search box, and the trigger's
+# toggle, the "Default" sentinel, the search box, and the trigger's
 # current-model label (`…-agent-model-value`).
 _MODEL_ROW_SENTINELS = ("smart-routing", "default", "search", "value")
 
@@ -639,10 +639,10 @@ def test_codex_picker_offers_the_clis_catalog_and_default(
         expect(picker).to_have_attribute("aria-label", "Codex, Model Default")
         expect(picker).to_contain_text("Default")
         expect(picker).not_to_contain_text("Models unavailable")
-        harness_default = page.get_by_test_id(_MODELS_SECTION_TESTID).get_by_role(
-            "menuitemcheckbox", name="Harness default", exact=True
+        default_row = page.get_by_test_id(_MODELS_SECTION_TESTID).get_by_role(
+            "menuitemcheckbox", name="Default", exact=True
         )
-        expect(harness_default).to_have_attribute("aria-checked", "true")
+        expect(default_row).to_have_attribute("aria-checked", "true")
         assert checked == []
     else:
         assert checked == [picker_rig.codex_default], (

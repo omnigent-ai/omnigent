@@ -20,7 +20,7 @@ and steers messages while the agent is busy.
   model, and keeps the selection. States: catalog loading, delayed catalog,
   alias vs. full model ID, refused switch (the pill keeps the applied model).
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
-  Pi). States: available, unavailable placeholder, max/ultra levels, refused
+  Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
@@ -31,6 +31,7 @@ and steers messages while the agent is busy.
   be removed. State: unsupported file type rejected without losing the message.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers.
+- `new-session-hotkey`: ⌘/Ctrl+Alt+N opens and focuses the new-session composer.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
@@ -76,12 +77,26 @@ and steers messages while the agent is busy.
   composer.
 - Hover the model/effort pill to see the tooltip.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
-  Pi), and permission mode before the session exists.
+  Pi, Devin), and permission mode before the session exists.
+- With a managed sandbox selected and no connected host, the model picker lists
+  the sandbox's default catalog when `/v1/info` advertises `default_models` (an
+  unbound gateway with `sandbox.model_discovery`, or a provider hook): rows under
+  the provider's label plus a "Default" row, for native and SDK agents.
+  A failed listing shows its error and keeps Default launchable; a
+  harness the catalog cannot serve keeps its ordinary list. This is distinct
+  from a connected host's own catalog and from a bound (`inference_models`)
+  target. Covered by
+  `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`
+  and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
 - Attach files or type `/` before the first send.
 - Open the agent picker's custom agents, then Create custom agent → Import
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
   selects the agent, which stays listed after a reload. A rejected bundle (for
   example a server agent's name) keeps the dialog open with the server's reason.
+
+**Fork dialog** (Fork in the session header menu, or Fork from here on a
+message, with a native target): the same model, effort, and permission mode
+pickers, seeded from the source session when its harness family is kept.
 
 **Mobile** (either composer on a phone-sized viewport): the same controls with
 collapsed labels.
@@ -133,6 +148,11 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
 - **`permission-mode`:**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_permission_mode_switch_persists`
+- **`model-picker`, `effort-picker`, `permission-mode`, Fork dialog:** the
+  permission-mode picker has component coverage in
+  `web/src/shell/ForkSessionDialog.test.tsx`; drive the model and effort
+  pickers by hand: fork a Codex session, pick another effort in the dialog, and
+  expect the new session's pill to show it. See [sessions](./sessions.md).
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`
 - **`attachments`:**
@@ -180,7 +200,8 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
 
 - The in-session and new-session composers are different surfaces. A change to
   the pill, tooltip, configuration menu, or effort picker in one does not reach
-  the other. Verify both, plus the mobile layout.
+  the other. Verify both, plus the mobile layout. The Fork dialog repeats the
+  model, effort, and permission-mode pickers for native targets; check it too.
 - "New session" in a test name can mean a session with no turns yet, not the
   landing page. Check which surface the test opens.
 - Tooltip changes need a hover after the picker closes, not only on first load.

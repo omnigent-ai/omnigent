@@ -38,7 +38,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
-from omnigent.runner.transports.ws_tunnel.frames import EventBatchFrame
+from omnigent.runner.transports.ws_tunnel.frames import EventAckFrame, EventBatchFrame
 from omnigent.runtime import inflight_text
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
@@ -1538,10 +1538,12 @@ async def test_runner_ingest_requires_bound_runner_and_replays_source_key(
     }
     ingest = app.state.runner_event_ingest
     batch = EventBatchFrame(id="b1", session_id=session["id"], events=[event])
-    rejected = await ingest(
+    # A runner the session moved off gets its late events acknowledged but not written.
+    superseded = await ingest(
         app=app, headers=Headers({}), owner=None, runner_id="another-runner", batch=batch
     )
-    assert rejected.applied == 0 and not rejected.retryable
+    assert superseded == EventAckFrame("b1", 1)
+    assert (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"] == []
     first = await ingest(
         app=app, headers=Headers({}), owner=None, runner_id="runner-owning-session", batch=batch
     )
