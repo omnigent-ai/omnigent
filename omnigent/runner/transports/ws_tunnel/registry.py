@@ -463,8 +463,7 @@ class TunnelRegistry:
         for state in list(session.in_flight.values()):
             _call_soon_threadsafe(state, partial(_abort_request_state, state, error))
         session.in_flight.clear()
-        for req_id in list(session.binary_requests):
-            TunnelRegistry._release_binary_request(session, req_id)
+        session.binary_requests.clear()
         session.binary_pending_sends.clear()
         session.binary_waiting_response.clear()
         for channel in list(session.ws_channels.values()):
@@ -703,16 +702,13 @@ class TunnelRegistry:
             if target is None:
                 return
             target.in_flight.pop(req_id, None)
-            if (
-                req_id not in target.binary_pending_sends
-                and req_id not in target.binary_waiting_response
-            ):
-                self._release_binary_request(target, req_id)
+            self._release_binary_request(target, req_id)
 
     @staticmethod
     def _release_binary_request(session: RunnerSession, req_id: str) -> None:
-        """Release admission under the registry lock, idempotently."""
-        session.binary_requests.discard(req_id)
+        """Release admission under the registry lock once the send and response are done."""
+        if req_id not in session.binary_pending_sends | session.binary_waiting_response:
+            session.binary_requests.discard(req_id)
 
     def request_is_open(self, session: RunnerSession, req_id: str) -> bool:
         """Return whether a request is still in flight on ``session``.
@@ -844,8 +840,7 @@ class TunnelRegistry:
     def _request_sent(self, session: RunnerSession, req_id: str) -> None:
         with self._lock:
             session.binary_pending_sends.discard(req_id)
-            if req_id not in session.binary_waiting_response:
-                self._release_binary_request(session, req_id)
+            self._release_binary_request(session, req_id)
 
     async def _send(
         self,
@@ -948,8 +943,7 @@ class TunnelRegistry:
             tracked_binary = req_id in current.binary_waiting_response
             if isinstance(frame, ResponseEndFrame):
                 current.binary_waiting_response.discard(req_id)
-                if req_id not in current.binary_pending_sends:
-                    self._release_binary_request(current, req_id)
+                self._release_binary_request(current, req_id)
             state = current.in_flight.get(req_id)
             if state is None:
                 return tracked_binary
