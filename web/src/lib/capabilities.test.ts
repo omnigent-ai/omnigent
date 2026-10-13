@@ -136,6 +136,20 @@ describe("resolveServerInfo sandbox_providers", () => {
   });
 });
 
+describe("resolveServerInfo static_sandbox_providers", () => {
+  it("keeps only the string providers", async () => {
+    const resolved = await probe({
+      static_sandboxes: true,
+      static_sandbox_providers: ["remote", 7, null],
+    });
+    expect(resolved.static_sandbox_providers).toEqual(["remote"]);
+  });
+
+  it("defaults to empty when the server omits it", async () => {
+    expect((await probe({})).static_sandbox_providers).toEqual([]);
+  });
+});
+
 describe("resolveServerInfo release features", () => {
   it("keeps boolean feature values and drops malformed entries", async () => {
     const parsed = await probe({

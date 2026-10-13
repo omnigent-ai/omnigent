@@ -72,7 +72,7 @@ from omnigent.server.routes._workspace_validation import (
     _is_windows_absolute_path,
     restore_host_filesystem_url_path,
 )
-from omnigent.server.schemas import SessionGitOptions
+from omnigent.server.schemas import SessionGitOptions, StaticSandboxRef
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -229,7 +229,7 @@ async def _proxy_list_dir(
     Send a ``host.list_dir`` frame and await the result.
 
     Mirrors the structure of the workspace validator's
-    ``_ask_host_stat``: enqueue the frame, register a future on
+    ``ask_host_stat``: enqueue the frame, register a future on
     the host connection's ``pending_list_dirs`` map, await with a
     timeout, and clean up in a finally block. The host's WS
     receive loop in ``host_tunnel.py`` resolves the future when
@@ -633,6 +633,17 @@ async def _resolve_agent_harness(
     return canonicalize_harness(loaded.spec.executor.harness_kind)
 
 
+async def _static_sandboxes(request: Request, hosts: list[Any]) -> dict[str, dict[str, str]]:
+    """Host id → ``StaticSandboxRef`` payload for the static hosts in *hosts*."""
+    from omnigent.server.vm_hosts import static_sandbox_refs
+
+    refs = await static_sandbox_refs(hosts, getattr(request.app.state, "sandbox_config", None))
+    return {
+        host_id: StaticSandboxRef(provider=ref.provider, sandbox_id=ref.sandbox_id).model_dump()
+        for host_id, ref in refs.items()
+    }
+
+
 def create_hosts_router(
     host_registry: HostRegistry,
     host_store: HostStore,
@@ -680,8 +691,9 @@ def create_hosts_router(
         :param request: The incoming request (for auth).
         :returns: ``{"hosts": [...]}`` with host details — ``host_id``,
             ``name``, ``owner``, ``status``, ``sandbox_provider``,
-            ``configured_harnesses``, and ``gateway_inference`` (``None`` when
-            no connected host has reported it to this replica).
+            ``static_sandbox``, ``configured_harnesses``, and
+            ``gateway_inference`` (``None`` when no connected host has
+            reported it to this replica).
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
@@ -695,6 +707,7 @@ def create_hosts_router(
         # One clock for the whole batch so every host is classified
         # against a consistent "now" (host_is_live's documented idiom).
         now = now_epoch()
+        static_sandboxes = await _static_sandboxes(request, hosts)
         result: list[dict[str, Any]] = []
         for host in hosts:
             # Status comes from the DB, not host_registry. The registry
@@ -718,6 +731,10 @@ def create_hosts_router(
                     # targets the server creates on demand, not
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
+                    # Non-None (``{provider, sandbox_id}``) marks the host of one
+                    # of the user's static sandboxes. Clients list the VM once,
+                    # under its label, and hide this raw row from host pickers.
+                    "static_sandbox": static_sandboxes.get(host.host_id),
                     "configured_harnesses": host.configured_harnesses,
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
@@ -763,6 +780,7 @@ def create_hosts_router(
             # Same semantics as list_hosts: non-None marks a
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
+            "static_sandbox": (await _static_sandboxes(request, [host])).get(host.host_id),
             "configured_harnesses": host.configured_harnesses,
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".

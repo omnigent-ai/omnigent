@@ -2,6 +2,8 @@ import { Loader2Icon, WifiOffIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
+import { StaticSandboxWakeBanner } from "@/components/StaticSandboxWakeBanner";
+import { usePausedStaticSandbox } from "@/hooks/useStaticSandboxWake";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type { SandboxStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -54,6 +56,7 @@ export function ConnectionIndicator({
   onShowReconnectHelp: () => void;
 }) {
   const terminalFirst = useTerminalFirst();
+  const pausedSandbox = usePausedStaticSandbox();
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   // Genuinely-unreachable states get the reconnect banner, for
   // both terminal-first and regular sessions. `runner_asleep` (host up,
@@ -71,6 +74,11 @@ export function ConnectionIndicator({
       return <SandboxFailedIndicator status={sandboxStatus} />;
     }
     return null;
+  }
+  // A static sandbox explains itself (paused / waking / gone) instead of
+  // the generic reconnect affordance.
+  if (pausedSandbox !== null) {
+    return <StaticSandboxWakeBanner sandbox={pausedSandbox} />;
   }
   if (unreachable) {
     // A host-bound session carries the reconnect affordance in the composer's

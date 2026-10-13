@@ -330,7 +330,12 @@ class HostStore:
                             SqlHost.token_hash == hash_host_launch_token(managed_token),
                             SqlHost.token_expires_at.is_not(None),
                             SqlHost.token_expires_at >= now,
-                            SqlHost.sandbox_id.is_not(None),
+                            # A managed row needs its current sandbox; a static
+                            # host (external row armed by upsert_static_host) has none.
+                            or_(
+                                SqlHost.sandbox_id.is_not(None),
+                                SqlHost.sandbox_provider.is_(None),
+                            ),
                             SqlHost.deleted_at.is_(None),
                         )
                         .values(
@@ -870,6 +875,87 @@ class HostStore:
             if row is None:
                 return None
             return _row_to_host(row)
+
+    def get_host_by_name(self, user_id: str, name: str) -> Host | None:
+        """Return *user_id*'s live host named *name* (names are unique per user)."""
+        with self._session("select_host_by_name") as session:
+            row = session.execute(
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.user_id == user_id,
+                    SqlHost.name == name,
+                    SqlHost.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+            return _row_to_host(row) if row is not None else None
+
+    def upsert_static_host(
+        self,
+        *,
+        host_id: str,
+        name: str,
+        user_id: str,
+        token: str,
+        token_expires_at: int,
+    ) -> Host:
+        """
+        Create or re-arm the host row for a static sandbox's host.
+
+        The row is an EXTERNAL host carrying a launch token: ``sandbox_provider``
+        and ``sandbox_id`` stay NULL so the managed reaper, keepalive, and
+        relaunch paths (which all key on them) never act on the user's VM. The
+        VM-to-host link lives in the provider's static-sandbox metadata
+        (``omnigent_host_id``), not here. Re-arming replaces the token digest,
+        which revokes the previous generation's token.
+
+        :param host_id: The host id linked from the provider's entry.
+        :param name: Display name for a new row; an existing row keeps its own.
+        :param user_id: Owner of the host and the VM.
+        :param token: The RAW launch token (hashed here, never stored).
+        :param token_expires_at: Unix epoch seconds the token stops working.
+        :returns: The armed :class:`Host`.
+        :raises ValueError: When *host_id* belongs to another user, is a managed
+            sandbox host, or was deleted.
+        """
+        now = now_epoch()
+        token_hash = hash_host_launch_token(token)
+
+        def write(session: Session) -> Host:
+            generation = require_active_account(session, user_id)
+            row = session.execute(
+                select(SqlHost)
+                .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                row = SqlHost(
+                    account_generation=generation,
+                    user_id=user_id,
+                    name=name,
+                    host_id=host_id,
+                    status=encode_host_status("offline"),
+                    created_at=now,
+                    updated_at=now,
+                    token_hash=token_hash,
+                    token_expires_at=token_expires_at,
+                )
+                session.add(row)
+                return _row_to_host(row)
+            if row.deleted_at is not None:
+                raise ValueError(f"host {host_id!r} has been deleted")
+            if row.user_id != user_id:
+                raise ValueError(f"host {host_id!r} is registered to a different user")
+            if row.sandbox_provider is not None:
+                raise ValueError(f"host {host_id!r} is a managed sandbox host")
+            row.token_hash = token_hash
+            row.token_expires_at = token_expires_at
+            # Bumping updated_at on a stale "online" row would make it read live
+            # again; the caller only re-arms a host it found offline.
+            row.status = encode_host_status("offline")
+            row.updated_at = now
+            return _row_to_host(row)
+
+        return run_write_transaction(self._session_immediate, "arm_static_host", write)
 
     def register_managed_host(
         self,

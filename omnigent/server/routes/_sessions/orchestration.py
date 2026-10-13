@@ -4389,6 +4389,48 @@ async def _maybe_relaunch_managed_sandbox(
     return True
 
 
+async def _host_connection_or_wake(*, conv: Conversation, app_state: Any) -> Any:
+    """
+    The session host's local tunnel, waking a static sandbox host that has none.
+
+    :returns: The host connection, or ``None`` when the host is not connected
+        here and is not a static host (callers keep their existing fallback).
+    :raises OmnigentError: As :func:`_maybe_ensure_vm_host`.
+    """
+    host_registry = getattr(app_state, "host_registry", None)
+    if conv.host_id is not None and host_registry is not None:
+        host_conn = host_registry.get(conv.host_id)
+        if host_conn is not None:
+            return host_conn
+    return await _maybe_ensure_vm_host(conv=conv, app_state=app_state)
+
+
+async def _maybe_ensure_vm_host(*, conv: Conversation, app_state: Any) -> Any:
+    """
+    Wake the session's host if it is a static sandbox host.
+
+    Called where a host-bound session has no local host tunnel, before the
+    managed relaunch fallback. Only an external host row armed with a launch
+    token reaches the shim, so other hosts cost one host-row read.
+
+    :returns: The host's local connection once it is back, or ``None`` when the
+        host is not a static host (callers keep their existing path).
+    :raises OmnigentError: The wake failed (409 VM gone, 503 otherwise), or
+        ``WRONG_REPLICA`` when the host came back on another replica.
+    """
+    host_store = getattr(app_state, "host_store", None)
+    if conv.host_id is None or host_store is None:
+        return None
+    from omnigent.server.vm_hosts import ensure_static_host_for
+
+    return await ensure_static_host_for(
+        conv.host_id,
+        host_store=host_store,
+        sandbox_config=getattr(app_state, "sandbox_config", None),
+        host_registry=getattr(app_state, "host_registry", None),
+    )
+
+
 async def _maybe_wake_stale_resumable_managed_sandbox(
     *,
     session_id: str,
@@ -4567,7 +4609,7 @@ async def ensure_runner_connected(
     # relaunch a managed sandbox whose host tunnel is gone. Mirrors the
     # gating in post_event — host presence, then managed relaunch fallback.
     if runner_client is None and conv.host_id is not None:
-        host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+        host_conn = await _host_connection_or_wake(conv=conv, app_state=app_state)
         relaunched_runner_id: str | None = None
         if host_conn is not None:
             # A session whose runner is merely booting already has a runner_id
@@ -12676,10 +12718,24 @@ async def _get_session_snapshot(
     # liveness arrives via the poll/stream). One indexed host read, gated to
     # host-bound sessions.
     host_resumable = False
+    sandbox_state: str | None = None
+    sandbox_name: str | None = None
+    sandbox_name_provider: str | None = None
     if host_store is not None and sandbox_config is not None and conv.host_id is not None:
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+            # A static host's VM state is read from the shim only while the
+            # host is offline, so healthy sessions add no shim calls.
+            if not host_resumable and not host_is_live(host_for_resume):
+                from omnigent.server.vm_hosts import find_static_host, sandbox_state_for
+
+                static_ref = await find_static_host(host_for_resume, sandbox_config)
+                if static_ref is not None:
+                    sandbox_state = sandbox_state_for(static_ref)
+                    sandbox_name = static_ref.sandbox_id
+                    sandbox_name_provider = static_ref.provider
+                    host_resumable = sandbox_state != "gone"
     response = _build_session_response(
         conv,
         items,
@@ -12710,6 +12766,9 @@ async def _get_session_snapshot(
     response.inference_configured = inference_configured
     response.inference_error = inference_error
     response.usage_included = include_usage
+    response.sandbox_state = sandbox_state  # type: ignore[assignment]
+    response.sandbox_name = sandbox_name
+    response.sandbox_name_provider = sandbox_name_provider
     return response
 
 
@@ -12744,6 +12803,7 @@ __all__ = [
     "_handle_mcp_tools_call",
     "_heal_subagent_runner_binding_via_parent",
     "_hold_native_ask_gate",
+    "_host_connection_or_wake",
     "_is_native_terminal_session",
     "_kick_managed_relaunch",
     "_kick_managed_wake",

@@ -188,6 +188,13 @@ class ServerInfoResponse(BaseModel):
     # (multi-repo picker vs single). Providers absent from the map default off.
     sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
     enabled_connections: list[str]
+    # True when sign-in and a host store are on and some configured provider
+    # offers static sandboxes (``/v1/static-sandboxes``); the web shows them in
+    # the New Session host menu.
+    static_sandboxes: bool = False
+    # The providers declaring ``static_sandboxes``, in configured order, so the
+    # web can label them per provider. Empty whenever ``static_sandboxes`` is off.
+    static_sandbox_providers: list[str] = []
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
     public_sharing_max_level: Literal["read", "edit"] = "read"
@@ -3070,6 +3077,15 @@ def create_app(
         from omnigent.server.dictation import engine_availability
 
         dictation_available, _ = engine_availability()
+        from omnigent.server.vm_hosts import static_sandbox_providers
+
+        # Only a signed-in user owns sandboxes at the provider. Reading a
+        # provider's capabilities may ask its service, so it runs off the loop.
+        static_providers = (
+            await asyncio.to_thread(static_sandbox_providers, sandbox_config)
+            if auth_provider is not None and host_store is not None
+            else []
+        )
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -3095,6 +3111,8 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
+                "static_sandboxes": bool(static_providers),
+                "static_sandbox_providers": static_providers,
                 "branding": branding_snapshot.config(),
             }
         )
@@ -3995,6 +4013,18 @@ def create_app(
             create_host_credentials_router(host_store),
             prefix="/v1",
             tags=["hosts"],
+        )
+
+    # Static sandboxes: the user's own long-lived sandboxes, at any provider offering them.
+    from omnigent.server.vm_hosts import static_sandboxes_configured
+
+    if host_store is not None and static_sandboxes_configured(sandbox_config):
+        from omnigent.server.routes.static_sandboxes import create_static_sandboxes_router
+
+        app.include_router(
+            create_static_sandboxes_router(auth_provider=auth_provider),
+            prefix="/v1",
+            tags=["sandboxes"],
         )
 
     # Per-user connection routes (/v1/connections/{provider}/*): connect /

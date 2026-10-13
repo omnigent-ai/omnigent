@@ -130,6 +130,33 @@ describe("projectPrefill config seeding", () => {
     expect(writes.hostId).toBeUndefined();
   });
 
+  it("selects a stored static sandbox while its VM is paused, with no host lookup", () => {
+    const { state, writes } = runToDone(
+      inputs({
+        // No host row for the VM is listed (its raw row is hidden), and the
+        // host list hasn't even loaded: the static branch must not wait on it.
+        hosts: undefined,
+        config: {
+          staticSandboxId: "foo",
+          workspace: "https://github.com/example/sample-app#main",
+        },
+        staticSandboxesEnabled: true,
+      }),
+    );
+    expect(writes.selectStaticSandbox).toBe("foo");
+    expect(writes.sandboxWorkspace).toBe("https://github.com/example/sample-app#main");
+    expect(writes.hostId).toBeUndefined();
+    expect(writes.workspace).toBeUndefined();
+    expect(state.phase).toBe("settled");
+  });
+
+  it("drops a stored static sandbox when the server no longer offers them", () => {
+    const { writes } = runToDone(
+      inputs({ config: { staticSandboxId: "foo" }, staticSandboxesEnabled: false }),
+    );
+    expect(writes.selectStaticSandbox).toBeUndefined();
+  });
+
   it("does not re-select the sandbox once it is already selected", () => {
     const { writes } = runToDone(
       inputs({

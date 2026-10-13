@@ -1403,6 +1403,51 @@ async def test_invalid_managed_token_refused_before_accept(
     assert host is None or host.status == "offline"
 
 
+@pytest.mark.parametrize("static", [True, False], ids=["static-vm", "managed-sandbox"])
+async def test_launch_token_hosts_count_as_managed_sandboxes(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    static: bool,
+) -> None:
+    """
+    Static sandbox hosts (``sandbox_id`` NULL) follow the same sharing
+    policy as managed sandboxes: both count for the SANDBOX default-public
+    grant and the restricted-mode unknown-cwd exemption.
+    """
+    from omnigent.server.sharing_settings import host_is_managed_sandbox
+
+    app, registry, store = host_app
+    token = f"tunnel-token-{'static' if static else 'managed'}"
+    if static:
+        armed = store.upsert_static_host(
+            host_id=_HOST_ID,
+            name="static-sandbox-foo",
+            user_id="alice@example.com",
+            token=token,
+            token_expires_at=now_epoch() + 3600,
+        )
+        assert armed.sandbox_id is None
+        name = "static-sandbox-foo"
+    else:
+        _register_managed(store, host_id=_HOST_ID, token=token)
+        name = f"managed-{_HOST_ID}"
+
+    communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, token))
+    await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=budget(1.0))
+    assert accepted["type"] == "websocket.accept"
+    try:
+        await _send_hello_and_wait(communicator, registry, name=name)
+
+        conn = registry.get(_HOST_ID)
+        assert conn is not None
+        assert conn.owner == "alice@example.com"
+        assert conn.registered_with_managed_token is True
+        assert host_is_managed_sandbox(registry, _HOST_ID) is True
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=budget(2.0))
+
+
 class _FakeSenderWebSocket:
     """Minimal ``send_text`` stand-in for ``_sender_loop`` unit tests.
 

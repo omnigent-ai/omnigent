@@ -18,10 +18,28 @@ import { authenticatedFetch } from "./identity";
  * slot". The vocabulary is client-owned; the server persists the object whole
  * and never acts on it, so adding a key here needs no backend change.
  */
+/** A project host default that is not a host id: one of the user's static sandboxes. */
+export interface ProjectSandboxTarget {
+  kind: "static";
+  /** The sandbox provider, e.g. "remote". */
+  provider: string;
+  /** The sandbox's id at the provider, e.g. "foo". */
+  sandbox_id: string;
+}
+
 export interface ProjectConfig {
-  /** Default host id, or the sandbox sentinel. */
+  /** Default host id, or the sandbox sentinel. Unset when `sandbox_target` is set. */
   host_id?: string;
-  /** Default working directory / repo path on that host. */
+  /**
+   * Default host as a static sandbox. Mutually exclusive with `host_id`;
+   * the VM is woken on create, so a paused VM is still a usable default.
+   */
+  sandbox_target?: ProjectSandboxTarget;
+  /**
+   * Default working directory / repo path on that host. For a `sandbox_target`
+   * it is a repository URL (optionally `#branch`); unset means the VM's
+   * primary repo.
+   */
   workspace?: string;
   /** Default agent id for new sessions. */
   agent_id?: string;

@@ -665,7 +665,7 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
     """
     from omnigent.server.routes._workspace_validation import (
         WorkspaceValidationError,
-        _ask_host_stat,
+        ask_host_stat,
     )
 
     if deps.host_registry is None:
@@ -680,7 +680,7 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
             error_code="host_offline",
         )
     try:
-        stat = await _ask_host_stat(
+        stat = await ask_host_stat(
             host_registry=deps.host_registry,
             host_conn=host_conn,
             path=_DEFAULT_WORKSPACE,

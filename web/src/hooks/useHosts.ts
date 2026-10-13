@@ -9,6 +9,7 @@ import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { ApiError } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
+import type { StaticSandboxRef } from "@/lib/staticSandboxes";
 
 export interface Host {
   host_id: string;
@@ -21,6 +22,12 @@ export interface Host {
    * omit the field entirely.
    */
   sandbox_provider?: string | null;
+  /**
+   * The static sandbox this host runs on, when it is the host of one of the
+   * user's own VMs; null/absent otherwise. Pickers list the VM once, under
+   * its label, so they hide these raw rows.
+   */
+  static_sandbox?: StaticSandboxRef | null;
   /**
    * Per-harness readiness reported by the host's last connect, e.g.
    * `{"claude-sdk": true, "codex": "needs-auth"}`. `null`/absent means the
@@ -52,8 +59,10 @@ export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   // manual targets is misleading. Hosts from older servers lack the
   // field and are kept. `includeSandbox` opts a caller (the chat-header
   // HostBadge) back into seeing them so it can label sandbox sessions.
+  // A static sandbox's raw host row is hidden the same way: the VM is
+  // listed once, under the user's label, from the static-sandboxes API.
   if (includeSandbox) return body.hosts;
-  return body.hosts.filter((h) => !h.sandbox_provider);
+  return body.hosts.filter((h) => !h.sandbox_provider && !h.static_sandbox);
 }
 
 interface UseHostsOptions {

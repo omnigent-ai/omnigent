@@ -634,6 +634,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _is_native_terminal_session as _is_native_terminal_session,
     _kick_managed_relaunch as _kick_managed_relaunch,
     _labels_for_viewer as _labels_for_viewer,
+    _host_connection_or_wake as _host_connection_or_wake,
     _maybe_relaunch_managed_sandbox as _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox as _maybe_wake_stale_resumable_managed_sandbox,
     _native_subagent_wrapper_labels as _native_subagent_wrapper_labels,

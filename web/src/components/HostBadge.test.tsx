@@ -51,6 +51,25 @@ describe("resolveHostBadge", () => {
     ).toEqual({ label: "Databricks Sandbox", status: "online" });
   });
 
+  it("labels a static sandbox host by the user's label, else its sandbox id", () => {
+    const staticHost = host({
+      name: "static-sandbox-foo",
+      static_sandbox: { provider: "remote", sandbox_id: "foo" },
+    });
+    expect(
+      resolveHostBadge({
+        hostId: "host_a1b2",
+        host: staticHost,
+        online: true,
+        staticSandboxLabel: "Checkout web app",
+      }),
+    ).toEqual({ label: "Checkout web app", status: "online" });
+    expect(resolveHostBadge({ hostId: "host_a1b2", host: staticHost, online: true })).toEqual({
+      label: "foo",
+      status: "online",
+    });
+  });
+
   it("falls back to the raw host_id when the host record is unresolved", () => {
     // Shared session on another owner's host, or hosts not loaded yet:
     // there's no name to show, but the session IS host-bound, so the
@@ -78,12 +97,16 @@ describe("resolveHostBadge", () => {
 const useSessionMock = vi.fn();
 const useHostsMock = vi.fn();
 const useSessionHostOnlineMock = vi.fn();
+const useStaticSandboxesMock = vi.fn();
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id: string | null | undefined) => useSessionMock(id),
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: (opts: unknown) => useHostsMock(opts),
+}));
+vi.mock("@/lib/staticSandboxesApi", () => ({
+  useStaticSandboxes: (opts: unknown) => useStaticSandboxesMock(opts),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionHostOnline: (id: string | undefined) => useSessionHostOnlineMock(id),
@@ -100,6 +123,8 @@ beforeEach(() => {
   useSessionMock.mockReset();
   useHostsMock.mockReset();
   useSessionHostOnlineMock.mockReset();
+  useStaticSandboxesMock.mockReset();
+  useStaticSandboxesMock.mockReturnValue({ data: undefined });
   // Sensible defaults; each test overrides what it cares about.
   useSessionMock.mockReturnValue({
     session: { hostId: "host_a1b2" },
@@ -309,6 +334,67 @@ describe("HostBadge", () => {
   it("labels local hosts as My machines in the composer menu", () => {
     render(<HostBadge sessionId="conv_1" appearance="composer" />);
     fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    expect(screen.getByText("My machines")).toBeTruthy();
+  });
+
+  it("shows a static sandbox session's host under the user's label", () => {
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_a1b2",
+          name: "static-sandbox-test-static-sandbox1",
+          owner: "alice",
+          status: "online",
+          sandbox_provider: null,
+          static_sandbox: { provider: "remote", sandbox_id: "test-static-sandbox1" },
+        },
+      ],
+    });
+    useStaticSandboxesMock.mockReturnValue({
+      data: [
+        { provider: "remote", id: "test-static-sandbox1", label: "My Sandbox", status: "running" },
+      ],
+    });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    const trigger = screen.getByTestId("composer-host-select");
+    expect(trigger.getAttribute("aria-label")).toBe("Host My Sandbox, online");
+    fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.getByText("My Sandbox")).toBeTruthy();
+    expect(screen.queryByText(/static-sandbox-/)).toBeNull();
+    expect(useStaticSandboxesMock).toHaveBeenCalledWith({ enabled: true });
+    // The session stays on its VM's host.
+    expect(screen.queryByText("Switch host…")).toBeNull();
+  });
+
+  it("doesn't fetch static sandbox labels for an ordinary host", () => {
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    expect(useStaticSandboxesMock).not.toHaveBeenCalled();
+  });
+
+  it("shows a provisioning managed sandbox as a cloud host before it binds", () => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: null, sandboxStatus: { stage: "provisioning" } },
+      isLoading: false,
+      error: null,
+    });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    const trigger = screen.getByTestId("composer-host-select");
+    expect(trigger.getAttribute("aria-label")).toBe("Provisioning sandbox");
+    fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.getByText("Cloud")).toBeTruthy();
+    expect(screen.queryByText("My machines")).toBeNull();
+  });
+
+  it("keeps an unbound session without a sandbox launch under My machines", () => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: null, sandboxStatus: null },
+      isLoading: false,
+      error: null,
+    });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    const trigger = screen.getByTestId("composer-host-select");
+    expect(trigger.getAttribute("aria-label")).toBe("No host bound");
+    fireEvent.pointerDown(trigger, { button: 0 });
     expect(screen.getByText("My machines")).toBeTruthy();
   });
 

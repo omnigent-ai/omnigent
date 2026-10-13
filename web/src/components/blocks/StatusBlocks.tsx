@@ -111,6 +111,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "runner_disconnected",
   "runner_failed_to_start",
   "runner_unavailable",
+  "host_start_failed",
   "rate_limit_exceeded",
   "transient_upstream_error",
   "connection_error",

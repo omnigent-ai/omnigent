@@ -292,6 +292,12 @@ export interface Session {
    * dead-end. `false`/absent otherwise.
    */
   hostResumable?: boolean;
+  /** Static sandbox host state while offline (see `SessionWire.sandbox_state`). */
+  sandboxState?: "running" | "paused" | "gone" | null;
+  /** The sandbox id behind `sandboxState`, e.g. "foo". */
+  sandboxName?: string | null;
+  /** The provider holding `sandboxName`, e.g. "remote". */
+  sandboxNameProvider?: string | null;
   /**
    * Whether the session is archived. Carried on the snapshot because it is
    * the only carrier for a session opened directly by URL — the default

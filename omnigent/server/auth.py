@@ -48,6 +48,13 @@ _AUTH_ENABLED_ENV = "OMNIGENT_AUTH_ENABLED"
 RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
+
+
+def is_reserved_user(user_id: str) -> bool:
+    """Whether *user_id* is a placeholder identity (``local``/``public``), not a person."""
+    return user_id in _RESERVED_USERS
+
+
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
 # Path prefixes a restricted (device-grant or machine client-credential)

@@ -1010,7 +1010,7 @@ def test_http_launch_rechecks_revocation_before_binding(setup_app, monkeypatch, 
             "canonical_path": kwargs["path"],
         }
 
-    monkeypatch.setattr(_workspace_validation, "_ask_host_stat", stat)
+    monkeypatch.setattr(_workspace_validation, "ask_host_stat", stat)
     reached, resume = Event(), Event()
     snapshots = []
     original = _host_launch.resolve_host_launch

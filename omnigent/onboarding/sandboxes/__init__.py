@@ -17,6 +17,7 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxGoneError,
     SandboxHostLauncher,
     SandboxLauncher,
+    StaticSandboxProvider,
 )
 from omnigent.onboarding.sandboxes.bootstrap import (
     DEFAULT_SANDBOX_NAME,
@@ -76,6 +77,7 @@ __all__ = [
     "SandboxProviderPluginState",
     "SandboxRegistryError",
     "SandboxSpec",
+    "StaticSandboxProvider",
     "available_providers",
     "bootstrap_sandbox_host",
     "build_wheels",

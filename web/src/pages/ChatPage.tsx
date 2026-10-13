@@ -69,6 +69,11 @@ import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
+import {
+  StaticSandboxWakeContext,
+  useStaticSandboxWake,
+  useStaticSandboxWakeOnInput,
+} from "@/hooks/useStaticSandboxWake";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { useFocusComposerHotkey } from "@/hooks/useFocusComposerHotkey";
@@ -803,6 +808,7 @@ export function ChatPage() {
     turnActive: status === "streaming",
     launchedAt: runnerLaunchedAt,
   });
+  const staticSandboxWake = useStaticSandboxWake(sessionConvId ?? null, liveness, activeSession);
 
   // Browser tab title: "● Title" while the main session is working so
   // background tabs signal parent activity without duplicating child-session
@@ -1158,7 +1164,9 @@ export function ChatPage() {
 
   return (
     <SessionSharedContext.Provider value={isSessionShared}>
-      <SessionLayout mainAgent={mainAgent} />
+      <StaticSandboxWakeContext.Provider value={staticSandboxWake}>
+        <SessionLayout mainAgent={mainAgent} />
+      </StaticSandboxWakeContext.Provider>
       <ReconnectSessionDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
@@ -2245,6 +2253,7 @@ function ComposerImpl(
     appendQuote,
     removeQuote,
   } = useReplyDraft();
+  useStaticSandboxWakeOnInput(fullText);
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);

@@ -39,9 +39,12 @@ function pickerAgent(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
-vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ managed_sandboxes_enabled: false, sandbox_provider: null }),
+const { serverInfoMock, staticSandboxesMock } = vi.hoisted(() => ({
+  serverInfoMock: vi.fn(),
+  staticSandboxesMock: vi.fn(),
 }));
+vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: serverInfoMock }));
+vi.mock("@/lib/staticSandboxesApi", () => ({ useStaticSandboxes: staticSandboxesMock }));
 // The filesystem browser owns its own data-fetching; stub its explicit commit
 // action so this suite can drive the shared dialog without filesystem plumbing.
 vi.mock("./WorkspacePicker", () => ({
@@ -84,6 +87,10 @@ beforeEach(() => {
   hostModelOptionsMock.mockReset();
   hostModelOptionsMock.mockReturnValue({ data: [] });
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+  serverInfoMock.mockReset();
+  serverInfoMock.mockReturnValue({ managed_sandboxes_enabled: false, sandbox_provider: null });
+  staticSandboxesMock.mockReset();
+  staticSandboxesMock.mockReturnValue({ data: undefined, isPending: true });
 });
 
 afterEach(cleanup);
@@ -419,5 +426,94 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", model: "opus" }),
     );
+  });
+});
+
+describe("ProjectSettingsDialog static sandboxes", () => {
+  const PAUSED_VM = {
+    provider: "remote",
+    id: "foo",
+    label: "Checkout web app",
+    status: "paused",
+    repo: "example/sample-app",
+    lastActivityAt: null,
+  };
+
+  beforeEach(() => {
+    serverInfoMock.mockReturnValue({
+      managed_sandboxes_enabled: false,
+      sandbox_provider: null,
+      static_sandboxes: true,
+    });
+    staticSandboxesMock.mockReturnValue({ data: [PAUSED_VM], isPending: false });
+  });
+
+  async function settled() {
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+  }
+
+  it("lists a paused VM under its label and saves it as a sandbox_target", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
+    renderDialog();
+    await settled();
+    const option = document.querySelector('option[value="__static_sandbox__:remote/foo"]');
+    expect(option?.textContent).toContain("Checkout web app");
+    expect(option?.textContent).toContain("Paused");
+
+    const native = document.querySelector("select") as HTMLSelectElement;
+    fireEvent.change(native, { target: { value: "__static_sandbox__:remote/foo" } });
+    // A static target's workspace is a repo URL, typed rather than browsed.
+    const workspace = await screen.findByPlaceholderText("https://github.com/org/repo");
+    fireEvent.change(workspace, { target: { value: " https://github.com/example/sample-app " } });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        sandbox_target: { kind: "static", provider: "remote", sandbox_id: "foo" },
+        workspace: "https://github.com/example/sample-app",
+      }),
+    );
+  });
+
+  it("keeps a stored static target, paused, without an unavailable fallback", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { sandbox_target: { kind: "static", provider: "remote", sandbox_id: "foo" } },
+    });
+    renderDialog();
+    await settled();
+    expect(screen.queryByText(/unavailable/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        sandbox_target: { kind: "static", provider: "remote", sandbox_id: "foo" },
+      }),
+    );
+  });
+
+  it("switching back to a host drops the static target", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        sandbox_target: { kind: "static", provider: "remote", sandbox_id: "foo" },
+        workspace: "https://github.com/example/sample-app",
+      },
+    });
+    renderDialog();
+    await settled();
+    fireEvent.change(document.querySelector("select") as HTMLSelectElement, {
+      target: { value: "h1" },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalled());
+    const saved = updateMock.mock.calls[0][1];
+    expect(saved.sandbox_target).toBeUndefined();
+    expect(saved.host_id).toBe("h1");
   });
 });

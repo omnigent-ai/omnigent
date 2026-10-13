@@ -254,6 +254,9 @@ class ErrorCode:
     UPSTREAM_CANCELLED = "upstream_cancelled"
     UPSTREAM_PERMISSION_DENIED = "upstream_permission_denied"
     STALE_CURSOR = "stale_cursor"
+    SANDBOX_GONE = "sandbox_gone"
+    HOST_START_FAILED = "host_start_failed"
+    WORKSPACE_PREPARE_FAILED = "workspace_prepare_failed"
 
 
 # Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
@@ -305,6 +308,13 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # succeed — the fix is to restart the enumeration without the cursor. The
     # distinct code is what a paging client keys that restart off.
     ErrorCode.STALE_CURSOR: 400,
+    # 410, like WORKSPACE_MISSING: the sandbox a request names was deleted at
+    # its provider, and Omnigent never recreates it.
+    ErrorCode.SANDBOX_GONE: 410,
+    # 502: a dependency (the sandbox provider, or the host on it) failed to
+    # start the host or prepare the workspace; the message carries why.
+    ErrorCode.HOST_START_FAILED: 502,
+    ErrorCode.WORKSPACE_PREPARE_FAILED: 502,
 }
 
 
@@ -345,6 +355,10 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A stale reference: the cursor row was deleted (often by the same user
     # in another client) between two page fetches.
     ErrorCode.STALE_CURSOR: ErrorCategory.USER,
+    # The user deleted the sandbox at its provider.
+    ErrorCode.SANDBOX_GONE: ErrorCategory.USER,
+    ErrorCode.HOST_START_FAILED: ErrorCategory.UPSTREAM,
+    ErrorCode.WORKSPACE_PREPARE_FAILED: ErrorCategory.UPSTREAM,
 }
 
 
@@ -388,6 +402,11 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.ALREADY_EXISTS: ErrorImpact.BENIGN,
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
+    # The session can't start on that sandbox until the user picks another.
+    ErrorCode.SANDBOX_GONE: ErrorImpact.BLOCKING,
+    # A retry starts the host or clone again; nothing durable was lost.
+    ErrorCode.HOST_START_FAILED: ErrorImpact.TRANSIENT,
+    ErrorCode.WORKSPACE_PREPARE_FAILED: ErrorImpact.TRANSIENT,
 }
 
 
@@ -427,6 +446,9 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
     ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorPhase.UNKNOWN,
     ErrorCode.STALE_CURSOR: ErrorPhase.REQUEST,
+    ErrorCode.SANDBOX_GONE: ErrorPhase.RUNNER_LAUNCH,
+    ErrorCode.HOST_START_FAILED: ErrorPhase.RUNNER_LAUNCH,
+    ErrorCode.WORKSPACE_PREPARE_FAILED: ErrorPhase.HARNESS_SETUP,
 }
 
 

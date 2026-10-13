@@ -219,6 +219,14 @@ export interface ServerInfo {
   agent_install?: boolean;
   /** True when GET /v1/agents/{id} is available; absent on older servers (off). */
   agent_detail?: boolean;
+  /**
+   * True when the server offers static sandboxes (``/v1/static-sandboxes``):
+   * sign-in is on and some configured provider declares them. Gates the
+   * saved-sandbox entries and "+ Add <provider> Static Sandbox…" in the host menu.
+   */
+  static_sandboxes?: boolean;
+  /** The providers offering static sandboxes, e.g. ``["remote"]``; empty when off. */
+  static_sandbox_providers?: string[];
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -279,6 +287,8 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   installable_harnesses: [],
   dictation_available: false,
   archive_worktree_cleanup: false,
+  static_sandboxes: false,
+  static_sandbox_providers: [],
   branding: null,
 };
 
@@ -392,6 +402,10 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
+          static_sandboxes: data.static_sandboxes === true,
+          static_sandbox_providers: Array.isArray(data.static_sandbox_providers)
+            ? data.static_sandbox_providers.filter((p): p is string => typeof p === "string")
+            : [],
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;
@@ -443,6 +457,11 @@ const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
   e2b: "E2B",
 };
 
+/** Display name for a sandbox provider id, e.g. "Remote" for `remote`. */
+export function sandboxProviderName(provider: string): string {
+  return SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
+}
+
 /**
  * Label for the new-session sandbox option, named per provider.
  *
@@ -453,9 +472,7 @@ const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
  */
 export function sandboxOptionLabel(provider: string | null): string {
   if (!provider) return "New Sandbox";
-  const name =
-    SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
-  return `${name} Sandbox`;
+  return `${sandboxProviderName(provider)} Sandbox`;
 }
 
 /**

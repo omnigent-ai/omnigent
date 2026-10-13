@@ -233,6 +233,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
     _heal_subagent_runner_binding_via_parent,
+    _host_connection_or_wake,
     _is_native_terminal_session,
     _mark_dispatch_in_flight,
     _maybe_relaunch_managed_sandbox,
@@ -1358,7 +1359,7 @@ def register_events_routes(
                             code=ErrorCode.WRONG_REPLICA,
                         )
                 _relaunched_runner_id: str | None = None
-                _host_conn = _host_reg.get(wake_conv.host_id) if _host_reg is not None else None
+                _host_conn = await _host_connection_or_wake(conv=wake_conv, app_state=_app_state)
                 if _host_conn is not None:
                     _attempt = await _launch_runner_on_host(
                         wake_conv,
@@ -2459,7 +2460,7 @@ def register_events_routes(
             # An absent host needs its own grace before it can spawn a runner.
             _host_reg = getattr(request.app.state, "host_registry", None)
             if runner_client is None and _host_reg is not None:
-                _host_conn = _host_reg.get(conv.host_id)
+                _host_conn = await _host_connection_or_wake(conv=conv, app_state=request.app.state)
                 if _host_conn is None:
                     if await _maybe_relaunch_managed_sandbox(
                         session_id=session_id,

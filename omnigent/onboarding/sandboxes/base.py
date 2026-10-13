@@ -29,7 +29,7 @@ from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
 import click
 
@@ -1102,3 +1102,91 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
 # is now ``ExecModelHostLauncher``. Kubernetes and future entrypoint-as-host
 # providers inherit ``SandboxHostLauncher`` directly.
 SandboxLauncher = ExecModelHostLauncher
+
+
+@runtime_checkable
+class StaticSandboxProvider(Protocol):
+    """
+    The operations a provider offers for static sandboxes.
+
+    A static sandbox is a long-lived sandbox the user owns at the provider;
+    the server attaches one ``omnigent host`` to it but never creates or
+    deletes it. The provider keeps the user's saved entries, each a dict with
+    ``sandbox_id``, ``label``, ``status`` (``running`` / ``paused`` /
+    ``gone``), ``repo``, ``default_repo_url`` (the primary repo's clone URL,
+    or ``""``), and ``omnigent_host_id`` (the linked host, or ``None``). A
+    provider implementing this also declares
+    :attr:`~omnigent.onboarding.sandboxes.types.SandboxCapabilities.static_sandboxes`.
+
+    Every call acts for the principal last bound with :meth:`bind_principal`,
+    and raises an exception carrying the service's ``status_code`` (404
+    unknown sandbox, 400 refused, 503 unavailable) when the provider refuses.
+    """
+
+    def bind_principal(self, principal: str) -> None:
+        """Act for *principal*, the signed-in owner, on every later call."""
+        ...
+
+    def list_available_sandboxes(self) -> list[dict[str, object]]:
+        """Every sandbox the principal could add, each with ``sandbox_id`` and ``status``."""
+        ...
+
+    def list_static_sandboxes(self) -> list[dict[str, object]]:
+        """The principal's saved entries, with each sandbox's live status."""
+        ...
+
+    def get_static_sandbox(self, sandbox_id: str) -> dict[str, object] | None:
+        """The principal's entry for *sandbox_id*, or ``None`` when it has none."""
+        ...
+
+    def put_static_sandbox(self, sandbox_id: str, label: str) -> dict[str, object]:
+        """Save *sandbox_id* under *label*, or rename it; returns the entry."""
+        ...
+
+    def delete_static_sandbox(self, sandbox_id: str) -> bool:
+        """Remove the entry, leaving the sandbox alone; whether it existed."""
+        ...
+
+    def link_static_host(self, sandbox_id: str, host_id: str) -> dict[str, object]:
+        """Link *host_id* to the entry unless one is linked; returns the entry."""
+        ...
+
+    def resume_static_sandbox(self, sandbox_id: str) -> dict[str, object]:
+        """Wake a paused sandbox and wait until it runs; returns the entry.
+
+        A running sandbox returns at once.
+
+        :raises SandboxGoneError: The sandbox no longer exists.
+        """
+        ...
+
+    def static_checkout_path(self, sandbox_id: str, repo_url: str) -> str:
+        """Where the sandbox keeps its checkout of *repo_url*, whether or not it exists yet."""
+        ...
+
+    def diagnose_host(self, sandbox_id: str, server_url: str) -> dict[str, object]:
+        """Report on the sandbox's ``omnigent host`` and its reach to *server_url*.
+
+        The dict carries ``fatal_reason`` (non-empty when the host can never
+        come online), ``log_tail`` (the host log's last lines), and the probes
+        behind them: ``host_process_running``, ``omnigent_on_path``,
+        ``omnigent_version``, ``server_host``, and ``server_resolves``. Raises
+        with ``status_code`` 409 when the sandbox is not running.
+        """
+        ...
+
+    def stop_host(self, sandbox_id: str) -> None:
+        """Stop the ``omnigent host`` in the sandbox, leaving the sandbox running."""
+        ...
+
+    def materialize_workspace(
+        self,
+        sandbox_id: str,
+        *,
+        workspace: str,
+        repo_url: str,
+        repo_branch: str | None,
+        repo_name: str | None,
+    ) -> str:
+        """Make sure the sandbox has a checkout of *repo_url*; returns its path."""
+        ...

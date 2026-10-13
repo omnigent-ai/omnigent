@@ -30,6 +30,7 @@ from omnigent.server.routes.sessions import (
     _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
     _ensure_runner_session_initialized,
     _forward_session_change_to_runner,
+    _host_connection_or_wake,
     _launch_runner_on_host,
     _maybe_relaunch_managed_sandbox,
     _RunnerForwardResult,
@@ -235,7 +236,7 @@ async def _start_codex_goal_runner_on_bound_host(
     host_registry = getattr(app_state, "host_registry", None)
     if host_registry is None:
         return None
-    host_conn = host_registry.get(conv.host_id)
+    host_conn = await _host_connection_or_wake(conv=conv, app_state=app_state)
     if host_conn is not None:
         launch_attempt = await _launch_runner_on_host(
             conv,

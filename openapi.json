@@ -5446,6 +5446,19 @@
           },
           "smart_routing_sources": {
             "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
+          },
+          "static_sandbox_providers": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Static Sandbox Providers",
+            "type": "array"
+          },
+          "static_sandboxes": {
+            "default": false,
+            "title": "Static Sandboxes",
+            "type": "boolean"
           }
         },
         "required": [
@@ -7623,6 +7636,44 @@
             "description": "Strict runner liveness \u2014 `True` iff a runner tunnel is currently registered for this session. This is the sole reachability signal: `True` means the client can chat normally. It does **not** fold in host-relaunch optimism (a dead runner on a live host reads `False` here, not `True`) \u2014 the open-session view pairs it with `host_online` to decide what to show. `None` when the server has no runner liveness lookup wired.",
             "title": "Runner Online"
           },
+          "sandbox_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Name"
+          },
+          "sandbox_name_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Name Provider"
+          },
+          "sandbox_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "running",
+                  "paused",
+                  "gone"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox State"
+          },
           "sandbox_status": {
             "anyOf": [
               {
@@ -8375,6 +8426,31 @@
           "conversation_id"
         ],
         "title": "SessionUsageEvent",
+        "type": "object"
+      },
+      "SessionWakeResponse": {
+        "description": "Response for `POST /v1/sessions/{id}/wake`.",
+        "properties": {
+          "host_id": {
+            "description": "The session's host, now online.",
+            "title": "Host Id",
+            "type": "string"
+          },
+          "kind": {
+            "description": "Which wake ran: `\"static\"` (a static sandbox host) or `\"managed\"` (a resume-in-place managed sandbox).",
+            "enum": [
+              "static",
+              "managed"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host_id",
+          "kind"
+        ],
+        "title": "SessionWakeResponse",
         "type": "object"
       },
       "SetCodexGoalRequest": {
@@ -10223,7 +10299,7 @@
     },
     "/v1/hosts": {
       "get": {
-        "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details \u2014 `host_id`, `name`, `owner`, `status`, `sandbox_provider`, `configured_harnesses`, and `gateway_inference` (`None` when no connected host has reported it to this replica).",
+        "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details \u2014 `host_id`, `name`, `owner`, `status`, `sandbox_provider`, `static_sandbox`, `configured_harnesses`, and `gateway_inference` (`None` when no connected host has reported it to this replica).",
         "operationId": "list_hosts_v1_hosts_get",
         "responses": {
           "200": {
@@ -16261,6 +16337,49 @@
           }
         },
         "summary": "Stream Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/wake": {
+      "post": {
+        "description": "Wake the session's paused host in place, ahead of the next message.\n\nIdempotent: concurrent calls join the in-flight wake through the\nper-host lock, and an online host makes it a cheap check. Only\nresume-in-place hosts wake here (static sandboxes and resumable\nmanaged sandboxes); anything else is 409 `not_resumable`, so a stray\ncall never creates a sandbox.",
+        "operationId": "wake_session_host_v1_sessions__session_id__wake_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionWakeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Wake Session Host",
         "tags": [
           "sessions"
         ]

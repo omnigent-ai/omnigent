@@ -244,6 +244,9 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
 # cold registry pull of the image on first use.
 MANAGED_HOST_ONLINE_TIMEOUT_S = 120
 _ONLINE_POLL_INTERVAL_S = 1.0
+# How often a host-online wait asks its failure probe (one sandbox exec) whether
+# the host can still come online.
+_FAILURE_PROBE_INTERVAL_S = 20.0
 
 # Launch-token lifetime for the YAML modal path: Modal's 24h sandbox
 # cap plus an hour of slack, so a live sandbox can always
@@ -3834,7 +3837,7 @@ async def _register_and_start_host(
             agent_name=agent_name,
             on_stage=on_stage,
         )
-        await _wait_for_host_online(host_store, host_id)
+        await wait_for_host_online(host_store, host_id)
     except Exception as exc:
         # The provider allocated the sandbox before registration or startup
         # could fail, so both failures must attempt cleanup.
@@ -3883,26 +3886,47 @@ async def _register_and_start_host(
     return workspace
 
 
-async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
+async def wait_for_host_online(
+    host_store: HostStore,
+    host_id: str,
+    *,
+    what: str = "managed host",
+    where: str = "inside the sandbox",
+    failure_probe: Callable[[], Awaitable[str | None]] | None = None,
+) -> None:
     """
-    Poll the hosts table until the sandbox host registers, or time out.
+    Poll the hosts table until a server-started host registers, or time out.
 
     :param host_store: Persistent host registrations.
     :param host_id: The launched host's identifier.
+    :param what: How the timeout message names the host.
+    :param where: Where the timeout message says the host log lives.
+    :param failure_probe: Optional check run every
+        :data:`_FAILURE_PROBE_INTERVAL_S` while waiting; a non-``None`` answer
+        means the host can never come online (e.g. its supervisor stood down),
+        so the wait stops with that reason.
     :raises HTTPException: 502 when the host does not come online
-        within :data:`MANAGED_HOST_ONLINE_TIMEOUT_S`.
+        within :data:`MANAGED_HOST_ONLINE_TIMEOUT_S`, or the probe reports
+        a failure.
     """
     deadline = time.monotonic() + MANAGED_HOST_ONLINE_TIMEOUT_S
+    next_probe = time.monotonic() + _FAILURE_PROBE_INTERVAL_S
     while time.monotonic() < deadline:
         if await asyncio.to_thread(host_store.is_online, host_id):
             return
+        if failure_probe is not None and time.monotonic() >= next_probe:
+            failure = await failure_probe()
+            if failure is not None:
+                raise HTTPException(
+                    status_code=502, detail=f"{what} stopped before coming online: {failure}"
+                )
+            next_probe = time.monotonic() + _FAILURE_PROBE_INTERVAL_S
         await asyncio.sleep(_ONLINE_POLL_INTERVAL_S)
     raise HTTPException(
         status_code=502,
         detail=(
-            f"managed host did not come online within "
-            f"{MANAGED_HOST_ONLINE_TIMEOUT_S}s — check {_HOST_LOG_PATH} "
-            "inside the sandbox"
+            f"{what} did not come online within "
+            f"{MANAGED_HOST_ONLINE_TIMEOUT_S}s — check {_HOST_LOG_PATH} {where}"
         ),
     )
 
@@ -4001,6 +4025,73 @@ def host_sandbox_is_running(
 _resume_locks: dict[str, asyncio.Lock] = {}
 
 
+def host_wake_lock(host_id: str) -> asyncio.Lock:
+    """The per-host single-flight lock every in-place wake of *host_id* holds.
+
+    In-process only: two replicas can still wake one host at once. Then the
+    later ``start_host`` stops the earlier host and re-arms the token, so the
+    loser's host simply never connects.
+    """
+    return _resume_locks.setdefault(host_id, asyncio.Lock())
+
+
+async def wake_host_in_sandbox(
+    launcher: SandboxHostLauncher,
+    sandbox_id: str,
+    *,
+    host_store: HostStore,
+    host_id: str,
+    host_name: str,
+    server_url: str,
+    host_config: dict[str, object] | None,
+    token_ttl_s: int,
+    arm: Callable[[str, int], Awaitable[bool]],
+    resume: bool = True,
+    repos: Sequence[RepoWorkspace] = (),
+    on_stage: Callable[[str], None] | None = None,
+    agent_name: str | None = None,
+    what: str = "managed host",
+    where: str = "inside the sandbox",
+    failure_probe: Callable[[], Awaitable[str | None]] | None = None,
+) -> bool:
+    """
+    The wake core shared by managed and static hosts.
+
+    Resume the sandbox in place (when *resume*), mint a fresh launch token,
+    let *arm* store it on the host row, start ``omnigent host`` with it, and
+    wait until the host registers. Callers hold :func:`host_wake_lock` and
+    decide which row to arm and what a gone sandbox means.
+
+    :param arm: ``(token, expires_at) -> armed``. ``False`` aborts the wake
+        before the host starts (the caller's row changed under it).
+    :returns: Whether the host was started.
+    :param failure_probe: Forwarded to :func:`wait_for_host_online`.
+    :raises SandboxGoneError: From ``resume`` when the sandbox no longer exists.
+    :raises HTTPException: 502 when the host does not come online in time.
+    """
+    if resume:
+        await asyncio.to_thread(launcher.resume, sandbox_id)
+    token = secrets.token_urlsafe(32)
+    if not await arm(token, now_epoch() + token_ttl_s):
+        return False
+    await _start_sandbox_host(
+        launcher,
+        sandbox_id,
+        token=token,
+        host_id=host_id,
+        host_name=host_name,
+        server_url=server_url,
+        repos=repos,
+        host_config=host_config,
+        on_stage=on_stage,
+        agent_name=agent_name,
+    )
+    await wait_for_host_online(
+        host_store, host_id, what=what, where=where, failure_probe=failure_probe
+    )
+    return True
+
+
 async def resume_managed_host(
     host_id: str,
     host_store: HostStore,
@@ -4062,8 +4153,7 @@ async def resume_managed_host(
     if not force and await asyncio.to_thread(host_store.is_online, host_id):
         return
     # Single-flight per host (see _resume_locks).
-    resume_lock = _resume_locks.setdefault(host_id, asyncio.Lock())
-    async with resume_lock:
+    async with host_wake_lock(host_id):
         # Re-check under the lock: a concurrent waker may have brought the host
         # online while we waited.
         if not force and await asyncio.to_thread(host_store.is_online, host_id):
@@ -4088,17 +4178,15 @@ async def resume_managed_host(
             sandbox_id,
             launcher.provider,
         )
-        try:
-            await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
-            await asyncio.to_thread(launcher.resume, sandbox_id)
-            token = secrets.token_urlsafe(32)
+
+        async def _arm(token: str, token_expires_at: int) -> bool:
             armed = await asyncio.to_thread(
                 host_store.rearm_managed_host,
                 host.host_id,
                 sandbox_id=sandbox_id,
                 expected_updated_at=host.updated_at,
                 token=token,
-                token_expires_at=now_epoch() + entry.token_ttl_s,
+                token_expires_at=token_expires_at,
             )
             if armed is None:
                 current = await asyncio.to_thread(host_store.get_host, host.host_id)
@@ -4123,20 +4211,25 @@ async def resume_managed_host(
                             host.host_id,
                             sandbox_id=sandbox_id,
                         )
-                return
-            await _start_sandbox_host(
+                return False
+            return True
+
+        try:
+            await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+            await wake_host_in_sandbox(
                 launcher,
                 sandbox_id,
-                token=token,
+                host_store=host_store,
                 host_id=host.host_id,
                 host_name=host.name,
                 server_url=entry.server_url,
-                repos=workspace_repos,
                 host_config=entry.host_config,
+                token_ttl_s=entry.token_ttl_s,
+                arm=_arm,
+                repos=workspace_repos,
                 on_stage=on_stage,
                 agent_name=agent_name,
             )
-            await _wait_for_host_online(host_store, host.host_id)
         except SandboxGoneError:
             raise
         except Exception as exc:

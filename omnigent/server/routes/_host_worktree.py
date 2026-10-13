@@ -1,7 +1,7 @@
 """
 Server-side proxies for the host git-worktree tunnel frames.
 
-Like ``_workspace_validation._ask_host_stat``: enqueue a
+Like ``_workspace_validation.ask_host_stat``: enqueue a
 ``host.create_worktree`` / ``host.remove_worktree`` frame, register a
 future on the host connection, and await the result with a timeout. The
 host (not the server) runs git. See designs/SESSION_GIT_WORKTREE.md.

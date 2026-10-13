@@ -161,6 +161,21 @@ async def test_create_and_get_roundtrips_config(project_client: httpx.AsyncClien
     assert fetched["config"] == cfg
 
 
+async def test_static_sandbox_host_target_roundtrips(project_client: httpx.AsyncClient) -> None:
+    """A static sandbox host default round-trips, and old host_id configs stay valid."""
+    cfg = {
+        "sandbox_target": {"kind": "static", "provider": "remote", "sandbox_id": "foo"},
+        "workspace": "https://github.com/example/sample-app",
+    }
+    created = (
+        await project_client.post("/v1/projects", json={"name": "Static", "config": cfg})
+    ).json()
+    assert (await project_client.get(f"/v1/projects/{created['id']}")).json()["config"] == cfg
+    legacy = {"host_id": "host_abc", "workspace": "/work/repo"}
+    patched = await project_client.patch(f"/v1/projects/{created['id']}", json={"config": legacy})
+    assert patched.json()["config"] == legacy
+
+
 async def test_patch_replaces_config(project_client: httpx.AsyncClient) -> None:
     """PATCH with a new config replaces the stored one and stamps updated_at."""
     created = (

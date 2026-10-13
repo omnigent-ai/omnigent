@@ -48,6 +48,9 @@ import {
   nativeCodingAgentForAvailableAgent,
 } from "@/lib/nativeCodingAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
+import { staticSandboxHostChoice, staticSandboxRefFromChoice } from "@/lib/staticSandboxes";
+import { useStaticSandboxes } from "@/lib/staticSandboxesApi";
+import { StaticSandboxStatusBadge } from "./StaticSandboxDialogs";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
@@ -121,6 +124,11 @@ export function ProjectSettingsDialog({
   // can only fail on create.
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const sandboxProvider = info !== "loading" ? info.sandbox_provider : null;
+  // The user's static sandboxes, listed under their labels. A paused VM is a
+  // usable default: session create wakes it.
+  const staticSandboxesEnabled = info !== "loading" && info.static_sandboxes === true;
+  const staticSandboxesQuery = useStaticSandboxes({ enabled: open && staticSandboxesEnabled });
+  const staticSandboxes = staticSandboxesQuery.data ?? [];
 
   // Draft fields. Seeded from the stored config each time the dialog opens (or
   // the fetched config arrives); local until saved.
@@ -184,7 +192,11 @@ export function ProjectSettingsDialog({
     // clobbering the fields would risk sending `{}` if the guard ever regressed.
     if (loadFailed) return;
     const c: ProjectConfig = stored ?? {};
-    setHostId(c.host_id ?? NONE);
+    setHostId(
+      c.sandbox_target?.kind === "static" && c.sandbox_target.sandbox_id
+        ? staticSandboxHostChoice(c.sandbox_target)
+        : (c.host_id ?? NONE),
+    );
     setWorkspace(c.workspace ?? "");
     setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
     setBaseBranch(c.base_branch ?? "");
@@ -201,11 +213,17 @@ export function ProjectSettingsDialog({
     // Preserve config keys owned by other dialogs, then replace only the fields
     // this form edits.
     const config: ProjectConfig = { ...(stored ?? {}) };
-    if (hostId !== NONE) config.host_id = hostId;
-    else delete config.host_id;
+    delete config.host_id;
+    delete config.sandbox_target;
+    if (staticSandbox !== null) {
+      config.sandbox_target = { kind: "static", ...staticSandbox };
+    } else if (hostId !== NONE) {
+      config.host_id = hostId;
+    }
     // A workspace is host-relative and only meaningful with a concrete host —
     // don't persist a stale path from a since-cleared host, and drop it for the
     // sandbox (a sandbox create provisions its own workspace and ignores this).
+    // For a static sandbox it is a repo URL; blank means the VM's primary repo.
     const ws =
       hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
     if (ws) config.workspace = ws;
@@ -244,15 +262,31 @@ export function ProjectSettingsDialog({
   // longer online, keep it as a labeled fallback item so opening + saving the
   // dialog doesn't silently drop the saved default.
   const onlineHosts = (hosts.data ?? []).filter((h) => h.status === "online");
+  // A static sandbox default. Paused or not, it stays listed (create wakes
+  // it); only an entry the user removed falls back to an "(unavailable)" item.
+  const staticSandbox = staticSandboxRefFromChoice(hostId);
+  const storedStaticMissing =
+    staticSandbox !== null &&
+    !staticSandboxesQuery.isPending &&
+    !staticSandboxes.some(
+      (t) => t.provider === staticSandbox.provider && t.id === staticSandbox.sandbox_id,
+    );
   const storedHostMissing =
     hostId !== NONE &&
     hostId !== SANDBOX_HOST_CHOICE &&
+    staticSandbox === null &&
     !onlineHosts.some((h) => h.host_id === hostId);
   // The filesystem browser needs a concrete, online host to list against — so
   // it's only offered when a real host is the default (not sandbox / no-default
-  // / an offline stored host). Otherwise the field is a plain path input.
+  // / an offline stored host / a static sandbox, whose workspace is a repo URL).
+  // Otherwise the field is a plain input.
   const browsableHostId =
-    hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE && !storedHostMissing ? hostId : null;
+    hostId !== NONE &&
+    hostId !== SANDBOX_HOST_CHOICE &&
+    staticSandbox === null &&
+    !storedHostMissing
+      ? hostId
+      : null;
 
   // Agent picker groups, mirroring the composer's split (native harness CLIs vs
   // SDK / bundle agents). The picker takes both lists and a selection.
@@ -343,6 +377,22 @@ export function ProjectSettingsDialog({
                     {sandboxOptionLabel(sandboxProvider)}
                   </SelectItem>
                 )}
+                {staticSandboxes.map((t) => (
+                  <SelectItem
+                    key={`static-${t.provider}/${t.id}`}
+                    value={staticSandboxHostChoice({ provider: t.provider, sandbox_id: t.id })}
+                  >
+                    <span className="flex items-center gap-2">
+                      <span className="truncate">{t.label}</span>
+                      <StaticSandboxStatusBadge status={t.status} />
+                    </span>
+                  </SelectItem>
+                ))}
+                {storedStaticMissing && (
+                  <SelectItem
+                    value={hostId}
+                  >{`${staticSandbox?.sandbox_id} (unavailable)`}</SelectItem>
+                )}
                 {onlineHosts.map((h) => (
                   <SelectItem key={h.host_id} value={h.host_id}>
                     {h.name}
@@ -362,9 +412,11 @@ export function ProjectSettingsDialog({
             hint={
               hostId === NONE
                 ? "Pick a host first"
-                : browsableHostId
-                  ? "Browse the host or type a path"
-                  : "Absolute path on the host"
+                : staticSandbox !== null
+                  ? "Repository on the VM; blank uses its primary repo"
+                  : browsableHostId
+                    ? "Browse the host or type a path"
+                    : "Absolute path on the host"
             }
             htmlFor="project-settings-workspace"
           >
@@ -416,7 +468,9 @@ export function ProjectSettingsDialog({
                 id="project-settings-workspace"
                 data-testid="project-settings-workspace"
                 className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                placeholder="/path/to/repo"
+                placeholder={
+                  staticSandbox !== null ? "https://github.com/org/repo" : "/path/to/repo"
+                }
                 value={workspace}
                 onChange={(e) => setWorkspace(e.target.value)}
                 disabled={isLoading}
@@ -478,7 +532,7 @@ export function ProjectSettingsDialog({
                 // agent" action and leave the handler inert.
                 onCreateCustomAgent={() => {}}
                 allowCreateCustomAgent={false}
-                sandboxSelected={hostId === SANDBOX_HOST_CHOICE}
+                sandboxSelected={hostId === SANDBOX_HOST_CHOICE || staticSandbox !== null}
                 // Modal so the menu establishes its own scroll context and can
                 // scroll inside the Dialog's scroll-lock (a non-modal dropdown
                 // portals outside that lock and can't scroll). The dismiss

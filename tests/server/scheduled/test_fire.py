@@ -1379,7 +1379,7 @@ async def test_resolve_default_workspace_returns_canonical_path(
             "canonical_path": "/home/alice",
         }
 
-    monkeypatch.setattr(wsv, "_ask_host_stat", _fake_stat)
+    monkeypatch.setattr(wsv, "ask_host_stat", _fake_stat)
     deps = _deps(
         FakeScheduledTaskStore(),
         host_registry=FakeHostRegistry(online={"host_9"}),
@@ -1400,7 +1400,7 @@ async def test_resolve_default_workspace_raises_when_home_missing(
     async def _fake_stat(*, host_registry: Any, host_conn: Any, path: str) -> dict[str, Any]:
         return {"status": "ok", "exists": False, "type": None, "canonical_path": None}
 
-    monkeypatch.setattr(wsv, "_ask_host_stat", _fake_stat)
+    monkeypatch.setattr(wsv, "ask_host_stat", _fake_stat)
     deps = _deps(
         FakeScheduledTaskStore(),
         host_registry=FakeHostRegistry(online={"host_9"}),

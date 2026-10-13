@@ -125,6 +125,35 @@ describe("useHosts", () => {
     expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop", "host_legacy"]);
   });
 
+  it("hides a static sandbox's raw host row, which is listed under its label", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        hosts: [
+          {
+            host_id: "host_vm",
+            name: "static-sandbox-foo",
+            owner: "alice",
+            status: "offline",
+            sandbox_provider: null,
+            static_sandbox: { provider: "remote", sandbox_id: "foo" },
+          },
+          {
+            host_id: "host_laptop",
+            name: "Laptop",
+            owner: "alice",
+            status: "online",
+            sandbox_provider: null,
+            static_sandbox: null,
+          },
+        ],
+      }),
+    );
+
+    const { result } = renderHook(() => useHosts(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop"]);
+  });
+
   it("retains sandbox hosts when includeSandbox is set", async () => {
     // The chat-header HostBadge needs sandbox-backed hosts so it can
     // label them ("Databricks Sandbox"); the default filtered call must

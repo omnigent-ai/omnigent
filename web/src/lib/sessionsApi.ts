@@ -127,6 +127,15 @@ interface SessionResponseWire {
    */
   host_resumable?: boolean;
   /**
+   * Static sandbox host only, set only while the host is offline:
+   * "paused" (wakeable), "running" (VM up, host restarting), or "gone".
+   */
+  sandbox_state?: "running" | "paused" | "gone" | null;
+  /** The sandbox id behind `sandbox_state`, e.g. "foo". */
+  sandbox_name?: string | null;
+  /** The provider holding `sandbox_name`, e.g. "remote". */
+  sandbox_name_provider?: string | null;
+  /**
    * Whether the session is archived. The snapshot is the only carrier for a
    * session opened directly by URL — the default list request excludes
    * archived rows. Absent/`false` for active sessions.
@@ -327,6 +336,9 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     hostId: wire.host_id ?? null,
     hostOnline: wire.host_online ?? undefined,
     hostResumable: wire.host_resumable ?? false,
+    sandboxState: wire.sandbox_state ?? null,
+    sandboxName: wire.sandbox_name ?? null,
+    sandboxNameProvider: wire.sandbox_name_provider ?? null,
     archived: wire.archived ?? false,
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,

@@ -8,8 +8,11 @@ import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { DisabledActionTooltip } from "./DisabledActionTooltip";
 import { SessionActionMenuItem } from "./SessionActionMenuItem";
+import { useStaticSandboxes } from "@/lib/staticSandboxesApi";
+import type { StaticSandboxRef } from "@/lib/staticSandboxes";
 import { SwitchHostDialog } from "@/shell/SwitchHostDialog";
 import { cn } from "@/lib/utils";
+import { useChatStore } from "@/store/chatStore";
 import { ComposerHostTrigger } from "@/components/composer/ComposerControls";
 import {
   DropdownMenu,
@@ -30,6 +33,8 @@ export interface HostBadgeInfo {
  *
  * - Not host-bound (`hostId` null/absent) → `null` (render nothing).
  * - Sandbox-backed host → the provider label ("Databricks Sandbox").
+ * - Static sandbox host → the user's label for the VM, else its sandbox
+ *   id (never the internal host row name).
  * - Connected host → its friendly `name`.
  * - Host-bound but record unresolved (shared session / not yet loaded)
  *   → the raw `hostId`, so the badge always answers "which host".
@@ -42,13 +47,17 @@ export function resolveHostBadge(args: {
   hostId: string | null | undefined;
   host: Host | undefined;
   online: boolean | null | undefined;
+  /** The user's label for a static sandbox host's VM, when known. */
+  staticSandboxLabel?: string | null;
 }): HostBadgeInfo | null {
-  const { hostId, host, online } = args;
+  const { hostId, host, online, staticSandboxLabel } = args;
   if (!hostId) return null;
   const label = host
     ? host.sandbox_provider
       ? sandboxOptionLabel(host.sandbox_provider)
-      : host.name
+      : host.static_sandbox
+        ? staticSandboxLabel || host.static_sandbox.sandbox_id
+        : host.name
     : hostId;
   const status: HostBadgeStatus =
     online === true ? "online" : online === false ? "offline" : "unknown";
@@ -70,22 +79,49 @@ const STATUS_WORD: Record<HostBadgeStatus, string> = {
 
 const RECONNECT_WORD = "offline — click to reconnect";
 
+interface HostBadgeProps {
+  sessionId: string;
+  onReconnect?: () => void;
+  appearance?: "status" | "composer";
+  readOnly?: boolean;
+}
+
 /**
  * Session-bound host status with shared liveness, reconnect and switch behavior.
  * The composer variant uses the compact host menu; the default retains the
  * name-and-status badge. Managed sandbox placement remains server-owned.
  */
-export function HostBadge({
+export function HostBadge(props: HostBadgeProps) {
+  const { session } = useSession(props.sessionId);
+  const hostId = session?.hostId ?? null;
+  const { data: hosts } = useHosts({ includeSandbox: true, enabled: Boolean(hostId) });
+  const sandbox = hosts?.find((h) => h.host_id === hostId)?.static_sandbox ?? null;
+  // Only a session on one of the user's static sandboxes fetches their labels.
+  return sandbox !== null ? (
+    <StaticSandboxHostBadge {...props} sandbox={sandbox} />
+  ) : (
+    <HostBadgeBody {...props} staticSandboxLabel={null} />
+  );
+}
+
+function StaticSandboxHostBadge({
+  sandbox,
+  ...props
+}: HostBadgeProps & { sandbox: StaticSandboxRef }) {
+  const { data: staticSandboxes } = useStaticSandboxes({ enabled: true });
+  const label =
+    staticSandboxes?.find((t) => t.provider === sandbox.provider && t.id === sandbox.sandbox_id)
+      ?.label ?? null;
+  return <HostBadgeBody {...props} staticSandboxLabel={label} />;
+}
+
+function HostBadgeBody({
   sessionId,
   onReconnect,
   appearance = "status",
   readOnly = false,
-}: {
-  sessionId: string;
-  onReconnect?: () => void;
-  appearance?: "status" | "composer";
-  readOnly?: boolean;
-}) {
+  staticSandboxLabel,
+}: HostBadgeProps & { staticSandboxLabel: string | null }) {
   const [switchOpen, setSwitchOpen] = useState(false);
   const { session } = useSession(sessionId);
   const hostId = session?.hostId ?? null;
@@ -95,7 +131,15 @@ export function HostBadge({
   const { data: hosts } = useHosts({ includeSandbox: true, enabled: Boolean(hostId) });
   const liveOnline = useSessionHostOnline(sessionId);
 
+  // The live stream's launch stage for the open session, else the snapshot's.
+  const liveSandboxStatus = useChatStore((s) =>
+    s.conversationId === sessionId ? s.sandboxStatus : null,
+  );
+  const sandboxLaunching = (liveSandboxStatus ?? session?.sandboxStatus ?? null) !== null;
+
   const host = hostId ? hosts?.find((h) => h.host_id === hostId) : undefined;
+  // A managed sandbox has no host until its launch finishes; it is still cloud.
+  const cloudHost = host ? !!host.sandbox_provider || !!host.static_sandbox : sandboxLaunching;
 
   // Host liveness is keyed by SESSION, not by host, and comes from a ~10s
   // poll. A host switch repoints `hostId` as soon as the session snapshot
@@ -130,15 +174,20 @@ export function HostBadge({
         : undefined
       : liveOnline;
 
-  const badge = resolveHostBadge({ hostId, host, online });
+  const badge = resolveHostBadge({ hostId, host, online, staticSandboxLabel });
   const { switchHostDisabledReason } = useSessionActionRestrictions(sessionId);
-  const canSwitch = host !== undefined && !switchHostDisabledReason && !readOnly;
+  const canSwitch =
+    host !== undefined && !switchHostDisabledReason && !host.static_sandbox && !readOnly;
   useEffect(() => {
     if (!canSwitch) setSwitchOpen(false);
   }, [canSwitch]);
   if (appearance === "composer") {
     const reconnectable = badge?.status === "offline" && !session?.hostResumable && !!onReconnect;
-    const label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
+    const label = badge
+      ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}`
+      : sandboxLaunching
+        ? "Provisioning sandbox"
+        : "No host bound";
     return (
       <>
         <DropdownMenu>
@@ -146,7 +195,7 @@ export function HostBadge({
             <ComposerHostTrigger
               label={label}
               status={badge?.status ?? "unknown"}
-              cloud={!!host?.sandbox_provider}
+              cloud={cloudHost}
               data-testid="composer-host-select"
             />
           </DropdownMenuTrigger>
@@ -158,7 +207,7 @@ export function HostBadge({
             data-testid="composer-host-menu"
           >
             <div className="px-2 py-1 text-xs text-muted-foreground">
-              {host?.sandbox_provider ? "Cloud" : "My machines"}
+              {cloudHost ? "Cloud" : "My machines"}
             </div>
             <DropdownMenuItem disabled className="gap-2" data-selected="true">
               <span

@@ -94,6 +94,15 @@ class SandboxCapabilities:
         handed a multi-repo request; providers opt in explicitly.
     :param git_clone_options: Provider honors ``RepoWorkspace.git_clone``
         when creating checkouts. Custom materializers must opt in.
+    :param provisions_repos: Provider's ``provision`` accepts the session's
+        repositories and materializes them with the sandbox, so the managed
+        launch path threads ``repos`` into it. Off by default, so a provider
+        whose ``provision`` takes only a name (and every out-of-tree
+        provider) is never handed the keyword.
+    :param static_sandboxes: Provider can attach a host to a user-owned,
+        long-lived sandbox it never creates or deletes. A provider setting
+        this implements
+        :class:`~omnigent.onboarding.sandboxes.base.StaticSandboxProvider`.
     """
 
     cli_bootstrap: bool = False
@@ -110,6 +119,8 @@ class SandboxCapabilities:
     snapshot_restore: bool = False
     multi_repo: bool = False
     git_clone_options: bool = False
+    provisions_repos: bool = False
+    static_sandboxes: bool = False
 
 
 @dataclass(frozen=True)

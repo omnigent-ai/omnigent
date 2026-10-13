@@ -1318,6 +1318,40 @@ class SessionEventInput(BaseModel):
         return data
 
 
+class StaticSandboxTarget(BaseModel):
+    """
+    Run the session on one of the caller's static sandboxes.
+
+    :param kind: Always ``"static"``.
+    :param provider: The sandbox provider owning the VM, e.g. ``"remote"``.
+        Must be a configured provider offering static sandboxes.
+    :param sandbox_id: The sandbox's id at the provider (never the display
+        label), e.g. ``"foo"``. Must be one of the caller's saved static
+        sandboxes.
+    """
+
+    kind: Literal["static"]
+    provider: str = Field(min_length=1, max_length=64)
+    sandbox_id: str = Field(min_length=1, max_length=128)
+
+
+class StaticSandboxRef(BaseModel):
+    """
+    Identifies one static sandbox, e.g. the one a host runs on.
+
+    :param provider: The sandbox provider, e.g. ``"remote"``.
+    :param sandbox_id: The sandbox's id at the provider, e.g. ``"foo"``.
+    """
+
+    provider: str
+    sandbox_id: str
+
+
+# Tagged so later kinds (e.g. "the VM session X is on") plug in without
+# changing this field's shape.
+SandboxTarget = Annotated[StaticSandboxTarget, Field(discriminator="kind")]
+
+
 class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.
@@ -1469,6 +1503,14 @@ class _SessionCreateRequestBase(BaseModel):
         source repository directory. Requires ``host_id``. ``None``
         starts the runner directly in ``workspace``. See
         designs/SESSION_GIT_WORKTREE.md.
+    :param sandbox_target: Optional host target the server resolves, e.g.
+        ``{"kind": "static", "provider": "remote", "sandbox_id": "foo"}``
+        for one of the caller's static sandboxes. Requires ``host_type: "external"``
+        and no ``host_id``: the server wakes the VM, starts its host, fills
+        in ``host_id``, locates or clones ``workspace`` (a repository URL,
+        an absolute path on the VM, or omitted for the VM's primary repo),
+        and gives the session its own worktree (``git`` defaults to a new
+        ``omnigent/<id>`` branch).
     :param terminal_launch_args: Optional pass-through CLI args for a
         native terminal wrapper (claude / codex), e.g.
         ``["--permission-mode", "bypassPermissions"]`` (the web UI's
@@ -1547,6 +1589,7 @@ class _SessionCreateRequestBase(BaseModel):
     workspace: str | None = None
     workspaces: list[str] | None = None
     git: SessionGitOptions | None = None
+    sandbox_target: SandboxTarget | None = None
     terminal_launch_args: list[str] | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
@@ -1568,7 +1611,12 @@ class _SessionCreateRequestBase(BaseModel):
         :returns: The validated instance.
         :raises ValueError: If ``git`` is set but ``host_id`` is not.
         """
-        if self.git is not None and self.host_id is None and self.project_id is None:
+        if (
+            self.git is not None
+            and self.host_id is None
+            and self.project_id is None
+            and self.sandbox_target is None
+        ):
             raise ValueError("git worktree creation requires host_id")
         return self
 
@@ -1599,6 +1647,22 @@ class _SessionCreateRequestBase(BaseModel):
         # at module scope would risk import cycles.
         from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
 
+        if self.sandbox_target is not None:
+            if self.host_type != "external" or self.host_id is not None:
+                raise ValueError(
+                    "sandbox_target picks the host; use host_type 'external' without host_id"
+                )
+            if self.sandbox_provider is not None or self.workspaces:
+                raise ValueError("sandbox_target takes one 'workspace', not sandbox options")
+            if self.workspace is not None and not self.workspace.startswith("/"):
+                try:
+                    parse_repo_workspace(self.workspace)
+                except ValueError as exc:
+                    raise ValueError(
+                        "with sandbox_target, 'workspace' is a git repository URL "
+                        f"(optionally '#<branch>') or an absolute path on the VM: {exc}"
+                    ) from exc
+            return self
         if self.host_type == "managed":
             if self.host_id is not None:
                 raise ValueError(
@@ -2209,6 +2273,13 @@ class SessionResponse(BaseModel):
     runner_online: bool | None = None
     host_online: bool | None = None
     host_resumable: bool = False
+    # Static sandbox host only, set only while the host is offline:
+    # "paused" (wakeable), "running" (VM up, host restarting), or "gone".
+    sandbox_state: Literal["running", "paused", "gone"] | None = None
+    # The sandbox id behind ``sandbox_state`` (e.g. "foo"), for the paused chip.
+    sandbox_name: str | None = None
+    # The provider holding ``sandbox_name`` (e.g. "remote").
+    sandbox_name_provider: str | None = None
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
@@ -2405,6 +2476,19 @@ class AutomaticSessionRenameRequest(BaseModel):
     title: str = Field(min_length=2, max_length=DEFAULT_GENERATED_TITLE_MAX_CHARS)
 
     model_config = ConfigDict(extra="forbid")
+
+
+class SessionWakeResponse(BaseModel):
+    """
+    Response for ``POST /v1/sessions/{id}/wake``.
+
+    :param host_id: The session's host, now online.
+    :param kind: Which wake ran: ``"static"`` (a static sandbox
+        host) or ``"managed"`` (a resume-in-place managed sandbox).
+    """
+
+    host_id: str
+    kind: Literal["static", "managed"]
 
 
 class AutomaticSessionRenameResponse(BaseModel):

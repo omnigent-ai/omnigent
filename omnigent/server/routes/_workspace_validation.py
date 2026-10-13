@@ -106,7 +106,7 @@ class WorkspaceValidationError(Exception):
         self.message = message
 
 
-async def _ask_host_stat(
+async def ask_host_stat(
     *,
     host_registry: HostRegistry,
     host_conn: HostConnection,
@@ -278,7 +278,7 @@ async def validate_workspace(
     # Step 4: stat the workspace. Done before the boundary check so
     # a missing workspace surfaces directly (more useful error than
     # "workspace is outside boundary that doesn't exist").
-    workspace_stat = await _ask_host_stat(
+    workspace_stat = await ask_host_stat(
         host_registry=host_registry,
         host_conn=host_conn,
         path=workspace,
@@ -302,7 +302,7 @@ async def validate_workspace(
         # spec_cwd is absolute (with-or-without ``~``); ask the
         # host to canonicalize it so boundary comparisons operate
         # on realpaths (symlinks in either side resolved away).
-        boundary_stat = await _ask_host_stat(
+        boundary_stat = await ask_host_stat(
             host_registry=host_registry,
             host_conn=host_conn,
             path=spec_cwd or "",  # _is_relative_cwd handled None above
@@ -340,7 +340,7 @@ async def validate_workspace(
         # picked path are already resolved — without that, a user
         # whose workspace is a symlink could fool the existence check.
         subdir_path = canonical_workspace.rstrip("/") + "/" + subdir
-        subdir_stat = await _ask_host_stat(
+        subdir_stat = await ask_host_stat(
             host_registry=host_registry,
             host_conn=host_conn,
             path=subdir_path,

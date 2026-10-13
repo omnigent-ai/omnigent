@@ -7547,6 +7547,363 @@ describe("NewChatLandingScreen", () => {
   });
 });
 
+describe("NewChatLandingScreen static sandboxes", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const STATIC_SANDBOXES = [
+    {
+      provider: "remote",
+      sandbox_id: "foo",
+      label: "Checkout web app",
+      status: "running",
+      repo: "example/sample-app",
+      last_activity_at: null,
+    },
+    {
+      provider: "remote",
+      sandbox_id: "old-spike",
+      label: "old-spike",
+      status: "gone",
+      repo: "",
+      last_activity_at: null,
+    },
+  ];
+
+  function mockStaticSandboxes(onRequest: (url: string, init?: RequestInit) => void = () => {}) {
+    authenticatedFetchMock.mockImplementation(((url: string, init?: RequestInit) => {
+      onRequest(url, init);
+      if (url === "/v1/static-sandboxes") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ static_sandboxes: STATIC_SANDBOXES }),
+        } as unknown as Response);
+      }
+      if (url === "/v1/sessions") return new Promise<Response>(() => {});
+      return Promise.resolve({
+        ok: true,
+        status: 204,
+        json: async () => ({}),
+      } as unknown as Response);
+    }) as unknown as typeof authenticatedFetch);
+  }
+
+  async function openHostMenu() {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+  }
+
+  it("lists saved entries from the API under their labels, with a Paused badge", async () => {
+    STATIC_SANDBOXES[0].status = "paused";
+    mockStaticSandboxes();
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      static_sandboxes: true,
+      static_sandbox_providers: ["remote"],
+    });
+    await openHostMenu();
+    const entry = await screen.findByTestId("new-chat-landing-static-sandbox-option-foo");
+    expect(entry.textContent).toContain("Checkout web app");
+    expect(entry.textContent).toContain("foo");
+    expect(entry.textContent).toContain("Paused");
+    expect(screen.getByTestId("new-chat-landing-add-static-sandbox").textContent).toContain(
+      "Add Remote Static Sandbox…",
+    );
+    STATIC_SANDBOXES[0].status = "running";
+  });
+
+  it("highlights only the picked static entry, not the managed sandbox row too", async () => {
+    mockStaticSandboxes();
+    renderLanding({ managed_sandboxes_enabled: true, static_sandboxes: true });
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-static-sandbox-option-foo"));
+    await openHostMenu();
+    const entry = await screen.findByTestId("new-chat-landing-static-sandbox-option-foo");
+    expect(entry).toHaveAttribute("data-active", "true");
+    expect(screen.getByTestId("new-chat-landing-sandbox-option")).not.toHaveAttribute(
+      "data-active",
+    );
+  });
+
+  it("shows a long label in full instead of truncating it", async () => {
+    const long = "checkout-web-app-with-a-very-long-descriptive-label";
+    STATIC_SANDBOXES[0].label = long;
+    mockStaticSandboxes();
+    renderLanding({ managed_sandboxes_enabled: true, static_sandboxes: true });
+    await openHostMenu();
+    const entry = await screen.findByTestId("new-chat-landing-static-sandbox-option-foo");
+    const label = within(entry).getByText(long);
+    expect(label.className).not.toContain("truncate");
+    STATIC_SANDBOXES[0].label = "Checkout web app";
+  });
+
+  it("is hidden when the server does not offer static sandboxes", async () => {
+    const requested: string[] = [];
+    mockStaticSandboxes((url) => requested.push(url));
+    renderLanding({ managed_sandboxes_enabled: true });
+    await openHostMenu();
+    expect(screen.queryByTestId("new-chat-landing-add-static-sandbox")).toBeNull();
+    expect(requested).not.toContain("/v1/static-sandboxes");
+  });
+
+  it("a gone entry offers Remove, which deletes it", async () => {
+    const calls: [string, string | undefined][] = [];
+    mockStaticSandboxes((url, init) => calls.push([url, init?.method]));
+    renderLanding({ managed_sandboxes_enabled: true, static_sandboxes: true });
+    await openHostMenu();
+    const gone = await screen.findByTestId("new-chat-landing-static-sandbox-option-old-spike");
+    expect(gone.textContent).toContain("VM no longer exists");
+    fireEvent.click(screen.getByTestId("new-chat-landing-static-sandbox-remove-old-spike"));
+    await waitFor(() =>
+      expect(calls).toContainEqual(["/v1/static-sandboxes/remote/old-spike", "DELETE"]),
+    );
+  });
+
+  it("creates on the picked sandbox with sandbox_target, not a managed sandbox", async () => {
+    mockStaticSandboxes();
+    renderLanding({ managed_sandboxes_enabled: true, static_sandboxes: true });
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-static-sandbox-option-foo"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "fix the login bug" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() =>
+      expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(true),
+    );
+    const [, init] = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.host_type).toBe("external");
+    expect(body.sandbox_target).toEqual({ kind: "static", provider: "remote", sandbox_id: "foo" });
+    expect("workspaces" in body).toBe(false);
+    expect("host_id" in body).toBe(false);
+    expect("sandbox_provider" in body).toBe(false);
+    // The static pick clears managed-sandbox fields by name; a new one must be
+    // cleared in useStaticSandboxPicker.createTarget too.
+    const sandboxKeys = Object.keys(body).filter(
+      (key) => key.startsWith("sandbox_") || key.startsWith("inference_configuration"),
+    );
+    expect(sandboxKeys).toEqual(["sandbox_target"]);
+  });
+
+  const SAMPLE_PROJECT_REPO = {
+    full_name: "example/sample-project",
+    clone_url: "https://github.com/example/sample-project.git",
+    default_branch: null,
+    private: true,
+    pushed_at: null,
+  };
+
+  /** Sandbox targets plus the GitHub repo list; `/v1/sessions` answers via *create*. */
+  function mockStaticWithRepos(create: () => Promise<Response> = () => new Promise(() => {})) {
+    authenticatedFetchMock.mockImplementation(((url: string) => {
+      if (url === "/v1/static-sandboxes") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ static_sandboxes: STATIC_SANDBOXES }),
+        } as unknown as Response);
+      }
+      if (url === "/v1/connections/github/repos") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ connected: true, truncated: false, repos: [SAMPLE_PROJECT_REPO] }),
+        } as unknown as Response);
+      }
+      if (url === "/v1/sessions") return create();
+      return Promise.resolve({
+        ok: true,
+        status: 204,
+        json: async () => ({}),
+      } as unknown as Response);
+    }) as unknown as typeof authenticatedFetch);
+  }
+
+  const STATIC_REPO_INFO = {
+    managed_sandboxes_enabled: true,
+    static_sandboxes: true,
+    enabled_connections: ["github"],
+  };
+
+  async function pickSampleProjectRepo() {
+    // The host menu must be gone first, or its dismissal closes the repo popover.
+    await waitFor(() =>
+      expect(screen.queryByTestId("new-chat-landing-static-sandbox-option-foo")).toBeNull(),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.click(await screen.findByTestId("new-chat-landing-repo-select"));
+    fireEvent.click(await screen.findByRole("option", { name: /example\/sample-project/ }));
+    await screen.findByTestId("new-chat-landing-repo-row");
+  }
+
+  it("keeps a repo picked before selecting a static entry and sends it as the workspace", async () => {
+    mockStaticWithRepos();
+    renderLanding(STATIC_REPO_INFO);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
+        "New Sandbox",
+      ),
+    );
+    await pickSampleProjectRepo();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-static-sandbox-option-foo"));
+    expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain(
+      "sample-project",
+    );
+    const { body } = await submitAndReadBody("fix the login bug");
+    expect(body.sandbox_target).toEqual({ kind: "static", provider: "remote", sandbox_id: "foo" });
+    expect(body.workspace).toBe("https://github.com/example/sample-project.git");
+  });
+
+  it("sends a repo picked after selecting a static entry", async () => {
+    mockStaticWithRepos();
+    renderLanding(STATIC_REPO_INFO);
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-static-sandbox-option-foo"));
+    await pickSampleProjectRepo();
+    const { body } = await submitAndReadBody("fix the login bug");
+    expect(body.workspace).toBe("https://github.com/example/sample-project.git");
+  });
+
+  it("a failed static create shows the server's error and keeps the draft", async () => {
+    mockStaticWithRepos(() =>
+      Promise.resolve({
+        ok: false,
+        status: 502,
+        json: async () => ({
+          detail: "the host on foo stopped before coming online: host process: not running",
+        }),
+      } as unknown as Response),
+    );
+    renderLanding(STATIC_REPO_INFO);
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-static-sandbox-option-foo"));
+    await pickSampleProjectRepo();
+    await submitAndReadBody("fix the login bug");
+    expect(await screen.findByTestId("new-chat-landing-error")).toHaveTextContent(
+      "host process: not running",
+    );
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("fix the login bug");
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+      /Checkout web app/,
+    );
+    expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain(
+      "sample-project",
+    );
+  });
+
+  it("a draft parked on a static entry comes back on that entry", async () => {
+    mockStaticSandboxes();
+    const view = renderLanding({ managed_sandboxes_enabled: true, static_sandboxes: true });
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-static-sandbox-option-foo"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "half a thought" },
+    });
+    view.unmount();
+    renderLanding({ managed_sandboxes_enabled: true, static_sandboxes: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+        /Checkout web app/,
+      ),
+    );
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("half a thought");
+  });
+
+  it("says the sandbox is being prepared when a static create is slow", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      showToastMock.mockClear();
+      mockStaticSandboxes();
+      renderLanding({ managed_sandboxes_enabled: true, static_sandboxes: true });
+      await openHostMenu();
+      fireEvent.click(await screen.findByTestId("new-chat-landing-static-sandbox-option-foo"));
+      await submitAndReadBody("fix the login bug");
+      expect(showToastMock).not.toHaveBeenCalledWith(expect.stringContaining("Starting the host"));
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(showToastMock).toHaveBeenCalledWith(
+        "Preparing Checkout web app… (up to 2 minutes the first time)",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("typing wakes a paused sandbox once, before Start", async () => {
+    STATIC_SANDBOXES[0].status = "paused";
+    const wakes: string[] = [];
+    mockStaticSandboxes((url, init) => {
+      if (init?.method === "POST" && url.endsWith("/wake")) wakes.push(url);
+    });
+    renderLanding({ managed_sandboxes_enabled: true, static_sandboxes: true });
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-static-sandbox-option-foo"));
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "  " } });
+    expect(wakes).toEqual([]);
+    fireEvent.change(input, { target: { value: "f" } });
+    fireEvent.change(input, { target: { value: "fi" } });
+    await waitFor(() => expect(wakes).toEqual(["/v1/static-sandboxes/remote/foo/wake"]));
+    STATIC_SANDBOXES[0].status = "running";
+  });
+
+  it("allows Start on a paused sandbox, which the create wakes", async () => {
+    STATIC_SANDBOXES[0].status = "paused";
+    mockStaticSandboxes();
+    renderLanding({ managed_sandboxes_enabled: true, static_sandboxes: true });
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-static-sandbox-option-foo"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "fix the login bug" },
+    });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    STATIC_SANDBOXES[0].status = "running";
+  });
+
+  it("a project's stored static sandbox is selected even while paused", async () => {
+    STATIC_SANDBOXES[0].status = "paused";
+    mockStaticSandboxes();
+    useProjectsMock.mockReturnValue({
+      ...SUCCESS_QUERY_STATE,
+      data: [{ id: "proj_alpha", name: "Alpha" }],
+    });
+    useProjectConfigMock.mockImplementation((id: string | null) =>
+      id === null
+        ? DISABLED_QUERY_RESULT
+        : {
+            ...SUCCESS_QUERY_STATE,
+            data: {
+              sandbox_target: { kind: "static", provider: "remote", sandbox_id: "foo" },
+              workspace: "https://github.com/example/sample-app#main",
+            },
+          },
+    );
+    renderLanding({ managed_sandboxes_enabled: true, static_sandboxes: true }, "/?project=Alpha");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+        /Checkout web app/,
+      ),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "fix the login bug" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() =>
+      expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(true),
+    );
+    const [, init] = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.sandbox_target).toEqual({ kind: "static", provider: "remote", sandbox_id: "foo" });
+    expect(body.workspace).toBe("https://github.com/example/sample-app#main");
+    expect(body.project_id).toBe("proj_alpha");
+    STATIC_SANDBOXES[0].status = "running";
+  });
+});
+
 // Bundled and host skills can be selected before a session exists.
 describe("NewChatLandingScreen skills menu", () => {
   beforeEach(() => {

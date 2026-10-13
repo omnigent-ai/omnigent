@@ -17,6 +17,8 @@ type ProjectPrefillPhase = "location" | "settled";
  */
 export interface ProjectPrefillConfig {
   hostId?: string;
+  /** A static sandbox host default (the config's `sandbox_target`). */
+  staticSandboxId?: string;
   workspace?: string;
   agentId?: string;
   /** Opt-in worktree default; only `true` is meaningful (absent = no worktree). */
@@ -59,6 +61,8 @@ interface ProjectPrefillInputs {
   /** Whether the server offers managed sandbox hosts. Gates seeding a stored
    *  sandbox default — an OSS server that no longer offers it drops the hint. */
   managedSandboxesEnabled: boolean;
+  /** Whether the server offers static sandboxes. Gates seeding one. */
+  staticSandboxesEnabled?: boolean;
   /** Live host pick; a mid-flight manual switch aborts the config host seeding
    *  so a stored host can't clobber the user's own choice. */
   selectedHostId: string | null;
@@ -77,6 +81,10 @@ interface ProjectPrefillWrites {
   /** Select the managed sandbox as the target (config.hostId was the sandbox
    *  sentinel). Distinct from `hostId` — the sandbox is not a real host id. */
   selectSandbox?: boolean;
+  /** Select this static sandbox (by sandbox id) as the target. */
+  selectStaticSandbox?: string;
+  /** Seed the sandbox repo picker with this `<url>[#<branch>]` workspace. */
+  sandboxWorkspace?: string;
 }
 
 /**
@@ -148,6 +156,23 @@ function locationStep(
   if (config?.hostId === SANDBOX_HOST_CHOICE) {
     if (inputs.managedSandboxesEnabled && !inputs.sandboxSelected && selectedHostId === null) {
       writes.selectSandbox = true;
+    }
+    return settled(state);
+  }
+
+  // A stored static sandbox: select it even while the VM is paused (the
+  // create wakes it), mirroring the sandbox branch above. Its workspace is a
+  // repo URL for the sandbox repo picker; none means the VM's primary repo.
+  if (config?.staticSandboxId != null && config.staticSandboxId !== "") {
+    if (
+      inputs.staticSandboxesEnabled === true &&
+      !inputs.sandboxSelected &&
+      selectedHostId === null
+    ) {
+      writes.selectStaticSandbox = config.staticSandboxId;
+      if (config.workspace != null && config.workspace !== "") {
+        writes.sandboxWorkspace = config.workspace;
+      }
     }
     return settled(state);
   }

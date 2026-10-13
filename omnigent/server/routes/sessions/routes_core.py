@@ -203,6 +203,7 @@ from omnigent.server.schemas import (
     SessionListItem,
     SessionProjectSummary,
     SessionResponse,
+    SessionWakeResponse,
     UpdateSessionRequest,
 )
 from omnigent.stores import AgentStore, ConversationStore
@@ -779,6 +780,37 @@ def register_core_routes(
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
+        if body.sandbox_target is not None:
+            from omnigent.server.routes._sandbox_target import (
+                precheck_sandbox_target_create,
+                resolve_sandbox_target,
+            )
+
+            # Resolving can wake a VM and clone a repo, so the cheap checks a
+            # create would fail anyway run first.
+            await precheck_sandbox_target_create(
+                body,
+                user_id=user_id,
+                agent_store=agent_store,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+                project_store=project_store,
+            )
+            # Wakes the target's VM and host and fills in host_id, workspace,
+            # and git; from here the create is an ordinary external create.
+            body = await resolve_sandbox_target(body, user_id=user_id, request=request)
+        elif body.host_id is not None and getattr(request.app.state, "host_store", None):
+            from omnigent.server.vm_hosts import wake_static_host_for_create
+
+            # A plain host_id naming a paused static sandbox host (e.g. a
+            # stored project default) wakes it before workspace validation.
+            await wake_static_host_for_create(
+                body.host_id,
+                user_id=user_id,
+                host_store=request.app.state.host_store,
+                sandbox_config=getattr(request.app.state, "sandbox_config", None),
+                host_registry=getattr(request.app.state, "host_registry", None),
+            )
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
@@ -2180,6 +2212,59 @@ def register_core_routes(
         if updated is None:
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
         return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
+
+    @router.post(
+        "/sessions/{session_id}/wake",
+        response_model=SessionWakeResponse,
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def wake_session_host(request: Request, session_id: str) -> SessionWakeResponse:
+        """Wake the session's paused host in place, ahead of the next message.
+
+        Idempotent: concurrent calls join the in-flight wake through the
+        per-host lock, and an online host makes it a cheap check. Only
+        resume-in-place hosts wake here (static sandboxes and resumable
+        managed sandboxes); anything else is 409 ``not_resumable``, so a stray
+        call never creates a sandbox.
+        """
+        from omnigent.server.managed_hosts import host_resume_supported, resume_managed_host
+        from omnigent.server.vm_hosts import ensure_vm_host, find_static_host
+
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        state = request.app.state
+        host_store = getattr(state, "host_store", None)
+        sandbox_config = getattr(state, "sandbox_config", None)
+        host = (
+            await asyncio.to_thread(host_store.get_host, conv.host_id)
+            if host_store is not None and conv.host_id is not None
+            else None
+        )
+        not_resumable = OmnigentError(
+            "This session's host cannot be woken in place (not_resumable)",
+            code=ErrorCode.CONFLICT,
+        )
+        if host is None or host_store is None:
+            raise not_resumable
+        static_ref = await find_static_host(host, sandbox_config)
+        if static_ref is not None:
+            await ensure_vm_host(
+                owner=static_ref.owner,
+                provider=static_ref.provider,
+                sandbox_id=static_ref.sandbox_id,
+                sandbox_config=sandbox_config,
+                host_store=host_store,
+            )
+            return SessionWakeResponse(host_id=host.host_id, kind="static")
+        if host_resume_supported(host, sandbox_config):
+            await resume_managed_host(host.host_id, host_store, sandbox_config)
+            return SessionWakeResponse(host_id=host.host_id, kind="managed")
+        raise not_resumable
 
     @router.post(
         "/sessions/{session_id}/auto-title",
