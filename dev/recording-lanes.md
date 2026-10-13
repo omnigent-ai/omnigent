@@ -56,6 +56,20 @@ Recording is **best-effort**:
   that cannot start.
 - Text-only CLI output is not a reason to skip recording. A missing recording
   from an earlier run is not a reason either.
+- **Footage a driver already produced is the clip — declare it.** Before you
+  write a skip reason, list the media this session produced: `.webm`/`.mp4`
+  files under `OMNIGENT_E2E_RECORD_DIR`, pytest's `--output` directory, and any
+  directory the test itself records into (for example
+  `.omnigent/repro-evidence/recordings/`). A recorded run of the journey's
+  driver — including the acceptance or regression e2e when it drives the real
+  surface — shows the journey was driven, so a reason that calls that journey
+  undrivable or unfilmable is false. Move the clip to the stable path and
+  declare it. A missing prepared or provisioned environment does not void
+  footage from a test's own self-contained server/runner rig, and not being
+  able to view the frames is a disclosure (see *Finishing a clip*), not a
+  reason to withhold the clip. Prefer a clip filmed on the final head; when
+  only an earlier candidate's clip exists, declare it and name that head and
+  whether later commits changed the filmed journey.
 - Do not block the verdict, fix, or PR because footage is missing or rejected.
   Explain the gap and continue with the available evidence.
 
@@ -323,6 +337,13 @@ healthy state for a `fixed`/`after` clip; a final frame that shows teardown — 
 pane greyed out behind "Bridge closed: terminal session ended", a deleted
 session, a result list emptied by fixture cleanup — means the recording outlived
 the test body. Fix the stop point and re-record; do not caption around it.
+
+If you cannot view frames (no image tool or OCR in the session), still declare
+the clip: state "frames not inspected" in the caption and in your evidence
+(repro `evidence`; the resolve PR Demo section and `test_audit`), and keep the
+caption to the steps the driver performed and the states it asserted. Not
+seeing the frames is a disclosure on a declared clip, never a reason to leave
+`recordings` empty.
 
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in

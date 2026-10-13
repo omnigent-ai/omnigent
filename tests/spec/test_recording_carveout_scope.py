@@ -29,6 +29,18 @@ def test_lane_recording_blockers_are_explicit_and_do_not_block_delivery() -> Non
     assert "Do not block the verdict, fix, or PR" in lanes
 
 
+def test_lane_rules_declare_footage_a_driver_already_produced() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+
+    assert "Footage a driver already produced is the clip" in lanes
+    assert "list the media this session produced" in lanes
+    assert "a reason that calls that journey undrivable or unfilmable is false" in lanes
+    assert "A missing prepared or provisioned environment does not void footage" in lanes
+    assert "not being able to view the frames is a disclosure" in lanes
+    assert 'state "frames not inspected" in the caption' in lanes
+    assert "never a reason to leave `recordings` empty" in lanes
+
+
 def test_repro_recording_rules_match_the_shared_guide() -> None:
     instructions = _normalized(_DEV / "repro-agent" / "AGENTS.md")
 

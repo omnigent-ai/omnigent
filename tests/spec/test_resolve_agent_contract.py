@@ -325,3 +325,31 @@ def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None
     handoff = json.loads(output.split("```json\n", 1)[1].split("```", 1)[0])
     assert handoff["ocr_review"]
     assert set(handoff["review_cycle"]) == {"head_sha", "fingerprint", "dispositions"}
+
+
+def test_resolve_declares_driver_footage_instead_of_calling_the_journey_undrivable() -> None:
+    instructions = _normalized_resolve_instructions()
+
+    author = instructions.split("### 2B.5", 1)[1].split("## Step 3", 1)[0]
+    assert "The driver that proves the fix is also the recorder" in author
+    assert (
+        "a missing prepared repro environment is not a capture blocker once that run exists"
+        in author
+    )
+    assert (
+        "must not call a journey undrivable or unfilmable when a recorded run of it exists"
+        in author
+    )
+
+    gate = instructions.split("### 4.5", 1)[1].split("## Output", 1)[0]
+    assert (
+        "A blocker is not genuine when this session's own driver run already produced footage"
+        in gate
+    )
+
+    fields = instructions.split("## Output —", 1)[1].split("Field meanings:", 1)[1]
+    assert "declare it even when you could not view its frames" in fields
+    assert (
+        "Never say a journey could not be driven or filmed when a recorded run of that journey "
+        "exists" in fields
+    )
