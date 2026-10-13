@@ -147,9 +147,16 @@ class RequestCancelFrame:
 
 @dataclass
 class PingFrame:
-    """Either direction: tunnel-level keepalive (request half)."""
+    """Either direction: tunnel-level keepalive (request half).
+
+    :param ts: Sender's epoch-ms timestamp, echoed by the pong.
+    :param request_host_stats: Server → host only: answer with a resource
+        snapshot (see :mod:`omnigent.host.stats`). Set only while the
+        ``host_stats`` release feature is on; peers that predate it ignore it.
+    """
 
     ts: int
+    request_host_stats: bool = False
 
 
 @dataclass
@@ -160,10 +167,13 @@ class PongFrame:
     :param keep_warm: Runner-to-server only. Whether the runner wants its managed
         sandbox kept warm (it is working, or within its idle timeout of the last
         work). ``None`` (omitted on the wire) means the runner does not report it.
+    :param host_stats: Resource snapshot a host daemon piggybacks on its reply
+        (see :mod:`omnigent.host.stats`); runners never set it.
     """
 
     ts: int
     keep_warm: bool | None = None
+    host_stats: _JsonObject | None = None
 
 
 @dataclass
@@ -334,11 +344,17 @@ def encode_frame(frame: Frame) -> str:
             }
         )
     if isinstance(frame, PingFrame):
-        return json.dumps({"kind": FrameKind.PING.value, "ts": frame.ts})
+        ping: dict[str, object] = {"kind": FrameKind.PING.value, "ts": frame.ts}
+        if frame.request_host_stats:
+            ping["request_host_stats"] = True
+        return json.dumps(ping)
     if isinstance(frame, PongFrame):
         pong: dict[str, object] = {"kind": FrameKind.PONG.value, "ts": frame.ts}
         if frame.keep_warm is not None:
             pong["keep_warm"] = frame.keep_warm
+        # Omitted when absent so runner pongs keep their original wire shape.
+        if frame.host_stats is not None:
+            pong["host_stats"] = frame.host_stats
         return json.dumps(pong)
     if isinstance(frame, WSOpenFrame):
         return json.dumps(
@@ -461,12 +477,18 @@ def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
         case FrameKind.REQUEST_CANCEL:
             return _decode_request_cancel(msg)
         case FrameKind.PING:
-            return PingFrame(ts=_required_int(msg, "ts"))
+            return PingFrame(
+                ts=_required_int(msg, "ts"),
+                request_host_stats=msg.get("request_host_stats") is True,
+            )
         case FrameKind.PONG:
             keep_warm = msg.get("keep_warm")
+            raw_stats = msg.get("host_stats")
+            host_stats = cast("_JsonObject", raw_stats) if isinstance(raw_stats, dict) else None
             return PongFrame(
                 ts=_required_int(msg, "ts"),
                 keep_warm=keep_warm if isinstance(keep_warm, bool) else None,
+                host_stats=host_stats,
             )
         case FrameKind.WS_OPEN:
             return _decode_ws_open(msg)
