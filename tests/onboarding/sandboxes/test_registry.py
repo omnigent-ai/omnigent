@@ -345,3 +345,14 @@ def test_instantiate_rejects_non_launcher_class(
 
     with pytest.raises(SandboxRegistryError, match="not a SandboxHostLauncher subclass"):
         instantiate("not-a-launcher")
+
+
+def test_boat_is_builtin_managed_only_provider() -> None:
+    """Boat is a built-in, managed-only provider with no optional SDK."""
+    from omnigent.server.managed_hosts import BOAT_MANAGED_TOKEN_TTL_S
+
+    assert "boat" in available_providers()
+    launcher = instantiate("boat")
+    assert launcher.provider == "boat"
+    assert launcher.supports_cli_bootstrap is False
+    assert get_provider_metadata("boat").managed_token_ttl_s == BOAT_MANAGED_TOKEN_TTL_S
