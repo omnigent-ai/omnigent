@@ -525,7 +525,7 @@ def register_upload_routes(
         if leader:
             try:
                 payload = await probe_capability(client, conv, environment_id)
-            except (OmnigentError, asyncio.CancelledError) as exc:
+            except BaseException as exc:
                 future.set_exception(
                     exc
                     if isinstance(exc, OmnigentError)
@@ -821,7 +821,7 @@ def register_upload_routes(
         touched(record)
         with index.lock:
             transitioned = index.finish(key, record)
-        if not abort and transitioned:
+        if transitioned:
             _publish_changed_files_invalidated(session_id, environment_id)
         return JSONResponse(result.model_dump(), headers={"Cache-Control": "no-store"})
 

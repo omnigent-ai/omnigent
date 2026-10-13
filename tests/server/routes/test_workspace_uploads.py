@@ -829,6 +829,84 @@ async def test_completion_retries_publish_once(scenario, monkeypatch, concurrent
     assert (await scenario.create()).status_code == 201
 
 
+@pytest.mark.parametrize("ordering", ["delete-first", "complete-first", "aborted"])
+async def test_commit_receipt_publishes_once_from_either_route(scenario, monkeypatch, ordering):
+    url = await scenario.url()
+    events = []
+    monkeypatch.setattr(
+        uploads, "_publish_changed_files_invalidated", lambda *args: events.append(args)
+    )
+    if ordering == "aborted":
+        assert (await scenario.client.delete(url)).status_code == 204
+        assert events == []
+    else:
+        scenario.failure = httpx.Response(
+            200,
+            json={
+                "path": scenario.name,
+                "size": scenario.size,
+                "sha256": "0" * 64,
+                "outcome": "created",
+                "final_name": scenario.name,
+            },
+        )
+        operations = [
+            lambda: scenario.client.delete(url),
+            lambda: scenario.client.post(url + "/complete"),
+        ]
+        if ordering == "complete-first":
+            operations.reverse()
+        results = []
+        for operation in operations:
+            results.append(await operation())
+            assert results[-1].status_code == 200
+            assert events == [(scenario.session_id, DEFAULT_ENVIRONMENT_ID)]
+        assert results[0].json() == results[1].json()
+        scenario.failure = None
+    assert (await scenario.create()).status_code == 201
+
+
+async def test_unexpected_capability_error_does_not_poison_connection(scenario):
+    probes = 0
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle(request):
+        nonlocal probes
+        probes += 1
+        if probes == 1:
+            entered.set()
+            await release.wait()
+            raise RuntimeError("unexpected transport failure")
+        return httpx.Response(502)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://runner"
+    ) as client:
+        scenario.routing._clients["binary-test"] = client
+        tasks = [asyncio.create_task(scenario.client.get(scenario.base))]
+        try:
+            await asyncio.wait_for(entered.wait(), 0.5)
+            tasks.append(asyncio.create_task(scenario.client.get(scenario.base)))
+            await asyncio.sleep(0.01)
+            release.set()
+            with pytest.raises(RuntimeError, match="unexpected transport failure"):
+                await tasks[0]
+            waiter = await asyncio.wait_for(tasks[1], 0.5)
+            assert waiter.status_code == 502
+            assert waiter.json()["error"]["code"] == "upload_relay_failed"
+            assert probes == 1
+            response = await asyncio.wait_for(scenario.client.get(scenario.base), 0.5)
+            assert response.status_code == 502
+            assert response.json()["error"]["code"] == "upload_relay_failed"
+            assert probes == 2
+        finally:
+            release.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
 @pytest.mark.parametrize(
     "failure", [httpx.ReadTimeout("lost acknowledgement"), httpx.Response(502)]
 )
