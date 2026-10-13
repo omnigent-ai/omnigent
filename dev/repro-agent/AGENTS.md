@@ -657,20 +657,19 @@ Follow these rules for each clip:
 - Show the user action and the product's response.
 - **Caption the screen from screen evidence.** A transcript or API check — a
   `GET /v1/sessions/{id}/items` read, a persisted-item flag, a runner log —
-  proves what the server stored, not what the frames show: Claude-native
-  streams the reply text to the Chat view before the final transcript item is
-  posted, so a reply the server rejects is still on screen next to the error
-  pill, and the Chat view shows a sent message as a pending bubble from the
-  moment Send is clicked, so a message the server never committed is still in
-  the chat next to the error pill. Compare every frame you extract with each
-  screen claim in the caption and in the Observed lines of `journey`; where
-  they disagree, describe the frame ("the streamed reply text appears, then
-  the turn ends in the 'transcript item … rejected' error pill"; "the sent
-  message stays in the chat as the 'Codex ran into an error during this turn.'
-  pill appears") and keep the backend check in `evidence` ("the reply was
-  never persisted, per GET /items"; "the message was never committed, per GET
-  /items"), not in the caption (see "Finishing a clip" in
-  `dev/recording-lanes.md`).
+  proves what the server stored, not what the frames show: a reply the server
+  rejected may already have streamed into the Chat view, and a sent message
+  the server never committed may still be showing as a pending bubble, each
+  beside the error pill. Compare every frame you extract with each screen
+  claim in the caption and in the Observed lines of `journey`; where they
+  disagree, describe the frame ("the streamed reply text appears, then the
+  turn ends in the 'transcript item … rejected' error pill"; "the sent message
+  stays in the chat as the 'Codex ran into an error during this turn.' pill
+  appears") rather than the backend result ("no reply bubble appears"; "the
+  sent message is dropped from the transcript"), and keep the backend check in
+  `evidence` ("the reply was never persisted, per GET /items"; "the message was
+  never committed, per GET /items"), not in the caption (see "Finishing a
+  clip" in `dev/recording-lanes.md`).
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.
@@ -834,15 +833,12 @@ Field meanings:
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
   behavior (the journey completing). Each screen claim comes from screen
-  evidence, not from a transcript or API check (Step 4): when the frames show
-  the streamed reply text, the caption says so and ends in the error pill, not
-  in "no reply bubble appears"; when they show the sent message still in the
-  chat, the caption says that, not "the message is dropped from the
-  transcript". This is per-recording (each clip drives its own steps),
-  distinct from the bug-level `journey` field. `capture_mode` is one
-  of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
-  authored-but-unrendered VHS tape in the artifact, but do not declare it as a
-  recording. Empty list when nothing valid was recorded.
+  evidence, not from a transcript or API check (Step 4). This is per-recording
+  (each clip drives its own steps), distinct from the bug-level `journey`
+  field. `capture_mode` is one of the surface-appropriate values in
+  `dev/recording-lanes.md`. Keep an authored-but-unrendered VHS tape in the
+  artifact, but do not declare it as a recording. Empty list when nothing valid
+  was recorded.
 - `recording_unavailable_reason` — leave empty when every expected clip is
   present. Otherwise explain each missing clip:
 

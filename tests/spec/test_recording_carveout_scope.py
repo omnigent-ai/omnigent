@@ -54,11 +54,10 @@ def test_finishing_a_clip_captions_the_screen_from_screen_evidence() -> None:
     assert "every claim it makes about the screen needs screen evidence" in lanes
     assert "Backend state is not screen evidence" in lanes
     assert "says what the server stored, not what the viewer sees" in lanes
-    assert "the two diverge in both directions" in lanes
-    assert "has already been painted on screen when the error pill appears" in lanes
-    assert "paints a sent message as a pending bubble the moment Send is clicked" in lanes
-    assert 'never "no reply bubble appears"' in lanes
-    assert 'or "the sent message is dropped from the transcript"' in lanes
+    assert (
+        'not the backend result ("no reply bubble appears"; '
+        '"the sent message is dropped from the transcript")' in lanes
+    )
     assert "Read every frame you extract against each screen claim in the caption" in lanes
     assert "Frames you extracted but never compared with the caption verify nothing" in lanes
 
@@ -71,26 +70,15 @@ def test_repro_agent_loads_the_screen_evidence_caption_rule_as_instructions() ->
     assert "Caption the screen from screen evidence" in instructions
     assert "proves what the server stored, not what the frames show" in instructions
     assert (
-        "Claude-native streams the reply text to the Chat view before the final "
-        "transcript item is posted" in instructions
-    )
-    assert (
-        "shows a sent message as a pending bubble from the moment Send is clicked" in instructions
-    )
-    assert (
-        "so a message the server never committed is still in the chat next to the "
-        "error pill" in instructions
-    )
-    assert (
         "Compare every frame you extract with each screen claim in the caption and in "
         "the Observed lines of `journey`" in instructions
+    )
+    assert (
+        'rather than the backend result ("no reply bubble appears"; '
+        '"the sent message is dropped from the transcript")' in instructions
     )
     assert "keep the backend check in `evidence`" in instructions
     assert (
         "Each screen claim comes from screen evidence, not from a transcript or API check"
         in instructions
-    )
-    assert (
-        "when they show the sent message still in the chat, the caption says that, not "
-        '"the message is dropped from the transcript"' in instructions
     )

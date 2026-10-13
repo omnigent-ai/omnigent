@@ -329,25 +329,26 @@ needs screen evidence: a driver assertion on a visible element, a saved
 screenshot, or a frame you extracted and looked at. Backend state is not screen
 evidence. A transcript read (`GET /v1/sessions/{id}/items`), a persisted-item
 flag, a runner log line, or an HTTP status says what the server stored, not what
-the viewer sees, and the two diverge in both directions. The Claude-native
+the viewer sees, and the two can diverge in both directions. The Claude-native
 forwarder streams each `MessageDisplay` chunk to the Chat view as a
 `response.output_text.delta` event while the final transcript item is still in
-flight, so a reply the server later rejects (`transcript item … rejected`) has
-already been painted on screen when the error pill appears. The Chat view also
-paints a sent message as a pending bubble the moment Send is clicked and keeps
-it there until the server reports the input consumed, so a message the server
-never committed — one a draining Codex app-server refused — still sits in the
-chat beside the "Codex ran into an error during this turn." pill. Caption the
-frames — "the streamed reply text fills the chat, then the turn ends in the
-'transcript item … rejected' error pill"; "the sent message stays in the chat as
-the 'Codex ran into an error during this turn.' pill appears" — never "no reply
-bubble appears" or "the sent message is dropped from the transcript", and keep
-the backend finding ("the reply was never persisted, per GET /items"; "the
-message was never committed, per GET /items") in `evidence`, not in the caption.
-Read every frame you extract against each screen claim in the caption, above all
-a claim that something is absent: a frame that shows it contradicts the caption,
-so rewrite the caption to the frame or re-record. Frames you extracted but never
-compared with the caption verify nothing.
+flight, so a reply the server later rejects (`transcript item … rejected`) may
+already be visible when the error pill appears. The Chat view paints a sent
+message as a pending bubble the moment Send is clicked and keeps it until the
+server reports the input consumed, so a message the server never committed —
+one a draining Codex app-server refused — may still be in the chat beside the
+"Codex ran into an error during this turn." pill. Only the frames settle which,
+so caption what they show — "the streamed reply text fills the chat, then the
+turn ends in the 'transcript item … rejected' error pill"; "the sent message
+stays in the chat as the 'Codex ran into an error during this turn.' pill
+appears" — not the backend result ("no reply bubble appears"; "the sent message
+is dropped from the transcript"), and keep that finding ("the reply was never
+persisted, per GET /items"; "the message was never committed, per GET /items")
+in `evidence`, not in the caption. Read every frame you extract against each
+screen claim in the caption, above all a claim that something is absent: a
+frame that shows it contradicts the caption, so rewrite the caption to the frame
+or re-record. Frames you extracted but never compared with the caption verify
+nothing.
 
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in
