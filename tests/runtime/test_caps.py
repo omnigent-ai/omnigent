@@ -119,6 +119,7 @@ def test_runtime_init_replaces_caps_and_resets_defaults(
     read_before_init: bool,
 ) -> None:
     """Explicit caps replace any lazy default; init(None) restores fresh defaults."""
+    expected = RuntimeCaps()
     configured = RuntimeCaps(execution_timeout=45, sandbox_enabled=False)
     factory = Mock(wraps=RuntimeCaps)
     monkeypatch.setattr(runtime, "RuntimeCaps", factory)
@@ -135,8 +136,8 @@ def test_runtime_init_replaces_caps_and_resets_defaults(
     reset = runtime.get_caps()
     assert reset is not configured
     assert reset is not initial
-    assert reset.execution_timeout == 7200
-    assert reset.sandbox_enabled is True
+    assert reset.execution_timeout == expected.execution_timeout
+    assert reset.sandbox_enabled is expected.sandbox_enabled
     assert runtime.get_caps() is reset
     assert factory.call_count == int(read_before_init) + 1
 

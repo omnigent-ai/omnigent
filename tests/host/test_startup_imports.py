@@ -152,4 +152,4 @@ def test_host_registers_without_database_imports(tmp_path: Path, entrypoint: str
         assert row["host_id"] == host.host_id
 
     # Best-effort capability probes must not swallow a prohibited import either.
-    assert "UNEXPECTED_DATABASE_IMPORT" not in host.log_path.read_text()
+    assert "UNEXPECTED_DATABASE_IMPORT" not in host.log_path.read_text(errors="replace")
