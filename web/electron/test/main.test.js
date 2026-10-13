@@ -3717,6 +3717,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         "http://localhost:5173",
         "b".repeat(32),
         hostId,
+        true,
       ),
       false,
     );
@@ -3729,10 +3730,55 @@ describe("browser-view teardown on server change (src/main.js)", () => {
           "http://localhost:5173",
           "b".repeat(32),
           hostId,
+          true,
         ) === null,
       "captured source identity",
     );
   });
+
+  for (const [name, sourceIsArcaHost] of [
+    ["a sandbox source", false],
+    ["an older renderer without the flag", undefined],
+  ]) {
+    it(`does not offer mismatch recovery for ${name}`, async (t) => {
+      const serverUrl = "https://account.databricks.com/omnigent?o=123";
+      const rememberedHostId = "a".repeat(32);
+      const sourceHostId = "b".repeat(32);
+      const h = loadNavigationHarness({
+        serverUrl,
+        internalFeatures: true,
+        arcaPath: "/usr/local/bin/arca",
+        arcaConsentResult: { ok: true },
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const deps = h.browserIpcDeps();
+      const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+      assert.equal(
+        await deps.recoverAgentNavigationForEvent(
+          event,
+          "http://localhost:5173",
+          sourceHostId,
+          rememberedHostId,
+          sourceIsArcaHost,
+        ),
+        false,
+      );
+      assert.deepEqual(h.calls.arcaConsentRuns, []);
+      assert.deepEqual(h.calls.arcaConnects, []);
+      assert.match(
+        deps.getAgentNavigationHintForEvent(
+          event,
+          "http://localhost:5173",
+          sourceHostId,
+          rememberedHostId,
+          sourceIsArcaHost,
+        ),
+        /can't be verified as Arca/,
+      );
+    });
+  }
 
   it("does not run recovery without a source-session host", async (t) => {
     const serverUrl = "https://account.databricks.com/omnigent?o=123";

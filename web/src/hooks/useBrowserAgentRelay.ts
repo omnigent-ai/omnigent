@@ -16,7 +16,8 @@ import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
 import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
-import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import type { Host } from "@/hooks/useHosts";
 import type { Session } from "@/lib/types";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
@@ -32,6 +33,7 @@ interface BrowserDesktopBridge {
       agent?: boolean;
       sourceHostId?: string;
       rememberedArcaHostId?: string;
+      sourceIsArcaHost?: boolean;
     },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserScreenshot?: (
@@ -243,6 +245,7 @@ async function dispatch(
   desktop: BrowserDesktopBridge,
   sourceHostId: string | null,
   rememberedArcaHostId: string | null,
+  sourceIsArcaHost: boolean,
 ): Promise<ActionResult> {
   try {
     switch (action) {
@@ -259,6 +262,7 @@ async function dispatch(
           agent: true,
           ...(sourceHostId ? { sourceHostId } : {}),
           ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
+          ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
         if (
@@ -429,6 +433,16 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
           // Unknown provenance stays denied for localhost; public browsing still works.
         }
       }
+      const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
+      const sourceIsArcaHost =
+        evt.action === "navigate" && sourceHostId !== null
+          ? queryClient
+              .getQueriesData<Host[]>({ queryKey: ["hosts"] })
+              .flatMap(([, rows]) => rows ?? [])
+              .some(
+                (host) => host.host_id === sourceHostId && isArcaHost(host, rememberedArcaHostId),
+              )
+          : false;
       const result = cancelled
         ? { ok: false, error: "browser relay context changed" }
         : await dispatch(
@@ -437,7 +451,8 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
             evt.args,
             desktop,
             sourceHostId,
-            evt.action === "navigate" ? readArcaHostId() : null,
+            rememberedArcaHostId,
+            sourceIsArcaHost,
           );
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };

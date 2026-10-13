@@ -315,6 +315,7 @@ function registerBrowserIpc({
           url,
           opts?.sourceHostId,
           opts?.rememberedArcaHostId,
+          opts?.sourceIsArcaHost,
         );
       } catch {
         recovered = false;
@@ -338,7 +339,13 @@ function registerBrowserIpc({
     // Strip the non-serializable `entry` before it crosses the IPC boundary.
     const hint =
       !r.ok && opts?.agent
-        ? getAgentNavigationHintForEvent(event, url, opts?.sourceHostId, opts?.rememberedArcaHostId)
+        ? getAgentNavigationHintForEvent(
+            event,
+            url,
+            opts?.sourceHostId,
+            opts?.rememberedArcaHostId,
+            opts?.sourceIsArcaHost,
+          )
         : null;
     return {
       ok: r.ok,

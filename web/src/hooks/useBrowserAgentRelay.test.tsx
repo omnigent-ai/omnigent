@@ -74,10 +74,10 @@ function installBridge(overrides: Record<string, unknown> = {}) {
  *  single claim fetch to have fired. */
 async function runAction(
   evt: BrowserActionRequestEvent,
-  opts: { expectResult?: boolean; source?: string } = {},
+  opts: { client?: QueryClient; expectResult?: boolean; source?: string } = {},
 ): Promise<void> {
-  const { expectResult = true, source = CONV } = opts;
-  renderRelay();
+  const { client = new QueryClient(), expectResult = true, source = CONV } = opts;
+  renderRelay(CONV, client);
   emitBrowserActionRequest(evt, source);
   if (expectResult) {
     await vi.waitFor(() => {
@@ -321,7 +321,19 @@ describe("useBrowserAgentRelay — action dispatch", () => {
   });
 
   it("corrects a mismatched remembered Arca host after an authorized preview retry", async () => {
-    installBridge();
+    const bridge = installBridge();
+    const client = new QueryClient();
+    client.setQueryData(
+      ["hosts", { includeSandbox: false }],
+      [
+        {
+          host_id: "actual-arca-host-b",
+          name: "Jackson's arca",
+          owner: "jackson",
+          status: "online",
+        },
+      ],
+    );
     writeArcaHostId("remembered-host-a");
     setSessionHost("conv_background_A", "actual-arca-host-b");
     getSessionSlim.mockResolvedValue({
@@ -331,9 +343,22 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     });
 
     await runAction(actionEvent("navigate", { url: "http://localhost:5173" }), {
+      client,
       source: "conv_background_A",
     });
 
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+      "conv_background_A",
+      "http://localhost:5173",
+      undefined,
+      {
+        force: true,
+        agent: true,
+        sourceHostId: "actual-arca-host-b",
+        rememberedArcaHostId: "remembered-host-a",
+        sourceIsArcaHost: true,
+      },
+    );
     expect(readArcaHostId()).toBe("actual-arca-host-b");
   });
 

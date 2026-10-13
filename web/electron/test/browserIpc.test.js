@@ -86,11 +86,18 @@ describe("browser IPC Arca context", () => {
           created: false,
         }),
       }),
-      recoverAgentNavigationForEvent: async (_event, url, sourceHostId, rememberedArcaHostId) => {
+      recoverAgentNavigationForEvent: async (
+        _event,
+        url,
+        sourceHostId,
+        rememberedArcaHostId,
+        sourceIsArcaHost,
+      ) => {
         recoveries++;
         assert.equal(url, "http://localhost:5173");
         assert.equal(sourceHostId, "arca-host");
         assert.equal(rememberedArcaHostId, "arca-host");
+        assert.equal(sourceIsArcaHost, true);
         allowed = true;
         return true;
       },
@@ -109,6 +116,7 @@ describe("browser IPC Arca context", () => {
           agent: true,
           sourceHostId: "arca-host",
           rememberedArcaHostId: "arca-host",
+          sourceIsArcaHost: true,
         },
       },
     );

@@ -219,6 +219,7 @@ interface ElectronDesktopApi extends NativeShellApi {
       agent?: boolean;
       sourceHostId?: string;
       rememberedArcaHostId?: string;
+      sourceIsArcaHost?: boolean;
     },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   /**

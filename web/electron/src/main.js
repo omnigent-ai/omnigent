@@ -3708,13 +3708,20 @@ function arcaPreviewRecoveryTargetForEvent(event, url) {
   return { win, target };
 }
 
-/** Recovery requires renderer-reported host IDs; a mismatch may only ask for consent. */
-function arcaPreviewRecoveryContextForEvent(event, url, sourceHostId, rememberedArcaHostId) {
+/** A mismatched remembered host additionally requires renderer identification as Arca. */
+function arcaPreviewRecoveryContextForEvent(
+  event,
+  url,
+  sourceHostId,
+  rememberedArcaHostId,
+  sourceIsArcaHost,
+) {
   const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
   if (
     !targetContext ||
     typeof sourceHostId !== "string" ||
-    typeof rememberedArcaHostId !== "string"
+    typeof rememberedArcaHostId !== "string" ||
+    (sourceHostId !== rememberedArcaHostId && sourceIsArcaHost !== true)
   ) {
     return null;
   }
@@ -4804,12 +4811,19 @@ function registerIpc() {
       serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
       sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
     }),
-    recoverAgentNavigationForEvent: async (event, url, sourceHostId, rememberedArcaHostId) => {
+    recoverAgentNavigationForEvent: async (
+      event,
+      url,
+      sourceHostId,
+      rememberedArcaHostId,
+      sourceIsArcaHost,
+    ) => {
       const context = arcaPreviewRecoveryContextForEvent(
         event,
         url,
         sourceHostId,
         rememberedArcaHostId,
+        sourceIsArcaHost,
       );
       if (!context) return false;
       const { target } = context;
@@ -4835,7 +4849,13 @@ function registerIpc() {
         return false;
       }
     },
-    getAgentNavigationHintForEvent: (event, url, sourceHostId, rememberedArcaHostId) => {
+    getAgentNavigationHintForEvent: (
+      event,
+      url,
+      sourceHostId,
+      rememberedArcaHostId,
+      sourceIsArcaHost,
+    ) => {
       const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
       if (!targetContext) return null;
       if (typeof rememberedArcaHostId !== "string") {
@@ -4846,6 +4866,7 @@ function registerIpc() {
         url,
         sourceHostId,
         rememberedArcaHostId,
+        sourceIsArcaHost,
       );
       if (!context) {
         return "This session's host can't be verified as Arca, so its localhost preview remains unavailable.";
