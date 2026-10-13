@@ -17,6 +17,12 @@ the header menu), and each place is a separate entry point.
   row pins it into that slot.
 - `rename`: from the row, the header menu, or the header title; long titles are
   limited.
+- `read-state`: Mark as unread flags a session to revisit and survives a reload,
+  including for the session being viewed. Its dot appears once the turn is
+  idle; approval and error indicators can take precedence. A row showing the
+  unread dot offers Mark as read instead. Bulk selection also offers these actions.
+- `export`: Export in the header menu downloads the conversation as a file that
+  keeps turn order, code, and links.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
@@ -84,18 +90,19 @@ the header menu), and each place is a separate entry point.
 ## How to get to it (user POV)
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
-offer pin, fork, rename, archive or unarchive, and delete.
+offer pin, fork, rename, mark as unread or read, archive or unarchive, and
+delete.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
 that slot.
 
 **Bulk selection:** select several rows in the sidebar, then use the selection
-actions (archive, unarchive, delete).
+actions (mark as read or unread, archive, unarchive, delete).
 
 **Session header menu:** open a session and use the menu next to its title for
-pin, fork, rename, archive or unarchive, and delete. Clicking the title also
-renames. Sub-agent sessions hide owner-only actions.
+pin, fork, rename, mark as unread, export, archive or unarchive, and delete.
+Clicking the title also renames. Sub-agent sessions hide owner-only actions.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
@@ -242,6 +249,22 @@ plain `uv run pytest`, which starts a private server for the test.
   The iOS drawer rename under the soft keyboard:
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_keeps_sidebar_sessions_reachable`,
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_scrolls_edit_row_into_view_above_keyboard`
+- **`read-state`, sidebar row menu:**
+  `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_mark_unread_lights_the_dot_and_persists_across_reload`,
+  `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_unread_dot_survives_reload_from_localStorage_when_server_seed_is_empty`.
+  The header menu's item is listed by the header-menu rename test above. The
+  row dropdown's Mark as read action has web unit coverage. Right-click
+  read-state actions need a manual check: mark an idle row unread, expect its
+  dot, then choose Mark as read and expect it cleared.
+- **`read-state`, bulk selection:** web unit coverage only. Manually select
+  idle sessions with at least one unread row, choose Mark as read, and expect
+  their dots to clear and selection mode to close. Select only read sessions,
+  choose Mark as unread, and expect their dots to appear and selection to close.
+- **`export`, header menu (own environment):**
+  `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_session_menu_offers_export`,
+  `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_export_downloads_transcript`
+  seed the transcript in the spawned server's database, so they fail under
+  `verify-env run`; run them with plain `uv run pytest`.
 - **`archive`:**
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,

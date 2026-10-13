@@ -29,6 +29,11 @@ and steers messages while the agent is busy.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
+- `dictation`: the microphone button beside the message box dictates speech
+  into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
+  terminal or code editor. While listening, Enter keeps the dictated text and
+  Escape discards it. The button
+  is absent when neither the browser nor the server can transcribe.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers.
 - `new-session-hotkey`: ⌘/Ctrl+Alt+N opens and focuses the new-session composer.
@@ -61,6 +66,8 @@ and steers messages while the agent is busy.
   return to Chat.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
+- Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
+  message box; press Enter to keep the text or Escape to discard it.
 - Send while the agent is working to queue a message, then steer it.
 
 **Desktop browser pointer** (open a session in the desktop app):
@@ -89,6 +96,7 @@ and steers messages while the agent is busy.
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
 - Attach files or type `/` before the first send.
+- Dictate with the microphone button or ⌘/Ctrl+Alt+V before the first send.
 - Open the agent picker's custom agents, then Create custom agent → Import
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
   selects the agent, which stays listed after a reload. A rejected bundle (for
@@ -150,6 +158,14 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/browser_ui/chat/test_composer_attachments.py::test_attach_supported_files_and_remove`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_landing_rejects_unsupported_type_and_keeps_message`
+- **`dictation`, in-session composer (own environment):**
+  `tests/e2e_ui/chat/test_dictation.py` streams a fake microphone through the
+  server's fake transcription engine, which only the test's own server enables;
+  run it with plain `uv run pytest`. It covers the button, the hotkey, Enter
+  keeping the text, Escape discarding it, and insertion at the caret.
+- **`dictation`, new-session composer:** no browser-level coverage. Manually:
+  on the landing page, click the microphone (or press ⌘/Ctrl+Alt+V), speak,
+  and expect the text in the message box; Escape restores the previous draft.
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
@@ -204,3 +220,7 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   terminal command actually landed before blaming the mirror.
 - The mock environment configures Claude and Codex only. Other harnesses'
   catalogs need real CLIs or credentials.
+- Dictation uses the browser's own speech recognition when it has one and
+  otherwise the server's transcription engine. The verification instance's
+  server advertises no engine, so its microphone depends on the browser alone;
+  a missing microphone button there is not proof for a configured server.
