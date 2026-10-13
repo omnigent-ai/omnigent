@@ -502,14 +502,31 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     return host == "anthropic.com" or host.endswith(".anthropic.com")
 
 
-def _ambient_claude_base_url() -> str:
-    """The ``ANTHROPIC_BASE_URL`` Claude Code applies when no config is resolved.
+_AMBIENT_CREDENTIAL_ENV = (
+    _ANTHROPIC_AUTH_TOKEN_ENV,
+    _ANTHROPIC_API_KEY_ENV,
+    _CLAUDE_CODE_CUSTOM_HEADERS_ENV,
+)
 
-    Managed settings win at Claude Code's actual launch, so a managed
-    ``env.ANTHROPIC_BASE_URL`` takes precedence over the process env.
+
+def _ambient_claude_env() -> dict[str, str]:
+    """The endpoint and credential values Claude Code applies with no resolved config.
+
+    Managed settings win at Claude Code's actual launch, so a managed ``env``
+    value takes precedence over the process env for each variable.
     """
-    managed_base_url, _ = managed_claude_gateway_signal()
-    return managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    from omnigent.onboarding.ambient import claude_managed_env
+
+    managed = claude_managed_env(_managed_settings_paths())
+    return {
+        name: managed.get(name) or os.environ.get(name, "")
+        for name in (_UCODE_CLAUDE_BASE_URL_ENV, *_AMBIENT_CREDENTIAL_ENV)
+    }
+
+
+def _ambient_claude_base_url() -> str:
+    """The ``ANTHROPIC_BASE_URL`` Claude Code applies when no config is resolved."""
+    return _ambient_claude_env()[_UCODE_CLAUDE_BASE_URL_ENV]
 
 
 def _ambient_env_is_non_anthropic_gateway(configured_base_url: str | None = None) -> bool:
@@ -592,26 +609,19 @@ def _gateway_claude_listing(
     return (serves, concrete)
 
 
-def _ambient_custom_headers() -> dict[str, str]:
-    """Claude Code's ``ANTHROPIC_CUSTOM_HEADERS`` (``Name: value`` per line) as a dict."""
+def _ambient_custom_headers(raw: str) -> dict[str, str]:
+    """An ``ANTHROPIC_CUSTOM_HEADERS`` value (``Name: value`` per line) as a dict."""
     headers: dict[str, str] = {}
-    for line in os.environ.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV, "").splitlines():
+    for line in raw.splitlines():
         name, separator, value = line.partition(":")
         if separator and name.strip():
             headers[name.strip()] = value.strip()
     return headers
 
 
-def _ambient_credential_digest() -> str | None:
+def _ambient_credential_digest(env: Mapping[str, str]) -> str | None:
     """A non-reversible digest of the ambient listing credential; ``None`` without one."""
-    values = [
-        os.environ.get(name, "")
-        for name in (
-            _ANTHROPIC_AUTH_TOKEN_ENV,
-            _ANTHROPIC_API_KEY_ENV,
-            _CLAUDE_CODE_CUSTOM_HEADERS_ENV,
-        )
-    ]
+    values = [env.get(name, "") for name in _AMBIENT_CREDENTIAL_ENV]
     if not any(values):
         return None
     return hashlib.sha256("\x00".join(values).encode("utf-8")).hexdigest()
@@ -635,16 +645,17 @@ def _ambient_gateway_serves_canonical_ids(
         undetermined: nothing to authenticate with, unreachable, rejected,
         unparseable, or empty.
     """
-    base_url = _ambient_claude_base_url()
+    env = _ambient_claude_env()
+    base_url = env[_UCODE_CLAUDE_BASE_URL_ENV]
     if not base_url:
         return None
     try:
         # Case-insensitive, and an explicit custom header wins over the derived
         # one, as in Claude Code's own client. Built inside the handler: a
         # non-ASCII header value fails here, before any request.
-        headers = httpx.Headers(_ambient_custom_headers())
-        auth_token = os.environ.get(_ANTHROPIC_AUTH_TOKEN_ENV)
-        api_key = os.environ.get(_ANTHROPIC_API_KEY_ENV)
+        headers = httpx.Headers(_ambient_custom_headers(env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV]))
+        auth_token = env[_ANTHROPIC_AUTH_TOKEN_ENV]
+        api_key = env[_ANTHROPIC_API_KEY_ENV]
         if auth_token and "authorization" not in headers:
             headers["Authorization"] = f"Bearer {auth_token}"
         if api_key and "x-api-key" not in headers:
@@ -1637,10 +1648,13 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     # cloud transport is never read again once that setting is removed.
     uses_cli_settings = claude_config is None or claude_config.subscription_auth
     ambient_transport = claude_ambient_transport() if uses_cli_settings else None
-    ambient_gateway = (_ambient_claude_base_url() or None) if claude_config is None else None
+    ambient_env = _ambient_claude_env() if claude_config is None else None
+    ambient_gateway = (ambient_env[_UCODE_CLAUDE_BASE_URL_ENV] or None) if ambient_env else None
     # The ambient credential decides what the gateway's listing reveals, so a
     # changed key or header re-probes; only its digest enters the key.
-    ambient_credentials = _ambient_credential_digest() if ambient_gateway else None
+    ambient_credentials = (
+        _ambient_credential_digest(ambient_env) if ambient_env and ambient_gateway else None
+    )
     return fingerprint_of(
         "claude-native",
         "control-picker-v4",
