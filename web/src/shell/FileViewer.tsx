@@ -726,7 +726,8 @@ function FileViewerBody({
     linkedFileRef.current?.path === path;
   const diffQuery = useFileDiff(conversationId, path, { requested: linkedDiff });
   const prepareDiff =
-    requestedDiff && (isDiffAvailable || (linkedDiff && changedFiles.data === undefined));
+    requestedDiff &&
+    (isDiffAvailable || (linkedDiff && changedFiles.data === undefined && !changedFiles.isError));
   useEffect(() => {
     if (!prepareDiff) return;
     void loadMonacoDiffViewer()

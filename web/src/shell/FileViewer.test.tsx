@@ -729,6 +729,19 @@ describe("FileViewer URL sync — diff param", () => {
     );
   });
 
+  it("does not prepare a linked diff when changed-file discovery has already failed", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+      () => ({ data: undefined, isError: true }) as ReturnType<typeof useWorkspaceChangedFiles>,
+      async () => {
+        renderViewer({ open: true, initialSearch: "diff=1" });
+        await act(async () => {});
+        expect(prepareDiffEditor).not.toHaveBeenCalled();
+        expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      },
+    );
+  });
+
   it.each(["image.png", "document.pdf", "model.stl"])(
     "does not prepare a diff for %s even with an explicit link",
     async (path) => {
