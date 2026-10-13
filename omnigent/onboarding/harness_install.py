@@ -800,6 +800,12 @@ _LOGIN_PROBE_CACHE_TTL_S = 120.0
 _PROBE_CACHE_MAX_ENTRIES = 64
 
 
+def invalidate_harness_login_probe_cache() -> None:
+    """Force the next harness login check to call the vendor CLI."""
+    with _PROBE_CACHE_LOCK:
+        _LOGIN_PROBE_CACHE.clear()
+
+
 def _binary_signature(binary: str) -> tuple[str, int, int] | None:
     """Return *binary*'s identity signature for the version cache.
 

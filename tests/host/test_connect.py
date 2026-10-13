@@ -64,6 +64,8 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostRefreshHarnessesFrame,
+    HostRefreshHarnessesResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -4716,6 +4718,40 @@ def test_handle_create_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
 # ── host.install_harness handler ────────────────────────
 
 
+def test_handle_refresh_harnesses_bypasses_cache_and_returns_fresh_maps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forced refresh invalidates login cache before the full re-probe."""
+    import omnigent.host.connect as connect
+
+    calls: list[str] = []
+
+    def _invalidate() -> None:
+        calls.append("invalidate")
+
+    def _configured() -> dict[str, bool]:
+        calls.append("configured")
+        return {"codex-native": True}
+
+    def _gateway() -> dict[str, bool]:
+        calls.append("gateway")
+        return {"codex-native": False}
+
+    monkeypatch.setattr(connect, "invalidate_harness_login_probe_cache", _invalidate)
+    monkeypatch.setattr(connect, "configured_harness_map", _configured)
+    monkeypatch.setattr(connect, "gateway_inference_map", _gateway)
+
+    result = _make_host_process()._handle_refresh_harnesses(
+        HostRefreshHarnessesFrame(request_id="refresh-1")
+    )
+
+    assert isinstance(result, HostRefreshHarnessesResultFrame)
+    assert result.status == "ok"
+    assert result.configured_harnesses == {"codex-native": True}
+    assert result.gateway_inference == {"codex-native": False}
+    assert calls == ["invalidate", "configured", "gateway"]
+
+
 def test_handle_install_harness_success_returns_refreshed_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4730,6 +4766,7 @@ def test_handle_install_harness_success_returns_refreshed_readiness(
     # Not yet installed, so the handler runs the installer.
     monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
     monkeypatch.setattr(connect, "try_install_harness_cli", lambda key: (True, None))
+    monkeypatch.setattr(connect, "harness_cli_version", lambda key: ("2.1.295", ">=2.1.161"))
     monkeypatch.setattr(
         connect,
         "configured_harness_map",
@@ -4745,6 +4782,7 @@ def test_handle_install_harness_success_returns_refreshed_readiness(
     assert result.status == "ok"
     assert result.error is None
     assert result.configured_harnesses == {"claude-native": True, "codex-native": "needs-auth"}
+    assert result.version == "2.1.295"
 
 
 def test_handle_install_harness_already_installed_skips_installer(
@@ -4761,6 +4799,9 @@ def test_handle_install_harness_already_installed_skips_installer(
     import omnigent.host.connect as connect
 
     monkeypatch.setattr(connect, "harness_cli_installed", lambda key: True)
+    monkeypatch.setattr(
+        connect, "harness_cli_version", lambda key: ("1.18.4", ">=1.17.7, <1.19.0")
+    )
 
     def _must_not_install(key: str) -> tuple[bool, str | None]:
         raise AssertionError("installer ran despite the harness already being installed")
@@ -4774,6 +4815,37 @@ def test_handle_install_harness_already_installed_skips_installer(
     )
 
     assert result.status == "ok"
+    assert result.configured_harnesses == {"opencode-native": True}
+    assert result.version == "1.18.4"
+
+
+def test_handle_install_harness_upgrades_outdated_cli_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present but unsupported CLI runs the installer and reports its new version."""
+    import omnigent.host.connect as connect
+
+    installed: list[str] = []
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
+
+    def _upgrade(key: str) -> tuple[bool, str | None]:
+        installed.append(key)
+        return True, None
+
+    monkeypatch.setattr(connect, "try_install_harness_cli", _upgrade)
+    monkeypatch.setattr(
+        connect, "harness_cli_version", lambda key: ("1.18.4", ">=1.17.7, <1.19.0")
+    )
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"opencode-native": True})
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="upgrade-1", harness="opencode")
+    )
+
+    assert installed == ["opencode"]
+    assert result.status == "ok"
+    assert result.version == "1.18.4"
     assert result.configured_harnesses == {"opencode-native": True}
 
 
