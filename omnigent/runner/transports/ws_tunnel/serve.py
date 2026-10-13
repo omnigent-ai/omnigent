@@ -1523,6 +1523,7 @@ class _UploadHelloCapability:
     lifecycle: asyncio.Task[None]
     session_id: str
     supported: bool = False
+    failed: bool = False
     probe: asyncio.Task[None] | None = None
 
 
@@ -1543,7 +1544,17 @@ def _start_workspace_upload_hello_probe(app: _ASGIApp) -> None:
             previous.manager is manager
             and previous.lifecycle is lifecycle
             and previous.session_id == session_id
+            and isinstance(manager, UploadManager)
+            and lifecycle is not None
+            and not lifecycle.done()
+            and not manager.stopping
         ):
+            if previous.failed and previous.probe is not None and previous.probe.done():
+                previous.failed = False
+                previous.probe = asyncio.create_task(
+                    _probe_workspace_upload_hello(manager, previous),
+                    name="workspace-upload-hello-probe",
+                )
             return
         previous.supported = False
         if previous.probe is not None:
@@ -1593,6 +1604,7 @@ async def _probe_workspace_upload_hello(manager: object, state: _UploadHelloCapa
             supported = result.get("raw_upload") is True
     except Exception:  # noqa: BLE001 — optional upload probing must never abort hello
         supported = False
+        state.failed = True
         _logger.warning("Workspace upload hello probe unavailable", exc_info=True)
     finally:
         if client is not None:
@@ -1602,6 +1614,7 @@ async def _probe_workspace_upload_hello(manager: object, state: _UploadHelloCapa
                     await asyncio.to_thread(client.close)
             except Exception:  # noqa: BLE001 — optional probe cleanup must never abort hello
                 supported = False
+                state.failed = True
                 _logger.warning("Workspace upload hello probe cleanup unavailable", exc_info=True)
     state.supported = (
         supported and not state.lifecycle.done() and not getattr(manager, "stopping", True)
@@ -1653,11 +1666,17 @@ async def _send_hello(
     )
     from omnigent.runner.workspace_upload import WORKSPACE_UPLOAD_CAPABILITY
 
+    if app is not None:
+        _start_workspace_upload_hello_probe(app)
     state = (
         getattr(app.state, "workspace_upload_hello_capability", None)
         if isinstance(app, FastAPI)
         else None
     )
+    if isinstance(state, _UploadHelloCapability) and state.probe is not None:
+        if not state.probe.done():
+            # Wait for readiness without cancelling or joining stalled helper cleanup.
+            await asyncio.wait({state.probe}, timeout=_UPLOAD_HELLO_PROBE_TIMEOUT_S)
     upload_supported = (
         isinstance(app, FastAPI)
         and isinstance(state, _UploadHelloCapability)
