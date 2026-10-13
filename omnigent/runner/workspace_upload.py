@@ -25,8 +25,11 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -52,13 +55,12 @@ from omnigent.runtime.filesystem_registry import FilesystemRegistry
 WORKSPACE_UPLOAD_CAPABILITY = "workspace_upload_v1"
 logger = logging.getLogger(__name__)
 HELPER_CACHE_MAX = 32
-# Leave headroom in the runner's eight-thread default executor.
-HELPER_IPC_MAX = 4
 HELPER_IDLE_S = 300
 STARTUP_SWEEP_BUDGET_S = 0.5
 GONE_MAX = 4096
 PUBLICATION_ATTEMPTS = 3
 T = TypeVar("T")
+_sweep_active = ContextVar("upload_sweep_active", default=False)
 
 
 @dataclass(frozen=True)
@@ -251,7 +253,9 @@ class UploadManager:
         self.lock = asyncio.Lock()
         self.index_dirty = False
         self.helper_lock = asyncio.Lock()
-        self.ipc_slots = asyncio.Semaphore(HELPER_IPC_MAX)
+        self.ipc_executor = ThreadPoolExecutor(
+            max_workers=HELPER_CACHE_MAX, thread_name_prefix="workspace-upload-ipc"
+        )
         self.upload_locks: dict[str, asyncio.Lock] = {}
         self.inflight: set[asyncio.Task[object]] = set()
         self.stopping = False
@@ -295,6 +299,8 @@ class UploadManager:
         try:
             env = await self.resolve_environment(session_id, environment_id)
         except Exception as exc:
+            if not _sweep_active.get():
+                raise
             raise EnvironmentResolutionError(
                 503, "environment_unavailable", "Upload environment cannot be resolved"
             ) from exc
@@ -401,25 +407,19 @@ class UploadManager:
                 continue
         binding.active_op = metadata.get("op")
         try:
+            task = asyncio.get_running_loop().run_in_executor(
+                self.ipc_executor,
+                copy_context().run,
+                partial(binding.client.call, metadata, raw, deadline=deadline),
+            )
             try:
-                async with asyncio.timeout(max(0, deadline - time.monotonic())):
-                    await self.ipc_slots.acquire()
-            except TimeoutError:
-                return {"code": "busy", "error": "Upload helper queue timed out"}
-            try:
-                task = asyncio.create_task(
-                    asyncio.to_thread(binding.client.call, metadata, raw, deadline=deadline)
-                )
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
                 try:
-                    return await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    try:
-                        await self._settle(task)
-                    except Exception:
-                        logger.exception("Upload helper operation failed during cancellation")
-                    raise
-            finally:
-                self.ipc_slots.release()
+                    await self._settle(task)
+                except Exception:
+                    logger.exception("Upload helper operation failed during cancellation")
+                raise
         finally:
             binding.active_op = None
             binding.gate.release()
@@ -586,6 +586,7 @@ class UploadManager:
                 record = self.records.get(uid)
                 if record is None:
                     continue
+                token = _sweep_active.set(True)
                 try:
                     if not await self._reconcile(uid, record, now=instant):
                         continue
@@ -594,7 +595,11 @@ class UploadManager:
                     await self._remove(uid, record)
                 except EnvironmentResolutionError:
                     if instant - record.created_at >= self.limits.max_age_s:
-                        logger.warning("Retiring expired upload %s: environment unavailable", uid)
+                        logger.warning(
+                            "Retiring expired upload %s: environment unavailable",
+                            uid,
+                            exc_info=True,
+                        )
                         async with self.lock:
                             self._drop(uid, record)
                             await self._save_settled()
@@ -608,6 +613,8 @@ class UploadManager:
                         async with self.lock:
                             self._drop(uid, record)
                             await self._save_settled()
+                finally:
+                    _sweep_active.reset(token)
         async with self.helper_lock:
             await self._evict_helpers()
 
@@ -656,13 +663,14 @@ class UploadManager:
                 *(asyncio.shield(task) for task in list(self.inflight)), return_exceptions=True
             )
         finally:
+            self.ipc_executor.shutdown(wait=False, cancel_futures=True)
             await asyncio.gather(
                 *(asyncio.to_thread(binding.client.close) for binding in self.helpers.values()),
                 return_exceptions=True,
             )
             self.helpers.clear()
 
-    async def _settle(self, task: asyncio.Task[T]) -> T:
+    async def _settle(self, task: asyncio.Future[T]) -> T:
         while True:
             try:
                 return await asyncio.shield(task)
