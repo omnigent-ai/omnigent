@@ -355,8 +355,7 @@ const SCROLLBAR_HIDE_DELAY_MS = 700;
 // a query observer per row (which would also re-run on every project mutation).
 const ProjectNamesContext = createContext<Map<string, string>>(new Map());
 // Maps a first-class project id → its chosen emoji icon (only projects that
-// have one), sharing the same list-level lookup as the names map so a row can
-// surface the real project glyph in the pinned flyout without its own query.
+// have one), sharing the names map lookup for the pinned flyout and session tooltip.
 const ProjectIconsContext = createContext<Map<string, string>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // The filter menu's "Show" toggles: which optional metadata each row renders.
@@ -4733,7 +4732,7 @@ function SessionTooltipDetail({
   children,
 }: {
   label: string;
-  icon: LucideIcon;
+  icon?: LucideIcon;
   iconContent?: ReactNode;
   testId: string;
   children: ReactNode;
@@ -4742,7 +4741,8 @@ function SessionTooltipDetail({
     <div data-testid={testId} className="flex items-center justify-between gap-3 text-sm">
       <span className="shrink-0 text-muted-foreground">{label}</span>
       <span className="flex min-w-0 items-center gap-1.5">
-        {iconContent ?? <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />}
+        {iconContent ??
+          (Icon && <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />)}
         <span className="truncate">{children}</span>
       </span>
     </div>
@@ -4817,7 +4817,6 @@ function SessionTooltipDetails({
       {projectName !== null && (
         <SessionTooltipDetail
           label="Project"
-          icon={FolderIcon}
           iconContent={<ProjectRowIcon icon={projectIcon} />}
           testId="session-tooltip-project"
         >
@@ -5139,7 +5138,7 @@ function ConversationRowImpl({
   // First-class projects can carry a chosen emoji; label-only projects have
   // none, so the project icon falls back to the folder glyph.
   const projectIconsById = useContext(ProjectIconsContext);
-  const projectFlyoutIcon =
+  const projectIcon =
     conversation.project_id != null
       ? (projectIconsById.get(conversation.project_id) ?? null)
       : null;
@@ -5595,7 +5594,7 @@ function ConversationRowImpl({
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
-              projectIcon={projectFlyoutIcon}
+              projectIcon={projectIcon}
               gitBranch={gitBranch}
               hasError={sessionState?.kind === "error"}
             />
@@ -5610,7 +5609,7 @@ function ConversationRowImpl({
               hostsById={hostsById}
               hasError={sessionState?.kind === "error"}
               projectName={projectTooltipName}
-              projectIcon={projectFlyoutIcon}
+              projectIcon={projectIcon}
             />
           </Tooltip>
         )
@@ -5631,7 +5630,7 @@ function ConversationRowImpl({
           <PinnedProjectFlyoutContent
             title={conversation.title ?? conversation.id}
             projectName={projectFlyoutName}
-            projectIcon={projectFlyoutIcon}
+            projectIcon={projectIcon}
             gitBranch={gitBranch}
             hasError={sessionState?.kind === "error"}
           />
@@ -5668,7 +5667,7 @@ function ConversationRowImpl({
             hostsById={hostsById}
             hasError={sessionState?.kind === "error"}
             projectName={projectTooltipName}
-            projectIcon={projectFlyoutIcon}
+            projectIcon={projectIcon}
           />
         </Tooltip>
       )}
