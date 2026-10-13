@@ -2511,6 +2511,79 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "refusal", "error", "next_step"),
+    [
+        pytest.param(
+            {"type": "model_change", "model": "claude-opus-4-7"},
+            claude_native_bridge.ClaudeUserPromptPending(
+                "Answer the pending Claude question or permission request "
+                "before sending a message."
+            ),
+            "claude_native_prompt_pending",
+            "Answer it in the terminal",
+            id="model-behind-question",
+        ),
+        pytest.param(
+            {"type": "effort_change", "effort": "high"},
+            claude_native_bridge.ClaudeUserPromptPending(
+                "Claude is waiting for an explicit answer; settings command not sent."
+            ),
+            "claude_native_prompt_pending",
+            "Answer it in the terminal",
+            id="effort-behind-question",
+        ),
+        pytest.param(
+            {"type": "compact"},
+            claude_native_bridge.ClaudeTerminalDialog(
+                "Claude Code's input box is occupied by an overlay, so the command was not sent."
+            ),
+            "claude_native_terminal_dialog",
+            "dismiss it",
+            id="compact-behind-dialog",
+        ),
+    ],
+)
+async def test_events_claude_command_refused_by_the_pane_says_what_to_clear(
+    monkeypatch: pytest.MonkeyPatch,
+    event: dict[str, str],
+    refusal: RuntimeError,
+    error: str,
+    next_step: str,
+) -> None:
+    """
+    A command the pane refuses names what to clear, not the runner log.
+
+    A pending question, permission prompt or dialog blocks ``/model``,
+    ``/effort`` and ``/compact`` before any keystroke. The person can fix that
+    from the terminal, so the reply says so.
+    """
+
+    def _refuse(bridge_dir: Any, **kwargs: Any) -> None:
+        """Refuse the command the way the pane's pending prompt does."""
+        del bridge_dir, kwargs
+        raise refusal
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _refuse)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    session_id = uuid.uuid4().hex
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(f"/v1/sessions/{session_id}/events", json=event)
+
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["error"] == error
+    assert next_step in body["detail"]
+    assert "runner log" not in body["detail"]
+
+
+@pytest.mark.asyncio
 async def test_events_model_change_on_non_native_session_is_204_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

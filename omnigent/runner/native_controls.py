@@ -177,6 +177,53 @@ class _HandleOpencodeNativeCostPopupFn(Protocol):
     ) -> Response: ...
 
 
+def _claude_command_failure(
+    conv_id: str,
+    exc: RuntimeError | ValueError,
+    *,
+    error: str,
+    context: str,
+) -> JSONResponse:
+    """
+    Answer a Claude slash command that the runner could not type.
+
+    A pending question or permission prompt, or a dialog covering the input
+    box, refuses the command before any keystroke. Name what to clear instead
+    of pointing the person at the runner log.
+
+    :param conv_id: Session the command was for, e.g. ``"conv_abc123"``.
+    :param exc: The failure from ``inject_slash_command``.
+    :param error: Error code for any other failure, e.g.
+        ``"claude_native_model_failed"``.
+    :param context: Operator-facing label for the log, e.g.
+        ``"claude-native model change"``.
+    :returns: A 503 response whose ``detail`` is safe to show the person.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        ClaudeTerminalDialog,
+        ClaudeUserPromptPending,
+    )
+
+    if isinstance(exc, ClaudeUserPromptPending):
+        error = "claude_native_prompt_pending"
+        detail = (
+            "Claude is waiting for an answer to a question or permission request. "
+            "Answer it in the terminal, then try again."
+        )
+    elif isinstance(exc, ClaudeTerminalDialog):
+        error = "claude_native_terminal_dialog"
+        detail = (
+            "A dialog is open in Claude's terminal. Open the terminal, dismiss it, then try again."
+        )
+    else:
+        return JSONResponse(
+            status_code=503,
+            content={"error": error, "detail": _client_safe_error_detail(exc, context=context)},
+        )
+    _logger.warning("%s refused: %s", context, type(exc).__name__, extra={"session_id": conv_id})
+    return JSONResponse(status_code=503, content={"error": error, "detail": detail})
+
+
 @dataclasses.dataclass(frozen=True)
 class NativeControls:
     """Native-harness control handlers the runner app's event dispatch calls."""
@@ -1020,14 +1067,11 @@ def build_native_controls(
                 confirm_hint=EFFORT_DIALOG_HINT,
             )
         except (RuntimeError, ValueError) as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "claude_native_effort_failed",
-                    "detail": _client_safe_error_detail(
-                        exc, context="claude-native effort change"
-                    ),
-                },
+            return _claude_command_failure(
+                conv_id,
+                exc,
+                error="claude_native_effort_failed",
+                context="claude-native effort change",
             )
         return Response(status_code=204)
 
@@ -1176,12 +1220,11 @@ def build_native_controls(
                 confirm_hint=SWITCH_MODEL_DIALOG_HINT,
             )
         except (RuntimeError, ValueError) as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "claude_native_model_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native model change"),
-                },
+            return _claude_command_failure(
+                conv_id,
+                exc,
+                error="claude_native_model_failed",
+                context="claude-native model change",
             )
         # Verify against the statusLine snapshot the forwarder already polls:
         # Claude rewrites it on every render, including right after ``/model``.
@@ -1475,12 +1518,11 @@ def build_native_controls(
                 timeout_s=1.0,
             )
         except (RuntimeError, ValueError) as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "claude_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native compact"),
-                },
+            return _claude_command_failure(
+                conv_id,
+                exc,
+                error="claude_native_compact_failed",
+                context="claude-native compact",
             )
         return Response(status_code=200)
 
