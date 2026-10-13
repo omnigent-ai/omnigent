@@ -392,26 +392,55 @@ existing hosted connections must not be reinterpreted as registry IDs.
 
 ### Syncing into Databricks MAS
 
-The compact switches and browser preference follow the existing MAS picker.
+The picker follows MAS's workspace-bar placement, compact switches, row spacing
+and amber sign-in status. It uses the composer's shared label-collapse constant,
+so labels disappear when the bar runs out of space, including in an embed.
+Service names and the account-settings link come from the OSS registry; MAS's
+provider icons and host-owned OAuth remain specific to its catalog.
+
 `web/src/lib/mcpPreferences.ts` preserves MAS's `readLastMcpServices` /
 `writeLastMcpServices` API and `omnigent:last-mcp-services` JSON string-array format.
-Universe currently protects that helper, its tests, `McpConnectionPicker.tsx`, and
-`useMcpConnections.ts` as sync overlays; they can remain unchanged. Removing the
-preference overlays later is optional, after checking parity at the sync target.
+The helper and its test cases match managed behavior; comments are shortened.
+A source sync keeps protected overlays verbatim, even when an equivalent file
+now exists upstream. Retire only the preference overlays when the pinned OSS
+commit includes this UI change:
+
+| Managed source | Action during sync | Reason |
+| --- | --- | --- |
+| `src/lib/mcpPreferences.ts` and `src/lib/mcpPreferences.test.ts` | Adopt the upstream files; remove their two `ui.overlay` entries from `source/MANIFEST.toml` and their two `manifest_selectors` from `contracts.ui_tooling` in `source/contracts.toml`. | These helpers are upstreamed. Keeping comment-only differences would create unnecessary replacement patches. |
+| `src/shell/McpConnectionPicker.tsx` and `src/hooks/useMcpConnections.ts` | Keep both overlays. | MAS still owns the catalog and authorization popup through its embed host. The OSS registry picker does not replace that integration. |
+| `src/shell/NewChatDialog.tsx` and its tests | Keep the managed selection, OAuth, persistence and launch-label hunks when reconciling the generated patches. | `selectedMcps` and `omnigent.sandbox.mcp_services` still drive managed launches. Git credential, repository-access and provider controls also share these patches. |
+| `src/lib/host.ts` | Keep the `mcpConnections` capability and its `list` / `authorize` methods. | The managed picker still calls this API. |
+
+Paths in the table are relative to `third_party/omnigent_ui` or
+`third_party/sync`, under `agentbricks/mas`. Do not delete an entire generated
+patch because a helper or a visual detail has moved upstream.
 
 Registry selection lives in `useMcpRegistrySelection`; the shared composer does
 not import the preference helper directly, avoiding duplicate imports with MAS's
-composer patch. Keep MAS's host-provided catalog, `selectedMcps` state, OAuth flow
-and `omnigent.sandbox.mcp_services` labels when resolving that patch. The OSS path
+composer patch. Registry controls use the workspace bar's trailing slot, keeping
+the managed repository and picker child markup available for patching. The OSS path
 requires the separate `mcp` capability and sends `mcp_registry_services`; syncing
 these UI files does not opt MAS into the OSS registry. Enabling both catalogs on
 one origin would share this preference slot and needs an explicit integration
 decision, rather than interpreting MAS service names as OSS registry IDs.
 
-At a sync, compare patch rejects with the parent registry PR, run the managed
-composer tests with its host capabilities, and check that only the intended MCP
-picker appears. Do not replace the protected picker or regenerate away MAS's
-selection labels just to make a patch apply.
+Use Universe's current `sync-omnigent` skill for the actual source sync and
+conflict resolution. Start `source:sync -- sync --ref <target-commit>` in a clean,
+dedicated worktree before editing. Retire the preference overlays during conflict
+reconciliation, before `finish`; if sync completed automatically, make the
+retirement afterward and use `regen`. Keep retirement and the new source pin in
+the same change; the older pin has no upstream preference helper. Edit vendored
+source and the manifest/contract inventory, then let the engine generate patches.
+Do not hand-edit generated patches or use the retired `sync.sh` workflow.
+
+After reconciliation, run `source:vendored_replay_test`, `source:contracts_test`
+and the managed composer tests, following the commands in that skill. Check a
+managed new-session launch: exactly one intended MCP picker, OAuth before
+selection, persisted selections (including none), and the existing sandbox
+labels. Verify Arclet receives no Lakebox MCP label. Check standalone UI with no
+`mcp` capability as well. Replay proves
+source fidelity; the managed browser journey is still needed to verify behavior.
 
 ### Bring your own gateway
 

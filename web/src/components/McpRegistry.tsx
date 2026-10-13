@@ -6,6 +6,7 @@ import { Switch } from "@/components/ui/switch";
 import { useMcpRegistryCatalog } from "@/hooks/useMcpRegistry";
 import { withBasePath } from "@/lib/basePath";
 import { authorizeRegistryService, registryRequest, type RegistryService } from "@/lib/mcpRegistry";
+import { cn } from "@/lib/utils";
 
 export function McpRegistryConnections() {
   const { services, error, loading, refresh } = useMcpRegistryCatalog();
@@ -291,21 +292,30 @@ export function McpRegistryPicker({
           return (
             <li key={service.id} className="px-3 py-1.5">
               <label className="flex items-center gap-3" title={service.description}>
-                <PlugIcon className="size-4 shrink-0 text-muted-foreground" />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm">{service.title}</span>
-                  <span className="block text-xs text-muted-foreground">
-                    {conflict
-                      ? "A custom server already uses this name"
-                      : authorizing === service.id
-                        ? "Authorizing…"
-                        : service.connected
-                          ? service.auth === "none"
-                            ? "Ready"
-                            : "Connected"
-                          : tokenNeeded
-                            ? "Connect your account in settings"
-                            : "Needs sign-in"}
+                <span className="flex min-w-0 flex-1 items-center gap-2">
+                  <PlugIcon className="size-4 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm text-foreground">{service.title}</span>
+                    <span
+                      className={cn(
+                        "block text-xs",
+                        selected && !service.connected && authorizing !== service.id && !conflict
+                          ? "text-amber-600 dark:text-amber-500"
+                          : "text-muted-foreground",
+                      )}
+                    >
+                      {conflict
+                        ? "A custom server already uses this name"
+                        : authorizing === service.id
+                          ? "Authorizing…"
+                          : service.connected
+                            ? service.auth === "none"
+                              ? "Ready"
+                              : "Connected"
+                            : tokenNeeded
+                              ? "Connect your account in settings"
+                              : "Needs sign-in"}
+                    </span>
                   </span>
                 </span>
                 <Switch

@@ -1,6 +1,8 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useComposerContext } from "@/hooks/useComposerContext";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
+import { useMcpRegistrySelection } from "@/hooks/useMcpRegistry";
+import { McpRegistryLaunchPicker } from "./McpRegistryLaunchPicker";
 import {
   HarnessPicker,
   HarnessPickerEntry,
@@ -98,8 +100,6 @@ import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { McpRegistryLaunchPicker } from "./McpRegistryLaunchPicker";
-import { useMcpRegistrySelection } from "@/hooks/useMcpRegistry";
 import {
   Command,
   CommandEmpty,
@@ -6049,10 +6049,13 @@ export function NewChatLandingScreen() {
           )}
           data-testid="new-chat-landing-composer-surface"
         >
-          {sandboxSelected ? (
+          {/* Keep the tray mounted while the execution target changes. */}
+          {sandboxSelected && (
             <ComposerWorkspaceBar
+              key="workspace-controls"
               className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
               data-testid="new-chat-landing-workspace-controls"
+              trailingContent={mcpRegistryPicker}
             >
               {/* Sandbox repository chip — the sandbox counterpart of the
               working-directory chip. There is no filesystem to browse
@@ -6258,12 +6261,14 @@ export function NewChatLandingScreen() {
                   </div>
                 </PopoverContent>
               </Popover>
-              {mcpRegistryPicker}
             </ComposerWorkspaceBar>
-          ) : (
+          )}
+          {!sandboxSelected && (
             <ComposerWorkspaceBar
+              key="workspace-controls"
               className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
               data-testid="new-chat-landing-workspace-controls"
+              trailingContent={mcpRegistryPicker}
             >
               {workspaceLoading && cachedWorkspace === null && (
                 <NewChatPickerLoading
@@ -6508,7 +6513,6 @@ export function NewChatLandingScreen() {
                     </PopoverContent>
                   </Popover>
                 )}
-              {mcpRegistryPicker}
             </ComposerWorkspaceBar>
           )}
           <form
