@@ -29,6 +29,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.serve import _handle_tunnel_frame, _send_hello
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+from omnigent.server.routes import runner_tunnel
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -271,146 +272,273 @@ async def test_decoder_rejects_over_limit(caplog) -> None:
     assert "message limit" in caplog.text
 
 
-async def test_binary_admission_bounds_buffering_and_keeps_pings_flowing() -> None:
-    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
-        tasks = [
-            asyncio.create_task(
-                client.patch(
-                    "/upload",
-                    content=b"\xff" * (8 * 1024 * 1024),
-                    extensions={"runner_tunnel_binary_request_body": True},
-                )
-            )
-            for _ in range(2)
-        ]
-        try:
-            ids: list[str] = []
-            for _ in range(2):
-                raw = await asyncio.wait_for(ws.recv(), 5)
-                assert isinstance(raw, bytes)
-                ids.append(_envelope_header(raw)["id"])
-            for _ in range(8):
-                with pytest.raises(httpx.PoolTimeout, match="binary"):
-                    await asyncio.wait_for(
-                        client.patch(
-                            "/upload",
-                            content=b"x" * (8 * 1024 * 1024),
-                            extensions={"runner_tunnel_binary_request_body": True},
-                        ),
-                        1,
-                    )
-            session = registry.get(_RUNNER)
-            assert session is not None
-            assert session.outbound_queue.qsize() <= 2
-            await registry.send_text(session, encode_frame(PingFrame(123)))
-            ping = decode_frame(await asyncio.wait_for(ws.recv(), 5))
-            assert isinstance(ping, PingFrame) and ping.ts == 123
-            await _handle_tunnel_frame(
-                lambda scope, receive, send: None, encode_frame(ping), ws.send, {}, {}
-            )
-            text_request = asyncio.create_task(client.get("/health"))
-            tasks.append(text_request)
-            raw_text = await asyncio.wait_for(ws.recv(), 5)
-            assert isinstance(raw_text, str)
-            text_frame = decode_frame(raw_text)
-            assert isinstance(text_frame, RequestFrame)
-            await _reply(ws, text_frame.id)
-            assert (await text_request).status_code == 204
-            assert session.diagnostics.snapshot()["last_app_pong_received_age_s"] is not None
-            for req_id in ids:
-                await _reply(ws, req_id)
-            assert all(response.status_code == 204 for response in await asyncio.gather(*tasks))
-            resumed = asyncio.create_task(
-                client.patch(
-                    "/upload",
-                    content=b"next",
-                    extensions={"runner_tunnel_binary_request_body": True},
-                )
-            )
-            tasks.append(resumed)
-            raw = await asyncio.wait_for(ws.recv(), 5)
-            assert isinstance(raw, bytes)
-            req_id = _envelope_header(raw)["id"]
-            await _reply(ws, req_id)
-            assert (await resumed).status_code == 204
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+@asynccontextmanager
+async def _runner_dispatch(
+    ws: ClientConnection, app, binary_sizes: list[int] | None = None
+) -> AsyncIterator[dict[str, asyncio.Task[None]]]:
+    dispatches: dict[str, asyncio.Task[None]] = {}
+
+    async def receive() -> None:
+        async for raw in ws:
+            if isinstance(raw, bytes) and binary_sizes is not None:
+                binary_sizes.append(len(raw))
+            await _handle_tunnel_frame(app, raw, ws.send, dispatches, {})
+
+    receiver = asyncio.create_task(receive())
+    try:
+        yield dispatches
+    finally:
+        receiver.cancel()
+        tasks = list(dispatches.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(receiver, *tasks, return_exceptions=True)
 
 
-async def test_cancelled_queued_requests_keep_buffer_bounded(
+async def test_binary_admission_bounds_buffering_and_keeps_pings_flowing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from omnigent.server.routes import runner_tunnel
-
-    writer_ready = asyncio.Event()
     writer_resume = asyncio.Event()
+    uploads_started = asyncio.Event()
+    uploads_finish = asyncio.Event()
+    active_uploads = 0
     original_sender = runner_tunnel._sender_loop
 
     async def paused_sender(ws, session) -> None:
-        writer_ready.set()
         await writer_resume.wait()
         await original_sender(ws, session)
+
+    async def app(scope, receive, send) -> None:
+        nonlocal active_uploads
+        if scope["path"] == "/upload":
+            event = await receive()
+            assert len(event["body"]) == len(payload)
+            active_uploads += 1
+            if active_uploads == 2:
+                uploads_started.set()
+            try:
+                await uploads_finish.wait()
+            finally:
+                active_uploads -= 1
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    monkeypatch.setattr(runner_tunnel, "_sender_loop", paused_sender)
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        # Content-Length has the same number of digits at this boundary.
+        probe = client.build_request(
+            "PATCH", "/upload", headers={"content-length": str(RUNNER_TUNNEL_MAX_MESSAGE_BYTES)}
+        )
+        frame = RequestFrame(
+            "0" * 32,
+            "PATCH",
+            "/upload",
+            headers=list(map(list, probe.headers.items())),
+            stream=True,
+        )
+        payload = b"\xff" * (
+            RUNNER_TUNNEL_MAX_MESSAGE_BYTES - len(encode_binary_request(frame, b""))
+        )
+        session = registry.get(_RUNNER)
+        assert session is not None
+        binary_sizes: list[int] = []
+        async with _runner_dispatch(ws, app, binary_sizes):
+            tasks = [
+                asyncio.create_task(
+                    client.patch(
+                        "/upload",
+                        content=payload,
+                        extensions={"runner_tunnel_binary_request_body": True},
+                    )
+                )
+                for _ in range(2)
+            ]
+            try:
+                async with asyncio.timeout(5):
+                    while session.outbound_queue.qsize() < 2:
+                        await asyncio.sleep(0.01)
+                # Queue control and ordinary traffic before either envelope is sent.
+                await registry.send_text(session, encode_frame(PingFrame(123)), app_ping_ts=123)
+                health = asyncio.create_task(client.get("/health"))
+                tasks.append(health)
+                async with asyncio.timeout(5):
+                    while session.outbound_queue.qsize() < 4:
+                        await asyncio.sleep(0.01)
+                for _ in range(4):
+                    with pytest.raises(httpx.PoolTimeout, match="binary"):
+                        await asyncio.wait_for(
+                            client.patch(
+                                "/upload",
+                                content=payload,
+                                extensions={"runner_tunnel_binary_request_body": True},
+                            ),
+                            1,
+                        )
+                    assert session.outbound_queue.qsize() == 4
+                writer_resume.set()
+                await asyncio.wait_for(uploads_started.wait(), 10)
+                assert (await asyncio.wait_for(health, 10)).status_code == 204
+                async with asyncio.timeout(5):
+                    while session.diagnostics.snapshot()["last_app_pong_received_age_s"] is None:
+                        await asyncio.sleep(0.01)
+                assert binary_sizes == [RUNNER_TUNNEL_MAX_MESSAGE_BYTES] * 2
+                assert active_uploads == 2
+                assert not uploads_finish.is_set()
+                assert all(not task.done() for task in tasks[:2])
+                uploads_finish.set()
+                responses = await asyncio.wait_for(asyncio.gather(*tasks), 10)
+                assert all(response.status_code == 204 for response in responses)
+            finally:
+                writer_resume.set()
+                uploads_finish.set()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("queued", [False, True], ids=["sent", "queued"])
+@pytest.mark.parametrize("terminal_error", [False, True], ids=["end", "error"])
+async def test_cancelled_requests_keep_admission_until_runner_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+    queued: bool,
+    terminal_error: bool,
+) -> None:
+    writer_resume = asyncio.Event()
+    if not queued:
+        writer_resume.set()
+    uploads_started = asyncio.Event()
+    uploads_finish = asyncio.Event()
+    active_uploads = 0
+    peak_uploads = 0
+    original_sender = runner_tunnel._sender_loop
+
+    async def paused_sender(ws, session) -> None:
+        await writer_resume.wait()
+        await original_sender(ws, session)
+
+    async def app(scope, receive, send) -> None:
+        nonlocal active_uploads, peak_uploads
+        if scope["path"] == "/upload":
+            await receive()
+            active_uploads += 1
+            peak_uploads = max(peak_uploads, active_uploads)
+            if active_uploads == 2:
+                uploads_started.set()
+            try:
+                await uploads_finish.wait()
+                await send({"type": "http.response.start", "status": 204, "headers": []})
+                if terminal_error:
+                    raise RuntimeError("blocked upload failed")
+                await send({"type": "http.response.body", "body": b""})
+            finally:
+                active_uploads -= 1
+        else:
+            await send({"type": "http.response.start", "status": 204, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
 
     monkeypatch.setattr(runner_tunnel, "_sender_loop", paused_sender)
     payload = b"\xff" * (RUNNER_TUNNEL_MAX_MESSAGE_BYTES - 1024)
     async with _tunnel([_CAPABILITY]) as (client, ws, registry):
-        await asyncio.wait_for(writer_ready.wait(), 5)
         session = registry.get(_RUNNER)
         assert session is not None
-        tasks = [
-            asyncio.create_task(
-                client.patch(
-                    "/upload",
-                    content=payload,
-                    extensions={"runner_tunnel_binary_request_body": True},
-                )
-            )
-            for _ in range(2)
-        ]
-        try:
-            async with asyncio.timeout(5):
-                while session.outbound_queue.qsize() < 2:
-                    await asyncio.sleep(0.01)
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            for _ in range(4):
-                with pytest.raises(httpx.PoolTimeout):
-                    await asyncio.wait_for(
-                        client.patch(
-                            "/upload",
-                            content=payload,
-                            extensions={"runner_tunnel_binary_request_body": True},
-                        ),
-                        1,
+        async with _runner_dispatch(ws, app) as dispatches:
+            tasks = [
+                asyncio.create_task(
+                    client.patch(
+                        "/upload",
+                        content=payload,
+                        extensions={"runner_tunnel_binary_request_body": True},
                     )
-                assert session.outbound_queue.qsize() == 2
-            writer_resume.set()
-            for _ in range(2):
-                assert isinstance(await asyncio.wait_for(ws.recv(), 10), bytes)
-            async with asyncio.timeout(5):
-                while session.binary_requests:
-                    await asyncio.sleep(0.01)
-            retry = asyncio.create_task(
-                client.patch(
-                    "/upload",
-                    content=b"retry",
-                    extensions={"runner_tunnel_binary_request_body": True},
                 )
+                for _ in range(2)
+            ]
+            try:
+                if queued:
+                    async with asyncio.timeout(5):
+                        while session.outbound_queue.qsize() < 2:
+                            await asyncio.sleep(0.01)
+                else:
+                    await asyncio.wait_for(uploads_started.wait(), 10)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                assert not session.in_flight
+                if queued:
+                    for _ in range(4):
+                        with pytest.raises(httpx.PoolTimeout):
+                            await asyncio.wait_for(
+                                client.patch(
+                                    "/upload",
+                                    content=payload,
+                                    extensions={"runner_tunnel_binary_request_body": True},
+                                ),
+                                1,
+                            )
+                        assert session.outbound_queue.qsize() == 2
+                    writer_resume.set()
+                    await asyncio.wait_for(uploads_started.wait(), 10)
+                # Cancellation has removed both consumers, but ASGI work is still blocked.
+                assert active_uploads == 2
+                for _ in range(3):
+                    with pytest.raises(httpx.PoolTimeout):
+                        await asyncio.wait_for(
+                            client.patch(
+                                "/upload",
+                                content=payload,
+                                extensions={"runner_tunnel_binary_request_body": True},
+                            ),
+                            1,
+                        )
+                assert peak_uploads == 2
+                uploads_finish.set()
+                results = await asyncio.wait_for(
+                    asyncio.gather(*list(dispatches.values()), return_exceptions=True), 5
+                )
+                if terminal_error:
+                    assert len(results) == 2
+                    assert all(isinstance(result, RuntimeError) for result in results)
+                else:
+                    assert results == [None, None]
+                async with asyncio.timeout(5):
+                    while session.binary_requests:
+                        await asyncio.sleep(0.01)
+                assert active_uploads == 0
+                assert not session.binary_pending_sends
+                response = await asyncio.wait_for(
+                    client.patch(
+                        "/health",
+                        content=b"retry",
+                        extensions={"runner_tunnel_binary_request_body": True},
+                    ),
+                    5,
+                )
+                assert response.status_code == 204
+                assert not session.binary_requests
+            finally:
+                writer_resume.set()
+                uploads_finish.set()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_transport_reports_oversized_binary_request() -> None:
+    async with _tunnel([_CAPABILITY]) as (client, _, registry):
+        payload = b"x" * RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+        with pytest.raises(
+            httpx.LocalProtocolError, match=r"binary request.*message limit"
+        ) as error:
+            await client.patch(
+                "/upload",
+                content=payload,
+                extensions={"runner_tunnel_binary_request_body": True},
             )
-            tasks.append(retry)
-            raw = await asyncio.wait_for(ws.recv(), 5)
-            assert isinstance(raw, bytes)
-            req_id = _envelope_header(raw)["id"]
-            await _reply(ws, req_id)
-            assert (await retry).status_code == 204
-        finally:
-            writer_resume.set()
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+        assert error.value.request.url.path == "/upload"
+        session = registry.get(_RUNNER)
+        assert session is not None
+        assert session.outbound_queue.empty()
+        assert not session.in_flight
+        assert not session.binary_requests
 
 
 async def test_binary_request_across_consumer_loop() -> None:
