@@ -216,6 +216,8 @@ Other connection providers alone do not enable the managed MCP picker.
   covers explicit removal from a project;
   `tests/browser_ui/chat/test_slash_menu.py::test_new_command_project_lookup_error_is_visible_and_retryable`
   covers failed lookup and retry without using a stale project name.
+  `tests/browser_ui/chat/test_slash_menu.py::test_new_command_deleted_project_opens_unfiled`
+  covers deleted projects with dangling session membership.
   No running agent is needed.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`

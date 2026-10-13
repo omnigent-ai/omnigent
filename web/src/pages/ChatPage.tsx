@@ -81,7 +81,7 @@ import {
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
-import { createSideChat, retrySession } from "@/lib/sessionsApi";
+import { ApiError, createSideChat, retrySession } from "@/lib/sessionsApi";
 import { getProject } from "@/lib/projectsApi";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
@@ -1092,7 +1092,11 @@ export function ChatPage() {
         ? (await getProject(projectId)).name
         : (row?.labels ?? activeSession?.labels)?.[PROJECT_LABEL_KEY];
       navigate(projectName ? `/?project=${encodeURIComponent(projectName)}` : "/");
-    } catch {
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        navigate("/");
+        return;
+      }
       toast.error("Couldn't open a new session in this project. Please try again.");
     }
   }, [conversations, urlConvId, activeSession?.projectId, activeSession?.labels, navigate]);

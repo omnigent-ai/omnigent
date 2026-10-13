@@ -143,7 +143,15 @@ export function rankedSlashCommandNames(
     return group + (body.startsWith(q) ? 0 : body.includes(q) ? 1 : 2);
   };
   return Object.keys(commands)
-    .filter((name) => slashCommandMatches(name, query, labels[name]))
+    .filter((name) =>
+      slashCommandMatches(
+        name,
+        query,
+        builtinNames.has(name)
+          ? (BUILTIN_SLASH_COMMAND_LABELS[name] ?? labels[name])
+          : labels[name],
+      ),
+    )
     .sort((a, b) => rank(a) - rank(b));
 }
 

@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   matchSlashCommandInvocation,
+  BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
   skillDisplayNames,
   skillMenuDescription,
@@ -9,6 +10,13 @@ import {
 } from "./SlashCommandMenu";
 
 afterEach(cleanup);
+
+describe("builtin display name matching", () => {
+  it("matches the visible label while preserving skill-only inventory semantics", () => {
+    expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "sess")).toContain("/new");
+    expect(rankedSlashCommandNames({ "/new": "A skill" }, "sess", new Set())).toEqual([]);
+  });
+});
 
 describe("matchSlashCommandInvocation", () => {
   const commands = [

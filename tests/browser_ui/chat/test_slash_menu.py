@@ -21,6 +21,7 @@ def _composer(page: Page):
         ("legacy", "click"),
         ("snapshot", "enter"),
         ("partial", "enter"),
+        ("id", "label-tab-enter"),
     ],
 )
 def test_new_command_opens_landing_in_current_project(
@@ -41,7 +42,7 @@ def test_new_command_opens_landing_in_current_project(
             handle.contract.json("/v1/sessions", {"object": "list", "data": []})
         if project_kind == "partial":
             row = handle._session()
-            row.pop("project_id")
+            row.pop("project_id", None)
             handle.contract.json("/v1/sessions", {"object": "list", "data": [row]})
         if project_kind == "id":
             handle.harness = "codex-native"
@@ -49,12 +50,14 @@ def test_new_command_opens_landing_in_current_project(
     page.goto(handle.url)
     composer = _composer(page)
     expect(composer).to_be_visible()
-    composer.fill("/n" if gesture == "tab-enter" else "/new")
+    composer.fill(
+        "/sess" if gesture == "label-tab-enter" else "/n" if gesture == "tab-enter" else "/new"
+    )
     command = page.get_by_test_id("slash-menu-item-new")
     expect(command).to_have_attribute("data-active", "true")
     expect(command).to_contain_text("New session")
     expect(command).to_contain_text("Start a blank session in the same project")
-    if gesture == "tab-enter":
+    if gesture in {"tab-enter", "label-tab-enter"}:
         composer.press("Tab")
         expect(composer).to_have_value("/new ")
         expect(page).to_have_url(handle.url)
@@ -79,6 +82,22 @@ def test_new_command_respects_unfiled_sidebar_row(page: Page, chat_session_contr
     handle.update_session(project_id="old-project", labels={"omni_project": "Old project"})
     row = {**handle._session(), "project_id": None, "labels": {}}
     handle.contract.json("/v1/sessions", {"object": "list", "data": [row]})
+    handle.contract.json(f"/v1/hosts/{handle.host_id}/filesystem", {"path": "/", "entries": []})
+    page.goto(handle.url)
+    composer = _composer(page)
+    expect(composer).to_be_visible()
+    composer.fill("/new")
+    composer.press("Enter")
+    expect(page).to_have_url(f"{handle.base_url}/")
+    assert handle.event_posts == []
+
+
+def test_new_command_deleted_project_opens_unfiled(page: Page, chat_session_contract) -> None:
+    handle = chat_session_contract
+    handle.update_session(project_id="deleted", labels={"omni_project": "Deleted project"})
+    handle.contract.json(
+        "/v1/projects/deleted", {"error": {"message": "Project not found"}}, status=404
+    )
     handle.contract.json(f"/v1/hosts/{handle.host_id}/filesystem", {"path": "/", "entries": []})
     page.goto(handle.url)
     composer = _composer(page)
