@@ -8,6 +8,7 @@ name: Ready-for-Review Gate Test
 on:
   pull_request:
     paths:
+      - '.github/workflows/ready-for-review-test.yml'
       - .github/workflows/ready-for-review.js
       - .github/workflows/ready-for-review.test.js
       - .github/workflows/pr-issue-link.js

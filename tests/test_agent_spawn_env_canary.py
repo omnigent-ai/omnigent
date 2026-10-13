@@ -32,6 +32,8 @@ CANARY_SECRETS = {
     "ANTHROPIC_API_KEY": "canary-anthropic",
     "GEMINI_API_KEY": "canary-gemini",
     "GITHUB_TOKEN": "canary-github",
+    "GLAB_TOKEN": "canary-glab",
+    "GITLAB_TOKEN": "canary-gitlab",
     "SLACK_BOT_TOKEN": "canary-slack",
     "OPENROUTER_API_KEY": "canary-openrouter",
     "PYTHON_KEYRING_BACKEND": "test_keyring_backend.FileKeyring",
@@ -151,6 +153,15 @@ def test_every_harness_is_covered_by_a_real_builder():
 
 
 @pytest.mark.parametrize("harness", sorted(SPAWN_ENV_BUILDERS))
+def test_real_builder_preserves_forge_cli_config_paths(harness, hostile_env, monkeypatch):
+    paths = {"GH_CONFIG_DIR": "/test/gh", "GLAB_CONFIG_DIR": "/test/glab"}
+    monkeypatch.setattr("os.environ", {**hostile_env, **paths})
+    env = SPAWN_ENV_BUILDERS[harness]()
+    assert {name: env.get(name) for name in paths} == paths
+    assert not (set(env) & CANARY_SECRETS.keys())
+
+
+@pytest.mark.parametrize("harness", sorted(SPAWN_ENV_BUILDERS))
 def test_real_builder_does_not_leak_host_secrets(harness, hostile_env, monkeypatch):
     """Drive the executor's own builder against a planted host environment."""
     monkeypatch.setattr("os.environ", dict(hostile_env))
@@ -188,6 +199,13 @@ def test_real_builders_pass_ssh_auth_sock(monkeypatch):
     monkeypatch.setattr("os.environ", {"SSH_AUTH_SOCK": sock})
     for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
         assert build().get("SSH_AUTH_SOCK") == sock, harness
+
+
+def test_real_builders_pass_browser(monkeypatch):
+    """The user's URL opener must survive filtering, or CLI logins open the wrong browser."""
+    monkeypatch.setattr("os.environ", {"BROWSER": "www-browser"})
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        assert build().get("BROWSER") == "www-browser", harness
 
 
 def test_real_builders_strip_desktop_session(monkeypatch):

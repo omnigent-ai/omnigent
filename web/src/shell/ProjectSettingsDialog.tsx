@@ -50,7 +50,7 @@ import {
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
-import { isNavigablePath, WorkspacePicker } from "./WorkspacePicker";
+import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 
 /** Select sentinel for "no default" — Radix Select can't hold an empty value. */
 const NONE = "__none__";
@@ -164,6 +164,10 @@ export function ProjectSettingsDialog({
     target: EventTarget | null;
     preventDefault: () => void;
   }) => {
+    if (workspaceOpen) {
+      event.preventDefault();
+      return;
+    }
     if (
       shouldGuardDialogDismiss(event.target, {
         selectOpen: dropdownOpenCountRef.current > 0,
@@ -375,20 +379,15 @@ export function ProjectSettingsDialog({
                 Pick a host first
               </p>
             ) : browsableHostId ? (
-              // A compact trigger showing the current path; clicking expands
-              // the filesystem browser as an overlay anchored to the trigger.
-              // The browser is rendered inside DialogContent (not a portaled
-              // popover) so it scrolls — a modal Dialog's scroll-lock blocks
-              // wheel events on portaled content — but positioned `absolute`
-              // so it floats over the fields below instead of stretching the
-              // modal. onNavigate updates the field live as you browse.
+              // Browsing uses the shared full-screen picker; navigation is
+              // provisional until the user confirms a folder.
               <div
                 className="relative flex flex-col gap-1.5"
                 data-testid="project-settings-workspace"
               >
                 <button
                   type="button"
-                  onClick={() => setWorkspaceOpen((v) => !v)}
+                  onClick={() => setWorkspaceOpen(true)}
                   aria-expanded={workspaceOpen}
                   disabled={isLoading}
                   className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
@@ -402,26 +401,13 @@ export function ProjectSettingsDialog({
                     }`}
                   />
                 </button>
-                {workspaceOpen && (
-                  <>
-                    {/* Click-away: a transparent full-modal backdrop that
-                          closes the browser (keeping the current path) on any
-                          click outside it. */}
-                    <button
-                      type="button"
-                      aria-label="Close directory browser"
-                      className="fixed inset-0 z-10 cursor-default"
-                      onClick={() => setWorkspaceOpen(false)}
-                    />
-                    <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:border-white/10 dark:backdrop-blur-xl dark:backdrop-saturate-150 [&>[data-testid=workspace-picker]]:border-0">
-                      <WorkspacePicker
-                        hostId={browsableHostId}
-                        initialPath={isNavigablePath(workspace) ? workspace : undefined}
-                        onNavigate={setWorkspace}
-                      />
-                    </div>
-                  </>
-                )}
+                <WorkspacePickerDialog
+                  open={workspaceOpen}
+                  onOpenChange={setWorkspaceOpen}
+                  hostId={browsableHostId}
+                  initialPath={workspace}
+                  onConfirm={setWorkspace}
+                />
               </div>
             ) : (
               // A host is picked but not browsable (sandbox / offline stored

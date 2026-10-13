@@ -27,7 +27,7 @@ def unsupported_in_pi(model_id_lower: str) -> bool:
 
 
 class DatabricksPiSurface(Enum):
-    """A Databricks AI Gateway protocol surface Pi can be pointed at.
+    """A Databricks Unity Gateway protocol surface Pi can be pointed at.
 
     The gateway serves each protocol under the same workspace origin, and each
     model accepts only some of them; sending a model to the wrong surface is

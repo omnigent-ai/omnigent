@@ -1112,6 +1112,9 @@ class ResolvedRoute:
 # outright — only used when no single-vendor harness fits.
 _MULTI_MODEL_FAMILY = "pi"
 
+# Canonical harness names required by routers such as task_v3.
+_ROUTER_HARNESS_BY_FAMILY: dict[str, str] = {"claude": "claude", "gpt": "codex"}
+
 # (harness, model) pairs the harness's own gateway 400s on: under pi, Claude
 # models on its ``eager_input_streaming`` field and gpt-5.5/5.6 reasoning models
 # on its openai-completions default ``reasoning_effort``. Probed against a
@@ -1404,7 +1407,9 @@ class TaskV1RouteOptionSource:
                 router_id = self.to_router_id(model)
                 offered.setdefault(
                     _bare_id(router_id, self._model_prefixes),
-                    RouteOptionSpec(model=router_id, harness=harness),
+                    RouteOptionSpec(
+                        model=router_id, harness=self._router_harness(harness, router_id)
+                    ),
                 )
         for arm in self.menu(harnesses or list(catalog)):
             key = _bare_id(arm, self._model_prefixes)
@@ -1413,7 +1418,7 @@ class TaskV1RouteOptionSource:
                 model=arm,
                 harness=existing.harness
                 if existing is not None
-                else self._tag_harness(arm, harnesses, catalog),
+                else self._router_harness(self._tag_harness(arm, harnesses, catalog), arm),
             )
         return list(offered.values())
 
@@ -1425,11 +1430,9 @@ class TaskV1RouteOptionSource:
     ) -> ResolvedRoute | None:
         """Translate *pick* into a servable (harness, model) pair.
 
-        :param pick: The router's selection as received; its ``harness`` is
-            ignored because the router echoes the tag verbatim without ever
-            reading it. An id that already carries a catalog prefix is mapped
-            back to router vocabulary first, so re-resolving an id this seam
-            already resolved is a no-op rather than a miss.
+        :param pick: The router's selection. Its harness tag is ignored; the
+            local harness is derived from the model and catalog. Prefixed model
+            ids are normalized first so resolving an id twice is a no-op.
         :param harnesses: Harnesses the decision may land on.
         :param catalog: Harness → servable model ids.
         :returns: A :class:`ResolvedRoute`, or ``None`` when the pick was
@@ -1514,17 +1517,26 @@ class TaskV1RouteOptionSource:
             return "codex"
         return "both"
 
+    def _router_harness(self, harness: str | None, model: str) -> str | None:
+        """Map a harness to its canonical router name, using the model's family for pi.
+
+        Unknown families keep the original harness tag.
+
+        Examples: ``("codex-native", "glm-5-3") -> "codex"``;
+        ``("pi", "claude-sonnet-5") -> "claude"``.
+        """
+        family = _HARNESS_FAMILY.get(harness or "")
+        if family == _MULTI_MODEL_FAMILY:
+            family = _model_family(model)
+        return _ROUTER_HARNESS_BY_FAMILY.get(family or "", harness)
+
     def _tag_harness(
         self,
         arm: str,
         harnesses: Sequence[str],
         catalog: dict[str, list[str]],
     ) -> str | None:
-        """Pick a plausible harness tag for an injected arm.
-
-        The tag is decoration — no router reads it — so a family match is
-        enough, falling back to the first harness on offer.
-        """
+        """Pick a harness by model family, falling back to the first one offered."""
         order = list(catalog) or list(harnesses)
         family = _model_family(arm)
         match = next((h for h in order if _HARNESS_FAMILY.get(h) == family), None)

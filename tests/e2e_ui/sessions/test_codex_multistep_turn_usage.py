@@ -41,6 +41,7 @@ import pytest
 import yaml
 from playwright.sync_api import Page, Response, Route, expect
 
+from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e_ui.chat.test_session_usage_loading import _session_read_matcher
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
@@ -111,20 +112,16 @@ def _create_codex_session(base_url: str, runner_id: str, model: str) -> str:
     name = f"codex-usage-{uuid.uuid4().hex[:8]}"
     bundle = _build_codex_bundle(name, model)
     # Background title inference must not consume the turn's scripted responses.
-    create_resp = httpx.post(
+    create_resp = post_session_bundle(
+        httpx.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"title": "Codex cumulative usage"})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        bundle,
+        metadata={"title": "Codex cumulative usage"},
         timeout=30.0,
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
-    patch_resp = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
     return session_id
 
 

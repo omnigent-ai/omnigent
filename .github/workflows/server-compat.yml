@@ -44,6 +44,7 @@ on:
       - "tests/e2e/**"
       - "tests/e2e_ui/**"
       - "tests/_helpers/compat.py"
+      - "tests/helpers/**"
       - ".github/actions/compat-smoke-run/**"
       - ".github/actions/compat-smoke-ui-run/**"
       - ".github/workflows/server-compat.yml"

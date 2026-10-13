@@ -13,6 +13,12 @@ import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
+import { useQueryClient } from "@tanstack/react-query";
+import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { getSessionSlim } from "@/lib/sessionsApi";
+import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import type { Host } from "@/hooks/useHosts";
+import type { Session } from "@/lib/types";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -22,7 +28,13 @@ interface BrowserDesktopBridge {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean },
+    opts?: {
+      force?: boolean;
+      agent?: boolean;
+      sourceHostId?: string;
+      rememberedArcaHostId?: string;
+      sourceIsArcaHost?: boolean;
+    },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserScreenshot?: (
     conversationId: string,
@@ -31,6 +43,20 @@ interface BrowserDesktopBridge {
     conversationId: string,
     js: string,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
+}
+
+function isLoopbackPreview(url: string): boolean {
+  try {
+    const { hostname } = new URL(url);
+    return (
+      hostname === "localhost" ||
+      hostname.endsWith(".localhost") ||
+      hostname === "127.0.0.1" ||
+      hostname === "[::1]"
+    );
+  } catch {
+    return false;
+  }
 }
 
 function getBrowserDesktop(): BrowserDesktopBridge | null {
@@ -217,6 +243,9 @@ async function dispatch(
   action: string,
   args: Record<string, unknown>,
   desktop: BrowserDesktopBridge,
+  sourceHostId: string | null,
+  rememberedArcaHostId: string | null,
+  sourceIsArcaHost: boolean,
 ): Promise<ActionResult> {
   try {
     switch (action) {
@@ -231,8 +260,20 @@ async function dispatch(
         const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
           force: true,
           agent: true,
+          ...(sourceHostId ? { sourceHostId } : {}),
+          ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
+          ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
+        if (
+          isLoopbackPreview(url) &&
+          sourceHostId &&
+          rememberedArcaHostId &&
+          sourceHostId !== rememberedArcaHostId
+        ) {
+          // Main only approves this after consent captures the source host.
+          writeArcaHostId(sourceHostId);
+        }
         return { ok: true, data: { final_url: url } };
       }
       case "screenshot": {
@@ -350,10 +391,13 @@ async function postResult(
  *   open. Routing uses the delivering conversation, not this.
  */
 export function useBrowserAgentRelay(conversationId: string | null | undefined): void {
+  const relayEnabled = !!conversationId;
+  const queryClient = useQueryClient();
   useEffect(() => {
-    if (!conversationId) return;
+    if (!relayEnabled) return;
     if (!supportsBrowser()) return;
 
+    let cancelled = false;
     const handler = async (evt: BrowserActionRequestEvent, sourceConversationId: string | null) => {
       if (!sourceConversationId) return; // no delivering session — nothing to target
       const desktop = getBrowserDesktop();
@@ -361,10 +405,62 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      const result = await dispatch(sourceConversationId, evt.action, evt.args, desktop);
+      let sourceHostId: string | null = null;
+      if (evt.action === "navigate") {
+        try {
+          // Parent hints cannot establish which ancestor has the nearest own host binding.
+          const visited = new Set<string>();
+          let id: string | null = sourceConversationId;
+          while (id !== null && !visited.has(id)) {
+            visited.add(id);
+            const hopId: string = id;
+            // oxlint-disable-next-line no-await-in-loop -- Each parent comes from the previous snapshot.
+            const source: Session = await queryClient.fetchQuery({
+              queryKey: ["session", hopId],
+              queryFn: () => getSessionSlim(hopId),
+              staleTime: Infinity,
+              retry: false,
+            });
+            setSessionHost(source.id, source.hostId);
+            setSessionParent(source.id, source.parentSessionId);
+            if (source.hostId) {
+              sourceHostId = source.hostId;
+              break;
+            }
+            id = source.parentSessionId;
+          }
+        } catch {
+          // Unknown provenance stays denied for localhost; public browsing still works.
+        }
+      }
+      const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
+      const sourceIsArcaHost =
+        evt.action === "navigate" && sourceHostId !== null
+          ? queryClient
+              .getQueriesData<Host[]>({ queryKey: ["hosts"] })
+              .flatMap(([, rows]) => rows ?? [])
+              .some(
+                (host) => host.host_id === sourceHostId && isArcaHost(host, rememberedArcaHostId),
+              )
+          : false;
+      const result = cancelled
+        ? { ok: false, error: "browser relay context changed" }
+        : await dispatch(
+            sourceConversationId,
+            evt.action,
+            evt.args,
+            desktop,
+            sourceHostId,
+            rememberedArcaHostId,
+            sourceIsArcaHost,
+          );
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 
-    return onBrowserActionRequest(handler);
-  }, [conversationId]);
+    const unsubscribe = onBrowserActionRequest(handler);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [relayEnabled, queryClient]);
 }

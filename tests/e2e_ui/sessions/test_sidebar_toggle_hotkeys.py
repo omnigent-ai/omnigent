@@ -1,9 +1,10 @@
-"""E2E: ⌘⌥[ / ⌘⌥] toggle the left and right sidebars from the app shell.
+"""E2E: ⌘⌥[ toggles the left sidebar; ⌘⌥] focuses or closes the right.
 
 Covers ``useSidebarToggleHotkeys`` (``web/src/hooks/useSidebarToggleHotkeys.ts``),
 wired in ``AppShell``: a window-level keydown listener flips the left
-(Conversations) sidebar on ⌘/Ctrl + ⌥/Alt + ``[`` and the right (Workspace)
-rail on ⌘/Ctrl + ⌥/Alt + ``]``. The hook matches the physical ``e.code``
+(Conversations) sidebar on ⌘/Ctrl + ⌥/Alt + ``[``. The right (Workspace) rail
+opens or focuses on ⌘/Ctrl + ⌥/Alt + ``]`` and closes when focus is inside its
+tab strip. The hook matches the physical ``e.code``
 (``BracketLeft`` / ``BracketRight``) rather than the character, because ⌥ on
 macOS turns ``[``/``]`` into ``“``/``‘`` — only a code match survives the
 modifier. CI runs Linux chromium, so this presses the ``Control+Alt`` chord
@@ -17,9 +18,9 @@ Two design points this exercises end-to-end that the unit test cannot:
   Conversations sidebar with the chord, and assert the draft is untouched —
   proving the chord toggled the panel without stealing the keystroke or
   navigating away.
-- the right-rail toggle runs the shared ``toggleRightPanel`` (open-state +
-  per-session persistence + URL sync), the same path the header's collapse
-  button uses, so the two can't drift.
+- the right-rail shortcut focuses the numbered permanent tabs before closing,
+  so its advertised shortcut sequence works while preserving a keyboard-only
+  close path.
 
 No LLM turn is needed — this is pure client-side keyboard + layout state — so
 it skips the nightly/real-agent markers the approval suites carry. The seeded
@@ -31,6 +32,7 @@ and always has content (the Agents tab is unconditional).
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 
 from playwright.sync_api import Page, expect
 
@@ -50,7 +52,7 @@ def test_sidebar_toggle_hotkeys(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """⌘⌥[ flips the Conversations sidebar; ⌘⌥] flips the Workspace rail."""
+    """⌘⌥[ toggles Conversations; ⌘⌥] focuses then closes Workspace."""
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -82,14 +84,20 @@ def test_sidebar_toggle_hotkeys(
     page.keyboard.press(_LEFT_CHORD)
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
 
-    # ⌘⌥] collapses the Workspace rail (unmounts it via the shared
-    # toggleRightPanel path) ...
+    # From outside the rail, ⌘⌥] keeps it open and focuses a permanent tab so
+    # the following numbered shortcut can select a workspace view.
+    page.keyboard.press(_RIGHT_CHORD)
+    expect(workspace).to_be_visible()
+    expect(workspace.locator("[data-workspace-tab]:focus")).to_have_count(1)
+
+    # With focus already inside the tab strip, the same chord closes it.
     page.keyboard.press(_RIGHT_CHORD)
     expect(workspace).to_have_count(0)
 
-    # ... and ⌘⌥] again brings it back.
+    # The chord brings it back and restores focus to the tab strip.
     page.keyboard.press(_RIGHT_CHORD)
     expect(workspace).to_be_visible()
+    expect(workspace.locator("[data-workspace-tab]:focus")).to_have_count(1)
 
 
 def test_sidebar_click_cancels_pending_peek(
@@ -98,6 +106,8 @@ def test_sidebar_click_cancels_pending_peek(
 ) -> None:
     """A quick press pins the sidebar open instead of losing to the peek timer."""
     base_url, session_id = seeded_session
+    clock_start = datetime.now(UTC)
+    page.clock.install(time=clock_start)
     page.goto(f"{base_url}/c/{session_id}")
 
     conversations = page.locator(_CONVERSATIONS)
@@ -108,12 +118,13 @@ def test_sidebar_click_cancels_pending_peek(
 
     trigger = page.get_by_role("button", name="Open sidebar")
     expect(trigger).to_be_visible()
+    page.clock.pause_at(clock_start + timedelta(hours=1))
     trigger.hover()
-    page.wait_for_timeout(300)
+    page.clock.run_for(300)
 
     page.mouse.down()
     try:
-        page.wait_for_timeout(200)
+        page.clock.run_for(200)
         expect(conversations).to_have_attribute("data-collapsed", "true")
         expect(conversations).not_to_have_class(_PEEK_CLASS)
     finally:
@@ -121,7 +132,7 @@ def test_sidebar_click_cancels_pending_peek(
 
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
     expect(conversations).not_to_have_class(_PEEK_CLASS)
-    page.wait_for_timeout(200)
+    page.clock.run_for(200)
     expect(conversations).not_to_have_class(_PEEK_CLASS)
 
 

@@ -291,6 +291,7 @@ def test_builtin_native_provider_paths_resolve() -> None:
             "auto_create_terminal",
             "spawn_env_builder",
             "materialize_agent_spec",
+            "input_ready_probe",
         ):
             resolved = native_dispatch.resolve_hook(provider, hook)
             assert callable(resolved), f"{provider.key}.{hook} did not resolve to a callable"

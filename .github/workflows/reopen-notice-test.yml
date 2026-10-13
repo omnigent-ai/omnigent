@@ -1,15 +1,17 @@
 name: Reopen Notice Test
 
-# Offline unit test for the close-notice logic: runs reopen-notice.test.js
-# (mocked GitHub client, no network). Triggers only when the script or its test
-# change. Runs on `pull_request` (PR head checkout) so it tests the PR's own
-# version. No secrets, no network.
+# Fixture and process tests use the PR head and a loopback-only GitHub API.
+# The process test runs the same pinned github-script bundle as production.
 
 on:
   pull_request:
     paths:
+      - '.github/workflows/reopen-notice-test.yml'
+      - .github/workflows/reopen-notice.yml
       - .github/workflows/reopen-notice.js
       - .github/workflows/reopen-notice.test.js
+      - .github/workflows/reopen-notice.process.test.js
+      - .github/workflows/fixtures/reopen-notice/**
   workflow_dispatch:
 
 permissions:
@@ -27,5 +29,20 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Run reopen-notice unit test
-        run: node .github/workflows/reopen-notice.test.js
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Check out the production github-script bundle
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: actions/github-script
+          ref: 3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0; match reopen-notice.yml
+          path: github-script-action
+          sparse-checkout: dist
+          persist-credentials: false
+      - name: Run closure and reopen fixture tests
+        run: node --test .github/workflows/reopen-notice.test.js .github/workflows/reopen-pr.test.js
+      - name: Run the production action against the local API fixture
+        env:
+          GITHUB_SCRIPT_BUNDLE: ${{ github.workspace }}/github-script-action/dist/index.js
+        run: node --test .github/workflows/reopen-notice.process.test.js

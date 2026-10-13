@@ -136,6 +136,59 @@ async def _create_session(client: httpx.AsyncClient, agent_id: str) -> dict[str,
     return resp.json()
 
 
+async def test_create_reuses_inserted_conversation(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A create without initial items must not point-read its new row."""
+    agent = await create_test_agent(client)
+
+    with _capture_sql(db_uri) as statements:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "labels": {"source": "create"}},
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["labels"]["source"] == "create"
+    point_reads = _conversation_point_reads(statements)
+    assert point_reads == [], (
+        "create point-read the row it had just inserted instead of reusing the "
+        f"authoritative create result: statements={point_reads}"
+    )
+
+
+async def test_create_rereads_after_initial_items(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Initial-item persistence keeps one refresh for the current snapshot."""
+    agent = await create_test_agent(client)
+    payload = {
+        "agent_id": agent["id"],
+        "initial_items": [
+            {
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+            }
+        ],
+    }
+
+    with _capture_sql(db_uri) as statements:
+        resp = await client.post("/v1/sessions", json=payload)
+
+    assert resp.status_code == 201, resp.text
+    point_reads = _conversation_point_reads(statements)
+    assert len(point_reads) == 2, (
+        "create with initial items should read once while appending and refresh "
+        "exactly once after persistence; "
+        f"statements={point_reads}"
+    )
+
+
 async def test_snapshot_reads_conversation_once(
     client: httpx.AsyncClient,
     db_uri: str,

@@ -30,6 +30,7 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
@@ -164,6 +165,7 @@ async def _register_routing_routes(
     await page.route(
         re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
     )
+    await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
     # The landing needs a working directory before Send enables, and the
     # stubbed host has no browsable filesystem.
     await page.add_init_script(

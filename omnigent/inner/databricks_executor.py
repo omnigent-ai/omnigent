@@ -535,16 +535,13 @@ def _databricks_cli_profile_token(
 def _databricks_cli_token_expires_at(
     payload: dict[str, Any], *, now: float | None = None
 ) -> float:
-    """Return the CLI token expiry timestamp, falling back conservatively."""
+    """Return the CLI token expiry timestamp, falling back conservatively.
+
+    The absolute ``expiry`` is authoritative: the CLI keeps ``expires_in`` at the
+    original TTL however old the cached token is, so it may only shorten the lifetime.
+    """
     base = time.time() if now is None else now
-    expires_in = payload.get("expires_in")
-    if isinstance(expires_in, (int, float)):
-        return base + max(float(expires_in), 0.0)
-    if isinstance(expires_in, str):
-        try:
-            return base + max(float(expires_in), 0.0)
-        except ValueError:
-            pass
+    candidates: list[float] = []
     expiry = payload.get("expiry")
     if isinstance(expiry, str) and expiry:
         try:
@@ -552,10 +549,18 @@ def _databricks_cli_token_expires_at(
             parsed = dt.datetime.fromisoformat(normalized)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=dt.UTC)
-            return parsed.timestamp()
+            candidates.append(parsed.timestamp())
         except ValueError:
             pass
-    return base + _CLI_TOKEN_DEFAULT_TTL_SECONDS
+    expires_in = payload.get("expires_in")
+    if isinstance(expires_in, str):
+        try:
+            expires_in = float(expires_in)
+        except ValueError:
+            expires_in = None
+    if isinstance(expires_in, (int, float)):
+        candidates.append(base + max(float(expires_in), 0.0))
+    return min(candidates, default=base + _CLI_TOKEN_DEFAULT_TTL_SECONDS)
 
 
 class _DatabricksBearerAuth(httpx.Auth):
@@ -862,6 +867,50 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     except Exception as exc:
         raise DatabricksAuthError(host_failure) from exc
     return _DatabricksBearerAuth(host_cfg, failure_message=host_failure), host
+
+
+class _ReusedDatabricksTokenSource:
+    """Reuse SDK auth, re-resolving it after a token mint fails."""
+
+    def __init__(self, server_url: str | None = None, *, host: str | None = None) -> None:
+        if server_url is not None and host is not None:
+            raise ValueError("_ReusedDatabricksTokenSource takes server_url or host, not both")
+        self._server_url = server_url
+        self._host = host
+        self._auth: _DatabricksBearerAuth | None = None
+
+    def _resolve(self) -> _DatabricksBearerAuth | None:
+        """Resolve fresh SDK auth, returning ``None`` on credential failure."""
+        try:
+            if self._host is not None:
+                return _resolve_databricks_auth(host=self._host)[0]
+            from omnigent.cli_auth import load_databricks_workspace_host
+
+            workspace_host = (
+                load_databricks_workspace_host(self._server_url) if self._server_url else None
+            )
+            if workspace_host is not None:
+                return _resolve_databricks_auth(host=workspace_host)[0]
+            return _resolve_databricks_auth()[0]
+        except (DatabricksAuthError, ImportError, ValueError):
+            return None
+
+    def current_token(self) -> str | None:
+        """Mint a token, resolving auth lazily and retrying once if it is stale."""
+        cached = self._auth
+        if cached is not None:
+            try:
+                return cached.current_token()
+            except DatabricksAuthError:
+                self._auth = None
+        auth = self._resolve()
+        if auth is None:
+            return None
+        self._auth = auth
+        try:
+            return auth.current_token()
+        except DatabricksAuthError:
+            return None
 
 
 # Sentinel default_section: keeps [DEFAULT] a plain section carrying only its

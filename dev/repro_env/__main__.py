@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -14,7 +15,8 @@ from .runtime import serve
 from .transport import Relay
 
 
-def execute(output: Path, command: list[str]) -> int:
+@contextmanager
+def command_environment(output: Path):
     state = json.loads((output / "environment.json").read_text())
     if state["status"] != "ready":
         raise RuntimeError(f"Reproduction environment is {state['status']}; inspect {output}")
@@ -38,6 +40,15 @@ def execute(output: Path, command: list[str]) -> int:
             status.raise_for_status()
             if not status.json().get("online"):
                 raise RuntimeError(f"Reproduction runner is offline; inspect {output}")
+        yield env
+
+
+def execute(output: Path, command: list[str]) -> int:
+    if (output / "execution-context.json").is_file():
+        from .execution import run
+
+        return run(output, command, prepare=lambda: command_environment(output))
+    with command_environment(output) as env:
         return subprocess.call(command, env=env)
 
 
@@ -51,6 +62,17 @@ def main() -> int:
     run.add_argument("command", nargs=argparse.REMAINDER)
     commands.add_parser("stop")
     commands.add_parser("status")
+    check = commands.add_parser("doctor")
+    check.add_argument("--plan", type=Path, required=True)
+    check.add_argument("--host", help="Exact host ID required by the journey")
+    check.add_argument("--json", action="store_true", help="Emit only the observation JSON")
+    check.add_argument(
+        "--check",
+        nargs=3,
+        action="append",
+        default=[],
+        metavar=("REQUIREMENT_ID", "FACT", "EXPECTED_JSON"),
+    )
     args = parser.parse_args()
     output = args.output.resolve()
     if args.action == "serve":
@@ -60,6 +82,11 @@ def main() -> int:
         return 0
     if args.action == "status":
         print((output / "environment.json").read_text())
+        return 0
+    if args.action == "doctor":
+        from .doctor import doctor
+
+        doctor(output, args.plan, args.check, args.host, json_only=args.json)
         return 0
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:

@@ -7,6 +7,7 @@ by ``omnigent login``.
 from __future__ import annotations
 
 import contextlib
+import sys
 import time
 
 import pytest
@@ -457,6 +458,34 @@ def test_databricks_request_headers_slice_key(token_dir) -> None:
 
     # Omitted (default) → no slice-key header even on the workspace mount.
     assert "X-Databricks-Omnigent-Slice-Key" not in databricks_request_headers(recorded)
+
+
+def test_oss_host_routing_opt_in(token_dir, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An OSS host and its spawned runner send the same routing key when enabled."""
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.host.identity import HostIdentity
+    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+
+    server = "http://localhost:8000"
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    assert databricks_request_headers(server, host_id="host_explicit") == {
+        "X-Databricks-Omnigent-Slice-Key": "host_explicit"
+    }
+    monkeypatch.setenv(RUNNER_SLICE_KEY_ENV_VAR, "host_runner")
+    assert databricks_request_headers(server) == {"X-Databricks-Omnigent-Slice-Key": "host_runner"}
+    assert databricks_request_headers(server, host_id="host_explicit") == {
+        "X-Databricks-Omnigent-Slice-Key": "host_explicit"
+    }
+    monkeypatch.delenv(RUNNER_SLICE_KEY_ENV_VAR)
+    monkeypatch.setattr(
+        "omnigent.host.identity.load_host_identity_if_present",
+        lambda: HostIdentity(host_id="host_saved", name="saved-host"),
+    )
+    assert databricks_request_headers(server) == {"X-Databricks-Omnigent-Slice-Key": "host_saved"}
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "true")
+    assert databricks_request_headers(server, host_id="host_explicit") == {}
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "0")
+    assert databricks_request_headers(server, host_id="host_explicit") == {}
 
 
 def test_databricks_request_headers_runner_env_default(
@@ -1040,3 +1069,44 @@ def test_refresh_rejects_unusable_response_fields(token_dir, monkeypatch) -> Non
     assert refresh_stored_token("http://localhost:6767") == "fresh"
     entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
     assert entry["expires_at"] < time.time() + 4000
+
+
+def _purge_tui_sdk_modules() -> None:
+    """Drop loaded ``omnigent_ui_sdk`` modules so the no-import assertions
+    below hold regardless of what earlier tests imported."""
+    for mod_name in list(sys.modules):
+        if mod_name == "omnigent_ui_sdk" or mod_name.startswith("omnigent_ui_sdk."):
+            sys.modules.pop(mod_name, None)
+
+
+def test_token_file_path_honors_data_dir_without_tui_sdk(tmp_path, monkeypatch) -> None:
+    """The token-path lookup must not import the prompt_toolkit-laden TUI SDK.
+
+    Every CLI startup that touches auth calls this; routing it through
+    ``omnigent_ui_sdk.terminal`` (-> prompt_toolkit -> XML parsing ->
+    pyexpat) crashed the CLI outright on interpreters whose ``pyexpat``
+    extension cannot load.
+    """
+    from omnigent.cli_auth import _token_file_path
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    _purge_tui_sdk_modules()
+
+    assert _token_file_path() == tmp_path / "auth_tokens.json"
+    assert "omnigent_ui_sdk.terminal" not in sys.modules, (
+        "computing the auth token path imported the TUI SDK"
+    )
+
+
+def test_token_file_path_defaults_to_home_state_dir(tmp_path, monkeypatch) -> None:
+    """Without ``OMNIGENT_DATA_DIR`` the token file lives under ``~/.omnigent``."""
+    from omnigent.cli_auth import _token_file_path
+
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _purge_tui_sdk_modules()
+
+    assert _token_file_path() == tmp_path / ".omnigent" / "auth_tokens.json"
+    assert "omnigent_ui_sdk.terminal" not in sys.modules, (
+        "computing the auth token path imported the TUI SDK"
+    )

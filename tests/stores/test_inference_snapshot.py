@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import copy
 import json
+import random
 import uuid
 from typing import Any
 
 import pytest
 import sqlalchemy as sa
 
+from omnigent.db.compression import decode, encode
 from omnigent.db.db_models import (
     SqlAgent,
     SqlConversation,
@@ -17,6 +19,7 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.entities import Conversation
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 
@@ -121,13 +124,17 @@ def test_large_catalog_snapshot_uses_metadata_across_create_child_and_fork(
         assert fetched.inference_snapshot == snapshot
         with store._engine.connect() as connection:
             saved = connection.scalar(
-                sa.select(SqlConversationMetadata.inference_snapshot).where(
+                sa.select(
+                    sa.type_coerce(SqlConversationMetadata.inference_snapshot, sa.LargeBinary)
+                ).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.id == session.id,
                 )
             )
         assert saved is not None
-        assert json.loads(saved) == snapshot
+        assert saved.startswith(b"\x00\x01")
+        assert len(saved) <= 65_535
+        assert json.loads(decode(saved)) == snapshot
         with store._conv_engine.connect() as connection:
             overrides = connection.scalar(
                 sa.select(SqlConversation.session_overrides).where(
@@ -137,6 +144,74 @@ def test_large_catalog_snapshot_uses_metadata_across_create_child_and_fork(
             )
         assert len(overrides or "") <= 512
         assert "inference_snapshot" not in json.loads(overrides or "{}")
+
+
+@pytest.mark.parametrize("bundled", [False, True], ids=["existing-agent", "bundle"])
+def test_oversized_snapshot_rejected_before_creating_rows(
+    store: SqlAlchemyConversationStore, bundled: bool
+) -> None:
+    snapshot = {"catalog": random.Random(0).randbytes(100_000).hex()}
+    assert len(encode(json.dumps(snapshot))) > 65_535
+    with pytest.raises(OmnigentError, match="compressed storage limit") as error:
+        _create_session(store, bundled=bundled, snapshot=snapshot)
+    assert error.value.code == ErrorCode.INVALID_INPUT
+    for engine, model in [
+        (store._engine, SqlAgent),
+        (store._engine, SqlConversationMetadata),
+        (store._conv_engine, SqlConversation),
+    ]:
+        with engine.connect() as connection:
+            assert connection.scalar(sa.select(sa.func.count()).select_from(model)) == 0
+
+
+@pytest.mark.parametrize("as_text", [False, True])
+def test_legacy_snapshot_reads_and_inherits_compression(
+    store: SqlAlchemyConversationStore, as_text: bool
+) -> None:
+    if as_text and store._engine.dialect.name != "sqlite":
+        pytest.skip("SQLite permits legacy TEXT values in binary columns")
+    snapshot = _snapshot()
+    source = _create_session(store, bundled=False)
+    raw = json.dumps(snapshot)
+    with store._engine.begin() as connection:
+        connection.execute(
+            sa.text("UPDATE omnigent_conversation_metadata SET inference_snapshot = :value"),
+            {"value": raw if as_text else raw.encode()},
+        )
+    fetched = store.get_conversation(source.id)
+    assert fetched is not None and fetched.inference_snapshot == snapshot
+    child = _create_session(store, bundled=False, parent_id=source.id)
+    fork = store.fork_conversation(source.id)
+    for session in (child, fork):
+        assert session.inference_snapshot == snapshot
+        with store._engine.connect() as connection:
+            saved = connection.scalar(
+                sa.select(
+                    sa.type_coerce(SqlConversationMetadata.inference_snapshot, sa.LargeBinary)
+                ).where(SqlConversationMetadata.id == session.id)
+            )
+        assert saved == encode(raw)
+
+
+def test_oversized_legacy_snapshot_cannot_create_child_or_fork(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    if store._engine.dialect.name == "mysql":
+        pytest.skip("MySQL BLOB cannot contain an oversized legacy value")
+    source = _create_session(store, bundled=False)
+    raw = json.dumps({"catalog": random.Random(0).randbytes(100_000).hex()})
+    with store._engine.begin() as connection:
+        connection.execute(
+            sa.text("UPDATE omnigent_conversation_metadata SET inference_snapshot = :value"),
+            {"value": raw.encode()},
+        )
+    for bundled in (False, True):
+        with pytest.raises(OmnigentError, match="compressed storage limit"):
+            _create_session(store, bundled=bundled, parent_id=source.id)
+    with pytest.raises(OmnigentError, match="compressed storage limit"):
+        store.fork_conversation(source.id)
+    with store._conv_engine.connect() as connection:
+        assert connection.scalar(sa.select(sa.func.count()).select_from(SqlConversation)) == 1
 
 
 @pytest.mark.parametrize("bundled", [False, True], ids=["existing-agent", "bundle"])

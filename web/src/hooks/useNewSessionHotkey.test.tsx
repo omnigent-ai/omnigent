@@ -24,26 +24,45 @@ function press(init: KeyboardEventInit, target: HTMLElement = document.body): Ke
 
 describe("isNewSessionHotkey", () => {
   it("uses Cmd on macOS and Ctrl on other platforms", () => {
-    expect(isNewSessionHotkey(event({ key: "n", metaKey: true }), true)).toBe(true);
-    expect(isNewSessionHotkey(event({ key: "n", ctrlKey: true }), true)).toBe(false);
-    expect(isNewSessionHotkey(event({ key: "n", ctrlKey: true }), false)).toBe(true);
-    expect(isNewSessionHotkey(event({ key: "n", metaKey: true }), false)).toBe(false);
+    expect(isNewSessionHotkey(event({ code: "KeyN", metaKey: true, altKey: true }), true)).toBe(
+      true,
+    );
+    expect(isNewSessionHotkey(event({ code: "KeyN", ctrlKey: true, altKey: true }), true)).toBe(
+      false,
+    );
+    expect(isNewSessionHotkey(event({ code: "KeyN", ctrlKey: true, altKey: true }), false)).toBe(
+      true,
+    );
+    expect(isNewSessionHotkey(event({ code: "KeyN", metaKey: true, altKey: true }), false)).toBe(
+      false,
+    );
   });
 
   it("rejects modified chords and unrelated keys", () => {
-    expect(isNewSessionHotkey(event({ key: "n", metaKey: true, shiftKey: true }), true)).toBe(
+    expect(
+      isNewSessionHotkey(
+        event({ code: "KeyN", metaKey: true, altKey: true, shiftKey: true }),
+        true,
+      ),
+    ).toBe(false);
+    expect(isNewSessionHotkey(event({ code: "KeyN", ctrlKey: true }), false)).toBe(false);
+    expect(isNewSessionHotkey(event({ code: "KeyM", metaKey: true, altKey: true }), true)).toBe(
       false,
     );
-    expect(isNewSessionHotkey(event({ key: "n", ctrlKey: true, altKey: true }), false)).toBe(false);
-    expect(isNewSessionHotkey(event({ key: "m", metaKey: true }), true)).toBe(false);
+  });
+
+  it("matches the physical N key when Alt remaps its character", () => {
+    expect(
+      isNewSessionHotkey(event({ key: "˜", code: "KeyN", metaKey: true, altKey: true }), true),
+    ).toBe(true);
   });
 });
 
 describe("useNewSessionHotkey", () => {
-  it("navigates to the shared new-session route and claims Ctrl+N", () => {
+  it("navigates to the shared new-session route and claims Ctrl+Alt+N", () => {
     renderHook(() => useNewSessionHotkey(true, false));
 
-    const e = press({ key: "n", ctrlKey: true });
+    const e = press({ code: "KeyN", ctrlKey: true, altKey: true });
 
     expect(navigate).toHaveBeenCalledWith("/");
     expect(e.defaultPrevented).toBe(true);
@@ -55,7 +74,7 @@ describe("useNewSessionHotkey", () => {
     document.body.appendChild(input);
     input.focus();
 
-    press({ key: "N", ctrlKey: true }, input);
+    press({ code: "KeyN", ctrlKey: true, altKey: true }, input);
 
     expect(navigate).toHaveBeenCalledWith("/");
   });
@@ -63,7 +82,7 @@ describe("useNewSessionHotkey", () => {
   it("ignores auto-repeat", () => {
     renderHook(() => useNewSessionHotkey(true, false));
 
-    press({ key: "n", ctrlKey: true, repeat: true });
+    press({ code: "KeyN", ctrlKey: true, altKey: true, repeat: true });
 
     expect(navigate).not.toHaveBeenCalled();
   });
@@ -71,7 +90,7 @@ describe("useNewSessionHotkey", () => {
   it("leaves the shortcut to the host page when disabled", () => {
     renderHook(() => useNewSessionHotkey(false, false));
 
-    const e = press({ key: "n", ctrlKey: true });
+    const e = press({ code: "KeyN", ctrlKey: true, altKey: true });
 
     expect(navigate).not.toHaveBeenCalled();
     expect(e.defaultPrevented).toBe(false);

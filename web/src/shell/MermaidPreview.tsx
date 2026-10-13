@@ -5,14 +5,17 @@
 
 import { mermaid } from "@streamdown/mermaid";
 import { Streamdown } from "streamdown";
+import { MERMAID_STREAMDOWN_PROPS } from "@/components/ai-elements/MermaidBlock";
 import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";
-import { MERMAID_STREAMDOWN_OPTIONS } from "@/components/ai-elements/MermaidError";
+import { mermaidOptionsForTheme } from "@/components/ai-elements/MermaidError";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { fenceForBody } from "./markdownFence";
 
 const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
 
 /** Render mermaid `source` (the diagram body, no fence) as an SVG diagram. */
 export function MermaidPreview({ source }: { source: string }) {
+  const themeMode = useResolvedThemeMode();
   const trimmed = source.replace(/\n$/, "");
   // Fence with more backticks than any run in the source, so a ``` line inside
   // the diagram can't close the wrapper early and spill out as plain markdown.
@@ -20,12 +23,13 @@ export function MermaidPreview({ source }: { source: string }) {
   return (
     <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
       <MarkdownErrorBoundary source={source}>
-        {/* key by source: mermaid renders async with no cancellation, so remount
-            on each settled source to discard a superseded in-flight render. */}
+        {/* Mermaid renders async with no cancellation. Remount on source or theme
+            changes to discard a superseded in-flight render. */}
         <Streamdown
-          key={trimmed}
+          {...MERMAID_STREAMDOWN_PROPS}
+          key={`${themeMode}:${trimmed}`}
           plugins={MERMAID_STREAMDOWN_PLUGINS}
-          mermaid={MERMAID_STREAMDOWN_OPTIONS}
+          mermaid={mermaidOptionsForTheme(themeMode)}
         >
           {`${fence}mermaid\n${trimmed}\n${fence}`}
         </Streamdown>

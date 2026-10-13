@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 
@@ -29,9 +30,11 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.pi_executor import (
     PiExecutor,
+    PiSubprocessConfig,
     _build_models_json,
     _databricks_model_wire_catalog,
     _generate_extension_js,
+    _only_configured_family,
     _pi_provider_for_model,
     _PiRpcSession,
     _redact_argv_for_log,
@@ -696,6 +699,170 @@ class TestBuildModelsJson(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+def test_anthropic_only_family_routes_non_claude_model_to_anthropic_surface():
+    # A provider configuring only an anthropic family (a vendor whose
+    # anthropic-wire endpoint also fronts non-Claude-named models, e.g.
+    # moonshot serving kimi at /anthropic) must route a non-claude model to
+    # that configured surface. Routing by name token instead sent the model
+    # to the completions provider against a fabricated /serving-endpoints
+    # path that only exists on a Databricks workspace, so the vendor
+    # answered 404 url.not_found.
+    result = _build_models_json(
+        "https://api.moonshot.ai",
+        "tok",
+        {"claude": "https://api.moonshot.ai/anthropic"},
+        model="kimi-k2.7-code",
+    )
+    p = result["providers"]
+    anthropic_ids = [e.get("id") for e in p["databricks-anthropic"]["models"]]
+    assert "kimi-k2.7-code" in anthropic_ids
+    assert p["databricks-anthropic"]["baseUrl"] == "https://api.moonshot.ai/anthropic"
+    for name, provider in p.items():
+        if name != "databricks-anthropic":
+            ids = [e.get("id") for e in provider.get("models", [])]
+            assert "kimi-k2.7-code" not in ids, name
+
+
+def test_openai_only_family_routes_claude_named_model_to_openai_surface():
+    # Symmetric: a provider configuring only an openai family that serves a
+    # Claude-named id (a LiteLLM-style passthrough) must keep that model on
+    # the configured openai surface. The name heuristic sent it to the
+    # anthropic provider against a fabricated /serving-endpoints/anthropic
+    # path. Configured families win over name tokens in both directions.
+    result = _build_models_json(
+        "https://gw.example.com",
+        "tok",
+        {"openai": "https://gw.example.com/v1"},
+        model="claude-k2.7",
+    )
+    p = result["providers"]
+    completions_ids = [e.get("id") for e in p["databricks-completions"]["models"]]
+    assert "claude-k2.7" in completions_ids
+    anthropic_ids = [e.get("id") for e in p["databricks-anthropic"]["models"]]
+    assert "claude-k2.7" not in anthropic_ids
+
+
+def test_databricks_claude_only_gateway_keeps_gpt_on_responses_surface():
+    # The cli-config Databricks path serializes only the gateway's Anthropic
+    # surface (workflow._apply_cli_config_databricks_to_pi), yet the same
+    # workspace serves GPT on the derived /ai-gateway/codex/v1 Responses
+    # surface. One *serialized* family is not one *served* surface there, so
+    # a lone Databricks URL must not pin an explicit GPT override onto the
+    # Anthropic Messages endpoint.
+    result = _build_models_json(
+        "https://ws.cloud.databricks.com",
+        "tok",
+        {"claude": "https://ws.cloud.databricks.com/ai-gateway/anthropic"},
+        model="databricks-gpt-5-5",
+    )
+    p = result["providers"]
+    responses_ids = [e.get("id") for e in p["databricks-openai"]["models"]]
+    assert "databricks-gpt-5-5" in responses_ids
+    assert (
+        p["databricks-openai"]["baseUrl"] == "https://ws.cloud.databricks.com/ai-gateway/codex/v1"
+    )
+    anthropic_ids = [e.get("id") for e in p["databricks-anthropic"]["models"]]
+    assert "databricks-gpt-5-5" not in anthropic_ids
+    # Claude keeps the configured gateway surface.
+    assert (
+        p["databricks-anthropic"]["baseUrl"]
+        == "https://ws.cloud.databricks.com/ai-gateway/anthropic"
+    )
+
+
+@pytest.mark.parametrize(
+    ("base_urls", "expected"),
+    [
+        # Generic single-family vendors pin, in both directions.
+        ({"claude": "https://api.moonshot.ai/anthropic"}, "claude"),
+        ({"openai": "https://gw.example.com/v1"}, "openai"),
+        # Both families (or neither) configured: routing unchanged.
+        ({"claude": "https://a.example.com", "openai": "https://b.example.com/v1"}, None),
+        ({"claude": ""}, None),
+        ({}, None),
+        (None, None),
+        # A lone Databricks gateway URL never pins: workspace-hosted path form
+        # and dedicated ai-gateway host form.
+        ({"claude": "https://ws.cloud.databricks.com/ai-gateway/anthropic"}, None),
+        ({"openai": "https://ws.cloud.databricks.com/ai-gateway/codex/v1"}, None),
+        ({"claude": "https://ws.ai-gateway.cloud.databricks.com/anthropic"}, None),
+    ],
+)
+def test_only_configured_family_pins_generic_vendors_only(base_urls, expected):
+    assert _only_configured_family(base_urls) == expected
+
+
+@pytest.mark.parametrize(
+    ("base_urls", "model", "expected_provider"),
+    [
+        # Generic anthropic-only vendor fronting a non-Claude id.
+        (
+            {"claude": "https://api.moonshot.ai/anthropic"},
+            "kimi-k2.7-code",
+            "databricks-anthropic",
+        ),
+        # Generic openai-only passthrough serving a Claude-named id.
+        ({"openai": "https://gw.example.com/v1"}, "claude-k2.7", "databricks-completions"),
+        # Databricks cli-config shape: lone claude URL, explicit GPT override
+        # stays on the Responses surface.
+        (
+            {"claude": "https://ws.cloud.databricks.com/ai-gateway/anthropic"},
+            "databricks-gpt-5-5",
+            "databricks-openai",
+        ),
+    ],
+)
+def test_ensure_rpc_launch_selector_matches_registration(base_urls, model, expected_provider):
+    """The launch-time ``provider/<model>`` selector agrees with models.json.
+
+    Drives the REAL ``_ensure_rpc`` for a gateway executor with only the
+    subprocess spawn stubbed and checks the selector handed to
+    ``_PiRpcSession.start`` names the same provider ``_build_models_json``
+    registered the model under, so the two decision points cannot drift.
+    """
+    lone_url = next(iter(base_urls.values()))
+    parsed = urlparse(lone_url)
+    host = f"{parsed.scheme}://{parsed.netloc}"
+
+    registered = _build_models_json(host, "tok", base_urls, model=model)["providers"]
+    assert model in [e.get("id") for e in registered[expected_provider]["models"]]
+    for name, provider in registered.items():
+        if name != expected_provider:
+            assert model not in [e.get("id") for e in provider["models"]], name
+
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.inner.pi_executor._fetch_shell_command_token", return_value="tok"),
+    ):
+        executor = PiExecutor(
+            gateway=True,
+            gateway_host=host,
+            base_urls_override=base_urls,
+            gateway_auth_command="printf tok",
+        )
+
+    seen: dict[str, object] = {}
+
+    async def fake_start(self, pi_path, **kwargs):
+        seen["model"] = kwargs.get("model")
+
+    async def _test():
+        with (
+            patch.object(_PiRpcSession, "start", fake_start),
+            patch.object(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={})),
+            patch.object(
+                executor,
+                "_build_env_and_dir",
+                return_value=PiSubprocessConfig(env={}, tmp_dir="", extra_args=[]),
+            ),
+        ):
+            await executor._ensure_rpc("session", "system", model, [])
+
+    _run(_test())
+
+    assert seen["model"] == f"{expected_provider}/{model}"
+
+
 class TestGenerateExtensionJs(unittest.TestCase):
     def test_contains_tool_names(self):
         schemas = [
@@ -1017,7 +1184,8 @@ class TestToolServer(unittest.TestCase):
             server = _ToolServer()
             await server.start()
 
-            async def executor(name, args):
+            async def executor(name, args, *, call_id=None):
+                self.assertEqual(call_id, "call-1")
                 return {
                     "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
                     "tags": {1, 2, 3},
@@ -1364,6 +1532,7 @@ class TestPiRpcSession(unittest.TestCase):
             payload = "x" * (70 * 1024)
             event = {
                 "type": "tool_execution_end",
+                "toolCallId": "pi_add",
                 "toolName": "large_result",
                 "isError": False,
                 "result": {"content": payload},
@@ -2028,11 +2197,17 @@ class TestRunTurn(unittest.TestCase):
             lines = [
                 json.dumps({"type": "response", "success": True}),
                 json.dumps(
-                    {"type": "tool_execution_start", "toolName": "add", "args": {"a": 1, "b": 2}}
+                    {
+                        "type": "tool_execution_start",
+                        "toolCallId": "pi_add",
+                        "toolName": "add",
+                        "args": {"a": 1, "b": 2},
+                    }
                 ),
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "add",
                         "isError": False,
                         "result": {"sum": 3},
@@ -2325,6 +2500,7 @@ class TestRunTurn(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "fail_tool",
                         "isError": True,
                         "result": "Something broke",
@@ -2485,6 +2661,7 @@ class TestRunTurn(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "sys_os_shell",
                         "isError": False,
                         "result": {"content": [{"type": "text", "text": "ok"}]},
@@ -2569,6 +2746,192 @@ def _executor_with_scripted_rpc(lines: list[str], model: str | None = None) -> P
 
     executor._ensure_rpc = fake_ensure_rpc
     return executor
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+async def test_pi_native_tool_results_survive_adapter_and_persistence(is_error: bool) -> None:
+    """Native results pair by Pi ID, including overlapping calls of the same tool."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes._sessions.helpers import _extract_persistent_item_from_sse
+
+    starts = [
+        {
+            "type": "tool_execution_start",
+            "toolCallId": cid,
+            "toolName": "read",
+            "args": {"path": cid},
+        }
+        for cid in ("read_a", "read_b")
+    ]
+    ends = [
+        {
+            "type": "tool_execution_end",
+            "toolCallId": cid,
+            "toolName": "read",
+            "isError": is_error,
+            "result": {"content": [{"type": "text", "text": f"result_{cid}"}]},
+        }
+        for cid in ("read_b", "read_a")
+    ]
+    executor = _executor_with_scripted_rpc(
+        [json.dumps(e) for e in [*starts, *ends, {"type": "agent_end", "messages": []}]]
+    )
+    adapter = ExecutorAdapter(lambda: executor, harness_label="Pi")
+    queue = asyncio.Queue()
+    ctx = TurnContext("turn_pi", queue, asyncio.Event())
+    persisted = []
+    live = []
+    async for event in executor.run_turn([{"role": "user", "content": "read files"}], [], ""):
+        adapter._translate_event(event, ctx)
+        while not queue.empty():
+            wire = queue.get_nowait().model_dump()
+            live.append(wire["item"])
+            item = _extract_persistent_item_from_sse(wire, response_id=ctx.response_id)
+            if item is not None:
+                persisted.append(item)
+
+    assert [item["status"] for item in live[:2]] == ["in_progress", "in_progress"]
+    assert [(item.type, item.data.call_id) for item in persisted] == [
+        ("function_call", "read_b"),
+        ("function_call_output", "read_b"),
+        ("function_call", "read_a"),
+        ("function_call_output", "read_a"),
+    ]
+    assert all(item.response_id == "turn_pi" for item in persisted)
+    for item in persisted:
+        if item.type == "function_call_output":
+            assert f"result_{item.data.call_id}" in item.data.output
+    assert not adapter._pending_mcp_call_ids
+    assert not adapter._observed_tool_calls
+
+
+@pytest.mark.parametrize("callback_first", [False, True])
+async def test_pi_bridge_correlates_out_of_order_tcp_and_stdout(callback_first: bool) -> None:
+    """TCP callbacks keep their own IDs even before stdout or in reverse call order."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes._sessions.helpers import _extract_persistent_item_from_sse
+
+    starts = [
+        {
+            "type": "tool_execution_start",
+            "toolCallId": cid,
+            "toolName": "sys_os_shell",
+            "args": {"command": cid},
+        }
+        for cid in ("shell_a", "shell_b")
+    ]
+    ends = [
+        {
+            "type": "tool_execution_end",
+            "toolCallId": cid,
+            "toolName": "sys_os_shell",
+            "result": {"result": cid},
+        }
+        for cid in ("shell_b", "shell_a")
+    ]
+    executor = _executor_with_scripted_rpc(
+        [json.dumps(e) for e in [*starts, *ends, {"type": "agent_end", "messages": []}]]
+    )
+    adapter = ExecutorAdapter(lambda: executor, harness_label="Pi")
+    queue = asyncio.Queue()
+    ctx = TurnContext("turn_pi", queue, asyncio.Event())
+    adapter._current_ctx = ctx
+    adapter._current_agent = "Pi"
+    server = _ToolServer()
+    server._tool_executor = adapter._stable_tool_executor
+    await server.start()
+    stream = executor.run_turn(
+        [{"role": "user", "content": "run commands"}], [{"name": "sys_os_shell"}], ""
+    )
+    wire_events = []
+
+    async def call_tool(cid: str) -> dict:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        try:
+            writer.write(
+                (
+                    json.dumps(
+                        {
+                            "id": f"tcp_{cid}",
+                            "token": server.token,
+                            "call_id": cid,
+                            "tool": "sys_os_shell",
+                            "args": {"command": cid},
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+            await writer.drain()
+            return json.loads(await asyncio.wait_for(reader.readline(), timeout=5))
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def dispatch(cid: str) -> None:
+        task = asyncio.create_task(call_tool(cid))
+        try:
+            while True:
+                wire = (await asyncio.wait_for(queue.get(), timeout=5)).model_dump()
+                wire_events.append(wire)
+                item = wire["item"]
+                if item.get("status") == "action_required":
+                    assert item["call_id"] == cid
+                    assert json.loads(item["arguments"]) == {"command": cid}
+                    break
+            assert ctx._complete_tool(cid, json.dumps({"result": cid}))
+            response = await asyncio.wait_for(task, timeout=5)
+            assert response == {"id": f"tcp_{cid}", "result": {"result": cid}}
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        if not callback_first:
+            for _ in starts:
+                adapter._translate_event(await anext(stream), ctx)
+        for cid in ("shell_b", "shell_a"):
+            await dispatch(cid)
+        async for event in stream:
+            adapter._translate_event(event, ctx)
+        while not queue.empty():
+            wire_events.append(queue.get_nowait().model_dump())
+    finally:
+        await stream.aclose()
+        await server.stop()
+
+    persisted = [
+        item
+        for wire in wire_events
+        if (item := _extract_persistent_item_from_sse(wire, response_id=ctx.response_id))
+        is not None
+    ]
+    assert [(item.type, item.data.call_id) for item in persisted] == [
+        ("function_call", "shell_b"),
+        ("function_call_output", "shell_b"),
+        ("function_call", "shell_a"),
+        ("function_call_output", "shell_a"),
+    ]
+    assert not adapter._pending_mcp_call_ids
+    assert not adapter._observed_tool_calls
+    if callback_first:
+        assert not any(wire["item"].get("status") == "in_progress" for wire in wire_events)
+
+
+@pytest.mark.parametrize("call_id", [None, "", 123])
+async def test_pi_ignores_tool_events_without_correlation_id(call_id) -> None:
+    """Malformed tool events must not create cards whose results can never pair."""
+    executor = _executor_with_scripted_rpc(
+        [
+            json.dumps({"type": kind, "toolCallId": call_id, "toolName": "read"})
+            for kind in ("tool_execution_start", "tool_execution_end")
+        ]
+        + [json.dumps({"type": "agent_end", "messages": []})]
+    )
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "read"}], [], "")]
+    assert not any(isinstance(e, (ToolCallRequest, ToolCallComplete)) for e in events)
 
 
 def test_pi_thinking_deltas_stream_as_reasoning_chunks() -> None:
@@ -2934,6 +3297,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "ping",
                         "isError": True,
                         "result": {"blocked": True, "reason": "Policy blocked it"},
@@ -2956,6 +3320,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "ping",
                         "isError": True,
                         "result": {"content": [{"type": "text", "text": blocked_json}]},
@@ -2977,6 +3342,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "ping",
                         "isError": True,
                         "result": json.dumps({"blocked": True, "reason": "Denied"}),
@@ -2999,6 +3365,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "ping",
                         "isError": False,  # top-level is False!
                         "result": {
@@ -3023,6 +3390,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "fail",
                         "isError": True,
                         "result": "Connection refused",
@@ -3167,7 +3535,7 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
     the shared Databricks default instead of ``None``.
 
     Failure means pi falls back to its own host default — an
-    Anthropic-direct id the Databricks AI gateway rejects, surfacing as a
+    Anthropic-direct id the Databricks Unity Gateway rejects, surfacing as a
     model error on the agent's first turn.
 
     Live discovery is stubbed unavailable so the resolver drops to the bundled
@@ -3860,9 +4228,11 @@ def test_redact_argv_for_log_hides_equals_joined_system_prompt() -> None:
         assert "/tmp/ext.js" in redacted
 
 
-def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
-    """``_PiRpcSession.start`` must not write the full ``--append-system-prompt``
-    value to the debug log; it should be redacted to a length placeholder.
+@pytest.mark.parametrize("system_prompt_mode", ["append", "replace"])
+def test_rpc_start_log_does_not_leak_system_prompt(
+    monkeypatch, caplog, system_prompt_mode
+) -> None:
+    """``_PiRpcSession.start`` must redact prompt values to a length placeholder.
 
     Guards F92: the old code logged ``" ".join(args)`` verbatim, leaking the
     entire system prompt into debug logs.
@@ -3886,6 +4256,7 @@ def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
             env={"PATH": "/usr/bin"},
             model="some-model",
             system_prompt=test_prompt,
+            system_prompt_mode=system_prompt_mode,
             extra_args=["--extension", "/tmp/ext.js"],
         )
         await rpc.close()
@@ -3906,7 +4277,10 @@ def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
     assert "--extension" in spawn_line
 
 
-def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog) -> None:
+@pytest.mark.parametrize("system_prompt_mode", ["append", "replace"])
+def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(
+    monkeypatch, caplog, system_prompt_mode
+) -> None:
     """The normal ``PiExecutor.run_turn`` path must pass the system prompt to
     Pi without leaking it into the spawn debug log.
 
@@ -3941,7 +4315,7 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog
     monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
 
     async def _test():
-        executor = PiExecutor(pi_path="/usr/bin/pi")
+        executor = PiExecutor(pi_path="/usr/bin/pi", system_prompt_mode=system_prompt_mode)
         try:
             return [
                 e
@@ -3962,8 +4336,14 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog
     assert turn_complete[0].response == "hi"
 
     argv = captured["argv"]
-    assert "--append-system-prompt" in argv
-    assert argv[argv.index("--append-system-prompt") + 1] == test_prompt
+    prompt_flag = (
+        "--system-prompt" if system_prompt_mode == "replace" else "--append-system-prompt"
+    )
+    assert argv[argv.index(prompt_flag) + 1] == test_prompt
+    if system_prompt_mode == "replace":
+        assert argv[argv.index("--append-system-prompt") + 1] == ""
+    else:
+        assert "--system-prompt" not in argv
 
     spawn_logs = [
         r.getMessage() for r in caplog.records if "PiExecutor: spawning" in r.getMessage()
@@ -3973,8 +4353,23 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog
 
     assert test_prompt not in spawn_line
     assert f"[system prompt {len(test_prompt)} chars]" in spawn_line
-    assert "--append-system-prompt" in spawn_line
+    assert prompt_flag in spawn_line
     assert "--mode" in spawn_line
+
+
+def test_executor_rejects_invalid_system_prompt_mode() -> None:
+    with pytest.raises(ValueError, match="system_prompt_mode must be 'append' or 'replace'"):
+        PiExecutor(pi_path="/fake/pi", system_prompt_mode="invalid")
+
+
+@pytest.mark.parametrize("prompt", [None, "", " \n "])
+def test_rpc_replace_rejects_empty_prompt(prompt: str | None) -> None:
+    async def _test():
+        rpc = _PiRpcSession()
+        with pytest.raises(ValueError, match="requires non-empty instructions"):
+            await rpc.start("/fake/pi", env={}, system_prompt=prompt, system_prompt_mode="replace")
+
+    _run(_test())
 
 
 def test_run_turn_spawn_env_has_no_host_secrets(monkeypatch) -> None:
@@ -4845,3 +5240,502 @@ def test_run_turn_prompt_command_includes_streaming_behavior():
         "residual race against a still-alive Pi process queues instead of "
         f"surfacing the raw protocol error; got {cmd!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Settled turn boundary (pi >= 0.80.4): only ``agent_settled`` ends the turn.
+# ---------------------------------------------------------------------------
+
+_SETTLED_PI_VERSION = (0, 85, 1)
+_SESSION_KEY = "s1"
+_RETRYABLE_503 = "503 Service Unavailable: upstream overloaded, please retry"
+
+
+def _rpc_frame(**event) -> str:
+    return json.dumps(event)
+
+
+def _text_delta_frame(text: str) -> str:
+    return _rpc_frame(
+        type="message_update",
+        assistantMessageEvent={"type": "text_delta", "delta": text},
+    )
+
+
+def _assistant_message(
+    text: str = "", *, stop_reason: str = "stop", error_message: str | None = None
+) -> dict:
+    message: dict = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}] if text else [],
+        "stopReason": stop_reason,
+    }
+    if error_message is not None:
+        message["errorMessage"] = error_message
+    return message
+
+
+def _session_executor(
+    lines: list[str], *, pi_version: tuple[int, int, int] | None = _SETTLED_PI_VERSION
+) -> tuple[PiExecutor, _PiRpcSession]:
+    """Executor with one live RPC session whose fake pi replays *lines*; the
+    *pi_version* probe result selects the turn boundary."""
+    from omnigent.inner.pi_executor import _PiSessionState
+
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi_native.main.pi_version", return_value=pi_version),
+    ):
+        executor = PiExecutor()
+    rpc = _PiRpcSession()
+    rpc._line_queue = asyncio.Queue()
+    rpc.process = _FakeProcess()
+    rpc._stderr_lines = []
+    for line in lines:
+        rpc._line_queue.put_nowait(line)
+    executor._session_states[_SESSION_KEY] = _PiSessionState(
+        rpc=rpc, system_prompt="system", model=None
+    )
+    return executor, rpc
+
+
+async def _run_session_turn(executor: PiExecutor, prompt: str) -> list:
+    messages = [{"role": "user", "content": prompt, "session_id": _SESSION_KEY}]
+    return [event async for event in executor.run_turn(messages, [], "system")]
+
+
+def _assert_session_evicted(executor: PiExecutor, rpc: _PiRpcSession) -> None:
+    assert _SESSION_KEY not in executor._session_states, "the RPC session was kept"
+    # ``_PiRpcSession.close`` terminates the process and then clears it.
+    assert rpc.process is None, "the pi process was not closed"
+
+
+def _retry_recovery_frames(recovered: str) -> list[str]:
+    """pi's frame sequence for a 503 that its automatic retry recovers from."""
+    errored = _assistant_message(stop_reason="error", error_message=_RETRYABLE_503)
+    return [
+        _rpc_frame(type="response", success=True),
+        _rpc_frame(type="agent_start"),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _rpc_frame(type="message_end", message=errored),
+        _rpc_frame(type="agent_end", messages=[errored], willRetry=True),
+        _rpc_frame(
+            type="auto_retry_start",
+            attempt=1,
+            maxAttempts=3,
+            delayMs=2000,
+            errorMessage=_RETRYABLE_503,
+        ),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _text_delta_frame(recovered),
+        _rpc_frame(type="message_end", message=_assistant_message(recovered)),
+        _rpc_frame(type="auto_retry_end", success=True, attempt=1),
+        _rpc_frame(type="agent_end", messages=[_assistant_message(recovered)], willRetry=False),
+        _rpc_frame(type="agent_settled"),
+    ]
+
+
+def _plain_answer_frames(answer: str) -> list[str]:
+    return [
+        _rpc_frame(type="response", success=True),
+        _rpc_frame(type="agent_start"),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _text_delta_frame(answer),
+        _rpc_frame(type="message_end", message=_assistant_message(answer)),
+        _rpc_frame(type="agent_end", messages=[_assistant_message(answer)], willRetry=False),
+        _rpc_frame(type="agent_settled"),
+    ]
+
+
+def test_constructor_probes_pi_version_once() -> None:
+    """The version gate reuses the single ``pi --version`` probe."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.harnesses.pi_native.main.pi_version", return_value=_SETTLED_PI_VERSION
+        ) as probe,
+    ):
+        executor = PiExecutor()
+    assert probe.call_count == 1
+    assert "--approve" in executor._extra_args
+
+
+def test_settled_turn_returns_recovered_answer_after_auto_retry() -> None:
+    """A retryable provider error followed by pi's own recovery completes
+    the turn with the recovered answer instead of the abandoned error."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(_retry_recovery_frames("RECOVERED"))
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["RECOVERED"]
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "RECOVERED"
+        assert rpc._line_queue.empty(), "recovery frames were left for the next turn"
+        assert _SESSION_KEY in executor._session_states
+
+    _run(_test())
+
+
+def test_settled_next_turn_reads_only_its_own_frames() -> None:
+    """On a persistent session the turn after a retry-recovered one must
+    not consume the earlier turn's leftover recovery frames."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            _retry_recovery_frames("FIRST") + _plain_answer_frames("SECOND")
+        )
+
+        first_events = await _run_session_turn(executor, "first")
+        second_events = await _run_session_turn(executor, "second")
+
+        assert not any(isinstance(e, ExecutorError) for e in first_events + second_events)
+        first_complete = [e for e in first_events if isinstance(e, TurnComplete)]
+        assert [t.response for t in first_complete] == ["FIRST"]
+        assert [e.text for e in second_events if isinstance(e, TextChunk)] == ["SECOND"]
+        second_complete = [e for e in second_events if isinstance(e, TurnComplete)]
+        assert [t.response for t in second_complete] == ["SECOND"]
+        assert rpc._line_queue.empty()
+
+    _run(_test())
+
+
+def test_settled_error_without_retry_fails_after_settlement() -> None:
+    """A provider error pi does not retry is reported once every terminal
+    frame, including ``agent_settled``, has been consumed."""
+
+    async def _test() -> None:
+        errored = _assistant_message(stop_reason="error", error_message="Rate limited")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(type="message_end", message=errored),
+                _rpc_frame(type="agent_end", messages=[errored], willRetry=False),
+                _rpc_frame(type="agent_settled"),
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [type(e) for e in events] == [ExecutorError]
+        assert events[0].message == "Rate limited"
+        assert rpc._line_queue.empty(), "agent_settled was left for the next turn"
+        assert _SESSION_KEY in executor._session_states
+
+    _run(_test())
+
+
+def test_settled_failed_message_with_streamed_text_stops_and_evicts() -> None:
+    """When the failed message already streamed text, the turn stops with
+    the error and drops the session instead of appending pi's regenerated
+    answer after the partial one."""
+
+    async def _test() -> None:
+        partial = _assistant_message("partial ", stop_reason="error", error_message=_RETRYABLE_503)
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("partial "),
+                _rpc_frame(type="message_end", message=partial),
+                _rpc_frame(type="agent_end", messages=[partial], willRetry=True),
+                _rpc_frame(
+                    type="auto_retry_start",
+                    attempt=1,
+                    maxAttempts=3,
+                    delayMs=2000,
+                    errorMessage=_RETRYABLE_503,
+                ),
+                *_plain_answer_frames("REGENERATED")[1:],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["partial "]
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == [_RETRYABLE_503]
+        assert not any(isinstance(e, TurnComplete) for e in events)
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_eof_before_settlement_is_an_error() -> None:
+    """pi exiting after ``agent_end`` but before ``agent_settled`` fails the
+    turn; a partial run is not reported as a completed one."""
+
+    async def _test() -> None:
+        answer = _assistant_message("Done")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("Done"),
+                _rpc_frame(type="message_end", message=answer),
+                _rpc_frame(type="agent_end", messages=[answer], willRetry=False),
+            ]
+        )
+        rpc._stderr_lines = ["pi: fatal"]
+        rpc._line_queue.put_nowait(None)  # stdout EOF: the process died.
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["Done"]
+        assert not any(isinstance(e, TurnComplete) for e in events)
+        (error,) = [e for e in events if isinstance(e, ExecutorError)]
+        assert "settled" in error.message
+        assert "pi: fatal" in error.message
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_overflow_compaction_retry_returns_recovered_answer() -> None:
+    """A context-overflow error that pi repairs by compacting and re-running
+    the prompt completes with the recovered answer."""
+
+    async def _test() -> None:
+        overflow = _assistant_message(
+            stop_reason="error", error_message="Context overflow: prompt is too long"
+        )
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(type="message_end", message=overflow),
+                _rpc_frame(type="agent_end", messages=[overflow], willRetry=False),
+                _rpc_frame(type="compaction_start", reason="overflow"),
+                _rpc_frame(
+                    type="compaction_end",
+                    reason="overflow",
+                    result={"summary": "..."},
+                    aborted=False,
+                    willRetry=True,
+                ),
+                *_plain_answer_frames("RECOVERED")[1:],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "RECOVERED"
+        assert rpc._line_queue.empty()
+
+    _run(_test())
+
+
+def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts() -> None:
+    """A truncated answer that already streamed is not followed by the
+    regenerated one pi produces after overflow compaction."""
+
+    async def _test() -> None:
+        truncated = _assistant_message("partial", stop_reason="length")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("partial"),
+                _rpc_frame(type="message_end", message=truncated),
+                _rpc_frame(type="agent_end", messages=[truncated], willRetry=False),
+                _rpc_frame(type="compaction_start", reason="overflow"),
+                _rpc_frame(
+                    type="compaction_end",
+                    reason="overflow",
+                    result={"summary": "..."},
+                    aborted=False,
+                    willRetry=True,
+                ),
+                *_plain_answer_frames("REGENERATED")[1:],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["partial"]
+        assert not any(isinstance(e, TurnComplete) for e in events)
+        assert len([e for e in events if isinstance(e, ExecutorError)]) == 1
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_retry_backoff_longer_than_error_drain_budget_keeps_waiting() -> None:
+    """After ``agent_end(willRetry=true)`` pi is silent during its retry
+    backoff; the short post-error drain budget must not end the turn."""
+
+    async def _test() -> None:
+        errored = _assistant_message(stop_reason="error", error_message=_RETRYABLE_503)
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(type="message_end", message=errored),
+                _rpc_frame(type="agent_end", messages=[errored], willRetry=True),
+                _rpc_frame(
+                    type="auto_retry_start",
+                    attempt=1,
+                    maxAttempts=3,
+                    delayMs=300,
+                    errorMessage=_RETRYABLE_503,
+                ),
+            ]
+        )
+        # A live reader: pi is running, just silent during the backoff.
+        reader = asyncio.create_task(asyncio.sleep(30))
+        rpc._read_task = reader
+
+        async def recover_after_backoff() -> None:
+            await asyncio.sleep(0.3)
+            for line in _plain_answer_frames("RECOVERED")[2:]:
+                rpc._line_queue.put_nowait(line)
+
+        feeder = asyncio.create_task(recover_after_backoff())
+        try:
+            with (
+                patch("omnigent.inner.pi_executor._TURN_STDOUT_IDLE_TIMEOUT_S", 0.05),
+                patch("omnigent.inner.pi_executor._TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S", 0.05),
+            ):
+                events = await _run_session_turn(executor, "hello")
+        finally:
+            feeder.cancel()
+            reader.cancel()
+            await asyncio.gather(feeder, reader, return_exceptions=True)
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "RECOVERED"
+
+    _run(_test())
+
+
+def test_settled_missing_agent_end_after_error_evicts_session() -> None:
+    """pi always follows an errored call with ``agent_end``; when it does not
+    arrive within the drain budget the session is dropped, not reused."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(
+                    type="message_end",
+                    message=_assistant_message(stop_reason="error", error_message="boom"),
+                ),
+            ]
+        )
+        reader = asyncio.create_task(asyncio.sleep(30))
+        rpc._read_task = reader
+        try:
+            with patch("omnigent.inner.pi_executor._TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S", 0.05):
+                events = await _run_session_turn(executor, "hello")
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == ["boom"]
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_aborted_message_evicts_session() -> None:
+    """An aborted message ends the turn and drops the session so the
+    ``agent_end``/``agent_settled`` frames still coming cannot be misread
+    by the next turn."""
+
+    async def _test() -> None:
+        aborted = _assistant_message(stop_reason="aborted", error_message="aborted")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(type="message_end", message=aborted),
+                _rpc_frame(type="agent_end", messages=[aborted], willRetry=False),
+                _rpc_frame(type="agent_settled"),
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [type(e) for e in events] == [ExecutorError]
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_rejected_prompt_evicts_session() -> None:
+    """A prompt pi refuses leaves the session in an unknown state; drop it."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            [_rpc_frame(type="response", success=False, error="Agent is already processing")]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == [
+            "Agent is already processing"
+        ]
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+@pytest.mark.parametrize("pi_version", [(0, 80, 3), None])
+def test_older_or_unknown_pi_keeps_agent_end_boundary(
+    pi_version: tuple[int, int, int] | None,
+) -> None:
+    """Without ``agent_settled`` support the turn still ends at ``agent_end``."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _text_delta_frame("Hi"),
+                _rpc_frame(type="agent_end", messages=[_assistant_message("Hi")]),
+            ],
+            pi_version=pi_version,
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "Hi"
+        assert rpc._line_queue.empty()
+        assert _SESSION_KEY in executor._session_states
+
+    _run(_test())
+
+
+def test_settled_queued_continuation_stays_in_the_turn() -> None:
+    """A follow-up pi queued behind the run continues the same turn: its
+    answer streams after the first one and the turn ends at ``agent_settled``."""
+
+    async def _test() -> None:
+        first = _assistant_message("First. ")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="agent_start"),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("First. "),
+                _rpc_frame(type="message_end", message=first),
+                _rpc_frame(type="agent_end", messages=[first], willRetry=False),
+                *_plain_answer_frames("Second.")[1:],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["First. ", "Second."]
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "First. Second."
+        assert rpc._line_queue.empty()
+
+    _run(_test())

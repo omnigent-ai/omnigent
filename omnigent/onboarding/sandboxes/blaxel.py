@@ -671,6 +671,7 @@ class BlaxelSandboxLauncher(ExecModelHostLauncher):
             file_copy=True,
             streaming_exec=True,
             foreground_exec=True,
+            git_clone_options=super().capabilities.git_clone_options,
         )
 
     def __init__(

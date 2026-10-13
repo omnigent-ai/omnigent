@@ -15,6 +15,19 @@
 // local session, leaving routing to the default.
 
 const _sessionHosts = new Map<string, string>();
+const _hostChangeListeners = new Set<() => void>();
+
+/** Subscribe to host/parent changes so live streams can recheck their effective host. */
+export function subscribeSessionHostChanges(listener: () => void): () => void {
+  _hostChangeListeners.add(listener);
+  return () => {
+    _hostChangeListeners.delete(listener);
+  };
+}
+
+function notifySessionHostChanges(): void {
+  for (const listener of _hostChangeListeners) listener();
+}
 
 /**
  * Record (or clear) the host a session is bound to. Called wherever a session
@@ -22,14 +35,16 @@ const _sessionHosts = new Map<string, string>();
  * that loses its host binding stops routing to the old replica.
  */
 export function setSessionHost(sessionId: string, hostId: string | null | undefined): void {
+  if ((_sessionHosts.get(sessionId) ?? null) === (hostId || null)) return;
   if (hostId) {
     _sessionHosts.set(sessionId, hostId);
   } else {
     _sessionHosts.delete(sessionId);
   }
+  notifySessionHostChanges();
 }
 
-// A sub-agent child runs on its parent's runner, whose tunnel lives on the
+// A sub-agent or side chat runs on its parent's runner, whose tunnel lives on the
 // replica keyed by the PARENT's host — the child row carries no host_id of its
 // own. Recording the parent link lets a child key its traffic by the nearest
 // host-bound ancestor instead of going keyless to the default replica.
@@ -39,16 +54,28 @@ const _sessionParents = new Map<string, string>();
  * Record (or clear) a session's parent so a hostless child resolves its host
  * through the ancestor chain. Called wherever a session object is parsed.
  */
-export function setSessionParent(sessionId: string, parentId: string | null | undefined): void {
-  if (parentId && parentId !== sessionId) {
-    _sessionParents.set(sessionId, parentId);
+export function setSessionParent(
+  sessionId: string,
+  parentId: string | null | undefined,
+  labels?: Record<string, string>,
+): void {
+  // The fork-source fallback supports side chats created by older servers.
+  const routingParent =
+    parentId ??
+    labels?.["omnigent.side_chat.source_id"] ??
+    (labels?.["omnigent.side_chat"] === "1" ? labels["omnigent.fork.source_id"] : null);
+  const nextParent = routingParent && routingParent !== sessionId ? routingParent : null;
+  if ((_sessionParents.get(sessionId) ?? null) === nextParent) return;
+  if (nextParent) {
+    _sessionParents.set(sessionId, nextParent);
   } else {
     _sessionParents.delete(sessionId);
   }
+  notifySessionHostChanges();
 }
 
 /**
- * A session's recorded parent id, or `null` for a top-level session or one
+ * A session's routing parent id, or `null` for an independent session or one
  * whose snapshot hasn't been seen yet.
  */
 export function getSessionParent(sessionId: string): string | null {

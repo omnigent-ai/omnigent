@@ -1,9 +1,9 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
-import { BubbleView } from "./ChatPage";
+import { BubbleView, WorkingIndicator } from "./ChatPage";
 import {
   ConnectionIndicator,
   RunnerStartingIndicator,
@@ -19,7 +19,13 @@ import {
 afterEach(() => {
   // Several tests poke sandboxStatus into the global zustand store; reset it
   // so a leftover launch band can't bleed into the next test.
-  useChatStore.setState({ sandboxStatus: null });
+  useChatStore.setState({
+    sandboxStatus: null,
+    backgroundTaskCount: 0,
+    blockedOn: null,
+    sessionStatus: "idle",
+    status: "idle",
+  });
   cleanup();
 });
 
@@ -159,6 +165,23 @@ describe("RunnerStartingIndicator", () => {
   });
 });
 
+describe("WorkingIndicator", () => {
+  it("stays hidden when only background tasks remain and returns for foreground work", () => {
+    useChatStore.setState({
+      backgroundTaskCount: 1,
+      blockedOn: null,
+      sessionStatus: "idle",
+      status: "idle",
+    });
+    const { rerender } = render(<WorkingIndicator />);
+    expect(screen.queryByTestId("working-indicator")).toBeNull();
+
+    act(() => useChatStore.setState({ sessionStatus: "running" }));
+    rerender(<WorkingIndicator />);
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+  });
+});
+
 describe("BubbleView dispatch", () => {
   beforeEach(() => {
     // Explicitly settled: the fold-only cases below turn on `possiblyLive`
@@ -263,6 +286,7 @@ describe("BubbleView dispatch", () => {
 
     const bubble = screen.getByTestId("message-bubble");
     expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(screen.queryByTestId("turn-worked-fold")).not.toBeInTheDocument();
     expect(bubble).toHaveClass("max-w-full");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(screen.getByTestId("message-timestamp")).toBeInTheDocument();
@@ -326,11 +350,7 @@ describe("BubbleView dispatch", () => {
     continued: true,
   });
 
-  it("gives fold-only turns the same chrome whether or not the hidden trace narrated", () => {
-    // WHY: the copy/fork row keys off ALL the bubble's text, including text
-    // sealed inside the fold — so an otherwise identical collapsed row grew a
-    // row of hover-only chrome purely because its hidden trace happened to
-    // narrate, and consecutive "Worked for" rows sat at two different gaps.
+  it("keeps narration and its actions visible while tool-only turns stay fold-only", () => {
     render(
       <BubbleView
         bubble={foldOnlyBubble([
@@ -340,9 +360,8 @@ describe("BubbleView dispatch", () => {
       />,
     );
     expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
-    // Nothing below the fold: the collapsed row is the bubble's whole height.
-    expect(screen.getByTestId("message-bubble").children).toHaveLength(1);
+    expect(screen.getByText("Let me look at the code.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
     cleanup();
 
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c2"), toolItem("c3")])} />);
@@ -354,11 +373,11 @@ describe("BubbleView dispatch", () => {
   it("spans the column for a fold-only turn so the row's hairline draws", () => {
     // WHY: shrink-wrapped to the ~110px summary row, the trailing hairline
     // (a flex-1 span) collapses to zero width and the click target stops
-    // short of the column. The max-w-3xl cap keeps it aligned with the rule
+    // short of the column. The prose cap keeps it aligned with the rule
     // under an answered turn.
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
     const bubble = screen.getByTestId("message-bubble");
-    expect(bubble).toHaveClass("max-w-3xl", "min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]");
+    expect(bubble).toHaveClass("max-w-[var(--chat-prose-width)]");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(bubble.firstElementChild).not.toHaveClass("w-fit");
   });
@@ -389,6 +408,11 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByTestId("compacting-indicator")).toHaveTextContent(
       "Compacting conversation…",
     );
+  });
+
+  it("renders a completed compaction marker in the transcript", () => {
+    render(<BubbleView bubble={{ kind: "compaction", itemId: "cmp_done" }} />);
+    expect(screen.getByText("Conversation compacted")).toBeInTheDocument();
   });
 
   it("accepts createdAtS timestamp for timer calculation", () => {

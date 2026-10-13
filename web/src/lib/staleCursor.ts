@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { matchQuery, useQueryClient, type Query } from "@tanstack/react-query";
 import { ApiError } from "@/lib/sessionsApi";
 
 /**
@@ -49,8 +49,7 @@ export function useRestartOnStaleCursor(queryKey: readonly unknown[]): void {
   useEffect(() => {
     const cache = queryClient.getQueryCache();
     let restarts = 0;
-    const check = (): void => {
-      const query = cache.find({ queryKey: keyRef.current, exact: true });
+    const check = (query: Query | undefined): void => {
       if (!query) return;
       if (query.state.status === "success") {
         restarts = 0;
@@ -61,7 +60,12 @@ export function useRestartOnStaleCursor(queryKey: readonly unknown[]): void {
       restarts += 1;
       void queryClient.resetQueries({ queryKey: keyRef.current, exact: true });
     };
-    check();
-    return cache.subscribe(check);
+    check(cache.find({ queryKey: keyRef.current, exact: true }));
+    return cache.subscribe((event) => {
+      // Every list hears every cache event; match only the event's query, not the whole cache.
+      if (event.type === "removed") return;
+      if (!matchQuery({ queryKey: keyRef.current, exact: true }, event.query)) return;
+      check(event.query);
+    });
   }, [keyId, queryClient]);
 }

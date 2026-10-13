@@ -105,7 +105,7 @@ def test_synthesize_env_key_openai_honors_openai_base_url(
     """A detected ``OPENAI_API_KEY`` adopts a companion ``OPENAI_BASE_URL``.
 
     The OpenAI SDK reads ``OPENAI_BASE_URL`` to target an OpenAI-compatible
-    gateway (e.g. the Databricks AI gateway). Ambient detection must honor
+    gateway (e.g. the Databricks Unity Gateway). Ambient detection must honor
     it; otherwise the env key is synthesized against ``api.openai.com`` and
     every request 401s — the credential is a gateway token, not an OpenAI
     key. This is the regression guard for that intermittent multi-turn 401.
@@ -388,7 +388,7 @@ def _codex_config_det() -> DetectedProvider:
         family=OPENAI_FAMILY,
         source="~/.codex/config.toml provider 'Databricks'",
         model_provider="Databricks",
-        display_name="Databricks AI Gateway",
+        display_name="Databricks Unity Gateway",
     )
 
 
@@ -404,7 +404,7 @@ def test_synthesize_cli_config_entry() -> None:
             "kind": "cli-config",
             "cli": "codex",
             "model_provider": "Databricks",
-            "display_name": "Databricks AI Gateway",
+            "display_name": "Databricks Unity Gateway",
         }
     }
 

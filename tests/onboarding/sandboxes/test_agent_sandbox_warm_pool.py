@@ -28,7 +28,7 @@ from omnigent.onboarding.sandboxes.agent_sandbox import (
     AgentSandboxLauncher,
 )
 from omnigent.onboarding.sandboxes.base import SandboxGoneError
-from omnigent.onboarding.sandboxes.types import RepoWorkspace
+from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
 
 _NAMESPACE = "original-runners"
 _CLAIM_UID = "377e70bc-61e5-4a4c-b79e-4913d561f496"
@@ -619,14 +619,19 @@ def test_controller_repair_or_missing_ownership_cannot_replace_workspace(
     harness.core.delete_namespaced_pod.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "git_clone", [GitCloneOptions(), GitCloneOptions(50, True, "blob:none", False)]
+)
 def test_start_gates_on_preparation_and_preserves_broker_configuration(
-    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, git_clone: GitCloneOptions
 ) -> None:
     execute = _exec_states(harness, monkeypatch, "waiting", "bound", "preparing", "prepared")
     render = MagicMock(wraps=warm._render_workspace_prep_command)
     monkeypatch.setattr(warm, "_render_workspace_prep_command", render)
     stages: list[str] = []
-    repo = RepoWorkspace("https://github.com/example/repository.git", None, "repository")
+    repo = RepoWorkspace(
+        "https://github.com/example/repository.git", None, "repository", git_clone
+    )
     result = harness.launcher.start_host(
         _HANDLE.encode(),
         **_START_ARGS,
@@ -646,6 +651,16 @@ def test_start_gates_on_preparation_and_preserves_broker_configuration(
     assert _TOKEN not in json.dumps(payload["prepare_command"])
     assert "omnigent.git_credential_github" in payload["prepare_command"][-1]
     assert HOST_TOKEN_ENV_VAR in payload["prepare_command"][-1]
+    if git_clone.depth:
+        assert (
+            "git clone --single-branch --depth 50 --filter=blob:none --no-tags --"
+            in payload["prepare_command"][-1]
+        )
+    else:
+        assert (
+            "git clone -- https://github.com/example/repository.git"
+            in payload["prepare_command"][-1]
+        )
     assert render.call_args.args[-1] == {"profile": "oss"}
     assert [call.args[2] for call in execute.call_args_list].count("status") == 4
 

@@ -62,7 +62,6 @@ Run::
 from __future__ import annotations
 
 import asyncio
-import io
 import ipaddress
 import json
 import os
@@ -70,7 +69,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tarfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -80,6 +78,8 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 import yaml
+
+from tests._helpers.session import bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -312,18 +312,9 @@ def _create_session(base_url: str) -> str:
         "prompt": "You are a test agent.",
         "executor": {"harness": "openai-agents", "model": "gpt-4o-mini"},
     }
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml.safe_dump(cfg).encode()
-        info = tarfile.TarInfo("relay-bind-repro.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    resp = _http.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": "{}"},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
+    data = yaml.safe_dump(cfg).encode()
+    bundle_bytes = bundle_files({"relay-bind-repro.yaml": data})
+    resp = post_session_bundle(_http.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=30.0)
     resp.raise_for_status()
     return str(resp.json()["session_id"])
 

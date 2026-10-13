@@ -36,6 +36,7 @@ from omnigent.server.schemas import ServerStreamEvent
 from ._child_status import child_summary_busy
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._timeouts import _SSE_TIMEOUT
+from ._types import PaginatedList
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
 # ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
@@ -127,9 +128,7 @@ class Session:
     :param agent_id: Durable identifier of the bound agent, e.g.
         ``"ag_abc123"``. Stable across renames of the agent.
     :param agent_name: Human-readable name of the bound agent, e.g.
-        ``"polly"``. Changes when the session is switched to a
-        different agent in place (``POST .../switch-agent``), so
-        attached clients can refresh their displayed agent label.
+        ``"polly"``.
         ``None`` when the server couldn't resolve the agent row.
     :param status: Session lifecycle status. One of ``"idle"``,
         ``"running"``, or ``"failed"``.
@@ -279,6 +278,8 @@ class SessionListItem:
         ``list`` with ``visibility="archived"`` or with
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
+    :param parent_session_id: Parent session for a sub-agent child; ``None``
+        for top-level sessions or when omitted by an older server.
     """
 
     id: str
@@ -295,6 +296,7 @@ class SessionListItem:
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
     archived: bool = False
+    parent_session_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> SessionListItem:
@@ -321,6 +323,7 @@ class SessionListItem:
             external_session_id=raw.get("external_session_id"),
             pending_elicitations_count=raw.get("pending_elicitations_count", 0),
             archived=bool(raw.get("archived", False)),
+            parent_session_id=raw.get("parent_session_id"),
         )
 
 
@@ -496,11 +499,15 @@ class SessionsNamespace:
         not resolvable this way and raises ``LookupError``.
 
         Follows the listing cursor, so an agent past the first page
-        still resolves.
+        still resolves. The only quiet end of the walk is the server
+        reporting ``has_more`` false; a stalled listing raises instead
+        of masquerading as a clean miss.
 
         :param agent_name: Agent display name, e.g. ``"hello_world"``.
         :returns: The matching agent's id and advertised harness.
-        :raises OmnigentError: If the listing returns a non-2xx status.
+        :raises OmnigentError: If the listing returns a non-2xx status,
+            or reports ``has_more`` with a missing or non-advancing
+            ``last_id`` cursor (a stalled walk, not an absent agent).
         :raises LookupError: If no registered agent has that name.
         """
         # Cap the miss-path name list: a large deployment should not
@@ -535,8 +542,22 @@ class SessionsNamespace:
                 break
             last_id = listing.get("last_id")
             if not last_id:
-                break
-            after = str(last_id)
+                # Server reports more pages but provides no cursor to advance
+                # — raise rather than silently stopping, so callers can
+                # distinguish a pagination stall from "agent not found".
+                raise OmnigentError(
+                    f"agent listing stalled: server returned has_more=True but"
+                    f" no last_id cursor (searched so far: {', '.join(names) or '<none>'})"
+                )
+            next_after = str(last_id)
+            if next_after == after:
+                # A cursor that does not advance would page forever; raise
+                # instead of looping on the same page.
+                raise OmnigentError(
+                    f"agent listing stalled: server repeated cursor {next_after!r}"
+                    f" with has_more=True (searched so far: {', '.join(names) or '<none>'})"
+                )
+            after = next_after
         available = ", ".join(names) + (", …" if truncated else "")
         raise LookupError(
             f"No agent named {agent_name!r} is registered on this server. Available: {available}"
@@ -610,6 +631,7 @@ class SessionsNamespace:
         sort_by: str = "created_at",
         include_archived: bool = False,
         visibility: Literal["all", "mine", "shared", "archived"] = "all",
+        kind: Literal["default", "sub_agent", "any"] | None = None,
     ) -> list[SessionListItem]:
         """
         List sessions with cursor-based pagination.
@@ -639,6 +661,9 @@ class SessionsNamespace:
             by the caller. ``"archived"`` returns only archived sessions.
             Without server authentication, ``"mine"`` and ``"shared"``
             behave like ``"all"``. Always sent explicitly to the server.
+        :param kind: ``"default"`` returns top-level sessions,
+            ``"sub_agent"`` returns children, and ``"any"`` includes both.
+            ``None`` leaves the server's top-level-only default unchanged.
         :returns: List of :class:`SessionListItem`.
         :raises StaleCursorError: If ``after``/``before`` names a session
             that has since been deleted. The walk cannot continue from
@@ -661,6 +686,8 @@ class SessionsNamespace:
             params["agent_name"] = agent_name
         if include_archived:
             params["include_archived"] = "true"
+        if kind is not None:
+            params["kind"] = kind
         resp = await self._http.get(
             f"{self._base}/v1/sessions",
             params=params,
@@ -876,7 +903,7 @@ class SessionsNamespace:
         limit: int = 100,
         after: str | None = None,
         order: str = "asc",
-    ) -> builtins.list[dict[str, Any]]:
+    ) -> PaginatedList:
         """
         List items in a session with cursor-based pagination.
 
@@ -890,7 +917,9 @@ class SessionsNamespace:
         :param after: Cursor — return items after this item ID.
         :param order: Sort order, ``"asc"`` (chronological) or
             ``"desc"``.
-        :returns: List of conversation item dicts.
+        :returns: :class:`PaginatedList` with ``data``, ``has_more``,
+            ``first_id``, and ``last_id``.  Pass ``result.last_id`` as
+            ``after=`` to fetch the next page when ``result.has_more``.
         :raises StaleCursorError: If ``after`` names an item that has since
             been deleted. The walk cannot continue from that cursor —
             restart it from the first page with no cursor.
@@ -906,15 +935,15 @@ class SessionsNamespace:
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/items")
-        data = body.get("data", [])
-        return data if isinstance(data, list) else []
+        return PaginatedList.from_dict(body)
 
     async def child_sessions(
         self,
         session_id: str,
         *,
         limit: int = 100,
-    ) -> builtins.list[dict[str, Any]]:
+        after: str | None = None,
+    ) -> PaginatedList:
         """
         List sub-agent (child) sessions under a parent session.
 
@@ -929,19 +958,23 @@ class SessionsNamespace:
             e.g. ``"conv_parent123"``.
         :param limit: Maximum number of children to return
             (1-1000, default 100).
-        :returns: List of child-session summary dicts (empty when the
-            session has no sub-agents).
+        :param after: Cursor — return children after this session ID.
+        :returns: :class:`PaginatedList` with ``data``, ``has_more``,
+            ``first_id``, and ``last_id``.  Pass ``result.last_id`` as
+            ``after=`` to fetch the next page when ``result.has_more``.
         :raises OmnigentError: On non-2xx status (404 when the
             session does not exist).
         """
+        params: dict[str, str | int] = {"limit": limit}
+        if after is not None:
+            params["after"] = after
         resp = await self._http.get(
             f"{self._base}/v1/sessions/{session_id}/child_sessions",
-            params={"limit": limit},
+            params=params,
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/child_sessions")
-        data = body.get("data", [])
-        return data if isinstance(data, list) else []
+        return PaginatedList.from_dict(body)
 
     async def child_sessions_tree(
         self,
@@ -977,8 +1010,8 @@ class SessionsNamespace:
         while frontier and depth < max_depth:
             next_frontier: list[str] = []
             for parent_id in frontier:
-                rows = await self.child_sessions(parent_id, limit=limit)
-                for row in rows:
+                page = await self.child_sessions(parent_id, limit=limit)
+                for row in page.data:
                     if not isinstance(row, dict):
                         continue
                     sid = row.get("id")

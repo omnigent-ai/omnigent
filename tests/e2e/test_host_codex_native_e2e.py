@@ -31,6 +31,7 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harnesses.claude_native.bridge import _capture_pane
 from omnigent.harnesses.codex_native.bridge import (
     bridge_dir_for_bridge_id,
     read_bridge_state,
@@ -631,6 +632,79 @@ def test_codex_native_builtin_session_can_be_created(
     assert labels.get("omnigent.wrapper") == "codex-native-ui", (
         f"Expected wrapper label 'codex-native-ui', got {labels.get('omnigent.wrapper')!r}"
     )
+
+
+@pytest.mark.skipif(
+    os.environ.get("OMNIGENT_E2E_CODEX_NATIVE") != "1" or shutil.which("codex") is None,
+    reason=(
+        "codex-native approval-mode e2e needs an authenticated `codex` binary; "
+        "set OMNIGENT_E2E_CODEX_NATIVE=1 to run"
+    ),
+)
+def test_codex_native_approval_mode_switch_uses_live_permissions_menu(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """Runtime mode changes drive the real Codex ``/permissions`` popup."""
+    workspace = tmp_path / "codex_permissions_ws"
+    workspace.mkdir()
+    daemon = _spawn_host_daemon(tmp_path=tmp_path, live_server=live_server)
+    try:
+        host_id = _online_host_id(http_client)
+        create = http_client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": _codex_native_agent_id(http_client),
+                "host_id": host_id,
+                "workspace": str(workspace),
+            },
+            timeout=60.0,
+        )
+        create.raise_for_status()
+        session_id = create.json()["id"]
+        terminal = _poll_for_terminal_resource(
+            http_client,
+            session_id=session_id,
+            resource_id=terminal_resource_id("codex", "main"),
+            timeout=30.0,
+        )
+        # The terminal resource is registered before Codex finishes starting
+        # MCP servers. Let the TUI reach its composer before opening a popup.
+        time.sleep(10.0)
+
+        for mode in ("full-access", "ask-for-approval"):
+            response = http_client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"approval_mode": mode},
+                timeout=30.0,
+            )
+            metadata = terminal["metadata"]
+            assert isinstance(metadata, dict)
+            pane = _capture_pane(str(metadata["tmux_socket"]), str(metadata["tmux_target"]))
+            assert response.status_code == 200, f"{response.text}\nCodex pane:\n{pane}"
+            assert response.json()["labels"]["omnigent.codex_native.approval_mode"] == mode
+
+        unsupported = http_client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"approval_mode": "read-only"},
+            timeout=30.0,
+        )
+        assert unsupported.status_code == 503, unsupported.text
+        assert "start a new session in read-only mode" in unsupported.text
+
+        snapshot = http_client.get(f"/v1/sessions/{session_id}")
+        snapshot.raise_for_status()
+        assert (
+            snapshot.json()["labels"]["omnigent.codex_native.approval_mode"] == "ask-for-approval"
+        )
+    finally:
+        daemon.send_signal(signal.SIGTERM)
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.wait()
 
 
 @pytest.mark.skipif(

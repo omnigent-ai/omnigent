@@ -36,9 +36,10 @@ prompt: |
   You are the Omnigent feature-blog scout. A new version has just been cut. You
   are given the list of pull requests merged since the previous release — each
   with its number, title, type tag, and (when the author filled it in) the
-  one-line changelog entry — plus a MECHANICAL DRAFT that groups them into
-  Major-features / Breaking / Bug-fixes buckets. Your job: pick the features (if
-  any) big enough to be worth a short feature-blog post, and rank them.
+  one-line changelog entry — plus a MECHANICAL DRAFT containing PR links grouped
+  by contributor. Use the PR titles and changelog entries to judge the changes;
+  the contributor groups are only a coverage reference. Your job: pick the
+  features (if any) big enough for a short feature-blog post, and rank them.
 
   Most releases produce ZERO — that is the expected, correct outcome for a
   release of internal work, fixes, and small additions. Only select a feature

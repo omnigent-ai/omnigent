@@ -151,9 +151,12 @@ async function waitForHealthy(url, label, logPath) {
  * not a blank window.
  *
  * @param {string} tmpDir A scratch dir for the db, artifacts, agent, and logs.
+ * @param {{ env?: (serverUrl: string) => Record<string, string> }} [options]
+ *   `env` adds server environment derived from the server's URL (e.g. an OIDC
+ *   redirect URI), since the port is chosen here.
  * @returns {Promise<{ serverUrl: string, close: () => Promise<void> }>}
  */
-async function spawnServer(tmpDir) {
+async function spawnServer(tmpDir, { env: extraEnv } = {}) {
   if (!fs.existsSync(path.join(WEB_UI_DIST, "index.html"))) {
     throw new Error(
       `SPA bundle missing at ${WEB_UI_DIST}. Build it first:\n` +
@@ -197,6 +200,7 @@ async function spawnServer(tmpDir) {
   }
 
   const serverOut = fs.openSync(serverLog, "w");
+  const serverUrl = `http://127.0.0.1:${serverPort}`;
   // Strip ambient runner/host env so a nested runner (if the journey starts a
   // host) boots clean rather than taking the zygote-fork path and hanging —
   // the same leak the Python recorder guards against. Rebuild by filtering
@@ -231,6 +235,7 @@ async function spawnServer(tmpDir) {
         OPENAI_API_KEY: "mock-key",
         ANTHROPIC_API_KEY: "",
         OMNIGENT_WEB_UI_DIST: WEB_UI_DIST,
+        ...extraEnv?.(serverUrl),
       },
       stdio: ["ignore", serverOut, serverOut],
     },
@@ -239,7 +244,6 @@ async function spawnServer(tmpDir) {
   serverProc.on("error", (err) => {
     serverSpawnError = err;
   });
-  const serverUrl = `http://127.0.0.1:${serverPort}`;
 
   const close = async () => {
     for (const proc of [serverProc, mockProc]) {
@@ -358,6 +362,10 @@ function startDisplayCapture(recordDir, display) {
  *   this, so the shell auto-connects on launch.
  * @param {string} [opts.userDataDir] Override the isolated userData dir
  *   (defaults to a fresh temp dir).
+ * @param {Record<string, string>} [opts.env] Extra environment for the app,
+ *   e.g. a scratch `HOME` so credential files stay out of the real one.
+ * @param {string[]} [opts.preload] Modules the main process requires before
+ *   `main.js`, e.g. a stand-in system browser that must exist from launch.
  * @returns {Promise<{ electronApp: import("playwright").ElectronApplication,
  *   window: import("playwright").Page, userDataDir: string,
  *   stopDisplayCapture: () => Promise<void> }>} `stopDisplayCapture` must be
@@ -369,14 +377,26 @@ async function launchDesktop(opts) {
   const userDataDir = opts.userDataDir || fs.mkdtempSync(path.join(os.tmpdir(), "omni-desktop-"));
   fs.mkdirSync(userDataDir, { recursive: true });
   if (opts.serverUrl) {
-    fs.writeFileSync(
-      path.join(userDataDir, "settings.json"),
-      JSON.stringify({ server_url: opts.serverUrl }, null, 2),
-    );
+    // Seed both profile locations, matching main.js's development userData path.
+    for (const profile of [userDataDir, path.join(userDataDir, "Omnigent Dev")]) {
+      fs.mkdirSync(profile, { recursive: true });
+      fs.writeFileSync(
+        path.join(profile, "settings.json"),
+        JSON.stringify({ server_url: opts.serverUrl }, null, 2),
+      );
+    }
   }
   fs.mkdirSync(opts.recordDir, { recursive: true });
 
-  const args = [APP_ROOT, `--user-data-dir=${userDataDir}`];
+  // Development builds derive userData from appData, overriding --user-data-dir.
+  // Redirect both before main.js loads so tests cannot touch a developer profile.
+  const profileBootstrap = path.join(userDataDir, "isolate-profile.cjs");
+  fs.writeFileSync(
+    profileBootstrap,
+    `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n`,
+  );
+  const preloads = (opts.preload ?? []).flatMap((file) => ["-r", file]);
+  const args = ["-r", profileBootstrap, ...preloads, APP_ROOT, `--user-data-dir=${userDataDir}`];
   // Headless-Linux / CI hardening, gated on the same env var the Python e2e_ui
   // suite uses (conftest.browser_type_launch_args). Under xvfb — and especially
   // as root or in a container — Electron's Chromium refuses to start without
@@ -405,17 +425,36 @@ async function launchDesktop(opts) {
       recordVideo: { dir: opts.recordDir },
       // Dev builds read dev-app-update.yml and would try to reach the update
       // endpoint; a version override keeps the app off the update path.
-      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0" },
+      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0", ...opts.env },
     });
   } catch (err) {
     await stopDisplayCapture();
     throw err;
   }
-  // If firstWindow() throws after launch() succeeded, close the app here so the
+  // If locating the shell fails after launch succeeds, close the app so the
   // Electron process isn't orphaned (the caller never got a handle to close).
   let window;
   try {
-    window = await electronApp.firstWindow();
+    // Native overlays can appear before the shell. Wait for its loaded page
+    // instead of treating the first WebContents as the application window.
+    const deadline = Date.now() + 20_000;
+    for (;;) {
+      window = electronApp.windows().find((page) => {
+        const url = page.url();
+        return (
+          /^https?:/.test(url) ||
+          /\/setup\/index\.html/.test(url) ||
+          /\/server-selector-v2\/server-selector-v2\.html/.test(url)
+        );
+      });
+      if (window) break;
+      if (Date.now() > deadline) {
+        const urls = electronApp.windows().map((page) => page.url());
+        throw new Error(`Desktop shell window did not load; saw: ${JSON.stringify(urls)}`);
+      }
+      // oxlint-disable-next-line no-await-in-loop -- Wait for the shell's navigation.
+      await sleep(50);
+    }
   } catch (err) {
     await electronApp.close().catch(() => {});
     await stopDisplayCapture();

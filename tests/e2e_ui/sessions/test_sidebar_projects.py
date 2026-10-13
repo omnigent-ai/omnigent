@@ -26,6 +26,7 @@ import re
 import uuid
 
 import httpx
+import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests.e2e_ui.conftest import seed_committed_turn
@@ -227,11 +228,7 @@ def test_remove_session_from_project(
     expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
 
 
-# A phone-width viewport, below the 768px `md` breakpoint, so the sidebar
-# renders as the mobile overlay — a genuine layout/width concern. It does NOT
-# by itself hide the folder's new-session pencil: that reveal is gated on input
-# capability (a hover+fine pointer), not width, so tests that need the pencil
-# gone pair this viewport with a `has_touch` context.
+# Below the 768px breakpoint the sidebar is a mobile overlay.
 _MOBILE_VIEWPORT = {"width": 390, "height": 780}
 _TABLET_VIEWPORT = {"width": 834, "height": 1112}
 
@@ -271,67 +268,127 @@ def test_project_header_action_is_clickable_on_touch_tablet(
         context.close()
 
 
-def test_project_new_session_folds_into_kebab_on_touch(
-    browser: Browser,
+def test_project_actions_are_keyboard_accessible_on_desktop(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Without a fine hover pointer the folder pencil is gone; its action lives
-    in the kebab menu.
-
-    The pencil reveal is gated on input capability, not viewport width: it shows
-    only where ``(hover: hover) and (pointer: fine)`` holds. On a touch device
-    (``has_touch`` → ``hover: none``, ``pointer: coarse``) that never matches, so
-    the pencil is ``display:none`` — genuinely absent, not merely clipped — while
-    the same "New session" action stays in the folder kebab's menu, linking to
-    the pre-filed composer (``/?project=<name>``). The kebab (sr-only on touch)
-    is reached by keyboard, the assistive-tech path a long-press can't cover.
-    """
+    """The desktop shortcut opens a session; the menu omits the duplicate."""
     base_url, session_id = seeded_session
-    title = f"e2e-proj-touch-{uuid.uuid4().hex[:8]}"
-    _set_title(base_url, session_id, title)
-    project = f"Project {uuid.uuid4().hex[:6]}"
-
-    # File the session into a fresh project on the (hover-capable) default page —
-    # the row kebab's affordances are hover-revealed, so a touch context can't
-    # drive the move. The folder is server-persisted, so the touch context below
-    # sees it.
+    page.set_viewport_size({"width": 1280, "height": 800})
+    project = f"Keyboard project {uuid.uuid4().hex[:6]}"
     page.goto(f"{base_url}/c/{session_id}")
     _move_to_new_project(page, _row(page, session_id), project)
-    expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
+    page.reload()
+    page.mouse.move(1279, 0)
+    assert page.evaluate("matchMedia('(hover: hover) and (pointer: fine)').matches")
 
-    # A genuine touch profile: has_touch flips the capability media the pencil
-    # gate keys on. The mobile sidebar starts closed, so reopen it via the
-    # one-shot ``?sidebar=open`` param (the notification-tap destination).
-    context = browser.new_context(viewport=_MOBILE_VIEWPORT, has_touch=True)
+    header = page.get_by_role("button", name=project, exact=True)
+    kebab = page.get_by_role("button", name=f"Project actions for {project}")
+    shortcut = page.get_by_role("link", name=f"New session in {project}", exact=True)
+    actions = kebab.locator("xpath=../..")
+    expect(actions).to_have_css("opacity", "0")
+    header.hover()
+    expect(actions).to_have_css("opacity", "1")
+    page.mouse.move(1279, 0)
+    expect(actions).to_have_css("opacity", "0")
+
+    # The shortcut precedes the menu in the browser's real Tab order.
+    header.focus()
+    page.keyboard.press("Tab")
+    expect(shortcut).to_be_focused()
+    expect(actions).to_have_css("opacity", "1")
+    page.keyboard.press("Tab")
+    expect(kebab).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(page.get_by_test_id("project-new-session-menu")).to_be_hidden()
+    expect(page.get_by_test_id("rename-project")).to_be_focused()
+    page.keyboard.press("Escape")
+    expect(kebab).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(shortcut).to_be_focused()
+    page.keyboard.press("Enter")
+    expect(page).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
+
+
+@pytest.mark.parametrize(
+    "viewport,has_touch",
+    [
+        ({"width": 390, "height": 780}, True),
+        ({"width": 834, "height": 1194}, True),
+        ({"width": 1194, "height": 834}, True),
+        ({"width": 500, "height": 780}, False),
+    ],
+    ids=["phone", "ipad-portrait", "ipad-landscape", "narrow-mouse"],
+)
+def test_project_menu_is_visible_without_hover(
+    browser: Browser,
+    page: Page,
+    seeded_session: tuple[str, str],
+    viewport: dict[str, int],
+    has_touch: bool,
+) -> None:
+    """Touch folders expose a menu containing New session without a long press."""
+    base_url, session_id = seeded_session
+    project = f"Project with a long name to check action overlap {uuid.uuid4().hex[:6]}"
+    page.goto(f"{base_url}/c/{session_id}")
+    _move_to_new_project(page, _row(page, session_id), project)
+    page.get_by_role("button", name=project, exact=True).hover()
+    expect(page.get_by_role("link", name=f"New session in {project}", exact=True)).to_be_visible()
+
+    context = browser.new_context(viewport=viewport, has_touch=has_touch)
     touch = context.new_page()
     try:
         touch.goto(f"{base_url}/c/{session_id}?sidebar=open")
-        # Establish the flip empirically rather than assuming it: this is the
-        # exact media the pencil/kebab reveal keys on, and it must be false here.
-        assert not touch.evaluate("matchMedia('(hover: hover) and (pointer: fine)').matches")
-
         header = touch.get_by_role("button", name=project, exact=True)
         expect(header).to_be_visible()
-
-        # Scope to THIS project's controls by their per-project accessible names —
-        # the shared server carries other tests' folders, so bare test-ids match
-        # multiple pencils/kebabs (strict-mode violation).
-        pencil = touch.get_by_role("link", name=f"New session in {project}")
+        shortcut = touch.get_by_role(
+            "link", name=f"New session in {project}", exact=True, include_hidden=True
+        )
+        if has_touch:
+            expect(shortcut).to_be_hidden()
+        else:
+            expect(shortcut).to_be_visible()
         kebab = touch.get_by_role("button", name=f"Project actions for {project}")
 
-        # The pencil is display:none here — genuinely absent, no duplicate of the
-        # kebab's "New session" item in the a11y tree.
-        expect(pencil).to_be_hidden()
+        for expanded in [True, False]:
+            if header.get_attribute("aria-expanded") != str(expanded).lower():
+                header.click()
+                touch.mouse.move(viewport["width"] - 1, 0)
+            expect(kebab).to_be_visible()
+            assert kebab.evaluate("""element => {
+                for (let node = element; node; node = node.parentElement) {
+                    if (getComputedStyle(node).opacity === '0') return false;
+                }
+                const box = element.getBoundingClientRect();
+                return box.width >= 24 && box.height >= 24 && element.contains(
+                    document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
+                );
+            }""")
+            title_box = header.locator("span.truncate").bounding_box()
+            action_box = (kebab if has_touch else shortcut).bounding_box()
+            assert title_box is not None and action_box is not None
+            assert title_box["x"] + title_box["width"] <= action_box["x"]
 
-        # The kebab is sr-only on touch: reached by keyboard (focus un-clips it
-        # via focus-visible), then opened with Enter — the AT path a long-press
-        # can't reliably dispatch.
-        kebab.focus()
-        kebab.press("Enter")
-        # asChild renders the item as the <a> itself, so the href lives on it.
+        before = header.get_attribute("aria-expanded")
+        if has_touch:
+            kebab.tap()
+        else:
+            kebab.click()
         menu_item = touch.get_by_test_id("project-new-session-menu")
-        expect(menu_item).to_be_visible()
-        expect(menu_item).to_have_attribute("href", f"/?project={project.replace(' ', '%20')}")
+        if has_touch:
+            expect(menu_item).to_be_visible()
+        else:
+            expect(menu_item).to_be_hidden()
+        expect(
+            touch.get_by_role("button", name=project, exact=True, include_hidden=True)
+        ).to_have_attribute("aria-expanded", before)
+        if has_touch:
+            menu_item.tap()
+        else:
+            touch.keyboard.press("Escape")
+            shortcut.click()
+        expect(touch).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
+        if viewport["width"] < 768:
+            expect(touch.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
     finally:
         context.close()

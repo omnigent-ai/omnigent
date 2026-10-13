@@ -2,7 +2,7 @@
 
 Config half of the *Connect Databricks* integration: it lets a signed-in user
 authorize their Databricks workspace (OAuth U2M authorization-code + PKCE) so
-their managed sandboxes reach the Databricks **AI Gateway** MCP as them. Mirrors
+their managed sandboxes reach the Databricks **Unity Gateway** MCP as them. Mirrors
 :mod:`omnigent.server.github_app`. See ``designs/DATABRICKS_CONNECT.md``.
 
 This module owns everything that *touches the app's secret* — reading it from
@@ -38,7 +38,7 @@ _logger = logging.getLogger(__name__)
 _AUTHORIZE_PATH = "/oidc/v1/authorize"
 _TOKEN_PATH = "/oidc/v1/token"
 
-#: Default scopes. ``all-apis`` covers the AI Gateway MCP surface; ``offline_access``
+#: Default scopes. ``all-apis`` covers the Unity Gateway MCP surface; ``offline_access``
 #: is required to receive a refresh token (server-side refresh, like GitHub).
 _DEFAULT_SCOPES = "all-apis offline_access"
 

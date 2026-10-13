@@ -26,6 +26,7 @@ on:
     # bakes the SPA, so a web-only PR can still break the build).
     paths:
       - 'deploy/docker/Dockerfile'
+      - 'deploy/docker/Dockerfile.dockerignore'
       - 'deploy/docker/entrypoint.py'
       - 'deploy/cloudflare/**'
       - 'omnigent/**'

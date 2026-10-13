@@ -89,7 +89,9 @@ def list_databricks_profiles() -> list[str]:
     try:
         parser.read(_DATABRICKSCFG_PATH)
     except configparser.Error as exc:
-        _logger.debug("Could not parse %s: %s", _DATABRICKSCFG_PATH, exc)
+        # Class-only: configparser errors can embed the offending line, which
+        # in a credentials file may be a token.
+        _logger.debug("Could not parse %s (%s)", _DATABRICKSCFG_PATH, type(exc).__name__)
         return []
     sections = [s for s in parser.sections() if s != "DEFAULT"]
     if parser.defaults():

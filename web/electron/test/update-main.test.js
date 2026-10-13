@@ -96,6 +96,7 @@ function loadMainHarness({
       getPath: (name) => (name === "userData" ? userData : userData),
       getVersion: () => "0.3.0",
       setName: () => {},
+      setPath: () => {},
       requestSingleInstanceLock: () => true,
       on: (name, listener) => appEvents.set(name, listener),
       whenReady: () => ({ then: () => {} }),
@@ -682,6 +683,7 @@ describe("auto-update main-process wiring", () => {
     const harness = loadMainHarness({
       forceDevUpdateConfig: true,
       settings: { update_mode: "manual" },
+      platform: "linux",
     });
     t.after(harness.cleanup);
     harness.api.updater.init();
@@ -710,6 +712,36 @@ describe("auto-update main-process wiring", () => {
     });
     assert.equal(harness.calls.appExit, 1); // fallback forced the exit
     assert.equal(harness.calls.appQuit, 1); // never re-issued
+  });
+
+  it("waits on macOS for an async install (admin prompt) instead of force-exiting", async (t) => {
+    // Squirrel.Mac installs asynchronously and may show an admin password
+    // prompt for a root-owned bundle; a timed exit would kill that prompt.
+    const harness = loadMainHarness({
+      forceDevUpdateConfig: true,
+      settings: { update_mode: "manual" },
+      platform: "darwin",
+    });
+    t.after(harness.cleanup);
+    harness.api.updater.init();
+    harness.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
+    harness.api.registerIpc();
+    await harness.ipcHandlers.get("omnigent:update-install")(harness.events.pinned);
+
+    harness.api.setQuitTimeouts({ installFallback: 10, cleanup: 10 });
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    await flushPromises();
+    harness.runMainImmediates();
+    assert.deepEqual(harness.calls.quitAndInstall, [[false, true]]);
+
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+    assert.equal(harness.calls.appExit, 0); // still waiting on the install
+
+    // A failed/cancelled install still exits rather than leaving the app up.
+    harness.autoUpdater.emit("error", new Error("authorization canceled"));
+    assert.equal(harness.calls.appExit, 1);
   });
 
   it("force-exits if the re-issued normal quit does not terminate", async (t) => {

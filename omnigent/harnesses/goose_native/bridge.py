@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 from omnigent._platform import stable_user_id
+from omnigent.native.input_ready import PaneSettledProbe
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_GOOSE_NATIVE_BRIDGE_DIR"
@@ -389,3 +390,8 @@ def send_goose_pane_keys(bridge_dir: Path, *keys: str) -> None:
     if info is None:
         raise RuntimeError("goose-native tmux target not advertised")
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], *keys)
+
+
+#: Provider ``input_ready_probe``: Goose renders no idle marker, so apply the
+#: same pane-settled gate as :func:`_settle_pane` to the watcher's captures.
+native_input_ready = PaneSettledProbe(_SETTLE_STABLE_POLLS)

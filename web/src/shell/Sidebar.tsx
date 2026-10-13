@@ -13,6 +13,7 @@ import {
   type ReactNode,
   type RefObject,
   createContext,
+  Fragment,
   memo,
   useCallback,
   useContext,
@@ -21,10 +22,12 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { createPortal } from "react-dom";
 import {
   ArchiveIcon,
+  ArrowUpDownIcon,
   ArchiveRestoreIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
@@ -33,12 +36,17 @@ import {
   ClockIcon,
   CircleAlertIcon,
   CircleStopIcon,
+  FolderGit2Icon,
   FolderIcon,
   FolderInputIcon,
   FolderMinusIcon,
   FolderOpenIcon,
   GitBranchIcon,
   GitForkIcon,
+  GitMergeIcon,
+  GitPullRequestClosedIcon,
+  GitPullRequestDraftIcon,
+  GitPullRequestIcon,
   InboxIcon,
   ListChecksIcon,
   ListFilterIcon,
@@ -48,6 +56,7 @@ import {
   MailIcon,
   MailOpenIcon,
   MessageCircleDashedIcon,
+  MessageCirclePlusIcon,
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
@@ -61,11 +70,12 @@ import {
   SmilePlusIcon,
   SquareIcon,
   SquareCheckIcon,
-  SquarePenIcon,
   Trash2Icon,
+  UserRoundIcon,
   UsersIcon,
   WalletIcon,
   XIcon,
+  type LucideIcon,
 } from "lucide-react";
 import {
   DndContext,
@@ -91,8 +101,16 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
-import { useQueryClient } from "@tanstack/react-query";
-import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
+import { useIsMutating, useQueryClient } from "@tanstack/react-query";
+import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useRebasePath,
+  useSearchParams,
+} from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
@@ -117,9 +135,10 @@ import {
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuLabel,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
   DropdownMenuSeparator,
@@ -147,6 +166,7 @@ import {
   PROJECT_LABEL_KEY,
   PINNED_CONVERSATIONS_KEY,
   useTogglePinnedConversation,
+  useReorderPinnedConversations,
   setConversationPinned,
   useRenameConversation,
   useStopAndDeleteConversation,
@@ -161,6 +181,8 @@ import { relativeTime } from "@/lib/relativeTime";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
+import { unpinWithUndo } from "./unpinUndoToast";
+import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
@@ -170,7 +192,8 @@ import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { useHasSessionDraft } from "@/lib/sessionDrafts";
+import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
+import { useNow } from "@/hooks/useNow";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { useSessionErrorStates } from "@/hooks/useSessionErrors";
@@ -197,6 +220,16 @@ import {
   readSessionFilter,
   writeSessionFilter,
 } from "@/lib/sessionFilterPreferences";
+import {
+  DEFAULT_SIDEBAR_VIEW,
+  readSidebarViewPreferences,
+  SIDEBAR_SHOW_FIELDS,
+  type SidebarGrouping,
+  type SidebarOrdering,
+  type SidebarShowField,
+  type SidebarViewPreferences,
+  writeSidebarViewPreferences,
+} from "@/lib/sidebarViewPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { useViewerId } from "@/hooks/useViewerId";
@@ -211,28 +244,59 @@ import {
   computeNextActiveOverride,
   conversationDisplayLabel,
   dedupeConversationsById,
+  getConversationAgentType,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+  groupConversations,
   orderByPinnedTimestamp,
+  pinOrderWrites,
   readPinnedConversationIds,
   resolveSidebarDrop,
   type SidebarDropTarget,
   sortByUpdatedAtDesc,
+  STATUS_BUCKETS,
+  type StatusBucket,
+  statusBucket,
+  UPDATED_BUCKETS,
+  updatedBucket,
   writeLegacyPinnedConversationIds,
   isOwnedByViewer,
   sessionBelongsToProject,
+  sessionsListAcceptsDrop,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
+import {
+  nativeCodingAgentForWrapper,
+  type NativeCodingAgentIconKind,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
+import AntigravityColor from "@lobehub/icons/es/Antigravity/components/Color";
+import DevinColor from "@lobehub/icons/es/Devin/components/Color";
+import KiroColor from "@lobehub/icons/es/Kiro/components/Color";
+import { type PullRequest, usePullRequestInfo } from "@/hooks/usePullRequests";
+import {
+  deriveRepoName,
+  localMachineLabel,
+  resolveThisMachineHostId,
+  SANDBOX_REPO_LABEL_KEY,
+} from "./NewChatDialog";
+import { useDesktopHostId } from "./RevealInFileManager";
 import { ForkSessionDialog } from "./ForkSessionDialog";
+import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { SIDEBAR_ROW } from "./sidebarStyles";
+import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
+import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
+import { ALT_KEY, ARIA_MOD_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // trailing icon edge in every viewport: on desktop it fades on hover so the pin
 // + kebab take its place; on mobile those controls are gone, so the badge holds
 // that edge.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute top-1/2 flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -261,6 +325,7 @@ const SIDEBAR_ACTIVE_HIGHLIGHT =
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
 const SCROLLBAR_HIDE_DELAY_MS = 700;
+const NEW_SESSION_KEYS = [MOD_KEY, ALT_KEY, "N"] as const;
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -272,6 +337,8 @@ const ProjectNamesContext = createContext<Map<string, string>>(new Map());
 // surface the real project glyph in the pinned flyout without its own query.
 const ProjectIconsContext = createContext<Map<string, string>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
+// The filter menu's "Show" toggles: which optional metadata each row renders.
+const SidebarShowContext = createContext<readonly SidebarShowField[]>([]);
 // Row-invariant values resolved once at the list owner and shared, so a row
 // doesn't run `useIsMobileViewport` (a matchMedia-on-every-render store) or
 // `useViewerId` (an identity-resolve effect) per instance.
@@ -281,6 +348,15 @@ const ServerInfoContext = createContext<ReturnType<typeof useServerInfo>>("loadi
 const RowActivationContext = createContext<
   (id: string, event: MouseEvent<HTMLAnchorElement>) => void
 >(() => {});
+// True while a pin, unpin, or reorder is saving; pin controls are disabled then.
+const PinSavingContext = createContext(false);
+// Set only around the Pinned section, so its rows become drag-to-reorder targets.
+// `draggingId` is the session being dragged; `overId` the row it's over.
+const PinOrderContext = createContext<{
+  ids: string[];
+  draggingId: string | null;
+  overId: string | null;
+} | null>(null);
 // Rows report an in-progress inline-rename edit here so ConversationList can
 // hold the sort order for the edit's whole duration — the pointer often
 // leaves the list while typing, and a reorder then would shuffle rows around
@@ -300,6 +376,7 @@ function SidebarRowDataProvider({
   projectNamesById,
   projectIconsById,
   hostsById,
+  show,
   isMobile,
   viewerId,
   serverInfo,
@@ -309,6 +386,7 @@ function SidebarRowDataProvider({
   projectNamesById: Map<string, string>;
   projectIconsById: Map<string, string>;
   hostsById: ReadonlyMap<string, Host>;
+  show: readonly SidebarShowField[];
   isMobile: boolean;
   viewerId: string | null;
   serverInfo: ReturnType<typeof useServerInfo>;
@@ -319,15 +397,17 @@ function SidebarRowDataProvider({
     <ProjectNamesContext.Provider value={projectNamesById}>
       <ProjectIconsContext.Provider value={projectIconsById}>
         <HostsByIdContext.Provider value={hostsById}>
-          <IsMobileContext.Provider value={isMobile}>
-            <ViewerIdContext.Provider value={viewerId}>
-              <ServerInfoContext.Provider value={serverInfo}>
-                <RowActivationContext.Provider value={onActivate}>
-                  {children}
-                </RowActivationContext.Provider>
-              </ServerInfoContext.Provider>
-            </ViewerIdContext.Provider>
-          </IsMobileContext.Provider>
+          <SidebarShowContext.Provider value={show}>
+            <IsMobileContext.Provider value={isMobile}>
+              <ViewerIdContext.Provider value={viewerId}>
+                <ServerInfoContext.Provider value={serverInfo}>
+                  <RowActivationContext.Provider value={onActivate}>
+                    {children}
+                  </RowActivationContext.Provider>
+                </ServerInfoContext.Provider>
+              </ViewerIdContext.Provider>
+            </IsMobileContext.Provider>
+          </SidebarShowContext.Provider>
         </HostsByIdContext.Provider>
       </ProjectIconsContext.Provider>
     </ProjectNamesContext.Provider>
@@ -414,11 +494,13 @@ function useActiveNavItem(): {
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   const location = useLocation();
+  const rebasePath = useRebasePath();
   const extensions = useExtensions();
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
-  const isCanvasPage = !isExtensionRoute && leaf === "canvas";
+  const isCanvasPage =
+    !isExtensionRoute && isCanvasPathname(location.pathname, rebasePath("/canvas"));
   const isTasksPage = !isExtensionRoute && leaf === "tasks";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
@@ -594,6 +676,8 @@ function SidebarImpl({
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
+  const [searchParams] = useSearchParams();
+  const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -779,6 +863,7 @@ function SidebarImpl({
     // key after the migration (gated on the query settling) mutates it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pinnedConversations, pinnedLoaded, ownedPinIds]);
+  const queryClient = useQueryClient();
   const togglePinnedMutation = useTogglePinnedConversation();
   const pinnedIdSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   // The migration compares the legacy key against what the SERVER already owns
@@ -789,10 +874,16 @@ function SidebarImpl({
   );
   // Stable identity (useStableCallback) so its changing deps don't defeat the row memo.
   const togglePinnedConversation = useStableCallback((conversationId: string) => {
-    togglePinnedMutation.mutate({
-      id: conversationId,
-      pinned: !pinnedIdSet.has(conversationId),
-    });
+    if (!pinnedIdSet.has(conversationId)) {
+      togglePinnedMutation.mutate({ id: conversationId, pinned: true });
+      return;
+    }
+    unpinWithUndo(
+      queryClient,
+      togglePinnedMutation.mutateAsync,
+      conversationId,
+      pinnedConversations.find((c) => c.id === conversationId),
+    );
   });
 
   // One-time migration: pins used to live only in localStorage. Push any
@@ -819,6 +910,21 @@ function SidebarImpl({
   // keyboard inset so every session row can still scroll into view while an
   // inline rename holds the keyboard up. No-op off iOS / keyboard closed.
   const keyboardInset = useIOSNativeKeyboardInset(effectiveOpen);
+  // The iOS shell disables WebKit's focus reveal: while that padding shrinks the list,
+  // center a focused row (an inline rename) when the keyboard opens and on later focus.
+  // Centered rather than nearest so the floating Settings action can't cover it.
+  useLayoutEffect(() => {
+    if (keyboardInset <= 0) return;
+    const reveal = (target: EventTarget | null) => {
+      if (target instanceof HTMLElement && scrollContainerRef.current?.contains(target)) {
+        target.scrollIntoView({ block: "center" });
+      }
+    };
+    reveal(document.activeElement);
+    const onFocusIn = (event: FocusEvent) => reveal(event.target);
+    document.addEventListener("focusin", onFocusIn);
+    return () => document.removeEventListener("focusin", onFocusIn);
+  }, [keyboardInset]);
 
   // While the peek card's entry animation is still fading it in, the card is
   // (nearly) invisible yet already covers the toggle whose hover armed it —
@@ -999,7 +1105,10 @@ function SidebarImpl({
           brand mark is dropped and the actions slide left to sit beside the
           window controls (see the [data-electron-mac] rules in index.css).
           Inert in a browser and on other platforms, which keep the row below. */}
-            <div className="sidebar-header-row flex h-12 shrink-0 items-center justify-between pr-3 pl-4">
+            {/* h-14 below md matches the mobile chat header height so the
+            Search bubble shares a centerline with the overflow bubble in the
+            chat strip beside the open drawer. */}
+            <div className="sidebar-header-row flex h-14 shrink-0 items-center justify-between pr-3 pl-4 md:h-12">
               {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -1039,7 +1148,7 @@ function SidebarImpl({
               />
             </div>
 
-            <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
+            <div className="flex flex-col gap-px px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
               {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -1053,7 +1162,7 @@ function SidebarImpl({
                   // transparent 1px border so the icon lands exactly on that
                   // column, flush with the Inbox row and folder rows.
                   SIDEBAR_ROW,
-                  "w-full justify-start border-0 font-normal",
+                  "group/new-session w-full justify-start border-0 font-normal",
                   SIDEBAR_HOVER_HIGHLIGHT,
                   isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                 )}
@@ -1066,12 +1175,13 @@ function SidebarImpl({
                 <Link
                   to="/"
                   componentId="sidebar.new_chat"
+                  aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+N`}
                   onClick={(e) => {
                     switchTab("mine");
                     onNavClick(e);
                   }}
                 >
-                  <SquarePenIcon
+                  <MessageCirclePlusIcon
                     className={cn(
                       "ui-icon",
                       isNewChatPage
@@ -1080,6 +1190,10 @@ function SidebarImpl({
                     )}
                   />
                   New session
+                  <CompactShortcutKeys
+                    keys={NEW_SESSION_KEYS}
+                    className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 opacity-0 transition-opacity group-focus-visible/new-session:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100"
+                  />
                 </Link>
               </Button>
               {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
@@ -1152,7 +1266,7 @@ function SidebarImpl({
               </Button>
               {canvasEnabled && (
                 <PrimaryNavLink
-                  to="/canvas"
+                  to={canvasDestination.pathname + canvasDestination.search}
                   label="Canvas"
                   icon={LayoutDashboardIcon}
                   active={isCanvasPage}
@@ -1215,7 +1329,7 @@ function SidebarImpl({
                 // without a gutter the last row's always-visible kebab parks
                 // underneath it and can't be tapped.
                 className={cn(
-                  "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16 md:mr-1",
+                  "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16",
                   // Reserve the gutter so toggling the thumb never reflows the list.
                   "[scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
                   isScrolling
@@ -1235,6 +1349,7 @@ function SidebarImpl({
                     multiUser={multiUser}
                     pinnedConversationIds={pinnedConversationIds}
                     pinnedConversations={pinnedConversations}
+                    pinReorderEnabled={pinnedFilterHonored}
                     onTogglePinned={togglePinnedConversation}
                     onEnterSelectionMode={enterSelectionMode}
                     selectionMode={selectionMode}
@@ -1503,8 +1618,6 @@ function ProjectFolder({
             actions={orderedMenuActions}
           />
         }
-        // Touch exposes these actions through the header's long-press menu.
-        actionHoverOnly
         headerContextMenu={
           <ContextMenuContent className="min-w-40">
             <ProjectFolderMenuItems
@@ -1551,6 +1664,9 @@ interface ConversationListProps {
   // The server-authoritative pinned sessions, so a pinned session that sits
   // outside the loaded pagination window still renders in the Pinned section.
   pinnedConversations: Conversation[];
+  // False against a server that can't store pins (they live in localStorage,
+  // which has no order), so drag-to-reorder is off there.
+  pinReorderEnabled: boolean;
   onTogglePinned: (conversationId: string) => void;
   onEnterSelectionMode: (scope: SelectionScope) => void;
   selectionMode: boolean;
@@ -1560,6 +1676,21 @@ interface ConversationListProps {
   onDeselectAll: () => void;
   onExitSelectionMode: () => void;
   getVisibleIdsRef: RefObject<() => string[]>;
+}
+
+const ignoreChatStore = () => () => {};
+
+/**
+ * The open conversation while it starts up — a send in flight or its terminal
+ * launching, before the server reports `running` (the row's `isStartingUp`).
+ * Disabled: null and no subscription.
+ */
+function useStartingConversationId(enabled: boolean): string | null {
+  return useSyncExternalStore(enabled ? useChatStore.subscribe : ignoreChatStore, () => {
+    if (!enabled) return null;
+    const s = useChatStore.getState();
+    return s.status === "streaming" || s.terminalPending ? s.conversationId : null;
+  });
 }
 
 function ConversationList({
@@ -1573,6 +1704,7 @@ function ConversationList({
   multiUser,
   pinnedConversationIds,
   pinnedConversations,
+  pinReorderEnabled,
   onTogglePinned,
   onEnterSelectionMode,
   selectionMode,
@@ -1595,6 +1727,34 @@ function ConversationList({
     () => new Map(hosts.map((host) => [host.host_id, host] as const)),
     [hosts],
   );
+  // Grouping / ordering / show options from the filter menu, seeded from the
+  // persisted per-device preference. With the release flag off the sidebar
+  // keeps its default layout and ignores any stored choice.
+  const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
+  const [storedView, setView] = useState<SidebarViewPreferences>(readSidebarViewPreferences);
+  const view = groupingUi ? storedView : DEFAULT_SIDEBAR_VIEW;
+  const updateView = useCallback(
+    (patch: Partial<SidebarViewPreferences>) => {
+      // Regrouping swaps which sections (and selection scopes) exist, so leave
+      // selection the way a Display switch does.
+      if (patch.grouping !== undefined && patch.grouping !== storedView.grouping && selectionMode) {
+        onExitSelectionMode();
+      }
+      const next = { ...storedView, ...patch };
+      writeSidebarViewPreferences(next);
+      setView(next);
+    },
+    [storedView, selectionMode, onExitSelectionMode],
+  );
+  const grouped = view.grouping !== "default";
+  const groupOrder: readonly string[] =
+    view.grouping === "status" ? STATUS_BUCKETS : UPDATED_BUCKETS;
+  // Status buckets read the unread mirror and the drafts store; only a status
+  // view subscribes, so other views don't re-render the list on those writes.
+  const statusView = view.grouping === "status" || view.ordering === "status";
+  const unseenTick = useUnseenTick(statusView);
+  const draftIds = useSessionDraftIds(statusView);
+  const startingId = useStartingConversationId(statusView);
   // All loaded conversations from the single paginated list (for the flat
   // session list; pinned rows are merged in from the server pinned query).
   const allConversations = useMemo(
@@ -1610,6 +1770,12 @@ function ConversationList({
   const [draggedProject, setDraggedProject] = useState<string | null>(null);
   const dragOrigin = useRef<{ left: number; top: number; width: number } | undefined>(undefined);
   const [overProject, setOverProject] = useState<string | null>(null);
+  const [overPin, setOverPin] = useState<string | null>(null);
+  const { mutateAsync: pinAt } = useTogglePinnedConversation();
+  // Pin writes don't overlap (the hooks refuse one while another saves), so the
+  // pinned rows stop taking drops until the current write settles.
+  const pinWriting = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
+  const { mutate: reorderPins } = useReorderPinnedConversations();
   const moveProject = (name: string, destination: "up" | "down" | "top" | "bottom") => {
     if (saveOrder.isPending) return;
     const from = projects.findIndex((p) => p.name === name);
@@ -1678,6 +1844,9 @@ function ConversationList({
   // write) and is cleared once neither hold is active, when the order snaps
   // back to reality.
   const frozenKeysRef = useRef<Map<string, number>>(new Map());
+  // Status buckets freeze the same way, so a turn finishing under the cursor
+  // doesn't move its row to another group.
+  const frozenStatusRef = useRef<Map<string, StatusBucket>>(new Map());
   const [pointerInside, setPointerInside] = useState(false);
   const [editingIds, setEditingIds] = useState<ReadonlySet<string>>(() => new Set());
   const reportRowEditing = useCallback((id: string, editing: boolean) => {
@@ -1691,8 +1860,11 @@ function ConversationList({
   }, []);
   const orderFrozen = pointerInside || editingIds.size > 0;
   const frozenKeys = orderFrozen ? frozenKeysRef.current : null;
+  const frozenStatus = orderFrozen ? frozenStatusRef.current : null;
   useEffect(() => {
-    if (!orderFrozen) frozenKeysRef.current.clear();
+    if (orderFrozen) return;
+    frozenKeysRef.current.clear();
+    frozenStatusRef.current.clear();
   }, [orderFrozen]);
 
   // Build sections: Pinned and Archived are peeled off; the rest splits into
@@ -1719,8 +1891,8 @@ function ConversationList({
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
-    // by when they were pinned (the `omnigent.pinned` label's epoch-ms value;
-    // oldest pin at the top, newest at the bottom), NOT by `updated_at`, so a
+    // by the `omnigent.pinned` label value (pin time, or a dragged position;
+    // newest pin at the bottom), NOT by `updated_at`, so a
     // pinned session holds its slot when a new message bumps its `updated_at`.
     // Pins are ownership-agnostic, so the Pinned section always shows every
     // non-archived pin regardless of the My/Shared/All/Archived filter — it's
@@ -1739,13 +1911,14 @@ function ConversationList({
     // project name alone, pulling a foreign session into the viewer's folder
     // (and out of the flat Shared list via filedIds). Each folder holds its
     // non-pinned sessions — pinning a project's last one leaves it empty.
+    // Grouped views drop the folders: filed sessions join the groups instead.
     const filedIds = new Set<string>();
     const projectGroups: {
       id: string | null;
       name: string;
       icon?: string | null;
       conversations: Conversation[];
-    }[] = projects.map(({ id, name, icon }) => {
+    }[] = (grouped ? [] : projects).map(({ id, name, icon }) => {
       // Dual-read membership: a session belongs to this folder if it has
       // the first-class id OR the legacy omni_project label of this name,
       // and (filing being owner-only) the viewer owns it.
@@ -1766,27 +1939,84 @@ function ConversationList({
     // unloaded page. We render it as a folder with a "No sessions" placeholder
     // rather than hiding it (matches the target sidebar layout).
 
-    // Sessions: the remainder — not pinned, not filed.
-    const sessions = sortByUpdatedAtDesc(
+    // The remainder — not pinned, not filed — splits into Shared (other owners')
+    // and Sessions (the viewer's own).
+    const byUpdated = sortByUpdatedAtDesc(
       tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
       activeOverride,
       frozenKeys,
     );
-    return { pinned, sessions, projectGroups };
+    const statusOf = (c: Conversation): StatusBucket => {
+      const frozen = frozenStatus?.get(c.id);
+      if (frozen) return frozen;
+      const unseen = isConversationUnseen(c.id, c.updated_at, c.status);
+      const bucket = statusBucket(c, unseen, hasSessionDraft(c.id));
+      // Like the row's spinner, the open session is Working while it starts up.
+      const live = bucket !== "Needs attention" && c.id === startingId ? "Working" : bucket;
+      frozenStatus?.set(c.id, live);
+      return live;
+    };
+    // Status ordering is a stable sort by bucket, so updated_at order holds within one.
+    const allOrdered =
+      view.ordering === "status"
+        ? groupConversations(byUpdated, statusOf, STATUS_BUCKETS).flatMap((g) => g.conversations)
+        : byUpdated;
+    // Grouped views fold Shared into the groups too, so the first group takes
+    // the Projects header's place.
+    const splitShared = groupingUi && !grouped;
+    const shared = splitShared ? allOrdered.filter((c) => !isOwnedByViewer(c, viewerId)) : [];
+    const ordered = splitShared
+      ? allOrdered.filter((c) => isOwnedByViewer(c, viewerId))
+      : allOrdered;
+    if (!grouped) return { pinned, shared, sessions: ordered, projectGroups, groupTitles: null };
+    // Buckets use render-time "now", so a day rollover shows on the next list update.
+    const now = new Date();
+    const groupTitles = new Map<string, string>(
+      ordered.map((c) => [
+        c.id,
+        view.grouping === "status"
+          ? statusOf(c)
+          : updatedBucket(
+              frozenKeys?.get(c.id) ??
+                (activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at),
+              now,
+            ),
+      ]),
+    );
+    const sessions = groupConversations(ordered, (c) => groupTitles.get(c.id), groupOrder).flatMap(
+      (g) => g.conversations,
+    );
+    return { pinned, shared, sessions, projectGroups, groupTitles };
+    // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     allConversations,
     pinnedConversations,
     pinnedSet,
     activeOverride,
     frozenKeys,
+    frozenStatus,
     projects,
     activeTab,
     viewerId,
+    groupingUi,
+    grouped,
+    groupOrder,
+    view.grouping,
+    view.ordering,
+    unseenTick,
+    draftIds,
+    startingId,
   ]);
 
   const config = useContext(SidebarConfigContext);
+  // Shared renders above Sessions, so the display window pages through both in that order.
+  const listRows = useMemo(
+    () => [...loadedSections.shared, ...loadedSections.sessions],
+    [loadedSections.shared, loadedSections.sessions],
+  );
   const displayPagination = useSidebarDisplayPagination(
-    loadedSections.sessions,
+    listRows,
     JSON.stringify([activeTab, searchQuery]),
     activeTab === "shared"
       ? (config.sharedDisplayPageSize ?? config.displayPageSize)
@@ -1794,15 +2024,30 @@ function ConversationList({
     conversationsQuery.hasNextPage,
     conversationsQuery.fetchNextPage,
   );
-  const sections = useMemo(
-    () => ({ ...loadedSections, sessions: displayPagination.rows }),
-    [loadedSections, displayPagination.rows],
-  );
+  const sections = useMemo(() => {
+    const sharedCount = Math.min(loadedSections.shared.length, displayPagination.rows.length);
+    return {
+      ...loadedSections,
+      shared: displayPagination.rows.slice(0, sharedCount),
+      sessions: displayPagination.rows.slice(sharedCount),
+    };
+  }, [loadedSections, displayPagination.rows]);
+  // The paginated Sessions rows split into titled groups; null keeps the single
+  // "Sessions" section (default grouping, or nothing to group).
+  const sessionGroups = useMemo(() => {
+    const titles = loadedSections.groupTitles;
+    if (!titles || sections.sessions.length === 0) return null;
+    return groupConversations(sections.sessions, (c) => titles.get(c.id), groupOrder);
+  }, [loadedSections.groupTitles, sections.sessions, groupOrder]);
 
   // Scope-active flags: which section owns the current selection UI (checkboxes
-  // + bulk-action bar). Only one is ever true at a time.
+  // + bulk-action bar). Only one is true at a time unless the selection is unified.
   const sessionsSelecting = selectionMode && selectionScope === "sessions";
-  const projectsSelecting = selectionMode && selectionScope === "projects";
+  // With sidebar_grouping_ui on, the default grouping's one "Select sessions" (on
+  // the Projects header) selects project folders, Shared and Sessions together.
+  const unifiedSelection = groupingUi && !grouped;
+  const projectsSelecting =
+    selectionMode && (selectionScope === "projects" || (unifiedSelection && sessionsSelecting));
 
   // Collapsed section titles — persisted like pins so the preference
   // survives reloads. Lifted here (not per-section state) because the
@@ -1955,6 +2200,7 @@ function ConversationList({
       }
       const dragged = activeDrag;
       setActiveDrag(null);
+      setOverPin(null);
       if (!dragged) return;
       const target = (event.over?.data.current as SidebarDropTarget | undefined) ?? null;
       const action = resolveSidebarDrop(
@@ -1964,10 +2210,34 @@ function ConversationList({
       if (action.kind === "move") {
         moveToProject.mutate({ id: dragged.id, project: action.project });
         // Unpin a pinned session so it actually drops into the folder instead of
-        // staying floated up in Pinned (pin outranks project membership).
-        if (action.unpin) onTogglePinned(dragged.id);
+        // staying floated up in Pinned (pin outranks project membership). No
+        // Undo pill: re-pinning would leave the session filed in the new folder.
+        if (action.unpin) pinAt({ id: dragged.id, pinned: false }).catch(() => {});
         // Open the (possibly brand-new) folder so the session is visible in it.
         expandProject(action.project);
+        return;
+      }
+      if (action.kind === "reorder-pin") {
+        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
+        if (writes.length > 0) reorderPins(writes);
+        return;
+      }
+      if (action.kind === "pin" && action.targetId) {
+        // Pin into the dropped-on slot; the new pin goes through the pin toggle
+        // (cap / ownership checks), and only once it's accepted are any
+        // renumbered neighbours rewritten through the batch.
+        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
+        const pin = writes.find((w) => w.id === dragged.id);
+        const rest = writes.filter((w) => w.id !== dragged.id);
+        // Chain on this call's own promise: per-call mutate callbacks are dropped
+        // when a later drop calls the mutation again.
+        if (pin) {
+          pinAt({ id: pin.id, pinned: true, pinnedAt: pin.pinnedAt })
+            .then(() => {
+              if (rest.length > 0) reorderPins(rest);
+            })
+            .catch(() => {});
+        }
         return;
       }
       if (action.kind === "pin" || action.kind === "unpin") {
@@ -1981,10 +2251,20 @@ function ConversationList({
         // Unfile silently — a first-class project persists when emptied, so
         // dragging out its last session deletes nothing. Mirrors the kebab flow.
         moveToProject.mutate({ id: dragged.id, project: "" });
-        if (action.unpin) onTogglePinned(dragged.id);
+        if (action.unpin) pinAt({ id: dragged.id, pinned: false }).catch(() => {});
       }
     },
-    [activeDrag, moveToProject, expandProject, onTogglePinned, projects, saveOrder],
+    [
+      activeDrag,
+      moveToProject,
+      expandProject,
+      onTogglePinned,
+      projects,
+      saveOrder,
+      sections.pinned,
+      pinAt,
+      reorderPins,
+    ],
   );
 
   const expandAllProjects = useCallback((allNames: string[]) => {
@@ -2058,12 +2338,15 @@ function ConversationList({
   useEffect(() => {
     if (!selectionMode || conversationsQuery.isFetching) return;
     const pool =
-      selectionScope === "projects" ? projectSessionPool.length : sections.sessions.length;
+      selectionScope === "projects"
+        ? projectSessionPool.length
+        : displayPagination.rows.length + (unifiedSelection ? projectSessionPool.length : 0);
     if (pool === 0) onExitSelectionMode();
   }, [
     selectionMode,
     selectionScope,
-    sections.sessions.length,
+    unifiedSelection,
+    displayPagination.rows.length,
     projectSessionPool.length,
     conversationsQuery.isFetching,
     onExitSelectionMode,
@@ -2105,9 +2388,12 @@ function ConversationList({
     return [
       ...visible("Pinned", sections.pinned),
       ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
-      ...visible("Chats", sections.sessions),
+      ...visible("Shared", sections.shared),
+      ...(sessionGroups
+        ? sessionGroups.flatMap((g) => visible(g.title, g.conversations))
+        : visible("Chats", sections.sessions)),
     ].map((c) => c.id);
-  }, [sections, effectiveCollapsedSections, expandedProjects]);
+  }, [sections, sessionGroups, effectiveCollapsedSections, expandedProjects]);
   // Getter for the shift-select range, built on demand (at click time). Scopes
   // to whichever section is selectable: the flat Sessions list, or the sessions
   // across expanded project folders (in render order). For projects scope the
@@ -2115,15 +2401,24 @@ function ConversationList({
   // renders — so a shift target the global window hasn't loaded still resolves.
   // Rows outside the active scope have no checkboxes, so they never enter a range.
   getVisibleIdsRef.current = () => {
-    if (selectionScope === "projects") {
+    const projectIds = () => {
       if (effectiveCollapsedSections.includes("Projects")) return [];
       return sections.projectGroups.flatMap((g) => {
         if (!expandedProjects.includes(g.name)) return [];
         const rows = folderConversations.get(g.name) ?? g.conversations;
         return rows.map((c) => c.id);
       });
-    }
-    return effectiveCollapsedSections.includes("Chats") ? [] : sections.sessions.map((c) => c.id);
+    };
+    if (selectionScope === "projects") return projectIds();
+    const visibleIds = (title: string, list: readonly Conversation[]) =>
+      effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
+    return [
+      ...(unifiedSelection ? projectIds() : []),
+      ...visibleIds("Shared", sections.shared),
+      ...(sessionGroups
+        ? sessionGroups.flatMap((g) => visibleIds(g.title, g.conversations))
+        : visibleIds("Chats", sections.sessions)),
+    ];
   };
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
@@ -2134,6 +2429,17 @@ function ConversationList({
     [sections.pinned, collapsedSections],
   );
   usePinnedSessionHotkeys(pinnedSessionIds, activeId);
+  const pinOrder = useMemo(
+    () =>
+      pinReorderEnabled && !pinWriting
+        ? {
+            ids: sections.pinned.map((c) => c.id),
+            draggingId: activeDrag?.id ?? null,
+            overId: overPin,
+          }
+        : null,
+    [pinReorderEnabled, pinWriting, sections.pinned, activeDrag, overPin],
+  );
 
   // Pinned membership is server-authoritative (the `omnigent.pinned` label),
   // so there's no client-side list to normalize against the loaded window —
@@ -2159,7 +2465,100 @@ function ConversationList({
     </p>
   ) : undefined;
   const showShared = activeTab === "shared";
+  // The Shared section replaces Sessions on the Shared filter (release-flagged).
+  const sharedListOnly = groupingUi && !grouped && showShared;
+  // The paginated list sections on screen, by collapse key: Shared, then Sessions or its groups.
+  const listSectionKeys = [
+    ...(sections.shared.length > 0 || sharedListOnly ? ["Shared"] : []),
+    ...(sharedListOnly ? [] : (sessionGroups?.map((g) => g.title) ?? ["Chats"])),
+  ];
   const emptyMessage = searchQuery ? "No matching conversations" : "No sessions";
+
+  // List header controls and row props, shared by the Shared, single "Sessions"
+  // and grouped sections; the controls sit on the first of the viewer's lists.
+  const sessionRowProps = {
+    activeConversationId: displayedActiveId,
+    pinnedConversationIds,
+    onRowClick,
+    onTogglePinned,
+    selectionMode: sessionsSelecting,
+    selectedIds,
+    onToggleSelected,
+    onProjectAssigned: expandProject,
+  };
+  const sessionsBulkBar =
+    sessionsSelecting && !unifiedSelection ? (
+      <BulkActionBar
+        selectedIds={selectedIds}
+        allConversations={displayPagination.rows}
+        onDeselectAll={onDeselectAll}
+        onExit={onExitSelectionMode}
+        onProjectAssigned={expandProject}
+      />
+    ) : undefined;
+  // The filter stays reachable while bulk-selecting; switching scope just exits
+  // selection. Only the "select" entry point hides, being already active.
+  const selectSessionsButton = (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          aria-label="Select sessions"
+          data-testid="toggle-selection-mode"
+          className="text-muted-foreground"
+          onClick={(event) => {
+            event.stopPropagation();
+            onEnterSelectionMode("sessions");
+          }}
+        >
+          <ListChecksIcon className="size-3.5" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">Select sessions</TooltipContent>
+    </Tooltip>
+  );
+  // A unified selection puts "Select sessions" on the Projects header instead.
+  const sessionsHeaderActions = !selectionMode ? (
+    <div className="flex items-center gap-0.5">
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            asChild
+            variant="ghost"
+            size="icon-xs"
+            aria-label="New session"
+            data-testid="sessions-new-session"
+            className="text-muted-foreground"
+          >
+            <Link
+              to="/"
+              componentId="sidebar.sessions_new_chat"
+              onClick={(event) => {
+                event.stopPropagation();
+                onActiveTabChange("mine");
+                onRowClick(event);
+              }}
+            >
+              <MessageCirclePlusIcon className="size-3.5" />
+            </Link>
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">New session</TooltipContent>
+      </Tooltip>
+      {!unifiedSelection && selectSessionsButton}
+    </div>
+  ) : undefined;
+  const sessionsFilterMenu = (
+    <SessionFilterMenu
+      value={activeTab}
+      onChange={onActiveTabChange}
+      multiUser={multiUser}
+      view={groupingUi ? view : null}
+      onViewChange={updateView}
+    />
+  );
 
   // Archived sessions are surfaced on the Settings page, not here, so they
   // don't count toward the sidebar's empty-state threshold. Each project
@@ -2169,6 +2568,7 @@ function ConversationList({
   // tab only (Projects is empty on the Shared tab).
   const totalVisible =
     sections.pinned.length +
+    sections.shared.length +
     sections.sessions.length +
     sections.projectGroups.length +
     sections.projectGroups.reduce((sum, g) => sum + g.conversations.length, 0);
@@ -2181,6 +2581,7 @@ function ConversationList({
       projectNamesById={projectNamesById}
       projectIconsById={projectIconsById}
       hostsById={hostsById}
+      show={view.show}
       isMobile={isMobile}
       viewerId={viewerId}
       serverInfo={serverInfo}
@@ -2217,217 +2618,101 @@ function ConversationList({
         measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
-        onDragOver={(event) =>
-          setOverProject(
-            event.over?.data.current?.type === "project-order"
-              ? (event.over.data.current.name as string)
-              : null,
-          )
-        }
+        onDragOver={(event) => {
+          const over = event.over?.data.current;
+          setOverProject(over?.type === "project-order" ? (over.name as string) : null);
+          setOverPin(over?.type === "pin-order" ? (over.id as string) : null);
+        }}
         onDragCancel={() => {
           setActiveDrag(null);
+          setOverPin(null);
           setDraggedProject(null);
           setOverProject(null);
         }}
       >
         <RowEditHoldContext.Provider value={reportRowEditing}>
-          <div
-            className="flex flex-col gap-4"
-            data-testid="sidebar-conversation-list"
-            // Freeze the sort order while the pointer is over the list so rows
-            // never move under the cursor. The frozen-keys map is cleared by the
-            // effect above once no hold (pointer or open rename edit) remains.
-            onMouseEnter={() => setPointerInside(true)}
-            onMouseLeave={() => setPointerInside(false)}
-          >
-            {/* Removing a filed session from its project means dropping it back
+          <PinSavingContext.Provider value={pinWriting}>
+            <div
+              className="flex flex-col gap-6"
+              data-testid="sidebar-conversation-list"
+              // Freeze the sort order while the pointer is over the list so rows
+              // never move under the cursor. The frozen-keys map is cleared by the
+              // effect above once no hold (pointer or open rename edit) remains.
+              onMouseEnter={() => setPointerInside(true)}
+              onMouseLeave={() => setPointerInside(false)}
+            >
+              {/* Removing a filed session from its project means dropping it back
             onto the flat "Chats" list — so the Chats section itself is the
             ungroup target (wrapped below). This top strip is only a FALLBACK
             for when there are no ungrouped chats yet, so the Chats section
             isn't rendered and there'd otherwise be nowhere to drop. */}
-            {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
-              <UngroupDropZone />
-            )}
-            {totalVisible === 0 && searchQuery && !sessionStatus ? (
-              <>
-                <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
-                {/* The list is one paginated stream ordered by updated_at across
+              {!showShared &&
+                !grouped &&
+                activeDrag?.project != null &&
+                sections.sessions.length === 0 && <UngroupDropZone />}
+              {totalVisible === 0 && searchQuery && !sessionStatus ? (
+                <>
+                  <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
+                  {/* The list is one paginated stream ordered by updated_at across
               owned + shared sessions, so the current filter can be empty on the
               loaded window while its sessions live on a later page. Keep the
               sentinel mounted so pagination continues instead of stranding the
               user on a false "empty" state. */}
-                {hasMorePages && (
-                  <InfiniteScrollSentinel
-                    scopeKey={activeTab}
-                    budgetRef={autoLoadBudget}
-                    maxAutoLoads={displayPagination.maxAutoLoads}
-                    hasMore={hasMorePages}
-                    isFetching={isFetchingNextPage}
-                    fetchMore={fetchNextPage}
-                    scrollRoot={scrollContainerRef}
-                  />
-                )}
-              </>
-            ) : (
-              <>
-                {sections.pinned.length > 0 && (
-                  // Drop a session here to pin it — pin-precedence then floats it
-                  // out of any project into this section. Active only while dragging
-                  // an unpinned session; outline-only highlight.
-                  <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
-                    <ConversationSection
-                      title="Pinned"
-                      conversations={sections.pinned}
-                      activeConversationId={displayedActiveId}
-                      pinnedConversationIds={pinnedConversationIds}
-                      collapsed={effectiveCollapsedSections.includes("Pinned")}
-                      onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
-                      onRowClick={onRowClick}
-                      onTogglePinned={onTogglePinned}
-                      selectionMode={false}
-                      selectedIds={selectedIds}
-                      onToggleSelected={onToggleSelected}
-                      onProjectAssigned={expandProject}
+                  {hasMorePages && (
+                    <InfiniteScrollSentinel
+                      scopeKey={activeTab}
+                      budgetRef={autoLoadBudget}
+                      maxAutoLoads={displayPagination.maxAutoLoads}
+                      hasMore={hasMorePages}
+                      isFetching={isFetchingNextPage}
+                      fetchMore={fetchNextPage}
+                      scrollRoot={scrollContainerRef}
                     />
-                  </PinDropZone>
-                )}
-                {/* Projects: a "Projects" group header, with each project rendered as
-              a collapsible folder row nested beneath it. Folders default
-              collapsed; an empty folder shows "No sessions". The folder icon marks
-              a project row; the group/section headers carry no icon or count.
-              Always shown (even with zero projects), unaffected by the filter, so
-              "New project" (create-empty) stays discoverable and folders don't
-              vanish when switching to Shared or Archived. */}
-                <SectionGroup
-                  title="Projects"
-                  collapsed={effectiveCollapsedSections.includes("Projects")}
-                  onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                  afterHeader={
-                    projectsSelecting ? (
-                      <BulkActionBar
-                        selectedIds={selectedIds}
-                        allConversations={projectSessionPool}
-                        onDeselectAll={onDeselectAll}
-                        onExit={onExitSelectionMode}
-                        onProjectAssigned={expandProject}
-                      />
-                    ) : undefined
-                  }
-                  headerAction={
-                    !selectionMode ? (
-                      <ProjectHeaderActions
-                        onOrderChange={(manual) => {
-                          const ranks = new Map(
-                            projectOrder.data?.ordered_project_ids?.map((id, index) => [id, index]),
-                          );
-                          const restored = [...projects].sort(
-                            (a, b) =>
-                              (ranks.get(a.id ?? "") ?? Infinity) -
-                              (ranks.get(b.id ?? "") ?? Infinity),
-                          );
-                          saveOrder.mutate(manual ? restored : null);
-                        }}
-                        manualOrder={projectOrder.data?.sort_mode === "manual"}
-                        orderDisabled={saveOrder.isPending || !projectOrder.data}
-                        projectNames={sections.projectGroups.map((group) => group.name)}
-                        collapsed={effectiveCollapsedSections.includes("Projects")}
-                        expandedProjects={expandedProjects}
-                        hasProjectSessions={sections.projectGroups.some(
-                          (group) => group.conversations.length > 0,
-                        )}
-                        onExpandAll={expandAllProjects}
-                        onCollapseAll={collapseAllProjects}
-                        onProjectCreated={expandProject}
-                        onEnterSelectionMode={() => onEnterSelectionMode("projects")}
-                      />
-                    ) : undefined
-                  }
-                >
-                  <SortableContext
-                    items={projects.map((p) => projectDragId(p.name))}
-                    strategy={verticalListSortingStrategy}
-                  >
-                    {sections.projectGroups.map((group, index) => (
-                      <ProjectFolder
-                        key={group.name}
-                        ordering={{
-                          disabled:
-                            !projectOrder.data ||
-                            saveOrder.isPending ||
-                            selectionMode ||
-                            editingIds.size > 0,
-                          first: index === 0,
-                          last: index === projects.length - 1,
-                          move: (destination) => moveProject(group.name, destination),
-                          insertion:
-                            overProject === group.name &&
-                            draggedProject !== group.name &&
-                            draggedProject !== null
-                              ? projects.findIndex((p) => p.name === draggedProject) < index
-                                ? "after"
-                                : "before"
-                              : undefined,
-                        }}
-                        name={group.name}
-                        projectId={group.id}
-                        icon={group.icon}
-                        windowConversations={group.conversations}
-                        activeConversationId={displayedActiveId}
-                        expanded={expandedProjects.includes(group.name)}
-                        active={newSessionProjectName === group.name}
-                        onToggleCollapsed={() => toggleProjectExpanded(group.name)}
-                        pinnedConversationIds={pinnedConversationIds}
-                        activeOverride={activeOverride}
-                        frozenSortKeys={frozenKeys}
-                        scrollRoot={scrollContainerRef}
-                        onRowClick={onRowClick}
-                        onTogglePinned={onTogglePinned}
-                        selectionMode={projectsSelecting}
-                        selectedIds={selectedIds}
-                        onToggleSelected={onToggleSelected}
-                        onProjectAssigned={expandProject}
-                        onConversationsLoaded={handleFolderConversationsLoaded}
-                      />
-                    ))}
-                  </SortableContext>
-                  {sections.projectGroups.length === 0 &&
-                    !effectiveCollapsedSections.includes("Projects") && (
-                      <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
-                    )}
-                </SectionGroup>
-                {/* Always rendered, even with no rows: the header carries the
-                    filter menu, so hiding it on an empty slice would strand the
-                    viewer with no way to pick another filter. */}
-                {
-                  // Drop a session here to send it to the flat "Chats" list — where
-                  // unfiled, unpinned sessions live. Active while dragging a filed
-                  // session (removes it from its project) or a pinned one (unpins
-                  // it), since both have somewhere to land here.
-                  <ChatsDropZone
-                    active={
-                      activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)
-                    }
-                  >
-                    <ConversationSection
-                      title="Sessions"
-                      conversations={sections.sessions}
-                      activeConversationId={displayedActiveId}
-                      emptyMessage={sessionStatus ? undefined : SIDEBAR_FILTER_EMPTY[activeTab]}
-                      footer={sessionStatus}
-                      pinnedConversationIds={pinnedConversationIds}
-                      collapsed={effectiveCollapsedSections.includes("Chats")}
-                      onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
-                      onRowClick={onRowClick}
-                      onTogglePinned={onTogglePinned}
-                      selectionMode={sessionsSelecting}
-                      selectedIds={selectedIds}
-                      onToggleSelected={onToggleSelected}
-                      onProjectAssigned={expandProject}
+                  )}
+                </>
+              ) : (
+                <>
+                  {sections.pinned.length > 0 && (
+                    // Drop a session here to pin it — pin-precedence then floats it
+                    // out of any project into this section. Active only while dragging
+                    // an unpinned session; outline-only highlight.
+                    <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
+                      <PinOrderContext.Provider value={pinOrder}>
+                        <ConversationSection
+                          title="Pinned"
+                          conversations={sections.pinned}
+                          activeConversationId={displayedActiveId}
+                          pinnedConversationIds={pinnedConversationIds}
+                          collapsed={effectiveCollapsedSections.includes("Pinned")}
+                          onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
+                          onRowClick={onRowClick}
+                          onTogglePinned={onTogglePinned}
+                          selectionMode={false}
+                          selectedIds={selectedIds}
+                          onToggleSelected={onToggleSelected}
+                          onProjectAssigned={expandProject}
+                        />
+                      </PinOrderContext.Provider>
+                    </PinDropZone>
+                  )}
+                  {/* Projects: one collapsible folder per project, unaffected by the filter so
+              "New project" stays reachable. With sidebar_grouping_ui on it holds the one
+              filter menu; grouped views hide it and the first group takes its place. */}
+                  {!grouped && (
+                    <SectionGroup
+                      title="Projects"
+                      collapsed={effectiveCollapsedSections.includes("Projects")}
+                      onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
+                      persistentHeaderAction={groupingUi ? sessionsFilterMenu : undefined}
                       afterHeader={
-                        sessionsSelecting ? (
+                        projectsSelecting ? (
                           <BulkActionBar
                             selectedIds={selectedIds}
-                            allConversations={sections.sessions}
+                            allConversations={
+                              unifiedSelection
+                                ? [...projectSessionPool, ...displayPagination.rows]
+                                : projectSessionPool
+                            }
                             onDeselectAll={onDeselectAll}
                             onExit={onExitSelectionMode}
                             onProjectAssigned={expandProject}
@@ -2435,63 +2720,185 @@ function ConversationList({
                         ) : undefined
                       }
                       headerAction={
-                        // The filter stays reachable while bulk-selecting;
-                        // switching scope just exits selection. Only the
-                        // "select" entry point hides, being already active.
                         !selectionMode ? (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon-xs"
-                                aria-label="Select sessions"
-                                data-testid="toggle-selection-mode"
-                                className="text-muted-foreground"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  onEnterSelectionMode("sessions");
-                                }}
-                              >
-                                <ListChecksIcon className="size-3.5" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom">Select sessions</TooltipContent>
-                          </Tooltip>
+                          <>
+                            <ProjectHeaderActions
+                              onOrderChange={(manual) => {
+                                const ranks = new Map(
+                                  projectOrder.data?.ordered_project_ids?.map((id, index) => [
+                                    id,
+                                    index,
+                                  ]),
+                                );
+                                const restored = [...projects].sort(
+                                  (a, b) =>
+                                    (ranks.get(a.id ?? "") ?? Infinity) -
+                                    (ranks.get(b.id ?? "") ?? Infinity),
+                                );
+                                saveOrder.mutate(manual ? restored : null);
+                              }}
+                              manualOrder={projectOrder.data?.sort_mode === "manual"}
+                              orderDisabled={saveOrder.isPending || !projectOrder.data}
+                              projectNames={sections.projectGroups.map((group) => group.name)}
+                              collapsed={effectiveCollapsedSections.includes("Projects")}
+                              expandedProjects={expandedProjects}
+                              // A unified selection starts from the header's own button.
+                              hasProjectSessions={
+                                !unifiedSelection &&
+                                sections.projectGroups.some(
+                                  (group) => group.conversations.length > 0,
+                                )
+                              }
+                              onExpandAll={expandAllProjects}
+                              onCollapseAll={collapseAllProjects}
+                              onProjectCreated={expandProject}
+                              onEnterSelectionMode={() => onEnterSelectionMode("projects")}
+                            />
+                            {unifiedSelection && selectSessionsButton}
+                          </>
                         ) : undefined
                       }
-                      persistentHeaderAction={
-                        <SessionFilterMenu
-                          value={activeTab}
-                          onChange={onActiveTabChange}
-                          multiUser={multiUser}
-                        />
+                    >
+                      <SortableContext
+                        items={projects.map((p) => projectDragId(p.name))}
+                        strategy={verticalListSortingStrategy}
+                      >
+                        {sections.projectGroups.map((group, index) => (
+                          <ProjectFolder
+                            key={group.name}
+                            ordering={{
+                              disabled:
+                                !projectOrder.data ||
+                                saveOrder.isPending ||
+                                selectionMode ||
+                                editingIds.size > 0,
+                              first: index === 0,
+                              last: index === projects.length - 1,
+                              move: (destination) => moveProject(group.name, destination),
+                              insertion:
+                                overProject === group.name &&
+                                draggedProject !== group.name &&
+                                draggedProject !== null
+                                  ? projects.findIndex((p) => p.name === draggedProject) < index
+                                    ? "after"
+                                    : "before"
+                                  : undefined,
+                            }}
+                            name={group.name}
+                            projectId={group.id}
+                            icon={group.icon}
+                            windowConversations={group.conversations}
+                            activeConversationId={displayedActiveId}
+                            expanded={expandedProjects.includes(group.name)}
+                            active={newSessionProjectName === group.name}
+                            onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                            pinnedConversationIds={pinnedConversationIds}
+                            activeOverride={activeOverride}
+                            frozenSortKeys={frozenKeys}
+                            scrollRoot={scrollContainerRef}
+                            onRowClick={onRowClick}
+                            onTogglePinned={onTogglePinned}
+                            selectionMode={projectsSelecting}
+                            selectedIds={selectedIds}
+                            onToggleSelected={onToggleSelected}
+                            onProjectAssigned={expandProject}
+                            onConversationsLoaded={handleFolderConversationsLoaded}
+                          />
+                        ))}
+                      </SortableContext>
+                      {sections.projectGroups.length === 0 &&
+                        !effectiveCollapsedSections.includes("Projects") && (
+                          <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
+                        )}
+                    </SectionGroup>
+                  )}
+                  {/* Other owners' sessions, above the viewer's own. On the Shared
+                    filter it's the only list, so it takes the list controls. */}
+                  {(sections.shared.length > 0 || sharedListOnly) && (
+                    <ConversationSection
+                      title="Shared"
+                      conversations={sections.shared}
+                      emptyMessage={
+                        sharedListOnly && !sessionStatus ? SIDEBAR_FILTER_EMPTY.shared : undefined
                       }
+                      footer={sharedListOnly ? sessionStatus : undefined}
+                      collapsed={effectiveCollapsedSections.includes("Shared")}
+                      onToggleCollapsed={() => effectiveToggleSectionCollapsed("Shared")}
+                      afterHeader={sharedListOnly ? sessionsBulkBar : undefined}
+                      headerAction={sharedListOnly ? sessionsHeaderActions : undefined}
+                      {...sessionRowProps}
                     />
-                  </ChatsDropZone>
-                }
-                {/* Every filter renders this same Pinned / Projects / Sessions
-              tree; `sections` is scoped to the active filter's conversations,
+                  )}
+                  {!sharedListOnly && (
+                    // Drop a session here to send it to the flat "Chats" list — where
+                    // unfiled, unpinned sessions live. Active while dragging a filed
+                    // session (removes it from its project) or a pinned one (unpins
+                    // it), since both have somewhere to land here.
+                    <ChatsDropZone
+                      active={activeDrag != null && sessionsListAcceptsDrop(activeDrag, grouped)}
+                    >
+                      {sessionGroups ? (
+                        // Grouped: one titled section per group; the first carries
+                        // the header controls, the last the load status.
+                        <div className="flex flex-col gap-6">
+                          {sessionGroups.map((group, index) => (
+                            <ConversationSection
+                              key={group.title}
+                              title={group.title}
+                              conversations={group.conversations}
+                              footer={
+                                index === sessionGroups.length - 1 ? sessionStatus : undefined
+                              }
+                              collapsed={effectiveCollapsedSections.includes(group.title)}
+                              onToggleCollapsed={() => effectiveToggleSectionCollapsed(group.title)}
+                              afterHeader={index === 0 ? sessionsBulkBar : undefined}
+                              headerAction={index === 0 ? sessionsHeaderActions : undefined}
+                              persistentHeaderAction={index === 0 ? sessionsFilterMenu : undefined}
+                              {...sessionRowProps}
+                            />
+                          ))}
+                        </div>
+                      ) : (
+                        <ConversationSection
+                          title="Sessions"
+                          conversations={sections.sessions}
+                          emptyMessage={sessionStatus ? undefined : SIDEBAR_FILTER_EMPTY[activeTab]}
+                          footer={sessionStatus}
+                          collapsed={effectiveCollapsedSections.includes("Chats")}
+                          onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
+                          afterHeader={sessionsBulkBar}
+                          headerAction={sessionsHeaderActions}
+                          persistentHeaderAction={
+                            groupingUi && !grouped ? undefined : sessionsFilterMenu
+                          }
+                          {...sessionRowProps}
+                        />
+                      )}
+                    </ChatsDropZone>
+                  )}
+                  {/* Every filter renders this same Pinned / Projects / Shared /
+              Sessions tree; `sections` is scoped to the active filter's conversations,
               and Projects is empty for Shared and Archived. */}
-                {/* Archived sessions are no longer listed here — they live on the
+                  {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
-                {/* Infinite-scroll sentinel for the global list. Pagination extends
-              the Chats list, so it hides with a collapsed Chats group — a loader
-              under a collapsed group reads orphaned. */}
-                {!effectiveCollapsedSections.includes("Chats") && (
-                  <InfiniteScrollSentinel
-                    scopeKey={activeTab}
-                    budgetRef={autoLoadBudget}
-                    maxAutoLoads={displayPagination.maxAutoLoads}
-                    hasMore={hasMorePages}
-                    isFetching={isFetchingNextPage}
-                    fetchMore={fetchNextPage}
-                    scrollRoot={scrollContainerRef}
-                  />
-                )}
-              </>
-            )}
-          </div>
+                  {/* Infinite-scroll sentinel. A new page can land in any list section,
+              so it hides only when all of them are collapsed (a loader under a
+              collapsed group reads orphaned). */}
+                  {!listSectionKeys.every((key) => effectiveCollapsedSections.includes(key)) && (
+                    <InfiniteScrollSentinel
+                      scopeKey={activeTab}
+                      budgetRef={autoLoadBudget}
+                      maxAutoLoads={displayPagination.maxAutoLoads}
+                      hasMore={hasMorePages}
+                      isFetching={isFetchingNextPage}
+                      fetchMore={fetchNextPage}
+                      scrollRoot={scrollContainerRef}
+                    />
+                  )}
+                </>
+              )}
+            </div>
+          </PinSavingContext.Provider>
         </RowEditHoldContext.Provider>
         {/* The dragged row's preview follows the pointer: a compact card showing
           the session's title. Portaled to <body>: the aside always carries a CSS
@@ -2643,7 +3050,6 @@ function SectionHeader({
   marker,
   active = false,
   hasAction,
-  actionHoverOnly,
   hasPersistentAction,
   actionFocusVisible,
   collapsed,
@@ -2663,8 +3069,6 @@ function SectionHeader({
       full control column there; only at rest on hover-capable desktops do the
       badges return to the rows' badge column. */
   hasAction?: boolean;
-  /** Whether the header action is absent without a fine hover pointer. */
-  actionHoverOnly?: boolean;
   /** Whether an always-visible control sits at the header's right edge (the
       Sessions filter), which the collapsed badges must clear even at rest on
       hover-capable desktops. */
@@ -2680,21 +3084,8 @@ function SectionHeader({
   contextMenuDisabled?: boolean;
 }) {
   const showsMarker = collapsed && marker != null;
-  // Right-edge offset of the marker when no header control is painted: it
-  // matches the rows' badge slot (-mr-1 trims an icon folder's px-2 to the
-  // right-1 edge; mr-1 pushes a padless header out to it). One media condition
-  // governs the whole header-control matrix: overlays hide (and stop
-  // hit-testing) only on md+ displays whose PRIMARY pointer is a fine,
-  // hover-capable one — `hover:hover` alone is not enough, since a convertible
-  // with a coarse primary pointer can still report it, and its first tap would
-  // be captured by the header underneath before any hover state exists.
-  // Everywhere else the controls stay painted and clickable, so with
-  // `hasAction` the cluster reserves the full mr-14 control column, returning
-  // to this rest offset (or clearing the always-visible Sessions filter with
-  // mr-7) only under that same condition. Hover-only actions keep this rest
-  // offset at every capability. On fine-pointer touchscreen laptops a screen
-  // tap still hit-tests before hover applies, so the folder's menu keeps its
-  // "New session" fallback at every breakpoint.
+  // Touch and narrow layouts reserve space for the visible controls. On hover
+  // desktops the marker returns to the right edge until the controls appear.
   const clusterRestMargin = showsMarker ? (icon ? "-mr-1" : "mr-1") : "mr-2";
   const clusterHoverDesktopMargin = hasPersistentAction
     ? "[@media((hover:hover)_and_(pointer:fine))]:md:mr-7"
@@ -2703,22 +3094,11 @@ function SectionHeader({
         ? "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1"
         : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-1"
       : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-2";
-  const markerFade = actionHoverOnly
-    ? "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0"
-    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
-  // The hover-only control's focus reveal (`focus-visible:not-sr-only`) is
-  // ungated by pointer type, so a coarse-pointer tablet with a keyboard can
-  // land focus on it. Its focus fade must therefore fire at every pointer type
-  // too — otherwise the focus-revealed kebab paints over a still-visible
-  // spinner/count. The hover-driven fades above stay pointer-gated (hover only
-  // exists on fine). Every other header keeps its width-gated focus fade.
+  const markerFade =
+    "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
   const actionFocusFade = actionFocusVisible
-    ? actionHoverOnly
-      ? "group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
-      : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
-    : actionHoverOnly
-      ? "group-has-[[data-header-controls]:focus-within]/header:opacity-0"
-      : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
+    ? "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
+    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
   const button = (
     <button
       ref={
@@ -2758,8 +3138,11 @@ function SectionHeader({
               SIDEBAR_HOVER_HIGHLIGHT,
               contextMenu && SIDEBAR_OPEN_MENU_HIGHLIGHT,
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
+              hasAction &&
+                !showsMarker &&
+                "pr-8 [@media((hover:hover)_and_(pointer:fine))]:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:pr-2 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pr-14",
             )
-          : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
+          : "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
       )}
     >
       {icon ? (
@@ -2799,8 +3182,12 @@ function SectionHeader({
         <span
           className={cn(
             "ml-auto flex shrink-0 items-center justify-center transition-opacity",
-            hasAction && !actionHoverOnly
-              ? cn("mr-14", clusterHoverDesktopMargin)
+            // Touch project rows have one menu; fine pointers also get a shortcut.
+            hasAction
+              ? cn(
+                  icon ? "mr-7 [@media((hover:hover)_and_(pointer:fine))]:mr-14" : "mr-14",
+                  clusterHoverDesktopMargin,
+                )
               : hasPersistentAction
                 ? "mr-7"
                 : clusterRestMargin,
@@ -2835,18 +3222,74 @@ function SectionHeader({
 
 // Scope filter on the Sessions heading. A radio group: the options are
 // mutually exclusive slices of one list.
+const GROUPING_LABELS: Record<SidebarGrouping, string> = {
+  default: "Default",
+  status: "Status",
+  updated: "Updated",
+};
+const ORDERING_LABELS: Record<SidebarOrdering, string> = { updated: "Updated", status: "Status" };
+const SHOW_LABELS: Record<SidebarShowField, string> = {
+  updated: "Updated",
+  environment: "Environment",
+  repo: "Repo",
+  branch: "Branch",
+};
+
+// A filter-menu submenu whose trigger shows the current pick at its right edge.
+function FilterMenuSub({
+  label,
+  value,
+  testId,
+  children,
+}: {
+  label: string;
+  value?: string;
+  testId: string;
+  children: ReactNode;
+}) {
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger data-testid={testId}>
+        {label}
+        {value && <span className="ml-auto pl-6 text-muted-foreground">{value}</span>}
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent className="min-w-40 [&_[role=menuitemradio]]:text-ui [&_[role=menuitemcheckbox]]:text-ui">
+        {children}
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
+}
+
 function SessionFilterMenu({
   value,
   onChange,
   multiUser,
+  view,
+  onViewChange,
 }: {
   value: SidebarTab;
   onChange: (value: SidebarTab) => void;
   multiUser: boolean;
+  /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
+  view: SidebarViewPreferences | null;
+  onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
 }) {
   const filters = multiUser
     ? SIDEBAR_FILTERS
     : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
+  const displayOptions = (
+    <DropdownMenuRadioGroup value={value} onValueChange={(next) => onChange(next as SidebarTab)}>
+      {filters.map((filter) => (
+        <DropdownMenuRadioItem
+          key={filter.value}
+          value={filter.value}
+          data-testid={`session-filter-${filter.value}`}
+        >
+          {filter.label}
+        </DropdownMenuRadioItem>
+      ))}
+    </DropdownMenuRadioGroup>
+  );
   return (
     <DropdownMenu>
       <Tooltip disableHoverableContent>
@@ -2860,6 +3303,7 @@ function SessionFilterMenu({
                 size="icon-xs"
                 aria-label="Filter sessions"
                 data-testid="session-filter"
+                className="text-muted-foreground"
                 onClick={(event) => event.stopPropagation()}
               >
                 <ListFilterIcon className="size-3.5" />
@@ -2871,23 +3315,84 @@ function SessionFilterMenu({
           Filter sessions
         </TooltipContent>
       </Tooltip>
-      <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
-        <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
-        <DropdownMenuRadioGroup
-          value={value}
-          onValueChange={(next) => onChange(next as SidebarTab)}
-        >
-          {filters.map((filter) => (
-            <DropdownMenuRadioItem
-              key={filter.value}
-              value={filter.value}
-              data-testid={`session-filter-${filter.value}`}
+      {view === null ? (
+        // Remove with the sidebar_grouping_ui flag (review by 0.19.0).
+        <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
+          <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
+          {displayOptions}
+        </DropdownMenuContent>
+      ) : (
+        <DropdownMenuContent align="end" className="min-w-56">
+          <FilterMenuSub
+            label="Grouping"
+            value={GROUPING_LABELS[view.grouping]}
+            testId="session-grouping-menu"
+          >
+            <DropdownMenuRadioGroup
+              value={view.grouping}
+              onValueChange={(next) => onViewChange({ grouping: next as SidebarGrouping })}
             >
-              {filter.label}
-            </DropdownMenuRadioItem>
-          ))}
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
+              {Object.entries(GROUPING_LABELS).map(([grouping, label]) => (
+                <DropdownMenuRadioItem
+                  key={grouping}
+                  value={grouping}
+                  data-testid={`session-grouping-${grouping}`}
+                >
+                  {label}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </FilterMenuSub>
+          <FilterMenuSub
+            label="Display"
+            value={filters.find((filter) => filter.value === value)?.label}
+            testId="session-display-menu"
+          >
+            {displayOptions}
+          </FilterMenuSub>
+          <FilterMenuSub
+            label="Ordering"
+            value={ORDERING_LABELS[view.ordering]}
+            testId="session-ordering-menu"
+          >
+            <DropdownMenuRadioGroup
+              value={view.ordering}
+              onValueChange={(next) => onViewChange({ ordering: next as SidebarOrdering })}
+            >
+              {Object.entries(ORDERING_LABELS).map(([ordering, label]) => (
+                <DropdownMenuRadioItem
+                  key={ordering}
+                  value={ordering}
+                  data-testid={`session-ordering-${ordering}`}
+                >
+                  {label}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </FilterMenuSub>
+          <DropdownMenuSeparator />
+          <FilterMenuSub label="Show" testId="session-show-menu">
+            {SIDEBAR_SHOW_FIELDS.map((field) => (
+              <DropdownMenuCheckboxItem
+                key={field}
+                checked={view.show.includes(field)}
+                data-testid={`session-show-${field}`}
+                // Keep the menu open so several fields can be toggled in one go.
+                onSelect={(event) => event.preventDefault()}
+                onCheckedChange={(checked) =>
+                  onViewChange({
+                    show: SIDEBAR_SHOW_FIELDS.filter((f) =>
+                      f === field ? checked : view.show.includes(f),
+                    ),
+                  })
+                }
+              >
+                {SHOW_LABELS[field]}
+              </DropdownMenuCheckboxItem>
+            ))}
+          </FilterMenuSub>
+        </DropdownMenuContent>
+      )}
     </DropdownMenu>
   );
 }
@@ -3000,6 +3505,7 @@ function SectionGroup({
   collapsed,
   onToggleCollapsed,
   headerAction,
+  persistentHeaderAction,
   afterHeader,
   children,
 }: {
@@ -3010,6 +3516,8 @@ function SectionGroup({
       "collapse all projects" toggle). Always shown without hover support and
       hover/focus-revealed on hover-capable desktop displays. */
   headerAction?: ReactNode;
+  /** Optional control that remains visible at the header's right edge. */
+  persistentHeaderAction?: ReactNode;
   /** Optional content rendered directly under the header, above the children
       (and shown even when collapsed) — e.g. the bulk-selection action bar. */
   afterHeader?: ReactNode;
@@ -3021,30 +3529,45 @@ function SectionGroup({
         <SectionHeader
           title={title}
           hasAction={headerAction != null}
+          hasPersistentAction={persistentHeaderAction != null}
           actionFocusVisible
           collapsed={collapsed}
           onToggleCollapsed={onToggleCollapsed}
         />
-        {headerAction && (
-          // Always visible (and hit-testable) except on md+ displays with a
-          // fine, hover-capable primary pointer — phones, touch tablets and
-          // coarse-pointer convertibles have no reliable hover, and the "New
-          // project" control lives here (the only way to create a project).
-          // On mouse/trackpad desktops it's hover/keyboard-focus-revealed.
-          // Reveal on :focus-visible (keyboard) — NOT :focus-within — so
-          // clicking the button with the mouse doesn't leave it stuck visible:
-          // React reuses the same node when it swaps expand↔revert, so the
-          // clicked button keeps focus afterward.
+        {persistentHeaderAction ? (
           <div
             data-header-controls
-            className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100"
+            className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5"
           >
-            {headerAction}
+            {headerAction && (
+              <div className="flex items-center gap-0.5 transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100">
+                {headerAction}
+              </div>
+            )}
+            {persistentHeaderAction}
           </div>
+        ) : (
+          headerAction && (
+            // Always visible (and hit-testable) except on md+ displays with a
+            // fine, hover-capable primary pointer — phones, touch tablets and
+            // coarse-pointer convertibles have no reliable hover, and the "New
+            // project" control lives here (the only way to create a project).
+            // On mouse/trackpad desktops it's hover/keyboard-focus-revealed.
+            // Reveal on :focus-visible (keyboard) — NOT :focus-within — so
+            // clicking the button with the mouse doesn't leave it stuck visible:
+            // React reuses the same node when it swaps expand↔revert, so the
+            // clicked button keeps focus afterward.
+            <div
+              data-header-controls
+              className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100"
+            >
+              {headerAction}
+            </div>
+          )
         )}
       </div>
       {afterHeader}
-      {!collapsed && <div className="flex flex-col gap-0">{children}</div>}
+      {!collapsed && <div className="flex flex-col gap-px pt-1">{children}</div>}
     </section>
   );
 }
@@ -3068,7 +3591,6 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
-  actionHoverOnly,
   headerContextMenu,
   persistentHeaderAction,
   afterHeader,
@@ -3103,8 +3625,6 @@ function ConversationSection({
   indentRows?: boolean;
   /** Optional control overlaid at the header's right edge. */
   headerAction?: ReactNode;
-  /** Whether `headerAction` is absent without a fine hover pointer. */
-  actionHoverOnly?: boolean;
   /** Optional context-menu content opened from the header button. */
   headerContextMenu?: ReactNode;
   /** Optional control that remains visible at the header's right edge. */
@@ -3135,7 +3655,6 @@ function ConversationSection({
             marker={marker}
             active={active}
             hasAction={headerAction != null}
-            actionHoverOnly={actionHoverOnly}
             hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
@@ -3159,14 +3678,8 @@ function ConversationSection({
               data-header-controls
               className={cn(
                 "-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
-                // A hover-only action reveals at every width on a fine hover
-                // pointer (no `md:`), so the badge it overlays is protected from
-                // its at-rest hit target on narrow hover desktops too. Every
-                // other header keeps the width-gated reveal.
                 protectsCollapsedBadge &&
-                  (actionHoverOnly
-                    ? "[@media((hover:hover)_and_(pointer:fine))]:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:has-[[aria-expanded=true]]:pointer-events-auto"
-                    : "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:pointer-events-auto"),
+                  "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:pointer-events-auto",
               )}
             >
               {headerAction && (
@@ -3178,9 +3691,7 @@ function ConversationSection({
                 <div
                   className={cn(
                     "flex items-center rounded transition-opacity",
-                    actionHoverOnly
-                      ? "[@media((hover:hover)_and_(pointer:fine))]:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:has-[[aria-expanded=true]]:opacity-100"
-                      : "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:opacity-100",
+                    "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:opacity-100",
                   )}
                 >
                   {headerAction}
@@ -3197,7 +3708,7 @@ function ConversationSection({
       )}
       {afterHeader}
       {!isCollapsed && (
-        <>
+        <div className="pt-1">
           {conversations.length === 0 && emptyMessage ? (
             // Expanded but empty — a project with no loaded chats (indented, in a
             // dashed well) or a top-level list whose filter matched nothing.
@@ -3215,7 +3726,7 @@ function ConversationSection({
             )
           ) : (
             // Indent project chats a step under the project-folder name above.
-            <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0")}>
+            <ul className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
               {conversations.map((conv) => (
                 <ConversationRow
                   key={conv.id}
@@ -3233,7 +3744,7 @@ function ConversationSection({
             </ul>
           )}
           {footer}
-        </>
+        </div>
       )}
     </section>
   );
@@ -3249,6 +3760,8 @@ interface MenuItemProps {
   children?: ReactNode;
   className?: string;
   disabled?: boolean;
+  "aria-disabled"?: boolean;
+  "aria-describedby"?: string;
   textValue?: string;
   variant?: "default" | "destructive";
   // Radix's menu `onSelect` receives a native Event in both families.
@@ -3311,7 +3824,6 @@ function ConversationMenuItems({
   onMarkRead,
   onProjectAssigned,
   moveToProject,
-  stopSession,
   setShareOpen,
   setForkOpen,
   setIsEditing,
@@ -3342,7 +3854,6 @@ function ConversationMenuItems({
   onMarkRead: () => void;
   onProjectAssigned?: (projectName: string) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
-  stopSession: ReturnType<typeof useStopSession>;
   setShareOpen: (open: boolean) => void;
   setForkOpen: (open: boolean) => void;
   setIsEditing: (editing: boolean) => void;
@@ -3355,6 +3866,8 @@ function ConversationMenuItems({
   runArchive: () => void;
 }) {
   const atPinCap = useContext(PinCapacityContext);
+  const pinSaving = useContext(PinSavingContext);
+  const { forkDisabledReason } = useSessionActionRestrictions(conversation.id, conversation);
   // Mobile lacks the horizontal room for a side-opening submenu, so the
   // project picker replaces the menu body in place instead of flying out
   // to the side. `view` swaps between the main actions and that sub-view;
@@ -3419,7 +3932,7 @@ function ConversationMenuItems({
       {!isArchived && (
         <C.Item
           data-testid="pin-conversation"
-          disabled={!isPinned && atPinCap}
+          disabled={pinSaving || (!isPinned && atPinCap)}
           className="md:hidden"
           onSelect={() => onTogglePinned(conversation.id)}
         >
@@ -3454,10 +3967,15 @@ function ConversationMenuItems({
             </TooltipContent>
           </Tooltip>
         ))}
-      <C.Item data-testid="fork-conversation" onSelect={() => setForkOpen(true)}>
+      <SessionActionMenuItem
+        Item={C.Item}
+        data-testid="fork-conversation"
+        disabledReason={forkDisabledReason}
+        onSelect={() => setForkOpen(true)}
+      >
         <GitForkIcon className="size-3.5" />
         Fork
-      </C.Item>
+      </SessionActionMenuItem>
       {isOwner ? (
         <C.Item
           data-testid="rename-conversation"
@@ -3560,14 +4078,7 @@ function ConversationMenuItems({
           <C.Item
             data-testid="stop-conversation"
             variant="destructive"
-            onSelect={() => {
-              // Clear any prior failure so a stale "couldn't stop"
-              // message doesn't greet the next attempt. Must happen
-              // here: Radix only fires the Dialog's onOpenChange for
-              // Radix-initiated changes, not this programmatic open.
-              stopSession.reset();
-              setStopOpen(true);
-            }}
+            onSelect={() => setStopOpen(true)}
           >
             <CircleStopIcon className="size-3.5" />
             Stop session
@@ -3654,7 +4165,192 @@ function SessionErrorHint() {
   );
 }
 
-function SessionTooltipContent({
+/** Where a session runs: local machine, a sandbox provider, or the host's name (id while unresolved). */
+function sessionLocationLabel(
+  conversation: Conversation,
+  hostsById: ReadonlyMap<string, Host>,
+): string {
+  if (!conversation.host_id) return "Local machine";
+  const host = hostsById.get(conversation.host_id);
+  return host?.sandbox_provider
+    ? sandboxOptionLabel(host.sandbox_provider)
+    : (host?.name ?? conversation.host_id);
+}
+
+/** A row's short environment: the sandbox type, this device, or "Remote"; the tooltip names the host. */
+function sessionEnvironmentLabel(
+  conversation: Conversation,
+  hostsById: ReadonlyMap<string, Host>,
+  desktopHostId: string | null,
+): string {
+  const hostId = conversation.host_id;
+  if (!hostId || hostsById.get(hostId)?.sandbox_provider) {
+    return sessionLocationLabel(conversation, hostsById);
+  }
+  const onlineHostIds = [...hostsById.values()]
+    .filter((h) => h.status === "online" && !h.sandbox_provider)
+    .map((h) => h.host_id);
+  return hostId === resolveThisMachineHostId(desktopHostId, isCurrentServerLocal(), onlineHostIds)
+    ? localMachineLabel(navigator.userAgent)
+    : "Remote";
+}
+
+/** A managed-sandbox session's repo name from its first `omnigent.sandbox.repo` label; null otherwise. */
+function sessionRepoName(conversation: Conversation): string | null {
+  const labels = conversation.labels ?? {};
+  const workspace = labels[`${SANDBOX_REPO_LABEL_KEY}.0`] ?? labels[SANDBOX_REPO_LABEL_KEY];
+  // Label value is `<url>[#<branch>]`; the name is derived from the url part.
+  return workspace ? deriveRepoName(workspace.split("#")[0]!) : null;
+}
+
+// Its own component so only rows showing Environment subscribe to the desktop host id.
+function SessionEnvironmentLabel({
+  conversation,
+  hostsById,
+}: {
+  conversation: Conversation;
+  hostsById: ReadonlyMap<string, Host>;
+}) {
+  return sessionEnvironmentLabel(conversation, hostsById, useDesktopHostId());
+}
+
+// Its own component so only rows showing the timestamp subscribe to the shared clock.
+function SessionUpdatedLabel({ updatedAt }: { updatedAt: number }) {
+  const now = useNow();
+  return relativeTime(updatedAt * 1000, now.getTime());
+}
+
+// A row's second line: the "Show" environment and branch, each omitted when empty.
+function SessionMetaLine({
+  environment,
+  repo,
+  branch,
+}: {
+  environment: ReactNode;
+  repo: string | null;
+  branch: string | null;
+}) {
+  const parts: { key: string; icon: LucideIcon; value: ReactNode }[] = [];
+  if (environment != null) parts.push({ key: "environment", icon: LaptopIcon, value: environment });
+  if (repo !== null) parts.push({ key: "repo", icon: FolderGit2Icon, value: repo });
+  if (branch !== null) parts.push({ key: "branch", icon: GitBranchIcon, value: branch });
+  if (parts.length === 0) return null;
+  return (
+    <span
+      data-testid="session-row-meta"
+      className="flex w-full min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
+    >
+      {parts.map(({ key, icon: Icon, value }, i) => (
+        <Fragment key={key}>
+          {i > 0 && <span aria-hidden>·</span>}
+          <span className="flex min-w-0 items-center gap-1">
+            <Icon aria-hidden className="size-3.5 shrink-0" />
+            <span className="truncate">{value}</span>
+          </span>
+        </Fragment>
+      ))}
+    </span>
+  );
+}
+
+// A label-left, value-right line in the session tooltip's details block.
+function SessionTooltipDetail({
+  label,
+  icon: Icon,
+  testId,
+  children,
+}: {
+  label: string;
+  icon: LucideIcon;
+  testId: string;
+  children: ReactNode;
+}) {
+  return (
+    <div data-testid={testId} className="flex items-center justify-between gap-3 text-sm">
+      <span className="shrink-0 text-muted-foreground">{label}</span>
+      <span className="flex min-w-0 items-center gap-1.5">
+        <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="truncate">{children}</span>
+      </span>
+    </div>
+  );
+}
+
+// GitHub's glyph and label for a PR state; gh reports a draft as OPEN + is_draft.
+function pullRequestStatus(pr: PullRequest): { icon: LucideIcon; label: string } {
+  const state = pr.state.toUpperCase();
+  if (state === "MERGED") return { icon: GitMergeIcon, label: "Merged" };
+  if (state === "CLOSED") return { icon: GitPullRequestClosedIcon, label: "Closed" };
+  if (pr.is_draft) return { icon: GitPullRequestDraftIcon, label: "Draft" };
+  return { icon: GitPullRequestIcon, label: "Open" };
+}
+
+// The tooltip's detail rows. Repo, PR and a non-worktree branch come from the
+// session's GitHub info, fetched only while the tooltip is open (Radix mounts
+// its content on open) and shared with the GitHub panel's cache.
+function SessionTooltipDetails({ conversation }: { conversation: Conversation }) {
+  const viewerId = useContext(ViewerIdContext);
+  // Only a workspace-bound session has a checkout to read GitHub state from.
+  const { data: github } = usePullRequestInfo(conversation.workspace ? conversation.id : undefined);
+  // `owner` is null when permissions are off; there's no creator to name then.
+  const owner = conversation.owner ?? null;
+  const createdBy = owner !== null && isOwnedByViewer(conversation, viewerId) ? "You" : owner;
+  const repo = github?.repo?.name_with_owner?.split("/").pop() ?? null;
+  // Prefer the resolved PR (carries state); fall back to the tracked association
+  // (number only) so the row still shows when gh can't resolve state — e.g. gh
+  // isn't authenticated on the host.
+  const pr = github?.pr ?? null;
+  const association =
+    github?.prs?.find((p) => p.url === github.selected_pr_url) ?? github?.prs?.[0] ?? null;
+  const prNumber = pr?.number ?? association?.number ?? null;
+  const prStatus = pr ? pullRequestStatus(pr) : null;
+  const branch = conversation.git_branch ?? github?.branch ?? null;
+  if (createdBy === null && repo === null && prNumber === null && branch === null) return null;
+  return (
+    <div className="mt-2.5 flex flex-col gap-1 border-t border-border pt-2.5">
+      {createdBy !== null && (
+        <SessionTooltipDetail
+          label="Created by"
+          icon={UserRoundIcon}
+          testId="session-tooltip-owner"
+        >
+          {createdBy}
+        </SessionTooltipDetail>
+      )}
+      {repo !== null && (
+        <SessionTooltipDetail label="Repo" icon={FolderGit2Icon} testId="session-tooltip-repo">
+          {repo}
+        </SessionTooltipDetail>
+      )}
+      {prNumber !== null && (
+        <SessionTooltipDetail
+          label="PR"
+          icon={prStatus?.icon ?? GitPullRequestIcon}
+          testId="session-tooltip-pr"
+        >
+          #{prNumber}
+          {prStatus ? ` · ${prStatus.label}` : ""}
+        </SessionTooltipDetail>
+      )}
+      {branch !== null && (
+        <SessionTooltipDetail label="Branch" icon={GitBranchIcon} testId="session-tooltip-branch">
+          {branch}
+        </SessionTooltipDetail>
+      )}
+    </div>
+  );
+}
+
+// Brand-color glyphs for harnesses ComposerAgentIcon draws in mono. Claude and Codex
+// are already in color there; Kimi's color mark is white-on-dark, and Cursor,
+// OpenCode, Pi and Goose have none.
+const TOOLTIP_COLOR_ICONS: Partial<
+  Record<NativeCodingAgentIconKind, ComponentType<{ size?: number; className?: string }>>
+> = { antigravity: AntigravityColor, devin: DevinColor, kiro: KiroColor };
+
+// The tooltip before the sidebar_grouping_ui release flag; remove with the flag
+// (review by 0.19.0).
+function LegacySessionTooltipContent({
   conversation,
   hostsById,
   hasError,
@@ -3663,13 +4359,6 @@ function SessionTooltipContent({
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
 }) {
-  const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
-  const locationLabel = !conversation.host_id
-    ? "Local machine"
-    : host?.sandbox_provider
-      ? sandboxOptionLabel(host.sandbox_provider)
-      : (host?.name ?? conversation.host_id);
-
   return (
     <TooltipContent
       side="right"
@@ -3692,7 +4381,7 @@ function SessionTooltipContent({
         className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
       >
         <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
-        <span className="truncate">{locationLabel}</span>
+        <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
       </p>
       {conversation.git_branch && (
         <p
@@ -3703,6 +4392,74 @@ function SessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
+      {hasError && <SessionErrorHint />}
+    </TooltipContent>
+  );
+}
+
+function SessionTooltipContent({
+  conversation,
+  hostsById,
+  hasError,
+}: {
+  conversation: Conversation;
+  hostsById: ReadonlyMap<string, Host>;
+  hasError: boolean;
+}) {
+  const serverInfo = useContext(ServerInfoContext);
+  if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
+    return (
+      <LegacySessionTooltipContent
+        conversation={conversation}
+        hostsById={hostsById}
+        hasError={hasError}
+      />
+    );
+  }
+  const nativeAgent = nativeCodingAgentForWrapper(conversation.labels?.[WRAPPER_LABEL_KEY]);
+  const ColorIcon = nativeAgent ? TOOLTIP_COLOR_ICONS[nativeAgent.iconKind] : undefined;
+  const harnessAgent = nativeAgent
+    ? { name: nativeAgent.agentName, harness: nativeAgent.harness }
+    : conversation.agent_name === "nessie"
+      ? { name: "nessie", harness: null }
+      : null;
+
+  return (
+    <TooltipContent
+      side="right"
+      align="start"
+      sideOffset={8}
+      data-testid="session-tooltip-content"
+      // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title and a
+      // muted "updated · harness · environment" line, then label/value rows.
+      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+    >
+      <p className="sidebar-compact-text line-clamp-3 font-medium">
+        {conversation.title ?? conversation.id}
+      </p>
+      <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
+        <span className="shrink-0">{relativeTime(conversation.updated_at * 1000)}</span>
+        <span aria-hidden>·</span>
+        {harnessAgent && (
+          <span
+            role="img"
+            aria-label={`${getConversationAgentType(conversation)} harness`}
+            data-testid="session-tooltip-harness"
+            className="flex shrink-0"
+          >
+            {ColorIcon ? (
+              <ColorIcon size={16} className="shrink-0" />
+            ) : (
+              <ComposerAgentIcon agent={harnessAgent} className="size-4" />
+            )}
+          </span>
+        )}
+        <span data-testid="session-tooltip-location" className="flex min-w-0 items-center gap-1.5">
+          <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
+          <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
+        </span>
+      </p>
+      <SessionTooltipDetails conversation={conversation} />
       {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
@@ -3737,6 +4494,10 @@ function ConversationRowImpl({
   onProjectAssigned?: (projectName: string) => void;
 }) {
   const atPinCap = useContext(PinCapacityContext);
+  const pinSaving = useContext(PinSavingContext);
+  let pinTooltip = isPinned ? "Unpin" : "Pin";
+  if (pinSaving) pinTooltip = "Saving pins…";
+  else if (!isPinned && atPinCap) pinTooltip = "Unpin a session first";
   const hostsById = useContext(HostsByIdContext);
   const navigate = useNavigate();
   // A client-only `temp:` row (navigate-first create window): no server session
@@ -3759,6 +4520,7 @@ function ConversationRowImpl({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
+  const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const leave = useLeaveSession();
   const moveToProject = useMoveToProject();
   // The kebab's user-facing "Stop session" action. Archiving does NOT go
@@ -3911,7 +4673,21 @@ function ConversationRowImpl({
   const showDraftIndicator = hasDraft && !isActive;
   const showSharedIndicator = !isOwner;
   const hasSessionIndicator = sessionState !== null || showDraftIndicator;
-  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator;
+  // The "Show → Updated" timestamp takes the indicator slot only when it's free.
+  const show = useContext(SidebarShowContext);
+  const showUpdated = show.includes("updated") && !hasSessionIndicator;
+  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator || showUpdated;
+  const metaEnvironment = show.includes("environment") ? (
+    <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
+  ) : null;
+  const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
+  const metaBranch = show.includes("branch") ? gitBranch : null;
+  // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
+  // the row, or on the title line — padding + half its 20px box — above a meta line.
+  const overlayTop =
+    metaEnvironment !== null || metaRepo !== null || metaBranch !== null
+      ? "top-4 md:top-3.5"
+      : "top-1/2";
 
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -3944,13 +4720,27 @@ function ConversationRowImpl({
     }, 0);
     return () => clearTimeout(timer);
   }, [isDragging]);
-  // Merge the drag node ref with the row ref used for scroll-into-view.
+  // In the Pinned section each row is also a reorder target for other pins.
+  const pinOrder = useContext(PinOrderContext);
+  const { setNodeRef: setPinOrderNodeRef } = useDroppable({
+    id: `pin-order:${conversation.id}`,
+    data: { type: "pin-order", id: conversation.id },
+    disabled: !pinOrder || !isPinned,
+  });
+  // A pin dragged down lands below this row; one dragged up, or a new pin, above it.
+  let pinInsertion: "before" | "after" | undefined;
+  if (pinOrder?.draggingId && pinOrder.overId === conversation.id) {
+    const from = pinOrder.ids.indexOf(pinOrder.draggingId);
+    pinInsertion = from >= 0 && from < pinOrder.ids.indexOf(conversation.id) ? "after" : "before";
+  }
+  // Merge the drag/drop node refs with the row ref used for scroll-into-view.
   const setRowRef = useCallback(
     (node: HTMLLIElement | null) => {
       rowRef.current = node;
       setDragNodeRef(node);
+      setPinOrderNodeRef(node);
     },
-    [setDragNodeRef],
+    [setDragNodeRef, setPinOrderNodeRef],
   );
   // Timestamps of the last two clicks this row received, for the dblclick
   // rename guard: the list can reorder between the two clicks of a
@@ -3998,7 +4788,16 @@ function ConversationRowImpl({
   }
 
   function runArchive() {
-    const nextArchived = !isArchived;
+    if (isArchived) {
+      runUnarchive();
+      return;
+    }
+    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+      archiveNow(deleteWorktreeIds.has(conversation.id)),
+    );
+  }
+
+  function archiveNow(deleteWorktree: boolean) {
     // The archive PATCH sends only the flag: the server stops the session (and
     // tears down a host-spawned runner) in the background once it's committed.
     // A client stop too would race that one against the same runner, and the
@@ -4011,15 +4810,15 @@ function ConversationRowImpl({
     // synchronously — not in an onSuccess callback that fires a round-trip
     // later with a stale `isActive`, which used to jump the user off whatever
     // session they'd switched to meanwhile. Mirrors confirmDelete.
-    if (nextArchived && isActive) navigate("/", { replace: true });
-    archive.mutate({ id: conversation.id, archived: nextArchived });
+    if (isActive) navigate("/", { replace: true });
+    archive.mutate({ id: conversation.id, archived: true, deleteWorktree });
     // Offer an Undo (and point at where the session went) — fire NOW, not in a
     // mutate onSuccess: the optimistic overlay unmounts this row on the next
     // frame, and per-call mutate callbacks don't fire once their observer
     // unmounts. A failed archive reconciles the row back with its own error
     // toast. The toast is driven imperatively (module state + app-level
     // Toaster), so it survives this row unmounting.
-    if (nextArchived) showArchiveUndoToast(queryClient, [conversation], navigate);
+    showArchiveUndoToast(queryClient, [conversation], navigate);
   }
 
   function runUnarchive() {
@@ -4071,7 +4870,6 @@ function ConversationRowImpl({
     onMarkRead: () => markConversationRead(conversation.id, conversation.updated_at),
     onProjectAssigned,
     moveToProject,
-    stopSession,
     setShareOpen,
     setForkOpen,
     setIsEditing,
@@ -4102,11 +4900,15 @@ function ConversationRowImpl({
             ? showSharedIndicator
               ? "pr-36"
               : "pr-29"
-            : hasSessionIndicator && showSharedIndicator
-              ? "pr-14"
-              : hasTrailingIndicator
-                ? "pr-8"
-                : "pr-2"),
+            : showUpdated
+              ? showSharedIndicator
+                ? "pr-18"
+                : "pr-11"
+              : hasSessionIndicator && showSharedIndicator
+                ? "pr-14"
+                : hasTrailingIndicator
+                  ? "pr-8"
+                  : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -4168,6 +4970,8 @@ function ConversationRowImpl({
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
       </div>
+      {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
+      <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
     </Link>
   );
 
@@ -4202,6 +5006,13 @@ function ConversationRowImpl({
       }}
       className={cn("group relative", isDragging && "opacity-40")}
     >
+      {pinInsertion && pinOrder?.draggingId !== conversation.id && (
+        <span
+          data-testid="pin-order-insertion"
+          className="pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-primary"
+          style={pinInsertion === "before" ? { top: 0 } : { bottom: 0 }}
+        />
+      )}
       {/* Right-click anywhere on the row opens the same actions as the kebab.
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
@@ -4292,7 +5103,12 @@ function ConversationRowImpl({
         </Tooltip>
       )}
       {selectionMode ? (
-        <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 flex items-center">
+        <span
+          className={cn(
+            "-translate-y-1/2 pointer-events-none absolute left-2 flex items-center",
+            overlayTop,
+          )}
+        >
           {isSelected ? (
             <SquareCheckIcon className="size-4 text-primary" />
           ) : (
@@ -4303,6 +5119,7 @@ function ConversationRowImpl({
         <span
           className={cn(
             SESSION_STATE_SLOT_CLASS,
+            overlayTop,
             "right-1",
             // The wide "awaiting" pill keeps its natural width; every other
             // marker (running/starting/unseen dot, or the draft pencil) sits in
@@ -4323,6 +5140,17 @@ function ConversationRowImpl({
             </span>
           )}
         </span>
+      ) : showUpdated ? (
+        <span
+          data-testid="session-row-updated"
+          className={cn(
+            SESSION_STATE_SLOT_CLASS,
+            overlayTop,
+            "right-2 text-sm text-muted-foreground",
+          )}
+        >
+          <SessionUpdatedLabel updatedAt={conversation.updated_at} />
+        </span>
       ) : null}
       {!selectionMode && showSharedIndicator && (
         <span
@@ -4330,8 +5158,9 @@ function ConversationRowImpl({
           aria-label="Shared session"
           title="Shared with you"
           className={cn(
-            "-translate-y-1/2 pointer-events-none absolute top-1/2 inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
-            hasSessionIndicator ? "right-8" : "right-1",
+            "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
+            overlayTop,
+            hasSessionIndicator ? "right-8" : showUpdated ? "right-11" : "right-1",
           )}
         >
           <UsersIcon className="size-3.5" aria-hidden="true" />
@@ -4346,14 +5175,19 @@ function ConversationRowImpl({
       {!selectionMode && (
         <ContextMenu>
           <ContextMenuTrigger asChild>
-            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+            <div
+              className={cn(
+                "-translate-y-1/2 absolute right-1 flex items-center gap-0.5",
+                overlayTop,
+              )}
+            >
               {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
               {!isArchived && (
                 <Tooltip disableHoverableContent>
                   <TooltipContent>
                     <TooltipArrow />
-                    {!isPinned && atPinCap ? "Unpin a session first" : isPinned ? "Unpin" : "Pin"}
+                    {pinTooltip}
                   </TooltipContent>
                   <TooltipTrigger asChild>
                     <Button
@@ -4362,7 +5196,7 @@ function ConversationRowImpl({
                       size="icon-xs"
                       aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
                       data-testid="quick-pin-conversation"
-                      aria-disabled={!isPinned && atPinCap}
+                      aria-disabled={pinSaving || (!isPinned && atPinCap)}
                       className={cn(
                         // Desktop-only quick affordance: hidden on mobile (the kebab's
                         // Pin item below covers that), hover/focus-revealed from `md`
@@ -4386,6 +5220,7 @@ function ConversationRowImpl({
                         // Keep the toggle click off the surrounding Link (no navigation).
                         e.preventDefault();
                         e.stopPropagation();
+                        if (pinSaving) return;
                         onTogglePinned(conversation.id);
                       }}
                     >
@@ -4579,6 +5414,7 @@ function ConversationRowImpl({
           </DialogContent>
         )}
       </Dialog>
+      {archiveWorktreePrompt.dialog}
       <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
         {leaveOpen && (
           <DialogContent
@@ -4629,36 +5465,33 @@ function ConversationRowImpl({
             <DialogHeader>
               <DialogTitle>Stop session?</DialogTitle>
               <DialogDescription>
-                This terminates the running session for <span className="font-medium">{label}</span>{" "}
-                and stops its runner. The conversation and its history are kept.
+                This terminates the running session for <span className="font-medium">{label}</span>
+                {conversation.host_id
+                  ? " and stops its runner, including side chats running on it."
+                  : "."}{" "}
+                Conversation histories are kept.
               </DialogDescription>
             </DialogHeader>
-            {stopSession.isError && (
-              <p className="text-ui text-destructive" role="alert">
-                Couldn't stop the session
-                {stopSession.error instanceof Error && stopSession.error.message
-                  ? `: ${stopSession.error.message}`
-                  : " — it may still be running"}
-                . Try again in a moment.
-              </p>
-            )}
             <DialogFooter>
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => setStopOpen(false)}
-                disabled={stopSession.isPending}
-              >
+              <Button type="button" variant="ghost" onClick={() => setStopOpen(false)}>
                 Cancel
               </Button>
               <Button
                 type="button"
                 variant="destructive"
                 data-testid="stop-session-confirm"
-                onClick={() =>
-                  stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
-                }
-                loading={stopSession.isPending}
+                onClick={() => {
+                  // Close now and stop in the background — keeping the modal open
+                  // for the whole kill blocks the rest of the sidebar. A failure
+                  // surfaces as a toast since the dialog is already gone.
+                  setStopOpen(false);
+                  stopSession.mutate(conversation.id, {
+                    onError: (err) => {
+                      const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+                      showToast(`Couldn't stop the session${detail}`);
+                    },
+                  });
+                }}
                 componentId="sidebar.conversation.stop"
               >
                 Stop session
@@ -4769,35 +5602,21 @@ function PinnedProjectFlyoutContent({
   );
 }
 
-// ── ProjectFolderActions ──────────────────────────────────────────────────────
-
-/** Fine-hover shortcuts for project actions and starting a pre-filed session. */
 function ProjectFolderActions({
   projectName,
   onNavigate,
   actions,
 }: {
   projectName: string;
-  /** Plain-left-click nav handler — closes the mobile overlay so the
-      pre-filed new-session page isn't left hidden behind the sidebar. */
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
   return (
-    // gap-0.5 (2px) between the pencil and kebab mirrors the session row's
-    // pin↔kebab spacing, so the two icon columns line up across row types.
     <div className="flex items-center gap-0.5">
-      {/* A redundant shortcut for the kebab's always-present "New session"
-          item, so it is genuinely absent (not just clipped) wherever no fine
-          hover pointer can reveal it: on touch, folding fully into the kebab
-          instead of leaving a duplicate focus stop for keyboard/AT users. On
-          hover+fine it is display-flex and revealed on hover or keyboard focus
-          by the overlay's opacity. */}
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
             asChild
-            type="button"
             variant="ghost"
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
@@ -4807,13 +5626,11 @@ function ProjectFolderActions({
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
               onClick={(e) => {
-                // Keep the click off the folder's collapse toggle, then run the
-                // shared nav handler (closes the sidebar overlay on mobile).
                 e.stopPropagation();
                 onNavigate(e);
               }}
             >
-              <SquarePenIcon className="size-3.5" data-icon-size="14" />
+              <MessageCirclePlusIcon className="size-3.5" data-icon-size="14" />
             </Link>
           </Button>
         </TooltipTrigger>
@@ -4832,11 +5649,13 @@ function ProjectFolderMenuItems({
   projectName,
   onNavigate,
   actions,
+  hideNewSessionOnDesktop = false,
 }: {
   components: MenuComponents;
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
+  hideNewSessionOnDesktop?: boolean;
 }) {
   const { onMenuOpen, onMenuClose } = actions;
   useEffect(() => {
@@ -4846,7 +5665,13 @@ function ProjectFolderMenuItems({
 
   return (
     <>
-      <C.Item asChild data-testid="project-new-session-menu">
+      <C.Item
+        asChild
+        data-testid="project-new-session-menu"
+        className={
+          hideNewSessionOnDesktop ? "[@media((hover:hover)_and_(pointer:fine))]:hidden" : undefined
+        }
+      >
         <Link
           to={`/?project=${encodeURIComponent(projectName)}`}
           onClick={(e) => {
@@ -4854,7 +5679,7 @@ function ProjectFolderMenuItems({
             onNavigate(e);
           }}
         >
-          <SquarePenIcon className="size-3.5" />
+          <MessageCirclePlusIcon className="size-3.5" />
           New session
         </Link>
       </C.Item>
@@ -4867,27 +5692,32 @@ function ProjectFolderMenuItems({
         Project settings
       </C.Item>
       {actions.ordering && (
-        <>
-          <C.Separator />
-          {(["up", "down", "top", "bottom"] as const).map((destination) => (
-            <C.Item
-              key={destination}
-              disabled={
-                actions.ordering!.disabled ||
-                (destination === "up" || destination === "top"
-                  ? actions.ordering!.first
-                  : actions.ordering!.last)
-              }
-              onSelect={() => actions.ordering!.move(destination)}
-            >
-              {destination === "top" || destination === "bottom"
-                ? `Move to ${destination}`
-                : `Move ${destination}`}
-            </C.Item>
-          ))}
-          <C.Separator />
-        </>
+        <C.Sub>
+          <C.SubTrigger data-testid="move-project">
+            <ArrowUpDownIcon className="size-3.5" />
+            Move
+          </C.SubTrigger>
+          <C.SubContent>
+            {(["up", "down", "top", "bottom"] as const).map((destination) => (
+              <C.Item
+                key={destination}
+                disabled={
+                  actions.ordering!.disabled ||
+                  (destination === "up" || destination === "top"
+                    ? actions.ordering!.first
+                    : actions.ordering!.last)
+                }
+                onSelect={() => actions.ordering!.move(destination)}
+              >
+                {destination === "top" || destination === "bottom"
+                  ? `Move to ${destination}`
+                  : `Move ${destination}`}
+              </C.Item>
+            ))}
+          </C.SubContent>
+        </C.Sub>
       )}
+      <C.Separator />
       <C.Item data-testid="delete-project" variant="destructive" onSelect={actions.openDelete}>
         <Trash2Icon className="size-3.5" />
         Delete project
@@ -4922,6 +5752,7 @@ function useProjectFolderMenu(
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(projectName);
+  const renameInputRef = useRef<HTMLInputElement>(null);
   // The icon staged in the rename modal, committed only on Confirm:
   //   undefined = untouched (show the saved icon), string = a picked emoji,
   //   null = staged removal. Reset to `undefined` each time the modal opens.
@@ -4968,6 +5799,11 @@ function useProjectFolderMenu(
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent
           onClick={(e) => e.stopPropagation()}
+          onOpenAutoFocus={(e) => {
+            e.preventDefault();
+            renameInputRef.current?.focus();
+            renameInputRef.current?.select();
+          }}
           // emoji-mart preventDefaults the pointer event, so Radix's own
           // outside-dismissal never fires for clicks elsewhere in the modal.
           // Catch them in the capture phase and close the picker ourselves,
@@ -5107,6 +5943,7 @@ function useProjectFolderMenu(
                 </PopoverContent>
               </Popover>
               <input
+                ref={renameInputRef}
                 className="w-full bg-transparent px-3 py-2 text-ui outline-none"
                 value={renameValue}
                 onChange={(e) => setRenameValue(e.target.value)}
@@ -5224,21 +6061,13 @@ function ProjectFolderMenu({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        {/* Revealed on hover for fine hover pointers at any width; otherwise
-            sr-only so touch and assistive tech keep a focusable, announced
-            trigger for the same actions the long-press menu also opens. */}
         <Button
           type="button"
           variant="ghost"
           size="icon-xs"
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
-          // sr-only keeps a focusable/announced trigger where no fine hover can
-          // reveal it (touch/AT). On reveal, not-sr-only zeroes width/height/
-          // padding, so restore the icon-xs box (size-6) — otherwise the ghost
-          // hover highlight collapses to the glyph and mismatches the session /
-          // project-list kebabs.
-          className="sr-only text-muted-foreground focus-visible:not-sr-only focus-visible:size-6 [@media((hover:hover)_and_(pointer:fine))]:not-sr-only [@media((hover:hover)_and_(pointer:fine))]:flex [@media((hover:hover)_and_(pointer:fine))]:size-6"
+          className="text-muted-foreground"
           onClick={(e) => e.stopPropagation()}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
@@ -5247,6 +6076,7 @@ function ProjectFolderMenu({
       <DropdownMenuContent align="end" className="min-w-40">
         <ProjectFolderMenuItems
           components={dropdownBundle}
+          hideNewSessionOnDesktop
           projectName={projectName}
           onNavigate={onNavigate}
           actions={actions}
@@ -5475,6 +6305,7 @@ function BulkActionBar({
   const queryClient = useQueryClient();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
+  const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const bulkDelete = useBulkDeleteConversations();
   const bulkMove = useBulkMoveToProject();
   const { data: projects = [] } = useProjects();
@@ -5595,20 +6426,26 @@ function BulkActionBar({
 
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
+    const toArchive = nonArchivedSelected;
+    archiveWorktreePrompt.requestArchive(toArchive, (deleteWorktreeIds) =>
+      archiveNow(toArchive, deleteWorktreeIds),
+    );
+  }
+
+  function archiveNow(toArchive: Conversation[], deleteWorktreeIds: ReadonlySet<string>) {
     // The rows leave the sidebar optimistically (useBulkArchiveConversations
     // flips their cached `archived` flag in onMutate), so this bar unmounts
     // with the selection. Navigate and deselect NOW rather than in a
     // mutate-level callback — a callback on the unmounted observer never fires,
     // and it would carry a stale `activeId` that could jump the user off a
     // session they switched to meanwhile. Mirrors handleDelete.
-    if (activeId && nonArchivedSelected.some((c) => c.id === activeId))
-      navigate("/", { replace: true });
+    if (activeId && toArchive.some((c) => c.id === activeId)) navigate("/", { replace: true });
     onDeselectAll();
-    bulkArchive.mutate({ ids: nonArchivedSelected.map((c) => c.id), archived: true });
+    bulkArchive.mutate({ ids: toArchive.map((c) => c.id), archived: true, deleteWorktreeIds });
     // Offer Undo for the whole batch. Fire now, before this bar unmounts with
     // the cleared selection; the toast is driven by module state + the
     // app-level Toaster, so it outlives this component.
-    showArchiveUndoToast(queryClient, nonArchivedSelected, navigate);
+    showArchiveUndoToast(queryClient, toArchive, navigate);
   }
 
   function handleUnarchive() {
@@ -5633,6 +6470,7 @@ function BulkActionBar({
 
   return (
     <>
+      {archiveWorktreePrompt.dialog}
       <div className="mt-1 mb-1 flex flex-col gap-1.5">
         <div className="flex items-center gap-2 rounded-lg border border-border bg-transparent p-1.5">
           <Tooltip>

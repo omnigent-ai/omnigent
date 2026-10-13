@@ -14,9 +14,30 @@ This is opt-in per sandbox target: a nonempty
 `sandbox.host_config.inference.harnesses` mapping enables it. Ordinary hosts and
 sandbox targets without bindings retain their existing authentication, provider
 defaults, and model selection. `/v1/info` advertises `inference_models` only for
-configured targets; other targets do not request preview catalogs or wait on
-discovery. The new credential-reference restrictions apply to saved inference
-profiles and explicitly configured discovery credentials, not legacy host configs.
+configured targets; unbound targets can opt into default model options below.
+The new credential-reference restrictions apply to saved inference profiles and
+explicitly configured discovery credentials, not legacy host configs.
+
+### Default model options
+
+A target without bindings can offer a default catalog when no host-specific
+catalog is available. `/v1/info` advertises this capability as `default_models`.
+`ManagedSandboxConfig.default_model_options` supplies request-scoped choices for
+the selected harness and authenticated user. "Default" describes the source of
+these choices; it does not select a default model or bind an inference profile.
+
+An unbound gateway configured through `sandbox.model_discovery` and
+`sandbox.host_config.providers` also enables this capability. The preview
+endpoint lists that gateway's harness-compatible models with
+`configured: false`: no snapshot or revision is saved, no row is marked default,
+"Default" stays selectable, and a discovery failure reports
+`unavailable` while leaving the default launch usable. The sandbox keeps
+resolving its own inference credential; the server uses only the discovery
+credential. Among several discoverable gateways, the provider marked `default`
+for the harness's family wins, otherwise the first configured one. Explicit
+choices travel as `model_override` and `reasoning_effort` without catalog
+validation, so the harness still validates them at launch, and efforts appear
+only when the listing itself reports reasoning metadata.
 
 ## Configuration
 
@@ -185,10 +206,13 @@ artifacts are created. The composer refreshes choices and retains the draft;
 it requires the user to submit again.
 
 Creation saves the actual harness identity, target/revision, provider settings,
-model policy, credential references, and workspace identity in a dedicated
-text column on Omnigent's conversation metadata. Server-only discovery settings
-are also saved there. An additive database migration creates the nullable column;
-the compact AP-owned session-overrides field is unchanged. Children inherit the full configuration and
+model policy, credential references, and workspace identity as compressed JSON in
+Omnigent's conversation metadata. Server-only discovery settings are also saved
+there. The nullable `inference_snapshot` column uses `BLOB` on MySQL, with a
+65,535-byte limit including compression framing. Reads accept legacy uncompressed
+JSON. New snapshots exceeding the compressed limit are rejected before session
+rows are created; reduce the configured model catalog or allowlist to fit.
+The compact AP-owned session-overrides field is unchanged. Children inherit the full configuration and
 resolve their own harness binding; forks retain it even when resetting model
 settings. Configured sessions cannot switch agents or fork into another harness
 or another owner's credential scope; create a new session for those changes.
@@ -197,6 +221,20 @@ Sessions with saved sandbox profiles can launch only on server-managed sandbox
 hosts, including when forked or restarted. Ordinary hosts keep their own provider
 configuration; start a new session to use one. Admission checks the actual
 destination host, so a fork can still reuse its original managed sandbox.
+
+The compression migration runs online with database readers and writers stopped.
+It commits the backfill in batches of at most 100 metadata rows. Interrupted copies
+restart from the original column; completed column swaps are detected on retry.
+Run it through the normal migration runner without an enclosing transaction.
+It clears only snapshots that still exceed the limit. A cleared snapshot loses its
+saved provider bindings, model policy, and catalog; the session retains its other
+metadata and follows the legacy behavior for sessions without snapshots. Deploy
+the updated code before resuming
+traffic. Downgrade decompresses retained snapshots back to text and cannot recover
+cleared snapshots. The 65,535-byte cap, irreversible clearing of oversized values,
+and coordinated schema/application cutover are deliberate requirements of this
+existing-column conversion, matching the preferences conversion. They depart from
+the database guide's smaller limit for new columns and staged rollout guidance.
 
 Launch and wake overlay the saved providers and bindings onto current sandbox
 lifecycle settings. Unbound harnesses on a profile-enabled target save that

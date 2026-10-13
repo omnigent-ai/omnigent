@@ -19,16 +19,22 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
 from omnigent.db.db_models import current_workspace_id
+from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.bundles import bundle_location
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from tests.server.helpers import build_agent_bundle
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
 
@@ -50,6 +56,11 @@ class _FakeAgent:
     bundle_location: str | None = None
     session_id: str | None = None
     name: str = "assistant"
+    created_by: str | None = None
+
+    @property
+    def operator_authored(self) -> bool:
+        return self.session_id is None and self.created_by is None
 
 
 class FakeAgentStore:
@@ -179,11 +190,20 @@ class FakeConversationStore:
 
 
 class FakePermissionStore:
-    def __init__(self, *, fail_grant: bool = False, users: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_grant: bool = False,
+        fail_grant_users: set[str] | None = None,
+        users: set[str] | None = None,
+    ) -> None:
         self.ensured: list[str] = []
         self.grants: list[tuple[str, str, int]] = []
         self.grant_workspace_ids: list[int] = []
         self.fail_grant = fail_grant
+        # Fail only grants to these user ids (e.g. just the public grant),
+        # leaving the owner grant to succeed.
+        self.fail_grant_users = fail_grant_users or set()
         # ``None`` means every owner exists (the default for most tests).
         self.users: set[str] | None = set(users) if users is not None else None
 
@@ -202,7 +222,7 @@ class FakePermissionStore:
 
     def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
         self.grant_workspace_ids.append(current_workspace_id())
-        if self.fail_grant:
+        if self.fail_grant or user_id in self.fail_grant_users:
             raise RuntimeError("grant failed")
         self.grants.append((user_id, conversation_id, level))
         return None
@@ -240,13 +260,24 @@ class FakeHostStore:
         return [h for h in self.hosts.values() if h.user_id == owner]
 
 
+class FakeHostConn:
+    def __init__(self, registered_with_managed_token: bool = False) -> None:
+        self.registered_with_managed_token = registered_with_managed_token
+
+
 class FakeHostRegistry:
-    def __init__(self, online: set[str] | None = None) -> None:
+    def __init__(
+        self, online: set[str] | None = None, sandbox_hosts: set[str] | None = None
+    ) -> None:
         self.online = online or set()
+        # Hosts whose live connection authenticated with a managed launch token.
+        self.sandbox_hosts = sandbox_hosts or set()
 
     def get(self, host_id: str) -> object | None:
+        if host_id in self.sandbox_hosts:
+            return FakeHostConn(registered_with_managed_token=True)
         if host_id in self.online:
-            return object()
+            return FakeHostConn()
         return None
 
 
@@ -438,6 +469,33 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+@pytest.mark.asyncio
+async def test_a_task_saved_on_another_users_agent_moves_to_its_owners_copy(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """The fire copies another user's agent once and repoints the task, so that
+    user's later changes never reach the runs."""
+    agents = SqlAlchemyAgentStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_id = generate_agent_id()
+    bundle = build_agent_bundle("orion")
+    location = bundle_location(agent_id, bundle)
+    artifacts.put(location, bundle)
+    agents.create_user_agent(agent_id, "orion", location, owner="alice@example.com")
+    task = _task(user_id="bob@example.com", agent_id=agent_id)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    deps = _deps(store, agent_store=agents, artifact_store=artifacts)
+
+    moved = await fire_mod._own_task_agent(deps, task)
+
+    copy = agents.get(moved.agent_id)
+    assert copy is not None and copy.id != agent_id
+    assert (copy.name, copy.created_by) == ("orion", "bob@example.com")
+    assert store.updates == [{"id": "task_1", "agent_id": copy.id}]
+    assert (await fire_mod._own_task_agent(deps, moved)).agent_id == copy.id
+    assert len(store.updates) == 1, "the owner's own copy is never copied again"
 
 
 @pytest.mark.asyncio
@@ -854,7 +912,7 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
         return None
 
     async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> None:
-        return None
+        captured["agent_revision"] = kwargs.get("agent_revision")
 
     monkeypatch.setattr(host_launch, "resolve_host_launch", _resolve_host_launch)
     monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _launch_runner_on_host)
@@ -877,12 +935,15 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
             conversation_store=FakeConversationStore(),
             host_store=FakeHostStore({"host_1": _FakeHost("host_1", RESERVED_USER_LOCAL)}),
             host_registry=FakeHostRegistry(online={"host_1"}),
+            agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/rev1")}),
         )
     )
 
     await dispatch(_FakeConversation(id="conv_1", agent_id="ag_1"), _task(user_id=None))
 
     assert captured["user_id"] == RESERVED_USER_LOCAL
+    # The kickoff names the bundle it runs, so the runner sees a later reinstall.
+    assert captured["agent_revision"] == "ag_1/rev1"
 
 
 @pytest.mark.asyncio
@@ -1830,3 +1891,84 @@ async def test_policy_create_failure_does_not_fail_fire() -> None:
     assert len(conv_store.created) == 1
     assert len(launched) == 1
     assert store.runs[0]["status"] == "running"
+
+
+class _DefaultPublicState:
+    """Minimal ``app.state`` carrying only the default-public policy."""
+
+    def __init__(self, policy: str) -> None:
+        self.default_public_sessions = lambda: policy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy,target,pinned_sandbox_host,expected_public",
+    [
+        ("off", "managed_sandbox", False, False),
+        ("sandbox", "managed_sandbox", False, True),
+        ("sandbox", "connected_host", False, False),
+        # A task pinned to an existing sandbox host is a sandbox run too.
+        ("sandbox", "connected_host", True, True),
+        ("all", "connected_host", False, True),
+    ],
+)
+async def test_fire_applies_default_public_policy(
+    policy: str, target: str, pinned_sandbox_host: bool, expected_public: bool
+) -> None:
+    """A fired run takes the server's default-public grant like a UI-created session."""
+    perm = FakePermissionStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target=target)})
+    # A live host connection that authenticated with a managed launch token is
+    # what marks a pinned host as a sandbox — not a persisted provider column.
+    registry = FakeHostRegistry(
+        online={"host_1"},
+        sandbox_hosts={"host_1"} if pinned_sandbox_host else None,
+    )
+    deps = _deps(
+        store,
+        permission_store=perm,
+        host_registry=registry,
+        sandbox_config=_FakeSandboxConfig(managed_launch_supported=True),
+    )
+    deps.app_state = _DefaultPublicState(policy)
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    public = [g for g in perm.grants if g[0] == RESERVED_USER_PUBLIC]
+    assert bool(public) is expected_public
+    if expected_public:
+        assert public[0][2] == LEVEL_READ
+
+
+@pytest.mark.asyncio
+async def test_public_grant_failure_does_not_cancel_run() -> None:
+    """Default-public access is decoration on top of the owner grant: if only the
+    public grant fails, the run still dispatches (privately), not recorded failed."""
+    perm = FakePermissionStore(fail_grant_users={RESERVED_USER_PUBLIC})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+    deps = _deps(
+        store,
+        permission_store=perm,
+        sandbox_config=_FakeSandboxConfig(managed_launch_supported=True),
+    )
+    deps.app_state = _DefaultPublicState("all")
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # Owner grant landed, public grant did not, the run dispatched and recorded running.
+    assert any(g[0] == RESERVED_USER_LOCAL for g in perm.grants)
+    assert not any(g[0] == RESERVED_USER_PUBLIC for g in perm.grants)
+    assert len(launched) == 1
+    assert store.runs and store.runs[0]["status"] == "running"
+    assert not any(r.get("error_code") == "owner_grant_failed" for r in store.runs)

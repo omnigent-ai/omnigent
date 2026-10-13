@@ -12,10 +12,35 @@ import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { isComposerSendKey, isComposerSteerAllKey } from "@/lib/composerSendShortcutPreferences";
+import {
+  isComposerAltNewlineKey,
+  isComposerSendKey,
+  isComposerSteerAllKey,
+} from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 
 export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
+
+/**
+ * The composer layout contract: one 12px inset, two roles.
+ *
+ * Inside the card, every content row - the input text, chip rows
+ * (attachment/mention chips), feedback rows (attachment/command errors), and
+ * the action row's controls - aligns to a shared left/right inset line 12px
+ * from the card's edges. Outside the card, the docked trays (workspace bar,
+ * queued-messages strip, sub-agent tray) nest 12px in from the card's outer
+ * edges: a tray is a shelf peeking above the card, not a content row, so it
+ * keeps its own inset rather than sharing the card's border box.
+ *
+ * Padding vs margin follows what each row's border box must coincide with:
+ * chip and action rows are measured through their children (chips, buttons),
+ * so they pad; a feedback row's own box sits on the inset line, so it uses
+ * margins. Vertical rhythm: the input area is `pt-3 pb-1`, each content row
+ * carries `pb-2`, and the action row is `pt-1 pb-2`.
+ */
+export const COMPOSER_CONTENT_INSET_CLASS = "px-3";
+export const COMPOSER_BLOCK_INSET_CLASS = "mx-3";
+export const COMPOSER_TRAY_INSET_CLASS = "mx-3";
 
 /**
  * Minimum free space (px) the action row keeps between its leading and
@@ -206,6 +231,28 @@ export function useCollapsedWorkspaceLabels(barRef: RefObject<HTMLElement | null
   }, [barRef]);
 }
 
+/**
+ * Replace ``[start, end)`` (default: the selection) as typed input, so onChange
+ * sees it. The editing commands also keep it on the undo stack; the fallback
+ * covers environments without them.
+ */
+function insertComposerText(
+  textarea: HTMLTextAreaElement,
+  text: string,
+  start = textarea.selectionStart,
+  end = textarea.selectionEnd,
+) {
+  textarea.setSelectionRange(start, end);
+  const inserted =
+    typeof document.execCommand === "function" &&
+    (text || start === end
+      ? document.execCommand("insertText", false, text)
+      : document.execCommand("delete"));
+  if (inserted) return;
+  textarea.setRangeText(text, start, end, "end");
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
 export function ComposerTextInput({
   input,
   keyboard,
@@ -214,7 +261,24 @@ export function ComposerTextInput({
     <ComposerTextarea
       {...input}
       onKeyDown={(event) => {
+        // A newline in every mode and on touch devices; completion menus never see it.
+        if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
+          event.preventDefault();
+          insertComposerText(event.currentTarget, "\n");
+          return;
+        }
         if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
+        const insertNewline =
+          event.key === "Enter" &&
+          (event.shiftKey || keyboard.submitWithModEnter) &&
+          !event.altKey &&
+          !event.metaKey &&
+          !event.ctrlKey;
+        const listEdit = insertNewline ? composerListEdit(event.currentTarget) : null;
+        const listStartEdit =
+          event.key === " " && !event.altKey && !event.shiftKey && !event.metaKey && !event.ctrlKey
+            ? composerListStartEdit(event.currentTarget)
+            : null;
         const shouldSubmitFromKeyboard = isComposerSendKey(
           { ...event, isComposing: event.nativeEvent.isComposing },
           keyboard.submitWithModEnter,
@@ -230,16 +294,99 @@ export function ComposerTextInput({
           shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
           shouldSteerAllFromKeyboard,
         });
+        if (event.defaultPrevented) return;
+        const edit = listStartEdit ?? listEdit;
+        if (edit) {
+          event.preventDefault();
+          insertComposerText(event.currentTarget, edit.text, edit.start, edit.end);
+        }
       }}
     />
   );
+}
+
+function composerListStartEdit(textarea: HTMLTextAreaElement) {
+  const { value, selectionStart, selectionEnd } = textarea;
+  if (selectionStart !== selectionEnd) return null;
+  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const prefix = value.slice(lineStart, selectionStart);
+  const match = prefix.match(/^([ \t]*)([-*]|\d+[.)])$/);
+  if (!match) return null;
+  const [, indent, marker] = match;
+  return {
+    start: lineStart,
+    end: selectionStart,
+    text: `${indent || "  "}${marker} `,
+  };
+}
+
+function composerListEdit(textarea: HTMLTextAreaElement) {
+  const { value, selectionStart, selectionEnd } = textarea;
+  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const lineEndIndex = value.indexOf("\n", selectionEnd);
+  const lineEnd = lineEndIndex < 0 ? value.length : lineEndIndex;
+  const prefix = value.slice(lineStart, selectionStart);
+  const match = prefix.match(/^([ \t]*)([-*•]|\d+[.)])([ \t]+)(.*)$/);
+  if (!match) return null;
+  const [, indent, marker, spacing, content] = match;
+  const suffix = value.slice(selectionEnd, lineEnd);
+  if (selectionStart === selectionEnd && !content.trim() && !suffix.trim()) {
+    return { start: lineStart, end: lineEnd, text: "" };
+  }
+  // Keep the typed bullet so the draft stays valid Markdown.
+  const nextMarker = /^\d/.test(marker)
+    ? `${Number.parseInt(marker, 10) + 1}${marker.at(-1)}`
+    : marker;
+  return { start: selectionStart, end: selectionEnd, text: `\n${indent}${nextMarker}${spacing}` };
 }
 
 export function ComposerInputArea({ className, ...props }: ComponentPropsWithoutRef<"div">) {
   return (
     <div
       className={cn(
-        "composer-input-text relative overflow-hidden px-3 pt-3 pb-1 text-ui",
+        "composer-input-text relative overflow-hidden pt-3 pb-1 text-ui",
+        COMPOSER_CONTENT_INSET_CLASS,
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+/**
+ * One wrapping row of chips (attachment tiles, mention chips) on the shared
+ * inset line. Chips are measured through their own boxes, so the row pads
+ * rather than margins; the chip type picks its gap via ``className``.
+ */
+export function ComposerChipRow({ className, ...props }: ComponentPropsWithoutRef<"div">) {
+  return (
+    <div
+      className={cn(
+        "flex flex-wrap items-start gap-2 pb-2",
+        COMPOSER_CONTENT_INSET_CLASS,
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+/**
+ * One feedback line under the input (rejected attachments, slash-command
+ * errors and /help output). The row's own border box sits on the shared
+ * inset line, so it margins rather than pads.
+ */
+export function ComposerFeedbackRow({
+  tone = "muted",
+  className,
+  ...props
+}: ComponentPropsWithoutRef<"div"> & { tone?: "muted" | "error" }) {
+  return (
+    <div
+      className={cn(
+        "pb-2 text-sm whitespace-pre-wrap",
+        COMPOSER_BLOCK_INSET_CLASS,
+        tone === "error" ? "text-destructive" : "text-muted-foreground",
         className,
       )}
       {...props}
@@ -284,7 +431,8 @@ export const ComposerActionRow = forwardRef<HTMLDivElement, ComponentPropsWithou
       <div
         ref={ref}
         className={cn(
-          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 px-2 pt-1 pb-2",
+          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 pt-1 pb-2",
+          COMPOSER_CONTENT_INSET_CLASS,
           className,
         )}
         {...props}

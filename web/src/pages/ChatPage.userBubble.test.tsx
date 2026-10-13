@@ -278,6 +278,25 @@ describe("AssistantBubble lifecycle rendering", () => {
   });
 });
 
+describe("UserBubble entrance motion", () => {
+  it("animates a newly queued composer message as one complete wrapper", () => {
+    const [pending] = buildPendingBubbles(
+      [{ tempId: "pending_enter", content: [{ type: "input_text", text: "new message" }] }],
+      null,
+    );
+
+    renderBubble(pending);
+
+    expect(screen.getByTestId("message-bubble")).toHaveClass("animate-user-message-enter");
+  });
+
+  it("does not replay the entrance animation for committed history", () => {
+    renderBubble(userBubble("existing message"));
+
+    expect(screen.getByTestId("message-bubble")).not.toHaveClass("animate-user-message-enter");
+  });
+});
+
 describe("UserBubble copy button", () => {
   afterEach(() => {
     vi.unstubAllGlobals();

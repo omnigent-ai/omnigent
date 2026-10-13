@@ -3,7 +3,7 @@
 Focused on :func:`require_access_and_level`, which folds ``require_access``
 and ``get_permission_level`` into a single resolution. The behaviour it must
 preserve is the 403-vs-404 distinction, the admin bypass, sub-agent parent
-delegation, and the user-vs-public displayed-level asymmetry — all exercised
+delegation, and the effective direct/public permission level — all exercised
 here against real SQLite-backed stores (no mocks) so the resolution matches
 production exactly.
 """
@@ -16,12 +16,17 @@ from omnigent.entities.agent import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
 )
 from omnigent.server.routes import _auth_helpers
-from omnigent.server.routes._auth_helpers import require_access_and_level, require_agent_owner
+from omnigent.server.routes._auth_helpers import (
+    can_mutate_session_agent,
+    require_access_and_level,
+    require_agent_owner,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -151,31 +156,27 @@ async def test_admin_allowed_and_bypasses_conversation_fetch(
 
 
 @pytest.mark.asyncio
-async def test_public_grant_allows_but_level_reports_user_grant(
+async def test_public_edit_elevates_displayed_level_without_granting_owner(
     perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
 ) -> None:
-    """Access via a higher public grant; displayed level is the user's own.
+    """The displayed level agrees with authorization after capping a public grant."""
+    from omnigent.server.sharing_settings import PublicSharingMaxLevel, public_sharing_policy_scope
 
-    The regression guard for the combined helper: a low user grant plus a
-    higher ``__public__`` grant must still report the user's own level
-    (matching ``get_permission_level``) while granting access via the
-    public grant (matching ``check_access``).
-    """
     conv = conv_store.create_conversation()
     perm_store.ensure_user(ALICE)
     perm_store.ensure_user(RESERVED_USER_PUBLIC)
     perm_store.grant(ALICE, conv.id, LEVEL_READ)  # user: read
     perm_store.grant(RESERVED_USER_PUBLIC, conv.id, LEVEL_OWNER)  # public: owner
 
-    access = await require_access_and_level(ALICE, conv.id, LEVEL_EDIT, perm_store, conv_store)
+    with public_sharing_policy_scope(lambda: PublicSharingMaxLevel.EDIT):
+        access = await require_access_and_level(ALICE, conv.id, LEVEL_EDIT, perm_store, conv_store)
+        assert perm_store.get_permission_level(ALICE, conv.id) == LEVEL_EDIT
+        assert not perm_store.check_access(ALICE, conv.id, LEVEL_OWNER)
 
     # Allowed (no raise) because the public grant satisfies EDIT ...
     assert access.conversation is not None
     assert access.conversation.id == conv.id, "must reuse the asked-for session"
-    # ... but the displayed level is Alice's own read grant, unchanged.
-    assert access.level == LEVEL_READ, (
-        f"displayed level must be the user's own read grant, got {access.level}"
-    )
+    assert access.level == LEVEL_EDIT
 
 
 @pytest.mark.asyncio
@@ -203,6 +204,77 @@ async def test_sub_agent_delegates_access_to_parent(
     assert access.conversation.id == child.id, "snapshot reuses the sub-agent row"
     # Displayed level is the direct grant on the sub-agent (none granted).
     assert access.level is None, "displayed level is the sub-agent's own grant, which is None here"
+
+
+@pytest.mark.parametrize(
+    "level",
+    [LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE],
+    ids=["reader", "editor", "manager"],
+)
+def test_child_agent_mutation_capability_requires_effective_owner(
+    perm_store: SqlAlchemyPermissionStore,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    level: int,
+) -> None:
+    """An agent creator with inherited non-owner access cannot edit a child."""
+    monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
+    parent = conv_store.create_conversation()
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        sub_agent_name="summarizer",
+    )
+    perm_store.ensure_user(ALICE)
+    perm_store.grant(ALICE, parent.id, level)
+
+    assert not can_mutate_session_agent(
+        ALICE,
+        child.id,
+        _session_agent(created_by=ALICE, session_id=parent.id),
+        perm_store,
+        conv_store,
+        conversation=child,
+    )
+
+
+def test_child_agent_mutation_capability_inherits_owner(
+    perm_store: SqlAlchemyPermissionStore,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parent owner and agent creator may edit the child agent."""
+    monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
+    parent = conv_store.create_conversation()
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        sub_agent_name="summarizer",
+    )
+    perm_store.ensure_user(ALICE)
+    perm_store.grant(ALICE, parent.id, LEVEL_OWNER)
+
+    assert can_mutate_session_agent(
+        ALICE,
+        child.id,
+        _session_agent(created_by=ALICE, session_id=parent.id),
+        perm_store,
+        conv_store,
+        conversation=child,
+    )
+
+
+def test_agent_mutation_capability_preserves_auth_disabled_mode(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """The capability stays permissive when no ownership model is configured."""
+    assert can_mutate_session_agent(
+        None,
+        "unresolved-session",
+        _session_agent(created_by=None),
+        None,
+        conv_store,
+    )
 
 
 @pytest.mark.asyncio

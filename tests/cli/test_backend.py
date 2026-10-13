@@ -909,6 +909,202 @@ def test_daemon_host_online_false_when_no_host_id(
     assert cli._daemon_host_online(record) is False
 
 
+def _server_record(target: str = "http://127.0.0.1:59999") -> cli._HostDaemonRecord:
+    """Build a server-mode daemon record pointing at *target*.
+
+    :param target: Configured server URL the daemon must register with.
+    :returns: A record with a host id, suitable for the registration wait.
+    """
+    return cli._HostDaemonRecord(
+        pid=4242,
+        target=target,
+        mode="server",
+        server_url=target,
+        log_path=None,
+        started_at=1_000_000,
+        host_id="host_abc",
+    )
+
+
+def _patch_registration_wait(
+    monkeypatch: pytest.MonkeyPatch, probe_result: cli._HostHttpResult
+) -> None:
+    """Pin the registration wait to one probe outcome with zero grace.
+
+    :param monkeypatch: Fixture used to scope the patches.
+    :param probe_result: Result every status probe returns.
+    """
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.0)
+    monkeypatch.setattr(cli, "_daemon_host_status_probe", lambda record, **_kw: probe_result)
+
+
+def test_registration_wait_names_server_while_waiting(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A daemon that is not instantly online prompts a line naming the server.
+
+    Without it, `start` against a slow or unreachable server sits silent
+    for the whole registration grace and the user cannot tell what it is
+    waiting for.
+    """
+    _patch_registration_wait(
+        monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "offline"})
+    )
+
+    with pytest.raises(click.ClickException):
+        cli._confirm_background_host_registered(_server_record())
+
+    captured = capsys.readouterr()
+    assert "Waiting for the host daemon to register with http://127.0.0.1:59999" in captured.err
+    # Progress goes to stderr so scripts capturing the command's stdout
+    # result never receive the waiting line.
+    assert captured.out == ""
+
+
+def test_registration_wait_prints_nothing_when_immediately_online(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The happy path stays quiet — no waiting line on instant registration."""
+    _patch_registration_wait(
+        monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "online"})
+    )
+
+    cli._confirm_background_host_registered(_server_record())
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_registration_timeout_names_unreachable_server_and_skips_stale_host_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server nothing answered at is named, with the transport failure.
+
+    The stale-host recovery hint targets HTTP 401 tunnel rejections; a
+    connection-refused failure cannot be one, so the hint is suppressed.
+    """
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    _patch_registration_wait(
+        monkeypatch,
+        cli._HostHttpResult(
+            status_code=0,
+            body="ConnectError: [Errno 111] Connection refused",
+            unreachable=True,
+        ),
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(_server_record())
+
+    message = str(excinfo.value)
+    assert "127.0.0.1:59999" in message
+    assert "Connection refused" in message
+    assert suppresses_recovery_hint(excinfo.value) is True
+
+
+def test_registration_diagnostics_never_expose_url_credentials(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A configured server URL carrying userinfo is redacted in diagnostics.
+
+    Server configuration and daemon URL normalization both preserve URL
+    userinfo (``http://user:token@host``), so the waiting line and the
+    timeout error would otherwise echo credentials into the terminal and
+    persistent CLI diagnostics.
+    """
+    _patch_registration_wait(
+        monkeypatch,
+        cli._HostHttpResult(
+            status_code=0,
+            body="ConnectError: [Errno 111] Connection refused",
+            unreachable=True,
+        ),
+    )
+    record = _server_record("http://synthetic-user:synthetic-secret@127.0.0.1:59999")
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(record)
+
+    message = str(excinfo.value)
+    captured = capsys.readouterr()
+    for text in (message, captured.out, captured.err):
+        assert "synthetic-secret" not in text
+        assert "synthetic-user" not in text
+    # The server is still identified, just without its userinfo.
+    assert "http://127.0.0.1:59999" in message
+    assert "Waiting for the host daemon to register with http://127.0.0.1:59999" in captured.err
+
+
+def test_registration_target_display_preserves_ipv6_brackets() -> None:
+    """Userinfo redaction keeps an IPv6 literal's brackets intact.
+
+    Rebuilding the URL from ``hostname``/``port`` would render ``[::1]``
+    as ``::1`` and produce a malformed diagnostic URL; only the userinfo
+    may be dropped from the authority.
+    """
+    record = _server_record("http://synthetic-user:synthetic-secret@[::1]:59999")
+
+    assert cli._registration_target_display(record) == "http://[::1]:59999"
+
+
+def test_registration_timeout_keeps_hint_when_server_answered_then_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that answered once and then became unreachable keeps the hint.
+
+    ``server_responded`` must stick across later transport failures: a
+    server that ever answered can genuinely have a stale host process, so
+    the generic registration timeout — with its recovery hint — applies,
+    not the unreachable-server wording.
+    """
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    responses = iter([cli._HostHttpResult(status_code=200, body={"status": "offline"})])
+    refused = cli._HostHttpResult(
+        status_code=0,
+        body="ConnectError: [Errno 111] Connection refused",
+        unreachable=True,
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.5)
+    monkeypatch.setattr(
+        cli, "_daemon_host_status_probe", lambda record, **_kw: next(responses, refused)
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(_server_record())
+
+    message = str(excinfo.value)
+    assert "did not register with the server at http://127.0.0.1:59999" in message
+    assert suppresses_recovery_hint(excinfo.value) is False
+
+
+def test_registration_timeout_keeps_stale_host_hint_when_server_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reachable server that never reports the host online keeps the hint.
+
+    Here a stale host process really can be the cause (e.g. a rejected
+    tunnel), so the generic timeout still names the server but the
+    recovery hint stays.
+    """
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    _patch_registration_wait(
+        monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "offline"})
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(_server_record())
+
+    message = str(excinfo.value)
+    assert "did not register with the server at http://127.0.0.1:59999" in message
+    assert suppresses_recovery_hint(excinfo.value) is False
+
+
 # Every proxy variable httpx consults, so the cases below see exactly the
 # ambient proxy configuration they set up (a developer's own ``NO_PROXY``
 # would otherwise exempt loopback and skip the proxy transport entirely).
@@ -2117,6 +2313,252 @@ def test_host_stop_undiscoverable_local_server_degrades_to_daemon_only(
     assert result.exit_code == 0, result.output
     assert terminated == ["local"]
     assert "sessions_stopped=0" in result.output
+
+
+def test_host_stop_local_daemon_points_at_full_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Stopping the local daemon reminds the user the server stays up.
+
+    ``host stop`` stops hosting only; the detached local server (web UI /
+    history) keeps running, so a wedged server can look like it survived a
+    restart. The command points at the full ``stop`` to clear that up.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+    )
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_local_server_confirmed_dead", lambda: True)
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: pytest.fail(f"unexpected HTTP call: {kwargs}"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: cli._STOP_TERMINATED,
+    )
+
+    result = CliRunner().invoke(cli_group, ["host", "stop", "--server", ""])
+
+    assert result.exit_code == 0, result.output
+    assert "the local Omnigent server (web UI / history)" in result.output
+    assert f"{cli.cli_invocation()} stop" in result.output
+
+
+def test_host_stop_remote_daemon_omits_local_server_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A remote ``--server`` stop says nothing about a local server."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: pytest.fail(f"unexpected HTTP call: {kwargs}"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: cli._STOP_TERMINATED,
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "the local Omnigent server" not in result.output
+    assert f"{cli.cli_invocation()} stop" not in result.output
+
+
+def test_host_stop_server_url_matches_local_daemon_serving_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``host stop --server <url>`` finds a local daemon serving that url.
+
+    ``host --server <url>`` refuses to start when a local-mode daemon already
+    serves ``<url>``, so ``host stop --server <url>`` must act on that same
+    daemon. Without this it printed "No matching host daemon found" for the
+    very daemon the start error called "already running", leaving the operator
+    with no working recovery for the command the error pointed them at.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
+    # The local daemon must read as live for it to count as a conflict/target.
+    monkeypatch.setattr(cli, "_daemon_owner_is_live", lambda record: True)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: terminated.append(record.target) or cli._STOP_TERMINATED,
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "http://127.0.0.1:8123", "--daemon-only", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No matching host daemon found" not in result.output
+    assert terminated == ["local"], result.output
+
+
+def test_host_stop_foreign_daemon_reports_cleared_not_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A foreign-owned daemon is reported as cleared, never falsely "Stopped".
+
+    ``host stop`` can only drop the shared registry record for a daemon owned
+    by another user — it cannot signal the process (EPERM). It must say so
+    rather than print the contradictory "Stopped ... daemon" summary next to
+    the "owned by another user" warning.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: True)
+
+    def _eperm_kill(pid: int, sig: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(cli.os, "kill", _eperm_kill)
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com", "--daemon-only", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "owned by another user" in result.output
+    assert "Cleared the registry record" in result.output
+    assert "Stopped https://server.example.com daemon" not in result.output
+
+
+def test_foreground_connect_foreign_daemon_gives_ownership_guidance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A conflict with another user's daemon points at remedies that work.
+
+    ``host stop`` cannot signal another user's process, so the "already
+    running" error must say the daemon is owned by another user and name real
+    recovery (ask them, or a private ``OMNIGENT_DATA_DIR``) instead of only
+    telling the operator to run a stop that cannot help.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_load_effective_config", dict)
+    monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid == 4242)
+    monkeypatch.setattr(cli, "_pid_is_foreign", lambda pid: True)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process",
+        lambda server_url, **_kw: pytest.fail(f"unexpected foreground connect: {server_url}"),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "--server", "https://server.example.com/"],
+    )
+
+    assert result.exit_code != 0
+    assert "already running for this server" in result.output
+    assert "pid=4242" in result.output
+    assert "owned by another user" in result.output
+    assert "OMNIGENT_DATA_DIR" in result.output
+
+
+def test_host_stop_recycled_pid_reports_cleared_stale(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A recycled/dead pid record is reported as cleared, not "Stopped".
+
+    The recorded pid is not the daemon that wrote the record, so there is no
+    live daemon to stop; ``host stop`` drops the stale record and must say so.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: False)
+
+    def _forbidden_kill(pid: int, sig: int) -> None:
+        raise AssertionError(f"os.kill({pid}, {sig}) reached for a recycled pid")
+
+    monkeypatch.setattr(cli.os, "kill", _forbidden_kill)
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com", "--daemon-only", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Cleared a stale registry record" in result.output
+    assert "Stopped https://server.example.com daemon" not in result.output
+
+
+def test_pid_is_foreign_classifies_kill_permission_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_pid_is_foreign`` maps kill(2) results: EPERM->foreign, else not."""
+
+    def _kill(result: BaseException | None):
+        def _inner(pid: int, sig: int) -> None:
+            if result is not None:
+                raise result
+
+        return _inner
+
+    monkeypatch.setattr(cli.os, "kill", _kill(PermissionError(1, "Operation not permitted")))
+    assert cli._pid_is_foreign(4242) is True
+
+    monkeypatch.setattr(cli.os, "kill", _kill(ProcessLookupError(3, "No such process")))
+    assert cli._pid_is_foreign(4242) is False
+
+    monkeypatch.setattr(cli.os, "kill", _kill(None))
+    assert cli._pid_is_foreign(4242) is False
 
 
 def test_host_http_json_marks_connection_refused_unreachable(

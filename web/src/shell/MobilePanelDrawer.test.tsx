@@ -35,6 +35,21 @@ describe("MobilePanelDrawer", () => {
     expect(screen.getByTestId("shells-panel-drawer")).toHaveClass("mobile-panel-drawer");
   });
 
+  it("only casts a shadow while visible", () => {
+    const { rerender } = renderDrawer({ open: false });
+    const drawer = screen.getByTestId("shells-panel-drawer");
+    expect(drawer).toHaveClass("shadow-none");
+    expect(drawer).not.toHaveClass("shadow-lg");
+
+    rerender(
+      <MobilePanelDrawer open title="Shells" onClose={() => {}} testId="shells-panel-drawer">
+        <div />
+      </MobilePanelDrawer>,
+    );
+    expect(drawer).toHaveClass("shadow-lg");
+    expect(drawer).not.toHaveClass("shadow-none");
+  });
+
   it("renders the title and a working Close button", () => {
     const onClose = vi.fn();
     renderDrawer({ onClose });

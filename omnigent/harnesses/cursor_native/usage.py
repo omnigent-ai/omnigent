@@ -6,10 +6,10 @@ the on-disk ``agent-transcripts`` JSONL carry none, and the headless
 ``result.usage`` is unavailable to the interactive TUI the harness drives. So we
 register a ``hooks.json`` ``stop`` hook (see
 :func:`omnigent.harnesses.cursor_native.bridge.write_hooks_config`) whose command runs
-``record-usage`` here. cursor invokes it once per completed turn with a JSON
+``record-usage`` here. cursor invokes it when a turn ends with a JSON
 payload on stdin:
 
-    {"generation_id": "...", "model": "claude-4-sonnet",
+    {"generation_id": "...", "status": "completed", "model": "claude-4-sonnet",
      "input_tokens": 23666, "output_tokens": 5,
      "cache_read_tokens": 23617, "cache_write_tokens": 47, ...}
 
@@ -128,11 +128,11 @@ def record_usage_payload(bridge_dir: Path, payload: object) -> bool:
 def _cli_record_usage(bridge_dir: Path) -> int:
     """Hook entrypoint: read the JSON payload from stdin and append it.
 
-    The cursor ``stop`` hook fires once per completed turn, so this is also the
-    authoritative "turn finished" signal: it records a turn-end marker
+    The cursor ``stop`` hook fires when a turn completes, aborts, or fails, so
+    this is also the authoritative turn-outcome signal: it records a marker
     (:func:`omnigent.harnesses.cursor_native.status.record_turn_end`) on EVERY firing — even
     a turn with no billable usage, which :func:`record_usage_payload` skips — so
-    the forwarder can POST an ``external_session_status: idle`` edge and wake the
+    the forwarder can POST an ``external_session_status`` event and wake the
     parent orchestrator.
 
     Always emits ``{}`` (a no-op hook response cursor reads as "continue") and

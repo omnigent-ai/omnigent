@@ -58,7 +58,8 @@ from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
@@ -144,6 +145,9 @@ class FireDeps:
     # which case a ``managed_sandbox`` task records a failed run.
     sandbox_config: Any | None = None
     managed_launches: Any | None = None
+    # ``app.state``, read per fire for the default-public-sessions policy.
+    # ``None`` (tests, embedders) leaves every fired session private.
+    app_state: Any | None = None
 
 
 @dataclass
@@ -472,6 +476,7 @@ async def _run_fire_for_task(
             return
 
         try:
+            effective = await _own_task_agent(deps, effective)
             conv = await _create_session(deps, effective)
         except Exception:
             _logger.exception("scheduled fire: failed to create session for task %s", task.id)
@@ -489,7 +494,7 @@ async def _run_fire_for_task(
         await _attach_cost_budget(deps, task, conv.id)
 
         try:
-            await _grant_owner(deps, task, conv.id)
+            await _grant_owner(deps, effective, conv.id)
         except Exception:
             _logger.exception(
                 "scheduled fire: owner grant failed for task %s (session %s)",
@@ -506,6 +511,19 @@ async def _run_fire_for_task(
                 error_code="owner_grant_failed",
             )
             return
+
+        # Default-public access is optional decoration on top of the owner
+        # grant, so a failure here must not cancel an otherwise-ready run — the
+        # session simply stays private.
+        try:
+            await _grant_default_public(deps, effective, conv.id)
+        except Exception:
+            _logger.exception(
+                "scheduled fire: default-public grant failed for task %s (session %s); "
+                "continuing with a private session",
+                task.id,
+                conv.id,
+            )
 
         try:
             await dispatch(conv, effective)
@@ -804,6 +822,29 @@ async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str,
         return {}
 
 
+async def _own_task_agent(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
+    """Move a task saved on another user's agent onto its owner's own copy, once.
+
+    Tasks get the copy when created; this covers ones saved before that.
+    """
+    agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+    if agent is None:
+        return task
+    bound = await asyncio.to_thread(
+        agent_for_user, deps.agent_store, deps.artifact_store, agent, task.user_id
+    )
+    if bound.id == agent.id:
+        return task
+    await asyncio.to_thread(deps.scheduled_task_store.update, task.id, agent_id=bound.id)
+    return replace(task, agent_id=bound.id)
+
+
+async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
+    """The bundle the kickoff runs, so the runner can tell when it later changes."""
+    agent = await asyncio.to_thread(deps.agent_store.get, conv.agent_id) if conv.agent_id else None
+    return agent.bundle_location if agent is not None else None
+
+
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     conv: Conversation = await asyncio.to_thread(
@@ -887,6 +928,29 @@ async def _grant_owner(deps: FireDeps, task: ScheduledTask, conversation_id: str
     else:
         owner = task.user_id
     await asyncio.to_thread(deps.permission_store.grant, owner, conversation_id, LEVEL_OWNER)
+
+
+async def _grant_default_public(deps: FireDeps, task: ScheduledTask, conversation_id: str) -> None:
+    """Add the default ``__public__`` read grant when the server policy covers
+    this run. Best-effort: default-public access is not required for the run to
+    proceed, so the caller isolates any failure here rather than failing the run.
+    """
+    if deps.permission_store is None or deps.app_state is None:
+        return
+    from omnigent.server.sharing_settings import (
+        host_is_managed_sandbox,
+        new_session_starts_public,
+    )
+
+    managed = task.execution_target == "managed_sandbox" or host_is_managed_sandbox(
+        deps.host_registry, task.host_id
+    )
+    if not new_session_starts_public(deps.app_state, managed=managed, workspace=task.workspace):
+        return
+    await asyncio.to_thread(deps.permission_store.ensure_user, RESERVED_USER_PUBLIC)
+    await asyncio.to_thread(
+        deps.permission_store.grant, RESERVED_USER_PUBLIC, conversation_id, LEVEL_READ
+    )
 
 
 async def _record_run(
@@ -1140,6 +1204,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             artifact_store=deps.artifact_store,
             created_by=owner,
             runner_router=deps.runner_router,
+            agent_revision=await _agent_revision(deps, conv_for_dispatch),
         )
 
     return _dispatch
@@ -1220,6 +1285,7 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
             artifact_store=deps.artifact_store,
             created_by=owner,
             runner_router=deps.runner_router,
+            agent_revision=await _agent_revision(deps, fresh),
         )
 
     return _dispatch

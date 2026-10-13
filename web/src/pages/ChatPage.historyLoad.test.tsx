@@ -1697,6 +1697,17 @@ describe("JumpToTopButton", () => {
     return { container, scroll, scroller: { el: scroll, state, stopScroll } };
   }
 
+  it("hides the action on mobile", () => {
+    const { container, scroller } = makeScroller({
+      scrollTop: 100,
+      scrollHeight: 500,
+      clientHeight: 200,
+    });
+
+    render(<JumpToTopButton containerEl={container} scroller={scroller} hasMoreHistory />);
+    expect(pill().parentElement).toHaveClass("max-md:hidden");
+  });
+
   it("stays non-interactive at the first message (nothing above)", () => {
     const { container, scroller } = makeScroller({
       scrollTop: 0,

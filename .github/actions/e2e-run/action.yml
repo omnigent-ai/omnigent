@@ -83,7 +83,7 @@ runs:
 
     - name: Install project and test dependencies
       shell: bash
-      run: uv sync --locked --extra all --group test
+      run: uv sync --locked --extra all --extra openshell --group test
 
     - name: Install system dependencies
       # bubblewrap backs the linux_bwrap sandbox. Ubuntu 24.04 restricts
