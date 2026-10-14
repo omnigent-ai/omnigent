@@ -1,0 +1,378 @@
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { ChevronDown, ChevronUp, Upload } from "lucide-react";
+import * as Progress from "radix-ui/progress";
+import { toast } from "sonner";
+import { useSession } from "@/hooks/useSession";
+import { useViewerId } from "@/hooks/useViewerId";
+import { useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
+import { useFileDropTarget } from "@/hooks/useFileDropTarget";
+import { isEditorLevel } from "@/lib/permissionsApi";
+import {
+  getUploadCapability,
+  type UploadCapability,
+  type UploadOwner,
+} from "@/lib/workspaceUploadsApi";
+import { cancelUpload, enqueueUploads, retryUpload } from "@/lib/workspaceUploadController";
+import { isActiveUpload, ownerKey, uploadTotals, useUploadStore } from "@/store/uploadStore";
+import { useChatStore } from "@/store/chatStore";
+import { FileDropOverlay } from "@/components/FileDropOverlay";
+import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { formatBytes } from "./fileStatusUtils";
+
+export function uploadGate(
+  permission: number | null,
+  capability: UploadCapability | null | undefined,
+  status: string | undefined,
+  directory: string,
+) {
+  const visible = permission !== null && isEditorLevel(permission) && capability != null;
+  const reason = ["failed", "ended"].includes(status ?? "")
+    ? "Reconnect this session to upload files"
+    : directory.startsWith("/") || directory.split("/").includes("..")
+      ? "Uploads must stay inside the workspace"
+      : capability && !capability.supported && capability.reason !== "runner_unavailable"
+        ? capability.reason === "runner_capability_mismatch"
+          ? "Update the host and restart the session to upload files"
+          : (capability.reason ?? "Workspace uploads are unsupported")
+        : undefined;
+  return { visible, reason, enabled: visible && !reason };
+}
+
+interface UploadContextValue {
+  owner: UploadOwner;
+  capability: UploadCapability | null | undefined;
+  visible: boolean;
+  enabled: boolean;
+  reason?: string;
+  directory: string;
+  destination: string;
+  setDirectory: (directory: string) => void;
+  enqueue: (files: File[], directory?: string) => void;
+}
+const UploadContext = createContext<UploadContextValue | null>(null);
+
+export function WorkspaceUploadProvider({
+  sessionId,
+  children,
+}: {
+  sessionId: string;
+  children: ReactNode;
+}) {
+  const identity = useViewerId();
+  const { session } = useSession(sessionId);
+  const environment = useWorkspaceEnvironment(sessionId);
+  const root = environment.data?.root ?? null;
+  const [directories, setDirectories] = useState<Record<string, string>>({});
+  const directory = directories[sessionId] ?? "";
+  const setDirectory = useCallback(
+    (next: string) =>
+      setDirectories((current) =>
+        current[sessionId] === next ? current : { ...current, [sessionId]: next },
+      ),
+    [sessionId],
+  );
+  const client = useQueryClient();
+  const liveStatus = useChatStore((state) =>
+    state.conversationId === sessionId ? state.sessionStatus : undefined,
+  );
+  const permission = session?.permissionLevel ?? null;
+  const owner = useMemo(
+    () => ({
+      origin: window.location.origin,
+      identity: identity ?? "",
+      session: sessionId,
+      environment: "default",
+    }),
+    [identity, sessionId],
+  );
+  const capability = useQuery({
+    queryKey: ["workspace-upload-capability", owner.origin, owner.identity, sessionId],
+    queryFn: () => getUploadCapability(owner),
+    enabled: identity !== null && permission !== null && isEditorLevel(permission),
+    staleTime: 30_000,
+    retry: false,
+  });
+  const gate = useMemo(
+    () => uploadGate(permission, capability.data, liveStatus ?? session?.status, directory),
+    [permission, capability.data, liveStatus, session?.status, directory],
+  );
+  const destination = directory || root?.split("/").filter(Boolean).at(-1) || "workspace";
+  const value = useMemo<UploadContextValue>(
+    () => ({
+      owner,
+      capability: capability.data,
+      ...gate,
+      directory,
+      destination,
+      setDirectory,
+      enqueue: (files, target = directory) => {
+        if (!gate.enabled || !capability.data) {
+          toast.error(gate.reason ?? "Workspace upload permission is pending");
+          return;
+        }
+        enqueueUploads(owner, files, target, target || destination, capability.data.limits, client);
+      },
+    }),
+    [owner, capability.data, gate, directory, destination, setDirectory, client],
+  );
+  return <UploadContext.Provider value={value}>{children}</UploadContext.Provider>;
+}
+
+export function UploadPicker({ directory }: { directory: string }) {
+  const context = useContext(UploadContext);
+  const input = useRef<HTMLInputElement>(null);
+  const button = useRef<HTMLButtonElement>(null);
+  const selectedDirectory = useRef(directory);
+  const setDirectory = context?.setDirectory;
+  useEffect(() => setDirectory?.(directory), [setDirectory, directory]);
+  useEffect(() => {
+    const element = input.current;
+    const restoreFocus = () => button.current?.focus();
+    element?.addEventListener("cancel", restoreFocus);
+    return () => element?.removeEventListener("cancel", restoreFocus);
+  }, [context?.visible]);
+  if (!context?.visible) return null;
+  return (
+    <>
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span title={context.reason}>
+              <Button
+                ref={button}
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Upload files"
+                disabled={!context.enabled}
+                onClick={() => {
+                  selectedDirectory.current = directory;
+                  input.current?.click();
+                }}
+              >
+                <Upload />
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{context.reason ?? "Upload files to this folder"}</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+      <input
+        ref={input}
+        type="file"
+        multiple
+        className="hidden"
+        aria-label="Choose workspace files"
+        onChange={(event) => {
+          context.enqueue(Array.from(event.target.files ?? []), selectedDirectory.current);
+          event.target.value = "";
+          button.current?.focus();
+        }}
+      />
+    </>
+  );
+}
+
+export function resolveUploadTarget(_event: DragEvent, browsedDirectory: string): string {
+  return browsedDirectory;
+}
+
+export function droppedUploadFiles(event: DragEvent, files: File[]): File[] {
+  const directories = Array.from(event.dataTransfer?.items ?? []).filter(
+    (item) => item.webkitGetAsEntry?.()?.isDirectory,
+  );
+  if (!directories.length) return files;
+  toast.error("Folders cannot be uploaded. Select their files instead.");
+  const directoryFiles = new Set(directories.map((item) => item.getAsFile()).filter(Boolean));
+  return files.filter((file) => !directoryFiles.has(file));
+}
+
+export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
+  const context = useContext(UploadContext);
+  const [target, setTarget] = useState<HTMLDivElement | null>(null);
+  const active = useFileDropTarget(context?.enabled ? target : null, (files, event) => {
+    if (context)
+      context.enqueue(
+        droppedUploadFiles(event, files),
+        resolveUploadTarget(event, context.directory),
+      );
+  });
+  return (
+    <div
+      ref={setTarget}
+      data-upload-drop-root={context?.visible ? "" : undefined}
+      data-upload-disabled-reason={
+        context?.visible && !context.enabled ? context.reason : undefined
+      }
+      className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
+    >
+      {children}
+      {active && target && context && (
+        <FileDropOverlay
+          container={target}
+          variant="upload"
+          label="Upload to workspace"
+          destination={context.destination}
+          subtext="Saved to this session's files"
+        />
+      )}
+    </div>
+  );
+}
+
+export function UploadsTray({ visible }: { visible: boolean }) {
+  const context = useContext(UploadContext);
+  const allRows = useUploadStore((state) => state.rows);
+  const client = useQueryClient();
+  const [expanded, setExpanded] = useState(true);
+  const group = context ? ownerKey(context.owner) : "";
+  const rows = useMemo(
+    () => Object.values(allRows).filter((row) => ownerKey(row) === group),
+    [allRows, group],
+  );
+  const totals = uploadTotals(rows);
+  const summary = `${totals.done}/${rows.length} files · ${formatBytes(totals.committed)} / ${formatBytes(totals.total)}`;
+  useEffect(() => {
+    if (visible && context?.visible) return useUploadStore.getState().showTray(group);
+    return undefined;
+  }, [group, visible, context?.visible]);
+  if (!context?.visible || !rows.length) return null;
+  return (
+    <section role="region" aria-label="Uploads" className="shrink-0 border-t border-border text-ui">
+      <div className="flex items-center gap-2 px-2 py-1.5">
+        <button
+          type="button"
+          className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          aria-expanded={expanded}
+          onClick={() => setExpanded(!expanded)}
+        >
+          <Upload className="size-4 shrink-0" />
+          <span className="truncate tabular-nums" title={summary}>
+            {summary}
+          </span>
+          {expanded ? <ChevronDown className="size-3" /> : <ChevronUp className="size-3" />}
+        </button>
+        {!totals.active && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => useUploadStore.getState().dismiss(rows.map((row) => row.key))}
+          >
+            Dismiss
+          </Button>
+        )}
+      </div>
+      {expanded && (
+        <>
+          <div className="max-h-56 overflow-auto px-2">
+            {rows.map((row) => (
+              <div
+                key={row.key}
+                className="space-y-1 border-t border-border py-2"
+                data-upload-state={row.status}
+              >
+                <div className="flex items-center gap-2">
+                  <span className="min-w-0 flex-1 truncate font-medium" title={row.name}>
+                    {row.name}
+                  </span>
+                  {isActiveUpload(row) && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      aria-label={`Cancel ${row.name}`}
+                      onClick={() => void cancelUpload(row.key)}
+                    >
+                      Cancel
+                    </Button>
+                  )}
+                  {row.status === "failed" && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      aria-label={`Retry ${row.name}`}
+                      onClick={() => void retryUpload(row.key, client)}
+                    >
+                      Retry
+                    </Button>
+                  )}
+                </div>
+                <p className="truncate text-muted-foreground" title={row.destination}>
+                  Uploading to {row.destination}
+                </p>
+                <Progress.Root
+                  aria-label={`${row.name} upload progress`}
+                  value={row.size ? (row.offset / row.size) * 100 : row.status === "done" ? 100 : 0}
+                  className="relative flex h-1 w-full overflow-hidden rounded-full bg-muted"
+                >
+                  <Progress.Indicator
+                    className="h-full bg-primary"
+                    style={{
+                      width: `${row.size ? (row.offset / row.size) * 100 : row.status === "done" ? 100 : 0}%`,
+                    }}
+                  />
+                </Progress.Root>
+                <div className="flex justify-between gap-2 text-muted-foreground">
+                  <span>
+                    {row.status === "connecting"
+                      ? "Connecting…"
+                      : row.status === "done"
+                        ? "Done"
+                        : row.status.charAt(0).toUpperCase() + row.status.slice(1)}
+                  </span>
+                  <span className="tabular-nums">
+                    {formatBytes(row.offset)} / {formatBytes(row.size)}
+                  </span>
+                </div>
+                {row.error && (
+                  <p
+                    role={row.status === "failed" ? "alert" : undefined}
+                    className="text-destructive"
+                  >
+                    {row.error}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+          <div className="flex flex-wrap gap-1 px-2 py-1">
+            {totals.active && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  rows.filter(isActiveUpload).forEach((row) => void cancelUpload(row.key))
+                }
+              >
+                Cancel remaining
+              </Button>
+            )}
+            {rows.some((row) => row.status === "failed") && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() =>
+                  rows
+                    .filter((row) => row.status === "failed")
+                    .forEach((row) => void retryUpload(row.key, client))
+                }
+              >
+                Retry failed
+              </Button>
+            )}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
