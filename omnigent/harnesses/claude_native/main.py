@@ -596,11 +596,14 @@ def _gateway_claude_listing(
                 transport=transport,
                 params={"return_wildcard_routes": "true"},
             )
-    except (httpx.HTTPError, OSError, ValueError, subprocess.SubprocessError):
+    except (httpx.HTTPError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        # The error text carries the request URL (userinfo, query tokens): log none of it.
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
         _logger.debug(
-            "claude gateway model listing failed for %s",
-            listing_provider.detail or listing_provider.base_url,
-            exc_info=True,
+            "claude gateway model listing failed for %s: %s (HTTP status %s)",
+            listing_provider.detail or listing_provider.kind,
+            type(exc).__name__,
+            status,
         )
         return (None, ())
     ids = [entry.id for entry in listing.models]
@@ -1669,6 +1672,14 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     ambient_credentials = (
         _ambient_credential_digest(ambient_env) if ambient_env and ambient_gateway else None
     )
+    # A live-enumerated gateway shapes the catalog rows, so key configured
+    # gateways on the listing endpoint (never the credential).
+    listing_provider = claude_config.listing_provider if claude_config is not None else None
+    listing_endpoint = (
+        (listing_provider.kind, listing_provider.family, listing_provider.base_url)
+        if listing_provider is not None
+        else None
+    )
     return fingerprint_of(
         "claude-native",
         "control-picker-v4",
@@ -1683,6 +1694,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         binary_identity("claude"),
         ambient_transport,
         ambient_credentials,
+        listing_endpoint,
         claude_managed_model_picker() if uses_cli_settings else None,
     )
 
@@ -1750,9 +1762,8 @@ async def claude_model_catalog(
                 and listing_provider.base_url
                 and is_databricks_ai_gateway_url(listing_provider.base_url)
             )
-            _non_canonical = (
-                is_undetermined_databricks_gateway
-                or not _serves_canonical_anthropic_ids(claude_config)
+            _non_canonical = is_undetermined_databricks_gateway or (
+                listing_provider is None and not _serves_canonical_anthropic_ids(claude_config)
             )
     else:
         _non_canonical = await _ambient_gateway_rejects_canonical_ids()
