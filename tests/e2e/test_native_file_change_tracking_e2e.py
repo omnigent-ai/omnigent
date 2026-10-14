@@ -52,7 +52,20 @@ async def test_native_write_reaches_changes_registry(
         session_id=_SESSION_ID,
         file_change_observer=_observe,
     )
-    hook = hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")
+    hook = hook_settings(
+        bridge_dir,
+        shlex.join(
+            [
+                sys.executable,
+                "-I",
+                "-m",
+                f"omnigent.harnesses.{harness}.hook",
+                "observe-tool",
+                "--bridge-dir",
+                str(bridge_dir),
+            ]
+        ),
+    )
     command = shlex.split(str(hook["command"]))
     try:
         report = workspace / "report.md"

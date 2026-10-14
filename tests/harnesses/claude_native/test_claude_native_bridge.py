@@ -12253,7 +12253,7 @@ def _policy_retry_clock(monkeypatch: pytest.MonkeyPatch) -> Mock:
     return clock
 
 
-def _hook_relay(tmp_path, monkeypatch, client):
+def _hook_relay(tmp_path, monkeypatch, client, *, file_change_observer=None):
     """Boot a relay wired with *client* for the hook-evaluate tests."""
     from omnigent.harnesses.pi_native import bridge as pi_native_bridge
 
@@ -12272,6 +12272,7 @@ def _hook_relay(tmp_path, monkeypatch, client):
         loop=asyncio.get_running_loop(),
         policy_client=client,  # type: ignore[arg-type]
         session_id="conv_hook_eval",
+        file_change_observer=file_change_observer,
     )
     return relay, bridge_dir
 
@@ -12362,46 +12363,61 @@ async def test_hook_evaluate_endpoint_allows(
             assert body == "", f"allow must be empty hook output, got {body!r}"
         assert client.calls == 2, f"every event must evaluate upstream, saw {client.calls}"
         # The relay wrote the shell-sourceable env file the curl hooks use.
-        env_text = (bridge_dir / claude_native_bridge._TOOL_RELAY_ENV_FILE).read_text("utf-8")
+        env_text = (bridge_dir / claude_native_bridge.TOOL_RELAY_ENV_FILE).read_text("utf-8")
         assert "OMNIGENT_RELAY_URL=" in env_text and "OMNIGENT_RELAY_TOKEN=" in env_text
     finally:
         relay.close()
 
 
+_HOOK_EVALUATE_ROUTES = pytest.mark.parametrize(
+    ("route", "harness"),
+    [
+        ("/hook/claude/evaluate-policy", "claude-native"),
+        ("/hook/codex/evaluate-policy", "codex-native"),
+    ],
+)
+
+
 @pytest.mark.asyncio
+@_HOOK_EVALUATE_ROUTES
 async def test_hook_evaluate_endpoint_returns_deny_hook_output(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, harness: str
 ) -> None:
     """A DENY verdict comes back as ready-made PreToolUse hook output."""
+    from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
+
     client = _ScriptedPolicyClient({"result": "POLICY_ACTION_DENY", "reason": "blocked by test"})
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    # Codex's live /model selection, which its cost gate evaluates against.
+    codex_home = codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "config.toml").write_text('model = "gpt-5.4"\n')
     try:
         body = await asyncio.to_thread(
-            _relay_request_raw,
-            bridge_dir,
-            "/hook/claude/evaluate-policy",
-            _PRE_TOOL_USE_PAYLOAD,
+            _relay_request_raw, bridge_dir, route, _PRE_TOOL_USE_PAYLOAD
         )
         output = json.loads(body)
         assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert "blocked by test" in output["hookSpecificOutput"]["permissionDecisionReason"]
+        context = client.bodies[0]["event"]["context"]
+        assert context["harness"] == harness
+        assert context.get("model") == ("gpt-5.4" if harness == "codex-native" else None)
     finally:
         relay.close()
 
 
 @pytest.mark.asyncio
+@_HOOK_EVALUATE_ROUTES
 async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, harness: str
 ) -> None:
     """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
+    del harness
     client = _ScriptedPolicyClient(None)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
         body = await asyncio.to_thread(
-            _relay_request_raw,
-            bridge_dir,
-            "/hook/claude/evaluate-policy",
-            _PRE_TOOL_USE_PAYLOAD,
+            _relay_request_raw, bridge_dir, route, _PRE_TOOL_USE_PAYLOAD
         )
         output = json.loads(body)
         assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
@@ -12409,10 +12425,51 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
         post_body = await asyncio.to_thread(
             _relay_request_raw,
             bridge_dir,
-            "/hook/claude/evaluate-policy",
+            route,
             {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
         )
         assert post_body == "", "PostToolUse must fail open (tool already ran)"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_observe_tool_answers_without_waiting_for_the_file_change_observer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The observer hook never holds the tool result, and records keep arrival order."""
+    release = asyncio.Event()
+    observed: list[object] = []
+
+    async def _observer(payload: dict[str, object]) -> None:
+        if payload["tool_use_id"] == "write":
+            await release.wait()
+        observed.append(payload["tool_use_id"])
+
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, None, file_change_observer=_observer)
+    try:
+        for call_id in ("write", "edit"):
+            body = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _relay_request_raw,
+                    bridge_dir,
+                    "/hook/observe-tool",
+                    {
+                        **_PRE_TOOL_USE_PAYLOAD,
+                        "hook_event_name": "PostToolUse",
+                        "tool_use_id": call_id,
+                    },
+                ),
+                timeout=5,
+            )
+            assert body == "", "the observer hook must stay model-invisible"
+        # The later Edit waits behind the Write still recording.
+        assert observed == []
+        release.set()
+        async with asyncio.timeout(5):
+            while len(observed) < 2:
+                await asyncio.sleep(0.01)
+        assert observed == ["write", "edit"]
     finally:
         relay.close()
 
@@ -12555,6 +12612,24 @@ async def test_curl_evaluate_policy_command_round_trips(
         output = json.loads(result.stdout)
         assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert "curl says no" in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+        # Codex's registered hook takes the same path on its own route. Its
+        # Python fallback has no bridge state here and would stay silent, so
+        # the deny can only have come from the relay.
+        from omnigent.harnesses.codex_native.app_server import _codex_policy_hooks_settings
+
+        codex_hooks = _codex_policy_hooks_settings(bridge_dir, sys.executable)["hooks"]
+        result = await asyncio.to_thread(
+            subprocess.run,
+            shlex.split(codex_hooks["PreToolUse"][0]["hooks"][0]["command"]),
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        output = json.loads(result.stdout)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert client.bodies[-1]["event"]["context"]["harness"] == "codex-native"
     finally:
         relay.close()
 
@@ -12831,7 +12906,7 @@ async def test_tool_relay_defaults_to_loopback(
         assert info["url"].startswith("http://127.0.0.1:"), (
             "detecting a routable address must not widen the default bind"
         )
-        env_text = (bridge_dir / claude_native_bridge._TOOL_RELAY_ENV_FILE).read_text(
+        env_text = (bridge_dir / claude_native_bridge.TOOL_RELAY_ENV_FILE).read_text(
             encoding="utf-8"
         )
         assert "OMNIGENT_RELAY_URL='http://127.0.0.1:" in env_text
@@ -12874,7 +12949,7 @@ async def test_all_interfaces_opt_in_advertises_routable_host_reachable_locally(
         assert info["url"] == f"http://203.0.113.9:{port}", (
             "relay advertised a non-routable URL; sandboxed hooks cannot reach it"
         )
-        env_text = (bridge_dir / claude_native_bridge._TOOL_RELAY_ENV_FILE).read_text(
+        env_text = (bridge_dir / claude_native_bridge.TOOL_RELAY_ENV_FILE).read_text(
             encoding="utf-8"
         )
         assert f"OMNIGENT_RELAY_URL='http://203.0.113.9:{port}'" in env_text
