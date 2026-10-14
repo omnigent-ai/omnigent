@@ -2313,7 +2313,8 @@ export function useMoveToProject() {
     const itemsById = new Map<string, SessionListWireItem>([
       [id, { id, project_id: projectId, labels }],
     ]);
-    let inWindow = false;
+    // Each sort has its own loaded window; the inactive sort may hold different rows.
+    const windowSorts = new Set<SessionSortBy>();
     for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
       queryKey: ["conversations"],
     })) {
@@ -2323,17 +2324,18 @@ export function useMoveToProject() {
         filtersFromConversationQueryKey(key),
         undefined,
       );
-      if (found.has(id)) inWindow = true;
+      if (found.has(id)) windowSorts.add(key[5] === "created_at" ? "created_at" : "updated_at");
       if (next !== data) queryClient.setQueryData(key, next);
     }
     // Target folder cache: overlay the row's fields if already present, and
     // insert a deep row (outside the flat window) into the first page.
-    let visibleOutsideOldFolders = inWindow;
+    const visibleSorts = new Set(windowSorts);
     if (targetProjectName !== null) {
       for (const [targetKey, targetData] of queryClient.getQueriesData<ConversationsInfiniteData>({
         queryKey: ["project-sessions", targetProjectName],
       })) {
         if (!targetData) continue;
+        const sortBy = targetKey[2] === "created_at" ? "created_at" : "updated_at";
         const { data: merged, found } = mergeItemsIntoPages(
           targetData,
           itemsById,
@@ -2342,7 +2344,7 @@ export function useMoveToProject() {
         );
         let next = merged ?? targetData;
         const [first, ...rest] = next.pages;
-        if (!found.has(id) && !inWindow && first) {
+        if (!found.has(id) && !windowSorts.has(sortBy) && first) {
           next = {
             ...next,
             pages: [
@@ -2352,17 +2354,16 @@ export function useMoveToProject() {
           };
         }
         if (next !== targetData) queryClient.setQueryData(targetKey, next);
-        if (found.has(id) || first !== undefined) visibleOutsideOldFolders = true;
+        if (found.has(id) || first !== undefined) visibleSorts.add(sortBy);
       }
     }
-    if (visibleOutsideOldFolders) {
-      for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-        queryKey: ["project-sessions"],
-      })) {
-        if (key[1] === targetProjectName) continue;
-        const { data: next, removed } = removeIdsFromPages(data, new Set([id]));
-        if (removed) queryClient.setQueryData(key, next);
-      }
+    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: ["project-sessions"],
+    })) {
+      const sortBy = key[2] === "created_at" ? "created_at" : "updated_at";
+      if (key[1] === targetProjectName || !visibleSorts.has(sortBy)) continue;
+      const { data: next, removed } = removeIdsFromPages(data, new Set([id]));
+      if (removed) queryClient.setQueryData(key, next);
     }
     queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
       old ? { ...old, project_id: projectId, labels } : old,
