@@ -262,6 +262,11 @@ SESSION_AGENT_MISSING_MESSAGE = (
     "This agent no longer exists. Fork this session into another agent to continue."
 )
 
+SESSION_AGENT_BUNDLE_MISSING_MESSAGE = (
+    "This agent's bundle no longer exists, so it cannot be copied. "
+    "Choose another agent to continue."
+)
+
 
 # Single source of truth for error code → HTTP status.
 _CODE_TO_HTTP_STATUS: dict[str, int] = {

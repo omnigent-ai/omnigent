@@ -1918,6 +1918,7 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     # The turn still fails: the pane is gone either way.
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+    assert events[0].undelivered is True
 
     records = [r for r in caplog.records if "terminal exited" in r.getMessage()]
     assert len(records) == 1
@@ -2053,15 +2054,17 @@ async def test_run_turn_does_not_reap_unrelated_runtime_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [ClaudePromptTimeout, ClaudeTerminalExited])
 async def test_run_turn_reports_reap_failure_with_prompt_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    failure: type[ClaudePromptTimeout],
 ) -> None:
     """A failed hard-stop remains visible beside the delivery error."""
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
-        raise ClaudePromptTimeout("terminal did not become ready")
+        raise failure("terminal did not become ready")
 
     def fail_kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
         del bridge_dir_arg, timeout_s
@@ -2083,6 +2086,7 @@ async def test_run_turn_reports_reap_failure_with_prompt_timeout(
     assert isinstance(events[0], ExecutorError)
     assert "terminal did not become ready" in events[0].message
     assert "Cleanup also failed: tmux kill failed" in events[0].message
+    assert events[0].undelivered is True
 
 
 @pytest.mark.asyncio

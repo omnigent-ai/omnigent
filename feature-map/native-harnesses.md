@@ -196,7 +196,11 @@ Cross-harness journeys:
   These own their environment: run with plain `uv run pytest`. They drive a
   real Codex TUI and REST session settings, checking the outgoing Responses
   effort, native settings, private config, and session state. Only the model
-  replies are mocked; models absent from the installed CLI are skipped.
+  replies are mocked; models absent from the installed CLI are skipped. Set
+  `OMNIGENT_TEST_CODEX_STANDARD_MODEL` (low..xhigh), `OMNIGENT_TEST_CODEX_EXTENDED_MODEL`
+  (max/ultra), and `OMNIGENT_TEST_CODEX_SWITCH_MODEL` (a different default) to
+  substitute models; a configured model the installed catalog lacks fails
+  instead of skipping, and replies stay on the local mock server.
   Existing-session cases also require the picker to show the applied effort
   when an unsupported request clamps back to the already active native value.
   Concurrent runner controls are covered by
@@ -292,6 +296,15 @@ Cross-harness journeys:
   covers the real CLI and transcript forwarder through the repro environment.
   It requires Claude Code and tmux; machine-managed Claude settings need an
   isolated container for the scripted model endpoint.
+  If shell mode or the prompt-history search still occupies Claude Code's input
+  box after Omnigent tries to dismiss it with Escape, the web message is refused
+  with a notice to open the terminal, dismiss it, and resend. No message text is
+  typed into the pane.
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_refuses_a_shell_mode_draft_escape_cannot_clear`
+  covers the refusal with a fake tmux (plain `uv run pytest`);
+  `tests/e2e_ui/messages/test_claude_native_refused_delivery_persistence.py::test_claude_refused_message_survives_reload`
+  (own environment; a scripted stand-in for the Claude TUI and real tmux) checks
+  that the refused input is still shown after a reload.
 - **`chat-render`, Claude shell commands from the agent terminal:**
   `tests/browser_ui/chat/test_native_shell_settlement.py::test_terminal_shell_commands_keep_their_user_turns`
   replays terminal-origin records in the built SPA at desktop and phone widths.
