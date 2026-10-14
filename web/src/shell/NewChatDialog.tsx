@@ -7665,7 +7665,6 @@ function NewChatLandingContent({
             container={landingSurface}
             label="Attach to message"
             subtext="Sent with your next message"
-            variant="attach"
           />
         ) : null}
         <fieldset
