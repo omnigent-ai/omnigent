@@ -1,6 +1,7 @@
+import { waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { restoreFontPreferences } from "./restoreFontPreferences";
-import { resetFontLoaderForTests, setWebFontsEnabled } from "./webFontLoader";
+import { applyWebFontCapability, restoreFontPreferences } from "./restoreFontPreferences";
+import { resetFontLoaderForTests } from "./webFontLoader";
 
 afterEach(() => {
   resetFontLoaderForTests();
@@ -14,8 +15,7 @@ describe("restoreFontPreferences webfonts gate", () => {
     localStorage.setItem("omnigent:ui-font-family", JSON.stringify("Inter"));
     localStorage.setItem("omnigent:fixed-width-font-family", JSON.stringify("IBM Plex Mono"));
     localStorage.setItem("omnigent:code-font-family", JSON.stringify("JetBrains Mono"));
-    setWebFontsEnabled(false);
-
+    applyWebFontCapability(false);
     restoreFontPreferences();
 
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe(
@@ -26,5 +26,31 @@ describe("restoreFontPreferences webfonts gate", () => {
     );
     expect(document.querySelector("link[data-omnigent-font]")).toBeNull();
     expect(document.querySelector("style[data-omnigent-font]")).toBeNull();
+  });
+
+  it("loads a saved catalog font when the capability is enabled", async () => {
+    localStorage.setItem("omnigent:ui-font-family", JSON.stringify("Inter"));
+    applyWebFontCapability(true);
+
+    await waitFor(() => {
+      expect(
+        document.querySelector('link[data-omnigent-font][href*="fonts.googleapis.com/css2"]'),
+      ).not.toBeNull();
+    });
+  });
+
+  it("loads saved catalog fonts after an off-mode restore is enabled", async () => {
+    localStorage.setItem("omnigent:ui-font-family", JSON.stringify("Roboto"));
+    applyWebFontCapability(false);
+    restoreFontPreferences();
+    expect(document.querySelector("link[data-omnigent-font]")).toBeNull();
+
+    applyWebFontCapability(true);
+
+    await waitFor(() => {
+      expect(
+        document.querySelector('link[data-omnigent-font][href*="family=Roboto"]'),
+      ).not.toBeNull();
+    });
   });
 });

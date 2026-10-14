@@ -63,6 +63,10 @@ describe("fontCatalog — integrity", () => {
     expect(geist?.source).toBe("bundled");
     expect(geist?.family).toBe("Geist Mono Variable");
 
+    const codeGeist = getFontById("geist-mono-code-bundled");
+    expect(codeGeist?.source).toBe("bundled");
+    expect(codeGeist?.family).toBe("Geist Mono Variable");
+
     const system = getFontById("system-ui");
     expect(system?.source).toBe("bundled");
     // Empty family = "System default" (maps to --font-sans, nothing to load).
@@ -84,65 +88,66 @@ describe("fontCatalog — integrity", () => {
     }
   });
 
-  it("offers the ranked 25 Google families and Nerd Fonts in both monospace roles", () => {
+  it("offers the ranked Google families and keeps base extras after them", () => {
     const sans = FONT_CATALOG_BY_CATEGORY.sans
       .filter((entry) => entry.source === "google-css2")
       .map((entry) => entry.family);
-    expect(sans).toEqual([
-      "Noto Sans JP",
+    expect(sans.slice(0, 25)).toEqual([
       "Roboto",
       "Open Sans",
-      "Arimo",
       "Google Sans",
       "Inter",
-      "Manrope",
-      "Outfit",
       "Montserrat",
-      "Work Sans",
       "Poppins",
-      "Barlow",
       "Lato",
-      "Fira Sans",
-      "Titillium Web",
-      "Roboto Condensed",
-      "Cairo",
+      "Arimo",
       "Noto Sans",
       "DM Sans",
-      "Mukta",
-      "Instrument Sans",
-      "Hind",
+      "Raleway",
       "Nunito",
       "Nunito Sans",
-      "Almarai",
+      "Rubik",
+      "Manrope",
+      "Ubuntu",
+      "Outfit",
+      "Kanit",
+      "Plus Jakarta Sans",
+      "Work Sans",
+      "Quicksand",
+      "Figtree",
+      "PT Sans",
+      "Archivo",
+      "Mulish",
     ]);
+    expect(sans.slice(25)).toEqual(["Source Sans 3", "Geist"]);
 
     const monospace = ["fixedWidth", "code"] as const;
     const expectedMonoFamilies = [
-      "JetBrains Mono",
       "Roboto Mono",
-      "Fira Code",
+      "JetBrains Mono",
       "Inconsolata",
       "IBM Plex Mono",
       "Source Code Pro",
-      "B612 Mono",
-      "Martian Mono",
-      "Geist Mono",
-      "Sometype Mono",
       "DM Mono",
       "Space Mono",
+      "Fira Code",
+      "Courier Prime",
       "Google Sans Code",
+      "Share Tech Mono",
       "PT Mono",
       "Ubuntu Mono",
+      "Cutive Mono",
       "Red Hat Mono",
-      "Fira Mono",
       "Anonymous Pro",
+      "Fira Mono",
       "Cousine",
       "Azeret Mono",
+      "Fragment Mono",
       "Overpass Mono",
       "Chivo Mono",
       "Spline Sans Mono",
-      "Oxygen Mono",
-      "Lekton",
+      "B612 Mono",
+      "Martian Mono",
     ];
     const nerdFamilies = [
       "JetBrainsMono Nerd Font Mono",
@@ -157,10 +162,18 @@ describe("fontCatalog — integrity", () => {
         .filter((entry) => entry.source === "google-css2")
         .map((entry) => entry.family);
       expect(googleFamilies).toEqual(expectedMonoFamilies);
-      expect(new Set(entries.map((entry) => entry.family)).size).toBe(entries.length);
       expect(
         entries.filter((entry) => entry.label.includes("Nerd Font")).map((entry) => entry.family),
       ).toEqual(nerdFamilies);
+    }
+  });
+
+  it("does not duplicate labels or families within a role across sources", () => {
+    for (const category of CATEGORIES) {
+      const entries = FONT_CATALOG_BY_CATEGORY[category];
+      expect(new Set(entries.map((entry) => entry.label)).size).toBe(entries.length);
+      const families = entries.map((entry) => entry.family.trim().toLowerCase()).filter(Boolean);
+      expect(new Set(families).size).toBe(families.length);
     }
   });
 });

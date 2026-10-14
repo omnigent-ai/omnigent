@@ -110,69 +110,73 @@ function googleFont(
   };
 }
 
-// Google Fonts metadata ranks popularity with lower numbers first. These
-// sans-serif families are the highest-ranked choices suited to UI text.
+// Eligible sans-serif families follow Google popularity ascending; display,
+// condensed-only, and single-script faces are omitted.
 const SANS_GOOGLE_FONTS: readonly [string, string, readonly number[]][] = [
-  ["noto-sans-jp", "Noto Sans JP", [400, 500, 600, 700]],
   ["roboto", "Roboto", [400, 500, 600, 700]],
   ["open-sans", "Open Sans", [400, 500, 600, 700]],
-  ["arimo", "Arimo", [400, 500, 600, 700]],
   ["google-sans", "Google Sans", [400, 500, 600, 700]],
   ["inter", "Inter", [400, 500, 600, 700]],
-  ["manrope", "Manrope", [400, 500, 600, 700]],
-  ["outfit", "Outfit", [400, 500, 600, 700]],
   ["montserrat", "Montserrat", [400, 500, 600, 700]],
-  ["work-sans", "Work Sans", [400, 500, 600, 700]],
   ["poppins", "Poppins", [400, 500, 600, 700]],
-  ["barlow", "Barlow", [400, 500, 600, 700]],
   ["lato", "Lato", [400, 700]],
-  ["fira-sans", "Fira Sans", [400, 500, 600, 700]],
-  ["titillium-web", "Titillium Web", [400, 600, 700]],
-  ["roboto-condensed", "Roboto Condensed", [400, 500, 600, 700]],
-  ["cairo", "Cairo", [400, 500, 600, 700]],
+  ["arimo", "Arimo", [400, 500, 600, 700]],
   ["noto-sans", "Noto Sans", [400, 500, 600, 700]],
   ["dm-sans", "DM Sans", [400, 500, 600, 700]],
-  ["mukta", "Mukta", [400, 500, 600, 700]],
-  ["instrument-sans", "Instrument Sans", [400, 500, 600, 700]],
-  ["hind", "Hind", [400, 500, 600, 700]],
+  ["raleway", "Raleway", [400, 500, 600, 700]],
   ["nunito", "Nunito", [400, 500, 600, 700]],
   ["nunito-sans", "Nunito Sans", [400, 500, 600, 700]],
-  ["almarai", "Almarai", [400, 700]],
+  ["rubik", "Rubik", [400, 500, 600, 700]],
+  ["manrope", "Manrope", [400, 500, 600, 700]],
+  ["ubuntu", "Ubuntu", [400, 500, 600, 700]],
+  ["outfit", "Outfit", [400, 500, 600, 700]],
+  ["kanit", "Kanit", [400, 500, 600, 700]],
+  ["plus-jakarta-sans", "Plus Jakarta Sans", [400, 500, 600, 700]],
+  ["work-sans", "Work Sans", [400, 500, 600, 700]],
+  ["quicksand", "Quicksand", [400, 500, 600, 700]],
+  ["figtree", "Figtree", [400, 500, 600, 700]],
+  ["pt-sans", "PT Sans", [400, 700]],
+  ["archivo", "Archivo", [400, 500, 600, 700]],
+  ["mulish", "Mulish", [400, 500, 600, 700]],
 ];
 
 const SANS_FONTS: readonly FontCatalogEntry[] = [
+  // System default has no face to load; it maps to the bundled system stack.
   { id: "system-ui", label: "System default", family: "", category: "sans", source: "bundled" },
   ...SANS_GOOGLE_FONTS.map(([id, family, weights]) => googleFont("sans", id, family, weights)),
+  // Base catalog entries retained after the popularity-ranked choices.
+  googleFont("sans", "source-sans-3", "Source Sans 3", [400, 600, 700]),
+  googleFont("sans", "geist", "Geist", [400, 500, 600, 700]),
 ];
 
-// Google Fonts popularity order, excluding typewriter/display faces that are
-// poor fits for the file paths, terminals, and source text shown by the app.
+// Eligible monospace families follow Google popularity ascending; display faces
+// and the bundled Geist Mono are omitted.
 const MONOSPACE_GOOGLE_FONTS: readonly [string, string, string, readonly number[]][] = [
-  ["jetbrains-mono-fixed-width", "jetbrains-mono", "JetBrains Mono", [400, 500, 600, 700]],
   ["roboto-mono", "roboto-mono-code", "Roboto Mono", [400, 500, 600, 700]],
-  ["fira-code-fixed-width", "fira-code", "Fira Code", [400, 500, 600, 700]],
+  ["jetbrains-mono-fixed-width", "jetbrains-mono", "JetBrains Mono", [400, 500, 600, 700]],
   ["inconsolata", "inconsolata-code", "Inconsolata", [400, 500, 600, 700]],
   ["ibm-plex-mono", "ibm-plex-mono-code", "IBM Plex Mono", [400, 500, 600, 700]],
   ["source-code-pro-fixed-width", "source-code-pro", "Source Code Pro", [400, 500, 600, 700]],
-  ["b612-mono", "b612-mono-code", "B612 Mono", [400, 700]],
-  ["martian-mono", "martian-mono-code", "Martian Mono", [400, 500, 600, 700]],
-  ["geist-mono-google", "geist-mono-google-code", "Geist Mono", [400, 500, 600, 700]],
-  ["sometype-mono", "sometype-mono-code", "Sometype Mono", [400, 500, 600, 700]],
   ["dm-mono", "dm-mono-code", "DM Mono", [400, 500]],
   ["space-mono", "space-mono-code", "Space Mono", [400, 700]],
+  ["fira-code-fixed-width", "fira-code", "Fira Code", [400, 500, 600, 700]],
+  ["courier-prime", "courier-prime-code", "Courier Prime", [400, 700]],
   ["google-sans-code", "google-sans-code-code", "Google Sans Code", [400, 500, 600, 700]],
+  ["share-tech-mono", "share-tech-mono-code", "Share Tech Mono", [400]],
   ["pt-mono", "pt-mono-code", "PT Mono", [400]],
   ["ubuntu-mono", "ubuntu-mono-code", "Ubuntu Mono", [400, 700]],
+  ["cutive-mono", "cutive-mono-code", "Cutive Mono", [400]],
   ["red-hat-mono", "red-hat-mono-code", "Red Hat Mono", [400, 500, 600, 700]],
-  ["fira-mono", "fira-mono-code", "Fira Mono", [400, 500, 700]],
   ["anonymous-pro", "anonymous-pro-code", "Anonymous Pro", [400, 700]],
+  ["fira-mono", "fira-mono-code", "Fira Mono", [400, 500, 700]],
   ["cousine", "cousine-code", "Cousine", [400, 700]],
   ["azeret-mono", "azeret-mono-code", "Azeret Mono", [400, 500, 600, 700]],
+  ["fragment-mono", "fragment-mono-code", "Fragment Mono", [400]],
   ["overpass-mono", "overpass-mono-code", "Overpass Mono", [400, 500, 600, 700]],
   ["chivo-mono", "chivo-mono-code", "Chivo Mono", [400, 500, 600, 700]],
   ["spline-sans-mono", "spline-sans-mono-code", "Spline Sans Mono", [400, 500, 600, 700]],
-  ["oxygen-mono", "oxygen-mono-code", "Oxygen Mono", [400]],
-  ["lekton", "lekton-code", "Lekton", [400, 700]],
+  ["b612-mono", "b612-mono-code", "B612 Mono", [400, 700]],
+  ["martian-mono", "martian-mono-code", "Martian Mono", [400, 500, 600, 700]],
 ];
 
 function monospaceFonts(category: "fixedWidth" | "code"): readonly FontCatalogEntry[] {
@@ -182,6 +186,7 @@ function monospaceFonts(category: "fixedWidth" | "code"): readonly FontCatalogEn
 }
 
 const NERD_FONT_VARIANTS = [
+  // Nerd Fonts are pinned to a release and lazy-loaded only when selected.
   [
     "jetbrainsmono-nerd-font-mono",
     "JetBrainsMono Nerd Font Mono",
@@ -218,6 +223,7 @@ function nerdFonts(category: "fixedWidth" | "code"): readonly FontCatalogEntry[]
 // ---- Fixed width (general monospace UI) -----------------------------------
 
 const FIXED_WIDTH_FONTS: readonly FontCatalogEntry[] = [
+  // Bundled by Fontsource in index.css, so selecting it never needs a fetch.
   {
     id: "geist-mono",
     label: "Geist Mono",
@@ -232,6 +238,14 @@ const FIXED_WIDTH_FONTS: readonly FontCatalogEntry[] = [
 // ---- Code (editor + terminal) ---------------------------------------------
 
 const CODE_FONTS: readonly FontCatalogEntry[] = [
+  // The app bundles this family for its default editor and terminal stack.
+  {
+    id: "geist-mono-code-bundled",
+    label: "Geist Mono",
+    family: "Geist Mono Variable",
+    category: "code",
+    source: "bundled",
+  },
   ...monospaceFonts("code"),
   // Cascadia Code isn't a Google Fonts family we bundle; deliver its @font-face
   // from the Fontsource CDN (latin subset, regular + bold).
