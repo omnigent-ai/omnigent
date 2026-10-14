@@ -1,15 +1,16 @@
-"""Grade one run: which skills it loaded and which assertions it passed."""
+"""Grade runs: which skills loaded, which criteria passed, and what was invented."""
 
 from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
-from dev.evals.omnigent_guide.cases import Case, Check
-from dev.evals.omnigent_guide.record import AssertionResult, GradedRun, RunRecord
+from dev.evals.omnigent_guide.cases import Case, Check, Criterion
+from dev.evals.omnigent_guide.record import CriterionResult, GradedRun, RunRecord
+from dev.evals.omnigent_guide.referee import FABRICATION_KINDS, Referee, Review
 from omnigent.runtime.harnesses._executor_adapter import (
     _extract_skill_name,
     _strip_mcp_tool_prefix,
@@ -22,12 +23,14 @@ _FLAGS = re.IGNORECASE | re.MULTILINE
 
 
 class Judge(Protocol):
-    """Grades free-text assertions about an answer."""
+    """Grades criteria about an answer."""
+
+    name: str
 
     def grade(
-        self, prompt: str, answer: str, assertions: tuple[str, ...]
-    ) -> list[AssertionResult]:
-        """Return one result per assertion, in order."""
+        self, prompt: str, answer: str, criteria: Sequence[Criterion]
+    ) -> dict[str, tuple[bool | None, str]]:
+        """Return ``{criterion id: (verdict or None, evidence)}``."""
         ...
 
 
@@ -57,79 +60,142 @@ def skills_loaded(tool_calls: Iterable[Mapping[str, Any]]) -> list[str]:
     return sorted(names)
 
 
-def grade_run(
-    case: Case,
-    record: RunRecord,
-    judge: Judge | None = None,
+def applicable(case: Case, version: str) -> tuple[Criterion, ...]:
+    """The case's criteria that hold for a build reporting *version*."""
+    return tuple(c for c in case.criteria if c.applies_to(version))
+
+
+def agent_dirs(case: Case, record: RunRecord) -> list[str]:
+    """Directories a ``valid_agent_dir`` check expects the agent to have written."""
+    if record.workspace is None:
+        return []
+    found: list[str] = []
+    for check in case.checks:
+        if check.kind == "valid_agent_dir":
+            name = check.values[0]
+            # A runner may give each session its own subdirectory of the workspace.
+            found.extend(
+                str(p.parent) for p in sorted(Path(record.workspace).rglob(f"{name}/config.yaml"))
+            )
+            found.extend(str(p) for p in sorted(Path(record.workspace).rglob(f"{name}.yaml")))
+    return found[:1]
+
+
+def grade_runs(
+    cases: Mapping[str, Case],
+    records: Sequence[RunRecord],
+    referee: Referee,
+    judges: Sequence[Judge] = (),
     *,
     installed_version: str = "",
-) -> GradedRun:
+) -> list[GradedRun]:
     """
-    Grade *record* against *case*.
+    Grade runs from one build.
 
-    :param case: The case the run answered.
-    :param record: The run.
-    :param judge: Grades ``case.judge`` assertions; ``None`` leaves them out.
-    :param installed_version: Replaces ``{installed_version}`` in check
-        regexes, e.g. ``"0.19.0.dev0"``.
-    :returns: The graded run.
+    :param cases: Cases by id.
+    :param records: Runs from the build *referee* describes.
+    :param referee: Checks claims against that build.
+    :param judges: Grade every criterion; their verdicts decide criteria
+        without a check and are kept for agreement on the rest.
+    :param installed_version: Replaces ``{installed_version}`` in regexes.
     """
-    loaded = skills_loaded(record.tool_calls)
-    if case.should_trigger:
-        triggered = any(skill in loaded for skill in case.expect_skills)
-    else:
-        triggered = any(skill in loaded for skill in FRAMEWORK_SKILL_NAMES)
-    assertions = [_run_check(_bind(check, installed_version), record) for check in case.checks]
-    if judge is not None and case.judge:
-        assertions.extend(judge.grade(case.prompt, record.answer, case.judge))
-    return GradedRun(
-        record=record, skills_loaded=loaded, triggered=triggered, assertions=assertions
-    )
+    dirs = [agent_dirs(cases[r.case_id], r) for r in records]
+    reviews = referee.review([r.answer for r in records], dirs)
+    graded = []
+    for record, review, written in zip(records, reviews, dirs, strict=True):
+        case = cases[record.case_id]
+        loaded = skills_loaded(record.tool_calls)
+        if case.should_trigger:
+            triggered = any(skill in loaded for skill in case.expect_skills)
+        else:
+            triggered = any(skill in loaded for skill in FRAMEWORK_SKILL_NAMES)
+        results = []
+        criteria = applicable(case, installed_version)
+        for criterion in criteria:
+            if criterion.check is None:
+                results.append(CriterionResult(criterion.id, criterion.text, "judge"))
+                continue
+            check = _bind(criterion.check, installed_version)
+            passed, evidence = _run_check(check, record, review, written)
+            results.append(
+                CriterionResult(
+                    criterion.id, criterion.text, check.kind, passed, evidence=evidence
+                )
+            )
+        if judges and record.status != "infra_error" and criteria:
+            by_id = {r.id: r for r in results}
+            for judge in judges:
+                for cid, (verdict, _evidence) in judge.grade(
+                    case.prompt, record.answer, criteria
+                ).items():
+                    if cid in by_id:
+                        by_id[cid].judges[judge.name] = verdict
+        graded.append(
+            GradedRun(
+                record=record,
+                skills_loaded=loaded,
+                triggered=triggered,
+                criteria=results,
+                findings=[
+                    {**f.__dict__, "counts": f.kind in FABRICATION_KINDS and not f.negated}
+                    for f in review.findings
+                ],
+                yaml_blocks=review.yaml_blocks,
+                yaml_invalid=review.yaml_invalid,
+            )
+        )
+    return graded
 
 
-def _run_check(check: Check, record: RunRecord) -> AssertionResult:
+def _run_check(
+    check: Check, record: RunRecord, review: Review, written: Sequence[str]
+) -> tuple[bool, str]:
+    answer = record.answer
     if check.kind == "any_of":
-        hit = _first_match(check.values, record.answer)
-        evidence = f"matched {hit!r}" if hit else "no pattern matched the answer"
-        return AssertionResult(check.label, hit is not None, evidence)
+        hit = _first_match(check.values, answer)
+        return hit is not None, f"matched {hit!r}" if hit else "no pattern matched"
     if check.kind == "none_of":
-        hit = _first_match(check.values, record.answer)
-        evidence = f"answer matched trap {hit!r}" if hit else "no trap matched"
-        return AssertionResult(check.label, hit is None, evidence)
+        hit = _first_match(check.values, answer)
+        return hit is None, f"matched trap {hit!r}" if hit else "no trap matched"
     if check.kind == "command_ran":
         for call in record.tool_calls:
-            raw = call.get("arguments")
-            text = raw if isinstance(raw, str) else json.dumps(raw or {})
+            text = (
+                call.get("arguments")
+                if isinstance(call.get("arguments"), str)
+                else json.dumps(call.get("arguments") or {})
+            )
             hit = _first_match(check.values, text)
             if hit:
-                return AssertionResult(check.label, True, f"{call.get('name')} matched {hit!r}")
-        return AssertionResult(check.label, False, "no tool call matched")
+                return True, f"{call.get('name')} matched {hit!r}"
+        return False, "no tool call matched"
     if check.kind == "tool_called":
-        called = {
-            _strip_mcp_tool_prefix(str(call.get("name") or "")) for call in record.tool_calls
-        }
+        called = {_strip_mcp_tool_prefix(str(c.get("name") or "")) for c in record.tool_calls}
         hits = sorted(called & set(check.values))
-        evidence = f"called {hits}" if hits else f"called none of them; saw {sorted(called)}"
-        return AssertionResult(check.label, bool(hits), evidence)
-    return _check_agent_dir(check, record)
-
-
-def _check_agent_dir(check: Check, record: RunRecord) -> AssertionResult:
-    from omnigent.spec.parser import parse
-
-    if record.workspace is None:
-        return AssertionResult(check.label, False, "run has no workspace")
-    # A runner may give each session its own subdirectory of the workspace.
-    name = check.values[0]
-    found = sorted(Path(record.workspace).rglob(f"{name}/config.yaml"))
-    if not found:
-        return AssertionResult(check.label, False, f"no {name}/config.yaml in the workspace")
-    agent_dir = found[0].parent
-    try:
-        spec = parse(agent_dir)
-    except Exception as exc:  # noqa: BLE001 — any parse failure is the evidence
-        return AssertionResult(check.label, False, f"parse failed: {str(exc)[:200]}")
-    return AssertionResult(check.label, True, f"parsed agent {spec.name!r}")
+        return bool(hits), f"called {hits}" if hits else "called none of them"
+    if check.kind == "cli":
+        for value in check.values:
+            if review.uses_command(value.split(), check.options):
+                return True, f"valid `omnigent {value}`"
+        seen = sorted({" ".join(p) for p, _ in review.commands})
+        return False, f"valid commands seen: {seen}"
+    if check.kind == "config":
+        hits = sorted(set(check.values) & review.config_paths)
+        return bool(
+            hits
+        ), f"uses {hits}" if hits else f"keys seen: {sorted(review.config_paths)[:12]}"
+    if check.kind == "tool":
+        hits = sorted(set(check.values) & review.tools_named)
+        return bool(hits), f"names {hits}" if hits else "names none of them"
+    # valid_agent_dir: the referee loaded what the agent wrote.
+    if not written:
+        return False, f"no {check.values[0]} agent in the workspace"
+    bad = [
+        f
+        for f in review.findings
+        if f.kind in {"config_key", "config_value"} and f.text.startswith(("/", written[0]))
+    ]
+    problems = [f for f in review.findings if f.kind in {"config_key", "config_value"}]
+    return not bad and not any(written[0] in f.text for f in problems), f"loaded {written[0]}"
 
 
 def _bind(check: Check, installed_version: str) -> Check:
@@ -138,7 +204,7 @@ def _bind(check: Check, installed_version: str) -> Check:
     # Without a known version, accept any version-shaped string.
     version = re.escape(installed_version) if installed_version else r"\d+\.\d+\.\d+\S*"
     values = tuple(value.replace("{installed_version}", version) for value in check.values)
-    return Check(kind=check.kind, values=values)
+    return Check(kind=check.kind, values=values, options=check.options)
 
 
 def _first_match(patterns: tuple[str, ...], text: str) -> str | None:
@@ -160,63 +226,60 @@ class OpenAIJudge:
     """
     LLM judge over an OpenAI-compatible endpoint (the Databricks gateway).
 
-    It sees the question, the answer, and the assertions, but not which
-    build produced the answer.
+    It sees the question, the answer, and the criteria, but not which build
+    produced the answer or what the deterministic checks decided.
 
     :param client: An ``openai.OpenAI`` client.
-    :param model: Judge model, e.g. ``"databricks-gpt-5-4-mini"``. Use a
-        different model family from the one under test.
+    :param model: Judge model. Use a family different from the model under test.
+    :param name: Short label for reports, e.g. ``"llama"``.
     """
 
     _INSTRUCTIONS = (
         "You grade an AI assistant's answer to a question about Omnigent, an "
-        "open-source meta-harness for AI agents. For each assertion, PASS only "
-        "when the answer states it concretely and correctly; a vague or hedged "
-        "mention is a FAIL. Quote the answer as evidence. Reply with JSON only: "
-        '{"results": [{"assertion": "...", "passed": true, "evidence": "..."}]}'
+        "open-source meta-harness for AI agents. Each criterion states something a "
+        "correct answer does. Mark a criterion passed only when the answer does it "
+        "concretely; a vague, hedged, or contradicted mention fails. Quote the answer "
+        "as evidence. Reply with JSON only, one entry per criterion id: "
+        '{"results": [{"id": "c1", "passed": true, "evidence": "..."}]}'
     )
 
-    def __init__(self, client: Any, model: str) -> None:
+    def __init__(self, client: Any, model: str, name: str) -> None:
         self._client = client
         self._model = model
+        self.name = name
 
     def grade(
-        self, prompt: str, answer: str, assertions: tuple[str, ...]
-    ) -> list[AssertionResult]:
-        """Grade each assertion; an unparseable reply fails all of them."""
-        numbered = "\n".join(f"{i + 1}. {text}" for i, text in enumerate(assertions))
+        self, prompt: str, answer: str, criteria: Sequence[Criterion]
+    ) -> dict[str, tuple[bool | None, str]]:
+        """Grade each criterion; a criterion the reply leaves out gets ``None``."""
+        listed = "\n".join(f"{c.id}: {c.text}" for c in criteria)
         message = (
-            f"Question:\n{prompt}\n\nAnswer:\n{answer or '(no answer)'}\n\nAssertions:\n{numbered}"
+            f"Question:\n{prompt}\n\nAnswer:\n{answer or '(no answer)'}\n\nCriteria:\n{listed}"
         )
-        try:
-            reply = self._client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": self._INSTRUCTIONS},
-                    {"role": "user", "content": message},
-                ],
-                temperature=0,
-            )
-            results = _judge_results(_message_text(reply.choices[0].message.content))
-        except Exception as exc:  # noqa: BLE001 — a judge outage must not abort the eval
-            results = []
-            failure = f"judge error: {str(exc)[:200]}"
-        else:
-            failure = "judge returned no verdict"
-        graded = []
-        for index, text in enumerate(assertions):
-            result = results[index] if index < len(results) else None
-            if not isinstance(result, dict):
-                graded.append(AssertionResult(f"judge: {text}", False, failure))
-                continue
-            graded.append(
-                AssertionResult(
-                    f"judge: {text}",
-                    result.get("passed") is True,
-                    str(result.get("evidence", ""))[:300],
+        for _attempt in range(2):
+            try:
+                reply = self._client.chat.completions.create(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": self._INSTRUCTIONS},
+                        {"role": "user", "content": message},
+                    ],
+                    temperature=0,
+                    max_tokens=4000,
                 )
-            )
-        return graded
+            except Exception:  # noqa: BLE001 — a judge outage must not abort grading
+                continue
+            results = _judge_results(_message_text(reply.choices[0].message.content))
+            verdicts: dict[str, tuple[bool | None, str]] = {}
+            for entry in results:
+                if isinstance(entry, dict) and isinstance(entry.get("passed"), bool):
+                    verdicts[str(entry.get("id"))] = (
+                        entry["passed"],
+                        str(entry.get("evidence", ""))[:300],
+                    )
+            if verdicts:
+                return {c.id: verdicts.get(c.id, (None, "no verdict")) for c in criteria}
+        return {c.id: (None, "judge gave no usable reply") for c in criteria}
 
 
 def _message_text(content: object) -> str:

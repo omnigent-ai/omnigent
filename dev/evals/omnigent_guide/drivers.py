@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
 import tempfile
 import threading
@@ -33,9 +34,10 @@ from tests.harness_bench.full_server import SharedFullServer, spawn_omnigent_ser
 from tests.harness_bench.native_tui_driver import NativeTuiDriver
 from tests.harness_bench.profile import resolve_profile
 from tests.harness_bench.runtime_env import resolve_bench_env
-from tests.harness_bench.session_items import assistant_text, function_calls
+from tests.harness_bench.session_items import assistant_text, function_calls, item_data, item_type
 
 _POLL_S = 0.5
+_OUTPUT_KEEP = 1500
 _BUSY = frozenset({"running", "waiting"})
 _ELICITATION_EVENT = "response.elicitation_request"
 
@@ -66,15 +68,43 @@ def isolated_claude_env(root: Path) -> dict[str, str]:
     return {"CLAUDE_CONFIG_DIR": str(claude_dir)}
 
 
+#: Tools a claude-native eval session may use without asking. Sessions run in
+#: ``dontAsk`` mode, so anything else is refused instead of parking the turn
+#: on a prompt nobody answers.
+CLAUDE_ALLOWED_TOOLS = (
+    "Read,Glob,Grep,WebFetch,WebSearch,Skill,Write,Edit,mcp__omnigent,"
+    "Bash(omnigent:*),Bash(omni:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(grep:*),"
+    "Bash(find:*),Bash(which:*),Bash(curl:*)"
+)
+
+#: Mirrors the production ``claude-native-ui`` agent, minus the user's own
+#: Claude Code settings: ``skills: none`` launches claude with
+#: ``--setting-sources ""`` while framework skills still load through
+#: ``--plugin-dir``.
+_CLAUDE_AGENT = {
+    "name": "eval-omnigent-guide-claude-native",
+    "prompt": (
+        "Claude Code is running in the session terminal. Web UI messages are "
+        "forwarded into that Claude Code process through the native bridge."
+    ),
+    "executor": {"harness": "claude-native", "context_window": 200_000},
+    "spawn": True,
+    "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+    "skills": "none",
+}
+
+
 class ClaudeNativeEvalDriver(NativeTuiDriver):
     """
-    claude-native through a live server and host daemon, one session per run.
+    claude-native on the user's own Claude Code login, one session per run.
 
-    Sessions launch with ``bypassPermissions`` so tool approvals cannot park a
-    turn; the approval watcher accepts any elicitation that still appears.
+    The scratch Omnigent config names only a subscription provider, so Claude
+    Code uses its first-party login. Each run uploads the eval agent bound to
+    the host daemon, which launches claude with ``--permission-mode dontAsk``,
+    the allowed tools above, and the pinned model.
 
-    :param model: Pinned model, e.g. ``"databricks-claude-sonnet-4-6"``.
-    :param databricks_profile: Profile for gateway credentials.
+    :param model: Claude Code model or alias, e.g. ``"sonnet"``.
+    :param databricks_profile: Unused; kept for a uniform driver signature.
     :param extra_env: Env overrides for the server and host, e.g. ``PATH``.
     :param timeout: Ceiling for one turn, in seconds.
     """
@@ -89,13 +119,11 @@ class ClaudeNativeEvalDriver(NativeTuiDriver):
         extra_env: Mapping[str, str],
         timeout: float,
     ) -> None:
-        profile = replace(resolve_profile("claude-native"), model=model)
-        super().__init__(profile, databricks_profile=databricks_profile)
+        super().__init__(resolve_profile("claude-native"), databricks_profile=databricks_profile)
         self._model = model
         self._extra_env = dict(extra_env)
         self._timeout = timeout
         self._host_id: str | None = None
-        self._ui_agent_id: str | None = None
 
     def __enter__(self) -> ClaudeNativeEvalDriver:
         try:
@@ -109,19 +137,20 @@ class ClaudeNativeEvalDriver(NativeTuiDriver):
         self._teardown()
 
     def _provision_stack(self) -> None:
-        """The bench's native provisioning, minus its single shared session."""
-        assert self._vendor is not None
+        """The bench's native provisioning, without gateway credentials."""
         self._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
         port = find_free_port()
         self._base_url = f"http://localhost:{port}"
         binding_token = uuid.uuid4().hex
-        self._resolved_env = resolve_bench_env(self._db_profile)
         base_env = {
-            **bench_child_environ(self._resolved_env.base_env),
+            **bench_child_environ(os.environ),
             **self._extra_env,
             "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
             "OMNIGENT_CONFIG_HOME": str(self._write_provider_config()),
         }
+        # Any of these would route Claude Code away from the first-party login.
+        for key in _GATEWAY_ENV:
+            base_env.pop(key, None)
         self._proc = spawn_omnigent_server(self._tmp, port, base_env, binding_token)
         self._wait_health()
         self._daemon = self._spawn_host_daemon(base_env)
@@ -131,17 +160,22 @@ class ClaudeNativeEvalDriver(NativeTuiDriver):
             headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         )
         self._host_id = self._wait_host_online()
-        self._ui_agent_id = self._agent_id(self._vendor.agent_name)
 
     def _write_provider_config(self) -> Path:
-        """The bench's provider config, plus a short runner idle timeout.
+        """Only a subscription provider, plus a short runner idle timeout.
 
-        Each run gets its own runner; without this, idle runners from
+        Each run gets its own runner; without the timeout, idle runners from
         finished runs would linger for the default hour.
         """
-        config_home = super()._write_provider_config()
-        with (config_home / "config.yaml").open("a", encoding="utf-8") as config:
-            config.write("runner:\n  idle_timeout_s: 60\n")
+        config_home = self._tmp / "omnigent-config"
+        config_home.mkdir(exist_ok=True)
+        config = {
+            "providers": {
+                "claude-subscription": {"cli": "claude", "default": True, "kind": "subscription"}
+            },
+            "runner": {"idle_timeout_s": 60},
+        }
+        (config_home / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
         return config_home
 
     def run(self, prompt: str, record: RunRecord) -> RunRecord:
@@ -150,22 +184,34 @@ class ClaudeNativeEvalDriver(NativeTuiDriver):
         workspace = self._tmp / "workspaces" / f"{record.case_id}-{record.run_index}"
         workspace.mkdir(parents=True)
         record.workspace = str(workspace)
+        bundle = bundle_files(
+            {f"{_CLAUDE_AGENT['name']}.yaml": yaml.safe_dump(_CLAUDE_AGENT).encode()}
+        )
+        launch_args = [
+            "--permission-mode",
+            "dontAsk",
+            "--model",
+            self._model,
+            "--allowedTools",
+            CLAUDE_ALLOWED_TOOLS,
+        ]
         try:
-            created = self._client.post(
+            created = post_session_bundle(
+                self._client.post,
                 "/v1/sessions",
-                json={
-                    "agent_id": self._ui_agent_id,
+                bundle,
+                metadata={
                     "host_id": self._host_id,
                     "workspace": str(workspace),
-                    "model_override": self._model,
-                    "terminal_launch_args": ["--permission-mode", "bypassPermissions"],
+                    "terminal_launch_args": launch_args,
                 },
-                timeout=60.0,
+                timeout=90.0,
             )
             created.raise_for_status()
-            self._session_id = str(created.json()["id"])
-            self._wire_native_forwarder(self._host_id, workspace)
-        except (httpx.HTTPError, ProvisioningError) as exc:
+            body = created.json()
+            self._session_id = str(body.get("session_id") or body["id"])
+            self._wait_forwarder()
+        except (httpx.HTTPError, ProvisioningError, KeyError) as exc:
             record.status, record.error = INFRA_ERROR, repr(exc)
             return record
         try:
@@ -174,6 +220,32 @@ class ClaudeNativeEvalDriver(NativeTuiDriver):
             )
         finally:
             _delete_session(self._client, self._session_id)
+
+    def _wait_forwarder(self, timeout: float = 120.0) -> None:
+        """Wait until claude is up and its transcript is mirrored into the session."""
+        assert self._client is not None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            snap = self._client.get(
+                f"/v1/sessions/{self._session_id}", params={"include_items": "false"}
+            )
+            if snap.status_code == 200 and snap.json().get("external_session_id"):
+                return
+            time.sleep(1.0)
+        raise ProvisioningError(f"claude did not come up within {timeout}s; logs in {self._tmp}")
+
+
+_GATEWAY_ENV = (
+    "OPENAI_BASE_URL",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_GATEWAY",
+    "DATABRICKS_CONFIG_PROFILE",
+    "CLAUDE_CONFIG_DIR",
+)
 
 
 class SdkEvalDriver:
@@ -191,6 +263,8 @@ class SdkEvalDriver:
     :param timeout: Ceiling for one turn, in seconds.
     :param executor_config: Extra ``executor.config`` keys, e.g.
         ``{"use_responses": False}``.
+    :param os_env: The agent's ``os_env``; defaults to an unsandboxed shell in
+        the workspace.
     """
 
     def __init__(
@@ -202,9 +276,13 @@ class SdkEvalDriver:
         extra_env: Mapping[str, str],
         timeout: float,
         executor_config: Mapping[str, Any] | None = None,
+        os_env: Mapping[str, Any] | None = None,
     ) -> None:
         self.harness = harness
         self._executor_config = dict(executor_config or {})
+        self._os_env = dict(
+            os_env or {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}}
+        )
         self._agent_name = f"eval-omnigent-guide-{harness}"
         self._model = model
         self._db_profile = databricks_profile
@@ -249,7 +327,7 @@ class SdkEvalDriver:
             "name": self._agent_name,
             "prompt": "You are a helpful assistant.",
             "executor": executor,
-            "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+            "os_env": self._os_env,
             # Hide the operator's own host skills; framework skills still load.
             "skills": "none",
         }
@@ -416,13 +494,26 @@ def ask(
         record.duration_s = time.monotonic() - started
         record.elicitations = watcher.accepted
     record.answer = assistant_text(items)
-    record.tool_calls = [
-        {"name": c["name"], "arguments": c["arguments"]} for c in function_calls(items)
-    ]
+    record.tool_calls = _tool_calls_with_outputs(items)
     record.total_tokens = _total_tokens(snapshot)
     cost = snapshot.get("total_cost_usd")
     record.cost_usd = float(cost) if isinstance(cost, (int, float)) else None
     return record
+
+
+def _tool_calls_with_outputs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Calls in order, each with the start of its output (fetch results, errors)."""
+    outputs: dict[Any, str] = {}
+    for item in items:
+        if item_type(item) == "function_call_output":
+            data = item_data(item)
+            out = data.get("output")
+            text = out if isinstance(out, str) else json.dumps(out, default=str)
+            outputs[data.get("call_id")] = text[:_OUTPUT_KEEP]
+    return [
+        {"name": c["name"], "arguments": c["arguments"], "output": outputs.get(c["call_id"], "")}
+        for c in function_calls(items)
+    ]
 
 
 def _snapshot(client: httpx.Client, session_id: str) -> dict[str, Any]:

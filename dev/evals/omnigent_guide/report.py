@@ -1,192 +1,211 @@
-"""Aggregate graded runs into ``benchmark.json`` and a Markdown summary."""
+"""Turn graded runs into per-arm rates, paired deltas with bootstrap CIs, and grader agreement."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
-from statistics import fmean, pstdev
+import json
+import re
+from collections import Counter, defaultdict
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from statistics import fmean
 from typing import Any
 
 from dev.evals.omnigent_guide.cases import Case
 from dev.evals.omnigent_guide.record import INFRA_ERROR, GradedRun
+from dev.evals.omnigent_guide.stats import agreement, paired_bootstrap
 
-ARMS = ("baseline", "treatment")
+#: Per-case metrics, each a mean over that case's runs.
+METRICS = ("score", "fabricated", "loaded", "yaml_invalid")
+_PINNED_RE = re.compile(r"raw\.githubusercontent\.com/omnigent-ai/omnigent/(v\d+\.\d+\.\d+)/")
 
 
-def summarize(runs: Iterable[GradedRun], cases: Mapping[str, Case]) -> dict[str, Any]:
-    """
-    Compute per-harness, per-arm statistics over *runs*.
-
-    Runs with an infrastructure error are counted but left out of every rate.
-
-    :param runs: Graded runs from any mix of harnesses and arms.
-    :param cases: Cases by id, for ``should_trigger``.
-    :returns: ``{harness: {arm: stats, ..., "delta": {...}}}``.
-    """
-    buckets: dict[str, dict[str, list[GradedRun]]] = {}
+def per_case(runs: Sequence[GradedRun], cases: Mapping[str, Case]) -> dict[str, dict[str, float]]:
+    """``{metric: {case_id: mean over runs}}`` for one arm, infrastructure errors excluded."""
+    buckets: dict[str, dict[str, list[float]]] = {m: defaultdict(list) for m in METRICS}
     for run in runs:
-        record = run.record
-        buckets.setdefault(record.harness, {}).setdefault(record.arm, []).append(run)
-    summary: dict[str, Any] = {}
-    for harness, by_arm in sorted(buckets.items()):
-        arms = {arm: _arm_stats(by_arm.get(arm, []), cases) for arm in ARMS if arm in by_arm}
-        if len(arms) == len(ARMS):
-            arms["delta"] = {
-                key: _delta(arms["treatment"][key], arms["baseline"][key])
-                for key in ("trigger_rate", "false_trigger_rate", "pass_rate", "tokens", "seconds")
-            }
-        summary[harness] = arms
-    return summary
-
-
-def per_case(runs: Iterable[GradedRun], cases: Mapping[str, Case]) -> list[dict[str, Any]]:
-    """
-    Per-case load and pass rates for each harness and arm.
-
-    :returns: One row per (harness, case), in case-file order.
-    """
-    rows: dict[tuple[str, str], dict[str, Any]] = {}
-    for run in runs:
-        record = run.record
-        if record.status == INFRA_ERROR:
+        if run.record.status == INFRA_ERROR:
             continue
-        row = rows.setdefault(
-            (record.harness, record.case_id),
-            {"harness": record.harness, "case": record.case_id, "arms": {}},
-        )
-        arm = row["arms"].setdefault(record.arm, {"runs": 0, "loaded": 0, "pass_rates": []})
-        arm["runs"] += 1
-        arm["loaded"] += run.triggered
-        if run.pass_rate is not None:
-            arm["pass_rates"].append(run.pass_rate)
-    order = {case_id: index for index, case_id in enumerate(cases)}
-    result = []
-    for (_harness, case_id), row in sorted(
-        rows.items(), key=lambda kv: (kv[0][0], order[kv[0][1]])
-    ):
-        row["split"] = cases[case_id].split
-        row["should_trigger"] = cases[case_id].should_trigger
-        for arm in row["arms"].values():
-            rates = arm.pop("pass_rates")
-            arm["pass_rate"] = fmean(rates) if rates else None
-        result.append(row)
-    return result
+        case = cases[run.record.case_id]
+        if case.should_trigger and run.score is not None:
+            buckets["score"][case.id].append(run.score)
+        if case.should_trigger:
+            buckets["fabricated"][case.id].append(float(run.fabricated))
+            if run.yaml_blocks:
+                buckets["yaml_invalid"][case.id].append(float(run.yaml_invalid > 0))
+        buckets["loaded"][case.id].append(float(run.triggered))
+    return {m: {cid: fmean(v) for cid, v in b.items()} for m, b in buckets.items()}
 
 
-def _arm_stats(runs: list[GradedRun], cases: Mapping[str, Case]) -> dict[str, Any]:
-    ok = [run for run in runs if run.record.status != INFRA_ERROR]
-    positives = [run for run in ok if cases[run.record.case_id].should_trigger]
-    negatives = [run for run in ok if not cases[run.record.case_id].should_trigger]
-    pass_rates = [run.pass_rate for run in positives if run.pass_rate is not None]
-    tokens = [run.record.total_tokens for run in ok if run.record.total_tokens is not None]
-    costs = [run.record.cost_usd for run in ok if run.record.cost_usd is not None]
+def _arm_summary(runs: Sequence[GradedRun], cases: Mapping[str, Case]) -> dict[str, Any]:
+    ok = [r for r in runs if r.record.status != INFRA_ERROR]
+    pos = [r for r in ok if cases[r.record.case_id].should_trigger]
+    neg = [r for r in ok if not cases[r.record.case_id].should_trigger]
+    metrics = per_case(runs, cases)
+    kinds = Counter(f["kind"] for r in pos for f in r.findings if f.get("counts"))
+    pinned = [
+        r
+        for r in pos
+        if any(_PINNED_RE.search(str(c.get("arguments"))) for c in r.record.tool_calls)
+    ]
+    tokens = [r.record.total_tokens for r in ok if r.record.total_tokens is not None]
+
+    def mean_of(values: dict[str, float], wanted: Sequence[str]) -> float | None:
+        chosen = [values[c] for c in wanted if c in values]
+        return fmean(chosen) if chosen else None
+
+    positives = sorted({r.record.case_id for r in pos})
+    negatives = sorted({r.record.case_id for r in neg})
     return {
         "runs": len(runs),
         "infra_errors": len(runs) - len(ok),
-        "trigger_hits": sum(run.triggered for run in positives),
-        "trigger_total": len(positives),
-        "trigger_rate": _rate(sum(run.triggered for run in positives), len(positives)),
-        "false_trigger_hits": sum(run.triggered for run in negatives),
-        "false_trigger_total": len(negatives),
-        "false_trigger_rate": _rate(sum(run.triggered for run in negatives), len(negatives)),
-        "pass_rate": fmean(pass_rates) if pass_rates else None,
-        "pass_rate_stddev": pstdev(pass_rates) if len(pass_rates) > 1 else None,
+        "cases": len(positives),
+        "score": mean_of(metrics["score"], positives),
+        "fabricated": mean_of(metrics["fabricated"], positives),
+        "loaded": mean_of(metrics["loaded"], positives),
+        "false_loads": mean_of(metrics["loaded"], negatives),
+        "yaml_invalid": mean_of(metrics["yaml_invalid"], positives),
+        "pinned_doc_runs": len(pinned),
+        "fabrication_kinds": dict(kinds.most_common()),
         "tokens": fmean(tokens) if tokens else None,
-        "seconds": fmean(run.record.duration_s for run in ok) if ok else None,
-        "cost_usd": fmean(costs) if costs else None,
+        "seconds": fmean(r.record.duration_s for r in ok) if ok else None,
     }
 
 
-def _rate(hits: int, total: int) -> float | None:
-    return hits / total if total else None
+def grader_agreement(runs: Sequence[GradedRun]) -> dict[str, Any]:
+    """Agreement between the judges, and between each judge and code where both decided."""
+    judge_names = sorted({name for r in runs for c in r.criteria for name in c.judges})
+    pairs: dict[str, tuple[list[bool], list[bool]]] = defaultdict(lambda: ([], []))
+    for run in runs:
+        if run.record.status == INFRA_ERROR:
+            continue
+        for crit in run.criteria:
+            votes = {n: v for n, v in crit.judges.items() if v is not None}
+            for i, a in enumerate(judge_names):
+                for b in judge_names[i + 1 :]:
+                    if a in votes and b in votes:
+                        key = (
+                            f"{a} vs {b} ({'checked' if crit.code is not None else 'judge-only'})"
+                        )
+                        pairs[key][0].append(votes[a])
+                        pairs[key][1].append(votes[b])
+                if a in votes and crit.code is not None:
+                    key = f"{a} vs code ({crit.kind})"
+                    pairs[key][0].append(votes[a])
+                    pairs[key][1].append(crit.code)
+    return {key: agreement(a, b) for key, (a, b) in sorted(pairs.items())}
 
 
-def _delta(after: float | None, before: float | None) -> float | None:
-    return None if after is None or before is None else after - before
-
-
-def render_markdown(
-    summaries: Mapping[str, Mapping[str, Any]],
-    rows: list[dict[str, Any]],
-    meta: Mapping[str, Any],
-) -> str:
-    """
-    Render the PR-ready summary.
-
-    :param summaries: ``{"All cases": summarize(...), "Holdout only": summarize(...)}``.
-    :param rows: :func:`per_case` output over all cases.
-    :param meta: Run settings: ``model``, ``runs``, ``judge``, and both arms' commits.
-    :returns: Markdown text.
-    """
-    lines = [
-        "## Omnigent guide eval",
-        "",
-        f"Models: {meta['model']}. {meta['runs']} run(s) per case. Judge: {meta['judge']}. "
-        f"Baseline `{meta['baseline_commit']}`, treatment `{meta['treatment_commit']}`.",
-        "",
-    ]
-    for title, summary in summaries.items():
-        lines += [
-            f"### {title}",
-            "",
-            "| Harness | Build | Guide loaded | Loaded when it should not "
-            "| Answer pass rate | Tokens | Time |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-        ]
-        for harness, arms in summary.items():
-            for arm in ARMS:
-                stats = arms.get(arm)
-                if stats is None:
+def write_report(
+    runs: Sequence[GradedRun],
+    cases: Mapping[str, Case],
+    out: Path,
+    *,
+    baseline: str,
+    pairs: Sequence[str] = (),
+    arms: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Write ``report.json`` and ``summary.md`` to *out*; return the report."""
+    by_key: dict[tuple[str, str, str], list[GradedRun]] = defaultdict(list)
+    for run in runs:
+        split = cases[run.record.case_id].split
+        by_key[(split, run.record.harness, run.record.arm)].append(run)
+    report: dict[str, Any] = {"arms": arms or {}, "splits": {}}
+    for split in sorted({k[0] for k in by_key}):
+        split_report: dict[str, Any] = {}
+        for harness in sorted({k[1] for k in by_key if k[0] == split}):
+            arm_runs = {
+                arm: rs for (s, h, arm), rs in by_key.items() if s == split and h == harness
+            }
+            summaries = {arm: _arm_summary(rs, cases) for arm, rs in sorted(arm_runs.items())}
+            metrics = {arm: per_case(rs, cases) for arm, rs in arm_runs.items()}
+            comparisons = []
+            wanted = [
+                f"{arm}:{baseline}"
+                for arm in sorted(arm_runs)
+                if arm != baseline and not any(p.startswith(f"{arm}:") for p in pairs)
+            ]
+            for pair in [*wanted, *pairs]:
+                arm, _, base = pair.partition(":")
+                if arm not in metrics or base not in metrics:
                     continue
-                lines.append(
-                    f"| {harness} | {arm} "
-                    f"| {_count(stats['trigger_hits'], stats['trigger_total'])} "
-                    f"| {_count(stats['false_trigger_hits'], stats['false_trigger_total'])} "
-                    f"| {_pct(stats['pass_rate'], stats['pass_rate_stddev'])} "
-                    f"| {_num(stats['tokens'])} | {_secs(stats['seconds'])} |"
-                )
-        errors = sum(
-            arms[a]["infra_errors"] for arms in summary.values() for a in ARMS if a in arms
-        )
-        if errors:
-            lines.append(f"\n{errors} run(s) hit infrastructure errors and are excluded.")
-        lines.append("")
-    lines += [
-        "<details><summary>Per case (answer pass rate, baseline → treatment)</summary>",
-        "",
-        "| Harness | Case | Split | Baseline | Treatment |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-    for row in rows:
-        cells = []
-        for arm in ARMS:
-            stats = row["arms"].get(arm)
-            if stats is None:
-                cells.append("—")
-            elif row["should_trigger"]:
-                cells.append(
-                    f"{_pct(stats['pass_rate'])} (loaded {stats['loaded']}/{stats['runs']})"
-                )
-            else:
-                cells.append(f"loaded {stats['loaded']}/{stats['runs']}")
-        name = row["case"] if row["should_trigger"] else f"{row['case']} (should not load)"
-        lines.append(f"| {row['harness']} | {name} | {row['split']} | {cells[0]} | {cells[1]} |")
-    lines += ["", "</details>", ""]
-    return "\n".join(lines)
+                row: dict[str, Any] = {"arm": arm, "baseline": base}
+                for metric in ("score", "fabricated", "loaded"):
+                    result = paired_bootstrap(metrics[base][metric], metrics[arm][metric])
+                    row[metric] = result.to_json() if result else None
+                comparisons.append(row)
+            per_cluster: dict[str, dict[str, float]] = defaultdict(dict)
+            for arm, m in metrics.items():
+                clusters: dict[str, list[float]] = defaultdict(list)
+                for cid, value in m["score"].items():
+                    clusters[cases[cid].cluster or "-"].append(value)
+                for cluster, values in clusters.items():
+                    per_cluster[cluster][arm] = fmean(values)
+            split_report[harness] = {
+                "arms": summaries,
+                "comparisons": comparisons,
+                "per_case": {arm: m["score"] for arm, m in metrics.items()},
+                "per_case_fabricated": {arm: m["fabricated"] for arm, m in metrics.items()},
+                "per_cluster": per_cluster,
+                "agreement": grader_agreement([r for rs in arm_runs.values() for r in rs]),
+            }
+        report["splits"][split] = split_report
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    (out / "summary.md").write_text(render_markdown(report))
+    print(render_markdown(report))
+    return report
 
 
-def _count(hits: int, total: int) -> str:
-    return "—" if not total else f"{hits}/{total} ({hits / total:.0%})"
+def _pct(value: float | None) -> str:
+    return "—" if value is None else f"{value:.0%}"
 
 
-def _pct(value: float | None, stddev: float | None = None) -> str:
-    if value is None:
+def _delta(row: Mapping[str, Any] | None) -> str:
+    if not row:
         return "—"
-    return f"{value:.0%}" if stddev is None else f"{value:.0%} ± {stddev:.0%}"
+    return f"{row['delta'] * 100:+.0f} pp [{row['low'] * 100:+.0f}, {row['high'] * 100:+.0f}]"
 
 
-def _num(value: float | None) -> str:
-    return "—" if value is None else f"{value / 1000:.1f}k"
-
-
-def _secs(value: float | None) -> str:
-    return "—" if value is None else f"{value:.0f} s"
+def render_markdown(report: Mapping[str, Any]) -> str:
+    """Short tables: per-arm rates, then paired deltas with 95% bootstrap CIs."""
+    lines: list[str] = []
+    for split, harnesses in report["splits"].items():
+        for harness, data in harnesses.items():
+            lines += [
+                f"### {split} split, {harness}",
+                "",
+                "| Arm | Cases | Pass rate | Fabricated | Guide loaded "
+                "| Loaded on near misses | Invalid YAML | Tokens | Infra errors |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+            for arm, s in data["arms"].items():
+                tokens = "—" if s["tokens"] is None else f"{s['tokens'] / 1000:.1f}k"
+                cells = [
+                    arm,
+                    str(s["cases"]),
+                    _pct(s["score"]),
+                    _pct(s["fabricated"]),
+                    _pct(s["loaded"]),
+                    _pct(s["false_loads"]),
+                    _pct(s["yaml_invalid"]),
+                    tokens,
+                    str(s["infra_errors"]),
+                ]
+                lines.append("| " + " | ".join(cells) + " |")
+            if data["comparisons"]:
+                lines += [
+                    "",
+                    "| Arm vs baseline | Pass rate Δ [95% CI] | Fabricated Δ [95% CI] "
+                    "| Guide loaded Δ [95% CI] |",
+                    "| --- | --- | --- | --- |",
+                ]
+                for row in data["comparisons"]:
+                    cells = [
+                        f"{row['arm']} vs {row['baseline']}",
+                        _delta(row["score"]),
+                        _delta(row["fabricated"]),
+                        _delta(row["loaded"]),
+                    ]
+                    lines.append("| " + " | ".join(cells) + " |")
+            lines.append("")
+    return "\n".join(lines)
