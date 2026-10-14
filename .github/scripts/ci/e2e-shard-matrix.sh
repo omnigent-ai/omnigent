@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Emits the e2e shard matrix as `matrix=<json>` on $GITHUB_OUTPUT, or an EMPTY
-# matrix ({"include":[]}) to skip. Consumers must guard the empty result before
-# GitHub expands their matrix strategy.
+# matrix ({"include":[]}) to skip. Empty yields zero jobs and thus NO check-runs
+# -- the point of the indirection: a job-level `if:` skip would instead leave a
+# check-run with an unexpanded `E2E Tests (shard ${{ matrix.shard_id }}/...)` name.
 #
 # Skips only draft PRs. These suites are mock-LLM (no secrets), so fork PRs run
 # directly, like CI.

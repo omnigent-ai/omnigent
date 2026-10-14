@@ -107,10 +107,9 @@ jobs:
     # -n 2 per shard => 4 x 2 = 8 concurrent gateway calls, below the
     # nightly's 429 pain point; drop -n before max-parallel if rate-limited.
     name: E2E Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Skip empty draft matrices before GitHub expands the strategy.
-    # Ready fork PRs run with mock LLM replies and no secrets.
+    # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
+    # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     needs: setup
-    if: needs.setup.outputs.matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     # Job-level cap (composite-action run steps can't set timeout-minutes):
     # ~30 min of tests + setup, replacing the old per-step 30-min backstop.
