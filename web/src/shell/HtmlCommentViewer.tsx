@@ -14,7 +14,7 @@ import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MessageSquarePlusIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanComment } from "@/hooks/usePermissions";
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot, getOmnigentHtmlPreviewFrame } from "@/lib/host";
 import { randomUUID } from "@/lib/randomUUID";
@@ -89,7 +89,7 @@ export function HtmlCommentViewer({
   activeSelection,
   onSetActiveSelection,
 }: HtmlCommentViewerProps) {
-  const canEdit = useCanEdit(conversationId);
+  const canComment = useCanComment(conversationId);
   const isEmbedded = useIsEmbedded();
   const HtmlPreviewFrame = getOmnigentHtmlPreviewFrame();
   // Only the default srcdoc frame inherits the host CSP. Isolated host frames
@@ -292,7 +292,7 @@ export function HtmlCommentViewer({
       {truncated && <TruncatedBanner />}
       <div className="min-h-0 flex-1">{preview}</div>
       {floating &&
-        canEdit &&
+        canComment &&
         createPortal(
           <button
             data-add-comment-btn

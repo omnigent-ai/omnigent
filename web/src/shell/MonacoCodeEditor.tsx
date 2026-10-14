@@ -12,7 +12,7 @@
 //
 // The comment layer (inline highlights, the floating "Add comment" button,
 // click-to-navigate, reveal-on-select) lives in useMonacoCommentLayer, shared
-// with the diff view. Adding a comment is gated on `canEdit && !isDirty`
+// with the diff view. Adding a comment is gated on `canComment && !isDirty`
 // (offsets must match the saved server content).
 
 import type { FilePosition } from "./FileViewerContext";
@@ -27,7 +27,7 @@ import {
   subscribeCodeFont,
 } from "@/lib/codeFontPreferences";
 import type { Comment } from "@/hooks/useComments";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanComment, useCanEdit } from "@/hooks/usePermissions";
 import { detectLang, type ActiveSelection, type SaveStatus } from "./codeViewerHelpers";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useMonacoFilePosition } from "./useMonacoFilePosition";
@@ -137,6 +137,8 @@ export function MonacoCodeEditor({
 }: MonacoCodeEditorProps) {
   // A truncated buffer must never be editable, regardless of permission.
   const canEdit = useCanEdit(conversationId) && !truncated;
+  // Comment offsets must match the full file, so a truncated buffer can't be commented on either.
+  const canComment = useCanComment(conversationId) && !truncated;
 
   // Lets the sync hook push external content into the live editor without a
   // full remount, preserving scroll/cursor.
@@ -161,6 +163,7 @@ export function MonacoCodeEditor({
       conversationId={conversationId}
       path={path}
       canEdit={canEdit}
+      canComment={canComment}
       truncated={truncated}
       isDirty={isDirty}
       setDirty={setDirty}
@@ -188,6 +191,7 @@ interface InnerProps extends CommentProps {
   conversationId: string;
   path: string;
   canEdit: boolean;
+  canComment: boolean;
   truncated: boolean;
   isDirty: boolean;
   setDirty: (dirty: boolean) => void;
@@ -217,6 +221,7 @@ function MonacoCodeEditorInner({
   conversationId,
   path,
   canEdit,
+  canComment,
   truncated,
   isDirty,
   setDirty,
@@ -457,7 +462,7 @@ function MonacoCodeEditorInner({
     [],
   );
 
-  // Comments may be added only when editable and clean (offsets must match the
+  // Comments may be added only when permitted and clean (offsets must match the
   // saved server content). Existing comments stay highlighted/navigable always.
   const commentButton = useMonacoCommentLayer({
     editorRef: editorInstanceRef,
@@ -465,7 +470,8 @@ function MonacoCodeEditorInner({
     comments,
     activeSelection,
     onSetActiveSelection,
-    canComment: canEdit && !isDirty,
+    canComment: canComment && !isDirty,
+    canMessageAgent: canEdit,
     pendingBodyRef,
     path,
   });

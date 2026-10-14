@@ -32,7 +32,12 @@ import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import { derivePermissionLevel, isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import {
+  canCommentLevel,
+  canReadLevel,
+  derivePermissionLevel,
+  isOwnerLevel,
+} from "@/lib/permissionsApi";
 import {
   isAndroidShell,
   isElectronShell,
@@ -765,9 +770,7 @@ export function AppShell() {
   // affordance doesn't flicker in before that resolves. Shared by the header
   // menus and ForkDialogContext's per-message "Fork from here" action.
   const canClone =
-    !!conversationId &&
-    (isKnownTopLevel || isChildSession) &&
-    (permissionLevel === null || permissionLevel >= 1);
+    !!conversationId && (isKnownTopLevel || isChildSession) && canReadLevel(permissionLevel);
   const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
   // Agent tools/policies exist to show.
   const hasAgentInfo =
@@ -910,7 +913,7 @@ export function AppShell() {
   // a one-entry list, not a dead end).
   const agentCount = childSessions.length + 1;
 
-  // Whether this viewer may browse the workspace at all. Edit-level and up
+  // Whether this viewer may browse the workspace at all. Comment-level and up
   // always can; a view-only collaborator only when the owner opted into
   // sharing the session's files (share_workspace_files) — otherwise a read
   // grant shares the conversation, not the raw filesystem (which routinely
@@ -919,7 +922,7 @@ export function AppShell() {
   // so an owner never sees a flash of hidden files; the server gate is what
   // actually protects the bytes.
   const canBrowseWorkspace =
-    isEditorLevel(activeSession?.permissionLevel ?? activeConv?.permission_level ?? null) ||
+    canCommentLevel(activeSession?.permissionLevel ?? activeConv?.permission_level ?? null) ||
     activeSession?.shareWorkspaceFiles === true;
   // Hide the files panel entirely when the agent spec has no os_env, or when
   // this viewer may not browse the workspace. Probe the default environment

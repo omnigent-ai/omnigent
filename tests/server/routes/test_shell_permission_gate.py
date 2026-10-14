@@ -49,12 +49,14 @@ from omnigent.entities import Conversation, ResolvedAccess, SessionPermission
 from omnigent.errors import OmnigentError
 from omnigent.runtime import _globals, set_runner_client, set_runner_router
 from omnigent.server.auth import (
+    LEVEL_COMMENT,
     LEVEL_EDIT,
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
     UnifiedAuthProvider,
+    level_satisfies,
 )
 from omnigent.server.routes.sessions import create_sessions_router
 
@@ -117,10 +119,10 @@ class _StubPermissionStore:
         if user_id is None:
             return False
         grant = self.get(user_id, conversation_id)
-        if grant is not None and grant.level >= required_level:
+        if grant is not None and level_satisfies(grant.level, required_level):
             return True
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        if public_grant is not None and public_grant.level >= required_level:
+        if public_grant is not None and level_satisfies(public_grant.level, required_level):
             return True
         return False
 
@@ -288,6 +290,7 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     perm_store = _StubPermissionStore()
     perm_store.add_grant("owner@example.com", "conv_share", LEVEL_EDIT)
     perm_store.add_grant("viewer@example.com", "conv_share", LEVEL_READ)
+    perm_store.add_grant("commenter@example.com", "conv_share", LEVEL_COMMENT)
     perm_store.add_grant("manager@example.com", "conv_share", LEVEL_MANAGE)
     perm_store.add_grant("real-owner@example.com", "conv_share", LEVEL_OWNER)
     perm_store.add_grant("owner@example.com", "conv_open", LEVEL_EDIT)
@@ -468,6 +471,7 @@ async def test_filesystem_allows_the_owner_outside_the_workspace(
         ("real-owner@example.com", _FS_RELATIVE, True),
         ("admin@example.com", _FS_RELATIVE, True),
         ("owner@example.com", _FS_RELATIVE, False),
+        ("commenter@example.com", _FS_RELATIVE, False),
         ("viewer@example.com", _FS_RELATIVE.replace("conv_share", "conv_open"), False),
         ("real-owner@example.com", _FS_ABSOLUTE, False),
         ("real-owner@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), True),
@@ -480,6 +484,7 @@ async def test_filesystem_allows_the_owner_outside_the_workspace(
         "owner",
         "admin",
         "edit-collaborator",
+        "commenter",
         "shared-viewer",
         "owner-absolute",
         "child-inherited-owner",
@@ -547,9 +552,10 @@ _FS_SEARCH_RELATIVE = "/v1/sessions/conv_share/resources/environments/default/se
         ("real-owner@example.com", 200),
         ("admin@example.com", 200),
         ("owner@example.com", 403),
+        ("commenter@example.com", 403),
         ("viewer@example.com", 403),
     ],
-    ids=["owner-allowed", "admin-allowed", "edit-denied", "read-denied"],
+    ids=["owner-allowed", "admin-allowed", "edit-denied", "comment-denied", "read-denied"],
 )
 async def test_filesystem_absolute_read_is_owner_only(
     client: httpx.AsyncClient,
@@ -713,6 +719,40 @@ async def test_workspace_reads_stay_open_to_edit_collaborators(
 
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url_tmpl", _CONTENT_READ_PATHS, ids=_CONTENT_READ_IDS)
+async def test_workspace_reads_stay_open_to_commenters(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    url_tmpl: str,
+) -> None:
+    """Comments are anchored to workspace files, so a comment grant reads
+    every workspace surface even when the owner hasn't shared files with
+    readers."""
+    resp = await client.get(
+        url_tmpl.format(cid="conv_share"), headers={"X-Forwarded-Email": "commenter@example.com"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(runner_client.gets) == 1
+
+
+@pytest.mark.asyncio
+async def test_workspace_writes_stay_closed_to_commenters(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+) -> None:
+    """Reading the files to comment on them never extends to changing them."""
+    resp = await client.put(
+        _FS_RELATIVE,
+        json={"content": "changed", "encoding": "utf-8"},
+        headers={"X-Forwarded-Email": "commenter@example.com"},
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert runner_client.puts == []
 
 
 @pytest.mark.asyncio

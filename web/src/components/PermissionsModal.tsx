@@ -3,7 +3,7 @@
  *
  * Displays current grants, allows granting/revoking access, and
  * toggling public visibility. Only accessible to users with
- * manage-level (3) permission on the session.
+ * manage access on the session.
  */
 
 import {
@@ -16,7 +16,7 @@ import {
   useState,
 } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CheckIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import { CheckIcon, InfoIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { Button } from "@/components/ui/button";
 import {
@@ -36,6 +36,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   type Permission,
   useGrantPermission,
@@ -49,7 +50,14 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { withBasePath } from "@/lib/basePath";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
-import { workspaceSharingBlocked } from "@/lib/permissionsApi";
+import {
+  LEVEL_COMMENT,
+  LEVEL_EDIT,
+  LEVEL_MANAGE,
+  LEVEL_OWNER,
+  LEVEL_READ,
+  workspaceSharingBlocked,
+} from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
@@ -57,10 +65,11 @@ const PUBLIC_USER = "__public__";
 
 /** Numeric permission level → display label for fixed (non-editable) rows. */
 const LEVEL_LABELS: Record<number, string> = {
-  1: "Read",
-  2: "Edit",
-  3: "Manage",
-  4: "Owner",
+  [LEVEL_READ]: "Read",
+  [LEVEL_COMMENT]: "Comment",
+  [LEVEL_EDIT]: "Edit",
+  [LEVEL_MANAGE]: "Manage",
+  [LEVEL_OWNER]: "Owner",
 };
 
 interface PermissionsModalProps {
@@ -90,8 +99,11 @@ export function PermissionsModal({
   const { data: livePublicMaxLevel } = usePublicSharingMaxLevel(open && !sharingOff);
   const publicMaxLevel =
     (livePublicMaxLevel ?? (info === "loading" ? "read" : info.public_sharing_max_level)) === "edit"
-      ? 2
-      : 1;
+      ? LEVEL_EDIT
+      : LEVEL_READ;
+  // Comment grants are opt-in per server; fail closed while the probe loads so
+  // the option never flashes in on a server that would reject it.
+  const commentSharingEnabled = info !== "loading" && info.comment_sharing_enabled;
   // In "off" mode never fetch the grant list — the modal short-circuits to a
   // notice below, so the request would be wasted (and the server rejects any
   // grant anyway).
@@ -100,9 +112,10 @@ export function PermissionsModal({
   const revoke = useRevokePermission(sessionId);
 
   const [newUserId, setNewUserId] = useState("");
-  const [newLevel, setNewLevel] = useState("1");
+  const [newLevel, setNewLevel] = useState(String(LEVEL_READ));
   const [error, setError] = useState<string | null>(null);
   const [showQr, setShowQr] = useState(false);
+  const workspaceFilesId = useId();
 
   // Whether the owner shared the workspace files with view-level collaborators.
   // Read from the (shared-cache) session snapshot; the toggle PATCHes it and
@@ -123,7 +136,11 @@ export function PermissionsModal({
 
   const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
-  const publicLevel = publicGrant ? Math.min(publicGrant.level, publicMaxLevel) : 0;
+  const publicLevel = !publicGrant
+    ? 0
+    : publicGrant.level === LEVEL_EDIT && publicMaxLevel === LEVEL_EDIT
+      ? LEVEL_EDIT
+      : LEVEL_READ;
 
   function handleGrant(e: FormEvent) {
     e.preventDefault();
@@ -135,7 +152,7 @@ export function PermissionsModal({
       {
         onSuccess: () => {
           setNewUserId("");
-          setNewLevel("1");
+          setNewLevel(String(LEVEL_READ));
         },
         onError: (err) => setError(err.message),
       },
@@ -199,7 +216,9 @@ export function PermissionsModal({
             <div className="space-y-3">
               <p>
                 {sharingReadOnly
-                  ? "This server allows read-only sharing — invite others to view this session."
+                  ? commentSharingEnabled
+                    ? "This server allows read-only sharing — invite others to view or comment on this session."
+                    : "This server allows read-only sharing — invite others to view this session."
                   : "Invite others to view or collaborate on this session."}
               </p>
               {sharingReadOnly && (
@@ -240,7 +259,7 @@ export function PermissionsModal({
                 <SelectItem value="1" disabled={workspaceBlocked || !publicSharingEnabled}>
                   Read
                 </SelectItem>
-                {publicMaxLevel === 2 && (
+                {publicMaxLevel === LEVEL_EDIT && (
                   <SelectItem
                     value="2"
                     disabled={sharingReadOnly || workspaceBlocked || !publicSharingEnabled}
@@ -255,20 +274,39 @@ export function PermissionsModal({
 
         {/* Workspace-files toggle — off by default so a view-only share never
             leaks the session's files (which routinely hold secrets). Only the
-            file surfaces open up; edit collaborators already have them. Shown
+            file surfaces open up; comment collaborators already have them. Shown
             only for sessions that actually have a workspace on disk. */}
         {hasWorkspace && (
           <div
-            className="flex items-center justify-between rounded-lg border px-3 py-2"
+            className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2"
             data-testid="share-workspace-files"
           >
             <div>
-              <p className="text-ui font-medium">Workspace files</p>
-              <p className="text-sm text-muted-foreground">
-                Let people with view access browse this session's files
+              <div className="flex items-center gap-1.5">
+                <p id={`${workspaceFilesId}-label`} className="text-ui font-medium">
+                  Workspace files for Read permission
+                </p>
+                <Tooltip>
+                  <TooltipTrigger
+                    type="button"
+                    aria-label="File access for Comment and Edit permissions"
+                    className="shrink-0 rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <InfoIcon className="size-3.5" />
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-64">
+                    Comment always includes file access and commenting. Edit and higher also allow
+                    file changes.
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+              <p id={`${workspaceFilesId}-description`} className="text-sm text-muted-foreground">
+                Let people with Read access view this session's files.
               </p>
             </div>
             <Switch
+              aria-labelledby={`${workspaceFilesId}-label`}
+              aria-describedby={`${workspaceFilesId}-description`}
               checked={workspaceShared}
               onCheckedChange={(checked) => {
                 setError(null);
@@ -309,6 +347,7 @@ export function PermissionsModal({
                     onChangeLevel={handleChangeLevel}
                     busy={grant.isPending || revoke.isPending}
                     readOnly={sharingReadOnly}
+                    commentSharingEnabled={commentSharingEnabled}
                   />
                 ))}
               </div>
@@ -338,9 +377,12 @@ export function PermissionsModal({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent position="popper" align="start">
-                <SelectItem value="1">Read</SelectItem>
-                {/* Read-only sharing caps new grants at view; hide Edit. */}
-                {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
+                <SelectItem value={String(LEVEL_READ)}>Read</SelectItem>
+                {commentSharingEnabled && (
+                  <SelectItem value={String(LEVEL_COMMENT)}>Comment</SelectItem>
+                )}
+                {/* Read-only sharing caps new grants at view/comment; hide Edit. */}
+                {!sharingReadOnly && <SelectItem value={String(LEVEL_EDIT)}>Edit</SelectItem>}
               </SelectContent>
             </Select>
           </div>
@@ -692,18 +734,20 @@ function GrantRow({
   onChangeLevel,
   busy,
   readOnly,
+  commentSharingEnabled,
 }: {
   permission: Permission;
   onRevoke: (userId: string) => void;
   onChangeLevel: (userId: string, level: number) => void;
   busy: boolean;
   readOnly: boolean;
+  commentSharingEnabled: boolean;
 }) {
-  const isOwner = permission.level === 4;
+  const isOwner = permission.level === LEVEL_OWNER;
   // Manage is not grantable from the UI, so a pre-existing manage grant
   // renders as a fixed label rather than a dropdown choice. Unlike the
   // owner row it can still be revoked.
-  const isManage = permission.level === 3;
+  const isManage = permission.level === LEVEL_MANAGE;
   // Read-only sharing mode: existing grants can't be re-leveled, so the level
   // shows as a fixed label (like owner/manage) — but the row stays revocable.
   const fixedLevel = isOwner || isManage || readOnly;
@@ -733,8 +777,13 @@ function GrantRow({
             <SelectValue />
           </SelectTrigger>
           <SelectContent position="popper" align="start">
-            <SelectItem value="1">Read</SelectItem>
-            <SelectItem value="2">Edit</SelectItem>
+            <SelectItem value={String(LEVEL_READ)}>Read</SelectItem>
+            {/* Keep an existing comment grant's value renderable even after the
+                server turns comment sharing off. */}
+            {(commentSharingEnabled || permission.level === LEVEL_COMMENT) && (
+              <SelectItem value={String(LEVEL_COMMENT)}>Comment</SelectItem>
+            )}
+            <SelectItem value={String(LEVEL_EDIT)}>Edit</SelectItem>
           </SelectContent>
         </Select>
       )}

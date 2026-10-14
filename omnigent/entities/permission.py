@@ -35,9 +35,10 @@ class ResolvedAccess:
     :param is_admin: Whether the user has the global admin flag set.
     :param user_grant_level: The user's own grant level on the
         conversation (``1`` = read, ``2`` = edit, ``3`` = manage,
-        ``4`` = owner), or ``None`` if they have no direct grant.
+        ``4`` = owner, ``5`` = comment), or ``None`` if they have no
+        direct grant.
     :param public_grant_level: The ``"__public__"`` sentinel grant level
-        on the conversation (same ``1``–``4`` scale), or ``None`` if the
+        on the conversation (same ``1``–``5`` scale), or ``None`` if the
         session is not public.
     """
 

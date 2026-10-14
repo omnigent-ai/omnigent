@@ -753,8 +753,9 @@ class SysSessionShareTool(Tool):
     is shared, which is the common case ("share this session with X").
     ``user_id`` is the grantee's email, or (when ``allow_public``) the
     sentinel ``"__public__"`` for link access. ``level``
-    is ``"read"`` (default), ``"edit"``, or ``"manage"``; the server
-    caps public grants at its configured maximum (read by default, optionally edit).
+    is ``"read"`` (default), ``"comment"``, or ``"edit"``; the server
+    caps public grants at its configured maximum (read by default, optionally
+    edit) and never grants public comment access.
 
     Runner-dispatched: the runner proxies ``PUT
     /v1/sessions/{id}/permissions`` using its authenticated server
@@ -788,7 +789,7 @@ class SysSessionShareTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "Share a session with another user by granting them access "
-            "(level 'read' default, 'edit', or 'manage'). Omit "
+            "(level 'read' default, 'comment', or 'edit'). Omit "
             "session_id to share the calling session itself, or pass it "
             "to share another session you manage. Requires manage-level "
             "access (the session owner has it)."
@@ -832,11 +833,14 @@ class SysSessionShareTool(Tool):
                         },
                         "level": {
                             "type": "string",
-                            "enum": ["read", "edit", "manage"],
+                            "enum": ["read", "comment", "edit"],
                             "description": (
                                 "Permission level to grant. Defaults to "
-                                "'read'. Public grants are capped at "
-                                "'read' regardless of this value."
+                                "'read'. 'comment' lets the grantee read "
+                                "and leave review comments without "
+                                "editing or messaging the agent. Public "
+                                "grants are capped at 'read' regardless "
+                                "of this value."
                             ),
                         },
                         "session_id": {

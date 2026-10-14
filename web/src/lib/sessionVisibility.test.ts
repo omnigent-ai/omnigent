@@ -12,6 +12,8 @@ describe("frontend session scope", () => {
     [{ permission_level: 1 }, "shared"],
     [{ permission_level: 2 }, "shared"],
     [{ permission_level: 3 }, "shared"],
+    [{ permission_level: 5 }, "shared"],
+    [{ permission_level: 0 }, "mine"],
     [{ permission_level: null }, "mine"],
   ] as const)("classifies %j as %s", (row, expected) => {
     expect(sessionVisibility(row, "alice")).toBe(expected);

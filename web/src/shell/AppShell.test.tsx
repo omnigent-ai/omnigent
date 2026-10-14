@@ -475,6 +475,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
+    comment_sharing_enabled: false,
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
@@ -2569,19 +2570,41 @@ describe("FilesPanel visibility", () => {
     expect(screen.queryByTestId("files-panel-drawer")).toBeNull();
   });
 
-  it("keeps FilesPanel for an edit-level collaborator", () => {
-    // Edit collaborators can already write files and run shell in the shared
-    // workspace, so the browsing surfaces stay available.
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: 2 }]);
+  it.each([2, 3, 4, 5])(
+    "keeps FilesPanel for permission level %s with file sharing off",
+    (level) => {
+      useEnvironmentMock.mockReturnValue({
+        data: { available: true, root: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      mockConversations([{ id: "conv_abc", permission_level: level }]);
+      useSessionMock.mockReturnValue({
+        session: {
+          id: "conv_abc",
+          agentId: "ag_owner",
+          agentName: "developer",
+          runnerId: null,
+          status: "idle",
+          createdAt: 1_700_000_000,
+          title: "Shared session",
+          labels: {},
+          items: [],
+          pendingElicitations: [],
+          permissionLevel: level,
+          shareWorkspaceFiles: false,
+          parentSessionId: null,
+          subAgentName: null,
+          kind: "default",
+        },
+        isLoading: false,
+        error: null,
+      });
 
-    renderShell("/c/conv_abc");
+      renderShell("/c/conv_abc");
 
-    expect(screen.getByTestId("files-panel")).toBeInTheDocument();
-  });
+      expect(screen.getByTestId("files-panel")).toBeInTheDocument();
+    },
+  );
 
   it("shows FilesPanel to a view-only collaborator once the owner shares files", () => {
     // The share opt-in (share_workspace_files on the snapshot) lets a view
@@ -4887,9 +4910,13 @@ describe("Mobile header actions menu", () => {
     });
   });
 
-  it("offers no Share to a read-only collaborator", () => {
-    // level 1 = read: can fork, but not share (needs ≥3).
-    mockConversations([{ id: "conv_shared", permission_level: 1 }]);
+  it.each([
+    [1, "read"],
+    [5, "comment"],
+  ])("offers no Share to a level-%d (%s) collaborator", (permissionLevel) => {
+    // Read and comment can fork but not share (manage or owner only). Comment
+    // (5) is numerically above owner, so a `>=` check would wrongly allow it.
+    mockConversations([{ id: "conv_shared", permission_level: permissionLevel }]);
 
     renderShell("/c/conv_shared");
     openActionsMenu();

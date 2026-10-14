@@ -126,7 +126,10 @@ vi.mock("./TipTapCommentExtension", () => ({
 }));
 vi.mock("./MarkdownCommentPlugin", () => ({ MarkdownCommentPlugin: () => null }));
 vi.mock("./MarkdownEditorToolbar", () => ({ ToolbarPlugin: () => null }));
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
+vi.mock("@/hooks/usePermissions", () => ({
+  useCanEdit: vi.fn().mockReturnValue(true),
+  useCanComment: vi.fn().mockReturnValue(true),
+}));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),

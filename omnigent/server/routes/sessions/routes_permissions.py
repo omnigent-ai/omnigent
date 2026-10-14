@@ -30,12 +30,15 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_COMMENT,
+    LEVEL_EDIT,
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
     AuthProvider,
     SharingMode,
+    level_satisfies,
     workspace_sharing_blocked,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -137,12 +140,20 @@ def register_permissions_routes(
                     "cannot be shared on this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
                 )
-        if (
-            _sharing_mode in (SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY)
-            and body.level > LEVEL_READ
-        ):
+        if _sharing_mode in (
+            SharingMode.READ_ONLY,
+            SharingMode.RESTRICTED_READ_ONLY,
+        ) and body.level not in (LEVEL_READ, LEVEL_COMMENT):
             raise OmnigentError(
                 "Sharing is limited to read-only access on this Omnigent server.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if (
+            body.level == LEVEL_COMMENT
+            and not getattr(request.app.state, "comment_sharing", lambda: False)()
+        ):
+            raise OmnigentError(
+                "Comment access is not enabled on this Omnigent server.",
                 code=ErrorCode.FORBIDDEN,
             )
         if permission_store is None:
@@ -170,7 +181,15 @@ def register_permissions_routes(
             ceiling = getattr(
                 request.app.state, "public_sharing_max_level", lambda: PublicSharingMaxLevel.READ
             )()
-            if body.level > ceiling.level:
+            # Comments carry an author, which anonymous link access can't supply.
+            if body.level == LEVEL_COMMENT:
+                raise OmnigentError(
+                    "Public access can't be comment-only; grant read or edit instead",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if body.level not in (LEVEL_READ, LEVEL_EDIT) or not level_satisfies(
+                ceiling.level, body.level
+            ):
                 raise OmnigentError(
                     f"Public access is limited to {ceiling.value} (level {ceiling.level})",
                     code=ErrorCode.INVALID_INPUT,

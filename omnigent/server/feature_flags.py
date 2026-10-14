@@ -28,6 +28,7 @@ class Feature(StrEnum):
     IMPORT_REVIEW = "import_review"
     CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
+    COMMENT_SHARING = "comment_sharing"
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,15 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Sidebar grouping, ordering and row metadata options, Shared section",
         owner="web",
         review_by_release="0.19.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.COMMENT_SHARING,
+        description="Comment-only session sharing level",
+        owner="sharing",
+        review_by_release="0.19.0",
+        # Surfaced as /v1/info comment_sharing_enabled instead, which also
+        # reflects a per-request override passed to create_app.
+        frontend_visible=False,
     ),
 )
 

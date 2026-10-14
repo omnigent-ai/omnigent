@@ -83,7 +83,7 @@ interface RenderOpts {
     sel: { start_index: number; end_index: number; anchor_content: string } | null,
   ) => void;
   pendingBodyRef?: RefObject<string>;
-  canEdit?: boolean;
+  canComment?: boolean;
 }
 
 function renderPlugin(opts: RenderOpts = {}) {
@@ -98,7 +98,7 @@ function renderPlugin(opts: RenderOpts = {}) {
       activeSelection={opts.activeSelection ?? null}
       onSetActiveSelection={onSetActiveSelection}
       pendingBodyRef={opts.pendingBodyRef}
-      canEdit={opts.canEdit}
+      canComment={opts.canComment}
     />,
   );
   return { ...utils, onSetActiveSelection };
@@ -127,6 +127,33 @@ describe("MarkdownCommentPlugin render", () => {
 // ---------------------------------------------------------------------------
 // State sync into the decoration extension
 // ---------------------------------------------------------------------------
+
+describe("MarkdownCommentPlugin comment permission", () => {
+  // jsdom lays nothing out, so stand in a measurable selection rect.
+  function stubMeasurableSelection() {
+    const rect = { width: 40, height: 16, top: 100, left: 20 } as DOMRect;
+    vi.spyOn(window, "getSelection").mockReturnValue({
+      rangeCount: 1,
+      getRangeAt: () => ({ getClientRects: () => [rect], getBoundingClientRect: () => rect }),
+    } as unknown as Selection);
+  }
+
+  it.each([
+    { canComment: true, shown: true },
+    { canComment: false, shown: false },
+  ])(
+    "a text selection offers Add comment only when canComment=$canComment",
+    ({ canComment, shown }) => {
+      editor = makeEditor();
+      stubMeasurableSelection();
+      const { queryByText } = renderPlugin({ canComment });
+      act(() => {
+        editor!.commands.setTextSelection({ from: 5, to: 10 });
+      });
+      expect(queryByText("Add comment") !== null).toBe(shown);
+    },
+  );
+});
 
 describe("MarkdownCommentPlugin state sync", () => {
   // WHY: the sync effect must populate commentStateRef from the props.

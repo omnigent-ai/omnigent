@@ -9,6 +9,7 @@ import { useRef } from "react";
 
 import type { Conversation } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
+import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 
 /**
@@ -146,11 +147,10 @@ export type SessionLiveness =
  * True when the viewer owns `conv`. Mirrors the convention used by the
  * sidebar and header action gates (`Sidebar`/`AppShell`): a `null`
  * permission level means the session isn't shared (so the viewer is the
- * owner), and level >= 4 is the owner grant.
+ * owner); otherwise only the owner grant counts.
  */
 function isOwner(conv: Pick<Conversation, "permission_level"> | null | undefined): boolean {
-  const level = conv?.permission_level;
-  return level === null || level === undefined || level >= 4;
+  return isOwnerLevel(conv?.permission_level ?? null);
 }
 
 /**

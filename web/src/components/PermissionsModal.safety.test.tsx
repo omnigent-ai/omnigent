@@ -21,7 +21,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { PermissionsModal } from "./PermissionsModal";
 
-vi.mock("@/lib/permissionsApi", () => ({
+vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof api>()),
   listPermissions: vi.fn(),
   grantPermission: vi.fn(),
   revokePermission: vi.fn(),

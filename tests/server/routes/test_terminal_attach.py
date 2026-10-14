@@ -41,6 +41,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
     UnifiedAuthProvider,
+    level_satisfies,
 )
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.terminals import TerminalRegistry
@@ -72,10 +73,10 @@ class _StubPermissionStore:
         if user_id is None:
             return False
         grant = self.get(user_id, conversation_id)
-        if grant is not None and grant.level >= required_level:
+        if grant is not None and level_satisfies(grant.level, required_level):
             return True
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        if public_grant is not None and public_grant.level >= required_level:
+        if public_grant is not None and level_satisfies(public_grant.level, required_level):
             return True
         return False
 

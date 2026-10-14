@@ -30,6 +30,7 @@ lifecycle metadata.
 | `canvas` | Off | Web | 0.15.0 | Exposes the web Canvas route (`/canvas`) and its sidebar navigation: top-level sessions as draggable cards, one canvas per project. |
 | `custom_agents_settings_ui` | Off | Web | 0.18.0 | Exposes Custom agents settings when the server also advertises `agent_install`. |
 | `sidebar_grouping_ui` | Off | Web | 0.19.0 | Adds Grouping, Ordering and Show options to the sidebar filter menu, moves that menu to the Projects header, splits Shared sessions into their own section, lets a Status or Updated grouping replace the Projects, Shared and Sessions sections, and expands the session tooltip with Repo, PR and Created by. |
+| `comment_sharing` | Off | Sharing | 0.19.0 | Allows granting the comment-only session level (read plus writing your own review comments; no editing or messaging the agent). Reported as `/v1/info` `comment_sharing_enabled`; `create_app(comment_sharing=...)` overrides it per request. |
 
 At the review release, each flag must be removed by making the feature
 unconditional, removing the feature, or moving a genuinely permanent operator

@@ -29,6 +29,8 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
+    level_rank,
+    level_satisfies,
 )
 from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.permission_store import PermissionStore
@@ -516,12 +518,13 @@ class SqlAlchemyPermissionStore(PermissionStore):
             return False
 
         grant = self.get(user_id, conversation_id)
-        if grant is not None and grant.level >= required_level:
+        if grant is not None and level_satisfies(grant.level, required_level):
             return True
 
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        public_level = effective_public_level(public_grant.level if public_grant else None)
-        if public_level is not None and public_level >= required_level:
+        if level_satisfies(
+            effective_public_level(public_grant.level if public_grant else None), required_level
+        ):
             return True
 
         return False
@@ -546,7 +549,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             )
             if level is not None
         ]
-        return max(levels) if levels else None
+        return max(levels, key=level_rank) if levels else None
 
     def _resolve_cache_lookup(self, conversation_id: str, user_id: str) -> ResolvedAccess | None:
         """Return a live cached resolve_access result, or ``None`` on miss/expiry."""

@@ -76,7 +76,7 @@ const meta = {
     onCopyCommentLink: () => undefined,
     canAddress: true,
     addressPending: false,
-    canEdit: true,
+    canComment: true,
     now,
   },
   decorators: [
@@ -143,7 +143,7 @@ export const ReadOnlyAddressedTab: Story = {
   args: {
     comments: [openComments[0]!],
     addressedComments,
-    canEdit: false,
+    canComment: false,
     canAddress: false,
     activeSelection: {
       start_index: 5,

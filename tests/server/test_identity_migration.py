@@ -312,6 +312,27 @@ def test_grant_collision_merges_to_higher_level(db_uri: str) -> None:
     assert perm_store.get("alice", conv_id) is None
 
 
+def test_grant_collision_keeps_owner_over_comment(db_uri: str) -> None:
+    """COMMENT (5) is numerically above OWNER (4) but ranks below it."""
+    account_store = SqlAlchemyAccountStore(db_uri)
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    account_store.create_user_with_password("alice@example.com", hash_password("password123"))
+    conv_id = _conversation(db_uri)
+    perm_store.grant("alice", conv_id, level=5)  # old has comment
+    perm_store.grant("alice@example.com", conv_id, level=4)  # new owns it
+
+    remap_identities(
+        get_or_create_engine(db_uri),
+        {"alice": "alice@example.com"},
+        dry_run=False,
+        force=True,
+    )
+
+    merged = perm_store.get("alice@example.com", conv_id)
+    assert merged is not None and merged.level == 4
+
+
 def test_refuses_existing_new_without_force(db_uri: str) -> None:
     """Mapping onto an existing distinct NEW id is refused unless --force."""
     account_store = SqlAlchemyAccountStore(db_uri)

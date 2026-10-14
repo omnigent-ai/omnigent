@@ -26,7 +26,7 @@ import { ListItem, TaskItem, TaskList } from "@tiptap/extension-list";
 import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanComment, useCanEdit } from "@/hooks/usePermissions";
 import { useSessionActive } from "@/hooks/useWorkspaceChangedFiles";
 import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 import { TableHandles } from "./TableBubbleMenu";
@@ -125,6 +125,8 @@ export function MarkdownRichTextViewer({
 }: MarkdownRichTextViewerProps) {
   // A truncated buffer must never be editable, regardless of permission.
   const canEdit = useCanEdit(conversationId) && !truncated;
+  // Comment offsets must match the full file, so a truncated buffer can't be commented on either.
+  const canComment = useCanComment(conversationId) && !truncated;
 
   // True while the owning session's agent turn is in flight — used to warn
   // before edits that would be overwritten by the agent's next write.
@@ -170,6 +172,7 @@ export function MarkdownRichTextViewer({
       path={path}
       canEdit={canEdit}
       sessionActive={sessionActive}
+      canComment={canComment}
       truncated={truncated}
       isDirty={isDirty}
       setDirty={setDirty}
@@ -203,6 +206,7 @@ interface InnerProps {
   canEdit: boolean;
   /** True while the owning session's agent turn is in flight. */
   sessionActive: boolean;
+  canComment: boolean;
   truncated: boolean;
   isDirty: boolean;
   setDirty: (dirty: boolean) => void;
@@ -229,6 +233,7 @@ function MarkdownRichTextViewerInner({
   path,
   canEdit,
   sessionActive,
+  canComment,
   truncated,
   isDirty,
   setDirty,
@@ -593,7 +598,7 @@ function MarkdownRichTextViewerInner({
         activeSelection={activeSelection}
         onSetActiveSelection={onSetActiveSelection}
         pendingBodyRef={pendingBodyRef}
-        canEdit={canEdit}
+        canComment={canComment}
       />
     </div>
   );
