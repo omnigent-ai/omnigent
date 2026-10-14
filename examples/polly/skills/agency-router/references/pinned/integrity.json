@@ -1,0 +1,12 @@
+{
+  "LICENSE": "9a45258434d5cedf0af73c9ad4771373701225038d246c49219026c33677f66f",
+  "catalog.json": "ad445199497b5b0f411e813edb8a53ea584473d5b9385a63f6b272746357f170",
+  "manifest.json": "8d48f5e642084ede37a19423d86b65cc367e2837e1b256686f0791917848d8b0",
+  "personas/backend-developer.md": "45d94306c8f0f4c51efb76066008297fa4e87ce5b69f509cfede224084b74dfb",
+  "personas/code-reviewer.md": "7509fcc3ea1dda46511b2801996305bf3d4a125576f9655ff0b63df25602f446",
+  "personas/database-optimizer.md": "6d773003e3b9251068ab537be94d6827c118201e0e17c11d789cb29dc245bf99",
+  "personas/frontend-developer.md": "35961da50f408e00eb6189c87825ac5e62e6b1bf9de3dee198a95536c6d2619e",
+  "personas/mobile-app-developer.md": "1a3e043f806b0b7c071d58b2ee3ab3c58c8342e2727c1ca9e6e5175f86986caf",
+  "personas/software-architect.md": "b85121691776147bacde26673e68fbbacd6a7f0816d1ca8e203c264d25ce1d30",
+  "personas/technical-writer.md": "bf5c809977e10904b988ab8b218853ce8dfa38b2cbd89a7d2cfadba44ac25761"
+}

@@ -1,0 +1,65 @@
+{
+  "converter_version": 1,
+  "license_sha256": "9a45258434d5cedf0af73c9ad4771373701225038d246c49219026c33677f66f",
+  "personas": [
+    {
+      "alias": "Backend Developer",
+      "description": "Senior backend architect specializing in scalable system design, database architecture, API development, and cloud infrastructure. Builds robust, secure, performant server-side applications and microservices",
+      "id": "backend-developer",
+      "name": "Backend Architect",
+      "path": "engineering/engineering-backend-architect.md",
+      "sha256": "45d94306c8f0f4c51efb76066008297fa4e87ce5b69f509cfede224084b74dfb"
+    },
+    {
+      "alias": "Code Reviewer",
+      "description": "Expert code reviewer who provides constructive, actionable feedback focused on correctness, maintainability, security, and performance — not style preferences.",
+      "id": "code-reviewer",
+      "name": "Code Reviewer",
+      "path": "engineering/engineering-code-reviewer.md",
+      "sha256": "7509fcc3ea1dda46511b2801996305bf3d4a125576f9655ff0b63df25602f446"
+    },
+    {
+      "alias": "Database Optimizer",
+      "description": "Expert database specialist focusing on schema design, query optimization, indexing strategies, and performance tuning for PostgreSQL, MySQL, and modern databases like Supabase and PlanetScale.",
+      "id": "database-optimizer",
+      "name": "Database Optimizer",
+      "path": "engineering/engineering-database-optimizer.md",
+      "sha256": "6d773003e3b9251068ab537be94d6827c118201e0e17c11d789cb29dc245bf99"
+    },
+    {
+      "alias": "Frontend Developer",
+      "description": "Expert frontend developer specializing in modern web technologies, React/Vue/Angular frameworks, UI implementation, and performance optimization",
+      "id": "frontend-developer",
+      "name": "Frontend Developer",
+      "path": "engineering/engineering-frontend-developer.md",
+      "sha256": "35961da50f408e00eb6189c87825ac5e62e6b1bf9de3dee198a95536c6d2619e"
+    },
+    {
+      "alias": "Mobile App Developer",
+      "description": "Specialized mobile application developer with expertise in native iOS/Android development and cross-platform frameworks",
+      "id": "mobile-app-developer",
+      "name": "Mobile App Builder",
+      "path": "engineering/engineering-mobile-app-builder.md",
+      "sha256": "1a3e043f806b0b7c071d58b2ee3ab3c58c8342e2727c1ca9e6e5175f86986caf"
+    },
+    {
+      "alias": "Software Architect",
+      "description": "Expert software architect specializing in system design, domain-driven design, architectural patterns, and technical decision-making for scalable, maintainable systems.",
+      "id": "software-architect",
+      "name": "Software Architect",
+      "path": "engineering/engineering-software-architect.md",
+      "sha256": "b85121691776147bacde26673e68fbbacd6a7f0816d1ca8e203c264d25ce1d30"
+    },
+    {
+      "alias": "Technical Writer",
+      "description": "Expert technical writer specializing in developer documentation, API references, README files, and tutorials. Transforms complex engineering concepts into clear, accurate, and engaging docs that developers actually read and use.",
+      "id": "technical-writer",
+      "name": "Technical Writer",
+      "path": "engineering/engineering-technical-writer.md",
+      "sha256": "bf5c809977e10904b988ab8b218853ce8dfa38b2cbd89a7d2cfadba44ac25761"
+    }
+  ],
+  "schema_version": 1,
+  "upstream_sha": "bd956db032d907387e6b9ddebff3e18f1de8c679",
+  "upstream_url": "https://github.com/msitarzewski/agency-agents.git"
+}

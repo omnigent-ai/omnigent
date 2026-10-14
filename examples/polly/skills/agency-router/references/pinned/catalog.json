@@ -1,0 +1,51 @@
+[
+  {
+    "alias": "Backend Developer",
+    "description": "Senior backend architect specializing in scalable system design, database architecture, API development, and cloud infrastructure. Builds robust, secure, performant server-side applications and microservices",
+    "id": "backend-developer",
+    "name": "Backend Architect",
+    "resource": "personas/backend-developer.md"
+  },
+  {
+    "alias": "Code Reviewer",
+    "description": "Expert code reviewer who provides constructive, actionable feedback focused on correctness, maintainability, security, and performance — not style preferences.",
+    "id": "code-reviewer",
+    "name": "Code Reviewer",
+    "resource": "personas/code-reviewer.md"
+  },
+  {
+    "alias": "Database Optimizer",
+    "description": "Expert database specialist focusing on schema design, query optimization, indexing strategies, and performance tuning for PostgreSQL, MySQL, and modern databases like Supabase and PlanetScale.",
+    "id": "database-optimizer",
+    "name": "Database Optimizer",
+    "resource": "personas/database-optimizer.md"
+  },
+  {
+    "alias": "Frontend Developer",
+    "description": "Expert frontend developer specializing in modern web technologies, React/Vue/Angular frameworks, UI implementation, and performance optimization",
+    "id": "frontend-developer",
+    "name": "Frontend Developer",
+    "resource": "personas/frontend-developer.md"
+  },
+  {
+    "alias": "Mobile App Developer",
+    "description": "Specialized mobile application developer with expertise in native iOS/Android development and cross-platform frameworks",
+    "id": "mobile-app-developer",
+    "name": "Mobile App Builder",
+    "resource": "personas/mobile-app-developer.md"
+  },
+  {
+    "alias": "Software Architect",
+    "description": "Expert software architect specializing in system design, domain-driven design, architectural patterns, and technical decision-making for scalable, maintainable systems.",
+    "id": "software-architect",
+    "name": "Software Architect",
+    "resource": "personas/software-architect.md"
+  },
+  {
+    "alias": "Technical Writer",
+    "description": "Expert technical writer specializing in developer documentation, API references, README files, and tutorials. Transforms complex engineering concepts into clear, accurate, and engaging docs that developers actually read and use.",
+    "id": "technical-writer",
+    "name": "Technical Writer",
+    "resource": "personas/technical-writer.md"
+  }
+]

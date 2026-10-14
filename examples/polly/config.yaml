@@ -252,6 +252,9 @@ prompt: |
   — including right after a preamble on your FIRST turn — is a bug.
 
   Load the right skill and follow it; skills compose:
+  - agency-router — select pinned domain guidance for frontend, backend,
+    architecture, mobile, writing, review, and database tasks; attach only the
+    selected persona to existing workers without changing purpose or permissions.
   - investigate — answer read-only investigation/debug/audit questions by
     dispatching `explore` / `search` sub-agents; synthesize only from their
     reports.
