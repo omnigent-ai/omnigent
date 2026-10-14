@@ -5,6 +5,8 @@ import { useUploadStore, type UploadRow } from "@/store/uploadStore";
 import {
   adaptiveChunk,
   cancelUpload,
+  discardUploads,
+  pumpUploads,
   enqueueUploads,
   refreshUploadedFiles,
   retryDelay,
@@ -13,6 +15,7 @@ import {
   waitForRetry,
 } from "./workspaceUploadController";
 import { UploadError } from "./workspaceUploadsApi";
+import { toast } from "sonner";
 
 vi.mock("./identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("sonner", () => ({ toast: Object.assign(vi.fn(), { error: vi.fn() }) }));
@@ -61,6 +64,7 @@ async function server(_input: RequestInfo | URL, init?: RequestInit): Promise<Re
 }
 
 beforeEach(() => {
+  vi.mocked(toast).mockClear();
   row = {
     origin: "http://server",
     identity: "alice",
@@ -352,4 +356,176 @@ it("cancels retry waits and distinguishes long upload-limit backoff from busy", 
   vi.spyOn(Math, "random").mockReturnValue(0.5);
   expect(retryDelay(new UploadError("busy", 429, "busy", new Headers()), 0)).toBe(500);
   expect(retryDelay(new UploadError("limit", 429, "upload_limit", new Headers()), 0)).toBe(60_000);
+});
+
+it.each(["cancel", "discard"])(
+  "cleans up an admitted create after %s while POST is pending",
+  async (action) => {
+    let release!: (response: Response) => void;
+    fetchMock.mockImplementation((url, init) => {
+      if (init?.method === "POST")
+        return new Promise<Response>((resolve, reject) => {
+          release = resolve;
+          init.signal?.addEventListener("abort", () =>
+            reject(new DOMException("Cancelled", "AbortError")),
+          );
+        });
+      return server(url, init);
+    });
+    const transfer = transferUpload(row.key, client, wait);
+    if (action === "cancel") await cancelUpload(row.key);
+    else discardUploads(row.origin, row.identity);
+    release(json({ upload_id: "admitted", offset: 0, chunk_bytes: 4 }));
+    await transfer;
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) => init?.method === "DELETE" && String(url).endsWith("/admitted"),
+      ),
+    ).toBe(true);
+    expect(requests.some((request) => request.method === "PATCH")).toBe(false);
+    if (action === "cancel") expect(useUploadStore.getState().rows.id.status).toBe("cancelled");
+    else expect(useUploadStore.getState().rows.id).toBeUndefined();
+  },
+);
+
+it("reconciles a committed DELETE receipt after cancellation wins the response race", async () => {
+  vi.useFakeTimers();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  const result = {
+    path: "src/a.bin",
+    final_name: "a.bin",
+    size: 20,
+    sha256: "digest",
+    outcome: "replaced",
+  };
+  let finalizing!: () => void;
+  const reachedComplete = new Promise<void>((resolve) => {
+    finalizing = resolve;
+  });
+  fetchMock.mockImplementation((url, init) => {
+    if (String(url).endsWith("/complete"))
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject(new DOMException("Cancelled", "AbortError")),
+        );
+        finalizing();
+      });
+    if (init?.method === "DELETE") return Promise.resolve(json(result));
+    return server(url, init);
+  });
+  const transfer = transferUpload(row.key, client, wait);
+  await reachedComplete;
+  await cancelUpload(row.key);
+  await transfer;
+  expect(useUploadStore.getState().rows.id).toMatchObject({
+    status: "done",
+    offset: 20,
+    file: undefined,
+    result,
+  });
+  expect(toast).toHaveBeenCalledWith("1 of 1 uploaded");
+  expect(toast).not.toHaveBeenCalledWith(expect.stringContaining("cancelled"));
+  await vi.advanceTimersByTimeAsync(300);
+  expect(invalidate).toHaveBeenCalledWith({
+    queryKey: ["workspace-dir", "s", "src"],
+    refetchType: "active",
+  });
+});
+
+it("does not resurrect a conflict cancelled while retry DELETE is pending", async () => {
+  useUploadStore.getState().update(row.key, { status: "conflict", uploadId: "remote" });
+  let release!: (response: Response) => void;
+  const deleted = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  fetchMock.mockReturnValue(deleted);
+  let resurrected = false;
+  const unsubscribe = useUploadStore.subscribe((state) => {
+    const live = state.rows[row.key];
+    if (live?.status === "queued" && !live.file) {
+      resurrected = true;
+      state.update(row.key, { status: "failed", error: "File missing" });
+    }
+  });
+  try {
+    const retry = retryUpload(row.key, client, "rename");
+    const cancel = cancelUpload(row.key);
+    release(new Response(null, { status: 204 }));
+    await Promise.all([retry, cancel]);
+    expect(resurrected).toBe(false);
+    expect(useUploadStore.getState().rows.id).toMatchObject({
+      status: "cancelled",
+      file: undefined,
+    });
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "DELETE")).toHaveLength(1);
+  } finally {
+    unsubscribe();
+  }
+});
+
+it("serializes conflict retries while DELETE is pending", async () => {
+  useUploadStore.getState().update(row.key, { status: "conflict", uploadId: "remote" });
+  let release!: (response: Response) => void;
+  const deleted = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  fetchMock.mockReturnValue(deleted);
+  const first = retryUpload(row.key, client, "rename");
+  const second = retryUpload(row.key, client, "replace");
+  const deletes = fetchMock.mock.calls.length;
+  const cancel = cancelUpload(row.key);
+  release(new Response(null, { status: 204 }));
+  await Promise.allSettled([first, second, cancel]);
+  discardUploads(row.origin, row.identity);
+  expect(deletes).toBe(1);
+});
+
+it("fails a queued row without a File instead of repumping it", () => {
+  useUploadStore.getState().update(row.key, { file: undefined });
+  try {
+    pumpUploads(row, client);
+    expect(useUploadStore.getState().rows.id).toMatchObject({
+      status: "failed",
+      error: expect.stringMatching(/file.*(unavailable|missing|select)/i),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  } finally {
+    discardUploads(row.origin, row.identity);
+  }
+});
+
+it.each(["busy", "upload_limit"])(
+  "completes after four consecutive %s replies without spending the transient budget",
+  async (code) => {
+    let replies = 0;
+    fetchMock.mockImplementation((url, init) => {
+      if (init?.method === "PATCH" && replies++ < 4)
+        return Promise.resolve(
+          errorResponse(429, code, { "Retry-After": code === "busy" ? "2" : "60" }),
+        );
+      return server(url, init);
+    });
+    await transferUpload(row.key, client, wait);
+    expect(useUploadStore.getState().rows.id.status).toBe("done");
+    expect(wait).toHaveBeenCalledTimes(4);
+    expect(wait).toHaveBeenCalledWith(code === "busy" ? 2000 : 60_000, row.controller.signal);
+    expect(requests.some((request) => request.method === "HEAD")).toBe(false);
+  },
+);
+
+it.each([
+  [1, "Uploading 1 file to src"],
+  [2, "Uploading 2 files to src"],
+])("announces a grammatical start for %s files", (count, message) => {
+  fetchMock.mockResolvedValue(errorResponse(503, "runner_capability_mismatch"));
+  useUploadStore.setState({ rows: {} });
+  enqueueUploads(
+    row,
+    Array.from({ length: Number(count) }, () => row.file!),
+    "src",
+    "src",
+    row.limits,
+    client,
+  );
+  expect(useUploadStore.getState().announcement).toBe(message);
 });
