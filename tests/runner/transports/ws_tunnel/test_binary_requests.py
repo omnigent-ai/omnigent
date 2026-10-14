@@ -1419,7 +1419,10 @@ async def test_hello_waits_for_upload_readiness_and_recovers(
     monkeypatch.setattr(os_env_upload.UploadHelperClient, "call", call)
     monkeypatch.setattr(os_env_upload.UploadHelperClient, "close", close)
     monkeypatch.setattr(serve_module, "runner_primary_session_id", lambda: "session")
-    monkeypatch.setattr(serve_module, "_UPLOAD_HELLO_PROBE_TIMEOUT_S", 0.1)
+    default_timeout = serve_module._UPLOAD_HELLO_PROBE_TIMEOUT_S
+    # Only the timeout case races the deadline; the rest wait for the probe outcome.
+    if mode == "timeout":
+        monkeypatch.setattr(serve_module, "_UPLOAD_HELLO_PROBE_TIMEOUT_S", 0.1)
     manager = workspace_upload.register_upload_routes(
         app,
         resolve_environment=environment,
@@ -1441,6 +1444,7 @@ async def test_hello_waits_for_upload_readiness_and_recovers(
             mode in ("ready", "lifecycle")
         )
         await asyncio.wait_for(initial.probe, 0.5)
+        monkeypatch.setattr(serve_module, "_UPLOAD_HELLO_PROBE_TIMEOUT_S", default_timeout)
         if mode == "lifecycle":
             await manager.stop()
             await manager.start()
