@@ -23,7 +23,13 @@ import {
   type UploadOwner,
 } from "@/lib/workspaceUploadsApi";
 import { cancelUpload, enqueueUploads, retryUpload } from "@/lib/workspaceUploadController";
-import { isActiveUpload, ownerKey, uploadTotals, useUploadStore } from "@/store/uploadStore";
+import {
+  isActiveUpload,
+  ownerKey,
+  uploadTotals,
+  useUploadStore,
+  type UploadRow,
+} from "@/store/uploadStore";
 import { useChatStore } from "@/store/chatStore";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { Button } from "@/components/ui/button";
@@ -231,6 +237,10 @@ export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
   );
 }
 
+function uploadPercent(row: UploadRow): number {
+  return row.size ? (row.offset / row.size) * 100 : row.status === "done" ? 100 : 0;
+}
+
 export function UploadsTray({ visible }: { visible: boolean }) {
   const context = useContext(UploadContext);
   const allRows = useUploadStore((state) => state.rows);
@@ -312,13 +322,13 @@ export function UploadsTray({ visible }: { visible: boolean }) {
                 </p>
                 <Progress.Root
                   aria-label={`${row.name} upload progress`}
-                  value={row.size ? (row.offset / row.size) * 100 : row.status === "done" ? 100 : 0}
+                  value={uploadPercent(row)}
                   className="relative flex h-1 w-full overflow-hidden rounded-full bg-muted"
                 >
                   <Progress.Indicator
                     className="h-full bg-primary"
                     style={{
-                      width: `${row.size ? (row.offset / row.size) * 100 : row.status === "done" ? 100 : 0}%`,
+                      width: `${uploadPercent(row)}%`,
                     }}
                   />
                 </Progress.Root>
@@ -326,9 +336,7 @@ export function UploadsTray({ visible }: { visible: boolean }) {
                   <span>
                     {row.status === "connecting"
                       ? "Connecting…"
-                      : row.status === "done"
-                        ? "Done"
-                        : row.status.charAt(0).toUpperCase() + row.status.slice(1)}
+                      : row.status.charAt(0).toUpperCase() + row.status.slice(1)}
                   </span>
                   <span className="tabular-nums">
                     {formatBytes(row.offset)} / {formatBytes(row.size)}
