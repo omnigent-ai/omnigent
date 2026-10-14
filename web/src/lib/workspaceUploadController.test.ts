@@ -375,6 +375,53 @@ it("coalesces session-wide refetches across folders and refreshes each folder li
     expect(count(queryKey)).toBe(1);
 });
 
+it("flushes session-wide refetches during a sustained completion stream", async () => {
+  discardUploads(row.origin, row.identity);
+  vi.useFakeTimers();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  const result = {
+    path: "a.bin",
+    final_name: "a.bin",
+    size: 20,
+    sha256: "hash",
+    outcome: "created" as const,
+  };
+  const sessionKeys = [
+    ["workspace-all-files", "s"],
+    ["workspace-changed-files", "s"],
+    ["workspace-file-search", "s"],
+    ["workspace-dir-listing", "s"],
+  ];
+  const counts = () =>
+    sessionKeys.map(
+      (queryKey) =>
+        invalidate.mock.calls.filter(
+          ([arg]) => JSON.stringify(arg?.queryKey) === JSON.stringify(queryKey),
+        ).length,
+    );
+  // Completions 200 ms apart for 4 s never let the 300 ms trailing debounce settle.
+  for (let i = 0; i < 20; i++)
+    setTimeout(
+      () => refreshUploadedFiles(client, { ...row, directory: `d${i % 3}` }, result),
+      i * 200,
+    );
+  await vi.advanceTimersByTimeAsync(4000);
+  const during = counts();
+  for (const count of during) {
+    expect(count).toBeGreaterThanOrEqual(1);
+    expect(count).toBeLessThanOrEqual(3);
+  }
+  await vi.advanceTimersByTimeAsync(100);
+  expect(counts()).toEqual(during.map((count) => count + 1));
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(counts()).toEqual(during.map((count) => count + 1));
+
+  refreshUploadedFiles(client, row, result);
+  discardUploads(row.origin, row.identity);
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(counts()).toEqual(during.map((count) => count + 1));
+});
+
 it("cancels retry waits and distinguishes long upload-limit backoff from busy", async () => {
   vi.useFakeTimers();
   const controller = new AbortController();
