@@ -7579,6 +7579,10 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
 
         types = [i.type for i in store.appended_items]
         assert types == ["message", "error"], types
+        # A failure inside a turn still reaches the web as that turn's own card.
+        assert [e.get("type") for e in published if e.get("type") == "response.failed"] == [
+            "response.failed"
+        ]
         # The runner's failed edge names its turn; the relay keeps that id so the
         # web folds the edge into the response's own error card.
         failed_edges = [
@@ -7840,17 +7844,19 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
 
 
 @pytest.mark.asyncio
-async def test_setup_failure_failed_event_settles_input_without_a_response_id() -> None:
+async def test_setup_failure_failed_event_settles_input_without_a_response_id(
+    published_stream_events: list[dict[str, Any]],
+) -> None:
     """A runner setup failure settles its input and foils the later false missing-report.
 
     A codex-native turn that fails during runner setup (e.g. the bridge
     labels lookup) never emitted ``response.in_progress``, so its
     ``response.failed`` carries no response id — only ``input_stable_id``
     and ``error.undelivered``. The relay must still settle exactly that
-    queued entry (minting a response id for it), persist no error item from
-    the id-less event (the ``session.status: failed`` edge owns the one
-    card), and leave the queue clean so the next message's own mirror
-    matches without skipping a stale entry into a false
+    queued entry (minting a response id for it), neither persist nor
+    forward the id-less event (the ``session.status: failed`` edge owns the
+    one card, live and on reload), and leave the queue clean so the next
+    message's own mirror matches without skipping a stale entry into a false
     ``native_prompt_not_recorded``.
     """
     from omnigent.runtime import pending_inputs
@@ -7922,6 +7928,21 @@ async def test_setup_failure_failed_event_settles_input_without_a_response_id() 
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
             next_pending
         ]
+        # Live, the failed status edge is the only card: the id-less event isn't
+        # forwarded, so it can't add a second one under the previous turn's id.
+        assert not [e for e in published_stream_events if e.get("type") == "response.failed"]
+        failed_edges = [
+            e
+            for e in published_stream_events
+            if e.get("type") == "session.status" and e.get("status") == "failed"
+        ]
+        assert [(e["error"]["code"], e.get("response_id")) for e in failed_edges] == [
+            ("runner_error", None)
+        ]
+        consumed = [
+            e for e in published_stream_events if e.get("type") == "session.input.consumed"
+        ]
+        assert [e["data"]["cleared_pending_id"] for e in consumed] == [first_pending]
 
         await _persist_external_conversation_item(
             sid,

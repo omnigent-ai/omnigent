@@ -8894,6 +8894,18 @@ async def _relay_runner_stream_once(
                                         _usage_conv,
                                     )
 
+                    # A turnless undelivered failure only settles its input above; the
+                    # runner's failed status edge that follows is its one card, as on
+                    # reload, so forwarding this would add a second under the prior turn.
+                    _failed_response = event.get("response")
+                    if (
+                        evt_type == "response.failed"
+                        and current_response_id is None
+                        and not (isinstance(_failed_response, dict) and _failed_response.get("id"))
+                        and _failed_event_undelivered(event)
+                    ):
+                        continue
+
                     # Reset the turn-scoped response_id on any
                     # terminal event so it doesn't leak to the
                     # next turn.
