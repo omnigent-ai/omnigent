@@ -248,8 +248,16 @@ export async function transferUpload(
         void deleteUpload(cleanup, client).finally(() => settleCancellation(cleanup));
     } else {
       const message = error instanceof Error ? error.message : "Upload failed";
-      update({ status: "failed", error: message });
+      const cleanup = { ...(store().rows[key] ?? admitted), file: undefined };
+      update({
+        status: "failed",
+        error: message,
+        uploadId: undefined,
+        offset: 0,
+        cancellationPending: Boolean(cleanup.uploadId),
+      });
       store().announce(`${initial.name} upload failed: ${message}`);
+      if (cleanup.uploadId) void deleteUpload(cleanup, client);
     }
   } finally {
     if (transfers.get(key) === initial.controller) transfers.delete(key);
@@ -412,23 +420,35 @@ function deleteUpload(
 }
 
 export function cancelUpload(key: string): Promise<void> {
-  const row = useUploadStore.getState().rows[key];
-  if (!row || !isActiveUpload(row) || row.cancellationPending) return Promise.resolve();
-  const transferring = transfers.get(key) === row.controller;
-  row.controller.abort();
-  useUploadStore.getState().update(key, {
-    status: "cancelled",
-    file: undefined,
-    cancellationPending: true,
+  return cancelUploads([key]);
+}
+
+export function cancelUploads(keys: string[]): Promise<void> {
+  const store = useUploadStore.getState();
+  const rows = Array.from(new Set(keys)).flatMap((key) => {
+    const row = store.rows[key];
+    return row && isActiveUpload(row) && !row.cancellationPending
+      ? [{ ...row, file: undefined, transferring: transfers.get(key) === row.controller }]
+      : [];
   });
-  if (transferring) transfers.delete(key);
-  const client = clients.get(row.controller);
-  const cleanup = { ...row, file: undefined };
-  if (client) pumpUploads(cleanup, client);
-  const creating = createCancellations.get(row.controller);
-  return (creating ?? deleteUpload(cleanup, client)).finally(() => {
-    if (creating || cleanup.uploadId || !transferring) settleCancellation(cleanup);
+  // Cancel every selected row before releasing slots or admitting queued work.
+  for (const row of rows)
+    store.update(row.key, { status: "cancelled", file: undefined, cancellationPending: true });
+  const owners = new Map<string, { row: UploadRow; client: QueryClient }>();
+  for (const row of rows) {
+    row.controller.abort();
+    if (row.transferring) transfers.delete(row.key);
+    const client = clients.get(row.controller);
+    if (client) owners.set(ownerKey(row), { row, client });
+  }
+  const cancellations = rows.map((row) => {
+    const creating = createCancellations.get(row.controller);
+    return (creating ?? deleteUpload(row)).finally(() => {
+      if (creating || row.uploadId || !row.transferring) settleCancellation(row);
+    });
   });
+  for (const { row, client } of owners.values()) pumpUploads(row, client);
+  return Promise.all(cancellations).then(() => undefined);
 }
 
 function batchSummary(batch: string): void {
@@ -525,7 +545,13 @@ export async function retryUpload(
   conflict?: ConflictChoice,
 ): Promise<void> {
   const row = useUploadStore.getState().rows[key];
-  if (!row?.file || !["failed", "conflict"].includes(row.status) || deciding.has(key)) return;
+  if (
+    !row?.file ||
+    row.cancellationPending ||
+    !["failed", "conflict"].includes(row.status) ||
+    deciding.has(key)
+  )
+    return;
   deciding.add(key);
   clients.set(row.controller, client);
   try {
