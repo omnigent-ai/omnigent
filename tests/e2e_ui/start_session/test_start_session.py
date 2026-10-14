@@ -1317,6 +1317,9 @@ async def _drive_keeps_offline_host_selected(
             assert create_bodies == []
 
             # Only an explicit destination change permits creation elsewhere.
+            if managed:
+                # With a host picked, sandbox rows sit behind "See more".
+                await page.get_by_test_id("new-chat-landing-sandbox-see-more").click()
             replacement = (
                 "new-chat-landing-sandbox-option"
                 if managed
@@ -1830,6 +1833,8 @@ async def _drive_managed_sandbox_after_slow_info(base_url: str, session_id: str)
             # present, proving the SPA adopted the late /v1/info rather than
             # staying pinned to the fail-closed fallback (where it never appears).
             await page.get_by_test_id("new-chat-landing-host-chip").click()
+            # The connected host is picked, so sandbox rows sit behind "See more".
+            await page.get_by_test_id("new-chat-landing-sandbox-see-more").click()
             sandbox_option = page.get_by_test_id("new-chat-landing-sandbox-option")
             await expect(sandbox_option).to_be_visible(timeout=15_000)
             await expect(sandbox_option).to_contain_text("Databricks Sandbox")

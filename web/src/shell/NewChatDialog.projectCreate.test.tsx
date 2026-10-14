@@ -55,6 +55,12 @@ import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
+// Sandbox rows sit behind "See more" unless a sandbox is already picked.
+function revealSandboxRows() {
+  const more = screen.queryByTestId("new-chat-landing-sandbox-see-more");
+  if (more) fireEvent.click(more);
+}
+
 // A project-driven visit (`?project=` resolved to a first-class project id)
 // creates the session WITH `project_id`: the server files it atomically and
 // default-fills config-seeded fields the composer omits. These tests pin the
@@ -505,6 +511,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    revealSandboxRows();
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
 
     const body = await submitAndReadBody();
