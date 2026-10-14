@@ -48,6 +48,7 @@ const mocks = vi.hoisted(() => ({
   bulkArchiveMutate: vi.fn(),
   bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
+  webfontsEnabled: true,
   importSessionsPanel: vi.fn(() => null),
   enabledConnections: [] as string[],
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
@@ -96,6 +97,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           sibling_sessions: mocks.nestedAgents,
           enabled_connections: mocks.enabledConnections,
           session_title_instructions: mocks.sessionTitleInstructions,
+          features: { webfonts: mocks.webfontsEnabled },
         },
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
@@ -295,6 +297,7 @@ beforeEach(() => {
   mocks.bootFallback = false;
   mocks.sessionTitleInstructions = false;
   mocks.nestedAgents = false;
+  mocks.webfontsEnabled = true;
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
@@ -1254,7 +1257,7 @@ describe("SettingsPage", () => {
     document.documentElement.style.removeProperty("--ui-mono-font-family");
     renderPage("/settings/appearance");
     const trigger = screen.getByTestId("fixed-width-font-family-trigger");
-    expect(trigger).toHaveTextContent("Default");
+    expect(trigger).toHaveTextContent("Monospace default");
     expect(document.documentElement.style.getPropertyValue("--ui-mono-font-family")).toBe("");
 
     fireEvent.click(trigger);
@@ -1270,6 +1273,75 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("fixed-width-font-family-trigger")).toHaveTextContent(
       "IBM Plex Mono",
     );
+  });
+
+  it("hides downloadable fonts when disabled and keeps defaults and installed fonts usable", () => {
+    mocks.webfontsEnabled = false;
+    localStorage.clear();
+    renderPage("/settings/appearance");
+
+    expect(screen.getByTestId("ui-font-family-trigger")).toHaveTextContent("System default");
+    expect(screen.getByTestId("fixed-width-font-family-trigger")).toHaveTextContent(
+      "Monospace default",
+    );
+    expect(screen.getByTestId("code-font-family-trigger")).toHaveTextContent("Editor default");
+
+    for (const [testId, catalogFamily] of [
+      ["ui-font-family", "Inter"],
+      ["fixed-width-font-family", "IBM Plex Mono"],
+      ["code-font-family", "Fira Code"],
+    ]) {
+      fireEvent.click(screen.getByTestId(`${testId}-trigger`));
+      expect(screen.queryByTestId(`${testId}-option-${catalogFamily}`)).toBeNull();
+      fireEvent.click(screen.getByTestId(`${testId}-trigger`));
+    }
+
+    expect(document.querySelector("link[data-omnigent-font]")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("fixed-width-font-family-trigger"));
+    fireEvent.change(screen.getByTestId("fixed-width-font-family-input"), {
+      target: { value: "Menlo" },
+    });
+    fireEvent.click(screen.getByTestId("fixed-width-font-family-option-custom"));
+
+    expect(localStorage.getItem("omnigent:fixed-width-font-family")).toBe(JSON.stringify("Menlo"));
+    expect(document.documentElement.style.getPropertyValue("--ui-mono-font-family")).toBe(
+      "Menlo, var(--font-mono)",
+    );
+  });
+
+  it("uses catalog descriptions only while downloadable fonts are enabled", () => {
+    const { unmount } = renderPage("/settings/appearance");
+
+    expect(
+      screen.getByText(
+        "Interface text font. Pick from the catalog or type any font installed on this device.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Font for the code editor and terminal. Pick from the catalog or type any font installed on this device.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Monospace font for file paths, hashes, and inline code in the interface."),
+    ).toBeInTheDocument();
+
+    unmount();
+    mocks.webfontsEnabled = false;
+    renderPage("/settings/appearance");
+
+    expect(
+      screen.getByText(
+        "Use any font installed on this device. Leave blank for the system default.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Font for the code editor and terminal. Leave blank for the default."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Monospace font for file paths, hashes, and inline code in the interface."),
+    ).toBeInTheDocument();
   });
 
   it("keeps the fixed-width chrome font isolated from the code (Monaco/xterm) font", () => {

@@ -35,7 +35,7 @@ import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { CapabilitiesContext } from "./lib/CapabilitiesContext";
 import { createBootServerInfo } from "./lib/bootCapabilities";
-import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
+import { isFeatureEnabled, resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { EmbeddedProvider } from "./lib/embedded";
 import {
   type OmnigentHostConfig,
@@ -68,9 +68,10 @@ import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { restoreFontPreferences } from "./lib/restoreFontPreferences";
+import { setWebFontsEnabled } from "./lib/webFontLoader";
 
-// Restore the saved font preferences (and kick off any catalog webfont loads)
-// when the embed module loads. The UI/code font controls stay visible when
+// Restore saved font CSS when the embed module loads. Downloadable fonts wait
+// for the server capability probe. The UI/code font controls stay visible when
 // embedded (per-device readability prefs that don't conflict with host theming),
 // so a chosen font must be applied + fetched here just as standalone does in
 // main.tsx — otherwise the selection would only take effect on the next Settings
@@ -149,11 +150,17 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let alive = true;
     const boot = createBootServerInfo(resolveServerInfo());
+    function applyCapabilities(resolved: ServerInfo): void {
+      const webfontsEnabled = isFeatureEnabled(resolved, "webfonts");
+      setWebFontsEnabled(webfontsEnabled);
+      if (webfontsEnabled) restoreFontPreferences();
+      setInfo(resolved);
+    }
     void boot.initial.then((resolved) => {
-      if (alive) setInfo(resolved);
+      if (alive) applyCapabilities(resolved);
     });
     void boot.settled.then((resolved) => {
-      if (alive) setInfo(resolved);
+      if (alive) applyCapabilities(resolved);
     });
     return () => {
       alive = false;

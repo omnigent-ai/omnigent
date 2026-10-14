@@ -132,6 +132,7 @@ import {
 import { isAdminViewEnabled, setAdminViewEnabled } from "@/lib/adminView";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -2280,6 +2281,8 @@ function UiFontSizeControl() {
  */
 function UiFontFamilyControl() {
   const [family, setFamily] = useState(() => readUiFontFamily());
+  const info = useServerInfo();
+  const catalogEnabled = isFeatureEnabled(info, "webfonts");
 
   const update = useCallback((next: string) => {
     setFamily(next);
@@ -2292,10 +2295,15 @@ function UiFontFamilyControl() {
       <SettingsLabel
         label="Font family"
         className="flex-1"
-        description="Interface text font. Pick from the catalog or type any font installed on this device."
+        description={
+          catalogEnabled
+            ? "Interface text font. Pick from the catalog or type any font installed on this device."
+            : "Use any font installed on this device. Leave blank for the system default."
+        }
       />
       <FontFamilyCombobox
         category="sans"
+        catalogEnabled={catalogEnabled}
         value={family}
         onChange={update}
         defaultLabel="System default"
@@ -2318,6 +2326,8 @@ function UiFontFamilyControl() {
  */
 function FixedWidthFontFamilyControl() {
   const [family, setFamily] = useState(() => readFixedWidthFontFamily());
+  const info = useServerInfo();
+  const catalogEnabled = isFeatureEnabled(info, "webfonts");
 
   const update = useCallback((next: string) => {
     setFamily(next);
@@ -2334,9 +2344,10 @@ function FixedWidthFontFamilyControl() {
       />
       <FontFamilyCombobox
         category="fixedWidth"
+        catalogEnabled={catalogEnabled}
         value={family}
         onChange={update}
-        defaultLabel="Default"
+        defaultLabel="Monospace default"
         ariaLabel="Fixed width font family"
         testId="fixed-width-font-family"
         previewFallback="var(--font-mono)"
@@ -2456,6 +2467,8 @@ function UiCodeFontSizeControl() {
  */
 function UiCodeFontFamilyControl() {
   const [family, setFamily] = useState(() => readCodeFontFamily());
+  const info = useServerInfo();
+  const catalogEnabled = isFeatureEnabled(info, "webfonts");
 
   const update = useCallback((next: string) => {
     setFamily(next);
@@ -2471,10 +2484,15 @@ function UiCodeFontFamilyControl() {
       <SettingsLabel
         label="Code font family"
         className="flex-1"
-        description="Font for the code editor and terminal. Pick from the catalog or type any installed font."
+        description={
+          catalogEnabled
+            ? "Font for the code editor and terminal. Pick from the catalog or type any font installed on this device."
+            : "Font for the code editor and terminal. Leave blank for the default."
+        }
       />
       <FontFamilyCombobox
         category="code"
+        catalogEnabled={catalogEnabled}
         value={family}
         onChange={update}
         defaultLabel="Editor default"
