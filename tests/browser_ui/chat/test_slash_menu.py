@@ -1,6 +1,7 @@
 """Browser-only contracts for native slash-menu interaction."""
 
 import time
+from urllib.parse import quote
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -10,6 +11,128 @@ _ROWS = "[data-testid^='slash-menu-item-']"
 
 def _composer(page: Page):
     return page.get_by_label("Message the agent")
+
+
+@pytest.mark.parametrize(
+    ("project_kind", "gesture"),
+    [
+        ("none", "enter"),
+        ("id", "tab-enter"),
+        ("legacy", "click"),
+        ("snapshot", "enter"),
+        ("partial", "enter"),
+    ],
+)
+def test_new_command_opens_landing_in_current_project(
+    page: Page, chat_session_contract, project_kind: str, gesture: str
+) -> None:
+    handle = chat_session_contract
+    project_name = "Customer X & tools"
+    project = {"id": "project-new", "name": project_name, "config": {}}
+    handle.contract.json(f"/v1/hosts/{handle.host_id}/filesystem", {"path": "/", "entries": []})
+    if project_kind != "none":
+        handle.contract.json("/v1/projects", {"object": "list", "data": [project]})
+        handle.contract.json("/v1/projects/project-new", project)
+        if project_kind == "legacy":
+            handle.update_session(labels={"omni_project": project_name})
+        else:
+            handle.update_session(project_id=project["id"])
+        if project_kind == "snapshot":
+            handle.contract.json("/v1/sessions", {"object": "list", "data": []})
+        if project_kind == "partial":
+            row = handle.session_snapshot()
+            row.pop("project_id", None)
+            handle.contract.json("/v1/sessions", {"object": "list", "data": [row]})
+        if project_kind == "id":
+            handle.harness = "codex-native"
+            handle.update_session(labels={"omnigent.wrapper": "codex-native-ui"})
+            handle.contract.json(f"/v1/sessions/{handle.session_id}/codex_goal", {"goal": None})
+
+    page.goto(handle.url)
+    composer = _composer(page)
+    expect(composer).to_be_visible()
+    composer.fill("/n" if gesture == "tab-enter" else "/new")
+    command = page.get_by_test_id("slash-menu-item-new")
+    expect(command).to_have_attribute("data-active", "true")
+    expect(command).to_contain_text("/new")
+    expect(command).not_to_contain_text("New session")
+    expect(command).to_contain_text("Start a blank session in the same project")
+    if gesture == "tab-enter":
+        composer.press("Tab")
+        expect(composer).to_have_value("/new ")
+        expect(page).to_have_url(handle.url)
+    if gesture == "click":
+        command.click()
+    else:
+        composer.press("Enter")
+
+    target = f"{handle.base_url}/"
+    if project_kind != "none":
+        target += f"?project={quote(project_name, safe='')}"
+    expect(page).to_have_url(target)
+    if project_kind != "none":
+        expect(page.get_by_role("heading", name=project_name, exact=True, level=1)).to_be_visible()
+    assert handle.event_posts == []
+    page.go_back()
+    expect(_composer(page)).to_have_value("")
+
+
+def test_new_command_respects_unfiled_sidebar_row(page: Page, chat_session_contract) -> None:
+    handle = chat_session_contract
+    handle.update_session(project_id="old-project", labels={"omni_project": "Old project"})
+    row = {**handle.session_snapshot(), "project_id": None, "labels": {}}
+    handle.contract.json("/v1/sessions", {"object": "list", "data": [row]})
+    handle.contract.json(f"/v1/hosts/{handle.host_id}/filesystem", {"path": "/", "entries": []})
+    page.goto(handle.url)
+    composer = _composer(page)
+    expect(composer).to_be_visible()
+    composer.fill("/new")
+    composer.press("Enter")
+    expect(page).to_have_url(f"{handle.base_url}/")
+    assert handle.event_posts == []
+
+
+def test_new_command_deleted_project_opens_unfiled(page: Page, chat_session_contract) -> None:
+    handle = chat_session_contract
+    handle.update_session(project_id="deleted", labels={"omni_project": "Deleted project"})
+    handle.contract.json(
+        "/v1/projects/deleted", {"error": {"message": "Project not found"}}, status=404
+    )
+    handle.contract.json(f"/v1/hosts/{handle.host_id}/filesystem", {"path": "/", "entries": []})
+    page.goto(handle.url)
+    composer = _composer(page)
+    expect(composer).to_be_visible()
+    composer.fill("/new")
+    composer.press("Enter")
+    expect(page).to_have_url(f"{handle.base_url}/")
+    assert handle.event_posts == []
+
+
+def test_new_command_project_lookup_error_is_visible_and_retryable(
+    page: Page, chat_session_contract
+) -> None:
+    handle = chat_session_contract
+    handle.update_session(project_id="project-new", labels={"omni_project": "Stale name"})
+    handle.contract.json("/v1/projects/project-new", {"message": "Unavailable"}, status=503)
+    page.goto(handle.url)
+    composer = _composer(page)
+    expect(composer).to_be_visible()
+    composer.fill("/new")
+    composer.press("Enter")
+    expect(
+        page.get_by_text("Couldn't open a new session in this project. Please try again.")
+    ).to_be_visible()
+    expect(page).to_have_url(handle.url)
+    assert handle.event_posts == []
+
+    project = {"id": "project-new", "name": "Current name", "config": {}}
+    handle.contract.json("/v1/projects/project-new", project)
+    handle.contract.json("/v1/projects", {"object": "list", "data": [project]})
+    handle.contract.json(f"/v1/hosts/{handle.host_id}/filesystem", {"path": "/", "entries": []})
+    composer.fill("/new")
+    composer.press("Enter")
+    expect(page).to_have_url(f"{handle.base_url}/?project=Current%20name")
+    assert handle.event_posts == []
 
 
 def test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation(

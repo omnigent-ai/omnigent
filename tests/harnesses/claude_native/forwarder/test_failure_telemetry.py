@@ -23,6 +23,7 @@ async def test_hook_category_and_identity_survive_retry(tmp_path: Path) -> None:
             "hook_event_name": "StopFailure",
             "session_id": "native-session",
             "error": "server_error",
+            "error_details": "API Error: 500 Overloaded",
             "last_assistant_message": "I am waiting for a background task.",
         },
     )
@@ -59,13 +60,13 @@ async def test_hook_category_and_identity_survive_retry(tmp_path: Path) -> None:
     first, second = [request["data"] for request in requests]
     assert first == second
     assert second["failure_context"]["native_error_category"] == "server_error"
-    assert second["failure_context"]["detail_source"] == "hook_last_assistant_message"
+    assert second["failure_context"]["detail_source"] == "hook_error_details"
     assert second["failure_context"]["failure_id"]
     assert second["failure_context"]["native_hook_recorded_at"] > 0
     assert second["failure_context"]["native_session_id"] == "native-session"
     assert second["failure_context"]["diagnostic_capture_enabled"] is False
     assert second["response_id"] == "resp_synthetic"
-    assert second["failure_detail"] == "I am waiting for a background task."
+    assert second["failure_detail"] == "API Error: 500 Overloaded"
     assert "native_api_error_message" not in second["failure_context"]
 
 
@@ -80,7 +81,7 @@ async def test_hook_telemetry_failure_does_not_block_status(
             "hook_event_name": "StopFailure",
             "session_id": "native-session",
             "error": "server_error",
-            "last_assistant_message": "Generation failed.",
+            "error_details": "Generation failed.",
         },
     )
 
@@ -387,7 +388,7 @@ def test_hook_inference_fields_are_parsed_before_display_truncation(tmp_path: Pa
             "hook_event_name": "StopFailure",
             "session_id": "native-session",
             "error": "invalid_request",
-            "last_assistant_message": error_text,
+            "error_details": error_text,
         },
     )
     (record,) = bridge.read_hook_events_since_with_position(bridge_dir, 0).records

@@ -12,7 +12,6 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from functools import partial
 from importlib import import_module
 from itertools import batched, groupby
 from pathlib import Path
@@ -79,7 +78,12 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
-from omnigent.server.auth import AuthProvider, SharingMode, auth_mode
+from omnigent.server.auth import (
+    AuthProvider,
+    SharingMode,
+    auth_mode,
+    authentication_requires_identity,
+)
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
@@ -87,6 +91,7 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
+from omnigent.server.mcp_gateway import McpGatewayBackend
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -185,6 +190,7 @@ class ServerInfoResponse(BaseModel):
     enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
+    public_sharing_max_level: Literal["read", "edit"] = "read"
     server_version: str
     smart_routing_enabled: bool
     smart_routing_sources: SmartRoutingSourcesInfo
@@ -197,6 +203,8 @@ class ServerInfoResponse(BaseModel):
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
+    # GET /v1/agents/{id}; absent on older servers, which clients treat as unsupported.
+    agent_detail: bool = False
     branding: BrandingInfo
 
 
@@ -1330,8 +1338,11 @@ def create_app(
     github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
     databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
     databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
+    mcp_registry: Any | None = None,
+    mcp_gateway_backend: McpGatewayBackend | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
+    public_sharing_max_level: str | Callable[[], str] | None = None,
     default_public_sessions: str | Callable[[], str] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
@@ -1454,6 +1465,12 @@ def create_app(
         falsy — ``0``/``false``/``no``/``off``), failing open to enabled
         when unset. Reported by ``GET /v1/info`` as
         ``public_sharing_enabled``.
+    :param public_sharing_max_level: Maximum effective ``__public__`` permission,
+        ``"read"`` (default) or ``"edit"``. Edit requires authenticated multi-user
+        access, including accounts, OIDC and trusted-header deployments.
+        ``None`` uses ``OMNIGENT_PUBLIC_SHARING_MAX_LEVEL`` with a file-backed
+        admin override. A static value or callable is deployment-managed.
+        The live ceiling also limits stored grants, without upgrading Read.
     :param default_public_sessions: Which new sessions start with a public
         read grant: ``"off"`` (all private), ``"sandbox"`` (managed cloud
         sandbox sessions only) or ``"all"``. Same shape as ``public_sharing``:
@@ -1542,6 +1559,8 @@ def create_app(
         # is the latter, not a false wrong-replica.
         host_registry=host_registry,
         host_store=host_store,
+        agent_store=agent_store,
+        agent_cache=agent_cache,
     )
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
@@ -1549,6 +1568,7 @@ def create_app(
         conversation_store=conversation_store,
         file_store=file_store,
         agent_store=agent_store,
+        agent_cache=agent_cache,
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
@@ -1842,10 +1862,46 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
-    if host_store is not None:
-        host_registry.launch_authorizer = partial(
-            host_store.admit_launch, require_account_owner=runner_account_store is not None
-        )
+    app.state.mcp_gateway_backend = mcp_gateway_backend
+    app.state.mcp_registry = mcp_registry
+    app.state.mcp_registry_auth = auth_provider
+    app.state.runner_tunnel_tokens = runner_tunnel_tokens
+
+    def _admit_host_launch(
+        host_id: str,
+        session_id: str,
+        owner: str | None,
+        generation: str | None,
+        allow_unbound: bool,
+        transfer_from_host_id: str | None,
+    ) -> None:
+        """Authorize the launch and validate its host against the saved agent."""
+        if host_store is not None:
+            host_store.admit_launch(
+                host_id,
+                session_id,
+                owner,
+                generation,
+                allow_unbound,
+                transfer_from_host_id,
+                require_account_owner=runner_account_store is not None,
+            )
+        from omnigent.host.frames import CAP_MCP_REGISTRY
+        from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+
+        connection = host_registry.get(host_id)
+        if connection is not None and CAP_MCP_REGISTRY not in connection.hello.capabilities:
+            conv = conversation_store.get_conversation(session_id)
+            if conv is not None:
+                require_session_registry_mcp_support(
+                    conv,
+                    connection.hello.capabilities,
+                    component="host",
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
+                )
+
+    host_registry.launch_authorizer = _admit_host_launch
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
@@ -1945,8 +2001,37 @@ def create_app(
         _public_static = bool(public_sharing)
         app.state.public_sharing = lambda: _public_static
         app.state.public_sharing_writable = False
+    from omnigent.server.sharing_settings import (
+        DefaultPublicSessions,
+        PublicSharingMaxLevel,
+        PublicSharingPolicyMiddleware,
+        public_sharing_max_level_env_default,
+        read_public_sharing_max_level_override,
+    )
+
+    app.state.public_edit_available = (
+        authentication_requires_identity(auth_provider) and permission_store is not None
+    )
+    _public_max_env = public_sharing_max_level_env_default()
+
+    def _resolve_public_sharing_max_level() -> PublicSharingMaxLevel:
+        from omnigent.server.auth import local_single_user_enabled
+
+        if not app.state.public_edit_available or local_single_user_enabled():
+            return PublicSharingMaxLevel.READ
+        if public_sharing_max_level is None:
+            override = read_public_sharing_max_level_override()
+            return override if override is not None else _public_max_env
+        value = (
+            public_sharing_max_level()
+            if callable(public_sharing_max_level)
+            else public_sharing_max_level
+        )
+        return PublicSharingMaxLevel.coerce(value)
+
+    app.state.public_sharing_max_level = _resolve_public_sharing_max_level
+    app.state.public_sharing_max_level_writable = public_sharing_max_level is None
     # Default-public policy for NEW sessions, same shape as public_sharing.
-    from omnigent.server.sharing_settings import DefaultPublicSessions
 
     if default_public_sessions is None:
         from omnigent.server.sharing_settings import (
@@ -2973,6 +3058,8 @@ def create_app(
             if getattr(app.state, f"{provider}_config", None) is not None
             and getattr(app.state, f"{provider}_store", None) is not None
         ]
+        if mcp_registry is not None:
+            enabled_connections.append("mcp")
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -3040,6 +3127,7 @@ def create_app(
                 "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
+                "public_sharing_max_level": app.state.public_sharing_max_level().value,
                 "server_version": _server_version(),
                 "smart_routing_enabled": smart_routing_enabled,
                 "smart_routing_sources": smart_routing_sources,
@@ -3049,6 +3137,7 @@ def create_app(
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,
                 "agent_install": agent_store.supports_user_agents,
+                "agent_detail": True,
                 "branding": branding_snapshot.config(),
             }
         )
@@ -3175,6 +3264,16 @@ def create_app(
         ),
         prefix="/v1",
         tags=["sessions"],
+    )
+    from omnigent.server.mcp_policy_adapter import McpPolicyAdapter
+    from omnigent.server.routes.mcp_gateway import create_mcp_gateway_router
+
+    app.include_router(
+        create_mcp_gateway_router(
+            McpPolicyAdapter(conversation_store, agent_store, auth_provider, permission_store)
+        ),
+        prefix="/v1",
+        tags=["mcp_gateway"],
     )
     app.include_router(
         create_imports_router(
@@ -3577,9 +3676,12 @@ def create_app(
         # cancel any pending disconnect-grace timer so it can't re-run the
         # disconnect reconciliation on top of it.
         _cancel_disconnect_grace(runner_id)
-        # A runner this replica saw connect already ran, so its idle sessions lost
-        # no work; a replica that never saw it has no stamp and keeps failing them.
-        runner_ran = session_live_state.last_liveness_stamp(runner_id) is not None
+        # Host connection evidence survives tunnel moves between replicas. Older
+        # hosts fall back to this replica's observed liveness.
+        runner_ran = (
+            runner_exit_reports.was_connected(runner_id)
+            or session_live_state.last_liveness_stamp(runner_id) is not None
+        )
         try:
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
@@ -3948,6 +4050,15 @@ def create_app(
             tags=["hosts"],
         )
 
+    if mcp_registry is not None:
+        from omnigent.server.routes.mcp_registry import create_mcp_registry_router
+
+        app.include_router(
+            create_mcp_registry_router(mcp_registry, auth_provider),
+            prefix="/v1",
+            tags=["mcp_registry"],
+        )
+
     # Per-user connection routes (/v1/connections/{provider}/*): connect /
     # callback / status / disconnect. One registry entry per provider; each is
     # mounted only when configured (config + store present), so an unconfigured
@@ -4222,6 +4333,7 @@ def create_app(
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
     app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
+    app.add_middleware(PublicSharingPolicyMiddleware, max_level=app.state.public_sharing_max_level)
     if resolved_base_path:
         # Added last → outermost ASGI layer, so the prefix is stripped before
         # routing and every other middleware sees canonical `/v1/...` paths.

@@ -19,7 +19,7 @@ const CONTENT: SkillContent = {
   name: "review",
   description: "Review diffs.",
   content:
-    "## Instructions\nRead the diff.\n![private image](https://example.test/pixel)\n<script>secret()</script>",
+    "## Instructions\nRead the diff.\n[guide](./GUIDE.md) [docs](https://example.test/docs)\n![private image](https://example.test/pixel)\n<script>secret()</script>",
   truncated: false,
 };
 let contentQuery: { data?: SkillContent; error?: unknown; isPending: boolean } = {
@@ -612,6 +612,10 @@ it("opens skill markdown only on demand and returns to Skills", () => {
   expect(screen.getByRole("heading", { name: "Instructions" })).toBeTruthy();
   expect(document.querySelector("img")).toBeNull();
   expect(document.querySelector("script")).toBeNull();
+  expect(screen.queryByRole("link", { name: "guide" })).toBeNull();
+  expect(screen.getByRole("link", { name: "docs" }).getAttribute("href")).toBe(
+    "https://example.test/docs",
+  );
   fireEvent.click(screen.getByRole("button", { name: "Skills" }));
   expect(screen.getByRole("tab", { name: "Skills · 1" }).getAttribute("aria-selected")).toBe(
     "true",

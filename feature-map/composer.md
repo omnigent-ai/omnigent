@@ -20,17 +20,26 @@ and steers messages while the agent is busy.
   model, and keeps the selection. States: catalog loading, delayed catalog,
   alias vs. full model ID, refused switch (the pill keeps the applied model).
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
-  Pi). States: available, unavailable placeholder, max/ultra levels, refused
+  Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
   marked and the choice persists.
+- `managed-mcp-picker`: choose administrator-configured services before launch
+  on a host or sandbox. States: loading, empty, error/retry, selected, unavailable,
+  remembered selection, explicitly none, restored connection needing sign-in.
+- `managed-mcp-sign-in`: selecting an unconnected service opens inline sign-in;
+  selection and launch wait for success. States: connected, pending, cancelled,
+  failed, popup blocked, Databricks workspace prompt, bearer token needed.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
+- `new-command`: `/new` opens a blank new-session composer in the same project;
+  working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers.
+- `new-session-hotkey`: ⌘/Ctrl+Alt+N opens and focuses the new-session composer.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
@@ -61,6 +70,8 @@ and steers messages while the agent is busy.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
 - Send while the agent is working to queue a message, then steer it.
+- Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
+  page in the same project. Selecting **/new** in Commands also opens it.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
@@ -76,12 +87,37 @@ and steers messages while the agent is busy.
   composer.
 - Hover the model/effort pill to see the tooltip.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
-  Pi), and permission mode before the session exists.
+  Pi, Devin), and permission mode before the session exists.
+- With a managed sandbox selected and no connected host, the model picker lists
+  the sandbox's default catalog when `/v1/info` advertises `default_models` (an
+  unbound gateway with `sandbox.model_discovery`, or a provider hook): rows under
+  the provider's label plus a "Default" row, for native and SDK agents.
+  A failed listing shows its error and keeps Default launchable; a
+  harness the catalog cannot serve keeps its ordinary list. This is distinct
+  from a connected host's own catalog and from a bound (`inference_models`)
+  target. Covered by
+  `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`
+  and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
 - Attach files or type `/` before the first send.
+- Open **MCPs** in the workspace bar above the composer (the plug icon when space is tight), then turn
+  services on or off in **Tools for this session** before launching on a host or
+  sandbox. Turning a service off keeps its account connected. Explicit selections
+  are remembered for new sessions in this browser; an unsent draft takes precedence.
+  Reload to verify both remembered selections and choosing none.
+  If the catalog fails, retry or turn off saved services by ID to launch without
+  MCPs. The error itself leaves preferences intact.
+- Turn on an unconnected OAuth service to open its sign-in popup. Complete sign-in
+  to select it; for Databricks, first enter the workspace URL and choose
+  **Connect workspace**. Bearer-token services require **Manage MCP accounts**
+  before selection. Use **Reconnect** if a selected service loses its connection.
 - Open the agent picker's custom agents, then Create custom agent → Import
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
   selects the agent, which stays listed after a reload. A rejected bundle (for
   example a server agent's name) keeps the dialog open with the server's reason.
+
+**Fork dialog** (Fork in the session header menu, or Fork from here on a
+message, with a native target): the same model, effort, and permission mode
+pickers, seeded from the source session when its harness family is kept.
 
 **Mobile** (either composer on a phone-sized viewport): the same controls with
 collapsed labels.
@@ -99,6 +135,13 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 
 Tests under `tests/browser_ui/` stub every backend call and need no instance:
 `uv run pytest <test> --browser-ui-skip-build --video=on --output="$VERIFY_EVIDENCE/composer"`.
+
+For managed MCP journeys, the server must have an administrator-configured
+registry enabled and a service visible to the current account; otherwise the
+picker is hidden or the catalog is empty. Host and sandbox runners must support
+managed MCP services. Use a fictional local OAuth provider for live sign-in
+checks and allow popups; the browser tests below stub the catalog and callbacks.
+Other connection providers alone do not enable the managed MCP picker.
 
 - **`pill-tooltip`, `pill-tooltip-suppressed`, in-session:**
   `tests/browser_ui/chat/test_composer_tooltips.py::test_pill_uses_one_tooltip_and_suppresses_it_while_picker_is_open`
@@ -133,6 +176,49 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
 - **`permission-mode`:**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_permission_mode_switch_persists`
+- **`model-picker`, `effort-picker`, `permission-mode`, Fork dialog:** the
+  permission-mode picker has component coverage in
+  `web/src/shell/ForkSessionDialog.test.tsx`; drive the model and effort
+  pickers by hand: fork a Codex session, pick another effort in the dialog, and
+  expect the new session's pill to show it. See [sessions](./sessions.md).
+- **`managed-mcp-picker`, new-session composer:**
+  `tests/e2e_ui/sessions/test_mcp_registry_connections.py::test_managed_mcp_selection_is_sent_with_launch`
+  covers desktop sandbox and mobile local-host launches, including a long catalog
+  in a short viewport with a reachable last row and visible heading and footer.
+  After launch, the same cases use desktop agent info and mobile **Agent info** to select managed
+  services on a builtin agent and remove unavailable references after registry
+  disablement, while custom MCP controls remain read-only. The module has four
+  browser cases: these two launches, settings sign-in routing, and the
+  Databricks sign-in launch below. Selection persistence,
+  explicit opt-out during a persistent catalog failure, launch gating during
+  sign-in, and an absent picker without registry enablement
+  are covered in `web/src/shell/NewChatDialog.flow.test.tsx`.
+- **`managed-mcp-sign-in`, new-session composer:**
+  `tests/e2e_ui/sessions/test_mcp_registry_connections.py::test_databricks_connects_from_launch_picker`
+  covers the workspace prompt and successful sign-in before a desktop host
+  launch. `web/src/components/McpRegistry.test.tsx` and
+  `web/src/lib/mcpRegistry.test.ts` cover selection after sign-in, cancellation,
+  retry, reconnect, and closed or blocked popups (`pnpm --dir web test`).
+  `tests/server/integration/test_mcp_gateway_http.py::test_real_http_oauth_refresh_through_gateway`
+  covers real OAuth, refresh, account reuse, and disconnect without a browser
+  or external credentials (`uv run --no-sync pytest tests/server/integration/test_mcp_gateway_http.py`).
+  Manually on desktop and mobile: select an unconnected OAuth service, confirm
+  launch is disabled while sign-in is pending, then approve in the popup and
+  expect it to close with the service checked and the selection count updated.
+  Repeat with popup cancellation: expect an error, an unchecked service, and a
+  usable retry. Launch on a host and a sandbox with the selected service and
+  confirm its tools are available on the first turn.
+- **`new-command`:**
+  `tests/browser_ui/chat/test_slash_menu.py::test_new_command_opens_landing_in_current_project`
+  covers Enter, Tab then Enter, and clicking the command, with first-class,
+  legacy-label, off-sidebar, partial-sidebar, and no-project sessions.
+  `tests/browser_ui/chat/test_slash_menu.py::test_new_command_respects_unfiled_sidebar_row`
+  covers explicit removal from a project;
+  `tests/browser_ui/chat/test_slash_menu.py::test_new_command_project_lookup_error_is_visible_and_retryable`
+  covers failed lookup and retry without using a stale project name.
+  `tests/browser_ui/chat/test_slash_menu.py::test_new_command_deleted_project_opens_unfiled`
+  covers deleted projects with dangling session membership.
+  No running agent is needed.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`
 - **`attachments`:**
@@ -178,9 +264,13 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
 
 ## Gotchas
 
+- Chat `/new` is local navigation, not a message to the agent. Native TUI
+  `/new` is unchanged.
+
 - The in-session and new-session composers are different surfaces. A change to
   the pill, tooltip, configuration menu, or effort picker in one does not reach
-  the other. Verify both, plus the mobile layout.
+  the other. Verify both, plus the mobile layout. The Fork dialog repeats the
+  model, effort, and permission-mode pickers for native targets; check it too.
 - "New session" in a test name can mean a session with no turns yet, not the
   landing page. Check which surface the test opens.
 - Tooltip changes need a hover after the picker closes, not only on first load.
@@ -193,3 +283,8 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   terminal command actually landed before blaming the mirror.
 - The mock environment configures Claude and Codex only. Other harnesses'
   catalogs need real CLIs or credentials.
+- The managed MCP picker uses only the administrator's registry; it does not
+  add arbitrary MCP URLs or enable itself from existing GitHub/Databricks
+  connections. Bearer-token accounts must be connected in settings first.
+- Managed MCP browser tests stub launch and authentication. They prove composer
+  wiring; the HTTP integration test proves the real provider boundary.

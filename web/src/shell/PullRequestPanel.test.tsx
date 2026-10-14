@@ -349,6 +349,21 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText("No comments yet.")).not.toBeInTheDocument();
   });
 
+  it("explains unreadable checks instead of showing empty counts", () => {
+    // The token read the PR but GitHub refused its check runs.
+    state.info!.data!.pr!.checks = { passing: 0, failing: 0, pending: 0, total: 0, runs: [] };
+    state.info!.data!.pr!.checks_supported = false;
+    renderPanel();
+
+    expect(screen.getByText("Checks")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Checks can’t be read with this GitHub token. Fine-grained personal access tokens can’t read check runs; use a classic token or a GitHub App.",
+    );
+    expect(screen.queryByText(/Some checks are unavailable/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /passed|failed|pending/ })).toBeNull();
+    expect(screen.getByText("No description provided.")).toBeInTheDocument();
+  });
+
   it("retains loaded comments while indicating that more could not be fetched", () => {
     state.info!.data!.pr!.comments_partial = true;
     state.info!.data!.pr!.comments = [
@@ -398,6 +413,9 @@ describe("PullRequestPanel", () => {
     renderChanges();
     const diffs = await screen.findAllByTestId("diff");
     expect(diffs.map((d) => d.getAttribute("data-path"))).toEqual(["hello.py", "src/app.ts"]);
+    // index.css binds @pierre/diffs' font variables on this class; outside it the
+    // shadow stylesheet falls back to a fixed 13px that ignores the Interface font size.
+    for (const diff of diffs) expect(diff.closest(".github-diff-stack")).not.toBeNull();
   });
 
   it("jumps to a file's section when its sidebar row is clicked", async () => {

@@ -17,7 +17,12 @@
 
 import { stripBasePath, withBasePath } from "./basePath";
 import { getCachedServerInfo } from "./capabilities";
-import { getOmnigentHostConfig, hostFetch, isDatabricksWorkspace } from "./host";
+import {
+  getOmnigentHostConfig,
+  hostFetch,
+  isDatabricksWorkspace,
+  isHostRoutingEnabled,
+} from "./host";
 import {
   clearHostKeyless,
   getSessionHost,
@@ -157,9 +162,9 @@ const SESSION_SUBPATH_RE = /\/v1\/sessions\/([^/?#]+)\/[^?#]/;
  * keys correctly on the first attempt. Returns the in-flight resolve to await,
  * or `null` when there's nothing to do — callers only await a non-null result.
  *
- * Normal lookups require an embedded fetcher and run once per session/page.
- * A routing miss may force a fresh hostless lookup, including workspace dev
- * mode. Known hosts are reused; resolver failures remain best-effort.
+ * Normal lookups require an embedded fetcher or OSS host routing and run once
+ * per session/page. A routing miss may force a fresh hostless lookup, including
+ * workspace dev mode. Known hosts are reused; resolver failures are ignored.
  *
  * Concurrent callers in one tick share ONE resolve: the first creates the
  * promise synchronously through the `.set()`, the rest read and await it. Both
@@ -171,11 +176,10 @@ export function resolveSessionHost(
   sessionId: string,
   options: SessionHostResolveOptions = {},
 ): Promise<void> | null {
-  if (
-    _sessionHostResolver === null ||
-    (!getOmnigentHostConfig().fetcher && !(options.force && isDatabricksWorkspace()))
-  )
-    return null;
+  const canResolve =
+    getOmnigentHostConfig().fetcher != null ||
+    (isDatabricksWorkspace() ? options.force === true : isHostRoutingEnabled());
+  if (_sessionHostResolver === null || !canResolve) return null;
   if (getSessionHost(sessionId) !== null) return null;
   const refresh = _hostRefreshInFlight.get(sessionId);
   if (refresh !== undefined) return refresh;
@@ -192,11 +196,17 @@ export function resolveSessionHost(
         )
       : resolver(sessionId);
     inFlight = lookup
+      .then(() => {
+        _hostResolveAttempted.add(sessionId);
+      })
       .catch(() => {
         // Best-effort — leave the map unseeded and fall through to modal/keyless.
+        // Keep managed lookups one-shot; OSS retries on the next request.
+        if (isDatabricksWorkspace()) {
+          _hostResolveAttempted.add(sessionId);
+        }
       })
       .finally(() => {
-        _hostResolveAttempted.add(sessionId);
         pending.delete(sessionId);
       });
     pending.set(sessionId, inFlight);
@@ -456,13 +466,9 @@ export async function authenticatedFetch(
   if (currentUserId && currentUserId !== RESERVED_USER_LOCAL && !headers.has("X-Forwarded-Email")) {
     headers.set("X-Forwarded-Email", currentUserId);
   }
-  // Pin host- and session-scoped requests to the replica holding that host's
-  // runner tunnel (key = host_id). Derived centrally so no call site has to
-  // thread it; a caller that set the header explicitly wins, and non-host-scoped
-  // requests get no key (any replica). Only against a Databricks workspace-hosted
-  // server — the embedded (managed) UI, or `npm run dev` pointed at a workspace URL.
-  // A standalone/self-hosted server has no Dicer, so the key would just dirty
-  // its logs (see isDatabricksWorkspace).
+  // Route host-scoped requests with that host's key; other requests may use
+  // the modal host for cache affinity. An explicit caller header wins.
+  // OSS ingress deployments opt in to this routing.
   const url = typeof input === "string" ? input : input.toString();
   // Resolve this session's host BEFORE deriving the slice key below, so a fresh
   // session sub-path request keys to the right replica on the first attempt
@@ -478,7 +484,7 @@ export async function authenticatedFetch(
   // The host this request is FOR, even when we deliberately send it keyless
   // (demoted). Lets the retry logic below demote/un-demote the right host.
   let derivedHostId: string | null = null;
-  if (!headers.has(SLICE_KEY_HEADER) && isDatabricksWorkspace()) {
+  if (!headers.has(SLICE_KEY_HEADER) && isHostRoutingEnabled()) {
     // Key by the request's OWN host when it's host-scoped; otherwise (a
     // cross-host / DB-backed read) fall back to the modal host as a
     // cache-affinity hint. The distinction matters: a host-scoped request whose
@@ -503,7 +509,7 @@ export async function authenticatedFetch(
     // server-side wrong-replica guard: once demoted, every request for this host
     // goes keyless from the start and reaches the tunnel first try. A demoted
     // host that still returns wrong_replica keyless is un-demoted below.
-    if (derivedHostId && !isHostKeyless(derivedHostId)) {
+    if (derivedHostId && (!isDatabricksWorkspace() || !isHostKeyless(derivedHostId))) {
       headers.set(SLICE_KEY_HEADER, derivedHostId);
       stampedSliceKey = true;
     }
@@ -526,7 +532,7 @@ export async function authenticatedFetch(
   // the host registered under, so we can't know up front — try keyed, then fall
   // back). Only when WE stamped the key; a genuinely-offline runner returns
   // runner_unavailable and is not re-addressed here.
-  if (stampedSliceKey && (await _isWrongReplica(res))) {
+  if (isDatabricksWorkspace() && stampedSliceKey && (await _isWrongReplica(res))) {
     // Fresh Headers for the retry — mutating the first request's `headers`
     // object in place would also clear the key on the already-sent request
     // (callers/tests hold it by reference).
@@ -568,6 +574,7 @@ export async function authenticatedFetch(
       }
     }
   } else if (
+    isDatabricksWorkspace() &&
     derivedHostId &&
     !stampedSliceKey &&
     isHostKeyless(derivedHostId) &&

@@ -25,6 +25,7 @@ function loadPreload() {
   };
   vm.runInNewContext(PRELOAD, {
     console,
+    process: { platform: "linux" },
     require: (specifier) => {
       assert.equal(specifier, "electron");
       return {

@@ -17,11 +17,13 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.db.utils import generate_agent_id
-from omnigent.entities import Conversation
+from omnigent.entities import Agent, Conversation
+from omnigent.runtime import get_artifact_store
+from omnigent.server.bundles import bundle_location
 from omnigent.server.child_session_recovery import RECOVERY_STORE_CONCURRENCY
 from omnigent.server.routes import runner_tunnel, sessions
-from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from tests.budgets import budget
+from tests.server.helpers import build_agent_bundle
 from tests.server.integration.test_runner_tunnel_route import (
     _RUNNER_ID,
     _TUNNEL_PATH,
@@ -30,6 +32,15 @@ from tests.server.integration.test_runner_tunnel_route import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture
+def agent(app: FastAPI) -> Agent:
+    agent_id = generate_agent_id()
+    bundle = build_agent_bundle("test")
+    location = bundle_location(agent_id, bundle)
+    get_artifact_store().put(location, bundle)
+    return app.state.agent_store.create(agent_id, "test", location)
 
 
 class _AsyncioProxy:
@@ -110,9 +121,8 @@ async def _recover(
 
 
 async def test_multiple_slow_roots_recover_independently_with_descendants(
-    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     hung, slow, healthy = [_create_session(app, agent.id) for _ in range(3)]
     blocked_child = _create_session(
         app, agent.id, kind="sub_agent", parent_conversation_id=hung.id
@@ -165,11 +175,10 @@ async def test_multiple_slow_roots_recover_independently_with_descendants(
 
 @pytest.mark.parametrize("superseded", [False, True])
 async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
-    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch, superseded: bool
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch, superseded: bool
 ) -> None:
     import omnigent.server.app as server_app
 
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     parent = _create_session(app, agent.id)
     store = app.state.runner_router._conversation_store
     mirrors = []
@@ -253,9 +262,8 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
 
 
 async def test_failed_root_init_keeps_failure_but_does_not_block_other_tree(
-    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     failed, healthy = [_create_session(app, agent.id) for _ in range(2)]
     blocked_child = _create_session(
         app, agent.id, kind="sub_agent", parent_conversation_id=failed.id
@@ -277,7 +285,7 @@ async def test_failed_root_init_keeps_failure_but_does_not_block_other_tree(
 
 async def test_failed_binding_batch_does_not_strand_later_roots(
     app: FastAPI,
-    db_uri: str,
+    agent: Agent,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -286,7 +294,6 @@ async def test_failed_binding_batch_does_not_strand_later_roots(
     import omnigent.server.app as server_app
 
     monkeypatch.setattr(server_app, "_RECONNECT_BINDING_BATCH_SIZE", 1)
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     failed, healthy = [_create_session(app, agent.id) for _ in range(2)]
     store = app.state.runner_router._conversation_store
     get_many = store.get_conversations
@@ -327,14 +334,13 @@ async def test_failed_binding_batch_does_not_strand_later_roots(
 @pytest.mark.parametrize("dependent_kind", [None, "child", "mirror"])
 async def test_reconnect_skips_root_rebound_before_initialization(
     app: FastAPI,
-    db_uri: str,
+    agent: Agent,
     monkeypatch: pytest.MonkeyPatch,
     phase: str,
     dependent_kind: str | None,
 ) -> None:
     import omnigent.server.app as server_app
 
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     moved, healthy = [_create_session(app, agent.id) for _ in range(2)]
     store = app.state.runner_router._conversation_store
     dependent = None
@@ -397,13 +403,12 @@ async def test_reconnect_skips_root_rebound_before_initialization(
 
 
 async def test_reconnecting_trees_share_store_budget_without_waiting_for_initialization(
-    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import omnigent.server.app as server_app
     from omnigent.server import child_session_recovery, runner_session_init
     from omnigent.server.routes._sessions import helpers, orchestration
 
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     roots = [_create_session(app, agent.id) for _ in range(12)]
     children = [
         _create_session(app, agent.id, kind="sub_agent", parent_conversation_id=root.id)
@@ -455,9 +460,8 @@ async def test_reconnecting_trees_share_store_budget_without_waiting_for_initial
 
 
 async def test_hosted_child_recovers_independently_while_parent_is_stalled(
-    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     parent = _create_session(app, agent.id)
     hostless, hosted = [
         _create_session(app, agent.id, kind="sub_agent", parent_conversation_id=parent.id)
@@ -493,13 +497,12 @@ async def test_hosted_child_recovers_independently_while_parent_is_stalled(
 @pytest.mark.parametrize("error_type", [httpx.ConnectError, RuntimeError])
 async def test_root_recovery_failure_is_quiet_only_after_tunnel_replacement(
     app: FastAPI,
-    db_uri: str,
+    agent: Agent,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     superseded: bool,
     error_type: type[Exception],
 ) -> None:
-    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     root = _create_session(app, agent.id)
     caplog.set_level(logging.INFO, logger="omnigent.server.app")
 

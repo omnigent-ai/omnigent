@@ -56,6 +56,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
+import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { PageScroll } from "@/components/PageScroll";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
@@ -340,7 +341,11 @@ export function InboxPage() {
           tile={<KindTile icon={HandIcon} tone="yellow" />}
           kindLabel={item.elicitation.askUserQuestion ? "Question" : "Approval needed"}
           title={title}
-          preview={item.elicitation.message}
+          preview={
+            item.elicitation.message ? (
+              <ElicitationMessage message={item.elicitation.message} />
+            ) : undefined
+          }
           at={entry.at}
           unread={false}
           expanded={expanded}
@@ -364,7 +369,13 @@ export function InboxPage() {
             allowAutoMode={item.elicitation.allowAutoMode}
             rememberScope={item.elicitation.rememberScope}
             codexPersistModes={item.elicitation.codexPersistModes}
+            agyPermission={item.elicitation.agyPermission}
             onSubmit={makeSubmit(item)}
+            requester={
+              item.resolveSessionId !== item.row.id
+                ? { sessionId: item.resolveSessionId, ancestorSessionId: item.row.id }
+                : null
+            }
             className="border-0 bg-transparent p-0"
           />
           <InboxActions>
@@ -626,7 +637,7 @@ function InboxCard({
   tile: ReactNode;
   kindLabel: string;
   title: string;
-  preview: string | undefined;
+  preview: ReactNode;
   /** Epoch seconds. */
   at: number;
   unread: boolean;

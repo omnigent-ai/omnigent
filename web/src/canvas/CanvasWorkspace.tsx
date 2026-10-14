@@ -13,8 +13,10 @@ import {
   type ReactNode,
 } from "react";
 import { Spinner } from "@/components/ui/spinner";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { SidebarOpenButton } from "@/shell/SidebarOpenButton";
 import { MAIN_CANVAS_ID } from "./canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "./canvasNavigation";
 
@@ -54,15 +56,18 @@ export function CanvasWorkspace({
   conversationId,
   minConversationWidth = CANVAS_CONVERSATION_MIN_WIDTH,
   onCanvasWidthChange,
+  onOpenSidebar,
   children,
 }: {
   active: boolean;
   conversationId?: string;
   minConversationWidth?: number;
   onCanvasWidthChange?: (width: number) => void;
+  onOpenSidebar?: (peek?: boolean) => void;
   children: ReactNode;
 }) {
   const navigate = useNavigate();
+  const isMobile = useIsMobileViewport();
   const [searchParams] = useSearchParams();
   const container = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(() => window.innerWidth);
@@ -71,7 +76,7 @@ export function CanvasWorkspace({
   ratioRef.current = ratio;
   const [focused, setFocused] = useState(false);
   const drag = useRef<{ pointerId: number; x: number; width: number } | null>(null);
-  const compact = width < COMPACT_WIDTH;
+  const compact = isMobile || width < COMPACT_WIDTH;
   const available = Math.max(1, width - DIVIDER_WIDTH);
   const maximum = Math.max(MIN_CANVAS_WIDTH, available - minConversationWidth);
   const canvasWidth = Math.round(Math.max(MIN_CANVAS_WIDTH, Math.min(maximum, available * ratio)));
@@ -155,6 +160,12 @@ export function CanvasWorkspace({
             } as CSSProperties
           }
         >
+          {/* Keep navigation available while the board is loading. */}
+          {onOpenSidebar && (
+            <div className="chat-header pointer-events-none absolute inset-x-0 top-0 z-30 flex h-14 items-center px-2 md:h-12 md:px-4">
+              <SidebarOpenButton componentId="canvas.open_sidebar" onOpenSidebar={onOpenSidebar} />
+            </div>
+          )}
           <Suspense
             fallback={
               <div className="flex flex-1 items-center justify-center">

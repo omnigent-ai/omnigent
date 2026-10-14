@@ -51,10 +51,11 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -615,6 +616,10 @@ class ClaudeUserPromptPending(RuntimeError):
     """A native question or permission prompt must be answered before injection."""
 
 
+class ClaudeMessageNotAccepted(RuntimeError):
+    """The submitted draft remained in Claude's input box until the deadline."""
+
+
 @contextlib.contextmanager
 def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
     """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
@@ -959,9 +964,9 @@ class ClaudeHookRecord:
         absent, or when no counted entry carried a usable field.
     :param failure_category: ``StopFailure`` error category, e.g.
         ``"rate_limit"``. ``None`` for other events or when absent.
-    :param failure_message: ``StopFailure`` error text Claude Code rendered
-        for the turn (the payload's ``last_assistant_message``), e.g.
-        ``"API Error: 500 Internal server error"``. ``None`` when absent.
+    :param failure_message: ``StopFailure`` raw API error detail from the
+        payload's ``error_details`` field, e.g.
+        ``"prompt is too long: 120000 tokens (limit 100000)"``. ``None`` when absent.
     :param failure_context: Structured evidence supplied by this hook record.
     """
 
@@ -1274,7 +1279,13 @@ class ClaudeNativeToolRelay:
     """
 
     def __init__(
-        self, *, bridge_dir: Path, httpd: ThreadingHTTPServer, advertised_url: str
+        self,
+        *,
+        bridge_dir: Path,
+        httpd: ThreadingHTTPServer,
+        advertised_url: str,
+        relay_info: _JsonObject,
+        tool_executor: ToolExecutor,
     ) -> None:
         """
         Initialize the relay handle.
@@ -1283,11 +1294,30 @@ class ClaudeNativeToolRelay:
             advertisement, e.g. ``Path("/tmp/omnigent/...")``.
         :param httpd: Started HTTP server for tool calls.
         :param advertised_url: Base URL advertised in ``tool_relay.json``.
+        :param relay_info: Current relay advertisement, including its stable token.
+        :param tool_executor: Callback for the current tool surface.
         :returns: None.
         """
         self._bridge_dir = bridge_dir
         self._httpd = httpd
         self._advertised_url = advertised_url
+        self._relay_info = relay_info
+        self._tool_executor = tool_executor
+
+    def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
+        """Refresh tools on the owning event loop without changing cached relay credentials.
+
+        :param tools: Replacement tool schemas.
+        :param tool_executor: Callback dispatching against the updated spec.
+        """
+        relay_info = {
+            **self._relay_info,
+            "tools": _normalize_relay_tool_specs(tools),
+            "updated_at": time.time(),
+        }
+        _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
+        self._relay_info = relay_info
+        self._tool_executor = tool_executor
 
     def close(self) -> None:
         """
@@ -1633,26 +1663,10 @@ def build_claude_native_spawn_env(
 
 
 def _bridge_sandbox_payload(sandbox: OSEnvSandboxSpec) -> dict[str, Any]:
-    """
-    Build the JSON-safe sandbox payload persisted into the bridge config.
+    """Persist sandbox settings without parent-only credential sources."""
+    from omnigent.inner.os_env_serialization import encode_sandbox_spec
 
-    ``dataclasses.asdict`` flattens ``credential_proxy`` (a nested
-    ``CredentialProxySpec``) to a plain dict with no way to tell it apart
-    from a real one on read, so a naive ``OSEnvSandboxSpec(**payload)``
-    round-trip silently stores a ``dict`` where a ``CredentialProxySpec``
-    is expected — a real crash the first time sandboxed code dereferences
-    ``.entries`` / ``.databricks`` on it. ``credential_proxy`` is resolved
-    parent-side only and is never meant to cross a serialization boundary
-    in the first place — :func:`omnigent.inner.sandbox.SandboxPolicy.to_jsonable`
-    excludes it for the same reason (it can carry a credential *source*,
-    e.g. an env var name or a shell command, that has no business landing
-    in a file on disk). Dropping it here matches that existing convention
-    instead of inventing a new one.
-
-    :param sandbox: Resolved sandbox spec to serialize.
-    :returns: JSON-safe dict with ``credential_proxy`` omitted.
-    """
-    payload = asdict(sandbox)
+    payload = encode_sandbox_spec(sandbox)
     payload.pop("credential_proxy", None)
     return payload
 
@@ -1771,23 +1785,101 @@ def prune_orphaned_bridge_dirs() -> int:
     return native_bridge_common.prune_orphaned_dirs(_BRIDGE_ROOT)
 
 
-def ensure_claude_workspace_trusted(workspace: Path) -> None:
+def claude_global_config_path(
+    cwd: Path | None = None, env: Mapping[str, str] | None = None
+) -> Path:
+    """
+    Return Claude's global config path for its launch env and working directory.
+
+    Claude prefers an existing legacy ``.config.json`` in its config dir
+    (``$CLAUDE_CONFIG_DIR``, else ``~/.claude``), then ``.claude.json`` (or
+    ``.claude-custom-oauth.json`` with ``CLAUDE_CODE_CUSTOM_OAUTH_URL``) under
+    ``$CLAUDE_CONFIG_DIR``, else ``$HOME``. A relative ``CLAUDE_CONFIG_DIR`` is
+    relative to its working directory; an empty one moves only the legacy
+    lookup there.
+
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+        ``None`` uses this process's working directory.
+    :param env: Claude's launch environment, e.g. ``{"HOME": "/home/user"}``.
+        ``None`` uses this process's environment.
+    :returns: The config file path, e.g. ``Path("/home/user/.claude.json")``.
+    """
+    env = os.environ if env is None else env
+    base = cwd if cwd is not None else Path.cwd()
+    # Claude builds these with ``path.join``: no ``~`` expansion, ``..`` removed
+    # lexically, and relative results resolved against its cwd.
+    home_value = env.get("HOME") or str(_account_home_dir())
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    # Claude NFC-normalizes the config dir for the legacy lookup only.
+    if config_dir is None:
+        legacy_dir = unicodedata.normalize("NFC", os.path.join(home_value, ".claude"))
+        legacy_path = _claude_joined_path(base, legacy_dir, ".config.json")
+    elif not config_dir:
+        legacy_path = base / ".config.json"
+    else:
+        legacy_dir = unicodedata.normalize("NFC", config_dir)
+        legacy_path = _claude_joined_path(base, legacy_dir, ".config.json")
+    if legacy_path.exists():
+        return legacy_path
+    suffix = "-custom-oauth" if env.get("CLAUDE_CODE_CUSTOM_OAUTH_URL") else ""
+    return _claude_joined_path(base, config_dir or home_value, f".claude{suffix}.json")
+
+
+def _claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
+    """
+    Return the file Claude opens for ``path.join(directory, name)`` from *cwd*.
+
+    ``path.join`` removes ``.`` and ``..`` lexically, without following
+    symlinks, before the filesystem resolves a relative result against
+    Claude's working directory.
+
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+    :param directory: The joined directory value, e.g. ``"x/../cfg"``.
+    :param name: The config file name, e.g. ``".claude.json"``.
+    :returns: The file path, e.g. ``Path("/home/user/repo/cfg/.claude.json")``.
+    """
+    joined = os.path.normpath(os.path.join(directory, name))
+    return Path(joined) if os.path.isabs(joined) else cwd / joined
+
+
+def _account_home_dir() -> Path:
+    """
+    Return the account's home directory, as Claude's runtime does without ``HOME``.
+
+    Claude Code's runtime ignores an unset or empty ``HOME`` and reads the
+    password database, so the runner's own ``HOME`` is not a substitute.
+
+    :returns: The passwd home directory, e.g. ``Path("/home/user")``, or
+        :meth:`Path.home` where no password database exists.
+    """
+    try:
+        import pwd  # noqa: FlagLocalImports - POSIX-only module
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):
+        return Path.home()
+
+
+def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | None = None) -> None:
     """
     Pre-accept Claude Code's first-run trust + onboarding prompts.
 
     Claude Code blocks on two TUI prompts the first time it launches in
     a new context: a global onboarding flow (theme / login) gated by the
-    top-level ``hasCompletedOnboarding`` key in ``~/.claude.json``, and a
+    top-level ``hasCompletedOnboarding`` key in its global config
+    (:func:`claude_global_config_path`, usually ``~/.claude.json``), and a
     per-directory "Do you trust the files in this folder?" dialog gated
     by ``projects["<abs cwd>"].hasTrustDialogAccepted``. Neither fires a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
     session there is nobody at the terminal to answer them: Claude hangs
     and the web UI shows nothing. This is acute with
     per-session git worktrees, which hand Claude a brand-new —
-    therefore untrusted — directory on every session.
+    therefore untrusted — directory on every session, and for sessions
+    rooted at the home directory, whose interactively accepted trust
+    Claude keeps for that session only.
 
     Seed both gating keys idempotently so the launch never blocks. Only
-    those two keys are written; all other ``~/.claude.json`` state (the
+    those two keys are written; all other global config state (the
     user's own onboarding choices, project history, MCP config, OAuth
     account) is preserved, and the file is left untouched when both keys
     are already set. This deliberately does NOT skip per-tool permission
@@ -1805,17 +1897,31 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
     :param workspace: The runner workspace Claude will launch in, e.g.
         ``Path("/home/user/repo-worktrees/feature-x")``. Resolved to an
         absolute path to match Claude's ``projects`` key convention.
+    :param env: Environment the Claude terminal is launched with, used to
+        find the config file Claude will load. ``None`` uses this process's
+        environment.
     :returns: None.
-    :raises ValueError: If an existing ``~/.claude.json`` (or its
-        ``projects`` map / target project entry) is not a JSON object.
+    :raises ValueError: If the existing global config is not a regular
+        file or is a broken or looping symlink, or it (or its ``projects`` map /
+        target project entry) is not a JSON object. A symlinked config is
+        updated at its target.
         Surfaced rather than silently overwritten so a corrupt or
         unexpected user config is never clobbered (fail loud).
-    :raises json.JSONDecodeError: If an existing ``~/.claude.json`` is
+    :raises json.JSONDecodeError: If the existing global config is
         not valid JSON, for the same reason.
     """
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    config_path = (Path(config_dir).expanduser() if config_dir else Path.home()) / ".claude.json"
+    config_path = claude_global_config_path(workspace, env)
+    if config_path.is_symlink():
+        # Keep a symlinked (e.g. dotfile-managed) config; update its target.
+        try:
+            config_path = config_path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"{config_path} is a broken or looping symlink; refusing to overwrite."
+            ) from exc
     if config_path.exists():
+        if not config_path.is_file():
+            raise ValueError(f"{config_path} is not a regular file; refusing to overwrite.")
         data = json.loads(config_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError(f"{config_path} is not a JSON object; refusing to overwrite.")
@@ -1856,7 +1962,7 @@ def _atomic_write_user_json(path: Path, payload: _JsonObject) -> None:
 
     Unlike :func:`_write_json_file` (which targets the owner-only bridge
     tree under ``/tmp`` and enforces secure-directory ownership on the
-    parent), this writes the user's own ``~/.claude.json`` in their home
+    parent), this writes the user's own Claude global config in their home
     directory: it must not re-permission the home directory, but it does
     pin the result to owner-only ``0o600`` because the file holds the
     Claude OAuth account block.
@@ -3432,18 +3538,12 @@ def compute_transcript_cumulative_cost(
     pricing the token totals — but per-message pricing also stays correct
     across a model switch within one transcript.
 
-    **Deduplicated by ``requestId``.** Claude writes more than one
-    transcript record for a single API response (a streamed partial plus
-    the final record, retries, etc.), and those records share one
-    ``requestId`` while each carries that response's full ``message.usage``
-    (not an increment). Summing every record would bill the same response
-    two-plus times — observed ~2x inflation, with the parent badge and the
-    cost-budget gate both reading the doubled figure. So records are keyed
-    by ``requestId`` (last priceable record per id wins, as its usage is
-    the authoritative final figure) and each billed response is counted
-    exactly once. A record with no ``requestId`` (rare non-API assistant
-    entry) gets a per-record unique key so it is never collapsed with
-    another.
+    Claude can write several records per API response, each repeating its
+    usage. ``requestId`` may be absent without an Anthropic ``request-id``
+    response header. Deduplicate by ``message.id``, falling back to
+    ``requestId`` for records without one. Priceable records carrying both IDs
+    link request-only fragments to the same response. The last priceable record
+    wins; records with neither ID remain separate.
 
     :param transcript_path: Path to a Claude transcript JSONL, e.g.
         ``".../<session>.jsonl"`` (parent) or
@@ -3470,13 +3570,9 @@ def compute_transcript_cumulative_cost(
     provider_config = load_config()
     provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
 
-    # Per-``requestId`` cost (USD); last priceable record per id wins so a
-    # response written across multiple transcript records is counted once.
-    cost_by_request: dict[str, float] = {}
-    # Counter minting unique keys for records lacking a ``requestId`` so
-    # they each count once instead of collapsing onto a shared key.
-    no_request_id_index = 0
-    for record in read_result.records:
+    cost_by_response: dict[tuple[str, str | int], float] = {}
+    message_keys_by_request: dict[str, tuple[str, str | int]] = {}
+    for index, record in enumerate(read_result.records):
         if record.text is None:
             continue
         try:
@@ -3500,14 +3596,27 @@ def compute_transcript_cumulative_cost(
         )
         if pricing is None:
             continue
+        message = entry.get("message")
+        message_id = message.get("id") if isinstance(message, dict) else None
+        if not isinstance(message_id, str) or not message_id:
+            message_id = None
         request_id = entry.get("requestId")
         if not isinstance(request_id, str) or not request_id:
-            request_id = f"__no_request_id_{no_request_id_index}"
-            no_request_id_index += 1
-        cost_by_request[request_id] = compute_llm_cost(usage, pricing)
-    if not cost_by_request:
+            request_id = None
+        if message_id is not None:
+            key = ("message", message_id)
+            if request_id is not None:
+                # A later fragment can supply the identity missing from earlier ones.
+                cost_by_response.pop(("request", request_id), None)
+                message_keys_by_request[request_id] = key
+        elif request_id is not None:
+            key = message_keys_by_request.get(request_id, ("request", request_id))
+        else:
+            key = ("record", index)
+        cost_by_response[key] = compute_llm_cost(usage, pricing)
+    if not cost_by_response:
         return None
-    return sum(cost_by_request.values())
+    return sum(cost_by_response.values())
 
 
 def count_hook_events(bridge_dir: Path) -> int:
@@ -3815,18 +3924,16 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     failure_context: FailureContext | None = None
     if event_name == "StopFailure" and isinstance(payload, dict):
         failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
-        # The CLI renders this text for its own error, so it reads like the
-        # mirrored API-error message.
-        raw_message = _bounded_hook_text(
-            payload.get("last_assistant_message"), _FAILURE_MESSAGE_MAX_CHARS
-        )
-        original_message = payload.get("last_assistant_message")
+        # ``error_details`` is the purpose-built API error field; ``last_assistant_message``
+        # can hold prior-turn prose when the failure fires before any new output.
+        raw_details = _bounded_hook_text(payload.get("error_details"), _FAILURE_MESSAGE_MAX_CHARS)
+        original_details = payload.get("error_details")
         failure_context = claude_failure_context(
             payload,
-            error_text=original_message if isinstance(original_message, str) else None,
+            error_text=original_details if isinstance(original_details, str) else None,
         )
         failure_message = (
-            _display_text(raw_message, is_api_error=True) if raw_message is not None else None
+            _display_text(raw_details, is_api_error=True) if raw_details is not None else None
         )
     return ClaudeHookRecord(
         event_cursor=record.line_number,
@@ -4283,7 +4390,7 @@ def _paste_and_submit(
         ) from exc
     if accepted:
         return
-    raise RuntimeError(
+    raise ClaudeMessageNotAccepted(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )
@@ -5261,6 +5368,11 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     """
     Invoke ``tmux -S <socket_path> <args...>`` and raise on failure.
 
+    A ``send-keys`` first leaves any pane mode (``copy-mode -q``, tmux
+    3.1a+), so keys reach the application instead of the copy mode a
+    scrolled-back pane is in. Both run in one tmux invocation, so the pane
+    cannot enter a mode between the exit and the send.
+
     :param socket_path: Absolute path to the tmux socket the terminal
         was launched on, e.g. ``"/tmp/.../tmux.sock"``.
     :param args: Arguments after ``tmux -S <socket_path>``, e.g.
@@ -5272,6 +5384,10 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     import subprocess
 
     _check_injection_cancelled()
+    operation = args[0] if args else ""
+    if operation == "send-keys" and "-t" in args:
+        target = args[args.index("-t") + 1]
+        args = ("copy-mode", "-q", "-t", target, ";", *args)
     cmd = ["tmux", "-S", socket_path, *args]
     try:
         proc = subprocess.run(
@@ -5282,8 +5398,13 @@ def _run_tmux(socket_path: str, *args: str) -> None:
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired as exc:
+        delivery_diagnostics.record_tmux_failure(operation, timeout_s=_TMUX_SEND_TIMEOUT_S)
         raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s") from exc
+    except OSError as exc:
+        delivery_diagnostics.record_tmux_failure(operation, os_errno=exc.errno)
+        raise
     if proc.returncode != 0:
+        delivery_diagnostics.record_tmux_failure(operation, returncode=proc.returncode)
         detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 
@@ -6011,8 +6132,8 @@ def _wait_for_claude_prompt_ready(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param timeout_s: Base readiness budget, e.g. ``30.0``. A live pane or
         unanswered liveness probe extends the wait to
-        :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`; a dead pane or rejected
-        query ends the wait at the next liveness check.
+        :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`. Liveness checks start within
+        one second; a dead pane or rejected query ends the wait.
     :param bridge_dir: Protect live permission-hook waits when delivering a message.
     :returns: None.
     :raises ClaudeTerminalExited: If tmux affirms the pane's process has
@@ -6037,7 +6158,7 @@ def _wait_for_claude_prompt_ready(
         a box that never appeared — is diagnosable from the error alone.
     """
     started = time.monotonic()
-    next_liveness_probe = started + timeout_s
+    next_liveness_probe = started + min(timeout_s, _CLAUDE_LIVENESS_POLL_INTERVAL_S)
     hard_deadline = started + max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S)
     polls = 0
     empty_polls = 0
@@ -6102,8 +6223,6 @@ def _wait_for_claude_prompt_ready(
             )
         sign_in_url = sign_in.url if sign_in is not None else None
         now = time.monotonic()
-        if now >= hard_deadline:
-            break
         if now >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)
             if state.alive is False:
@@ -6111,6 +6230,8 @@ def _wait_for_claude_prompt_ready(
                 exited_status = state.exit_status
                 break
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
+        if time.monotonic() >= hard_deadline:
+            break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     # Timed out. The poll/empty-capture counts separate the failure modes:
     # mostly-empty captures point at a torn read under a busy repaint (the
@@ -6242,9 +6363,13 @@ def start_tool_relay(
     :returns: Started relay handle. Call :meth:`close` when done.
     """
     token = secrets.token_urlsafe(32)
+
+    async def _execute_current_tool(name: str, arguments: _JsonObject) -> object:
+        return await relay._tool_executor(name, arguments)
+
     handler_cls = _tool_relay_handler_factory(
         token,
-        tool_executor,
+        _execute_current_tool,
         loop,
         policy_client=policy_client,
         session_id=session_id,
@@ -6269,13 +6394,20 @@ def start_tool_relay(
         encoding="utf-8",
     )
     os.chmod(env_path, 0o600)
+    relay = ClaudeNativeToolRelay(
+        bridge_dir=bridge_dir,
+        httpd=httpd,
+        advertised_url=advertised_url,
+        relay_info=relay_info,
+        tool_executor=tool_executor,
+    )
     thread = threading.Thread(
         target=httpd.serve_forever,
         name="claude-native-tool-relay",
         daemon=True,
     )
     thread.start()
-    return ClaudeNativeToolRelay(bridge_dir=bridge_dir, httpd=httpd, advertised_url=advertised_url)
+    return relay
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -7451,6 +7583,7 @@ def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], Non
     # Only the bridge MCP server (launch path) ever builds these tools.
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.os_env import create_os_environment
+    from omnigent.inner.os_env_serialization import decode_sandbox_spec
     from omnigent.tools.builtins.os_env import build_os_env_tools
 
     workspace_raw = config.get("workspace")
@@ -7459,7 +7592,7 @@ def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], Non
     if workspace is not None:
         sandbox_payload = config.get("sandbox")
         sandbox = (
-            OSEnvSandboxSpec(**sandbox_payload)
+            decode_sandbox_spec(sandbox_payload)
             if isinstance(sandbox_payload, dict)
             else OSEnvSandboxSpec(type="none")
         )
