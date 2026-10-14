@@ -416,6 +416,12 @@ describe("PullRequestPanel", () => {
     renderPanel();
 
     expect(screen.getByText(/No open PR for/)).toBeInTheDocument();
+    // The empty state shows the panel title; the provider stays in the tooltip.
+    expect(screen.getByRole("heading", { name: "Pull Requests" })).toHaveAttribute(
+      "title",
+      "GitHub",
+    );
+    expect(screen.getByText("Pull Requests")).not.toHaveClass("sr-only");
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("GitLab discovery failed.");
     expect(screen.queryByText("Pull requests aren’t available.")).not.toBeInTheDocument();
@@ -942,7 +948,10 @@ describe("PullRequestPanel", () => {
     it("uses the generic label and names the missing CLI", () => {
       state.info!.data = gitlab({ authenticated: false, cli: { name: "glab", available: false } });
       renderPanel();
-      expect(screen.getByRole("heading", { name: "gitlab" })).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Pull Requests" })).toHaveAttribute(
+        "title",
+        "gitlab",
+      );
       expect(screen.getByText("gitlab CLI not found")).toBeInTheDocument();
       expect(screen.getByText("glab")).toHaveClass("font-mono");
       expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();

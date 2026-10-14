@@ -135,13 +135,14 @@ function PullRequestEmptyState({
   );
 }
 
-/** Keep the provider name accessible without taking space from the PR picker. */
-function PanelTitle({ copy }: { copy: GitProviderCopy }) {
+/** The provider icon with the panel title, or icon-only (provider named for screen
+ *  readers) where the PR picker needs the room. */
+function PanelTitle({ copy, showTitle = false }: { copy: GitProviderCopy; showTitle?: boolean }) {
   const Icon = copy.Icon;
   return (
-    <h2 className="shrink-0" title={copy.label}>
+    <h2 className="flex shrink-0 items-center gap-2 font-medium text-ui" title={copy.label}>
       <Icon size={14} className="shrink-0" aria-hidden />
-      <span className="sr-only">{copy.label}</span>
+      {showTitle ? "Pull Requests" : <span className="sr-only">{copy.label}</span>}
     </h2>
   );
 }
@@ -1027,7 +1028,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
     <div className="flex h-full min-h-0 flex-col">
       {showTrackingControls ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} />
+          <PanelTitle copy={copy} showTitle={prs.length === 0} />
           <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
             {prs.length > 0 && (
               <TooltipProvider>
@@ -1123,7 +1124,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
         </div>
       ) : panelState.kind !== "ready" ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} />
+          <PanelTitle copy={copy} showTitle />
         </div>
       ) : null}
       {showTrackingControls && (linking || update.isError) && (
