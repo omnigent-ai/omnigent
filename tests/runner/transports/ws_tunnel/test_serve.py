@@ -459,8 +459,7 @@ async def test_serve_tunnel_fails_fast_when_factory_has_no_token(
     message = str(exc_info.value)
     assert attempt == 1
     assert message.startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
-    assert "login https://ws.cloud.databricks.com/omnigent` " in message
-    assert "?o=" not in message
+    assert "login https://ws.cloud.databricks.com/omnigent?o=123` " in message
 
 
 @pytest.mark.asyncio

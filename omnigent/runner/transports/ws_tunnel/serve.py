@@ -171,15 +171,11 @@ def _reauth_hint(server_url: str | None) -> str:
         return f"run `{override}` to re-authenticate"
     if not server_url:
         return "check remote server authentication"
-    # `omnigent login` detects the fronting workspace itself and reads the
-    # org id from its stored record, so the URL carries no ``?o=``: clients
-    # that append paths to the hinted URL would otherwise build
-    # ``…?o=123/auth/cli-login``.
+    # `omnigent login` detects the fronting workspace itself; the display
+    # form keeps ``?o=``, which selects the workspace on multi-workspace hosts.
     from omnigent.util.server_url import display_server_url
 
-    display = urlsplit(display_server_url(server_url))
-    bare = urlunsplit((display.scheme, display.netloc, display.path, "", ""))
-    return f"run `{cli_invocation()} login {bare}` to re-authenticate"
+    return f"run `{cli_invocation()} login {display_server_url(server_url)}` to re-authenticate"
 
 
 # Schemes that, when surfaced through ``InvalidURI.uri``, indicate
