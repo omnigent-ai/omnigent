@@ -3259,7 +3259,7 @@ describe("Sidebar view options", () => {
     expect(within(groupSection("Older")).getByText("conv_old")).toBeInTheDocument();
   });
 
-  it("orders the flat list by creation time instead of status or updates", () => {
+  it("uses fresh timestamps when switching Created to Updated through the menu", () => {
     mockConversations([
       conv("conv_done_new", "Codex", { status: "idle", created_at: 3, updated_at: 300 }),
       conv("conv_running", "Codex", { status: "running", created_at: 1, updated_at: 100 }),
@@ -3269,7 +3269,11 @@ describe("Sidebar view options", () => {
 
     openViewSubmenu("session-ordering-menu");
     expect(screen.queryByTestId("session-ordering-status")).toBeNull();
-    fireEvent.click(screen.getByRole("menuitemradio", { name: "Created" }));
+    const created = screen.getByRole("menuitemradio", { name: "Created" });
+    // Portalled menu events bubble through the list even though the pointer is outside it.
+    expect(screen.getByTestId("sidebar-conversation-list")).not.toContainElement(created);
+    fireEvent.mouseOver(created);
+    fireEvent.click(created);
     expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("created");
     const links = within(groupSection("Sessions")).getAllByRole("link", { name: /^conv_/ });
     expect(links.map((link) => link.textContent)).toEqual([
@@ -3277,6 +3281,21 @@ describe("Sidebar view options", () => {
       "conv_done_old",
       "conv_running",
     ]);
+
+    mockConversations([
+      conv("conv_done_new", "Codex", { status: "idle", created_at: 3, updated_at: 500 }),
+      conv("conv_running", "Codex", { status: "running", created_at: 1, updated_at: 100 }),
+      conv("conv_done_old", "Codex", { status: "idle", created_at: 2, updated_at: 400 }),
+    ]);
+    openViewSubmenu("session-ordering-menu");
+    const updated = screen.getByRole("menuitemradio", { name: "Updated" });
+    fireEvent.mouseOver(updated);
+    fireEvent.click(updated);
+    expect(
+      within(groupSection("Sessions"))
+        .getAllByRole("link", { name: /^conv_/ })
+        .map((link) => link.textContent),
+    ).toEqual(["conv_done_new", "conv_done_old", "conv_running"]);
   });
 
   it.each(["default", "status", "updated"])(

@@ -2635,10 +2635,11 @@ function ConversationList({
             <div
               className="flex flex-col gap-6"
               data-testid="sidebar-conversation-list"
-              // Freeze the sort order while the pointer is over the list so rows
-              // never move under the cursor. The frozen-keys map is cleared by the
-              // effect above once no hold (pointer or open rename edit) remains.
-              onMouseEnter={() => setPointerInside(true)}
+              // Only DOM descendants hold the order; portalled menus bubble
+              // mouse events here even when the pointer is outside the list.
+              onMouseOver={(event) =>
+                setPointerInside(event.currentTarget.contains(event.target as Node))
+              }
               onMouseLeave={() => setPointerInside(false)}
             >
               {/* Removing a filed session from its project means dropping it back
