@@ -59,6 +59,7 @@ from omnigent.models.claude_model_vocabulary import (
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
@@ -1158,7 +1159,8 @@ def _resolve_gateway_env(
     used verbatim. When only a Databricks profile is supplied (no override
     values), the Databricks-specific fallback derives both from the profile's
     workspace **host** (see
-    :func:`~omnigent.inner.databricks_executor._databricks_gateway_host`).
+    :func:`~omnigent.inner.databricks_executor._databricks_gateway_host`);
+    an ``ANTHROPIC_BASE_URL`` on that host replaces the derived base URL.
     Only the host is needed: the bearer token is minted at request time by
     the generated auth command, so OAuth U2M profiles (``auth_type =
     databricks-cli``, no static ``token`` field) resolve too. Returns an
@@ -1217,10 +1219,27 @@ def _resolve_gateway_env(
 
         if not host:
             return {}
+        from omnigent.host.databricks_credential import https_url_on_workspace_host
+
         host = host.rstrip("/")
-        base_url = (
-            base_url_override if base_url_override is not None else f"{host}/ai-gateway/anthropic"
-        )
+        # The auth command mints a bearer for this host, so only a same-workspace
+        # URL the user exported (e.g. /serving-endpoints/anthropic) may replace the route.
+        exported = getenv_nonempty_with_omnigent_prefix("ANTHROPIC_BASE_URL")
+        ambient_base_url = exported[1].strip() if exported else ""
+        if base_url_override is not None:
+            base_url = base_url_override
+        elif https_url_on_workspace_host(ambient_base_url, host):
+            base_url = ambient_base_url
+        else:
+            base_url = f"{host}/ai-gateway/anthropic"
+            if exported:
+                logger.info(
+                    "Ignoring %s=%s (not HTTPS on %s); using %s",
+                    exported[0],
+                    ambient_base_url,
+                    host,
+                    base_url,
+                )
         auth_command = (
             auth_command_override
             if auth_command_override is not None
