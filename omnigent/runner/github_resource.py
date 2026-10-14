@@ -88,7 +88,9 @@ _pr_title_timed_out: ContextVar[bool] = ContextVar("pr_title_timed_out", default
 # both are accepted by ``gh pr list`` too, so the fork-fallback path shares them.
 _PR_VIEW_FIELDS = (
     "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
+    ",reviewRequests,latestReviews"
 )
+_PR_REVIEW_FIELDS = frozenset({"reviewRequests", "latestReviews"})
 # Reading check runs needs the Checks permission, which a fine-grained personal
 # access token cannot hold; GitHub refuses just this field and ``gh`` fails the
 # whole call, so :func:`_gh_pr_view` retries without it.
@@ -405,6 +407,45 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
 _MAX_COMMENTS = 100
 
 
+def _shape_reviewers(data: dict[str, Any]) -> list[dict[str, str]]:
+    """Combine completed reviews with outstanding requests, including re-requests."""
+    reviewers: dict[tuple[str, str], dict[str, str]] = {}
+    reviews = data.get("latestReviews")
+    for review in reviews if isinstance(reviews, list) else []:
+        if not isinstance(review, dict):
+            continue
+        author = review.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        state = review.get("state")
+        if (
+            not isinstance(login, str)
+            or not login
+            or state
+            not in (
+                "APPROVED",
+                "COMMENTED",
+                "CHANGES_REQUESTED",
+                "DISMISSED",
+            )
+        ):
+            continue
+        reviewers[("user", login.lower())] = {"login": login, "kind": "user", "state": state}
+
+    requests = data.get("reviewRequests")
+    for request in requests if isinstance(requests, list) else []:
+        if not isinstance(request, dict):
+            continue
+        kind = "team" if request.get("__typename") == "Team" else "user"
+        login = (
+            request.get("slug") or request.get("name") if kind == "team" else request.get("login")
+        )
+        if not isinstance(login, str) or not login:
+            continue
+        # A re-request is pending even if the reviewer previously approved.
+        reviewers[(kind, login.lower())] = {"login": login, "kind": kind, "state": "PENDING"}
+    return list(reviewers.values())
+
+
 def _shape_comments(raw: Any) -> list[dict[str, Any]]:
     """Shape ``gh``'s PR ``comments`` into the Summary tab's comment list.
 
@@ -548,15 +589,19 @@ def _gh_pr_view(
 ) -> dict[str, Any] | None:
     """Return ``gh pr view <args> --json <fields>`` as a dict, or ``None``.
 
-    When GitHub refuses ``statusCheckRollup``, retry once without it; the result
-    then lacks that key. Any other failure, or no PR, is ``None``.
+    Retry without optional checks or reviewer fields only when the error names
+    them. Each retry removes fields, so unrelated failures never retry here.
     """
     rc, out, err = _gh(["pr", "view", *args, "--json", fields], cwd=cwd, token=token)
-    if rc != 0 and _checks_refused(fields, err):
-        without_checks = ",".join(f for f in fields.split(",") if f != _PR_CHECKS_FIELD)
-        rc, out, _ = _gh(["pr", "view", *args, "--json", without_checks], cwd=cwd, token=token)
-    if rc != 0:
-        return None
+    while rc != 0:
+        refused = {_PR_CHECKS_FIELD} if _checks_refused(fields, err) else set()
+        if any(field in err for field in _PR_REVIEW_FIELDS):
+            refused.update(_PR_REVIEW_FIELDS)
+        remaining = ",".join(field for field in fields.split(",") if field not in refused)
+        if not remaining or remaining == fields:
+            return None
+        fields = remaining
+        rc, out, err = _gh(["pr", "view", *args, "--json", fields], cwd=cwd, token=token)
     try:
         data = json.loads(out)
     except ValueError:
@@ -681,6 +726,8 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
             "body": body if isinstance(body, str) and body.strip() else None,
             "comments": _shape_comments(data.get("comments")),
         }
+        if _PR_REVIEW_FIELDS.issubset(data):
+            payload["pr"]["reviewers"] = _shape_reviewers(data)
         payload["authenticated"] = True
         payload["base_ref"] = data.get("baseRefName")
         payload["repo"] = {"name_with_owner": _owner_repo_from_pr_url(data.get("url"))}
@@ -782,6 +829,8 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         "body": data.get("body") or None,
         "comments": _shape_comments(data.get("comments")),
     }
+    if _PR_REVIEW_FIELDS.issubset(data):
+        info["pr"]["reviewers"] = _shape_reviewers(data)
     return info
 
 
