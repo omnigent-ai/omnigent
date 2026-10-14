@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import httpx
 import pytest
@@ -580,6 +580,34 @@ async def test_resumed_fallback_resets_pick_only_if_preload_and_terminal_succeed
     assert harness.resets == (
         [] if preload_fails else [{"expected_model_override": _RETIRED_PICK}]
     )
+
+
+@pytest.mark.asyncio
+async def test_relaunch_after_a_reaped_pane_applies_the_persisted_model_and_effort(
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pick stored while the pane was gone is what the resumed terminal launches with."""
+    harness = codex_launch_harness
+    pick, thread_id, effort = "gpt-5.6-sol", "019e96aa-0be2-7343-8d3b-6f914d60936c", "high"
+    harness.snapshot.update(
+        model_override=pick, reasoning_effort=effort, external_session_id=thread_id
+    )
+    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}, {"id": pick}])
+    apply_effort = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main._ensure_local_codex_resume_rollout", AsyncMock()
+    )
+    monkeypatch.setattr(codex_app, "preload_codex_thread_for_resume", AsyncMock())
+    monkeypatch.setattr(codex_app, "apply_codex_thread_effort", apply_effort)
+    monkeypatch.setattr(runner_native, "_codex_forward_known_thread", AsyncMock())
+
+    await harness.launch()
+
+    assert harness.builds[0]["model"] == pick
+    assert harness.builds[0]["reasoning_effort"] == effort
+    apply_effort.assert_awaited_once_with(ANY, thread_id, effort, model=pick, bridge_dir=ANY)
+    assert harness.resets == []
 
 
 @pytest.mark.asyncio
