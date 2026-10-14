@@ -4869,8 +4869,9 @@ def test_inject_user_message_raises_when_draft_never_submits(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="message was not delivered"):
+    with pytest.raises(RuntimeError, match="message was not delivered") as caught:
         inject_user_message(bridge_dir, content="fix the flaky test")
+    assert isinstance(caught.value, claude_native_bridge.ClaudeMessageNotAccepted)
 
 
 def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(

@@ -2985,8 +2985,17 @@ def create_runner_app(
             history = []
         else:
             history = await _load_history_as_input(session_id)
+        # A runner-connect init carries no suppress flag, yet the server may
+        # forward the first message concurrently. A forward already past its
+        # active-turn check starts the turn itself; a recovery turn started now
+        # would be a second turn-start, which the harness answers with a 204
+        # injection that surfaces as "turn failed (status 204)".
+        forward_in_flight = _ingest_next_seq.get(session_id, 0) != _ingest_now_serving.get(
+            session_id, 0
+        )
         execution_seen = (
             initially_active
+            or forward_in_flight
             or _turn_bind_epoch.get(session_id) != initial_turn_epoch
             or resource_registry.session_activity_epoch(session_id) != initial_native_activity
         )
@@ -3089,6 +3098,7 @@ def create_runner_app(
                 ),
                 suppress_recovery_turn=_suppress_recovery,
                 execution_seen=execution_seen,
+                forward_in_flight=forward_in_flight,
                 history_len=len(history),
                 last_item_type=history[-1].get("type") if history else None,
             ),

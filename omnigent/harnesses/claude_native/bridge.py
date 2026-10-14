@@ -616,6 +616,10 @@ class ClaudeUserPromptPending(RuntimeError):
     """A native question or permission prompt must be answered before injection."""
 
 
+class ClaudeMessageNotAccepted(RuntimeError):
+    """The submitted draft remained in Claude's input box until the deadline."""
+
+
 @contextlib.contextmanager
 def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
     """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
@@ -4394,7 +4398,7 @@ def _paste_and_submit(
         ) from exc
     if accepted:
         return
-    raise RuntimeError(
+    raise ClaudeMessageNotAccepted(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )

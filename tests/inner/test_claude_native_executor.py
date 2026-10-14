@@ -1724,18 +1724,24 @@ async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("submitted", [False, True], ids=["before_submit", "after_submit"])
-async def test_run_turn_marks_a_prompt_held_message_undelivered_only_before_submit(
+@pytest.mark.parametrize(
+    ("submitted", "refusal"),
+    [
+        (False, "pending_prompt"),
+        (True, "pending_prompt"),
+        (True, "draft_persisted"),
+        (False, "missing_target"),
+    ],
+    ids=["before_submit", "after_submit", "draft_not_accepted", "missing_target"],
+)
+async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_ambiguous(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     submitted: bool,
+    refusal: str,
 ) -> None:
     """
-    A pending Claude prompt fails the turn as undelivered only before the submit Enter.
-
-    Until the Enter the sender's queued copy is the only record of the message.
-    A prompt that appears after it may belong to the turn the message started,
-    so that failure must not be reported as undelivered.
+    Refusals preserve input; a prompt after Enter may belong to its accepted turn.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -1753,13 +1759,21 @@ async def test_run_turn_marks_a_prompt_held_message_undelivered_only_before_subm
         elif args[-1] == "Enter":
             # The draft stays visible, so submit verification looks to retry.
             enters += 1
-            prompt_pending = True
+            prompt_pending = refusal == "pending_prompt"
 
-    monkeypatch.setattr(
-        claude_bridge,
-        "_wait_for_tmux_info",
-        lambda *_a, **_k: {"socket_path": "/unused/socket", "tmux_target": "main"},
-    )
+    if refusal == "missing_target":
+        wait_for_target = claude_bridge._wait_for_tmux_info
+        monkeypatch.setattr(
+            claude_bridge,
+            "_wait_for_tmux_info",
+            lambda directory, **_kwargs: wait_for_target(directory, timeout_s=0.0),
+        )
+    else:
+        monkeypatch.setattr(
+            claude_bridge,
+            "_wait_for_tmux_info",
+            lambda *_a, **_k: {"socket_path": "/unused/socket", "tmux_target": "main"},
+        )
     monkeypatch.setattr(claude_bridge, "_restore_occupied_input", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_bridge, "_run_tmux", run_tmux)
@@ -1768,6 +1782,7 @@ async def test_run_turn_marks_a_prompt_held_message_undelivered_only_before_subm
     monkeypatch.setattr(claude_bridge, "_PASTE_SETTLE_S", 0.0)
     monkeypatch.setattr(claude_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(claude_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(claude_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.01)
     monkeypatch.setattr(
         claude_native_executor,
         "kill_session",
@@ -1784,13 +1799,22 @@ async def test_run_turn_marks_a_prompt_held_message_undelivered_only_before_subm
         )
     ]
 
-    assert enters == int(submitted)
+    if refusal == "draft_persisted":
+        assert enters >= 1
+        assert pane == "❯ review this function"
+    else:
+        assert enters == int(submitted)
     assert killed == []
     assert len(events) == 1
     error = events[0]
     assert isinstance(error, ExecutorError)
-    assert "waiting for an explicit answer" in error.message
-    assert error.undelivered is not submitted
+    expected_detail = {
+        "pending_prompt": "waiting for an explicit answer",
+        "draft_persisted": "draft is still in the input box",
+        "missing_target": "tmux target is not advertised",
+    }[refusal]
+    assert expected_detail in error.message
+    assert error.undelivered is (refusal != "pending_prompt" or not submitted)
 
 
 @pytest.mark.asyncio
@@ -2024,6 +2048,8 @@ async def test_run_turn_does_not_reap_unrelated_runtime_error(
 
     assert killed == []
     assert isinstance(events[0], ExecutorError)
+    assert events[0].message == "tmux send-keys failed"
+    assert events[0].undelivered is False
 
 
 @pytest.mark.asyncio

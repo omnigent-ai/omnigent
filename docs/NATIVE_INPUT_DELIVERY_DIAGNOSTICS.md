@@ -93,6 +93,12 @@ A runner's `response.failed` event can carry top-level `input_stable_id`.
 SSE logging retains this validated ID to connect the failure to its original
 web submission, even before a transcript item exists.
 
+Claude reports an input as undelivered when the tmux target was never
+advertised or submit verification found its draft still in the input box.
+The executor keeps the terminal for recovery and reports this refusal so the
+server can persist the queued web input. A question or permission prompt
+discovered after Enter may belong to a delivered message and remains uncertain.
+
 ## Verification
 
 Run the deterministic persistence check from the repository root:
