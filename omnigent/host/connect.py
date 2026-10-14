@@ -1890,7 +1890,6 @@ class HostProcess:
             harness_ready = frame.harness is None or await asyncio.to_thread(
                 harness_is_configured, frame.harness
             )
-        # Readiness probes Pi on PATH; the selected executable can differ.
         if frame.harness in {"pi", "pi-native"}:
             from omnigent.harnesses.pi_native.main import (
                 PiNativeCliOutdatedError,
