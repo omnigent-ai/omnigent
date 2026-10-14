@@ -420,6 +420,88 @@ async def test_serve_tunnel_fails_loud_on_http_auth_rejection(
     assert attempt == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
 
 
+@pytest.mark.asyncio
+async def test_serve_tunnel_fails_fast_when_factory_has_no_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 401 on an upgrade sent without a bearer (factory returned None) is fatal at once.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.delenv(serve_module.REAUTH_COMMAND_ENV, raising=False)
+    attempt = 0
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        """Raise 401 the way the front door answers an unauthenticated upgrade.
+
+        :param app: Runner ASGI app.
+        :param auth_token: Bearer token (expected ``None``).
+        :raises InvalidStatus: Always with 401.
+        """
+        del app
+        assert auth_token is None
+        nonlocal attempt
+        attempt += 1
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent?o=123",
+            runner_id="runner_no_credential",
+            runner_version="0.1.0",
+            auth_token_factory=lambda: None,
+        )
+
+    message = str(exc_info.value)
+    assert attempt == 1
+    assert message.startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+    assert "login https://ws.cloud.databricks.com/omnigent` " in message
+    assert "?o=" not in message
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_reauth_hint_uses_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_REAUTH_COMMAND`` replaces the default ``omnigent login`` hint.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv(serve_module.REAUTH_COMMAND_ENV, "isaac login")
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        """Raise 401.
+
+        :param app: Runner ASGI app.
+        :raises InvalidStatus: Always with 401.
+        """
+        del app
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    async def _sleep(_delay: float) -> None:
+        """No-op sleep.
+
+        :param _delay: Reconnect delay (unused).
+        """
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(RuntimeError, match="run `isaac login` to re-authenticate"):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://example.databricksapps.com",
+            runner_id="runner_env_hint",
+            runner_version="0.1.0",
+            auth_token="tok-expired",
+        )
+
+
 def test_websocket_auth_redirect_url_detects_https_redirect() -> None:
     """An ``InvalidURI`` carrying an https:// target is classified as auth.
 

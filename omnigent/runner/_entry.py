@@ -30,7 +30,10 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
-from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.runner.transports.ws_tunnel.serve import (
+    RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
+    RUNNER_TUNNEL_REJECTION_PREFIX,
+)
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
@@ -2135,9 +2138,11 @@ def main() -> None:
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:
-        if not str(exc).startswith(RUNNER_TUNNEL_REJECTION_PREFIX):
+        if not str(exc).startswith(
+            (RUNNER_TUNNEL_REJECTION_PREFIX, RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+        ):
             raise
-        # A fatal server rejection is an expected, actionable exit — log the
+        # A fatal tunnel auth failure is an expected, actionable exit — log the
         # reason but keep stderr to the concise message (no traceback).
         _logger.error("runner exiting: %s", exc, extra={"session_id": runner_primary_session_id()})
         print(f"error: {exc}", file=sys.stderr)
