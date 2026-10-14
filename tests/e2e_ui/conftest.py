@@ -2545,14 +2545,20 @@ executor:
 """
 
 
-def _bind_session_runner(base_url: str, session_id: str, runner_id: str) -> None:
+def _bind_session_runner(
+    base_url: str,
+    session_id: str,
+    runner_id: str,
+    *,
+    timeout: float = 10.0,
+) -> None:
     """PATCH *session_id* onto *runner_id* so ``POST /v1/responses`` dispatches.
 
     :param base_url: Spawned server base URL, e.g. ``"http://127.0.0.1:51234"``.
     :param session_id: The session/conversation id to bind.
     :param runner_id: The token-bound runner id the session dispatches to.
     """
-    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=timeout)
 
 
 def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> str:
@@ -2743,6 +2749,7 @@ def _create_native_codex_session(
     runner_id: str,
     *,
     model: str | None = None,
+    bind_timeout_s: float = 10.0,
 ) -> str:
     """Register the ``codex-native`` wrapper agent and bind its session.
 
@@ -2777,7 +2784,7 @@ def _create_native_codex_session(
         metadata={"workspace": str(_REPO_ROOT)},
     )
     session_id = str(created["session_id"])
-    _bind_session_runner(base_url, session_id, runner_id)
+    _bind_session_runner(base_url, session_id, runner_id, timeout=bind_timeout_s)
     return session_id
 
 

@@ -38,6 +38,7 @@ bounded allowance.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import secrets
 import shutil
@@ -54,6 +55,10 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.harnesses.codex_native.bridge import (
+    CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS,
+    CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
+)
 from tests.e2e_ui.conftest import (
     _create_native_codex_session,
     configure_mock_llm,
@@ -83,9 +88,6 @@ _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 # boot adds a few seconds on top before ``thread/started``.
 _WRAPPER_SETUP_DELAY_S = 45
 
-# Must match the model in the mock openai provider config written below.
-_CODEX_MOCK_MODEL = "gpt-4o"
-
 # Markers of the regression failure in the turn's executor error text (the
 # runner's bridge startup error, surfaced verbatim by the codex-native
 # executor as "Codex native thread never started: ...").
@@ -97,6 +99,30 @@ def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+def _visible_bundled_model(codex_path: str) -> str:
+    """Choose a model the installed Codex accepts before provider dispatch."""
+    completed = subprocess.run(
+        [codex_path, "debug", "models", "--bundled"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    models = json.loads(completed.stdout).get("models", [])
+    model = next(
+        (
+            row.get("slug")
+            for row in models
+            if isinstance(row, dict)
+            and row.get("visibility") == "list"
+            and isinstance(row.get("slug"), str)
+        ),
+        None,
+    )
+    assert model, "Codex's bundled catalog has no visible model for the E2E rig"
+    return model
 
 
 # Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars
@@ -113,22 +139,33 @@ for _var in ("NO_PROXY", "no_proxy"):
 def _clean_env() -> dict[str, str]:
     """Ambient env with loopback proxy-excluded and runner/host vars stripped.
 
-    Stripping ``OMNIGENT_RUNNER_*`` / ``OMNIGENT_HOST_*`` matters when the
-    test itself runs inside a server-spawned runner: leaked zygote/tunnel
-    vars make the spawned child runner take the zygote-fork path and hang.
-    ``OMNIGENT_PROCESS_LOG_FILE`` / ``OMNIGENT_DATA_DIR`` are host-owned
-    write paths; the spawned pair must not write into (or crash on) the
-    calling host's log/data locations.
+    Stripping ``OMNIGENT_*`` matters when the test itself runs inside a
+    server-spawned runner: leaked identity, zygote, tunnel, and write-path
+    settings can redirect the isolated pair back to the calling host.
+    Credential, endpoint, and config-selector suffixes keep arbitrary
+    managed-launcher state out of the generic wrapper rig.
     """
     env = os.environ.copy()
     for var in ("NO_PROXY", "no_proxy"):
         existing = env.get(var, "")
         env[var] = ",".join(filter(None, [existing, "127.0.0.1,localhost"]))
     for key in list(env):
-        if key.startswith(("OMNIGENT_RUNNER_", "OMNIGENT_HOST_")):
+        if key.startswith(("OMNIGENT_", "CODEX_")) or key.endswith(
+            (
+                "_API_KEY",
+                "_TOKEN",
+                "_MODEL_CATALOG_PATH",
+                "_HOST",
+                "_CONFIG_FILE",
+                "_CONFIG_PROFILE",
+                "_BEARER",
+                "_CLIENT_ID",
+                "_CLIENT_SECRET",
+                "_AUTH_TYPE",
+            )
+        ):
             del env[key]
-    for key in ("RUNNER_SERVER_URL", "OMNIGENT_PROCESS_LOG_FILE", "OMNIGENT_DATA_DIR"):
-        env.pop(key, None)
+    env.pop("RUNNER_SERVER_URL", None)
     return env
 
 
@@ -137,7 +174,7 @@ def wrapped_codex_session(
     built_spa: None,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[tuple[str, str, Path]]:
+) -> Iterator[tuple[str, str, Path, str]]:
     """A codex-native session launched through a slow configured wrapper command.
 
     Spawns a dedicated server + runner whose ``OMNIGENT_CONFIG_HOME`` carries
@@ -149,10 +186,11 @@ def wrapped_codex_session(
     args. The wrapper stamps marker files so the test can prove the launch
     was healthy (Codex really started, just late).
 
-    :returns: ``(base_url, session_id, markers_dir)``.
+    :returns: ``(base_url, session_id, markers_dir, model)``.
     """
     codex_path = shutil.which("codex")
     assert codex_path is not None  # pytestmark guards this
+    codex_model = _visible_bundled_model(codex_path)
 
     work = tmp_path_factory.mktemp("codex_wrapped_startup")
     config_home = work / "config-home"
@@ -191,7 +229,7 @@ providers:
       api_key: "mock-key"
       wire_api: responses
       models:
-        default: {_CODEX_MOCK_MODEL}
+        default: {codex_model}
 harness:
   codex-native:
     command: {wrapper}
@@ -281,8 +319,15 @@ harness:
                 f"Runner log:\n{runner_log.read_text()[-3000:]}"
             )
 
-        session_id = _create_native_codex_session(base_url, runner_id)
-        yield (base_url, session_id, markers)
+        session_id = _create_native_codex_session(
+            base_url,
+            runner_id,
+            bind_timeout_s=(
+                CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+                + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS
+            ),
+        )
+        yield (base_url, session_id, markers, codex_model)
     finally:
         if session_id is not None:
             with contextlib.suppress(httpx.HTTPError):
@@ -304,7 +349,7 @@ harness:
 @pytest.mark.timeout(600)
 def test_configured_codex_command_setup_survives_startup_watchdog(
     page: Page,
-    wrapped_codex_session: tuple[str, str, Path],
+    wrapped_codex_session: tuple[str, str, Path, str],
     mock_llm_server_url: str,
 ) -> None:
     """A healthy wrapped codex launch must not die at the 30s watchdog.
@@ -318,7 +363,7 @@ def test_configured_codex_command_setup_survives_startup_watchdog(
     rendered by the SPA as an error pill — even though the wrapper execs
     Codex a few seconds later (proven via the marker file).
     """
-    base_url, session_id, markers = wrapped_codex_session
+    base_url, session_id, markers, codex_model = wrapped_codex_session
 
     nonce = uuid.uuid4().hex[:8]
     user_marker = f"wrapped-start-{nonce}"
@@ -336,7 +381,7 @@ def test_configured_codex_command_setup_survives_startup_watchdog(
         match=user_marker,
     )
     # Stray internal Codex calls (model-routed, no transcript) must not stall.
-    set_fallback_mock_llm(mock_llm_server_url, _CODEX_MOCK_MODEL, "")
+    set_fallback_mock_llm(mock_llm_server_url, codex_model, "")
 
     page.goto(f"{base_url}/c/{session_id}")
     _ensure_chat_view(page)
@@ -388,7 +433,44 @@ def test_configured_codex_command_setup_survives_startup_watchdog(
         f"bounded startup allowance: {premature[0][:500]}"
     )
 
-    # And the journey must actually complete: the wrapped launch's thread
-    # serves the first turn once the allowance covers the setup delay.
-    reply = page.locator(_ASSISTANT, has_text=assistant_token)
-    expect(reply.first).to_be_visible(timeout=120_000)
+    # The configured allowance must carry startup through real thread creation.
+    # Provider-response behavior is covered by the native round-trip E2Es; this
+    # test isolates the wrapper/watchdog boundary.
+    thread_id: str | None = None
+    thread_deadline = time.monotonic() + 120.0
+    while thread_id is None and time.monotonic() < thread_deadline:
+        snapshot = _client.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+        snapshot.raise_for_status()
+        raw_thread_id = snapshot.json().get("external_session_id")
+        thread_id = raw_thread_id if isinstance(raw_thread_id, str) else None
+        if thread_id is None:
+            time.sleep(0.5)
+    assert thread_id, "the configured wrapper exec'd Codex but no thread became available"
+
+    # Recovery uses the public resource proxy rather than the bind-time path.
+    # Its HTTP budgets must cover the same configured-wrapper allowance.
+    wrapper_started = markers / "wrapper-started"
+    first_start_mtime = wrapper_started.stat().st_mtime_ns
+    first_exec_mtime = exec_marker.stat().st_mtime_ns
+    deleted = _client.delete(
+        f"{base_url}/v1/sessions/{session_id}/resources/terminals/terminal_codex_main",
+        timeout=30.0,
+    )
+    deleted.raise_for_status()
+    ensured = _client.post(
+        f"{base_url}/v1/sessions/{session_id}/resources/terminals",
+        json={"terminal": "codex", "session_key": "main", "ensure_native_terminal": True},
+        timeout=(
+            CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+            + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS
+            + 30.0
+        ),
+    )
+    ensured.raise_for_status()
+    restart_deadline = time.monotonic() + _WRAPPER_SETUP_DELAY_S + 90.0
+    while (
+        exec_marker.stat().st_mtime_ns <= first_exec_mtime and time.monotonic() < restart_deadline
+    ):
+        time.sleep(0.5)
+    assert wrapper_started.stat().st_mtime_ns > first_start_mtime
+    assert exec_marker.stat().st_mtime_ns > first_exec_mtime

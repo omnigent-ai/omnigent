@@ -195,7 +195,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _PI_NATIVE_WRAPPER_LABEL_VALUE,
     _RUNNER_FORWARD_TIMEOUT,
     _RUNNER_RELAY_READY_TIMEOUT_S,
-    _RUNNER_SESSION_INIT_TIMEOUT_S,
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL,
@@ -232,6 +231,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_terminal_pending_cache,
     get_caps,
     get_server_runner_router,
+    runner_session_init_timeout,
     session_stream,
     set_server_runner_router,
 )
@@ -5195,11 +5195,15 @@ async def _ensure_runner_session_initialized(
         terminal is ready; ``False`` for legacy or non-native responses.
     """
     try:
+        native_agent = _native_coding_agent_for_session(conv)
+        session_init_timeout = runner_session_init_timeout(
+            native_agent.harness if native_agent is not None else None
+        )
         if initializer is not None:
             resp = await initializer.initialize(
                 conv,
                 runner_client,
-                timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
+                timeout=session_init_timeout,
                 suppress_recovery_turn=suppress_recovery_turn,
             )
         else:
@@ -5212,7 +5216,7 @@ async def _ensure_runner_session_initialized(
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
                 ),
-                timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
+                timeout=session_init_timeout,
             )
         from omnigent.server.runner_session_init import (
             is_session_agent_removed,
@@ -5368,7 +5372,7 @@ async def _ensure_native_terminal_ready(
                 "ensure_native_terminal": True,
                 "persist_resource_event": persist_resource_event,
             },
-            timeout=10.0,
+            timeout=runner_session_init_timeout(harness),
         )
 
     def _is_tunnel_loss(exc: httpx.HTTPError | ConnectionError) -> bool:
