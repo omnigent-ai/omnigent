@@ -1,8 +1,8 @@
-"""Browser e2e: the Rename-project dialog must focus and preselect the name.
+"""Browser e2e: Project Settings focuses and preselects the project name.
 
-Drives the real sidebar journey (right-click a project folder -> Rename
-project) and asserts that the dialog opens with the name input focused and
-its whole value selected, so typing immediately replaces the current name.
+Drives the real sidebar journey (right-click a project folder -> Project
+Settings) and asserts that the name input is focused with its whole value
+selected, so typing immediately replaces the current name.
 """
 
 from __future__ import annotations
@@ -27,8 +27,11 @@ def _folder_header(page: Page, project: str) -> Locator:
     return page.locator('button[data-slot="context-menu-trigger"]').filter(has_text=project)
 
 
-def _open_rename_dialog(page: Page, seeded_session: tuple[str, str]) -> Locator:
-    """Open the rename dialog for a fresh project and return its name input."""
+def _open_project_settings(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> Locator:
+    """Open Project Settings for a fresh project and return its name input."""
     base_url, session_id = seeded_session
     project = f"Repro-{uuid.uuid4().hex[:6]}"
     page.goto(f"{base_url}/c/{session_id}")
@@ -36,10 +39,10 @@ def _open_rename_dialog(page: Page, seeded_session: tuple[str, str]) -> Locator:
     header = _folder_header(page, project)
     expect(header).to_be_visible()
     header.click(button="right")
-    page.get_by_test_id("rename-project").click()
+    page.get_by_test_id("project-settings").click()
     dialog = page.get_by_role("dialog")
     expect(dialog).to_be_visible()
-    name_input = dialog.locator("input")
+    name_input = dialog.get_by_test_id("project-settings-name")
     expect(name_input).to_have_value(project)
     return name_input
 
@@ -49,7 +52,7 @@ def test_rename_dialog_focuses_name_input(
     seeded_session: tuple[str, str],
 ) -> None:
     """The name input receives initial focus when the dialog opens."""
-    name_input = _open_rename_dialog(page, seeded_session)
+    name_input = _open_project_settings(page, seeded_session)
     expect(name_input).to_be_focused()
 
 
@@ -58,7 +61,7 @@ def test_rename_dialog_preselects_name_so_typing_replaces(
     seeded_session: tuple[str, str],
 ) -> None:
     """The current name opens fully selected, so typing replaces it."""
-    name_input = _open_rename_dialog(page, seeded_session)
+    name_input = _open_project_settings(page, seeded_session)
     old_name = name_input.input_value()
     expect(name_input).to_be_focused()
     expect(name_input).to_have_js_property("selectionStart", 0)
@@ -66,3 +69,6 @@ def test_rename_dialog_preselects_name_so_typing_replaces(
     new_name = f"Renamed-{uuid.uuid4().hex[:6]}"
     page.keyboard.type(new_name)
     expect(name_input).to_have_value(new_name)
+    page.get_by_test_id("project-settings-save").click()
+    expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
+    expect(_folder_header(page, new_name)).to_be_visible()

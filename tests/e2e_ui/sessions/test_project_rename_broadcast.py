@@ -67,20 +67,21 @@ def _create_project(page: Page, name: str) -> None:
 
 
 def _rename_project(page: Page, old: str, new: str) -> None:
-    """Rename a project via the folder context menu's "Rename project" dialog.
+    """Rename a project through Project Settings.
 
     Asserts the renaming client itself shows the new name afterwards -- that
     half works via the local mutation's invalidation and is the sanity check,
     not the cross-client delivery under test.
     """
     _folder_header(page, old).click(button="right")
-    page.get_by_test_id("rename-project").click()
+    page.get_by_test_id("project-settings").click()
     dialog = page.get_by_role("dialog")
     expect(dialog).to_be_visible()
-    # The dialog's single text input holds the current name; replace it.
-    dialog.locator("input").fill(new)
-    page.get_by_test_id("rename-project-confirm").click()
-    expect(page.get_by_test_id("rename-project-confirm")).to_have_count(0)
+    name_input = dialog.get_by_test_id("project-settings-name")
+    expect(name_input).to_have_value(old)
+    name_input.fill(new)
+    page.get_by_test_id("project-settings-save").click()
+    expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
     expect(_folder_header(page, new)).to_be_visible()
 
 
