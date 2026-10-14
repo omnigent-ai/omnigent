@@ -12,9 +12,9 @@ Covers the two reported consequences:
 
 * the sessions API journey — a client paging ``GET /v1/sessions`` while the
   user deletes the cursor session silently never sees the remaining rows;
-* the policy/display spend seed — ``load_session_usage`` builds its subtree
-  total from the same enumeration loop, so a concurrent delete under-counts
-  the surviving tree's spend.
+* the usage report's spend roll-up — ``load_session_usage_and_tree`` builds
+  its subtree total from the same enumeration loop, so a concurrent delete
+  under-counts the surviving tree's spend.
 
 Uses the shared ``client`` fixture from ``tests/server/conftest.py`` (real
 route → store pipeline) and a real ``SqlAlchemyConversationStore`` on the
@@ -28,10 +28,12 @@ from typing import Any
 
 import httpx
 import pytest
+from sqlalchemy import update
 
+from omnigent.db.db_models import SqlConversation, current_workspace_id
 from omnigent.runtime.policies.builder import (
     _SUBTREE_USAGE_PAGE_SIZE,
-    load_session_usage,
+    load_session_usage_and_tree,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -146,23 +148,33 @@ class _DeleteCursorBetweenPages:
         return page
 
 
-def test_policy_usage_seed_not_silently_truncated_by_concurrent_delete(
+def test_usage_report_rollup_not_silently_truncated_by_concurrent_delete(
     db_uri: str,
 ) -> None:
-    """A concurrent delete must not silently under-count the spend seed.
+    """A concurrent delete must not silently under-count a paged spend roll-up.
 
     Builds a spawn tree larger than ``_SUBTREE_USAGE_PAGE_SIZE`` where every
     conversation recorded $1.00 of spend, then loads the subtree usage via
-    the public ``load_session_usage`` entry point (the same paged tree read
-    that seeds ``PolicyEngine(initial_usage=...)``) while a delete of the
-    page-1 cursor row lands between the two page fetches. The dead cursor
-    restarts the tree read, so the seed must come back as *exactly* the
-    surviving tree's spend — a truncated total moves budget gates and can
-    allow an over-budget tool call.
+    ``load_session_usage_and_tree`` (the usage report's paged full-row tree
+    read) while a delete of the page-1 cursor row lands between the two page
+    fetches. The dead cursor restarts the tree read, so the total must come
+    back as *exactly* the surviving tree's spend. (The policy seed's keyset
+    pages do not depend on the cursor row still existing.)
     """
     store = SqlAlchemyConversationStore(db_uri)
     root = store.create_conversation(title="usage-root")
     store.set_session_usage(root.id, {"total_cost_usd": 1.0})
+    # Make the root strictly oldest: rows created in the same second sort by id,
+    # and deleting a root that lands on the page-1 cursor removes the whole tree.
+    with store._conv_engine.begin() as connection:
+        connection.execute(
+            update(SqlConversation)
+            .where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == root.id,
+            )
+            .values(created_at=SqlConversation.created_at - 60)
+        )
     n_children = _SUBTREE_USAGE_PAGE_SIZE + 4
     for i in range(n_children):
         child = store.create_conversation(
@@ -173,14 +185,14 @@ def test_policy_usage_seed_not_silently_truncated_by_concurrent_delete(
         store.set_session_usage(child.id, {"total_cost_usd": 1.0})
 
     proxy = _DeleteCursorBetweenPages(store)
-    usage = load_session_usage(root.id, proxy)
+    usage, _ = load_session_usage_and_tree(root.id, proxy)
 
     assert proxy.deleted_id is not None, "test setup: tree never paged"
     # 1 root + n_children rows at $1 each, minus the one deleted mid-read.
     surviving_total = float(1 + n_children - 1)
     got = float(usage.get("total_cost_usd", 0.0))
     assert got == pytest.approx(surviving_total), (
-        f"spend seed misreports the surviving tree after a concurrent "
+        f"spend roll-up misreports the surviving tree after a concurrent "
         f"delete: got ${got}, expected ${surviving_total} "
         f"(deleted mid-enumeration: {proxy.deleted_id})"
     )
