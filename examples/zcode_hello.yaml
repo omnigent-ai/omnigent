@@ -1,0 +1,18 @@
+name: zcode-hello
+description: >-
+  Smallest ZCode agent. Each turn runs the ZCode CLI in safe print mode.
+
+executor:
+  harness: zcode
+
+prompt: |
+  You are ZCode, running headlessly inside Omnigent. Help with software
+  engineering tasks. Keep responses short.
+
+# Use `zcode login` or configure a Coding Plan API key in the ZCode TUI.
+# Credentials stay in ZCode's encrypted ~/.zcode/v2/credentials.json store;
+# do not set executor.auth or model. Print mode uses yolo. Use os_env.sandbox
+# when OS-level isolation is required.
+#
+# Try it:
+#   omnigent run examples/zcode_hello.yaml -p "say pong"

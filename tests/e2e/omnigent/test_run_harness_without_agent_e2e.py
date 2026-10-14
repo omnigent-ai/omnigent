@@ -262,6 +262,9 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "kimi-native",
         "hermes",
         "hermes-native",
+        # zcode wraps the own-auth ``zcode`` CLI (credential file, not the
+        # shared gateway probe this matrix drives).
+        "zcode",
         "devin-native",
         *ACP_CLI_HARNESSES,
     }

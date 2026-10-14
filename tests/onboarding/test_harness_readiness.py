@@ -462,6 +462,10 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
+        # ZCode headless CLI plus the ``z-code`` alias. Gated on the binary
+        # and a credential file, not on an Omnigent provider.
+        "zcode",
+        "z-code",
         # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
         # binary of its own; the acp:<slug> picks are config-derived, not keyed here.
         "acp",
@@ -518,6 +522,7 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "native-goose",
         "qwen",
         "hermes",
+        "zcode",
         *sorted(ACP_CLI_HARNESSES),
     ):
         assert result[cli] is not True, f"{cli} should be gated on its CLI binary"
@@ -571,11 +576,13 @@ def test_configured_harness_map_all_true_with_clis(
     (token-gated) by a ``GH_TOKEN``, antigravity-native (binary + credential
     gated) by a detected Gemini OAuth credential, kimi (binary + credential
     gated) by a detected ``kimi login`` credential or a Kimi API key in
-    ``~/.kimi-code/config.toml``, and the generic ACP harness (config-gated) by
+    ``~/.kimi-code/config.toml``, zcode (binary + credential file) by a
+    non-empty ``credentials.json``, and the generic ACP harness (config-gated) by
     a registered agent — so nothing is reported unconfigured.
     """
     import omnigent.onboarding.gemini_auth as _ga
     import omnigent.onboarding.kimi_auth as _ka
+    import omnigent.onboarding.zcode_auth as _za
 
     _all_clis_installed(monkeypatch)
     monkeypatch.setattr(
@@ -587,6 +594,8 @@ def test_configured_harness_map_all_true_with_clis(
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
     # kimi also needs a credential (not just the ``kimi`` binary).
     monkeypatch.setattr(_ka, "kimi_auth_configured", lambda: True)
+    # zcode also needs the encrypted credential file, not just the binary.
+    monkeypatch.setattr(_za, "zcode_login_configured", lambda: True)
     monkeypatch.setenv("GH_TOKEN", "gho_ready")
     # claude / pi are auth-aware on the credential axis now: satisfy the provider
     # check deterministically (don't depend on the dev machine's real config).
@@ -602,6 +611,41 @@ def test_configured_harness_map_all_true_with_clis(
     result = configured_harness_map()
     not_ready = {k: v for k, v in result.items() if v is not True}
     assert not not_ready, f"expected every spelling ready, got {not_ready}"
+
+
+def test_zcode_readiness_needs_binary_and_credential_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ZCode is launchable only when ``zcode`` is installed and signed in."""
+    import omnigent.onboarding.zcode_auth as zcode_auth
+
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(zcode_auth, "zcode_login_configured", lambda: False)
+    assert harness_is_configured("zcode") is False
+    assert harness_is_configured("z-code") is False
+    monkeypatch.setattr(zcode_auth, "zcode_login_configured", lambda: True)
+    assert harness_is_configured("zcode") is True
+    assert harness_is_configured("z-code") is True
+
+
+def test_zcode_readiness_honors_configured_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.onboarding.zcode_auth as zcode_auth
+
+    monkeypatch.delenv("OMNIGENT_ZCODE_PATH", raising=False)
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: {"harness": {"zcode": {"command": "/custom/zcode"}}},
+    )
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary",
+        lambda command: command if command == "/custom/zcode" else None,
+    )
+    monkeypatch.setattr(zcode_auth, "zcode_login_configured", lambda: True)
+
+    assert harness_is_configured("zcode") is True
+    assert zcode_auth.zcode_auth_summary().ready is True
 
 
 def test_configured_harness_map_probes_codex_readiness_once(

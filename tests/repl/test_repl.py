@@ -3280,6 +3280,18 @@ def _openai_key_default_config() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("harness", ["zcode", "z-code"])
+@pytest.mark.parametrize("model_override", [None, "unsupported-model"])
+def test_model_readout_zcode_reports_vendor_auth_and_no_model_override(
+    harness: str, model_override: str | None
+) -> None:
+    lines = _build_model_readout_lines(_openai_key_default_config(), harness, model_override)
+    assert lines == [
+        "Active:  ZCode's own model and authentication",
+        "ZCode print mode does not support model overrides via /model or executor.model.",
+    ]
+
+
 def test_model_readout_own_auth_acp_harness_reports_agent_not_provider() -> None:
     """
     Own-auth ACP harnesses must not report an Omnigent provider credential.

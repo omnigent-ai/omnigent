@@ -1571,6 +1571,8 @@ def harness_owns_its_credential(harness: str) -> bool:
     from omnigent.harness_plugins import harness_capabilities
 
     canonical = canonicalize_harness(harness) or harness
+    if canonical == "zcode":
+        return True
     if canonical in _HARNESS_FAMILY:
         return False
     caps = harness_capabilities().get(canonical)

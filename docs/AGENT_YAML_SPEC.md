@@ -55,7 +55,7 @@ of the agent YAML.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, devin-native, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, devin-native, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, zcode, ...
   model: databricks-claude-opus-4-7
   reasoning_effort: high     # optional spec default: low | medium | high | xhigh (harness-dependent)
   auth:
@@ -241,6 +241,41 @@ CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's
 `executor.auth` block or your `omnigent setup` provider config — there is
 no profile flag.
+
+## ZCode
+
+`harness: zcode` runs the agent through [ZCode](https://github.com/zai-org/zcode),
+Z.ai's coding CLI. Each turn runs `zcode -p --output-format stream-json` in
+`yolo` mode. ZCode does not speak ACP. Model overrides are rejected because
+print mode has no supported model-selection mechanism. Alias: `z-code`.
+
+```yaml
+executor:
+  harness: zcode
+```
+
+Use `zcode login` for browser OAuth, or enter an API key in the ZCode TUI as
+`/login zai-coding-plan-api-key <key>`. Both paths use ZCode's encrypted shared
+credential store under `~/.zcode/v2`; Omnigent neither reads it nor accepts
+`executor.auth`. Because ZCode exposes no supported auth-status command,
+Omnigent reports only whether credential storage was found.
+
+The official app-server is not used because it requires the host to answer
+`interaction/requestProviderRuntimeHeaders` with decrypted provider headers;
+Omnigent does not read or decrypt vendor credentials. Print mode supports only
+`yolo`. `executor.config.disallowed_tools` controls tool selection, not a hard
+`yolo` security boundary. ZCode executes tools internally, and Omnigent reports
+but does not re-dispatch them.
+
+The child environment is the safe base plus ZCode/Z.ai variables and explicitly
+declared passthrough. An active `os_env.sandbox` wraps the ZCode process tree.
+It does not automatically expose `~/.zcode`, because tools in that same process
+could read it. Sandboxed users need narrow read grants for credential and
+provider configuration files plus a write grant for ZCode's session database,
+normally `~/.zcode/cli/db`. ZCode tools share those grants. Image and file data
+URIs are materialized, remote HTTP(S) attachments are rejected, and local paths
+must stay inside the working directory. Resume IDs live only in the executor
+process. The system prompt prefixes its first successful session turn.
 
 ## Qwen Code
 

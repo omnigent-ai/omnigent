@@ -154,6 +154,15 @@ HERMES_KEY = "hermes"
 
 _HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
 
+# ZCode (Z.ai) ships a Node CLI named ``zcode``. It is not on npm. Browser OAuth
+# is ``zcode login``; Coding Plan API keys are entered in the TUI with
+# ``/login zai-coding-plan-api-key``. Both use ZCode's encrypted shared store
+# under ``~/.zcode/v2``. Omnigent detects the store but does not validate,
+# read, or decrypt the credential.
+ZCODE_KEY = "zcode"
+
+_ZCODE_INSTALL_HINT = "Install ZCode so `zcode` is on PATH (https://github.com/zai-org/zcode)"
+
 # Devin (Cognition) ships via a curl installer rather than npm and authenticates
 # through its own ``devin auth login``, which writes a credential file it reads
 # back at spawn — Omnigent stores no Devin credential. ``devin auth status``
@@ -331,6 +340,17 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_command=("bash", "-c", _DEVIN_INSTALL_HINT),
         auth_hint="run `devin auth login` (Omnigent stores no Devin credential)",
     ),
+    ZCODE_KEY: HarnessInstallSpec(
+        "ZCode",
+        "zcode",
+        package=None,
+        login_args=("login",),
+        install_hint=_ZCODE_INSTALL_HINT,
+        auth_hint=(
+            "run `zcode login` (browser OAuth), or enter a Coding Plan API key "
+            "in the ZCode TUI: `/login zai-coding-plan-api-key <key>`"
+        ),
+    ),
 }
 
 
@@ -402,6 +422,10 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary through the catalog.
     "devin-native": DEVIN_KEY,
     "native-devin": DEVIN_KEY,
+    # Headless ZCode (``harness: zcode``) wraps the ``zcode`` CLI. ``z-code`` is
+    # the alias spelling.
+    ZCODE_KEY: ZCODE_KEY,
+    "z-code": ZCODE_KEY,
 }
 
 

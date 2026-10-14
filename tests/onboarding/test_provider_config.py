@@ -767,6 +767,33 @@ def test_describe_active_credential_cli_config() -> None:
     assert cred.model is None
 
 
+@pytest.mark.parametrize("harness", ["zcode", "z-code"])
+def test_zcode_credential_readout_ignores_provider_default(harness: str) -> None:
+    from omnigent.onboarding.provider_config import (
+        describe_active_credential,
+        harness_owns_its_credential,
+    )
+
+    config = {
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "default": "openai",
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "$OPENAI_API_KEY",
+                    "models": {"default": "gpt-5.5"},
+                },
+            }
+        }
+    }
+    assert harness_owns_its_credential(harness) is True
+    assert describe_active_credential(config, harness) is None
+    qwen_credential = describe_active_credential(config, "qwen")
+    assert qwen_credential is not None
+    assert qwen_credential.provider_name == "openai"
+
+
 def test_bedrock_kind_rejected_for_non_native_harnesses() -> None:
     """`kind: bedrock` is native-`omnigent claude` only; in-process harnesses fail loud.
 
