@@ -19,6 +19,9 @@ on:
 - :func:`read_session_status` — read the file and map its interactive
   status to the runner's ``running`` / ``idle`` vocabulary.
 
+A cold resume also reads the registry, through :func:`find_background_holder`,
+to learn whether a background job still runs the session it is about to resume.
+
 The file is an **undocumented internal detail** of Claude Code, so the
 watcher that consumes this treats an unresolved / unreadable file as
 "fall back to the PTY watcher", never as an error.
@@ -34,6 +37,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+import psutil
 
 _logger = logging.getLogger(__name__)
 
@@ -251,6 +256,93 @@ def read_session_status(path: Path) -> SessionStatus | None:
         status_updated_at=status_updated_at,
         blocked_on=reason if isinstance(reason, str) and reason else None,
     )
+
+
+@dataclass(frozen=True)
+class BackgroundHolder:
+    """A live Claude process, other than an interactive TUI, running a session.
+
+    :param pid: The holder's process id, e.g. ``4242``.
+    :param kind: Its registry ``kind``, e.g. ``"bg"`` for a background job.
+    :param job_id: Its background job id, e.g. ``"ab12cd34"``, or ``None``
+        when the record names none.
+    """
+
+    pid: int
+    kind: str
+    job_id: str | None
+
+
+def find_background_holder(
+    session_id: str,
+    *,
+    config_dir: Path | None = None,
+) -> BackgroundHolder | None:
+    """Find a live background Claude process that runs *session_id*.
+
+    Claude Code refuses ``--resume <session_id>`` ("That session is running
+    in the background") while a registry record that is not ``interactive``
+    names the session and its process is still alive. This applies the same
+    test, so a caller can resume a copy instead of launching into that refusal.
+
+    :param session_id: Claude session uuid, matched case-insensitively, e.g.
+        ``"02857840-6362-408f-b41f-309e396ed7c6"``.
+    :param config_dir: Explicit Claude config dir override (tests).
+    :returns: The holder, or ``None`` when no live background process runs
+        the session or the registry cannot be read.
+    """
+    wanted = session_id.lower()
+    try:
+        entries = list(sessions_dir(config_dir).glob("*.json"))
+    except OSError:
+        return None
+    for entry in entries:
+        # Claude names each record after its pid and ignores other files.
+        if not entry.stem.isdigit():
+            continue
+        record = _read_json_file(entry)
+        if record is None:
+            continue
+        kind = record.get("kind")
+        record_session_id = record.get("sessionId")
+        if not isinstance(kind, str) or not kind or kind == "interactive":
+            continue
+        if not isinstance(record_session_id, str) or record_session_id.lower() != wanted:
+            continue
+        pid = int(entry.stem)
+        if not _is_recorded_process(pid, record.get("procStart")):
+            continue
+        job_id = record.get("jobId")
+        return BackgroundHolder(
+            pid=pid,
+            kind=kind,
+            job_id=job_id if isinstance(job_id, str) and job_id else None,
+        )
+    return None
+
+
+def _is_recorded_process(pid: int, proc_start: object) -> bool:
+    """Whether *pid* is still the live process a registry record describes.
+
+    :param pid: Process id the record is named after.
+    :param proc_start: The record's ``procStart``, the process start time from
+        ``/proc/<pid>/stat`` on Linux, so a recycled pid does not count.
+    :returns: ``True`` when the process is alive and, where procfs exists,
+        started when the record says.
+    """
+    if pid == os.getpid() or not psutil.pid_exists(pid):
+        return False
+    if not isinstance(proc_start, str):
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        # No procfs (macOS): liveness is the only signal available.
+        return True
+    # Fields after the parenthesized command name start at field 3, so the
+    # start time (field 22) is index 19.
+    fields = stat.rsplit(")", 1)[-1].split()
+    return len(fields) <= 19 or fields[19] == proc_start
 
 
 # Attempts to resolve the file before giving up and leaving the PTY

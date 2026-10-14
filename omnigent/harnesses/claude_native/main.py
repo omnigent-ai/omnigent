@@ -110,6 +110,7 @@ from omnigent.harnesses.claude_native.state import (
     redirect_launch_state,
     write_launch_state,
 )
+from omnigent.harnesses.claude_native.status_file import find_background_holder
 from omnigent.host.daemon_launch import (
     daemon_poll_intervals,
     error_text,
@@ -5348,10 +5349,11 @@ async def _resolve_cold_resume_args(
         click.echo(f"warning: {message}", err=True)
         _logger.warning(message)
         return ()
+    resume_session_id = _claude_resume_session_id(external_session_id, session_id=session_id)
     transcript = await _ensure_local_claude_resume_transcript(
         client,
         session_id=session_id,
-        external_session_id=external_session_id,
+        external_session_id=resume_session_id,
         workspace=Path.cwd().resolve(),
         bridge_dir=bridge_dir_for_bridge_id(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
     )
@@ -5366,7 +5368,41 @@ async def _resolve_cold_resume_args(
         click.echo(f"warning: {message}", err=True)
         _logger.warning(message)
         return ()
-    return ("--resume", external_session_id)
+    return ("--resume", resume_session_id)
+
+
+def _claude_resume_session_id(external_session_id: str, *, session_id: str) -> str:
+    """
+    Pick the Claude session id a cold resume passes to ``--resume``.
+
+    Claude Code refuses to resume a session one of its background jobs still
+    runs, and rebuilding that session's transcript would rewrite the file the
+    job appends to. Such a session resumes on a copy under a fresh id instead,
+    rebuilt from the same Omnigent history. The Omnigent session keeps its
+    ``external_session_id``, so a later resume checks the original again.
+
+    :param external_session_id: The session's Claude id, e.g.
+        ``"02857840-6362-408f-b41f-309e396ed7c6"``.
+    :param session_id: Omnigent conversation id the resume is for, e.g.
+        ``"conv_abc123"``; attributes the log line.
+    :returns: *external_session_id*, or a fresh uuid when a background job
+        holds it.
+    """
+    holder = find_background_holder(external_session_id)
+    if holder is None:
+        return external_session_id
+    copy_session_id = str(uuid.uuid4())
+    _logger.info(
+        "Claude session %s is running in a background job (pid=%s kind=%s job=%s); "
+        "resuming a copy as %s",
+        external_session_id,
+        holder.pid,
+        holder.kind,
+        holder.job_id,
+        copy_session_id,
+        extra={"session_id": session_id},
+    )
+    return copy_session_id
 
 
 async def _ensure_local_claude_resume_transcript(

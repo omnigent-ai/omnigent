@@ -5896,6 +5896,81 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
 
 
 @pytest.mark.asyncio
+async def test_resolve_cold_resume_args_resumes_a_copy_while_a_background_job_runs_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A session a background Claude job still runs resumes on a rebuilt copy.
+
+    Claude refuses ``--resume`` for that session ("That session is running in
+    the background"), and the job keeps appending to the original transcript,
+    so the resume must leave that file alone and launch a copy under a new id.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    projects = tmp_path / "claude-projects"
+    project_dir = projects / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
+    live_transcript = project_dir / "claude-uuid-abc.jsonl"
+    project_dir.mkdir(mode=0o700, parents=True)
+    live_line = json.dumps({"type": "user", "sessionId": "claude-uuid-abc"}) + "\n"
+    live_transcript.write_text(live_line, encoding="utf-8")
+    config_dir = tmp_path / "claude-config"
+    (config_dir / "sessions").mkdir(parents=True)
+    (config_dir / "sessions" / f"{os.getppid()}.json").write_text(
+        json.dumps({"sessionId": "claude-uuid-abc", "kind": "bg", "jobId": "ab12cd34"}),
+        encoding="utf-8",
+    )
+    item_from_ap = {
+        "id": "msg_user_1",
+        "response_id": "resp_1",
+        "type": "message",
+        "status": "completed",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "fresh Omnigent text"}],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve the session snapshot and its item page.
+
+        :param request: Incoming mock HTTP request.
+        :returns: Mock Omnigent response.
+        """
+        if request.url.path == "/v1/sessions/conv_abc":
+            return httpx.Response(
+                200,
+                json=_conversation_response_body(
+                    labels={"omnigent.wrapper": "claude-code-native-ui"},
+                    external_session_id="claude-uuid-abc",
+                ),
+            )
+        if request.url.path == "/v1/sessions/conv_abc/items":
+            return httpx.Response(200, json=_items_response_body([item_from_ap]))
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+
+    assert args[0] == "--resume"
+    copy_session_id = args[1]
+    assert copy_session_id != "claude-uuid-abc"
+    assert live_transcript.read_text(encoding="utf-8") == live_line
+    copy_transcript = project_dir / f"{copy_session_id}.jsonl"
+    records = [
+        json.loads(line)
+        for line in copy_transcript.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [record["message"]["content"] for record in records] == ["fresh Omnigent text"]
+    assert {record["sessionId"] for record in records} == {copy_session_id}
+
+
+@pytest.mark.asyncio
 async def test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_image(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

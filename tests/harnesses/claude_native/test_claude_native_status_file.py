@@ -14,10 +14,14 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from omnigent.harnesses.claude_native.status_file import (
     IDLE,
     RUNNING,
+    BackgroundHolder,
     SessionStatusPoller,
+    find_background_holder,
     read_session_status,
     resolve_status_file,
     sessions_dir,
@@ -505,3 +509,72 @@ def test_parked_session_stays_running_indefinitely(tmp_path: Path) -> None:
     poller.tick()
     assert published == [(RUNNING, "input needed")]
     assert poller.blocked_on == "input needed"
+
+
+def _write_registry_record(directory: Path, name: str, record: dict[str, object]) -> None:
+    """Write one raw registry record, named the way Claude names its files.
+
+    :param directory: The ``sessions`` directory to write into.
+    :param name: File stem, normally the holder's pid, e.g. ``"4242"``.
+    :param record: The record body.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{name}.json").write_text(json.dumps(record), encoding="utf-8")
+
+
+def _proc_start(pid: int) -> str:
+    """Return *pid*'s ``/proc`` start time, the value Claude records as ``procStart``.
+
+    :param pid: A live process id.
+    :returns: Field 22 of ``/proc/<pid>/stat``.
+    """
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    return stat.rsplit(")", 1)[-1].split()[19]
+
+
+def test_find_background_holder_reports_a_live_background_job(tmp_path: Path) -> None:
+    """A live non-interactive record for the session is the job Claude defers to."""
+    holder_pid = os.getppid()
+    _write_registry_record(
+        tmp_path / "sessions",
+        str(holder_pid),
+        {"pid": holder_pid, "sessionId": "SID-1", "kind": "bg", "jobId": "ab12cd34"},
+    )
+
+    holder = find_background_holder("sid-1", config_dir=tmp_path)
+
+    assert holder == BackgroundHolder(pid=holder_pid, kind="bg", job_id="ab12cd34")
+
+
+@pytest.mark.parametrize(
+    ("name", "record"),
+    [
+        pytest.param("{pid}", {"sessionId": "sid-1", "kind": "interactive"}, id="interactive"),
+        pytest.param("{pid}", {"sessionId": "sid-2", "kind": "bg"}, id="other-session"),
+        pytest.param("{pid}", {"sessionId": "sid-1"}, id="no-kind"),
+        pytest.param("renamed", {"sessionId": "sid-1", "kind": "bg"}, id="not-a-pid-file"),
+        pytest.param("{self}", {"sessionId": "sid-1", "kind": "bg"}, id="own-process"),
+        pytest.param("999999999", {"sessionId": "sid-1", "kind": "bg"}, id="dead-process"),
+    ],
+)
+def test_find_background_holder_ignores_records_claude_would_ignore(
+    tmp_path: Path, name: str, record: dict[str, object]
+) -> None:
+    """Only a live background record for this session blocks a resume."""
+    file_name = name.format(pid=os.getppid(), self=os.getpid())
+    _write_registry_record(tmp_path / "sessions", file_name, record)
+
+    assert find_background_holder("sid-1", config_dir=tmp_path) is None
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs procfs")
+def test_find_background_holder_skips_a_recycled_pid(tmp_path: Path) -> None:
+    """A record whose start time no longer matches its pid is a dead job's leftover."""
+    holder_pid = os.getppid()
+    sessions = tmp_path / "sessions"
+    record = {"sessionId": "sid-1", "kind": "bg", "procStart": _proc_start(holder_pid)}
+    _write_registry_record(sessions, str(holder_pid), record)
+    assert find_background_holder("sid-1", config_dir=tmp_path) is not None
+
+    _write_registry_record(sessions, str(holder_pid), {**record, "procStart": "1"})
+    assert find_background_holder("sid-1", config_dir=tmp_path) is None
