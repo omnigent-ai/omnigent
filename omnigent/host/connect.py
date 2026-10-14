@@ -586,6 +586,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # spawn the wrong auth mode while the operator set the switch on the CLI.
         # Not a secret.
         "OMNIGENT_AUTH_ENABLED",
+        # Wrapper CLI name (e.g. ``isaac omni``). Runner-side hints built by
+        # cli_invocation() must name the command the user actually runs.
+        # Not a secret.
+        "OMNIGENT_WRAPPER_COMMAND",
         # Process logging controls. These are diagnostics knobs, not secrets.
         "OMNIGENT_LOG_LEVEL",
         "OMNIGENT_LOG_TO_STDERR",

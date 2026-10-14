@@ -421,15 +421,21 @@ async def test_serve_tunnel_fails_loud_on_http_auth_rejection(
 
 
 @pytest.mark.asyncio
-async def test_serve_tunnel_fails_fast_when_factory_has_no_token(
+async def test_serve_tunnel_no_credential_error_after_streak(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A 401 on an upgrade sent without a bearer (factory returned None) is fatal at once.
+    """Repeated 401s on bearer-less upgrades end in the no-credential error.
+
+    The streak is kept so a transient mint failure still gets re-minted on retry.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    monkeypatch.delenv(serve_module.REAUTH_COMMAND_ENV, raising=False)
+    from omnigent.runner.transports.ws_tunnel.serve import (
+        _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS,
+    )
+
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
     attempt = 0
 
     async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
@@ -445,7 +451,14 @@ async def test_serve_tunnel_fails_fast_when_factory_has_no_token(
         attempt += 1
         raise InvalidStatus(Response(401, "Unauthorized", [], b""))
 
+    async def _sleep(_delay: float) -> None:
+        """No-op sleep.
+
+        :param _delay: Reconnect delay (unused).
+        """
+
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
 
     with pytest.raises(RuntimeError) as exc_info:
         await serve_tunnel(
@@ -457,21 +470,21 @@ async def test_serve_tunnel_fails_fast_when_factory_has_no_token(
         )
 
     message = str(exc_info.value)
-    assert attempt == 1
+    assert attempt == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
     assert message.startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
     assert "login https://ws.cloud.databricks.com/omnigent?o=123` " in message
 
 
 @pytest.mark.asyncio
-async def test_serve_tunnel_reauth_hint_uses_env_override(
+async def test_serve_tunnel_reauth_hint_uses_wrapper_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``OMNIGENT_REAUTH_COMMAND`` replaces the default ``omnigent login`` hint.
+    """``OMNIGENT_WRAPPER_COMMAND`` names the wrapper CLI in the login hint.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    monkeypatch.setenv(serve_module.REAUTH_COMMAND_ENV, "isaac login")
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
 
     async def _serve_once(app: Any, **_kwargs: Any) -> None:
         """Raise 401.
@@ -491,7 +504,10 @@ async def test_serve_tunnel_reauth_hint_uses_env_override(
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
 
-    with pytest.raises(RuntimeError, match="run `isaac login` to re-authenticate"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"run `isaac omni login https://example.databricksapps\.com` to re-authenticate",
+    ):
         await serve_tunnel(
             _noop_app,
             server_url="https://example.databricksapps.com",

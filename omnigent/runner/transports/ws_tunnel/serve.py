@@ -152,11 +152,6 @@ RUNNER_TUNNEL_REJECTION_PREFIX = "runner tunnel rejected by server "
 # to send, so the message names the local cause rather than the server.
 RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX = "runner tunnel has no credential available "
 
-# Embedders whose credentials are not repaired by ``omnigent login`` (e.g. a
-# host credential service backed by another CLI profile) set this to the
-# command that does repair them; it replaces the default hint.
-REAUTH_COMMAND_ENV = "OMNIGENT_REAUTH_COMMAND"
-
 
 def _reauth_hint(server_url: str | None) -> str:
     """Build the re-authentication hint for a fatal tunnel auth failure.
@@ -166,9 +161,6 @@ def _reauth_hint(server_url: str | None) -> str:
     :returns: e.g. ``"run `omnigent login https://ws.databricks.com/omnigent`
         to re-authenticate"``.
     """
-    override = os.environ.get(REAUTH_COMMAND_ENV, "").strip()
-    if override:
-        return f"run `{override}` to re-authenticate"
     if not server_url:
         return "check remote server authentication"
     # `omnigent login` detects the fronting workspace itself; the display
@@ -561,15 +553,16 @@ async def serve_tunnel(
                         and auth_token is None
                         and auth_token_factory is not None
                         and not getattr(auth_token_factory, "declined", False)
+                        and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):
-                        # The upgrade went out without a bearer because the
-                        # local credential source had none: the failure is
-                        # local, and retrying unauthenticated cannot fix it.
-                        # A factory that *declined* (the server refused to
-                        # mint) keeps the retry path, which may re-mint.
+                        # Same streak as the rejection below, so a transient
+                        # mint failure (factory returns None) still gets the
+                        # loop-top re-mint; only the message differs, naming
+                        # the local credential source instead of the server.
                         raise RuntimeError(
                             f"{RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX}"
-                            f"(HTTP {http_status} on an unauthenticated upgrade; the "
+                            f"(HTTP {http_status} persisted across "
+                            f"{http_auth_rejection_streak} unauthenticated attempts; the "
                             "credential source returned no token, e.g. the host "
                             "credential service's grant expired or was rejected); "
                             f"{_reauth_hint(server_url)}"
