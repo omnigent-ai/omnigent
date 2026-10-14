@@ -341,6 +341,9 @@ class SqlUser(OmnigentBase):
 
     __tablename__ = "users"
     account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Current sign-in credential epoch; NULL until first rotated. Unlike the
+    # generation, rotating it leaves owned hosts and scheduled tasks untouched.
+    credential_epoch: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -410,6 +413,8 @@ class SqlAccountToken(OmnigentBase):
 
     __tablename__ = "account_tokens"
     account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # The user's credential epoch when the token was minted.
+    credential_epoch: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -540,6 +545,8 @@ class SqlDeviceGrant(OmnigentBase):
 
     __tablename__ = "device_grants"
     account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # The user's credential epoch when the grant was approved.
+    credential_epoch: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
