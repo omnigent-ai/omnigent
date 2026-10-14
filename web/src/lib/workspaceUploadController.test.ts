@@ -373,10 +373,14 @@ it.each(["cancel", "discard"])(
       return server(url, init);
     });
     const transfer = transferUpload(row.key, client, wait);
-    if (action === "cancel") await cancelUpload(row.key);
-    else discardUploads(row.origin, row.identity);
+    const cancellation = action === "cancel" ? cancelUpload(row.key) : undefined;
+    if (action === "discard") discardUploads(row.origin, row.identity);
     release(json({ upload_id: "admitted", offset: 0, chunk_bytes: 4 }));
     await transfer;
+    await cancellation;
+    await vi.waitFor(() =>
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(true),
+    );
     expect(
       fetchMock.mock.calls.some(
         ([url, init]) => init?.method === "DELETE" && String(url).endsWith("/admitted"),
@@ -779,3 +783,208 @@ it.each(["offline", "relay timeout"])(
     expect(useUploadStore.getState().rows.id).toBeUndefined();
   },
 );
+
+it.each(["headers", "body"])(
+  "bounds cancellation of stalled create %s and deletes a late id once",
+  async (stall) => {
+    vi.useFakeTimers();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const slice = vi.spyOn(row.file!, "slice");
+    let release!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    let createSignal: AbortSignal | null | undefined;
+    fetchMock.mockImplementation((_url, init) => {
+      if (init?.method === "DELETE") return Promise.resolve(new Response(null, { status: 204 }));
+      createSignal = init?.signal;
+      if (stall === "body") {
+        const response = json({});
+        vi.spyOn(response, "json").mockImplementation(async () => (await pending).json());
+        return Promise.resolve(response);
+      }
+      return pending;
+    });
+    let transferSettled = false;
+    const transfer = transferUpload(row.key, client, wait).then(() => {
+      transferSettled = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const cancellation = cancelUpload(row.key);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(useUploadStore.getState().rows.id.file).toBeUndefined();
+    const releasedTransfer = transferSettled;
+    await vi.advanceTimersByTimeAsync(150_000);
+    expect(useUploadStore.getState().rows.id.cancellationPending).toBe(true);
+    useUploadStore.getState().dismiss([row.key]);
+    expect(useUploadStore.getState().rows.id).toBeDefined();
+    await vi.advanceTimersByTimeAsync(1);
+    const settled = useUploadStore.getState().rows.id;
+    useUploadStore.getState().dismiss([row.key]);
+    const dismissed = !useUploadStore.getState().rows.id;
+    release(json({ upload_id: "late", offset: 0, chunk_bytes: 4 }));
+    await transfer;
+    await vi.advanceTimersByTimeAsync(300);
+    await cancellation;
+    expect(createSignal).toBeUndefined();
+    expect(releasedTransfer).toBe(true);
+    expect(settled).toMatchObject({
+      status: "cancelled",
+      cancellationPending: false,
+      file: undefined,
+    });
+    expect(settled.error).toMatch(/server did not confirm cancellation.*staging expires/i);
+    expect(dismissed).toBe(true);
+    expect(toast).toHaveBeenCalledWith("0 of 1 uploaded, 1 cancelled");
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "DELETE")).toHaveLength(1);
+    expect(slice).not.toHaveBeenCalled();
+    expect(invalidate).not.toHaveBeenCalled();
+  },
+);
+
+it("releases a discarded stalled create before late metadata cleanup without touching a new identity", async () => {
+  vi.useFakeTimers();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  const slice = vi.spyOn(row.file!, "slice");
+  let release!: (response: Response) => void;
+  const pending = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  fetchMock.mockImplementation((_url, init) =>
+    init?.method === "DELETE"
+      ? Promise.resolve(
+          json({
+            path: "src/a.bin",
+            final_name: "a.bin",
+            size: 20,
+            sha256: "digest",
+            outcome: "replaced",
+          }),
+        )
+      : pending,
+  );
+  let transferSettled = false;
+  const transfer = transferUpload(row.key, client, wait).then(() => {
+    transferSettled = true;
+  });
+  discardUploads(row.origin, row.identity);
+  const replacement = {
+    ...row,
+    identity: "bob",
+    batch: "new-identity-batch",
+    controller: new AbortController(),
+    file: undefined,
+    status: "done" as const,
+  };
+  useUploadStore.getState().add([replacement]);
+  await vi.advanceTimersByTimeAsync(0);
+  const releasedTransfer = transferSettled;
+  release(json({ upload_id: "late", offset: 0, chunk_bytes: 4 }));
+  await transfer;
+  await vi.advanceTimersByTimeAsync(300);
+  expect(releasedTransfer).toBe(true);
+  expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "DELETE")).toHaveLength(1);
+  expect(slice).not.toHaveBeenCalled();
+  expect(useUploadStore.getState().rows.id).toEqual(replacement);
+  expect(invalidate).not.toHaveBeenCalled();
+  expect(toast).not.toHaveBeenCalled();
+});
+
+it("starts a queued file while a cancelled create stays pending", async () => {
+  vi.useFakeTimers();
+  useUploadStore.getState().update(row.key, { limits: { ...row.limits, parallel_files: 1 } });
+  const next = {
+    ...row,
+    id: "next",
+    key: "next",
+    controller: new AbortController(),
+    file: new File([new Uint8Array(20)], "next.bin"),
+  };
+  useUploadStore.getState().add([next]);
+  let release!: (response: Response) => void;
+  const pending = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  let first = true;
+  fetchMock.mockImplementation((url, init) => {
+    if (init?.method === "POST" && first) {
+      first = false;
+      return pending;
+    }
+    return server(url, init);
+  });
+  let transferSettled = false;
+  const transfer = transferUpload(row.key, client, wait).then(() => {
+    transferSettled = true;
+  });
+  const cancellation = cancelUpload(row.key);
+  await vi.advanceTimersByTimeAsync(0);
+  const releasedTransfer = transferSettled;
+  const nextStatus = useUploadStore.getState().rows.next.status;
+  release(json({ upload_id: "late", offset: 0, chunk_bytes: 4 }));
+  await Promise.all([transfer, cancellation]);
+  expect(releasedTransfer).toBe(true);
+  expect(nextStatus).toBe("done");
+  expect(
+    fetchMock.mock.calls.filter(
+      ([url, init]) => init?.method === "DELETE" && String(url).endsWith("/late"),
+    ),
+  ).toHaveLength(1);
+});
+
+it("shares the create-cancellation deadline with delayed DELETE reconciliation", async () => {
+  vi.useFakeTimers();
+  let release!: (response: Response) => void;
+  const pending = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  fetchMock.mockImplementation((_url, init) =>
+    init?.method === "DELETE" ? new Promise<Response>(() => {}) : pending,
+  );
+  const transfer = transferUpload(row.key, client, wait);
+  const cancellation = cancelUpload(row.key);
+  await vi.advanceTimersByTimeAsync(149_000);
+  release(json({ upload_id: "late", offset: 0, chunk_bytes: 4 }));
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(useUploadStore.getState().rows.id.cancellationPending).toBe(true);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(useUploadStore.getState().rows.id.cancellationPending).toBe(false);
+  await Promise.all([transfer, cancellation]);
+});
+
+it("keeps an expired create cancellation settled when a late cleanup returns a receipt", async () => {
+  vi.useFakeTimers();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  let release!: (response: Response) => void;
+  const pending = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  fetchMock.mockImplementation((_url, init) =>
+    init?.method === "DELETE"
+      ? Promise.resolve(
+          json({
+            path: "src/a.bin",
+            final_name: "a.bin",
+            size: 20,
+            sha256: "digest",
+            outcome: "replaced",
+          }),
+        )
+      : pending,
+  );
+  const transfer = transferUpload(row.key, client, wait);
+  const cancellation = cancelUpload(row.key);
+  await vi.advanceTimersByTimeAsync(150_001);
+  const pendingAtDeadline = useUploadStore.getState().rows.id.cancellationPending;
+  release(json({ upload_id: "late", offset: 0, chunk_bytes: 4 }));
+  await transfer;
+  await vi.advanceTimersByTimeAsync(300);
+  await cancellation;
+  expect(pendingAtDeadline).toBe(false);
+  expect(useUploadStore.getState().rows.id).toMatchObject({
+    status: "cancelled",
+    cancellationPending: false,
+  });
+  expect(invalidate).not.toHaveBeenCalled();
+  expect(toast).toHaveBeenCalledExactlyOnceWith("0 of 1 uploaded, 1 cancelled");
+});

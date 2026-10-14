@@ -127,7 +127,9 @@ export function WorkspaceUploadProvider({
     enabled: canProbe,
     staleTime: 30_000,
     retry: (attempt, error) =>
-      error instanceof UploadError && [429, 503].includes(error.status) && attempt < 5,
+      (error instanceof TypeError ||
+        (error instanceof UploadError && (error.status === 429 || error.status >= 500))) &&
+      attempt < 5,
     retryDelay: (attempt, error) =>
       error instanceof UploadError && error.headers.has("Retry-After")
         ? retryDelay(error, attempt)
@@ -135,8 +137,29 @@ export function WorkspaceUploadProvider({
   });
   const { refetch: refetchCapability } = capability;
   const probeError = capability.failureReason ?? capability.error;
-  const probeReason =
-    probeError instanceof UploadError
+  const evidence = useRef({ owner: "", answered: false });
+  const group = ownerKey(owner);
+  if (evidence.current.owner !== group) evidence.current = { owner: group, answered: false };
+  if (capability.data === null) evidence.current.answered = false;
+  const responseProvesRoute =
+    capability.data != null ||
+    (probeError instanceof UploadError &&
+      [
+        "unauthorized",
+        "forbidden",
+        "permission_denied",
+        "busy",
+        "upload_limit",
+        "runner_unavailable",
+        "runner_capability_mismatch",
+        "upload_relay_failed",
+        "upload_timeout",
+      ].includes(probeError.code));
+  if (responseProvesRoute) evidence.current.answered = true;
+  const routeAnswered = evidence.current.answered;
+  const probeReason = !routeAnswered
+    ? undefined
+    : probeError instanceof UploadError
       ? probeError.status === 401
         ? "Sign in again to upload files, then retry"
         : probeError.status === 403
@@ -159,7 +182,7 @@ export function WorkspaceUploadProvider({
     );
     if (!probeReason || permission === null || !isEditorLevel(permission)) return current;
     return {
-      visible: current.visible || probeError instanceof UploadError,
+      visible: current.visible || routeAnswered,
       enabled: false,
       reason: probeReason,
     };
@@ -171,7 +194,7 @@ export function WorkspaceUploadProvider({
     session?.archived,
     directory,
     probeReason,
-    probeError,
+    routeAnswered,
   ]);
   const destination = directory || root?.split("/").filter(Boolean).at(-1) || "workspace";
   const value = useMemo<UploadContextValue>(
