@@ -114,6 +114,36 @@ async def test_stderr_preserves_lines_and_unicode_with_a_bounded_tail(
     ]
 
 
+@pytest.mark.parametrize(
+    ("requested", "banner", "expected"),
+    [
+        ("ws://127.0.0.1:0", "  listening on: ws://127.0.0.1:57045", "ws://127.0.0.1:57045"),
+        ("ws://127.0.0.1:0", "  listening on: ws://127.0.0.1:0", "ws://127.0.0.1:0"),
+        ("ws://127.0.0.1:0", "  listening on: ws://127.0.0.1:65536", "ws://127.0.0.1:0"),
+        ("ws://127.0.0.1:0", "  listening on: ws://192.0.2.1:57045", "ws://127.0.0.1:0"),
+        ("ws://127.0.0.1:45678", "  listening on: ws://127.0.0.1:57045", "ws://127.0.0.1:45678"),
+    ],
+    ids=["assigned-port", "unbound-port", "invalid-port", "other-host", "explicit-port"],
+)
+async def test_stderr_resolves_only_a_requested_dynamic_loopback_listener(
+    server: CodexNativeAppServer, requested: str, banner: str, expected: str
+) -> None:
+    """The app-server's bind banner supplies the port for subsequent clients."""
+    stderr = asyncio.StreamReader()
+    server.proc = cast(asyncio.subprocess.Process, SimpleNamespace(stderr=stderr))
+    server.listen_url = requested
+    stderr.feed_data(banner[:20].encode())
+    reader = asyncio.create_task(server._stderr_loop())
+    await asyncio.sleep(0)
+    assert server.listen_url == requested
+    stderr.feed_data(banner[20:].encode() + b"\n")
+    stderr.feed_eof()
+
+    await reader
+
+    assert server.listen_url == expected
+
+
 async def test_stderr_read_failure_is_logged_immediately(
     server: CodexNativeAppServer, caplog: pytest.LogCaptureFixture
 ) -> None:

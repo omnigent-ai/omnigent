@@ -579,6 +579,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
         async def start(self) -> None:
             """:returns: None."""
+            assert self.listen_url == "ws://127.0.0.1:0"
+            self.listen_url = "ws://127.0.0.1:57045"
             assert list(self.codex_home.glob(f"sessions/**/rollout-*-{thread_id}.jsonl")), (
                 "Codex resume rollout must be synthesized in app-server CODEX_HOME "
                 "before app-server start"

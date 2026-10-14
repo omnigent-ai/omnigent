@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -168,6 +169,35 @@ async def test_wait_until_ready_closes_failed_client_before_reconnect(
     assert first.close_calls == 1
     assert second.connect_calls == 1
     assert second.close_calls == 0
+
+
+async def test_wait_until_ready_waits_for_the_assigned_listener_before_connecting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A port-zero launch never probes until its own bind has completed."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    server = _test_app_server(tmp_path, tmp_path / "home", tmp_path / "bridge", tmp_path)
+    server.proc = Mock(returncode=None)
+    server.listen_url = "ws://127.0.0.1:0"
+    client = Mock(connect=AsyncMock())
+
+    def _client(*, ws_url: str, client_name: str) -> Mock:
+        assert ws_url == "ws://127.0.0.1:57045"
+        return client
+
+    async def _bound(_delay: float) -> None:
+        server.listen_url = "ws://127.0.0.1:57045"
+
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _client)
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "asyncio",
+        SimpleNamespace(**{**vars(asyncio), "sleep": _bound}),
+    )
+
+    assert await server._wait_until_ready() is client
+    client.connect.assert_awaited_once()
 
 
 async def test_wait_until_ready_cancellation_closes_connecting_client(

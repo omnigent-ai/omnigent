@@ -1933,6 +1933,8 @@ class CodexNativeAppServer:
     :param python_executable: Python executable the policy hook command
         runs, e.g. ``"/path/to/.venv/bin/python"``. ``None`` uses
         :data:`sys.executable`.
+    :param listen_url: Optional WebSocket listener. A loopback port of zero
+        lets Codex bind an available port; startup replaces it with the bound URL.
     :param policy_hook_disabled_reason: Runtime field set by
         :meth:`start`: ``None`` when the tool-call policy hook is active
         (registered + trusted), or a human-readable reason string when it
@@ -2179,9 +2181,6 @@ class CodexNativeAppServer:
         if self.reconcile_process_registry:
             reconcile_codex_native_process_registry()
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
-        effort_catalog_transport = self.listen_url or str(self.socket_path)
-        _effort_catalog_cache.pop(effort_catalog_transport, None)
-        _effort_catalog_misses.pop(effort_catalog_transport, None)
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         tagged_argv0 = (
             f"{Path(self.codex_path).name} "
@@ -2240,6 +2239,9 @@ class CodexNativeAppServer:
         try:
             startup_client = await self._wait_until_ready()
             try:
+                effort_catalog_transport = self.listen_url or str(self.socket_path)
+                _effort_catalog_cache.pop(effort_catalog_transport, None)
+                _effort_catalog_misses.pop(effort_catalog_transport, None)
                 # Standalone CLI launches may have no shared catalog snapshot.
                 # Correct their copied defaults before a TUI creates its thread.
                 if (
@@ -2496,6 +2498,10 @@ class CodexNativeAppServer:
             if self.proc is not None and self.proc.returncode is not None:
                 detail = " | ".join((self.recent_stderr or [])[-5:])
                 raise RuntimeError(f"Codex app-server exited early: {detail}")
+            if self.listen_url == "ws://127.0.0.1:0":
+                # Codex reports its kernel-assigned port on stderr after binding.
+                await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
+                continue
             client: CodexAppServerClient | None = None
             try:
                 if self.listen_url and self.listen_url.startswith("ws://"):
@@ -2559,6 +2565,10 @@ class CodexNativeAppServer:
             text = pending[:_STDERR_CHUNK_LIMIT].decode("utf-8", errors="replace").rstrip()
             if omitted_bytes or len(pending) > _STDERR_CHUNK_LIMIT:
                 text = f"{text}...[truncated]"
+            if self.listen_url == "ws://127.0.0.1:0":
+                listener = re.fullmatch(r"\s*listening on: (ws://127\.0\.0\.1:([0-9]{1,5}))", text)
+                if listener is not None and 0 < int(listener[2]) <= 65535:
+                    self.listen_url = listener[1]
             if self.recent_stderr is not None:
                 self.recent_stderr.append(text)
                 if len(self.recent_stderr) > 20:

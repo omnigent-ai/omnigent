@@ -356,6 +356,11 @@ Cross-harness journeys:
   checks host-started failure reporting with stubbed discovery. Run these with
   plain `uv run pytest`. The ongoing chat forwarder also consumes native events;
   these startup tests do not prove it stops or recovers after a live disconnect.
+- **`launch` and `cleanup`, Codex listener (own process):**
+  `tests/e2e/test_codex_native_dynamic_listener_e2e.py` starts a real Codex CLI
+  without a model request, checks its assigned loopback listener accepts an
+  initialized client, and verifies cancellation reaps the process. Run with
+  plain `uv run pytest`; `OMNIGENT_CODEX_PATH` selects a compatibility version.
 - **`disconnect`, browser stream (own environment):**
   `tests/e2e_ui/chat/test_stream_disconnect_stage_matrix.py::test_numbered_output_recovers_across_stream_stages`
   checks output recovery across a real server restart and injected stream-open
