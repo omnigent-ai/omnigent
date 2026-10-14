@@ -36,7 +36,8 @@ export function UploadConflicts() {
       <DialogContent showCloseButton={false}>
         <DialogTitle>Files already exist</DialogTitle>
         <DialogDescription>
-          {conflicts.length} files have the same name in the destination. Choose how to upload them.
+          {conflicts.length} {conflicts.length === 1 ? "file has" : "files have"} the same name in
+          the destination. Choose how to upload {conflicts.length === 1 ? "it" : "them"}.
         </DialogDescription>
         <ul className="max-h-40 overflow-auto text-ui">
           {conflicts.map((row) => (

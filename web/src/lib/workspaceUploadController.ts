@@ -18,6 +18,7 @@ import {
 
 const transfers = new Map<string, AbortController>();
 const deciding = new Set<string>();
+const createCancellations = new WeakMap<AbortController, Promise<void>>();
 const clients = new WeakMap<AbortController, QueryClient>();
 const deletions = new WeakMap<AbortController, Map<string, Promise<void>>>();
 const refreshes = new Map<
@@ -139,23 +140,8 @@ export async function transferUpload(
       try {
         if (!row.uploadId) {
           update({ status: "connecting", error: undefined });
-          const response = await uploadRequest(row, "", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              dir: row.directory,
-              name: row.name,
-              size: row.size,
-              on_conflict: row.conflict,
-            }),
-          });
-          const created = (await response.json()) as {
-            upload_id: string;
-            offset: number;
-            chunk_bytes: number;
-          };
-          admitted = { ...row, uploadId: created.upload_id };
-          update({ uploadId: created.upload_id, offset: created.offset });
+          const created = await createUpload({ ...row, file: undefined }, client);
+          admitted = { ...row, file: undefined, uploadId: created.upload_id };
           checkOwnership();
           failures = 0;
           throttledSince.clear();
@@ -254,8 +240,12 @@ export async function transferUpload(
       const live = store().rows[key];
       if (live?.controller === initial.controller && live.status !== "done")
         update({ status: "cancelled", file: undefined });
-      const cleanup = { ...admitted, file: undefined };
-      void deleteUpload(cleanup, client).finally(() => settleCancellation(cleanup));
+      const cleanup = {
+        ...(live?.controller === initial.controller ? live : admitted),
+        file: undefined,
+      };
+      if (!createCancellations.has(initial.controller))
+        void deleteUpload(cleanup, client).finally(() => settleCancellation(cleanup));
     } else {
       const message = error instanceof Error ? error.message : "Upload failed";
       update({ status: "failed", error: message });
@@ -290,7 +280,95 @@ function settleCancellation(row: UploadRow): void {
   batchSummary(row.batch);
 }
 
-function deleteUpload(row: UploadRow, client = clients.get(row.controller)): Promise<void> {
+function cancellationDeadline(size: number): number {
+  // Cover the default finalize budget (120s + 300s/GiB), 5s relay and 25s transport.
+  return 150_000 + Math.ceil((300_000 * size) / 1024 ** 3);
+}
+
+function unconfirmedCancellation(row: UploadRow): void {
+  const live = useUploadStore.getState().rows[row.key];
+  if (live?.controller !== row.controller || live.status !== "cancelled") return;
+  const message = "Server did not confirm cancellation. Temporary staging expires automatically.";
+  useUploadStore.getState().update(row.key, { error: message });
+  toast.error(`${row.name}: ${message}`);
+}
+
+function createUpload(row: UploadRow, client: QueryClient) {
+  const signal = row.controller.signal;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let deadlineAt: number | undefined;
+  let resolveCancellation!: () => void;
+  const cancellation = new Promise<void>((resolve) => {
+    resolveCancellation = resolve;
+  });
+  createCancellations.set(row.controller, cancellation);
+  let settled = false;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    settleCancellation(row);
+    resolveCancellation();
+    createCancellations.delete(row.controller);
+  };
+  let abort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    abort = () => {
+      deadlineAt = Date.now() + cancellationDeadline(row.size);
+      timer = setTimeout(() => {
+        unconfirmedCancellation(row);
+        settle();
+      }, cancellationDeadline(row.size));
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+  });
+  // Keep admission independent of cancellation; late cleanup retains metadata only.
+  const created = uploadRequest(row, "", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      dir: row.directory,
+      name: row.name,
+      size: row.size,
+      on_conflict: row.conflict,
+    }),
+  })
+    .then(async (response) => {
+      const declaration = (await response.json()) as { upload_id: string; offset: number };
+      if (signal.aborted) {
+        clearTimeout(timer);
+        await deleteUpload({ ...row, uploadId: declaration.upload_id }, client, deadlineAt);
+        settle();
+      } else if (useUploadStore.getState().rows[row.key]?.controller === row.controller) {
+        useUploadStore
+          .getState()
+          .update(row.key, { uploadId: declaration.upload_id, offset: declaration.offset });
+      }
+      return declaration;
+    })
+    .catch((error: unknown) => {
+      if (signal.aborted && !settled) {
+        unconfirmedCancellation(row);
+        settle();
+      }
+      throw error;
+    })
+    .finally(() => {
+      signal.removeEventListener("abort", abort);
+      if (!signal.aborted) {
+        resolveCancellation();
+        createCancellations.delete(row.controller);
+      }
+    });
+  return Promise.race([created, aborted]);
+}
+
+function deleteUpload(
+  row: UploadRow,
+  client = clients.get(row.controller),
+  deadlineAt?: number,
+): Promise<void> {
   const id = row.uploadId;
   if (!id) return Promise.resolve();
   const pending = deletions.get(row.controller) ?? new Map<string, Promise<void>>();
@@ -299,8 +377,10 @@ function deleteUpload(row: UploadRow, client = clients.get(row.controller)): Pro
   if (previous) return previous;
   const abort = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  // Cover the default finalize budget (120s + 300s/GiB), 5s relay and 25s transport.
-  const deadline = 150_000 + Math.ceil((300_000 * row.size) / 1024 ** 3);
+  const remaining =
+    deadlineAt === undefined ? cancellationDeadline(row.size) : deadlineAt - Date.now();
+  const reconcile = remaining > 0;
+  const deadline = reconcile ? remaining : cancellationDeadline(row.size);
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
       abort.abort(new DOMException("Upload cancellation timed out", "TimeoutError"));
@@ -318,19 +398,13 @@ function deleteUpload(row: UploadRow, client = clients.get(row.controller)): Pro
       );
       const result = await Promise.race([receipt, timeout]);
       // Publication can win cancellation; DELETE then carries the committed receipt.
-      if (result) finishUpload(row, result, client);
+      if (result && reconcile) finishUpload(row, result, client);
     } catch (error) {
       if (error instanceof UploadError && [404, 410].includes(error.status)) return;
-      const live = useUploadStore.getState().rows[row.key];
-      if (live?.controller !== row.controller) return;
-      const message =
-        "Server did not confirm cancellation. Temporary staging expires automatically.";
-      if (live.status === "cancelled")
-        useUploadStore.getState().update(row.key, { error: message });
-      toast.error(`${row.name}: ${message}`);
+      if (reconcile) unconfirmedCancellation(row);
     } finally {
       clearTimeout(timer);
-      settleCancellation(row);
+      if (reconcile) settleCancellation(row);
     }
   })();
   pending.set(id, deletion);
@@ -351,8 +425,9 @@ export function cancelUpload(key: string): Promise<void> {
   const client = clients.get(row.controller);
   const cleanup = { ...row, file: undefined };
   if (client) pumpUploads(cleanup, client);
-  return deleteUpload(cleanup, client).finally(() => {
-    if (cleanup.uploadId || !transferring) settleCancellation(cleanup);
+  const creating = createCancellations.get(row.controller);
+  return (creating ?? deleteUpload(cleanup, client)).finally(() => {
+    if (creating || cleanup.uploadId || !transferring) settleCancellation(cleanup);
   });
 }
 

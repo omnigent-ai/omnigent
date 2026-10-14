@@ -68,3 +68,26 @@ it("applies a choice only to the first conflict when Apply to all is unchecked",
   fireEvent.click(screen.getByRole("button", { name: "Replace" }));
   expect(retryUpload).toHaveBeenCalledExactlyOnceWith("a", client, "replace");
 });
+
+it.each([1, 2])("uses grammatical conflict copy for %s files", (count) => {
+  useUploadStore.getState().add(
+    Array.from(
+      { length: count },
+      (_, index) =>
+        ({
+          key: String(index),
+          name: `file${index}`,
+          batch: "one",
+          status: "conflict",
+        }) as UploadRow,
+    ),
+  );
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <UploadConflicts />
+    </QueryClientProvider>,
+  );
+  expect(screen.getByRole("dialog")).toHaveAccessibleDescription(
+    `${count} ${count === 1 ? "file has" : "files have"} the same name in the destination. Choose how to upload ${count === 1 ? "it" : "them"}.`,
+  );
+});
