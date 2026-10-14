@@ -3676,45 +3676,18 @@ async def _maybe_handle_turn_event(
         async with _conversation_item_delivery_scope(session_id):
             if delta_coalescer is not None:
                 await delta_coalescer.flush()
-            turn_id = _turn_id_from_payload(params)
-            if (
-                forwarder_state is not None
-                and turn_id is not None
-                and turn_id in forwarder_state.surfaced_terminal_error_turns
-            ):
-                _logger.info(
-                    "Codex forwarder ignored duplicate terminal error: turn_id=%s",
-                    turn_id,
-                )
-                return True
             error = _terminal_error_from_notification(params)
             if error is None:
-                state = (
-                    read_bridge_state(bridge_dir)
-                    if forwarder_state is not None and bridge_dir is not None
-                    else None
-                )
-                if not (
-                    params.get("willRetry") is False
-                    and turn_id is not None
-                    and state is not None
-                    and state.active_turn_id == turn_id
-                ):
-                    _logger.warning("Codex forwarder ignored malformed error notification")
-                    return True
-                error = _CodexTerminalError(
-                    message=_error_payload_message({}), kind=_CODEX_ERROR_KIND_GENERIC
-                )
-                _logger.warning(
-                    "Codex terminal error omitted usable detail",
-                    extra=debug_event(
-                        "codex_terminal_error_fallback",
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        reason="missing_or_non_object_error",
-                    ),
-                )
+                _logger.warning("Codex forwarder ignored malformed error notification")
+                return True
+            turn_id = _turn_id_from_payload(params)
             if forwarder_state is not None:
+                if turn_id in forwarder_state.surfaced_terminal_error_turns:
+                    _logger.info(
+                        "Codex forwarder ignored duplicate terminal error: turn_id=%s",
+                        turn_id,
+                    )
+                    return True
                 # Child threads have no on-disk bridge to correlate against.
                 if bridge_dir is not None and (
                     turn_id is None

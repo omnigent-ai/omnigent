@@ -285,30 +285,46 @@ async def test_handle_event_ignores_retrying_error_notification(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("detail", [None, "unstructured diagnostic", [], {}])
-async def test_malformed_terminal_error_settles_only_its_active_turn(
-    tmp_path: Path, detail: object, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("detail", [None, "unstructured diagnostic"])
+async def test_error_without_usable_detail_leaves_the_turn_to_turn_completed(
+    tmp_path: Path, detail: object
 ) -> None:
+    """An ``error`` with no usable detail yields to ``turn/completed``'s real error."""
     _seed_active_turn(tmp_path, "turn_123")
     client = _RecordingClient()
+    usage_coalescer = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    elicitation_tracker = fwd._CodexElicitationTaskTracker()
     forwarder_state = fwd._CodexForwarderState()
-    event = {
-        "method": "error",
-        "params": {
-            "threadId": "thread_123",
-            "turnId": "turn_123",
-            "willRetry": False,
-            "error": detail,
+
+    for event in (
+        {
+            "method": "error",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": "turn_123",
+                "willRetry": False,
+                "error": detail,
+            },
         },
-    }
-    for _ in range(2):
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_123",
+                "turn": {
+                    "id": "turn_123",
+                    "status": "failed",
+                    "error": {"message": "unexpected status 503 Service Unavailable"},
+                },
+            },
+        },
+    ):
         await fwd._handle_event(
             client,  # type: ignore[arg-type]
             session_id="conv_x",
             bridge_dir=tmp_path,
             event=event,  # type: ignore[arg-type]
-            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
-            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+            usage_coalescer=usage_coalescer,
+            elicitation_tracker=elicitation_tracker,
             expected_thread_id="thread_123",
             forwarder_state=forwarder_state,
         )
@@ -318,20 +334,10 @@ async def test_malformed_terminal_error_settles_only_its_active_turn(
     assert {key: data.get(key) for key in ("status", "response_id", "output")} == {
         "status": "failed",
         "response_id": "codex_turn_123",
-        "output": "Codex turn ended with an unspecified error.",
+        "output": "unexpected status 503 Service Unavailable",
     }
     state = read_bridge_state(tmp_path)
     assert state is not None and state.active_turn_id is None
-    fallbacks = [
-        record
-        for record in caplog.records
-        if getattr(record, "event_name", None) == "codex_terminal_error_fallback"
-    ]
-    assert len(fallbacks) == (0 if isinstance(detail, dict) else 1)
-    if fallbacks:
-        assert fallbacks[0].session_id == "conv_x"
-        assert fallbacks[0].turn_id == "turn_123"
-        assert fallbacks[0].attributes == {"reason": "missing_or_non_object_error"}
 
 
 @pytest.mark.asyncio
@@ -407,49 +413,8 @@ async def test_stateful_idless_error_cannot_fail_an_idle_bridge(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "case", ["retrying", "unknown_retry", "other_thread", "old_turn", "no_turn", "no_state"]
-)
-async def test_malformed_error_requires_an_explicit_correlated_terminal_edge(
-    tmp_path: Path, case: str
-) -> None:
-    _seed_active_turn(tmp_path, "turn_123")
-    client = _RecordingClient()
-    params: dict[str, object] = {
-        "threadId": "thread_123",
-        "turnId": "turn_123",
-        "willRetry": False,
-    }
-    if case == "retrying":
-        params["willRetry"] = True
-    elif case == "unknown_retry":
-        params.pop("willRetry")
-    elif case == "other_thread":
-        params["threadId"] = "unrelated_thread"
-    elif case == "old_turn":
-        params["turnId"] = "old_turn"
-    elif case == "no_turn":
-        params.pop("turnId")
-
-    await fwd._handle_event(
-        client,  # type: ignore[arg-type]
-        session_id="conv_x",
-        bridge_dir=tmp_path,
-        event={"method": "error", "params": params},  # type: ignore[arg-type]
-        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
-        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
-        expected_thread_id="thread_123",
-        forwarder_state=None if case == "no_state" else fwd._CodexForwarderState(),
-    )
-    assert client.posts == []
-    state = read_bridge_state(tmp_path)
-    assert state is not None and state.active_turn_id == "turn_123"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("detail", [{"message": "child turn failed"}, None])
 async def test_child_thread_error_needs_no_bridge_to_fail_its_turn(
-    tmp_path: Path, detail: object, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A child thread has no bridge: a detailed error fails its turn once."""
     monkeypatch.chdir(tmp_path)
@@ -465,7 +430,7 @@ async def test_child_thread_error_needs_no_bridge_to_fail_its_turn(
                 "threadId": "thread_child",
                 "turnId": "turn_child",
                 "willRetry": False,
-                "error": detail,
+                "error": {"message": "child turn failed"},
             },
             usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_child"),  # type: ignore[arg-type]
             delta_coalescer=None,
@@ -475,10 +440,8 @@ async def test_child_thread_error_needs_no_bridge_to_fail_its_turn(
         )
 
     statuses = [body["data"]["status"] for _, body in client.posts]
-    assert statuses == (["failed"] if detail is not None else [])
-    assert forwarder_state.surfaced_terminal_error_turns == (
-        {"turn_child"} if detail is not None else set()
-    )
+    assert statuses == ["failed"]
+    assert forwarder_state.surfaced_terminal_error_turns == {"turn_child"}
     assert list(tmp_path.iterdir()) == []
 
 
