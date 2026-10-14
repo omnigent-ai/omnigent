@@ -301,10 +301,10 @@ describe("About window", () => {
     assert.deepEqual(h.calls.closedParents, [firstParent]);
   });
 
-  it("opens the release history in the browser without creating an app window", () => {
+  it("opens the official release notes in the browser without creating an app window", () => {
     const h = makeAbout();
     const about = h.controller.open(new FakeWindow());
-    const url = "https://github.com/omnigent-ai/omnigent/releases";
+    const url = "https://omnigent.ai/releases";
 
     assert.deepEqual(about.webContents.windowOpenHandler({ url }), { action: "deny" });
     assert.deepEqual(h.calls.externalUrls, [url]);
@@ -317,7 +317,7 @@ describe("About window", () => {
     const about = h.controller.open(new FakeWindow());
     for (const url of [
       "https://example.com",
-      "https://github.com/omnigent-ai/omnigent/releases/untrusted",
+      "https://omnigent.ai/releases/untrusted",
       "file:///tmp/untrusted.html",
       "omnigent://untrusted",
     ]) {
@@ -333,7 +333,7 @@ describe("About window", () => {
           prevented = true;
         },
       },
-      "https://github.com/omnigent-ai/omnigent/releases",
+      "https://omnigent.ai/releases",
     );
     assert.equal(prevented, true);
   });

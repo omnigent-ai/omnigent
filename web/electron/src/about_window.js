@@ -146,7 +146,7 @@ function createAboutWindow({
     if (platform === "darwin") about.excludedFromShownWindowsMenu = true;
 
     about.webContents.setWindowOpenHandler(({ url }) => {
-      if (url === "https://github.com/omnigent-ai/omnigent/releases") {
+      if (url === "https://omnigent.ai/releases") {
         void shell.openExternal(url).catch((error) => {
           console.warn("Unable to open release notes:", error);
         });
