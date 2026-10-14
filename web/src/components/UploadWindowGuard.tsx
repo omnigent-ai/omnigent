@@ -50,7 +50,7 @@ export function UploadWindowGuard() {
       const id = `workspace-uploads:${key}`;
       activeIds.add(id);
       toast(
-        `Uploads: ${totals.done}/${group.length} files · ${formatBytes(totals.acknowledged)} / ${formatBytes(totals.total)}`,
+        `Uploads: ${totals.done}/${group.length} ${group.length === 1 ? "file" : "files"} · ${formatBytes(totals.acknowledged)} / ${formatBytes(totals.total)}`,
         { id, duration: Infinity },
       );
     }
