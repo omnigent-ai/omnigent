@@ -1,9 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
 import { enqueueUploads } from "@/lib/workspaceUploadController";
+import type * as UploadController from "@/lib/workspaceUploadController";
 import { useUploadStore } from "@/store/uploadStore";
+import type { SessionStatus } from "@/lib/types";
 import {
   droppedUploadFiles,
   resolveUploadTarget,
@@ -17,15 +19,18 @@ import {
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "alice" }));
 let permission: number | null = 4;
+let archived = false;
+let status: SessionStatus = "idle";
 vi.mock("@/hooks/useSession", () => ({
-  useSession: () => ({ session: { permissionLevel: permission, status: "idle" } }),
+  useSession: () => ({ session: { permissionLevel: permission, status, archived } }),
 }));
 let workspaceRoot: string | null = "/work/demo";
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceEnvironment: () => ({ data: { root: workspaceRoot } }),
 }));
-vi.mock("@/store/chatStore", () => ({ useChatStore: () => "idle" }));
-vi.mock("@/lib/workspaceUploadController", () => ({
+vi.mock("@/store/chatStore", () => ({ useChatStore: () => undefined }));
+vi.mock("@/lib/workspaceUploadController", async (importOriginal) => ({
+  ...(await importOriginal<typeof UploadController>()),
   enqueueUploads: vi.fn(),
   cancelUpload: vi.fn(),
   retryUpload: vi.fn(),
@@ -57,12 +62,15 @@ function view(directory = "src") {
 }
 beforeEach(() => {
   permission = 4;
+  archived = false;
+  status = "idle";
   workspaceRoot = "/work/demo";
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   vi.mocked(authenticatedFetch).mockResolvedValue(new Response(JSON.stringify(capability)));
 });
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.clearAllMocks();
   client.clear();
   useUploadStore.setState({ rows: {} });
@@ -101,7 +109,6 @@ it("explains unsupported runners, allows asleep connections, and disables failed
       .enabled,
   ).toBe(true);
   expect(uploadGate(4, capability, "failed", "").enabled).toBe(false);
-  expect(uploadGate(4, capability, "ended", "").enabled).toBe(false);
   expect(uploadGate(4, capability, "idle", "/tmp").reason).toContain("inside");
   vi.mocked(authenticatedFetch).mockResolvedValue(
     new Response(
@@ -112,6 +119,77 @@ it("explains unsupported runners, allows asleep connections, and disables failed
   const button = await screen.findByRole("button", { name: "Upload files" });
   expect((button as HTMLButtonElement).disabled).toBe(true);
   expect(button.parentElement?.title).toContain("restart");
+});
+
+it.each([
+  ["failed", false],
+  ["idle", true],
+])("disables uploads for status %s, archived %s", async (sessionStatus, isArchived) => {
+  status = sessionStatus as SessionStatus;
+  archived = Boolean(isArchived);
+  view();
+  const button = await screen.findByRole("button", { name: "Upload files" });
+  expect(button).toBeDisabled();
+  expect(button.parentElement?.title).toMatch(/reconnect|archived/i);
+  fireEvent.drop(screen.getByTestId("files-content"), {
+    dataTransfer: { types: ["Files"], files: [new File(["x"], "a")] },
+  });
+  expect(enqueueUploads).not.toHaveBeenCalled();
+});
+
+it.each([401, 403, 429, 503])(
+  "explains capability %s and recovers only after a successful retry",
+  async (statusCode) => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: "unavailable" } }), {
+        status: statusCode,
+        headers: { "Retry-After": "2" },
+      }),
+    );
+    view();
+    const button = await screen.findByRole("button", { name: "Upload files" });
+    expect(button).toBeDisabled();
+    expect(button.parentElement?.title).toMatch(
+      statusCode === 401
+        ? /sign in/i
+        : statusCode === 403
+          ? /permission/i
+          : statusCode === 429
+            ? /busy|throttl/i
+            : /unavailable/i,
+    );
+    const retry = screen.getByRole("button", { name: "Retry upload availability" });
+    fireEvent.drop(screen.getByTestId("files-content"), {
+      dataTransfer: { types: ["Files"], files: [new File(["x"], "a")] },
+    });
+    expect(enqueueUploads).not.toHaveBeenCalled();
+    vi.mocked(authenticatedFetch).mockResolvedValue(new Response(JSON.stringify(capability)));
+    if (statusCode === 401 || statusCode === 403) fireEvent.click(retry);
+    await waitFor(() => expect(button).toBeEnabled(), { timeout: 4000 });
+  },
+);
+
+it.each([429, 503])("honours Retry-After before re-probing capability %s", async (statusCode) => {
+  vi.useFakeTimers();
+  vi.mocked(authenticatedFetch).mockResolvedValue(
+    new Response(null, { status: statusCode, headers: { "Retry-After": "2" } }),
+  );
+  view();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(100);
+  });
+  expect(screen.getByRole("button", { name: "Upload files" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Retry upload availability" })).toBeDisabled();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1800);
+  });
+  expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+  vi.mocked(authenticatedFetch).mockResolvedValue(new Response(JSON.stringify(capability)));
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(200);
+  });
+  expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+  expect(screen.getByRole("button", { name: "Upload files" })).toBeEnabled();
 });
 
 it("freezes the picker directory on opening, accepts multiple files, resets and restores focus on change or cancel", async () => {
@@ -224,4 +302,36 @@ it("allows an asleep runner to connect before workspace metadata is available", 
   const button = await screen.findByRole("button", { name: "Upload files" });
   expect(button).toBeEnabled();
   expect(document.querySelector("[data-upload-drop-root]")).toBeTruthy();
+});
+
+it("backs off successive unavailable capability probes without Retry-After", async () => {
+  vi.useFakeTimers();
+  const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
+  try {
+    vi.mocked(authenticatedFetch).mockImplementation(
+      async () => new Response(null, { status: 503 }),
+    );
+    view();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(400);
+    });
+    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Upload files" })).toBeDisabled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200);
+    });
+    expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(800);
+    });
+    expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+    vi.mocked(authenticatedFetch).mockResolvedValue(new Response(JSON.stringify(capability)));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200);
+    });
+    expect(authenticatedFetch).toHaveBeenCalledTimes(3);
+    expect(screen.getByRole("button", { name: "Upload files" })).toBeEnabled();
+  } finally {
+    random.mockRestore();
+  }
 });

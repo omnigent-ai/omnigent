@@ -87,7 +87,7 @@ it("keeps an aggregate toast for an earlier session when its tray is hidden and 
   useUploadStore.getState().add([row]);
   render(<UploadWindowGuard />);
   expect(toast).toHaveBeenCalledWith(
-    "Uploads: 0/1 files · 2 B / 5 B",
+    "Uploads: 0/1 file · 2 B / 5 B",
     expect.objectContaining({ duration: Infinity }),
   );
   let hide: (() => void) | undefined;
