@@ -13008,11 +13008,16 @@ _SIGNED_IN_SCREENS = {
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["codex-native", "claude-native"])
+@pytest.mark.parametrize(
+    ("harness", "rotated"),
+    [("codex-native", False), ("codex-native", True), ("claude-native", False)],
+    ids=["codex-native", "codex-native-rotated", "claude-native"],
+)
 async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     harness: str,
+    rotated: bool,
 ) -> None:
     """
     A turn that failed on a pending Databricks sign-in is followed by one "signed in" notice.
@@ -13021,15 +13026,21 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
     prompt is on screen nothing is posted. Once the prompt is gone and the
     agent can take a message (Codex has published its bridge state, Claude Code
     shows its composer), one neutral notice lands in the transcript so the
-    person knows the sign-in worked and can resend.
+    person knows the sign-in worked and can resend. A rotated Codex session's
+    launch publishes its state in its bridge-id label's directory.
     """
     from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner.native import orchestration as native_orchestration
     from omnigent.terminals import TerminalRegistry
     from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
     conv = f"conv_signin_{harness.replace('-', '_')}"
     monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
     monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = codex_bridge.bridge_dir_for_bridge_id(conv)
+    if rotated:
+        bridge_dir = codex_bridge.bridge_dir_for_bridge_id("conv_signin_rotated_from")
+        monkeypatch.setitem(native_orchestration._AUTO_CODEX_BRIDGE_DIRS, conv, bridge_dir)
 
     class _RecordingServerClient(NullServerClient):
         def __init__(self) -> None:
@@ -13050,7 +13061,7 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
         if harness == "codex-native":
             # Thread discovery publishes the bridge state as the TUI starts a thread.
             codex_bridge.write_bridge_state(
-                codex_bridge.bridge_dir_for_bridge_id(conv),
+                bridge_dir,
                 codex_bridge.CodexNativeBridgeState(
                     session_id=conv,
                     socket_path="ws://127.0.0.1:1",
