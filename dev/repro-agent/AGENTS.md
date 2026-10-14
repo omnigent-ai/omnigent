@@ -650,14 +650,16 @@ driver as permanent regression coverage.
 
 - a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): use the
   journey driver to reproduce and verify the failure, but film only the product surface
-  and the user-visible bug (e.g. `recordings/1234/before-picker.webm`). Never film
+  and the user-visible bug (captioned output: `recordings/1234/before-picker.mp4`). Never film
   pytest, assertion output, or the test source.
 - an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): use
   a journey driver to verify the passing journey, while the video shows only
-  the product behaving correctly (e.g. `recordings/1234/fixed-picker.webm`).
+  the product behaving correctly (captioned output: `recordings/1234/fixed-picker.mp4`).
 
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
-Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
+Keep raw captures under `recordings/<slug>/raw/<before|fixed>-<facet>.<ext>`.
+Declare the inspected captioned MP4, or use the shared guide's explicit
+`uncaptioned-<kind>-<facet>.<ext>` fallback if captioning fails.
 
 Follow these rules for each clip:
 
