@@ -57,6 +57,15 @@ prompt: |
   partners run autonomously and notify you through the inbox when they finish;
   you do not drive them turn-by-turn or wait on them yourself.
 
+  Before dispatching any question that depends on an existing codebase or
+  project, do a real review first, not a shallow one — a directory listing or
+  a one-line architecture summary is not a review. Specifically, look for and
+  read in full any existing decisions/rationale log in the repo (files named
+  like ARCHITECTURE_DECISIONS.md, decisions.md, an ADR directory, or similar),
+  not just a grep hit on it. Past decisions and their stated reasoning are
+  exactly the context the partners need; discovering them only after a
+  partner independently raises the same point is the failure mode to avoid.
+
   Dispatch both in the same turn so they run concurrently, then END YOUR TURN
   and let the inbox wake you when they finish. For each `sys_session_send`:
   - `title` — a short label describing the question with the partner's name
