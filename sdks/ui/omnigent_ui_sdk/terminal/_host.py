@@ -774,11 +774,9 @@ def _install_csi_u_sequences() -> None:
     for cp, key in _ctrl_codepoints.items():
         ANSI_SEQUENCES[f"\x1b[{cp};5u"] = key
 
-    # Ctrl+letter a-z, keyed by letter so Alt+Shift/Ctrl+Alt below reuse
-    # this table. Kitty reports the base codepoint under Ctrl (e.g.
-    # Ctrl+I arrives as ``[105;5u``, not the C0 code ``[9;5u``).
-    # No "z": prompt-toolkit's built-in Ctrl+Z binding re-inserts the raw
-    # matched sequence, so 122;5u/;6u are left to the Ignore fallback.
+    # Ctrl+a-z by letter, reused for Ctrl+Alt below. Kitty sends the base
+    # codepoint under Ctrl (Ctrl+I is ``[105;5u``, not ``[9;5u``). "z" is
+    # omitted: prompt-toolkit's Ctrl+Z re-inserts the raw sequence; Ignore it.
     _ctrl_letter_keys = {
         "a": Keys.ControlA,
         "b": Keys.ControlB,
@@ -812,10 +810,9 @@ def _install_csi_u_sequences() -> None:
         # regardless of Shift, so decode it the same as plain Ctrl+letter.
         ANSI_SEQUENCES[f"\x1b[{ord(ch)};6u"] = key
 
-    # Ctrl+<punctuation>: unshifted keys whose legacy byte
-    # (``ord(ch) & 0x1f``) already names a prompt-toolkit key. Not
-    # extended to ``^``/``_`` since those are themselves Shift-modified
-    # on a standard layout, so their base-key codepoint wouldn't match.
+    # Ctrl+<punct> via ``ord(ch) & 0x1f``, except Ctrl+/ -> ^_ (terminal
+    # convention; masking would give 0x0F, Ctrl+O). ``^``/``_`` are skipped:
+    # they're Shift-modified, so their base codepoint wouldn't match.
     _ctrl_punct_codepoints = {
         0x20: Keys.ControlAt,  # Ctrl+Space
         0x2F: Keys.ControlUnderscore,  # Ctrl+/ (emacs undo)
@@ -862,34 +859,27 @@ def _install_csi_u_sequences() -> None:
     ANSI_SEQUENCES["\x1b[I"] = Keys.Ignore  # focus in
     ANSI_SEQUENCES["\x1b[O"] = Keys.Ignore  # focus out
 
-    # Alt+<printable> (mod 3), cp 0x20-0x7E (space, "!".."~"). Legacy
-    # terminals send Alt+key as ESC + the plain char byte — two key
-    # presses — so the value is a tuple, matching how prompt-toolkit's
-    # own emacs bindings (``M-b``, ``M-f``, ...) are registered as
-    # ``("escape", "b")``. Range excludes 0x0D/0x7F, which already have
-    # more specific ``;3u`` entries above.
+    # Alt+printable ASCII (mod 3), 0x20-0x7E; not arbitrary Unicode. An
+    # (Escape, char) tuple like legacy ESC-prefix, matching ``("escape", "b")``
+    # emacs bindings. 0x0D/0x7F are excluded: they have ``;3u`` entries above.
     for cp in range(0x20, 0x7F):
         ANSI_SEQUENCES[f"\x1b[{cp};3u"] = (Keys.Escape, chr(cp))
 
-    # Alt+Shift+<letter> (mod 4): Kitty reports the base codepoint even
-    # under Shift, so the shifted letter is synthesized by upper-casing.
-    # Letters only (non-letter shifted glyphs are layout-dependent, left
-    # to the Ignore fallback). Iterates a-z directly, not
-    # ``_ctrl_letter_keys`` (which omits "z"): Alt+Shift+Z is unaffected
-    # by the Ctrl+Z fallback decision above.
+    # Alt+Shift+letter (mod 4): Kitty reports the base codepoint, so upper-case
+    # it. Non-letter shifted glyphs are layout-dependent and left to Ignore.
+    # Iterates a-z, not ``_ctrl_letter_keys``, so Alt+Shift+Z is covered.
     for ch in "abcdefghijklmnopqrstuvwxyz":
         ANSI_SEQUENCES[f"\x1b[{ord(ch)};4u"] = (Keys.Escape, ch.upper())
 
-    # Ctrl+Alt(+Shift)+<letter> (mod 7 / 8): legacy Alt is an ESC prefix
-    # in front of the Ctrl+letter control byte.
+    # Ctrl+Alt(+Shift)+letter (mod 7 / 8): ESC prefix before the Ctrl+letter
+    # byte. Ctrl+Alt+Z is excluded (Z is omitted from the Ctrl table) -> Ignore.
     for ch, ctrl_key in _ctrl_letter_keys.items():
         ANSI_SEQUENCES[f"\x1b[{ord(ch)};7u"] = (Keys.Escape, ctrl_key)
         ANSI_SEQUENCES[f"\x1b[{ord(ch)};8u"] = (Keys.Escape, ctrl_key)
 
-    # Catch-all: any other modified CSI-u combo (Super, Hyper, unbound
-    # punctuation/digit modifiers, etc.) is ignored rather than leaking
-    # as literal text. ``setdefault`` runs last so it never overrides a
-    # specific entry above.
+    # Catch-all for modifier parameters 2-16 (Shift/Alt/Ctrl/Super combos,
+    # unbound keys): ignored rather than leaked as text. ``setdefault`` runs
+    # last so it never overrides a specific entry above.
     _fallback_codepoints = (*range(0x20, 0x7F), 9, 13, 27, 127)
     for mod in range(2, 17):
         for cp in _fallback_codepoints:

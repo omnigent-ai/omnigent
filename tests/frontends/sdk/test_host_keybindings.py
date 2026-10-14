@@ -45,11 +45,15 @@ def _parse_raw(raw: str) -> list:
     return presses
 
 
-async def _apply_raw(start_text: str, raw: str, *, times: int = 1) -> str:
+async def _feed_buffer(
+    start_text: str, raw: str, *, times: int = 1, cursor: int | None = None
+) -> Buffer:
     """Feed ``raw`` (repeated ``times``) into a buffer holding ``start_text``
-    with the cursor at the end, through the default emacs key bindings, and
-    return the resulting buffer text. Drives the full real input pipeline."""
-    buf = Buffer(document=Document(start_text, len(start_text)))
+    through the default emacs key bindings and return the buffer. The cursor
+    starts at ``cursor`` (default end-of-text). Drives the full real input
+    pipeline."""
+    position = len(start_text) if cursor is None else cursor
+    buf = Buffer(document=Document(start_text, position))
     app = Application(
         layout=Layout(Window(BufferControl(buffer=buf))),
         key_bindings=load_key_bindings(),
@@ -62,7 +66,13 @@ async def _apply_raw(start_text: str, raw: str, *, times: int = 1) -> str:
                 processor.feed(press)
         processor.process_keys()
         await asyncio.sleep(0)  # let the processor settle on the running loop
-    return buf.text
+    return buf
+
+
+async def _apply_raw(start_text: str, raw: str, *, times: int = 1) -> str:
+    """Feed ``raw`` into ``start_text`` (cursor at the end) and return the
+    resulting buffer text."""
+    return (await _feed_buffer(start_text, raw, times=times)).text
 
 
 # ── decode: every fixed CSI-u sequence resolves to one real key (no leak) ──
@@ -81,6 +91,34 @@ async def _apply_raw(start_text: str, raw: str, *, times: int = 1) -> str:
         ("plain Backspace", "\x1b[127u", Keys.Backspace),
         ("plain Enter", "\x1b[13u", Keys.ControlM),
         ("plain Tab", "\x1b[9u", Keys.ControlI),
+        # Ctrl+<letter>, previously missing i/j/m/v/x — Kitty reports the
+        # base letter codepoint under Ctrl, not the legacy C0 code, so
+        # Ctrl+I/J/M arrive as [105;5u] / [106;5u] / [109;5u].
+        ("Ctrl+I", "\x1b[105;5u", Keys.ControlI),
+        ("Ctrl+J", "\x1b[106;5u", Keys.ControlJ),
+        ("Ctrl+M", "\x1b[109;5u", Keys.ControlM),
+        ("Ctrl+V", "\x1b[118;5u", Keys.ControlV),
+        ("Ctrl+X", "\x1b[120;5u", Keys.ControlX),
+        # Ctrl+Shift+letter: xterm sends the same byte as plain Ctrl+letter.
+        ("Ctrl+Shift+I", "\x1b[105;6u", Keys.ControlI),
+        # Ctrl+<punctuation>: legacy control-masking, except Ctrl+/ -> ^_.
+        ("Ctrl+Space", "\x1b[32;5u", Keys.ControlAt),
+        ("Ctrl+/", "\x1b[47;5u", Keys.ControlUnderscore),
+        ("Ctrl+[", "\x1b[91;5u", Keys.Escape),
+        ("Ctrl+\\", "\x1b[92;5u", Keys.ControlBackslash),
+        ("Ctrl+]", "\x1b[93;5u", Keys.ControlSquareClose),
+        # Ignore fallback: no mapping, no leak. Ctrl+Z lands here on purpose —
+        # prompt-toolkit's "c-z" binding re-inserts the raw sequence, so
+        # mapping "z" to ControlZ would leak.
+        ("Ctrl+Z", "\x1b[122;5u", Keys.Ignore),
+        ("Ctrl+Shift+Z", "\x1b[122;6u", Keys.Ignore),
+        ("Ctrl+1 (unbound digit)", "\x1b[49;5u", Keys.Ignore),
+        ("Ctrl+- (unbound punct)", "\x1b[45;5u", Keys.Ignore),
+        ("Super+A", "\x1b[97;9u", Keys.Ignore),
+        ("Alt+Esc", "\x1b[27;3u", Keys.Ignore),
+        ("Ctrl+Shift+Enter", "\x1b[13;6u", Keys.Ignore),
+        ("Alt+Tab", "\x1b[9;3u", Keys.Ignore),
+        ("Alt+Shift+, (layout-dependent)", "\x1b[44;4u", Keys.Ignore),
     ],
 )
 def test_csi_u_sequence_decodes_to_single_key(label: str, raw: str, expected: Keys) -> None:
@@ -123,58 +161,13 @@ async def test_word_delete_edge_cases(start: str, times: int, expected: str) -> 
     assert await _apply_raw(start, "\x1b[127;3u", times=times) == expected
 
 
-# ── decode: extended Ctrl/Alt coverage (i/j/m/v/x, punctuation, Ignore) ──
-
-
-@pytest.mark.parametrize(
-    ("label", "raw", "expected"),
-    [
-        # Ctrl+<letter>, previously missing i/j/m/v/x — Kitty reports the
-        # base letter codepoint under Ctrl, not the legacy C0 code, so
-        # Ctrl+I/J/M arrive as [105;5u] / [106;5u] / [109;5u].
-        ("Ctrl+I", "\x1b[105;5u", Keys.ControlI),
-        ("Ctrl+J", "\x1b[106;5u", Keys.ControlJ),
-        ("Ctrl+M", "\x1b[109;5u", Keys.ControlM),
-        ("Ctrl+V", "\x1b[118;5u", Keys.ControlV),
-        ("Ctrl+X", "\x1b[120;5u", Keys.ControlX),
-        # Ctrl+Shift+letter: xterm sends the same byte as plain Ctrl+letter.
-        ("Ctrl+Shift+I", "\x1b[105;6u", Keys.ControlI),
-        # Ctrl+<punctuation> matching legacy ASCII control-masking.
-        ("Ctrl+Space", "\x1b[32;5u", Keys.ControlAt),
-        ("Ctrl+/", "\x1b[47;5u", Keys.ControlUnderscore),
-        ("Ctrl+[", "\x1b[91;5u", Keys.Escape),
-        ("Ctrl+\\", "\x1b[92;5u", Keys.ControlBackslash),
-        ("Ctrl+]", "\x1b[93;5u", Keys.ControlSquareClose),
-        # Ignore fallback — no dedicated mapping, no literal-text leak.
-        # Ctrl+Z/Ctrl+Shift+Z land here deliberately: prompt-toolkit's
-        # built-in "c-z" binding re-inserts the raw matched sequence, so
-        # mapping "z" to ControlZ would itself leak; Ignore is silent.
-        ("Ctrl+Z", "\x1b[122;5u", Keys.Ignore),
-        ("Ctrl+Shift+Z", "\x1b[122;6u", Keys.Ignore),
-        ("Ctrl+1 (unbound digit)", "\x1b[49;5u", Keys.Ignore),
-        ("Ctrl+- (unbound punct)", "\x1b[45;5u", Keys.Ignore),
-        ("Super+A", "\x1b[97;9u", Keys.Ignore),
-        ("Alt+Esc", "\x1b[27;3u", Keys.Ignore),
-        ("Ctrl+Shift+Enter", "\x1b[13;6u", Keys.Ignore),
-        ("Alt+Tab", "\x1b[9;3u", Keys.Ignore),
-        ("Alt+Shift+, (layout-dependent)", "\x1b[44;4u", Keys.Ignore),
-    ],
-)
-def test_extended_sequence_decodes_to_single_key(label: str, raw: str, expected: Keys) -> None:
-    """Same contract as ``test_csi_u_sequence_decodes_to_single_key`` above,
-    for the sequences added/fixed in the CSI-u leak follow-up."""
-    presses = _parse_raw(raw)
-    assert len(presses) == 1, f"{label}: expected 1 key, got {[str(p.key) for p in presses]}"
-    assert presses[0].key == expected, label
-
-
 # ── decode: Alt / Alt+Shift / Ctrl+Alt(+Shift) resolve to (Escape, <key>) ──
 
 
 @pytest.mark.parametrize(
     ("label", "raw", "expected"),
     [
-        # Alt+<printable> — the leaks the bug report reproduced.
+        # Alt+<printable> — these previously leaked as literal text.
         ("Alt+B", "\x1b[98;3u", (Keys.Escape, "b")),
         ("Alt+F", "\x1b[102;3u", (Keys.Escape, "f")),
         ("Alt+1", "\x1b[49;3u", (Keys.Escape, "1")),
@@ -182,11 +175,9 @@ def test_extended_sequence_decodes_to_single_key(label: str, raw: str, expected:
         # Alt+Shift+<letter> — base codepoint, upper-cased locally.
         ("Alt+Shift+B", "\x1b[98;4u", (Keys.Escape, "B")),
         ("Alt+Shift+Z", "\x1b[122;4u", (Keys.Escape, "Z")),
-        # Ctrl+Alt(+Shift)+<letter> — Escape prefix in front of Ctrl+letter.
-        # (Escape, ControlA) has no emacs binding, so on a real host the
-        # Escape half falls through to the host's own escape→cancel
-        # binding — same as legacy ESC-prefix parity, a documented
-        # limitation rather than a leak.
+        # Ctrl+Alt(+Shift)+letter: Escape prefix before Ctrl+letter. The Escape
+        # half hits the host's escape->cancel binding, as with a legacy
+        # ESC prefix (a documented limitation, not a leak).
         ("Ctrl+Alt+B", "\x1b[98;7u", (Keys.Escape, Keys.ControlB)),
         ("Ctrl+Alt+Shift+A", "\x1b[97;8u", (Keys.Escape, Keys.ControlA)),
     ],
@@ -207,22 +198,9 @@ def test_alt_sequence_decodes_to_escape_pair(
 
 
 async def _apply_raw_cursor(start_text: str, raw: str, *, cursor: int | None = None) -> int:
-    """Like ``_apply_raw`` but returns the resulting cursor position instead
-    of the buffer text — word-movement doesn't change the text, only where
-    the cursor ends up. ``cursor`` defaults to end-of-text."""
-    buf = Buffer(document=Document(start_text, cursor if cursor is not None else len(start_text)))
-    app = Application(
-        layout=Layout(Window(BufferControl(buffer=buf))),
-        key_bindings=load_key_bindings(),
-    )
-    with create_app_session() as session:
-        session.app = app
-        processor = KeyProcessor(app.key_bindings)
-        for press in _parse_raw(raw):
-            processor.feed(press)
-        processor.process_keys()
-        await asyncio.sleep(0)
-    return buf.cursor_position
+    """Like ``_apply_raw`` but returns the resulting cursor position — word
+    movement changes only where the cursor ends up, not the text."""
+    return (await _feed_buffer(start_text, raw, cursor=cursor)).cursor_position
 
 
 @pytest.mark.parametrize(
