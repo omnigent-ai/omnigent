@@ -376,6 +376,54 @@ async def test_start_pins_reasoning_effort_in_config(
     assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
 
 
+def test_build_codex_native_server_owns_add_dir_roots(tmp_path: Path) -> None:
+    """``--add-dir`` roots resolve against the workspace, as Codex resolves them."""
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path / "workspace",
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path="/opt/codex/bin/codex",
+        terminal_launch_args=("--add-dir", "attachments", "--add-dir=/shared"),
+    )
+
+    assert app_server.writable_roots == (str(tmp_path / "workspace" / "attachments"), "/shared")
+
+
+async def test_start_writes_add_dir_roots_for_remote_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Startup appends ``--add-dir`` roots to the private workspace-write roots.
+
+    The ``--remote`` TUI cannot pass them, and the thread it starts takes its
+    writable roots from this config. The user's own roots stay first.
+    """
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    original = '[sandbox_workspace_write]\nwritable_roots = ["/configured"]\n'
+    (real_codex_home / "config.toml").write_text(original, encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    server.writable_roots = (str(tmp_path / "attachments"), "/configured")
+    await server.start()
+    await server.close()
+
+    rendered = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert rendered["sandbox_workspace_write"]["writable_roots"] == [
+        "/configured",
+        str(tmp_path / "attachments"),
+    ]
+    assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
+
+
 @pytest.mark.parametrize(
     ("requested", "inherited", "expected"),
     [
