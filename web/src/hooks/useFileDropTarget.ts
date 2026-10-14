@@ -61,7 +61,6 @@ export function useFileDropTarget(
     };
     const ignored = (event: DragEvent) => {
       if (!optionsRef.current.ignore?.(event)) return false;
-      depth = 0;
       setIsDragActive(false);
       return true;
     };
@@ -75,7 +74,7 @@ export function useFileDropTarget(
     };
 
     const leave = (e: DragEvent): void => {
-      if (!carriesFiles(e.dataTransfer)) return;
+      if (!carriesFiles(e.dataTransfer) || optionsRef.current.ignore?.(e)) return;
       depth = Math.max(0, depth - 1);
       if (depth === 0) setIsDragActive(false);
     };
@@ -107,7 +106,7 @@ export function useFileDropTarget(
     };
 
     const scroll = () => {
-      if (optionsRef.current.clearOnScroll) end();
+      if (optionsRef.current.clearOnScroll) setIsDragActive(false);
     };
     target.addEventListener("scroll", scroll);
     target.addEventListener("dragenter", enter);
