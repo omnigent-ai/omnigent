@@ -1,9 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
 import { enqueueUploads } from "@/lib/workspaceUploadController";
 import { useUploadStore } from "@/store/uploadStore";
+import { FolderTree } from "./FolderTree";
 import {
   droppedUploadFiles,
   resolveUploadTarget,
@@ -23,6 +25,7 @@ vi.mock("@/hooks/useSession", () => ({
 let workspaceRoot: string | null = "/work/demo";
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceEnvironment: () => ({ data: { root: workspaceRoot } }),
+  useWorkspaceDirectories: () => new Map(),
 }));
 vi.mock("@/store/chatStore", () => ({ useChatStore: () => "idle" }));
 vi.mock("@/lib/workspaceUploadController", () => ({
@@ -42,13 +45,14 @@ const limits = {
 };
 const capability = { supported: true, limits };
 let client: QueryClient;
-function view(directory = "src") {
+function view(directory = "src", content?: ReactNode) {
   return render(
     <QueryClientProvider client={client}>
       <WorkspaceUploadProvider sessionId="s">
         <WorkspaceUploadDropRoot>
           <UploadPicker directory={directory} />
           <span data-testid="files-content">tree</span>
+          {content}
         </WorkspaceUploadDropRoot>
         <UploadsTray visible />
       </WorkspaceUploadProvider>
@@ -224,4 +228,139 @@ it("allows an asleep runner to connect before workspace metadata is available", 
   const button = await screen.findByRole("button", { name: "Upload files" });
   expect(button).toBeEnabled();
   expect(document.querySelector("[data-upload-drop-root]")).toBeTruthy();
+});
+
+it.each([
+  ["folder", "src/assets", "browsed/src/assets"],
+  ["file", "src/assets", "browsed/src/assets"],
+  ["root-file", "", "browsed"],
+])("resolves %s from the drop event's mounted row", (_kind, rowDirectory, wanted) => {
+  const row = document.createElement("div");
+  row.dataset.dropDir = rowDirectory;
+  const child = row.appendChild(document.createElement("span"));
+  expect(resolveUploadTarget({ target: child } as unknown as DragEvent, "browsed")).toBe(wanted);
+});
+
+it.each(["space", "header", "empty tree", "Changes"])(
+  "resolves %s without a tree row to the browsed root",
+  () => {
+    expect(
+      resolveUploadTarget({ target: document.createElement("div") } as unknown as DragEvent, "src"),
+    ).toBe("src");
+  },
+);
+
+function tree() {
+  return (
+    <FolderTree
+      files={[
+        {
+          path: "assets/existing.txt",
+          name: "existing.txt",
+          type: "file",
+          bytes: 1,
+          modified_at: null,
+        },
+        { path: "other", name: "other", type: "directory", bytes: null, modified_at: null },
+      ]}
+      conversationId="upload-tree"
+      browseLocation="src"
+      isLoading={false}
+      isError={false}
+      error={null}
+      onFileSelect={vi.fn()}
+      showHidden={false}
+      changedFiles={undefined}
+      sort="alpha"
+    />
+  );
+}
+
+it("shows a single folder ring and upload label, then freezes the DROP row despite stale hover", async () => {
+  view("src", tree());
+  await screen.findByRole("button", { name: "Upload files" });
+  const assets = screen.getByText("assets/");
+  const transfer = { types: ["Files"], files: [new File(["bytes"], "new.txt")] };
+  fireEvent.dragOver(assets, { dataTransfer: transfer });
+  expect(screen.getByText("Upload to src/assets")).toBeVisible();
+  expect(screen.getByText("Upload to src/assets").parentElement).toBe(document.body);
+  expect(assets.closest("[data-upload-hover]")).toBeTruthy();
+  expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(1);
+  expect(screen.queryByText("Upload to workspace")).toBeNull();
+  fireEvent.drop(screen.getByText("other/"), { dataTransfer: transfer });
+  expect(enqueueUploads).toHaveBeenCalledExactlyOnceWith(
+    expect.anything(),
+    transfer.files,
+    "src/other",
+    "src/other",
+    limits,
+    client,
+  );
+  expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
+  expect(assets.closest("[data-upload-hover]")).toBeNull();
+});
+
+it("uploads a file-row drop to its parent once and a header drop to the browsed root", async () => {
+  view("src", tree());
+  await screen.findByRole("button", { name: "Upload files" });
+  const transfer = { types: ["Files"], files: [new File(["bytes"], "new.txt")] };
+  fireEvent.drop(screen.getByText("existing.txt"), { dataTransfer: transfer });
+  expect(enqueueUploads).toHaveBeenCalledExactlyOnceWith(
+    expect.anything(),
+    transfer.files,
+    "src/assets",
+    "src/assets",
+    limits,
+    client,
+  );
+  fireEvent.dragOver(screen.getByTestId("files-content"), { dataTransfer: transfer });
+  expect(screen.getByText("Upload to workspace")).toBeVisible();
+  expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(1);
+  fireEvent.drop(screen.getByTestId("files-content"), { dataTransfer: transfer });
+  expect(enqueueUploads).toHaveBeenLastCalledWith(
+    expect.anything(),
+    transfer.files,
+    "src",
+    "src",
+    limits,
+    client,
+  );
+  expect(enqueueUploads).toHaveBeenCalledTimes(2);
+});
+
+it("spring-load expands the actual folder without re-rooting the browser", async () => {
+  view("src", tree());
+  await screen.findByRole("button", { name: "Upload files" });
+  const folder = screen.getByRole("button", { name: "other/" });
+  expect(folder).toHaveAttribute("aria-expanded", "false");
+  fireEvent.dragOver(folder, { dataTransfer: { types: ["Files"] } });
+  await waitFor(() => expect(folder).toHaveAttribute("aria-expanded", "true"));
+  fireEvent.drop(folder, {
+    dataTransfer: { types: ["Files"], files: [new File(["a"], "new.txt")] },
+  });
+  expect(enqueueUploads).toHaveBeenLastCalledWith(
+    expect.anything(),
+    expect.anything(),
+    "src/other",
+    "src/other",
+    limits,
+    client,
+  );
+});
+
+it("a disabled tree never highlights or handles a row drop", async () => {
+  vi.mocked(authenticatedFetch).mockResolvedValue(
+    new Response(
+      JSON.stringify({ ...capability, supported: false, reason: "runner_capability_mismatch" }),
+    ),
+  );
+  view("src", tree());
+  await screen.findByRole("button", { name: "Upload files" });
+  const row = screen.getByText("assets/");
+  const transfer = { types: ["Files"], files: [new File(["a"], "a.txt")] };
+  expect(fireEvent.dragOver(row, { dataTransfer: transfer })).toBe(true);
+  expect(document.querySelector("[data-upload-hover]")).toBeNull();
+  expect(document.querySelector('[data-drop-variant="upload"]')).toBeNull();
+  expect(fireEvent.drop(row, { dataTransfer: transfer })).toBe(true);
+  expect(enqueueUploads).not.toHaveBeenCalled();
 });
