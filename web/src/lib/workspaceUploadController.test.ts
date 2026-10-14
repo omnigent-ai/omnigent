@@ -988,3 +988,147 @@ it("keeps an expired create cancellation settled when a late cleanup returns a r
   expect(invalidate).not.toHaveBeenCalled();
   expect(toast).toHaveBeenCalledExactlyOnceWith("0 of 1 uploaded, 1 cancelled");
 });
+
+it.each(["dismiss", "discard"])(
+  "releases an admitted failed upload exactly once before %s",
+  async (action) => {
+    vi.useFakeTimers();
+    let patches = 0;
+    fetchMock.mockImplementation(async (url, init) => {
+      if (init?.method === "PATCH" && ++patches > 1)
+        return errorResponse(502, "upload_relay_failed");
+      return server(url, init);
+    });
+    await transferUpload(row.key, client, wait);
+    await vi.advanceTimersByTimeAsync(0);
+    if (action === "dismiss") useUploadStore.getState().dismiss([row.key]);
+    else discardUploads(row.origin, row.identity);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url, init]) => init?.method === "DELETE" && String(url).endsWith("/remote"),
+      ),
+    ).toHaveLength(1);
+    expect(useUploadStore.getState().rows.id).toBeUndefined();
+  },
+);
+
+it("retries a cleaned-up failed upload with a new create and offset zero", async () => {
+  vi.useFakeTimers();
+  let patches = 0;
+  fetchMock.mockImplementation(async (url, init) => {
+    if (init?.method === "PATCH" && ++patches > 1) return errorResponse(502, "upload_relay_failed");
+    return server(url, init);
+  });
+  await transferUpload(row.key, client, wait);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(useUploadStore.getState().rows.id).toMatchObject({
+    status: "failed",
+    uploadId: undefined,
+    offset: 0,
+  });
+  fetchMock.mockImplementation(server);
+  const before = requests.length;
+  await retryUpload(row.key, client);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(requests.slice(before).map((request) => request.method)).toEqual([
+    "POST",
+    "PATCH",
+    "PATCH",
+    "PATCH",
+    "POST",
+  ]);
+  expect(requests.slice(before).find((request) => request.method === "PATCH")?.offset).toBe(0);
+  expect(useUploadStore.getState().rows.id.status).toBe("done");
+});
+
+it.each(["dismiss", "discard"])(
+  "reconciles a failed upload's delayed committed cleanup across %s",
+  async (action) => {
+    vi.useFakeTimers();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    let patches = 0;
+    let release!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    const result = {
+      path: "src/a.bin",
+      final_name: "a.bin",
+      size: 20,
+      sha256: "digest",
+      outcome: "replaced",
+    };
+    fetchMock.mockImplementation(async (url, init) => {
+      if (init?.method === "DELETE") return pending;
+      if (init?.method === "PATCH" && ++patches > 1)
+        return errorResponse(502, "upload_relay_failed");
+      return server(url, init);
+    });
+    await transferUpload(row.key, client, wait);
+    await vi.advanceTimersByTimeAsync(0);
+    let guarded = false;
+    if (action === "dismiss") {
+      useUploadStore.getState().dismiss([row.key]);
+      guarded = Boolean(useUploadStore.getState().rows.id);
+      await retryUpload(row.key, client);
+    } else discardUploads(row.origin, row.identity);
+    release(json(result));
+    await vi.advanceTimersByTimeAsync(300);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "DELETE")).toHaveLength(1);
+    if (action === "dismiss") {
+      expect(guarded).toBe(true);
+      expect(useUploadStore.getState().rows.id).toMatchObject({
+        status: "done",
+        result,
+        cancellationPending: false,
+        file: undefined,
+      });
+      expect(invalidate).toHaveBeenCalledWith({
+        queryKey: ["workspace-dir", "s", "src"],
+        refetchType: "active",
+      });
+      expect(invalidate).toHaveBeenCalledWith({
+        queryKey: ["file-content", "s", "src/a.bin"],
+        refetchType: "active",
+      });
+      expect(toast).toHaveBeenCalledWith("1 of 1 uploaded");
+    } else {
+      expect(useUploadStore.getState().rows.id).toBeUndefined();
+      expect(invalidate).not.toHaveBeenCalled();
+      expect(toast).not.toHaveBeenCalledWith("1 of 1 uploaded");
+    }
+  },
+);
+
+it("bounds failed-upload cleanup and refuses retry until reconciliation settles", async () => {
+  vi.useFakeTimers();
+  let patches = 0;
+  let release!: (response: Response) => void;
+  const pending = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  fetchMock.mockImplementation(async (url, init) => {
+    if (init?.method === "DELETE") return pending;
+    if (init?.method === "PATCH" && ++patches > 1) return errorResponse(502, "upload_relay_failed");
+    return server(url, init);
+  });
+  await transferUpload(row.key, client, wait);
+  const before = fetchMock.mock.calls.length;
+  await retryUpload(row.key, client);
+  const callsAfterRetry = fetchMock.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(150_001);
+  const failed = useUploadStore.getState().rows.id;
+  useUploadStore.getState().dismiss([row.key]);
+  release(new Response(null, { status: 204 }));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(callsAfterRetry).toBe(before);
+  expect(failed).toMatchObject({
+    status: "failed",
+    cancellationPending: false,
+    uploadId: undefined,
+    offset: 0,
+  });
+  expect(useUploadStore.getState().rows.id).toBeUndefined();
+  expect(toast).toHaveBeenCalledWith("0 of 1 uploaded, 1 failed");
+});
