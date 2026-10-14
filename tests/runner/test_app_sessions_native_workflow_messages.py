@@ -34,6 +34,50 @@ from tests.runner.conftest import (
 from tests.runner.helpers import NullServerClient
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+async def test_native_input_identity_reaches_the_harness_request(harness: str) -> None:
+    from omnigent.runtime.harnesses._scaffold import MessageEvent
+
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(hc),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    identity = {
+        "input_stable_id": "a" * 32,
+        "pending_id": "pending_" + "b" * 32,
+        "delivery_attempt_id": "c" * 32,
+        "input_enqueued_at_ms": 12345,
+    }
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "private prompt"}],
+                "harness": harness,
+                "stable_id": "a" * 32,
+                **identity,
+            },
+        )
+        assert response.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+    assert len(hc.posted_bodies) == 1
+    request = MessageEvent.model_validate(hc.posted_bodies[0]).to_create_request()
+    assert request.model_dump(include=set(identity)) == identity
+
+
 def _build_blocking_app(
     gate: asyncio.Event,
 ) -> tuple[FastAPI, _FakeProcessManager, _BlockingHarnessClient]:

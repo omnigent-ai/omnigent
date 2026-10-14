@@ -39,10 +39,12 @@ export function BackButton({
   label,
   to,
   onClick,
+  componentId = "settings.harnesses.back",
 }: {
   label: string;
   to?: string;
   onClick?: () => void;
+  componentId?: string;
 }) {
   return (
     <Button
@@ -53,7 +55,7 @@ export function BackButton({
       onClick={onClick}
     >
       {to !== undefined ? (
-        <Link to={to} componentId="settings.harnesses.back">
+        <Link to={to} componentId={componentId}>
           <ArrowLeftIcon />
           {label}
         </Link>
@@ -459,11 +461,15 @@ function SkillPage({
 
 const SKILL_MARKDOWN_COMPONENTS: Components = {
   img: ({ alt }) => <span>{alt}</span>,
-  a: ({ href, children }) => (
-    <a href={href} rel="noreferrer" target="_blank">
-      {children}
-    </a>
-  ),
+  // Only SKILL.md is shown, so relative links (sibling files, anchors) lead nowhere.
+  a: ({ href, children }) =>
+    href && /^[a-z][a-z\d+.-]*:/i.test(href) ? (
+      <a href={href} rel="noreferrer" target="_blank">
+        {children}
+      </a>
+    ) : (
+      <span>{children}</span>
+    ),
 };
 
 function McpList({

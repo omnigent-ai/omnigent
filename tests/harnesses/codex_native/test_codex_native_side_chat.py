@@ -56,6 +56,12 @@ def test_side_chat_question_extracts_question() -> None:
     )
 
 
+def test_side_chat_question_preserves_first_line_indentation() -> None:
+    assert side_chat.side_chat_question(_text_items("/side   - First\n  - Second")) == (
+        "  - First\n  - Second"
+    )
+
+
 def test_side_chat_question_ignores_non_side_and_empty() -> None:
     assert side_chat.side_chat_question(_text_items("hello")) is None
     assert side_chat.side_chat_question(_text_items("/sidebar thing")) is None  # needs the space

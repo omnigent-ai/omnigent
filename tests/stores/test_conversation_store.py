@@ -33,6 +33,7 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import ConversationUpdateResult
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -486,6 +487,121 @@ def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:
         conversation_store.update_conversation("c55a64c3f6f954fe0fc8738ba3f45f26", title="x")
         is None
     )
+
+
+def test_update_conversation_with_changes_reports_effort_changes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+
+    first = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="high")
+    assert isinstance(first, ConversationUpdateResult)
+    assert first.conversation.reasoning_effort == "high"
+    assert first.reasoning_effort_changed is True
+    assert first.model_override_changed is False
+
+    no_op = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="high")
+    assert no_op is not None
+    assert no_op.reasoning_effort_changed is False
+    assert no_op.model_override_changed is False
+
+    changed = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="low")
+    assert changed is not None
+    assert changed.conversation.reasoning_effort == "low"
+    assert changed.reasoning_effort_changed is True
+
+    cleared = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_reasoning_effort=True
+    )
+    assert cleared is not None
+    assert cleared.conversation.reasoning_effort is None
+    assert cleared.reasoning_effort_changed is True
+
+    clear_no_op = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_reasoning_effort=True
+    )
+    assert clear_no_op is not None
+    assert clear_no_op.reasoning_effort_changed is False
+
+    unrelated = conversation_store.update_conversation_with_changes(conv.id, title="Renamed")
+    assert unrelated is not None
+    assert unrelated.reasoning_effort_changed is False
+    assert unrelated.model_override_changed is False
+
+
+def test_update_conversation_with_changes_reports_model_changes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+
+    first = conversation_store.update_conversation_with_changes(conv.id, model_override="model-a")
+    assert first is not None
+    assert first.conversation.model_override == "model-a"
+    assert first.reasoning_effort_changed is False
+    assert first.model_override_changed is True
+
+    no_op = conversation_store.update_conversation_with_changes(conv.id, model_override="model-a")
+    assert no_op is not None
+    assert no_op.model_override_changed is False
+
+    changed = conversation_store.update_conversation_with_changes(
+        conv.id, model_override="model-b"
+    )
+    assert changed is not None
+    assert changed.conversation.model_override == "model-b"
+    assert changed.model_override_changed is True
+
+    cleared = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_model_override=True
+    )
+    assert cleared is not None
+    assert cleared.conversation.model_override is None
+    assert cleared.model_override_changed is True
+
+    clear_no_op = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_model_override=True
+    )
+    assert clear_no_op is not None
+    assert clear_no_op.model_override_changed is False
+
+
+def test_update_conversation_with_changes_missing_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    assert (
+        conversation_store.update_conversation_with_changes(
+            "c55a64c3f6f954fe0fc8738ba3f45f26",
+            reasoning_effort="high",
+            model_override="model-a",
+        )
+        is None
+    )
+
+
+def test_update_conversation_with_changes_retries_commit(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    retrying_maker = _RetryOnceMaker(conversation_store._conv_session_immediate)
+    conversation_store._conv_session_immediate = retrying_maker
+
+    result = conversation_store.update_conversation_with_changes(
+        conv.id,
+        reasoning_effort="high",
+        model_override="model-a",
+    )
+
+    assert retrying_maker.attempts == 2
+    assert result is not None
+    assert result.reasoning_effort_changed is True
+    assert result.model_override_changed is True
+    assert result.conversation.reasoning_effort == "high"
+    assert result.conversation.model_override == "model-a"
+
+    committed = conversation_store.get_conversation(conv.id)
+    assert committed is not None
+    assert committed.reasoning_effort == "high"
+    assert committed.model_override == "model-a"
 
 
 def test_reported_model_round_trips_beside_the_request(
@@ -4407,6 +4523,146 @@ def test_fork_conversation_copies_items(
         assert fork_item.response_id == src_item.response_id
         # Data content is identical.
         assert fork_item.data == src_item.data
+
+
+@pytest.mark.parametrize("last_error_code", ["workspace_missing", "runner_disconnected"])
+def test_fork_marks_source_workspace_failures_as_notices(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    last_error_code: str,
+) -> None:
+    """A new unbound fork leaves the source's missing-workspace diagnosis behind."""
+    host_id = "1" * 32
+    _register_host(db_uri, host_id)
+    source = conversation_store.create_conversation(
+        workspace="/missing-workspace", host_id=host_id, runner_id="source-runner"
+    )
+    source_labels = {
+        "omnigent.last_task_error_code": last_error_code,
+        "omnigent.last_task_error_message": "Source launch failed",
+        "omnigent.last_task_error_item_id": "source-error",
+        "omnigent.last_task_error_title": "Source failure",
+        "kept": "yes",
+    }
+    conversation_store.set_labels(source.id, source_labels)
+    missing = NewConversationItem(
+        type="error",
+        response_id="failed_launch",
+        data=ErrorData(
+            source="execution",
+            code="workspace_missing",
+            message="workspace path does not exist: /missing-workspace",
+            title="Workspace missing",
+            cause="The source working directory was deleted.",
+            remediation="Restore the original directory.",
+        ),
+    )
+    source_items = conversation_store.append(
+        source.id,
+        [
+            _user_message("Earlier context", "earlier"),
+            NewConversationItem(
+                type="error",
+                response_id="earlier",
+                data=ErrorData(source="llm", code="rate_limit_exceeded", message="Retry later"),
+            ),
+            missing,
+            _user_message("Please continue", "failed_launch"),
+            missing,
+        ],
+    )
+    calls = _count_encode_hooks(conversation_store, monkeypatch)
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert calls == {"item": 0, "batch": 1, "decode_batch": 1}
+    assert fork.workspace is None and fork.host_id is None and fork.runner_id is None
+    assert fork.labels["kept"] == "yes"
+    if last_error_code == "workspace_missing":
+        assert not any(key.startswith("omnigent.last_task_error_") for key in fork.labels)
+    else:
+        assert all(fork.labels[key] == value for key, value in source_labels.items())
+    fork_items = conversation_store.list_items(fork.id).data
+    for original_item, fork_item in zip(source_items, fork_items, strict=True):
+        assert original_item.id != fork_item.id
+        assert original_item.response_id == fork_item.response_id
+        if original_item.data == missing.data:
+            assert isinstance(fork_item.data, ErrorData)
+            assert fork_item.data.code == "source_workspace_missing"
+            assert fork_item.data.level == "info"
+            assert fork_item.data.title == "The original session’s workspace was unavailable."
+            assert fork_item.data.message == missing.data.message
+            assert fork_item.data.cause is None and fork_item.data.remediation is None
+        else:
+            assert fork_item.data == original_item.data
+    assert _stored_positions(conversation_store, fork.id) == list(range(5))
+    assert conversation_store.list_items(source.id).data == source_items
+    original = conversation_store.get_conversation(source.id)
+    assert original is not None
+    assert original.workspace == "/missing-workspace" and original.host_id == host_id
+    assert original.labels == source_labels
+    assert len(conversation_store.search("source_workspace_missing", conversation_id=fork.id)) == 2
+    assert conversation_store.search("source_workspace_missing", conversation_id=source.id) == []
+
+    [new_failure] = conversation_store.append(fork.id, [missing])
+    assert conversation_store.list_items(fork.id).data[-1] == new_failure
+    assert isinstance(new_failure.data, ErrorData)
+    assert new_failure.data.code == "workspace_missing" and new_failure.data.level is None
+    assert _stored_positions(conversation_store, fork.id) == list(range(6))
+
+
+@pytest.mark.parametrize("has_prior_item", [False, True])
+def test_fork_preserves_compaction_boundary_at_workspace_error(
+    conversation_store: SqlAlchemyConversationStore,
+    has_prior_item: bool,
+) -> None:
+    """A historical workspace notice keeps later, unsummarized messages after its cursor."""
+    source = conversation_store.create_conversation()
+    if has_prior_item:
+        conversation_store.append(source.id, [_user_message("Earlier context", "earlier")])
+    [boundary] = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="error",
+                response_id="failed_launch",
+                data=ErrorData(
+                    source="execution", code="workspace_missing", message="Directory missing"
+                ),
+            ),
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            _user_message("Intervening message", "between"),
+            NewConversationItem(
+                type="compaction",
+                response_id="compacted",
+                data=CompactionData(
+                    summary="Prior context", last_item_id=boundary.id, token_count=3
+                ),
+            ),
+            _user_message("Continue", "latest"),
+        ],
+    )
+    original_items = conversation_store.list_items(source.id).data
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    items = conversation_store.list_items(fork.id).data
+    compaction = next(item for item in items if item.type == "compaction")
+    assert isinstance(compaction.data, CompactionData)
+    fork_boundary = next(item for item in items if item.type == "error")
+    assert compaction.data.last_item_id == fork_boundary.id
+    assert isinstance(fork_boundary.data, ErrorData)
+    assert fork_boundary.data.code == "source_workspace_missing"
+    recent_items = conversation_store.list_items(fork.id, after=compaction.data.last_item_id).data
+    assert [
+        item.data.content[0]["text"] for item in recent_items if isinstance(item.data, MessageData)
+    ] == ["Intervening message", "Continue"]
+    assert conversation_store.list_items(source.id).data == original_items
 
 
 def test_fork_conversation_remaps_file_references(

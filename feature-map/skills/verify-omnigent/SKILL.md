@@ -88,8 +88,10 @@ instance runs old code: stop it and start a new one.
 A test that fails before reaching the user action has a setup failure, not a
 reproduction. Check its browser error and server/runner logs. When a test starts
 its own server or runner from inside an agent, check whether it inherited the
-parent's `OMNIGENT_RUNNER_*`, `RUNNER_SERVER_URL`, or
-`OMNIGENT_PROCESS_LOG_FILE`. Use an isolated child environment for that test;
+parent's `OMNIGENT_RUNNER_*`, `RUNNER_SERVER_URL`, `OMNIGENT_PROCESS_LOG_FILE`,
+or `OMNIGENT_CONFIG_HOME`; a spawned host daemon writes its identity into that
+config home, so an inherited read-only path keeps it from coming online. Use an
+isolated child environment for that test;
 do not change the controlling agent's environment. Record setup failures,
 skipped variants, and unavailable credentials separately from behavior results.
 

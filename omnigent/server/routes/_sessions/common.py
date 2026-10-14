@@ -319,6 +319,12 @@ _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediat
 _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: str = "omnigent.last_task_error_item_id"
 
 
+# The runner bound when this failure was recorded, so a later exit from a
+# different runner attempt surfaces its own startup failure instead of hiding
+# behind this stale cause. Empty when unknown (treated as the current runner's).
+_LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: str = "omnigent.last_task_error_runner_id"
+
+
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 
@@ -777,6 +783,7 @@ class _PendingPolicyAskWrites:
         (e.g. ``INCREMENT`` state updates for cost-budget counters).
     :param reviewed_arguments: Original MCP arguments shown for approval.
     :param transformed_arguments: Policy transform stored with that approval.
+    :param mcp_call_identity: Session, tool, policy actor and credential user.
     """
 
     state_updates: list[StateUpdate] | None
@@ -784,6 +791,7 @@ class _PendingPolicyAskWrites:
     from_mcp: bool = False
     reviewed_arguments: dict[str, Any] | None = None
     transformed_arguments: dict[str, Any] | None = None
+    mcp_call_identity: tuple[str, str, str | None, str | None] | None = None
 
 
 # Workspace-scoped: keyed by a harness elicitation id, which can be

@@ -34,6 +34,8 @@ from omnigent.inner.native_attachments import reject_authored_framework_notices
 
 # ── Shared ──────────────────────────────────────────────────────
 
+McpRegistryServiceId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")]
+
 
 class PaginatedList(BaseModel):
     """
@@ -111,7 +113,7 @@ class UpsertMCPServerRequest(BaseModel):
     """
 
     name: str = Field(min_length=1, max_length=128, pattern=_MCP_SERVER_NAME_RE)
-    transport: Literal["http", "stdio"]
+    transport: Literal["http", "stdio", "registry"]
     description: str | None = Field(default=None, max_length=512)
     url: str | None = None
     headers: dict[str, str] | None = None
@@ -135,6 +137,10 @@ class UpsertMCPServerRequest(BaseModel):
     @model_validator(mode="after")
     def _validate_transport_fields(self) -> UpsertMCPServerRequest:
         """Enforce the same transport shape as the agent spec parser."""
+        if self.transport == "registry":
+            if self.url or self.headers or self.command or self.args:
+                raise ValueError("Registry services cannot override server connection settings")
+            return self
         if self.transport == "http":
             if not self.url:
                 raise ValueError("url is required when transport is 'http'")
@@ -259,6 +265,8 @@ class AgentObject(BaseModel):
         through the session UI by the authenticated caller. This requires
         ownership of both the effective session and its session-scoped agent;
         built-in template and native agents are read-only.
+    :param mcp_registry_editable: Whether this caller owns the session and can
+        select managed MCP services independently of agent ownership.
     :param policies: Guardrails policies declared on the agent.
         Each entry summarises the policy name, type, and
         phases. Empty list when the spec declares no policies
@@ -300,10 +308,17 @@ class AgentObject(BaseModel):
     harness: str | None = None
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
     mcp_servers_editable: bool = False
+    mcp_registry_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)
     builtin: bool = False
+
+
+class AgentDetailObject(AgentObject):
+    """Agent summary with caller ownership for management actions."""
+
+    user_owned: bool
 
 
 # ── Session Policies ───────────────────────────────────────────
@@ -1051,6 +1066,11 @@ class CreateResponseRequest(BaseModel):
     # the message, so the runner can drop the buffered copy and not
     # re-deliver it in a continuation turn. ``None`` for fresh turns.
     injection_id: str | None = None
+    # Server-side identity of the native web input, independent of native transcript matching.
+    input_stable_id: str | None = None
+    pending_id: str | None = None
+    delivery_attempt_id: str | None = None
+    input_enqueued_at_ms: int | None = None
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None
@@ -1526,6 +1546,7 @@ class _SessionCreateRequestBase(BaseModel):
     agent_id: Any
     project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
+    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     parent_session_id: str | None = None
@@ -1726,6 +1747,8 @@ class SessionCreateMetadata(BaseModel):
     """
 
     inference_configuration_revision: str | None = None
+
+    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None
@@ -2615,7 +2638,7 @@ class SessionForkRequest(BaseModel):
     workspace: str | None = None
     # Marks the fork as a side chat: it is stamped with the side-chat label so
     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
-    # side-chat tab). The fork otherwise behaves normally (its own runner).
+    # side-chat tab). It may share its parent's runner.
     side_chat: bool = False
 
     model_config = ConfigDict(extra="forbid")
@@ -2938,7 +2961,7 @@ class GrantPermissionRequest(BaseModel):
 
     :param user_id: The user to grant access to, e.g.
         ``"alice@example.com"`` or ``"__public__"`` for public
-        read access.
+        access subject to the server's public permission ceiling.
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage.
     """

@@ -121,21 +121,22 @@ jobs:
           pnpm --filter web run build:storybook
 
       - name: Compare and verify the regenerated baselines
-        # Deliberately NOT --update-snapshots: that rewrites EVERY PNG, churning
-        # baselines that already pass. Under GitHub Actions, plain compare mode
-        # updates only drifting/missing PNGs in place. The first run may therefore
-        # fail by design. The second must pass, distinguishing expected baseline
-        # updates from Storybook/index/server/render failures. The first run
-        # allows size drift so a story whose captured surface changed size is
-        # rewritten in place too, instead of aborting on the size check.
+        # CI compare updates only drifting/missing PNGs and fails those cases.
+        # Allow resized captures on the first pass, then verify failed cases
+        # with strict sizes. Clear old failures so selection is run-local.
         run: |
+          status=0
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \
-            -p no:rerunfailures --ignore-size-diff \
-            --ui-skip-build || true
+            -p no:rerunfailures --ignore-size-diff --cache-clear \
+            --ui-skip-build || status=$?
+          # Only test failures (1) need verification; propagate other exit codes.
+          if [[ "$status" -ne 1 ]]; then
+            exit "$status"
+          fi
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \
-            -p no:rerunfailures \
+            -p no:rerunfailures --last-failed \
             --ui-skip-build
 
       # Tar the snapshots tree (paths intact) so the commit job can restore it

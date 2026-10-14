@@ -285,6 +285,13 @@ output, it records `detail_source=missing`.
 | `gateway_request_id`, `provider_request_id` | Only populated when the source explicitly names that ownership |
 | `failure_context_missing_fields` | Comma-separated list of unavailable source fields, including IDs, versions, and inference details |
 
+Claude forwarding failures retain the rejected delivery's `http_status` and,
+when recognized, `forwarder_rejection_reason`. The reason is restricted to
+known tunnel rejection messages and error codes; arbitrary response text and
+validation bodies are omitted because they can echo transcript content.
+The status can be synthesized from a runner-tunnel acknowledgement, so it does
+not establish that a corresponding HTTP request reached the server.
+
 Claude transcript entries marked `isApiErrorMessage` also produce INFO
 `native_failure_observed` events, correlated by Omnigent session/response ID and
 native record ID. These observations do not publish an additional failed status.

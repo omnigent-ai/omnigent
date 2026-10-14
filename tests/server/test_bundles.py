@@ -399,22 +399,56 @@ def test_validate_bundle_allows_server_callable_tool_when_not_enforced() -> None
     assert spec.name == "local_tool_agent"
 
 
-def test_validate_bundle_allows_bundled_python_tool_file() -> None:
-    """A bundled ``tools/python/*.py`` tool file is not a ``callable:`` and is allowed.
-
-    File tools ship the agent's own code (path ``tools/python/echo.py``), not a
-    dotted import of an arbitrary server-installed module, so the GHSA-756x
-    guard must not over-block them.
-    """
+@pytest.mark.parametrize("trusted", [False, True])
+@pytest.mark.parametrize(
+    "tool_path,content",
+    [
+        ("tools/python/echo.py", "def echo(text: str) -> str:\n    return text\n"),
+        ("tools/typescript/echo.ts", "export function echo(text: string) { return text; }\n"),
+    ],
+)
+def test_validate_bundle_source_tools_require_trusted_upload(
+    trusted: bool, tool_path: str, content: str
+) -> None:
+    """Operator-authored bundles retain source-file tools."""
     bundle = _make_bundle_bytes(
         {
             "config.yaml": _MIN_CONFIG.format(name="filetool_agent"),
-            "tools/python/echo.py": "def echo(text: str) -> str:\n    return text\n",
+            tool_path: content,
         }
     )
-    spec = validate_agent_bundle(bundle)
+    if not trusted:
+        with pytest.raises(OmnigentError, match="may not ship a server-side Python/TS tool file"):
+            validate_agent_bundle(bundle)
+        return
+    spec = validate_agent_bundle(bundle, enforce_handler_allowlist=False)
     assert spec.name == "filetool_agent"
     assert any(t.name == "echo" for t in spec.local_tools)
+
+
+@pytest.mark.parametrize("suffix", ["py", "ts"])
+@pytest.mark.parametrize("runtime", ["server", "client"])
+def test_uploaded_source_tool_validation_covers_nested_agents(suffix: str, runtime: str) -> None:
+    from omnigent.server.bundles import _reject_uploaded_callable_tools
+    from omnigent.spec import AgentSpec
+    from omnigent.spec.types import LocalToolInfo, ToolRuntime
+
+    sub = AgentSpec(name="child", spec_version=1)
+    sub.local_tools = [
+        LocalToolInfo(
+            name="echo",
+            path=f"tools/echo.{suffix}",
+            language="python" if suffix == "py" else "typescript",
+            runtime=ToolRuntime(runtime),
+        )
+    ]
+    root = AgentSpec(name="root", spec_version=1)
+    root.sub_agents = [sub]
+    if runtime == "server":
+        with pytest.raises(OmnigentError, match="may not ship a server-side Python/TS tool file"):
+            _reject_uploaded_callable_tools(root)
+    else:
+        _reject_uploaded_callable_tools(root)
 
 
 def test_reject_uploaded_callable_tools_recurses_into_sub_agents() -> None:

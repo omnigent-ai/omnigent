@@ -416,10 +416,17 @@ GitHub requests these reviews automatically. The `main-no-force-push` ruleset
 requires code-owner approval and dismisses stale approvals after changes are
 pushed. This requirement is enforced by GitHub alongside the CI checks.
 
-### Every PR needs an issue
+<a name="every-pr-needs-an-issue"></a>
 
-We require an issue for every pull request. Issues are how work gets
-prioritized, so a PR without one arrives unsorted and waits longer.
+### When a PR needs an issue
+
+We require an issue for contributor-authored pull requests, with the exceptions
+below. Issues are how work gets prioritized, so a PR without one arrives
+unsorted and waits longer.
+
+**Maintainer-authored pull requests are exempt, regardless of the type of
+change.** Maintainers may link an existing issue when useful, but do not need
+to create one solely to satisfy this requirement.
 
 Reference it in the description. Which keyword you use depends on whether the PR
 finishes the issue:
@@ -440,17 +447,17 @@ saying anything about this PR, so pair it with one of the keywords above. The
 reference also has to point at an **issue**: naming another pull request does not
 count, since a PR is not a tracking record.
 
-**No issue for your change yet?** Open one first, then reference it. That is also
-the faster path for anything non-trivial: it lets a maintainer confirm the
-approach before you write code.
+**No issue for your change yet?** If your PR requires one, open it first, then
+reference it. This lets a maintainer confirm the approach before you write code.
 
-The only exceptions are changes with no user-visible behaviour: pure
-**Refactor / chore**, **Docs**, or **Test / CI** work. If that is genuinely what
-your PR is, check that box under *Type of change* and no issue is needed.
-Anything that fixes a bug, adds a feature, or changes the UI needs an issue,
-even when it also touches docs or tests.
+Contributor-authored PRs are also exempt for changes with no user-visible
+behaviour: pure **Refactor / chore**, **Docs**, or **Test / CI** work. If that
+describes your PR, check that box under *Type of change* and no issue is needed.
+Other contributor-authored PRs that fix a bug, add a feature, or change the UI
+need an issue, even when they also touch docs or tests.
 
-A bot comments once on PRs that reference no issue and labels them `needs-issue`.
+A bot comments once on non-exempt PRs that reference no issue and labels them
+`needs-issue`.
 Reference an issue and the label clears automatically. A PR still labeled
 `needs-issue` after **7 days** is closed, the same way and for the same reason as
 `waiting-on-author` below: to keep the review queue readable, not as a judgement
@@ -468,8 +475,8 @@ need to apply them.
 | `waiting-for-review` | You have responded. It is back in the reviewer's queue. |
 
 A third label, `needs-issue`, is separate from these two: it says the PR
-references no issue, not that anyone is waiting on a reply. See [Every PR needs an
-issue](#every-pr-needs-an-issue).
+references no issue, not that anyone is waiting on a reply. See [When a PR needs
+an issue](#when-a-pr-needs-an-issue).
 
 A maintainer reviewing or commenting on your PR sets `waiting-on-author`. When
 you push a commit, comment, or reply to a review, that clears automatically and

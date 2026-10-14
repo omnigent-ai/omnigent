@@ -4,16 +4,41 @@
 "use strict";
 
 const serverEl = document.getElementById("server");
+const titleEl = document.getElementById("title");
+const introEl = document.getElementById("intro");
 const commandEl = document.getElementById("command");
 const terminalEl = document.getElementById("terminal");
 const statusEl = document.getElementById("status");
 const confirmBtn = document.getElementById("confirm");
 const cancelBtn = document.getElementById("cancel");
 
-window.arcaConnect.onInit(({ serverUrl, command }) => {
+let resizeFrame = null;
+function resizeToContent() {
+  if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+  resizeFrame = requestAnimationFrame(() => {
+    resizeFrame = null;
+    window.arcaConnect.resizeToContent({
+      height: document.documentElement.scrollHeight,
+      phase: document.body.dataset.phase,
+    });
+  });
+}
+
+void document.fonts?.ready.then(resizeToContent).catch(() => {});
+
+window.arcaConnect.onInit(({ serverUrl, command, reason }) => {
   // textContent only: the server URL is remote-influenced data.
   serverEl.textContent = serverUrl;
   commandEl.textContent = command;
+  const reconnect = reason === "preview-reconnect";
+  titleEl.textContent = reconnect
+    ? "Reconnect Arca for this preview?"
+    : "Connect your Arca instance?";
+  introEl.textContent = reconnect
+    ? "To load this preview, run the command below over "
+    : "This runs the command below over ";
+  confirmBtn.textContent = reconnect ? "Reconnect" : "Connect";
+  resizeToContent();
 });
 
 confirmBtn.addEventListener("click", () => {
@@ -29,6 +54,7 @@ window.arcaConnect.onStarted(({ login, command }) => {
   commandEl.textContent = command;
   // Reveal the terminal pane (the main process grows the window to match).
   document.body.dataset.phase = "running";
+  resizeToContent();
   // Mount the terminal now that its container has real dimensions.
   requestAnimationFrame(() => ensureTerminal());
   // The button itself carries the progress: spinner + "Connecting…".
@@ -82,4 +108,5 @@ window.arcaConnect.onDone(({ ok, error, authRequired, command }) => {
     confirmBtn.focus();
   }
   cancelBtn.textContent = authRequired ? "Cancel" : "Close";
+  resizeToContent();
 });

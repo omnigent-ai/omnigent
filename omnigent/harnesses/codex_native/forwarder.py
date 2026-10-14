@@ -73,6 +73,8 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
+from omnigent.runtime.tool_output import cap_tool_output
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -3108,7 +3110,7 @@ async def _handle_event(
     if await _maybe_handle_turn_event(
         client,
         session_id=route_session_id,
-        bridge_dir=bridge_dir if not is_child else Path(),
+        bridge_dir=bridge_dir if not is_child else None,
         method=method,
         params=params,
         usage_coalescer=(child_coalescer if child_coalescer is not None else usage_coalescer),
@@ -3628,7 +3630,7 @@ async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     method: str,
     params: _JsonObject,
     usage_coalescer: _SessionUsageCoalescer,
@@ -3658,16 +3660,17 @@ async def _maybe_handle_turn_event(
                 "Codex forwarder observed retryable turn error: turn_id=%s",
                 _turn_id_from_payload(params),
             )
-            await _maybe_fail_turn_on_certificate_failure(
-                client,
-                session_id=session_id,
-                bridge_dir=bridge_dir,
-                params=params,
-                usage_coalescer=usage_coalescer,
-                delta_coalescer=delta_coalescer,
-                codex_client=codex_client,
-                forwarder_state=forwarder_state,
-            )
+            if bridge_dir is not None:
+                await _maybe_fail_turn_on_certificate_failure(
+                    client,
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    params=params,
+                    usage_coalescer=usage_coalescer,
+                    delta_coalescer=delta_coalescer,
+                    codex_client=codex_client,
+                    forwarder_state=forwarder_state,
+                )
             return True
         async with _conversation_item_delivery_scope(session_id):
             if delta_coalescer is not None:
@@ -3685,7 +3688,8 @@ async def _maybe_handle_turn_event(
                     )
                     return True
                 forwarder_state.surfaced_terminal_error_turns.add(turn_id)
-                clear_active_turn_id_if_matches(bridge_dir, turn_id)
+                if bridge_dir is not None:
+                    clear_active_turn_id_if_matches(bridge_dir, turn_id)
             await _post_turn_status_edge(
                 client,
                 session_id,
@@ -3703,7 +3707,7 @@ async def _maybe_handle_turn_event(
             if delta_coalescer is not None:
                 await delta_coalescer.flush()
             await _handle_turn_started(client, session_id, bridge_dir, params)
-            if forwarder_state is not None:
+            if forwarder_state is not None and bridge_dir is not None:
                 # A new turn opens a fresh reasoning block: the next reasoning
                 # delta must emit ``response.reasoning.started`` again.
                 forwarder_state.reasoning_stream_item_id = None
@@ -3910,7 +3914,7 @@ async def _handle_terminal_turn_boundary(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     method: str,
     params: _JsonObject,
     usage_coalescer: _SessionUsageCoalescer,
@@ -3939,7 +3943,7 @@ async def _handle_terminal_turn_boundary_inner(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     method: str,
     params: _JsonObject,
     usage_coalescer: _SessionUsageCoalescer,
@@ -4008,6 +4012,7 @@ async def _handle_terminal_turn_boundary_inner(
     if (
         handled
         and method == "turn/completed"
+        and bridge_dir is not None
         and codex_client is not None
         and forwarder_state is not None
     ):
@@ -4865,7 +4870,7 @@ def _default_collaboration_mode(
 async def _handle_turn_started(
     client: httpx.AsyncClient,
     session_id: str,
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     params: _JsonObject,
 ) -> None:
     """
@@ -4882,7 +4887,7 @@ async def _handle_turn_started(
 
 
 def _turn_started_status_edge(
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     params: _JsonObject,
 ) -> _CodexTurnStatusEdge:
     """
@@ -4894,7 +4899,8 @@ def _turn_started_status_edge(
     """
     turn = params.get("turn")
     turn_id = _turn_id_from_payload(turn) or _turn_id_from_payload(params)
-    update_active_turn_id(bridge_dir, turn_id)
+    if bridge_dir is not None:
+        update_active_turn_id(bridge_dir, turn_id)
     return _CodexTurnStatusEdge(
         status="running",
         turn_id=turn_id,
@@ -4903,7 +4909,7 @@ def _turn_started_status_edge(
 
 
 def _prepare_terminal_turn_event(
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     method: str,
     params: _JsonObject,
     *,
@@ -4925,7 +4931,8 @@ def _prepare_terminal_turn_event(
         and terminal_turn_id is not None
         and terminal_turn_id in forwarder_state.surfaced_terminal_error_turns
     ):
-        clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id)
+        if bridge_dir is not None:
+            clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id)
         _logger.info(
             "Codex forwarder suppressed terminal boundary after standalone error: "
             "method=%s turn_id=%s",
@@ -4945,7 +4952,7 @@ def _prepare_terminal_turn_event(
 
 
 def _terminal_turn_status_edge(
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     method: str,
     params: _JsonObject,
 ) -> _CodexTurnStatusEdge | None:
@@ -4962,7 +4969,10 @@ def _terminal_turn_status_edge(
     :returns: Terminal status edge, or ``None`` when the event is stale.
     """
     terminal_turn_id = _terminal_turn_id_from_params(params)
-    if not clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id):
+    # Child threads share the app-server but have no on-disk bridge of their own.
+    if bridge_dir is not None and not clear_active_turn_id_if_matches(
+        bridge_dir, terminal_turn_id
+    ):
         if not _terminal_turn_boundary_matches_idle_bridge(bridge_dir, params, terminal_turn_id):
             return None
         source = f"{method}:recovered"
@@ -5004,7 +5014,7 @@ def _terminal_turn_status_edge(
                 terminal_turn_id,
                 method,
             )
-        if _turn_status_from_params(params) in (None, "completed"):
+        if bridge_dir is not None and _turn_status_from_params(params) in (None, "completed"):
             # The model answered, so a certificate failure recorded at launch
             # no longer describes this app-server's egress.
             clear_certificate_failure(bridge_dir)
@@ -7471,6 +7481,7 @@ def _note_forward_failure(event_type: str, result: _PostResult, session_id: str)
                     if result.response is not None
                     else None,
                     "transport_error": result.transport_error,
+                    "rejection_reason": result.rejection_reason,
                     "delivered_ambiguous": result.delivered_ambiguous,
                 },
             },
@@ -7559,11 +7570,13 @@ class _PostResult:
     :param transport_error: Transport-error class name when a POST raised
         without a response, e.g. ``"ConnectError"``; ``None`` when the server
         responded.
+    :param rejection_reason: Local validation failure before any request was sent.
     """
 
     response: httpx.Response | None
     delivered_ambiguous: bool = False
     transport_error: str | None = None
+    rejection_reason: str | None = None
 
 
 async def _post_session_event(
@@ -7612,7 +7625,9 @@ async def _post_session_event(
         dl_dir = _dead_letter_dir.get()
         if event_type in _DEAD_LETTER_EVENT_TYPES and dl_dir is not None:
             http_status = response.status_code if response is not None else None
-            if response is not None:
+            if result.rejection_reason is not None:
+                reason = result.rejection_reason
+            elif response is not None:
                 reason = f"http {response.status_code}"
             elif result.delivered_ambiguous:
                 reason = "ambiguous transport failure (may already be committed)"
@@ -7666,7 +7681,32 @@ async def _post_session_event_inner(
     if max_attempts is None and not idempotent:
         raise ValueError("unbounded session-event retries require an idempotent source_id")
     url = f"/v1/sessions/{url_component(session_id)}/events"
+    # The server's output cap runs after body validation; cap the mirror before
+    # upload so a large tool result can reach that handler at all.
+    item_data = data.get("item_data")
+    if (
+        event_type == "external_conversation_item"
+        and data.get("item_type") == "function_call_output"
+        and isinstance(item_data, dict)
+        and isinstance(output := item_data.get("output"), str)
+    ):
+        data = {**data, "item_data": {**item_data, "output": cap_tool_output(output)}}
     payload = {"type": event_type, "data": data}
+    # Early body rejection can surface as ReadError instead of HTTP 400 when
+    # the upload is closed. Such an event must not enter the unbounded retry loop.
+    request_bytes = len(httpx.Request("POST", url, json=payload).content)
+    if request_bytes > MAX_SESSION_EVENT_REQUEST_BYTES:
+        reason = (
+            f"session event request exceeds {MAX_SESSION_EVENT_REQUEST_BYTES} byte limit "
+            f"({request_bytes} bytes)"
+        )
+        _logger.warning(
+            "Codex session event rejected before upload: session=%s type=%s reason=%s",
+            session_id,
+            event_type,
+            reason,
+        )
+        return _PostResult(response=None, rejection_reason=reason)
     attempt = 0
     while max_attempts is None or attempt < max_attempts:
         attempt += 1

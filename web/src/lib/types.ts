@@ -36,6 +36,20 @@ export interface RememberScope {
 export type CodexPersistMode = "session" | "always";
 
 /**
+ * Antigravity (agy) permission-prompt details the approval card must
+ * surface to match agy's own TUI prompt. ``actionDescription`` is what
+ * agy says it wants to do (e.g. "Running pwd command");
+ * ``alwaysAllowPattern`` is the persist pattern agy's prompt offers to
+ * always-allow, when it offers one. Shared by the elicitation event
+ * (`events.ts`), the reduced block (`blocks.ts`), and the ApprovalCard
+ * that renders the description and the "Always allow" button.
+ */
+export interface AgyPermission {
+  actionDescription: string | null;
+  alwaysAllowPattern: string | null;
+}
+
+/**
  * An un-consumed web-composer user message replayed from the session
  * snapshot. Native-terminal sessions don't persist a web message at
  * POST time (the transcript forwarder is the single writer), so the
@@ -260,6 +274,7 @@ export interface BackgroundTaskInfo {
 }
 
 export interface Session {
+  projectId?: string | null;
   id: string;
   agentId: string;
   /**
@@ -379,7 +394,7 @@ export interface Session {
   subagentRoutingOverride?: "on" | "off" | null;
   /**
    * Whether the owner opted into letting people with *view* (read-only)
-   * access browse this session's workspace files (the Files/Changes/GitHub
+   * access browse this session's workspace files (the Files/Changes/Pull Requests
    * surfaces and the file contents behind them). `false` by default — a
    * read grant shares the conversation, not the raw filesystem. Owner-set
    * from the share dialog; the rail reads it to decide whether to mount the

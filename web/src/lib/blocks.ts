@@ -12,7 +12,7 @@ import { capitalizeAgentName } from "./agentLabels";
 import { agentRootName } from "./forkHarness";
 import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
 import type { RoutingDecisionExtras } from "./routingDecision";
-import type { CodexPersistMode, RememberScope, Response } from "./types";
+import type { AgyPermission, CodexPersistMode, RememberScope, Response } from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -358,6 +358,17 @@ export interface TerminalCommandBlock {
   stderr: string | null;
 }
 
+export function isTerminalCommandInput(
+  block: AnyBlock,
+): block is TerminalCommandBlock & { kind: "input"; input: string } {
+  return (
+    block.type === "terminal_command" &&
+    block.kind === "input" &&
+    block.input !== null &&
+    block.input.trim().length > 0
+  );
+}
+
 // ── Text ─────────────────────────────────────────────────
 
 /** A flushed chunk of streamed text. */
@@ -696,6 +707,12 @@ export interface ElicitationBlock {
   rememberScope?: RememberScope | null;
   /** Codex-native MCP approval persistence modes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
+  /**
+   * Agy-native permission prompts only: the action description and
+   * advertised always-allow persist pattern agy's own prompt shows, so
+   * the card can render them. Null for every other elicitation.
+   */
+  agyPermission?: AgyPermission | null;
 }
 
 /** Union of all block types. */

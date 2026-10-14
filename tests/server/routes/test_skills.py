@@ -128,7 +128,7 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
         task = asyncio.create_task(
             client.get("/v1/skills", params={"session_id": conv.id}, headers={"x-test-user": user})
         )
-        frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
+        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
         assert isinstance(frame, HostSkillsFrame)
         assert (
             frame.session_id,
@@ -253,7 +253,7 @@ async def test_presession_catalog_matches_filtered_invocations(
                 headers={"x-test-user": "owner"},
             )
         )
-        frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
+        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
         assert isinstance(frame, HostSkillsFrame)
         assert frame.skills_filter == skill_filter
         assert frame.agent_version == str(agent.version)
@@ -318,7 +318,7 @@ async def test_presession_discovery_requires_host_to_apply_agent_filter(presessi
                 headers={"x-test-user": "owner"},
             )
         )
-        frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
+        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
         assert isinstance(frame, HostSkillsFrame)
         conn.pending_skills[frame.request_id].set_result(
             HostSkillsResultFrame(frame.request_id, "ok")

@@ -3,6 +3,7 @@ import type * as ReactRouterDomModule from "react-router-dom";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -129,6 +130,7 @@ function renderDialog(
     sourceHostId?: string | null;
     sourceGitBranch?: string | null;
     upToResponseId?: string | null;
+    workspaceRecovery?: boolean;
     // Server capabilities the dialog reads. Omitted leaves the context on
     // "loading", which fails the sandbox gate closed — the world every
     // pre-sandbox case here was written against.
@@ -137,7 +139,7 @@ function renderDialog(
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const invalidateSpy = vi.spyOn(client, "invalidateQueries");
-  const dialog = (
+  const dialog = () => (
     <ForkSessionDialog
       sourceSessionId="conv_src"
       sourceTitle={props.sourceTitle}
@@ -145,26 +147,28 @@ function renderDialog(
       sourceHostId={props.sourceHostId}
       sourceGitBranch={props.sourceGitBranch}
       upToResponseId={props.upToResponseId}
+      workspaceRecovery={props.workspaceRecovery}
       open
       onOpenChange={vi.fn()}
     />
   );
-  const utils = render(
+  const content = () => (
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <MemoryRouter>
           {props.info === undefined ? (
-            dialog
+            dialog()
           ) : (
             <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...props.info }}>
-              {dialog}
+              {dialog()}
             </CapabilitiesProvider>
           )}
         </MemoryRouter>
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
-  return { ...utils, invalidateSpy };
+  const utils = render(content());
+  return { ...utils, invalidateSpy, refresh: () => utils.rerender(content()) };
 }
 
 /** Open the Radix host <Select> (hosts + sandbox rows). */
@@ -228,6 +232,79 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ForkSessionDialog", () => {
+  it.each([
+    ["managed snapshot", null],
+    ["Arclet host", "arclet"],
+    ["Databricks Sandbox host", "lakebox"],
+  ])("blocks the whole form for an unsupported source detected by %s", async (source, provider) => {
+    useSessionMock.mockReturnValue({
+      session: {
+        hostId: "host_1",
+        labels: source === "managed snapshot" ? { "omnigent.host_type": "managed" } : {},
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useSession>);
+    setHosts([host({ sandbox_provider: provider })]);
+    renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo" });
+
+    const submit = screen.getByTestId("fork-session-submit");
+    expect(submit).toBeDisabled();
+    expect(screen.getByRole("group", { name: "Clone session" })).toBe(submit.parentElement);
+    expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
+      "Forking this sandbox session is not supported yet.",
+    );
+    expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-advanced-toggle")).not.toBeInTheDocument();
+    fireEvent.click(submit);
+    fireEvent.focus(submit.parentElement!);
+    fireEvent.keyDown(submit.parentElement!, { key: "Enter" });
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent(
+        "Forking this sandbox session is not supported yet.",
+      ),
+    );
+    expect(submit.parentElement).toHaveAccessibleDescription(
+      "Forking this sandbox session is not supported yet.",
+    );
+    expect(forkSessionMock).not.toHaveBeenCalled();
+    expect(launchRunnerMock).not.toHaveBeenCalled();
+    expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+  });
+
+  it("does not expose an actionable form before the source snapshot resolves", () => {
+    useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo" });
+    expect(screen.getByRole("status")).toHaveTextContent("Checking session capabilities…");
+    expect(screen.queryByTestId("fork-session-submit")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
+  });
+
+  it("moves keyboard focus into the form when source capabilities finish loading", async () => {
+    const user = userEvent.setup();
+    useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    const { refresh } = renderDialog();
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
+
+    useSessionMock.mockReturnValue({
+      session: null,
+      isLoading: false,
+      error: new Error("Session unavailable"),
+    });
+    refresh();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Unable to check session capabilities. Reload to try again.",
+    );
+    expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+
+    useSessionMock.mockReturnValue({ session: null, isLoading: false, error: null });
+    refresh();
+    expect(screen.getByTestId("fork-session-agent-select")).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("listbox")).toBeVisible();
+    expect(forkSessionMock).not.toHaveBeenCalled();
+  });
+
   it("leaves the name optional, suggesting 'Fork of <title>' as the placeholder", () => {
     renderDialog({ sourceTitle: "My session" });
     // Name lives under Advanced now (optional, prefilled-by-placeholder).
@@ -644,6 +721,134 @@ describe("ForkSessionDialog", () => {
     const sameOption = screen.getByTestId("fork-session-agent-option-same");
     expect(sameOption).toHaveTextContent("Claude");
     expect(sameOption).toHaveTextContent("(same as original session)");
+  });
+
+  describe("missing workspace recovery", () => {
+    const RECOVERY = {
+      sourceTitle: "My session",
+      sourceWorkspace: "/Users/a/repo-worktrees/deleted-branch",
+      sourceGitBranch: "deleted-branch",
+      sourceHostId: "host_1",
+      workspaceRecovery: true,
+    };
+
+    it.each([
+      ["plain directory", "/Users/a/repo", null],
+      ["worktree", RECOVERY.sourceWorkspace, RECOVERY.sourceGitBranch],
+      ["worktree without a recorded branch", RECOVERY.sourceWorkspace, null],
+    ])("requires a directory instead of prefilling the missing %s", (_name, workspace, branch) => {
+      renderDialog({ ...RECOVERY, sourceWorkspace: workspace, sourceGitBranch: branch });
+
+      expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
+      expect(
+        screen.getByText(
+          "Choose an existing directory to continue this conversation in a new session. Files from the missing workspace won’t be restored.",
+        ),
+      ).toBeVisible();
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("serena-laptop");
+      expect(screen.getByTestId("workspace-path-input")).toBeVisible();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+      expect(screen.queryByTestId("fork-session-branch-input")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+      expect(forkSessionMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects a missing chosen path without recreating its worktree or creating a session", async () => {
+      checkHostDirectoryMock.mockResolvedValue("The working directory doesn't exist on this host.");
+      hostDirectoryMissingMock.mockResolvedValue(true);
+      renderDialog(RECOVERY);
+
+      fireEvent.change(screen.getByTestId("workspace-path-input"), {
+        target: { value: RECOVERY.sourceWorkspace },
+      });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() =>
+        expect(screen.getByTestId("fork-session-error")).toHaveTextContent("doesn't exist"),
+      );
+      expect(checkHostDirectoryMock).toHaveBeenCalledExactlyOnceWith(
+        "host_1",
+        RECOVERY.sourceWorkspace,
+      );
+      expect(hostDirectoryMissingMock).not.toHaveBeenCalled();
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+      expect(navigateMock).not.toHaveBeenCalled();
+    });
+
+    it("waits for validation, then starts the full conversation in the chosen existing repository", async () => {
+      let finishPreflight!: (problem: string | null) => void;
+      checkHostDirectoryMock.mockReturnValue(
+        new Promise((resolve) => {
+          finishPreflight = resolve;
+        }),
+      );
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      renderDialog(RECOVERY);
+
+      fireEvent.change(screen.getByTestId("workspace-path-input"), {
+        target: { value: "/Users/a/repo" },
+      });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", "/Users/a/repo");
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+      finishPreflight(null);
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+        title: undefined,
+        agentId: undefined,
+        upToResponseId: undefined,
+        config: {},
+        sandbox: undefined,
+      });
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_1",
+        "conv_fork",
+        "/Users/a/repo",
+        undefined,
+      );
+      expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork");
+    });
+
+    it("accepts a folder from the directory browser", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      renderDialog(RECOVERY);
+
+      fireEvent.click(screen.getByTestId("workspace-browse-toggle"));
+      fireEvent.click(screen.getByTestId("mock-pick-workspace"));
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/Users/a/git/omnigent");
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_1",
+        "conv_fork",
+        "/Users/a/git/omnigent",
+        undefined,
+      );
+    });
+
+    it("requires an online host instead of falling back to a fresh sandbox", () => {
+      setHosts([host({ status: "offline" })]);
+      renderDialog({
+        ...RECOVERY,
+        info: { managed_sandboxes_enabled: true, sandbox_provider: "arclet" },
+      });
+
+      expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+      expect(screen.getByTestId("connect-host-command")).toBeVisible();
+      expect(screen.queryByTestId("fork-session-sandbox-hint")).not.toBeInTheDocument();
+    });
   });
 
   describe("coding source (fork + start)", () => {

@@ -42,6 +42,7 @@ from omnigent.debug_logging import (
     sse_logging_enabled,
 )
 from omnigent.errors import ErrorImpact, ErrorPhase
+from omnigent.native.input_diagnostics import input_attributes
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -182,6 +183,10 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
         value = event.get(key)
         if value is not None and not isinstance(value, (dict, list)):
             attrs[key] = value
+    if event.get("type") == "session.status":
+        count = event.get("background_task_count")
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            attrs["background_task_count"] = count
     response = event.get("response")
     if isinstance(response, dict) and isinstance(response.get("id"), str):
         attrs["response_id"] = response["id"]
@@ -189,6 +194,13 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
         attrs["response_id"] = event["response_id"]
     item = event.get("item")
     if isinstance(item, dict):
+        nested_response_id = item.get("response_id")
+        if (
+            "response_id" not in attrs
+            and isinstance(nested_response_id, str)
+            and len(nested_response_id) <= 256
+        ):
+            attrs["response_id"] = nested_response_id
         if isinstance(item.get("id"), str):
             attrs["item_id"] = item["id"]
         if isinstance(item.get("type"), str):
@@ -205,6 +217,14 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
             source = item.get("source")
             if isinstance(source, str) and len(source) <= 32:
                 attrs["item_source"] = source
+    if event.get("type") == "session.input.consumed":
+        data = event.get("data")
+        if isinstance(data, dict):
+            for key in ("item_id", "cleared_pending_id"):
+                value = data.get(key)
+                if isinstance(value, str) and len(value) <= 256:
+                    attrs[key] = value
+    attrs.update(input_attributes(event))
     error = event.get("error")
     if not isinstance(error, dict) and isinstance(response, dict):
         error = response.get("error")

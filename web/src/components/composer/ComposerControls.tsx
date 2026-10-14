@@ -33,7 +33,12 @@ import {
  * content inset line via the shared content inset; a chip's box starts there, and its
  * own px-1 keeps the glyph off the edge.
  */
-export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWithoutRef<"div">) {
+export function ComposerWorkspaceBar({
+  className,
+  children,
+  trailingContent,
+  ...props
+}: ComponentPropsWithoutRef<"div"> & { trailingContent?: ReactNode }) {
   const barRef = useRef<HTMLDivElement>(null);
   useCollapsedWorkspaceLabels(barRef);
   return (
@@ -46,7 +51,10 @@ export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWith
         className,
       )}
       {...props}
-    />
+    >
+      {children}
+      {trailingContent}
+    </div>
   );
 }
 

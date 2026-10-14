@@ -2,11 +2,9 @@
 //
 // The xterm + WebSocket lifecycle lives in `TerminalSession` (plain
 // JS, outside React). This component is a thin shell: a callback ref
-// constructs the session when its container node attaches and
-// returns a cleanup that disposes the session when the node detaches
-// (or any of the addressing inputs change). React 19 calls the
-// returned cleanup directly — no `useEffect` + `useRef` dance, no
-// guard against a missing `ref.current`.
+// constructs the session when its container node attaches, and a
+// layout effect disposes it on unmount (React 18 never calls a ref's
+// returned cleanup).
 
 import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -17,7 +15,12 @@ import {
   isTerminalClipboardWritePending,
   queueTerminalClipboardWrite,
 } from "@/lib/terminalClipboardWriter";
-import { getOmnigentServerIdentity, isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
+import {
+  getOmnigentServerIdentity,
+  isDatabricksWorkspace,
+  isHostRoutingEnabled,
+  resolveWebSocketUrl,
+} from "@/lib/host";
 import {
   canRememberTerminalClipboardPreference,
   readTerminalClipboardPreference,
@@ -87,6 +90,12 @@ export const RECONNECT_BACKOFF_MS = [
  * plain reset-on-connect, a connect→drop hot loop would retry forever.
  */
 export const RECONNECT_STABLE_MS = 30_000;
+
+function isReconnectableTerminalClose(code: number): boolean {
+  return (
+    isUnexpectedTerminalClose(code) || (code === WS_CLOSE_WRONG_REPLICA && !isDatabricksWorkspace())
+  );
+}
 
 interface TerminalClipboardRequest {
   scope: string;
@@ -296,6 +305,7 @@ export function TerminalView({
   // Abort handle for the outgoing attach's direct-upgrade probe, which
   // otherwise holds a loopback socket open for its full timeout.
   const upgradeCtlRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(false);
 
   useEffect(() => {
     clipboardMountedRef.current = true;
@@ -485,6 +495,22 @@ export function TerminalView({
     sessionRef.current = null;
   }, []);
 
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    onStateChangeRef.current?.(stateRef.current);
+    return () => {
+      mountedRef.current = false;
+      // Synchronous so a same-id successor's first report lands after it.
+      onStateChangeRef.current?.(null);
+      // Deferred so StrictMode's dev-only remount keeps the live attach.
+      queueMicrotask(() => {
+        if (mountedRef.current) return;
+        upgradeCtlRef.current?.abort();
+        disposeActiveSession();
+      });
+    };
+  }, [disposeActiveSession]);
+
   const handleResume = useCallback(async () => {
     if (!onResume) return;
     setResumeError(null);
@@ -531,9 +557,10 @@ export function TerminalView({
       let cancelled = false;
       const upgradeCtl = new AbortController();
       upgradeCtlRef.current = upgradeCtl;
-      // Superseded by a later attach on this node? React 18 never calls
-      // the ref cleanup, so `cancelled` alone can't catch that case.
-      const superseded = () => cancelled || attachGenerationRef.current !== generation;
+      // Superseded by a later attach on this node, or unmounted (checked
+      // only after the first await)? React 18 never calls the ref cleanup.
+      const superseded = () =>
+        cancelled || attachGenerationRef.current !== generation || !mountedRef.current;
       void (async () => {
         // The awaited microtask preserves the StrictMode-collapse
         // behavior queueMicrotask provided; the URL resolution (when a
@@ -541,16 +568,14 @@ export function TerminalView({
         // every await.
         await Promise.resolve();
         if (superseded()) return;
-        // Route this WS to the replica holding the session's runner tunnel
-        // (key = the session's host_id). A browser WS can't set request
-        // headers, so the key rides the query string. Only against a
-        // Databricks workspace-hosted server — an unsharded server needs no key,
-        // and a hostless session yields none. The direct URL needs no key: it
-        // bypasses the server entirely.
+        // Browser WebSockets carry the host ID in the query string so they
+        // reach the replica holding the runner tunnel. Hostless sessions
+        // and direct connections need no routing key.
         const computedHostId = (() => {
-          if (keylessRef.current || !isDatabricksWorkspace()) return undefined;
+          if (!isHostRoutingEnabled()) return undefined;
+          if (isDatabricksWorkspace() && keylessRef.current) return undefined;
           const h = getSessionHost(sessionId);
-          return h && !isHostKeyless(h) ? h : undefined;
+          return h && (!isDatabricksWorkspace() || !isHostKeyless(h)) ? h : undefined;
         })();
         const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId);
         const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
@@ -632,7 +657,7 @@ export function TerminalView({
     if (active && !wasActiveRef.current) {
       sessionRef.current?.focus();
       const current = stateRef.current;
-      if (current.kind === "closed" && isUnexpectedTerminalClose(current.code)) {
+      if (current.kind === "closed" && isReconnectableTerminalClose(current.code)) {
         reconnectAttemptsRef.current = 0;
         disposeActiveSession();
         setConnectAttempt((attempt) => attempt + 1);
@@ -674,7 +699,7 @@ export function TerminalView({
     // immediately without backoff (the correct route is one handshake away).
     // One-shot: if we're ALREADY keyless and still get 4400, the host is
     // genuinely unreachable from here — stop, don't loop.
-    if (state.code === WS_CLOSE_WRONG_REPLICA) {
+    if (state.code === WS_CLOSE_WRONG_REPLICA && isDatabricksWorkspace()) {
       if (keylessRef.current) {
         setReconnectPending(false);
         return;
@@ -687,7 +712,7 @@ export function TerminalView({
       setConnectAttempt((attempt) => attempt + 1);
       return;
     }
-    if (!isUnexpectedTerminalClose(state.code)) {
+    if (!isReconnectableTerminalClose(state.code)) {
       setReconnectPending(false);
       return;
     }

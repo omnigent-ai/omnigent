@@ -29,8 +29,9 @@ from dataclasses import dataclass
 
 import httpx
 import pytest
-from playwright.sync_api import Browser, BrowserContext, Page, expect
+from playwright.sync_api import Browser, Page, expect
 
+from tests._helpers.browser import user_page
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import (
     _build_hello_world_bundle,
@@ -129,11 +130,6 @@ def shared(
                 respawned_runner.wait(timeout=5)
 
 
-def _user_context(browser: Browser, email: str) -> BrowserContext:
-    """A browser context whose fetch/XHR/SSE requests carry *email*."""
-    return browser.new_context(extra_http_headers={"X-Forwarded-Email": email})
-
-
 def _goto_expecting_snapshot(page: Page, base_url: str, session_id: str) -> int:
     """Navigate to the session and return the snapshot GET's status code.
 
@@ -166,18 +162,17 @@ def test_share_grant_downgrade_revoke_journey(
     marker = f"bob-turn-{uuid.uuid4().hex[:8]}"
     # The owner context is headerless (the ``local`` identity), same
     # as every other e2e_ui browser context.
-    owner_ctx = browser.new_context()
-    bob_ctx = _user_context(browser, shared.bob_email)
-    try:
+    with (
+        user_page(browser, headers={}) as owner_page,
+        user_page(browser, headers={"X-Forwarded-Email": shared.bob_email}) as bob_page,
+    ):
         # ── Pre-grant: Bob has nothing, and is told nothing ──────
-        bob_page = bob_ctx.new_page()
         status = _goto_expecting_snapshot(bob_page, live_server, sid)
         # 404 (not 403): existence must not leak to ungranted users.
         assert status == 404
         expect(bob_page.get_by_placeholder(_COMPOSER)).to_have_count(0)
 
         # ── Grant EDIT; Bob collaborates; owner sees it live ─────
-        owner_page = owner_ctx.new_page()
         assert _goto_expecting_snapshot(owner_page, live_server, sid) == 200
 
         shared.owner.put(
@@ -223,9 +218,6 @@ def test_share_grant_downgrade_revoke_journey(
         assert _goto_expecting_snapshot(bob_page, live_server, sid) == 404
         expect(bob_page.get_by_placeholder(_COMPOSER)).to_have_count(0)
         assert shared.bob.get(f"/v1/sessions/{sid}").status_code == 404
-    finally:
-        owner_ctx.close()
-        bob_ctx.close()
 
 
 def _open_agent_info(page: Page) -> None:
@@ -273,9 +265,7 @@ def test_agent_info_popover_shows_session_owner(
     ).raise_for_status()
 
     # ── Collaborator (Bob): sees the owner, but not "(you)" ──────────
-    bob_ctx = _user_context(browser, shared.bob_email)
-    try:
-        bob_page = bob_ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": shared.bob_email}) as bob_page:
         bob_page.goto(f"{live_server}/c/{sid}")
         expect(bob_page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
         _open_agent_info(bob_page)
@@ -283,18 +273,12 @@ def test_agent_info_popover_shows_session_owner(
         expect(bob_row).to_be_visible(timeout=15_000)
         expect(bob_row).to_contain_text(owner_id)
         expect(bob_row).not_to_contain_text("(you)")
-    finally:
-        bob_ctx.close()
 
     # ── Owner (headerless): same row, now with "(you)" ───────────────
-    owner_ctx = browser.new_context()
-    try:
-        owner_page = owner_ctx.new_page()
+    with user_page(browser, headers={}) as owner_page:
         owner_page.goto(f"{live_server}/c/{sid}")
         expect(owner_page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
         _open_agent_info(owner_page)
         owner_row = owner_page.locator(_OWNER_ROW)
         expect(owner_row).to_be_visible(timeout=15_000)
         expect(owner_row).to_contain_text("(you)")
-    finally:
-        owner_ctx.close()

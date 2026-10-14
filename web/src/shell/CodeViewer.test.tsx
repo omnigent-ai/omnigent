@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
+import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 import { highlightCode } from "@/components/ai-elements/code-block";
@@ -402,6 +403,100 @@ describe("CodeViewer truncated preview", () => {
   it("shows no banner in markdown preview when not truncated", () => {
     renderViewer("# full file", true, "notes.md", { viewMode: "preview", truncated: false });
     expect(screen.queryByText(/too large to load fully/)).toBeNull();
+  });
+});
+
+const previewOpenFile = vi.fn();
+const PREVIEW_FILE_VIEWER = {
+  openFile: previewOpenFile,
+  openGithubTab: () => {},
+  isChangedPath: () => false,
+  conversationId: "conv_1",
+  workspaceRoot: "/ws",
+  workspaceHome: null,
+};
+
+describe("CodeViewer markdown preview links", () => {
+  const renderPreview = (content: string, path: string) => {
+    previewOpenFile.mockClear();
+    render(
+      <FileViewerContext.Provider value={PREVIEW_FILE_VIEWER}>
+        <CodeViewer
+          conversationId="conv_1"
+          path={path}
+          fileQuery={makeFileQuery(content)}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+          panelOpen
+          searchOpen={false}
+          setSearchOpen={() => {}}
+          searchInputRef={noopRef}
+          viewMode="preview"
+        />
+      </FileViewerContext.Provider>,
+    );
+    return previewOpenFile;
+  };
+
+  it("opens a relative link in the FileViewer instead of navigating the app", () => {
+    // As an anchor, `../notes/plan.md` would resolve against `/c/<id>` and load
+    // a session named after the file.
+    const openFile = renderPreview("See [the plan](../notes/plan.md#steps).", "docs/guide.md");
+
+    const link = screen.getByText("the plan");
+    expect(link.getAttribute("href")).toBeNull();
+    fireEvent.click(link);
+
+    expect(openFile).toHaveBeenCalledWith("notes/plan.md");
+  });
+
+  it("opens URLs outside the app window and keeps in-page anchors in place", () => {
+    // A same-window URL navigates the app off its server; the desktop app's
+    // Databricks browser sign-in treats that as a lost session.
+    const openFile = renderPreview(
+      "[docs](https://example.com/docs), [cdn](//cdn.example.com/docs), " +
+        "[mail](mailto:docs@example.com) and [below](#usage)\n\n## Usage",
+      "docs/guide.md",
+    );
+
+    for (const [text, href] of [
+      ["docs", "https://example.com/docs"],
+      ["cdn", "//cdn.example.com/docs"],
+      ["mail", "mailto:docs@example.com"],
+    ]) {
+      const link = screen.getByText(text);
+      expect(link.getAttribute("href")).toBe(href);
+      expect(link.getAttribute("target")).toBe("_blank");
+      expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+    }
+    const anchor = screen.getByText("below");
+    expect(anchor.getAttribute("href")).toBe("#usage");
+    expect(anchor.getAttribute("target")).toBeNull();
+    expect(openFile).not.toHaveBeenCalled();
+  });
+
+  it("follows a URL click the way chat links do", () => {
+    const followed: HTMLAnchorElement[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      followed.push(this);
+    });
+    const popupDocument = document.implementation.createHTMLDocument();
+    const openSpy = vi
+      .spyOn(window, "open")
+      .mockReturnValue({ opener: window, document: popupDocument } as Window);
+
+    renderPreview("[docs](https://example.com/docs)", "docs/guide.md");
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+    screen.getByText("docs").dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(openSpy).toHaveBeenCalledWith("about:blank", "_blank");
+    expect(followed.map((link) => [link.ownerDocument, link.href])).toEqual([
+      [popupDocument, "https://example.com/docs"],
+    ]);
   });
 });
 
