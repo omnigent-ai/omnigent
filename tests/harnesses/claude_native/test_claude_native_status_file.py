@@ -183,6 +183,29 @@ def test_poller_publishes_edges_only(tmp_path: Path) -> None:
     assert published == [RUNNING, IDLE]
 
 
+def test_poller_reports_idle_tracks_last_read_status(tmp_path: Path) -> None:
+    """``reports_idle`` mirrors the last read so backoff waits for a real idle."""
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: None,
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+
+    # Nothing read yet: unknown is not idle.
+    assert poller.reports_idle is False
+    poller.tick()  # busy → running
+    assert poller.reports_idle is False
+    _write_session_file(sessions, pid=1, session_id="s", status="idle")
+    poller.tick()
+    assert poller.reports_idle is True
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    poller.tick()
+    assert poller.reports_idle is False
+
+
 def test_poller_gives_up_when_file_never_appears(tmp_path: Path) -> None:
     """With no file (old Claude), the poller retires and stays inactive."""
     (tmp_path / "sessions").mkdir()

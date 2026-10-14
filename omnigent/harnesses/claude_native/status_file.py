@@ -428,6 +428,17 @@ class SessionStatusPoller:
             return None
         return status.blocked_on
 
+    @property
+    def reports_idle(self) -> bool:
+        """Whether the last read mapped Claude to :data:`IDLE`.
+
+        The file is authoritative for claude-native idleness, so the terminal
+        watcher only backs off its tmux polling once this is ``True``; a stale
+        ``None`` or a running status keeps the base cadence.
+        """
+        status = self._last_status
+        return status is not None and status.runner_status == IDLE
+
     def _read_and_publish(self) -> None:
         """Read the resolved file and fire the callback on a status change."""
         assert self._path is not None

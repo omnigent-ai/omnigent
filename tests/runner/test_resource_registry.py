@@ -15,6 +15,7 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
@@ -150,6 +151,34 @@ def test_list_resources_filters_by_type(tmp_path: Path) -> None:
 
     term_page = reg.list_resources("conv_1", resource_type="terminal")
     assert all(r.type == "terminal" for r in term_page.data)
+
+
+def test_wake_session_terminal_watchers_targets_only_status_terminals(tmp_path: Path) -> None:
+    """A turn edge wakes native agent terminals' watchers, not generic ones."""
+    tr = TerminalRegistry()
+    _seed_terminal(tr, "conv_1", "claude", "main", tmp_path)
+    _seed_terminal(tr, "conv_1", "bash", "s1", tmp_path)
+    reg = SessionResourceRegistry(terminal_registry=tr)
+    reg._terminal_roles[("conv_1", terminal_resource_id("claude", "main"))] = (
+        CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+
+    woke: list[tuple[str, bool]] = []
+    for entry in tr.list_for_conversation("conv_1"):
+        entry.instance.wake_idle_watcher = (  # type: ignore[method-assign]
+            lambda name=entry.terminal_name, *, expect_output=False: woke.append(
+                (name, expect_output)
+            )
+        )
+
+    reg.wake_session_terminal_watchers("conv_1")
+
+    assert woke == [("claude", True)]
+
+
+def test_wake_session_terminal_watchers_without_registry_is_noop() -> None:
+    """With no terminal registry the wake hook is a safe no-op."""
+    SessionResourceRegistry().wake_session_terminal_watchers("conv_x")
 
 
 @pytest.mark.asyncio
@@ -355,9 +384,11 @@ async def test_auxiliary_terminal_exit_publishes_resource_exit_only(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s
+        del on_idle, on_activity, on_tick, idle_threshold_s
+        del poll_interval_s, idle_poll_backoff_allowed
         callbacks["on_exit"] = on_exit
         callbacks["replace"] = replace
 
@@ -428,9 +459,11 @@ async def test_auxiliary_codex_exit_persists_redacted_final_screen(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s
+        del poll_interval_s, idle_poll_backoff_allowed, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
@@ -481,9 +514,10 @@ async def _observe_native_agent_terminal_and_capture(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del idle_threshold_s, poll_interval_s, replace
+        del idle_threshold_s, poll_interval_s, idle_poll_backoff_allowed, replace
         callbacks["on_idle"] = on_idle
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit
@@ -515,6 +549,7 @@ class _FakeStatusPoller:
     def __init__(self, on_status: object) -> None:
         self._on_status = on_status
         self.active = False
+        self.reports_idle = False
         self.blocked_on: str | None = None
         self.ticks = 0
         self.retired = False
@@ -575,6 +610,7 @@ async def _observe_native_with_fake_poller(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
         del idle_threshold_s, poll_interval_s, replace
@@ -582,6 +618,7 @@ async def _observe_native_with_fake_poller(
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit
         callbacks["on_tick"] = on_tick
+        callbacks["idle_poll_backoff_allowed"] = idle_poll_backoff_allowed
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
     await registry.observe_required_terminal(
@@ -603,6 +640,69 @@ async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
     on_tick()
     on_tick()
     assert pollers[0].ticks == 2
+
+
+@pytest.mark.asyncio
+async def test_claude_native_backoff_predicate_tracks_file_idle(tmp_path: Path) -> None:
+    """Native idle-poll backoff is gated on the status file's idle reading.
+
+    While the file owns the session's status the predicate holds the base
+    cadence until Claude itself reads idle, so a quiet-but-working pane never
+    delays the file-driven turn edge. Without the file, pane quiescence alone
+    governs backoff.
+    """
+    callbacks, _statuses, pollers, _registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_backoff"
+    )
+    allowed = callbacks["idle_poll_backoff_allowed"]
+    assert callable(allowed)
+    poller = pollers[0]
+
+    # File unresolved: pane quiescence governs, so backoff is allowed.
+    poller.active = False
+    poller.reports_idle = False
+    assert allowed()
+
+    # File owns status while Claude runs (or is unknown): hold the base cadence.
+    poller.active = True
+    poller.reports_idle = False
+    assert not allowed()
+
+    # File owns status and Claude reads idle: allow backoff.
+    poller.reports_idle = True
+    assert allowed()
+
+
+@pytest.mark.asyncio
+async def test_non_claude_native_terminal_has_no_idle_poll_backoff_gate(
+    tmp_path: Path,
+) -> None:
+    """Only claude-native wires the status-file backoff gate.
+
+    Other native roles have no status file to arbitrate their turn edge, so
+    the watcher receives no backoff predicate and pane quiescence alone
+    governs their polling.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    registry.set_session_status_publisher(lambda *_args: None)
+    registry.set_terminal_exit_publisher(lambda *_args: None)
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_codex_gate", {})[("codex", "main")] = (
+        instance
+    )
+    captured: dict[str, object] = {"backoff": "unset"}
+
+    def _capture_watcher(
+        *_args: object, idle_poll_backoff_allowed: object | None = None, **_kwargs: object
+    ) -> None:
+        captured["backoff"] = idle_poll_backoff_allowed
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    await registry.observe_required_terminal(
+        "conv_codex_gate", "codex", "main", instance, resource_role=CODEX_NATIVE_TERMINAL_ROLE
+    )
+    assert captured["backoff"] is None
 
 
 @pytest.mark.asyncio
@@ -984,9 +1084,11 @@ async def test_required_terminal_exit_without_observed_status_is_failure(tmp_pat
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s
+        del poll_interval_s, idle_poll_backoff_allowed, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
@@ -1666,9 +1768,10 @@ async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del idle_threshold_s, poll_interval_s, replace
+        del idle_threshold_s, poll_interval_s, idle_poll_backoff_allowed, replace
         callbacks["on_idle"] = on_idle
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit

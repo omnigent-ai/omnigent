@@ -240,6 +240,34 @@ def test_host_slice_key_gate_reaches_daemon_and_runner(
     assert runner_env["OMNIGENT_HOST_SLICE_KEY_ENABLED"] == enabled
 
 
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_idle_poll_backoff_switch_reaches_daemon_and_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """The native idle-poll backoff kill switch survives both env strips.
+
+    Operators roll the watcher back to its pre-backoff cadence by exporting
+    ``OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF=0``; the watcher runs in the runner,
+    so the switch must reach it through both the host->daemon and
+    daemon->runner allowlists.
+    """
+    monkeypatch.setenv("OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF", "0")
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_idle_backoff",
+        binding_token="binding-idle-backoff",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    assert daemon_env["OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF"] == "0"
+    assert runner_env["OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF"] == "0"
+
+
 _CLAUDE_TOOL_SEARCH_ENV: Final = {
     "CLAUDE_CODE_USE_GATEWAY": "1",
     "ENABLE_TOOL_SEARCH": "true",

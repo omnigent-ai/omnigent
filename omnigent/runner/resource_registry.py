@@ -739,6 +739,28 @@ class SessionResourceRegistry:
             except Exception as exc:  # noqa: BLE001 - diagnostics cannot affect status handling.
                 _logger.debug("Terminal status telemetry failed (%s)", type(exc).__name__)
 
+    def wake_session_terminal_watchers(self, session_id: str) -> None:
+        """Return native agent terminals' idle watchers to their base cadence.
+
+        A backed-off watcher polls tmux slowly; on a new turn the session
+        status must track Claude promptly, so wake the status-emitting
+        terminals' watchers at the turn edge. Generic terminals are left alone
+        — their backoff is governed by pane quiescence and keystroke sends.
+        """
+        if self._terminal_registry is None:
+            return
+        for entry in self._terminal_registry.list_for_conversation(session_id):
+            try:
+                terminal_id = terminal_resource_id(entry.terminal_name, entry.session_key)
+                if (
+                    self.terminal_resource_role(session_id, terminal_id)
+                    not in _STATUS_EMITTING_TERMINAL_ROLES
+                ):
+                    continue
+                entry.instance.wake_idle_watcher(expect_output=True)
+            except Exception as exc:  # noqa: BLE001 - waking is best-effort.
+                _logger.debug("Terminal watcher wake failed for %s: %s", entry.terminal_name, exc)
+
     def note_terminal_control_request(self, session_id: str, action: str) -> None:
         """Record explicit runner requests separately from process exit and cleanup."""
         if self._terminal_registry is None:
@@ -1514,6 +1536,15 @@ class SessionResourceRegistry:
             with self._lock:
                 self._status_pollers[session_id] = status_poller
 
+        def _idle_poll_backoff_allowed() -> bool:
+            # The status file is authoritative, so back off its tmux polling only
+            # once Claude reads idle, keeping the file-driven turn edge timely;
+            # without the file, pane quiescence alone governs backoff.
+            if not _file_owns_status():
+                return True
+            assert status_poller is not None
+            return status_poller.reports_idle
+
         input_ready_probe = _native_input_ready_probe(resource_role)
         native_input_ready = False
 
@@ -1674,6 +1705,9 @@ class SessionResourceRegistry:
             on_idle=_on_idle,
             on_exit=_on_exit,
             on_tick=_on_tick,
+            idle_poll_backoff_allowed=(
+                _idle_poll_backoff_allowed if status_poller is not None else None
+            ),
             idle_threshold_s=_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
             poll_interval_s=_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
             replace=replace,
