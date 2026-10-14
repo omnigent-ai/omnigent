@@ -13924,6 +13924,24 @@ def _reject_reserved_kiro_resume_args(kiro_args: tuple[str, ...]) -> None:
         )
 
 
+def _reject_reserved_codex_transport_args(codex_args: tuple[str, ...]) -> None:
+    """Reject Codex transport args that the runner owns in passthrough args.
+
+    The runner starts Codex's app-server and attaches the TUI itself, so a
+    session created with ``app-server``/``--listen``/``--remote`` could only
+    fail at terminal start.
+    """
+    from omnigent.harnesses.codex_native.launch_args import reserved_codex_transport_arg
+
+    reserved = reserved_codex_transport_arg(codex_args)
+    if reserved is not None:
+        raise click.UsageError(
+            f"{reserved!r} is reserved for Omnigent, which starts Codex's app-server "
+            f"and attaches the TUI itself. Drop it from `{cli_invocation()} codex`, "
+            "or run `codex app-server` directly for a standalone app-server."
+        )
+
+
 def _build_kiro_launch_args(
     *,
     effort: str | None,

@@ -1052,6 +1052,45 @@ def test_codex_args_no_config_is_cli_args_only(
     assert captured["extra_args"] == ("--flag",)
 
 
+@pytest.mark.parametrize(
+    ("codex_args", "reserved"),
+    [
+        # A tool spawning its own app-server sidecar through the Omnigent launcher.
+        (
+            [
+                "app-server",
+                "--listen",
+                "ws://127.0.0.1:7101",
+                "-c",
+                "mcp_servers.demo.command=node",
+            ],
+            "app-server",
+        ),
+        (["--remote", "ws://127.0.0.1:7101"], "--remote"),
+    ],
+)
+def test_codex_cli_rejects_runner_owned_transport_args(
+    monkeypatch: pytest.MonkeyPatch,
+    codex_args: list[str],
+    reserved: str,
+) -> None:
+    """Runner-owned Codex transport args fail before a session or backend exists."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend",
+        lambda *_: pytest.fail("invalid args must not start the backend"),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.run_codex_native",
+        lambda **_: pytest.fail("invalid args must not create a session"),
+    )
+
+    result = CliRunner().invoke(cli, ["codex", *codex_args])
+
+    assert result.exit_code == 2, result.output
+    assert f"'{reserved}' is reserved for Omnigent" in result.output
+
+
 def test_pi_config_args_form_base_cli_args_append(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -125,16 +125,15 @@ _RESERVED_CODEX_TRANSPORT_TOKENS = frozenset(
 )
 
 
-def reject_reserved_codex_transport_args(args: Sequence[str]) -> None:
-    """Reject pass-through Codex args that select or attach the runner-owned transport.
+def reserved_codex_transport_arg(args: Sequence[str]) -> str | None:
+    """Return the first pass-through Codex arg that selects or attaches the runner-owned transport.
 
     Scoped to Codex (the runner owns ``app-server``/``--listen``/``--remote``);
     option *values* are never flagged (``--model app-server`` passes), and tokens
     after a ``--`` prompt separator are left alone.
 
     :param args: Caller pass-through Codex CLI args (``terminal_launch_args``).
-    :raises ValueError: when a reserved transport token appears as a standalone
-        flag or subcommand.
+    :returns: The reserved token, e.g. ``"app-server"``, or ``None``.
     """
     index = 0
     while index < len(args):
@@ -146,12 +145,25 @@ def reject_reserved_codex_transport_args(args: Sequence[str]) -> None:
             index += 1 if "=" in arg else 2
             continue
         if arg in _RESERVED_CODEX_TRANSPORT_TOKENS:
-            raise ValueError(
-                f"terminal_launch_args may not contain the runner-owned Codex transport "
-                f"token {arg!r}: the runner starts the app-server and appends the TUI "
-                "attach itself"
-            )
+            return arg
         index += 1
+    return None
+
+
+def reject_reserved_codex_transport_args(args: Sequence[str]) -> None:
+    """Reject pass-through Codex args that select or attach the runner-owned transport.
+
+    :param args: Caller pass-through Codex CLI args (``terminal_launch_args``).
+    :raises ValueError: when :func:`reserved_codex_transport_arg` finds a
+        reserved token.
+    """
+    token = reserved_codex_transport_arg(args)
+    if token is not None:
+        raise ValueError(
+            f"terminal_launch_args may not contain the runner-owned Codex transport "
+            f"token {token!r}: the runner starts the app-server and appends the TUI "
+            "attach itself"
+        )
 
 
 def canonical_codex_launch_args(args: Sequence[str]) -> list[str]:

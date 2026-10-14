@@ -562,6 +562,7 @@ def test_reject_reserved_codex_transport_args_rejects(reserved_args: list[str]) 
     These compose an incoherent argv (``codex app-server … --remote``) that clap
     exits 2 on, so the thread never starts; reject them at build time instead.
     """
+    assert launch_args.reserved_codex_transport_arg(reserved_args) == reserved_args[0]
     with pytest.raises(ValueError, match="runner-owned Codex transport"):
         launch_args.reject_reserved_codex_transport_args(reserved_args)
     with pytest.raises(ValueError, match="runner-owned Codex transport"):
@@ -589,6 +590,7 @@ def test_reject_reserved_codex_transport_args_rejects(reserved_args: list[str]) 
 )
 def test_reject_reserved_codex_transport_args_allows(allowed_args: list[str]) -> None:
     """Legitimate pass-through args — including ``app-server`` as a value — pass."""
+    assert launch_args.reserved_codex_transport_arg(allowed_args) is None
     launch_args.reject_reserved_codex_transport_args(allowed_args)  # does not raise
     result = app_server.build_codex_remote_args(
         codex_args=tuple(allowed_args),
