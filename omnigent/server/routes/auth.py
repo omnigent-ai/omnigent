@@ -23,6 +23,7 @@ These routes are only mounted when ``OMNIGENT_AUTH_PROVIDER=oidc``.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import re
@@ -36,12 +37,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 import jwt
 from fastapi import APIRouter, Query, Request
-from starlette.responses import JSONResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
 from omnigent.server.auth import (
     _RESERVED_USERS,
+    LOGOUT_NOT_RECORDED_MESSAGE,
     UnifiedAuthProvider,
 )
 from omnigent.server.device_grant_store import DeviceGrantStore
@@ -50,6 +52,7 @@ from omnigent.server.oidc import (
     derive_code_challenge,
     generate_code_verifier,
     mint_session_cookie,
+    set_session_cookie,
 )
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
 from omnigent.server.routes._oauth import NO_STORE_HEADERS, oauth_error
@@ -575,14 +578,12 @@ def create_auth_router(
             resp = HTMLResponse(content=html)
             # Still set the session cookie (useful if they also open
             # the web UI in the same browser).
-            resp.set_cookie(
-                key=_session_cookie,
-                value=session_jwt,
-                max_age=config.session_ttl_hours * 3600,
-                httponly=True,
+            set_session_cookie(
+                resp,
+                session_jwt,
+                cookie_name=_session_cookie,
                 secure=_secure,
-                samesite="lax",
-                path="/",
+                max_age_seconds=config.session_ttl_hours * 3600,
             )
             resp.delete_cookie(
                 key=_state_cookie,
@@ -595,14 +596,12 @@ def create_auth_router(
 
         # Normal browser login — redirect back to the app.
         response = RedirectResponse(url=return_to, status_code=302)
-        response.set_cookie(
-            key=_session_cookie,
-            value=session_jwt,
-            max_age=config.session_ttl_hours * 3600,
-            httponly=True,
+        set_session_cookie(
+            response,
+            session_jwt,
+            cookie_name=_session_cookie,
             secure=_secure,
-            samesite="lax",
-            path="/",
+            max_age_seconds=config.session_ttl_hours * 3600,
         )
         # Clear the auth state cookie.
         response.delete_cookie(
@@ -674,9 +673,31 @@ def create_auth_router(
         redirects to the app root, kept under the deployment base
         path so sign-out does not escape a subpath mount.
 
-        :returns: 302 redirect with the session cookie cleared.
+        If the logout cannot be recorded in the shared store, answers 503
+        with an error page instead of redirecting (the browser navigated
+        here, so the page is what the user sees), keeps the session cookie
+        and skips any IdP end-session hop: the session is still live, and
+        the page's "Try again" link re-runs this logout.
+
+        :returns: 302 redirect with the session cookie cleared, or 503.
         """
+        recorded = await asyncio.to_thread(auth_provider.end_browser_session, request)
         base_path = getattr(request.app.state, "base_path", "")
+        if not recorded:
+            import html as _html
+
+            safe_base = _html.escape(base_path, quote=True)
+            return HTMLResponse(
+                status_code=503,
+                content=(
+                    "<html><body style='font-family:system-ui;text-align:center;padding:60px'>"
+                    "<h2>Sign-out failed</h2>"
+                    f"<p>{_html.escape(LOGOUT_NOT_RECORDED_MESSAGE)}</p>"
+                    f"<p><a href='{safe_base}/auth/logout'>Try again</a> · "
+                    f"<a href='{safe_base}/'>Back to the app</a></p>"
+                    "</body></html>"
+                ),
+            )
         redirect_url = config.logout_redirect_uri or f"{base_path}/"
         response = RedirectResponse(url=redirect_url, status_code=302)
         response.delete_cookie(
