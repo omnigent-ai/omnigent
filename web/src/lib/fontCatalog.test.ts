@@ -83,6 +83,87 @@ describe("fontCatalog — integrity", () => {
       expect(labels).toContain(expected);
     }
   });
+
+  it("offers the ranked 25 Google families and Nerd Fonts in both monospace roles", () => {
+    const sans = FONT_CATALOG_BY_CATEGORY.sans
+      .filter((entry) => entry.source === "google-css2")
+      .map((entry) => entry.family);
+    expect(sans).toEqual([
+      "Noto Sans JP",
+      "Roboto",
+      "Open Sans",
+      "Arimo",
+      "Google Sans",
+      "Inter",
+      "Manrope",
+      "Outfit",
+      "Montserrat",
+      "Work Sans",
+      "Poppins",
+      "Barlow",
+      "Lato",
+      "Fira Sans",
+      "Titillium Web",
+      "Roboto Condensed",
+      "Cairo",
+      "Noto Sans",
+      "DM Sans",
+      "Mukta",
+      "Instrument Sans",
+      "Hind",
+      "Nunito",
+      "Nunito Sans",
+      "Almarai",
+    ]);
+
+    const monospace = ["fixedWidth", "code"] as const;
+    const expectedMonoFamilies = [
+      "JetBrains Mono",
+      "Roboto Mono",
+      "Fira Code",
+      "Inconsolata",
+      "IBM Plex Mono",
+      "Source Code Pro",
+      "B612 Mono",
+      "Martian Mono",
+      "Geist Mono",
+      "Sometype Mono",
+      "DM Mono",
+      "Space Mono",
+      "Google Sans Code",
+      "PT Mono",
+      "Ubuntu Mono",
+      "Red Hat Mono",
+      "Fira Mono",
+      "Anonymous Pro",
+      "Cousine",
+      "Azeret Mono",
+      "Overpass Mono",
+      "Chivo Mono",
+      "Spline Sans Mono",
+      "Oxygen Mono",
+      "Lekton",
+    ];
+    const nerdFamilies = [
+      "JetBrainsMono Nerd Font Mono",
+      "FiraCode Nerd Font Mono",
+      "SauceCodePro Nerd Font Mono",
+      "CaskaydiaCove Nerd Font Mono",
+    ];
+
+    for (const category of monospace) {
+      const entries = FONT_CATALOG_BY_CATEGORY[category];
+      const googleFamilies = entries
+        .filter((entry) => entry.source === "google-css2")
+        .map((entry) => entry.family);
+      expect(googleFamilies).toEqual(expectedMonoFamilies);
+      expect(new Set(entries.map((entry) => entry.family)).size).toBe(entries.length);
+      expect(
+        entries.filter((entry) => entry.label.includes("Nerd Font")).map((entry) => entry.family),
+      ).toEqual(nerdFamilies);
+    }
+    expect(expectedMonoFamilies).not.toContain("Major Mono Display");
+  });
 });
 
 describe("fontCatalog — lookups", () => {
@@ -92,9 +173,9 @@ describe("fontCatalog — lookups", () => {
   });
 
   it("resolves a typed family name case-insensitively", () => {
-    expect(getFontByFamily("Fira Code")?.id).toBe("fira-code");
-    expect(getFontByFamily("fira code")?.id).toBe("fira-code");
-    expect(getFontByFamily("  FIRA CODE  ")?.id).toBe("fira-code");
+    expect(getFontByFamily("Fira Code")?.id).toBe("fira-code-fixed-width");
+    expect(getFontByFamily("fira code")?.id).toBe("fira-code-fixed-width");
+    expect(getFontByFamily("  FIRA CODE  ")?.id).toBe("fira-code-fixed-width");
   });
 
   it("returns undefined for an empty name or a non-catalog family", () => {
@@ -133,10 +214,10 @@ describe("fontCatalog — lookups", () => {
   });
 
   it("falls back to the first match when the family isn't in the asked category", () => {
-    // Fira Code is code-only; asking for it as sans still resolves (delivery
-    // metadata is identical across a family's entries, so it still loads).
+    // Fira Code is monospace; asking for it as sans falls back to the first
+    // matching entry, which still loads the same stylesheet.
     const entry = getFontByFamily("Fira Code", "sans");
-    expect(entry?.id).toBe("fira-code");
+    expect(entry?.id).toBe("fira-code-fixed-width");
   });
 });
 
@@ -146,9 +227,9 @@ describe("fontCatalog — fontLoadKey (resource identity)", () => {
     expect(fontLoadKey(inter!)).toBe(inter!.cssUrl);
   });
 
-  it("gives the two IBM Plex Mono entries the SAME load key", () => {
-    // Different ids, identical Google CSS2 URL → identical resource → one key,
-    // so the loader dedupes them (see webFontLoader dedup test).
+  it("shares each Google monospace stylesheet across fixed-width and code", () => {
+    // Both roles expose the same Google families and weights, so resource URLs
+    // match and the loader dedupes each font across the two controls.
     const fixed = getFontById("ibm-plex-mono")!;
     const code = getFontById("ibm-plex-mono-code")!;
     expect(fixed.id).not.toBe(code.id);
@@ -162,8 +243,9 @@ describe("fontCatalog — fontLoadKey (resource identity)", () => {
 
   it("gives distinct resources distinct keys", () => {
     const keys = FONT_CATALOG.filter((e) => e.source !== "bundled").map(fontLoadKey);
-    // The only intentional collision is the shared IBM Plex Mono URL.
+    // Google monospace URLs and Nerd Font assets are shared between the two
+    // monospace roles.
     const dupes = keys.filter((k, i) => keys.indexOf(k) !== i);
-    expect(new Set(dupes).size).toBe(1);
+    expect(new Set(dupes).size).toBe(29);
   });
 });

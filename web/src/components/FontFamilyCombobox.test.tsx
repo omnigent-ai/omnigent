@@ -2,11 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { FontFamilyCombobox } from "./FontFamilyCombobox";
 import { FONT_CATALOG_BY_CATEGORY } from "@/lib/fontCatalog";
-import { resetFontLoaderForTests } from "@/lib/webFontLoader";
+import { resetFontLoaderForTests, setWebFontsEnabled } from "@/lib/webFontLoader";
 
 // jsdom has no FontFaceSet; stub document.fonts.load so the loader (invoked when
 // the dropdown opens to render previews) doesn't throw.
 beforeEach(() => {
+  setWebFontsEnabled(true);
   Object.defineProperty(document, "fonts", {
     configurable: true,
     value: { load: vi.fn(() => Promise.resolve([])) },
@@ -27,6 +28,7 @@ function renderCombobox(props: Partial<Parameters<typeof FontFamilyCombobox>[0]>
   render(
     <FontFamilyCombobox
       category="sans"
+      catalogEnabled
       value=""
       onChange={onChange}
       defaultLabel="System default"
@@ -40,6 +42,21 @@ function renderCombobox(props: Partial<Parameters<typeof FontFamilyCombobox>[0]>
 }
 
 describe("FontFamilyCombobox", () => {
+  it("hides the downloadable catalog when disabled while keeping free-text choices", () => {
+    setWebFontsEnabled(false);
+    const { onChange } = renderCombobox({ category: "code", catalogEnabled: false });
+    fireEvent.click(screen.getByTestId("test-font-trigger"));
+
+    expect(screen.getByTestId("test-font-option-default")).toBeInTheDocument();
+    expect(screen.queryByTestId("test-font-option-Fira Code")).toBeNull();
+    expect(document.querySelector("link[data-omnigent-font]")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("test-font-input"), { target: { value: "Menlo" } });
+    fireEvent.click(screen.getByTestId("test-font-option-custom"));
+    expect(onChange).toHaveBeenCalledWith("Menlo");
+    expect(document.querySelector("link[data-omnigent-font]")).toBeNull();
+  });
+
   it("renders every font in its category (plus the default row)", () => {
     renderCombobox({ category: "sans" });
     fireEvent.click(screen.getByTestId("test-font-trigger"));
