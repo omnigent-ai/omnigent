@@ -25,21 +25,39 @@ const refreshes = new Map<
   string,
   {
     timer: ReturnType<typeof setTimeout>;
+    deadline?: ReturnType<typeof setTimeout>;
     paths: Set<string>;
     origin: string;
     identity: string;
+    run: () => void;
   }
 >();
 const reportedBatches = new Set<string>();
+// A steady stream of completions keeps resetting the trailing debounce; flush session-wide
+// queries at least this often so search and listings stay fresh during long uploads.
+const SESSION_REFRESH_MAX_WAIT_MS = 1500;
 
-function debounceRefresh(key: string, row: UploadRow, paths: Set<string>, run: () => void): void {
+function debounceRefresh(
+  key: string,
+  row: UploadRow,
+  paths: Set<string>,
+  run: () => void,
+  maxWait?: number,
+): void {
+  const flush = () => {
+    const entry = refreshes.get(key);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    clearTimeout(entry.deadline);
+    refreshes.delete(key);
+    entry.run();
+  };
   const previous = refreshes.get(key);
   if (previous) clearTimeout(previous.timer);
-  const timer = setTimeout(() => {
-    refreshes.delete(key);
-    run();
-  }, 300);
-  refreshes.set(key, { timer, paths, origin: row.origin, identity: row.identity });
+  const deadline =
+    previous?.deadline ?? (maxWait === undefined ? undefined : setTimeout(flush, maxWait));
+  const timer = setTimeout(flush, 300);
+  refreshes.set(key, { timer, deadline, paths, origin: row.origin, identity: row.identity, run });
 }
 
 export function refreshUploadedFiles(
@@ -65,17 +83,23 @@ export function refreshUploadedFiles(
     ]),
   );
   // Session-wide queries share one debounce across every destination folder.
-  debounceRefresh(ownerKey(row), row, new Set(), () => {
-    refetch([
-      ["workspace-all-files", sid],
-      ["workspace-changed-files", sid],
-      ["workspace-file-search", sid],
-    ]);
-    void client.invalidateQueries({
-      queryKey: ["workspace-dir-listing", sid],
-      refetchType: "none",
-    });
-  });
+  debounceRefresh(
+    ownerKey(row),
+    row,
+    new Set(),
+    () => {
+      refetch([
+        ["workspace-all-files", sid],
+        ["workspace-changed-files", sid],
+        ["workspace-file-search", sid],
+      ]);
+      void client.invalidateQueries({
+        queryKey: ["workspace-dir-listing", sid],
+        refetchType: "none",
+      });
+    },
+    SESSION_REFRESH_MAX_WAIT_MS,
+  );
 }
 
 export function adaptiveChunk(bytes: number, elapsedMs: number, limits: UploadLimits): number {
@@ -597,6 +621,7 @@ export function discardUploads(origin: string, identity: string): void {
   for (const [key, refresh] of refreshes) {
     if (refresh.origin !== origin || refresh.identity !== identity) continue;
     clearTimeout(refresh.timer);
+    clearTimeout(refresh.deadline);
     refreshes.delete(key);
   }
   const rows = Object.values(useUploadStore.getState().rows).filter(
