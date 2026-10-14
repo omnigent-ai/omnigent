@@ -11,8 +11,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
+import pytest
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -28,6 +29,37 @@ CHUNK = 8 * 1024**2
 MAX_COPIES = 3
 # Headers, frames and other per-request objects are far smaller than one chunk.
 SLACK = 512 * 1024
+# A multi-part read may hold the growing buffer's over-allocation, never a second copy.
+MAX_READ_PEAK = 1.2
+
+
+@pytest.mark.parametrize(
+    ("size", "part"),
+    [(CHUNK, 64 * 1024), (1024**2, 16)],
+    ids=["8MiB-in-64KiB-parts", "1MiB-in-16B-parts"],
+)
+async def test_multi_part_read_stays_near_one_copy(size: int, part: int) -> None:
+    payload = os.urandom(size)
+    offsets = iter(range(0, size, part))
+
+    async def receive() -> dict:
+        start = next(offsets, size)
+        # Slicing allocates a fresh part per message, as uvicorn does for each receive().
+        body = payload[start : start + part]
+        return {"type": "http.request", "body": body, "more_body": start + part < size}
+
+    request = Request({"type": "http", "method": "PATCH", "headers": []}, receive)
+    tracemalloc.start()
+    try:
+        baseline = tracemalloc.get_traced_memory()[0]
+        body = await uploads._read_capped(request, size)
+        peak = tracemalloc.get_traced_memory()[1] - baseline
+    finally:
+        tracemalloc.stop()
+    assert body == payload
+    print(f"{size}B in {part}B parts: read peak={peak} bytes ({peak / size:.2f}x)")
+    assert peak <= MAX_READ_PEAK * size, f"read peak {peak / size:.2f}x payload"
+
 
 # The runner lives in a child process so tracemalloc sees only server-side allocations.
 _RUNNER = r"""
