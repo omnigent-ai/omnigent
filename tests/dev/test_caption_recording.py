@@ -279,7 +279,10 @@ def test_concurrent_output_is_never_overwritten(tmp_path, monkeypatch):
         "dev.caption_recording.probe", lambda _: {"width": 640, "height": 360, "duration": 3}
     )
 
+    render_directories = []
+
     def concurrent_render(command, **kwargs):
+        render_directories.append(Path(kwargs["cwd"]))
         Path(command[-1]).write_bytes(b"our render")
         output.write_bytes(b"another render")
 
@@ -288,7 +291,7 @@ def test_concurrent_output_is_never_overwritten(tmp_path, monkeypatch):
         caption_recording(source, cues, output)
     assert output.read_bytes() == b"another render"
     assert source.read_bytes() == b"source"
-    assert not list(tmp_path.glob(".caption-*"))
+    assert render_directories and all(not path.exists() for path in render_directories)
 
 
 @pytest.mark.parametrize("failure", [None, "access", "exists", "copy", "close"])
