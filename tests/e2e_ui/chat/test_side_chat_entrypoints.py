@@ -414,6 +414,7 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     drawer.get_by_test_id("side-chat-input").fill(question)
     drawer.get_by_test_id("side-chat-send").click()
     expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible(timeout=30_000)
+    expect(drawer.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
     assert len(side_chat_forks) == 1
 
     drawer.locator(_ASSISTANT).get_by_text(side_reply, exact=True).select_text()
