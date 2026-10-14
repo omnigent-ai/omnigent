@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 // lightningcss is the minifier @tailwindcss/vite runs during `vite build`
 // (resolved from its dependency tree, so we test the version the build uses).
 import { transform } from "lightningcss";
-import { type ComponentProps, createElement } from "react";
+import { type ComponentProps, type ReactNode, createElement } from "react";
 import { createPortal } from "react-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render } from "@testing-library/react";
@@ -26,6 +26,11 @@ import { WorkspacePanel } from "./shell/WorkspacePanel";
 // mounts without Monaco / xterm / query stacks.
 vi.mock("./shell/FileViewer", () => ({ FileViewer: () => null }));
 vi.mock("./shell/FilesPanel", () => ({ FilesPanel: () => null }));
+vi.mock("./shell/WorkspaceUploads", () => ({
+  WorkspaceUploadProvider: ({ children }: { children: ReactNode }) => children,
+  WorkspaceUploadDropRoot: ({ children }: { children: ReactNode }) => children,
+  UploadsTray: () => null,
+}));
 vi.mock("./shell/SubagentsPanel", () => ({ SubagentsPanel: () => null }));
 vi.mock("./components/BrowserPane/BrowserPane", () => ({ BrowserPane: () => null }));
 vi.mock("./components/blocks/TerminalView", () => ({ TerminalView: () => null }));

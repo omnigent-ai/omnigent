@@ -351,7 +351,7 @@ import {
 } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
-import { useFileDropTarget } from "@/hooks/useFileDropTarget";
+import { ignoreWorkspaceUploadDrag, useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
@@ -2555,9 +2555,15 @@ function NewChatLandingContent({
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
   // the landing surface attaches here. Declared after ``landingSurface``.
-  const isDragActive = useFileDropTarget(landingSurface, (droppedFiles) => {
-    if (!checkingDbcert) addFiles(droppedFiles);
-  });
+  const isDragActive = useFileDropTarget(
+    landingSurface,
+    (droppedFiles) => {
+      if (!checkingDbcert) addFiles(droppedFiles);
+    },
+    {
+      ignore: ignoreWorkspaceUploadDrag,
+    },
+  );
 
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
@@ -7232,7 +7238,14 @@ function NewChatLandingContent({
           {isMobileViewport && workspaceControls}
         </div>
         {/* Drop cue, spanning the landing surface. */}
-        {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
+        {isDragActive && landingSurface ? (
+          <FileDropOverlay
+            container={landingSurface}
+            label="Attach to message"
+            subtext="Sent with your next message"
+            variant="attach"
+          />
+        ) : null}
         <fieldset
           disabled={checkingDbcert}
           className={cn("relative flex min-w-0 flex-col gap-0", COMPOSER_COLUMN_WIDTH)}
