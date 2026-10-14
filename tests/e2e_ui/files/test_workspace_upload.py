@@ -78,14 +78,16 @@ def _open_uploads(page: Page, session: tuple[str, str, Path]) -> None:
     expect(rail.get_by_role("button", name="Upload files")).to_be_enabled(timeout=30_000)
 
 
-def _drag(page: Page, selector: str, event: str, *, name: str = "rail.txt") -> None:
-    page.locator(selector).first.evaluate(
+def _drag(page: Page, selector: str, event: str, *, name: str = "rail.txt") -> bool:
+    return page.locator(selector).first.evaluate(
         """(element, {event, name}) => {
           const transfer = new DataTransfer();
           transfer.items.add(new File(['rail bytes'], name, {type: 'text/plain'}));
-          element.dispatchEvent(new DragEvent(event, {
+          const drag = new DragEvent(event, {
             bubbles: true, cancelable: true, dataTransfer: transfer
-          }));
+          });
+          element.dispatchEvent(drag);
+          return drag.defaultPrevented;
         }""",
         {"event": event, "name": name},
     )
@@ -248,7 +250,7 @@ def test_workspace_upload_cancel_and_overlay_swap(
     assert not (workspace / "chat.txt").exists()
     page.get_by_role("button", name="Remove chat.txt").click()
     url = page.url
-    _drag(page, "body", "drop", name="near-miss.txt")
+    assert _drag(page, "body", "drop", name="near-miss.txt")
     expect(page.locator('[data-testid="file-drop-overlay"]')).to_have_count(0)
     assert page.url == url
     assert not (workspace / "near-miss.txt").exists()
