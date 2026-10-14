@@ -26,6 +26,8 @@ import { cn } from "@/lib/utils";
 interface FontFamilyComboboxProps {
   /** Which catalog category to list. */
   category: FontCategory;
+  /** Whether this deployment allows downloading fonts from the catalog. */
+  catalogEnabled: boolean;
   /** Current family; "" means the default (no override). */
   value: string;
   /** Fired with the chosen family ("" for default). */
@@ -50,6 +52,7 @@ interface FontOption {
 
 export function FontFamilyCombobox({
   category,
+  catalogEnabled,
   value,
   onChange,
   defaultLabel,
@@ -66,7 +69,7 @@ export function FontFamilyCombobox({
   const options = useMemo<FontOption[]>(() => {
     const seen = new Set<string>();
     const rows: FontOption[] = [];
-    for (const entry of FONT_CATALOG_BY_CATEGORY[category]) {
+    for (const entry of catalogEnabled ? FONT_CATALOG_BY_CATEGORY[category] : []) {
       if (!entry.family) continue;
       const key = entry.family.toLowerCase();
       if (seen.has(key)) continue;
@@ -74,7 +77,7 @@ export function FontFamilyCombobox({
       rows.push({ family: entry.family, label: entry.label });
     }
     return rows;
-  }, [category]);
+  }, [category, catalogEnabled]);
 
   // A stored family this category's dropdown doesn't offer (a locally-installed
   // or previously typed font, or a family that only lives in a DIFFERENT catalog

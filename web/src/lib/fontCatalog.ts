@@ -10,7 +10,7 @@
 //   - `sans`       — UI/chrome text (the --ui-font-family variable).
 //   - `fixedWidth` — general monospace UI usage.
 //   - `code`       — the code editor (Monaco) and terminal (xterm).
-// PR 2's Settings dropdowns render one control per category off this shape.
+// Settings renders one control for each category.
 
 /** The three distinct font roles the interface exposes. */
 export type FontCategory = "sans" | "fixedWidth" | "code";
@@ -92,8 +92,7 @@ function nerdFace(path: string): readonly FontFaceAsset[] {
 
 /**
  * A Google Fonts CSS2 catalog entry: label mirrors the family, `id` is the
- * stable slug, and the stylesheet href is built from the family + weights. Keeps
- * the ~13 Google entries from repeating the family name four times each.
+ * stable slug, and the stylesheet href is built from the family + weights.
  */
 function googleFont(
   category: FontCategory,
@@ -111,24 +110,221 @@ function googleFont(
   };
 }
 
-// ---- Sans (UI/chrome) -----------------------------------------------------
+// Google Fonts metadata ranks popularity with lower numbers first. These
+// sans-serif families are the highest-ranked choices suited to UI text.
+const SANS_GOOGLE_FONTS: readonly [string, string, readonly number[]][] = [
+  ["noto-sans-jp", "Noto Sans JP", [400, 500, 600, 700]],
+  ["roboto", "Roboto", [400, 500, 600, 700]],
+  ["open-sans", "Open Sans", [400, 500, 600, 700]],
+  ["arimo", "Arimo", [400, 500, 600, 700]],
+  ["google-sans", "Google Sans", [400, 500, 600, 700]],
+  ["inter", "Inter", [400, 500, 600, 700]],
+  ["manrope", "Manrope", [400, 500, 600, 700]],
+  ["outfit", "Outfit", [400, 500, 600, 700]],
+  ["montserrat", "Montserrat", [400, 500, 600, 700]],
+  ["work-sans", "Work Sans", [400, 500, 600, 700]],
+  ["poppins", "Poppins", [400, 500, 600, 700]],
+  ["barlow", "Barlow", [400, 500, 600, 700]],
+  ["lato", "Lato", [400, 700]],
+  ["fira-sans", "Fira Sans", [400, 500, 600, 700]],
+  ["titillium-web", "Titillium Web", [400, 600, 700]],
+  ["roboto-condensed", "Roboto Condensed", [400, 500, 600, 700]],
+  ["cairo", "Cairo", [400, 500, 600, 700]],
+  ["noto-sans", "Noto Sans", [400, 500, 600, 700]],
+  ["dm-sans", "DM Sans", [400, 500, 600, 700]],
+  ["mukta", "Mukta", [400, 500, 600, 700]],
+  ["instrument-sans", "Instrument Sans", [400, 500, 600, 700]],
+  ["hind", "Hind", [400, 500, 600, 700]],
+  ["nunito", "Nunito", [400, 500, 600, 700]],
+  ["nunito-sans", "Nunito Sans", [400, 500, 600, 700]],
+  ["almarai", "Almarai", [400, 700]],
+];
 
 const SANS_FONTS: readonly FontCatalogEntry[] = [
-  // System default: no face to load — the empty family maps to --font-sans.
   { id: "system-ui", label: "System default", family: "", category: "sans", source: "bundled" },
-  googleFont("sans", "inter", "Inter", [400, 500, 600, 700]),
-  googleFont("sans", "roboto", "Roboto", [400, 500, 700]),
-  googleFont("sans", "open-sans", "Open Sans", [400, 600, 700]),
-  googleFont("sans", "lato", "Lato", [400, 700]),
-  googleFont("sans", "source-sans-3", "Source Sans 3", [400, 600, 700]),
-  googleFont("sans", "geist", "Geist", [400, 500, 600, 700]),
+  ...SANS_GOOGLE_FONTS.map(([id, family, weights]) => googleFont("sans", id, family, weights)),
 ];
+
+interface MonospaceGoogleFont {
+  readonly fixedWidthId: string;
+  readonly codeId: string;
+  readonly family: string;
+  readonly weights: readonly number[];
+}
+
+// Google Fonts popularity order, excluding typewriter/display faces that are
+// poor fits for the file paths, terminals, and source text shown by the app.
+const MONOSPACE_GOOGLE_FONTS: readonly MonospaceGoogleFont[] = [
+  {
+    fixedWidthId: "jetbrains-mono-fixed-width",
+    codeId: "jetbrains-mono",
+    family: "JetBrains Mono",
+    weights: [400, 500, 600, 700],
+  },
+  {
+    fixedWidthId: "roboto-mono",
+    codeId: "roboto-mono-code",
+    family: "Roboto Mono",
+    weights: [400, 500, 600, 700],
+  },
+  {
+    fixedWidthId: "fira-code-fixed-width",
+    codeId: "fira-code",
+    family: "Fira Code",
+    weights: [400, 500, 600, 700],
+  },
+  {
+    fixedWidthId: "inconsolata",
+    codeId: "inconsolata-code",
+    family: "Inconsolata",
+    weights: [400, 500, 600, 700],
+  },
+  {
+    fixedWidthId: "ibm-plex-mono",
+    codeId: "ibm-plex-mono-code",
+    family: "IBM Plex Mono",
+    weights: [400, 500, 600, 700],
+  },
+  {
+    fixedWidthId: "source-code-pro-fixed-width",
+    codeId: "source-code-pro",
+    family: "Source Code Pro",
+    weights: [400, 500, 600, 700],
+  },
+  { fixedWidthId: "b612-mono", codeId: "b612-mono-code", family: "B612 Mono", weights: [400, 700] },
+  {
+    fixedWidthId: "martian-mono",
+    codeId: "martian-mono-code",
+    family: "Martian Mono",
+    weights: [400, 500, 600, 700],
+  },
+  {
+    fixedWidthId: "geist-mono-google",
+    codeId: "geist-mono-google-code",
+    family: "Geist Mono",
+    weights: [400, 500, 600, 700],
+  },
+  {
+    fixedWidthId: "sometype-mono",
+    codeId: "sometype-mono-code",
+    family: "Sometype Mono",
+    weights: [400, 500, 600, 700],
+  },
+  { fixedWidthId: "dm-mono", codeId: "dm-mono-code", family: "DM Mono", weights: [400, 500] },
+  {
+    fixedWidthId: "space-mono",
+    codeId: "space-mono-code",
+    family: "Space Mono",
+    weights: [400, 700],
+  },
+  {
+    fixedWidthId: "google-sans-code",
+    codeId: "google-sans-code-code",
+    family: "Google Sans Code",
+    weights: [400, 500, 600, 700],
+  },
+  { fixedWidthId: "pt-mono", codeId: "pt-mono-code", family: "PT Mono", weights: [400] },
+  {
+    fixedWidthId: "ubuntu-mono",
+    codeId: "ubuntu-mono-code",
+    family: "Ubuntu Mono",
+    weights: [400, 700],
+  },
+  {
+    fixedWidthId: "red-hat-mono",
+    codeId: "red-hat-mono-code",
+    family: "Red Hat Mono",
+    weights: [400, 500, 600, 700],
+  },
+  {
+    fixedWidthId: "fira-mono",
+    codeId: "fira-mono-code",
+    family: "Fira Mono",
+    weights: [400, 500, 700],
+  },
+  {
+    fixedWidthId: "anonymous-pro",
+    codeId: "anonymous-pro-code",
+    family: "Anonymous Pro",
+    weights: [400, 700],
+  },
+  { fixedWidthId: "cousine", codeId: "cousine-code", family: "Cousine", weights: [400, 700] },
+  {
+    fixedWidthId: "azeret-mono",
+    codeId: "azeret-mono-code",
+    family: "Azeret Mono",
+    weights: [400, 500, 600, 700],
+  },
+  {
+    fixedWidthId: "overpass-mono",
+    codeId: "overpass-mono-code",
+    family: "Overpass Mono",
+    weights: [400, 500, 600, 700],
+  },
+  {
+    fixedWidthId: "chivo-mono",
+    codeId: "chivo-mono-code",
+    family: "Chivo Mono",
+    weights: [400, 500, 600, 700],
+  },
+  {
+    fixedWidthId: "spline-sans-mono",
+    codeId: "spline-sans-mono-code",
+    family: "Spline Sans Mono",
+    weights: [400, 500, 600, 700],
+  },
+  {
+    fixedWidthId: "oxygen-mono",
+    codeId: "oxygen-mono-code",
+    family: "Oxygen Mono",
+    weights: [400],
+  },
+  { fixedWidthId: "lekton", codeId: "lekton-code", family: "Lekton", weights: [400, 700] },
+];
+
+function monospaceFonts(category: "fixedWidth" | "code"): readonly FontCatalogEntry[] {
+  return MONOSPACE_GOOGLE_FONTS.map(({ fixedWidthId, codeId, family, weights }) =>
+    googleFont(category, category === "fixedWidth" ? fixedWidthId : codeId, family, weights),
+  );
+}
+
+const NERD_FONT_VARIANTS = [
+  [
+    "jetbrainsmono-nerd-font-mono",
+    "JetBrainsMono Nerd Font Mono",
+    "JetBrainsMono/Ligatures/Regular/JetBrainsMonoNerdFontMono-Regular.ttf",
+  ],
+  [
+    "firacode-nerd-font-mono",
+    "FiraCode Nerd Font Mono",
+    "FiraCode/Regular/FiraCodeNerdFontMono-Regular.ttf",
+  ],
+  [
+    "saucecodepro-nerd-font-mono",
+    "SauceCodePro Nerd Font Mono",
+    "SourceCodePro/SauceCodeProNerdFontMono-Regular.ttf",
+  ],
+  [
+    "caskaydiacove-nerd-font-mono",
+    "CaskaydiaCove Nerd Font Mono",
+    "CascadiaCode/CaskaydiaCoveNerdFontMono-Regular.ttf",
+  ],
+] as const;
+
+function nerdFonts(category: "fixedWidth" | "code"): readonly FontCatalogEntry[] {
+  return NERD_FONT_VARIANTS.map(([id, family, path]): FontCatalogEntry => ({
+    id: category === "code" ? id : `${id}-fixed-width`,
+    label: family,
+    family,
+    category,
+    source: "self-hosted",
+    faces: nerdFace(path),
+  }));
+}
 
 // ---- Fixed width (general monospace UI) -----------------------------------
 
 const FIXED_WIDTH_FONTS: readonly FontCatalogEntry[] = [
-  // Bundled via Fontsource (@fontsource-variable/geist-mono in index.css) — the
-  // loader no-ops for this one.
   {
     id: "geist-mono",
     label: "Geist Mono",
@@ -136,20 +332,14 @@ const FIXED_WIDTH_FONTS: readonly FontCatalogEntry[] = [
     category: "fixedWidth",
     source: "bundled",
   },
-  googleFont("fixedWidth", "ibm-plex-mono", "IBM Plex Mono", [400, 500, 600, 700]),
-  googleFont("fixedWidth", "roboto-mono", "Roboto Mono", [400, 500, 700]),
-  googleFont("fixedWidth", "space-mono", "Space Mono", [400, 700]),
+  ...monospaceFonts("fixedWidth"),
+  ...nerdFonts("fixedWidth"),
 ];
 
 // ---- Code (editor + terminal) ---------------------------------------------
 
 const CODE_FONTS: readonly FontCatalogEntry[] = [
-  googleFont("code", "jetbrains-mono", "JetBrains Mono", [400, 500, 700]),
-  googleFont("code", "fira-code", "Fira Code", [400, 500, 700]),
-  googleFont("code", "source-code-pro", "Source Code Pro", [400, 500, 700]),
-  // Shares the fixedWidth IBM Plex Mono stylesheet URL (same family + weights),
-  // so the loader dedupes them by resource identity — distinct id, one fetch.
-  googleFont("code", "ibm-plex-mono-code", "IBM Plex Mono", [400, 500, 600, 700]),
+  ...monospaceFonts("code"),
   // Cascadia Code isn't a Google Fonts family we bundle; deliver its @font-face
   // from the Fontsource CDN (latin subset, regular + bold).
   {
@@ -163,41 +353,7 @@ const CODE_FONTS: readonly FontCatalogEntry[] = [
       { url: `${CASCADIA_FONTSOURCE}/latin-700-normal.woff2`, weight: "700", format: "woff2" },
     ],
   },
-  // Nerd Font variants: patched glyphs (powerline, icons) IDE/terminal users
-  // expect. Delivered as single-file Mono faces from the pinned Nerd Fonts CDN,
-  // lazily — never eagerly imported.
-  {
-    id: "jetbrainsmono-nerd-font-mono",
-    label: "JetBrainsMono Nerd Font Mono",
-    family: "JetBrainsMono Nerd Font Mono",
-    category: "code",
-    source: "self-hosted",
-    faces: nerdFace("JetBrainsMono/Ligatures/Regular/JetBrainsMonoNerdFontMono-Regular.ttf"),
-  },
-  {
-    id: "firacode-nerd-font-mono",
-    label: "FiraCode Nerd Font Mono",
-    family: "FiraCode Nerd Font Mono",
-    category: "code",
-    source: "self-hosted",
-    faces: nerdFace("FiraCode/Regular/FiraCodeNerdFontMono-Regular.ttf"),
-  },
-  {
-    id: "saucecodepro-nerd-font-mono",
-    label: "SauceCodePro Nerd Font Mono",
-    family: "SauceCodePro Nerd Font Mono",
-    category: "code",
-    source: "self-hosted",
-    faces: nerdFace("SourceCodePro/SauceCodeProNerdFontMono-Regular.ttf"),
-  },
-  {
-    id: "caskaydiacove-nerd-font-mono",
-    label: "CaskaydiaCove Nerd Font Mono",
-    family: "CaskaydiaCove Nerd Font Mono",
-    category: "code",
-    source: "self-hosted",
-    faces: nerdFace("CascadiaCode/CaskaydiaCoveNerdFontMono-Regular.ttf"),
-  },
+  ...nerdFonts("code"),
 ];
 
 /** Every catalog entry, in category then display order. */

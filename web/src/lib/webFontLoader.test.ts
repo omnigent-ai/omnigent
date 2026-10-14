@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type FontCatalogEntry, getFontById } from "./fontCatalog";
-import { loadFont, loadFontByFamily, resetFontLoaderForTests } from "./webFontLoader";
+import {
+  loadFont,
+  loadFontByFamily,
+  resetFontLoaderForTests,
+  setWebFontsEnabled,
+} from "./webFontLoader";
 
 // A resolvable promise handle for driving readiness/link ordering in tests.
 function deferred<T>() {
@@ -23,6 +28,7 @@ interface FontsLoadCall {
 let fontsLoadCalls: FontsLoadCall[] = [];
 
 beforeEach(() => {
+  setWebFontsEnabled(true);
   fontsLoadCalls = [];
   Object.defineProperty(document, "fonts", {
     configurable: true,
@@ -288,6 +294,22 @@ describe("webFontLoader — self-hosted", () => {
 });
 
 describe("webFontLoader — no-ops", () => {
+  it("makes no CDN request until webfonts is enabled", async () => {
+    setWebFontsEnabled(false);
+    const disabledLoad = loadFont(inter());
+    expect(links()).toHaveLength(0);
+    expect(styles()).toHaveLength(0);
+    await expect(disabledLoad).resolves.toBe(false);
+
+    setWebFontsEnabled(true);
+    const ready = loadFont(inter());
+    expect(links()).toHaveLength(1);
+    fireLinkLoads();
+    await flush();
+    fontsLoadCalls[0].deferred.resolve([{}]);
+    await expect(ready).resolves.toBe(true);
+  });
+
   it("does not fetch a bundled font (resolves ready)", async () => {
     await expect(loadFont(getFontById("geist-mono") as FontCatalogEntry)).resolves.toBe(true);
     expect(links().length + styles().length).toBe(0);
@@ -323,7 +345,7 @@ describe("webFontLoader — resetFontLoaderForTests cleans up the DOM", () => {
 describe("webFontLoader — loadFontByFamily bridge", () => {
   it("loads a catalog family typed as a bare name", async () => {
     const { entry, ready } = loadFontByFamily("Fira Code");
-    expect(entry?.id).toBe("fira-code");
+    expect(entry?.id).toBe("fira-code-fixed-width");
     await flush();
     fireLinkLoads();
     await flush();
