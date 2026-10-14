@@ -29,7 +29,11 @@ import {
 } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import { buildFusionSections } from "@/components/composer/fusionSections";
-import { compactModelTriggerLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
+import {
+  compactModelTriggerLabel,
+  nativeModelTooltip,
+  normalizeEffortLabel,
+} from "@/lib/composerModelLabel";
 import {
   codexCreateApprovalOptions,
   applyCodexApprovalSelection,
@@ -3939,7 +3943,7 @@ export function NewChatLandingScreen() {
                                 option.isDefault ? MODEL_SELECT_DEFAULT : option.id,
                               ),
                         testId: `new-chat-landing-agent-model-${option.id}`,
-                        title: nativeModelLabel(option),
+                        title: nativeModelTooltip(option),
                         className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
                       })),
                   ],

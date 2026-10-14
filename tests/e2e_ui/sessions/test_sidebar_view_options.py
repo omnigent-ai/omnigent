@@ -103,11 +103,31 @@ def _section_header(page: Page, title: str) -> Locator:
     return page.get_by_role("button", name=title, exact=True)
 
 
-def test_status_grouping_and_show_toggles_persist_across_reload(
-    page: Page, stubbed_sidebar: str
+def test_date_grouping_and_show_toggles_persist_across_reload(
+    page: Page, stubbed_sidebar: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Status grouping titles the list by state, Show adds the branch line, and both persist."""
+    """Status falls back to Default; both date groupings and Show persist."""
+    today, yesterday = page.evaluate("""() => {
+        const day = new Date();
+        day.setHours(0, 0, 0, 0);
+        const today = day.getTime() / 1000;
+        day.setDate(day.getDate() - 1);
+        return [today, day.getTime() / 1000];
+    }""")
+    for row, created_at, updated_at in [
+        (_ROWS[0], yesterday, today),
+        (_ROWS[1], 0, yesterday),
+        (_ROWS[2], today, today),
+    ]:
+        monkeypatch.setitem(row, "created_at", created_at)
+        monkeypatch.setitem(row, "updated_at", updated_at)
+    page.evaluate(
+        "localStorage.setItem('omnigent:sidebar-view', JSON.stringify({grouping: 'status'}))"
+    )
+    page.reload()
     expect(_section_header(page, "Sessions")).to_be_visible()
+    expect(_section_header(page, "Working")).to_have_count(0)
+    expect(_section_header(page, "Done")).to_have_count(0)
     filter_button = page.get_by_test_id("session-filter")
     expect(filter_button).to_have_accessible_name("Group, sort, and filter sessions")
     filter_button.hover()
@@ -115,14 +135,20 @@ def test_status_grouping_and_show_toggles_persist_across_reload(
     before = filter_button.bounding_box()
 
     _open_view_submenu(page, "session-grouping-menu")
-    page.get_by_test_id("session-grouping-status").click()
+    expect(page.get_by_test_id("session-grouping-status")).to_have_count(0)
+    expect(page.get_by_role("menuitemradio", name="Default", exact=True)).to_be_checked()
+    expect(page.get_by_role("menuitemradio", name="Created", exact=True)).to_be_visible()
+    page.get_by_test_id("session-grouping-updated").click()
     page.keyboard.press("Escape")
-    for title in ("Needs attention", "Working", "Done"):
-        expect(_section_header(page, title)).to_be_visible()
+    expect(_section_header(page, "Updated today")).to_be_visible()
+    updated_yesterday = page.locator("section").filter(
+        has=_section_header(page, "Updated yesterday")
+    )
+    expect(updated_yesterday.locator(f'a[href="/c/{_AWAITING}"]')).to_be_visible()
     expect(_section_header(page, "Sessions")).to_have_count(0)
     # The first group takes the Projects header's place, so the filter stays put.
     expect(_section_header(page, "Projects")).to_have_count(0)
-    first_group = page.locator("section").filter(has=_section_header(page, "Needs attention"))
+    first_group = page.locator("section").filter(has=_section_header(page, "Updated today"))
     expect(first_group.get_by_test_id("session-filter")).to_be_visible()
     after = filter_button.bounding_box()
     assert before is not None and after is not None
@@ -141,8 +167,22 @@ def test_status_grouping_and_show_toggles_persist_across_reload(
     expect(idle_row.get_by_test_id("session-row-meta")).to_have_text(meta)
 
     page.reload()
-    expect(_section_header(page, "Needs attention")).to_be_visible(timeout=30_000)
+    expect(_section_header(page, "Updated today")).to_be_visible(timeout=30_000)
     # Every selected field survives the reload, not just some metadata.
+    expect(idle_row.get_by_test_id("session-row-meta")).to_have_text(meta)
+
+    _open_view_submenu(page, "session-grouping-menu")
+    page.get_by_role("menuitemradio", name="Created", exact=True).click()
+    page.keyboard.press("Escape")
+    for title, session_id in [
+        ("Created today", _IDLE),
+        ("Created yesterday", _RUNNING),
+        ("Created earlier", _AWAITING),
+    ]:
+        section = page.locator("section").filter(has=_section_header(page, title))
+        expect(section.locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+    page.reload()
+    expect(_section_header(page, "Created today")).to_be_visible(timeout=30_000)
     expect(idle_row.get_by_test_id("session-row-meta")).to_have_text(meta)
 
 

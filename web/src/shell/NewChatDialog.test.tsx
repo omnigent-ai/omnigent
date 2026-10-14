@@ -3965,6 +3965,10 @@ describe("NewChatLandingScreen", () => {
     expect(summary).toHaveClass("text-right");
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus");
+    expect(screen.getByTestId("new-chat-landing-agent-model-opus")).toHaveAttribute(
+      "title",
+      "system.ai.claude-opus-4-6",
+    );
   });
 
   it.each([true, false])(

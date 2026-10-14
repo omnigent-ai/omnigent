@@ -14,10 +14,22 @@ describe("sidebarViewPreferences", () => {
     expect(readSidebarViewPreferences()).toEqual(DEFAULT_SIDEBAR_VIEW);
   });
 
-  it("round-trips a stored selection", () => {
-    const view = { grouping: "status", ordering: "created", show: ["updated", "branch"] } as const;
+  it.each(["created", "updated"] as const)("round-trips %s grouping", (grouping) => {
+    const view = { grouping, ordering: "created", show: ["updated", "branch"] } as const;
     writeSidebarViewPreferences(view);
     expect(readSidebarViewPreferences()).toEqual(view);
+  });
+
+  it("falls back from hidden Status grouping while preserving ordering and metadata", () => {
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({ grouping: "status", ordering: "created", show: ["branch"] }),
+    );
+    expect(readSidebarViewPreferences()).toEqual({
+      grouping: "default",
+      ordering: "created",
+      show: ["branch"],
+    });
   });
 
   it("falls back per field on unknown or corrupt values", () => {
