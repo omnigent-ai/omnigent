@@ -58,7 +58,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
     error: null,
   }),
 }));
-vi.mock("@/lib/routing", () => ({ useParams: () => ({ conversationId: "upload-panel" }) }));
+let panelConversation = "upload-panel";
+vi.mock("@/lib/routing", () => ({ useParams: () => ({ conversationId: panelConversation }) }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: () => true,
   useSessionHostOnline: () => true,
@@ -97,6 +98,7 @@ function view(directory = "src", content?: ReactNode, picker = true, sessionId =
   );
 }
 beforeEach(() => {
+  panelConversation = "upload-panel";
   identity = "alice";
   permission = 4;
   archived = false;
@@ -295,7 +297,7 @@ it("freezes the picker directory on opening, accepts multiple files, resets and 
 });
 
 it("drops into the browsed directory with upload-only copy, accepting file siblings and refusing folders", async () => {
-  view();
+  view("src", tree());
   await screen.findByRole("button", { name: "Upload files" });
   const target = screen.getByTestId("files-content");
   const file = new File(["x"], "a.txt");
@@ -411,6 +413,48 @@ function panel(flatView = false) {
     />
   );
 }
+
+it("sends Changes drops to the workspace root after browsing a subfolder", async () => {
+  // A fresh conversation keeps FilesPanel's per-session browse cache isolated.
+  panelConversation = "upload-changes-root";
+  const shell = (flatView: boolean) => (
+    <QueryClientProvider client={client}>
+      <WorkspaceUploadProvider sessionId="s">
+        <WorkspaceUploadDropRoot>{panel(flatView)}</WorkspaceUploadDropRoot>
+      </WorkspaceUploadProvider>
+    </QueryClientProvider>
+  );
+  const { rerender } = render(shell(false));
+  await screen.findByRole("button", { name: "Upload files" });
+  fireEvent.doubleClick(screen.getByText("other/"));
+  const transfer = { types: ["Files"], files: [new File(["bytes"], "root.txt")] };
+  const header = screen.getByRole("button", { name: "Refresh files" }).closest(".h-11");
+  fireEvent.drop(header as HTMLElement, { dataTransfer: transfer });
+  expect(enqueueUploads).toHaveBeenLastCalledWith(
+    expect.anything(),
+    transfer.files,
+    "other",
+    "other",
+    limits,
+    client,
+  );
+  rerender(shell(true));
+  const row = await screen.findByText("existing.txt");
+  fireEvent.dragOver(row, { dataTransfer: transfer });
+  expect(screen.getByText("Upload to workspace")).toBeVisible();
+  expect(screen.getByText("to demo")).toBeVisible();
+  expect(screen.queryByText("to other")).toBeNull();
+  fireEvent.drop(row, { dataTransfer: transfer });
+  expect(enqueueUploads).toHaveBeenLastCalledWith(
+    expect.anything(),
+    transfer.files,
+    "",
+    "demo",
+    limits,
+    client,
+  );
+  expect(enqueueUploads).toHaveBeenCalledTimes(2);
+});
 
 it.each(["space", "header", "empty tree", "Changes"])(
   "drops on the real %s surface into the browsed root",

@@ -743,6 +743,11 @@ function FolderTreeInner({
   });
 
   const upload = useWorkspaceUpload();
+  const setTreeDirectory = upload?.setTreeDirectory;
+  useEffect(() => {
+    setTreeDirectory?.(browseLocation);
+    return () => setTreeDirectory?.(null);
+  }, [setTreeDirectory, browseLocation]);
   const { active: dropActive, hover: dropHover } = useTreeUploadDrop(scrollElementRef, {
     enabled:
       !!upload?.enabled && !!visibleTree?.length && !searchQuery.trim() && !isLoading && !isError,

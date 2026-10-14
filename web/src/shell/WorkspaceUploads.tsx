@@ -79,6 +79,10 @@ interface UploadContextValue {
   directory: string;
   destination: string;
   setDirectory: (directory: string) => void;
+  /** Drop-root target: the mounted Files tree's location, else the workspace root. */
+  dropDirectory: string;
+  dropDestination: string;
+  setTreeDirectory: (directory: string | null) => void;
   enqueue: (files: File[], directory?: string) => void;
 }
 const UploadContext = createContext<UploadContextValue | null>(null);
@@ -107,6 +111,8 @@ export function WorkspaceUploadProvider({
       ),
     [sessionId],
   );
+  // Only the Files tree browses; the Changes view mounts no tree, so its drops go to the root.
+  const [treeDirectory, setTreeDirectory] = useState<string | null>(null);
   const client = useQueryClient();
   const liveStatus = useChatStore((state) =>
     state.conversationId === sessionId ? state.sessionStatus : undefined,
@@ -197,7 +203,8 @@ export function WorkspaceUploadProvider({
     probeReason,
     routeAnswered,
   ]);
-  const destination = directory || root?.split("/").filter(Boolean).at(-1) || "workspace";
+  const rootName = root?.split("/").filter(Boolean).at(-1) || "workspace";
+  const destination = directory || rootName;
   const value = useMemo<UploadContextValue>(
     () => ({
       owner,
@@ -214,12 +221,15 @@ export function WorkspaceUploadProvider({
       directory,
       destination,
       setDirectory,
+      dropDirectory: treeDirectory ?? "",
+      dropDestination: treeDirectory || rootName,
+      setTreeDirectory,
       enqueue: (files, target = directory) => {
         if (!gate.enabled || !capability.data) {
           toast.error(gate.reason ?? "Workspace upload permission is pending");
           return;
         }
-        enqueueUploads(owner, files, target, target || destination, capability.data.limits, client);
+        enqueueUploads(owner, files, target, target || rootName, capability.data.limits, client);
       },
     }),
     [
@@ -233,6 +243,8 @@ export function WorkspaceUploadProvider({
       directory,
       destination,
       setDirectory,
+      treeDirectory,
+      rootName,
       client,
     ],
   );
@@ -347,7 +359,7 @@ export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
       if (context)
         context.enqueue(
           droppedUploadFiles(event, files),
-          resolveUploadTarget(event, context.directory),
+          resolveUploadTarget(event, context.dropDirectory),
         );
     },
     {
@@ -370,7 +382,7 @@ export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
           container={target}
           variant="upload"
           label="Upload to workspace"
-          destination={context.destination}
+          destination={context.dropDestination}
           subtext="Saved to this session's files"
         />
       )}
