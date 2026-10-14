@@ -17,6 +17,10 @@ import {
 } from "./workspaceUploadsApi";
 
 const running = new Set<string>();
+const transfers = new Map<string, AbortController>();
+const deciding = new Set<string>();
+const clients = new WeakMap<AbortController, QueryClient>();
+const deletions = new WeakMap<AbortController, Map<string, Promise<void>>>();
 const refreshes = new Map<string, { timer: ReturnType<typeof setTimeout>; paths: Set<string> }>();
 const reportedBatches = new Set<string>();
 
@@ -105,11 +109,24 @@ export async function transferUpload(
   let chunk = Math.max(initial.limits.chunk.min, Math.min(1024 ** 2, initial.limits.chunk.max));
   let restarts = 0;
   let failures = 0;
+  let mismatches = 0;
   let needsHead = Boolean(initial.uploadId);
+  let admitted = initial;
+  const throttledSince = new Map<string, number>();
+  transfers.set(key, initial.controller);
+  clients.set(initial.controller, client);
+  const ownsFile = () => {
+    const live = store().rows[key];
+    return live?.controller === initial.controller && live.file === file && !signal.aborted;
+  };
+  const checkOwnership = () => {
+    signal.throwIfAborted();
+    if (!ownsFile()) throw new DOMException("Upload no longer owns this file", "AbortError");
+  };
   const update = (value: Partial<UploadRow>) => store().update(key, value);
   try {
     const step = async (): Promise<void> => {
-      signal.throwIfAborted();
+      checkOwnership();
       const row = store().rows[key];
       if (!row) return;
       try {
@@ -124,21 +141,23 @@ export async function transferUpload(
               size: row.size,
               on_conflict: row.conflict,
             }),
-            signal,
           });
           const created = (await response.json()) as {
             upload_id: string;
             offset: number;
             chunk_bytes: number;
           };
+          admitted = { ...row, uploadId: created.upload_id };
           update({ uploadId: created.upload_id, offset: created.offset });
-          signal.throwIfAborted();
+          checkOwnership();
           failures = 0;
+          throttledSince.clear();
           return step();
         }
         const suffix = `/${encodeURIComponent(row.uploadId)}`;
         if (needsHead) {
           const response = await uploadRequest(row, suffix, { method: "HEAD", signal });
+          checkOwnership();
           if (response.headers.get("Upload-Length") !== String(file.size))
             throw new Error("Upload length changed");
           update({ offset: acknowledgedOffset(response, file.size) });
@@ -158,23 +177,25 @@ export async function transferUpload(
             body,
             signal,
           });
+          checkOwnership();
           const offset = acknowledgedOffset(response, file.size);
           if (offset !== row.offset + body.size)
             throw new Error("Unexpected upload acknowledgement");
           update({ offset });
           chunk = adaptiveChunk(chunk, performance.now() - start, row.limits);
           failures = 0;
+          throttledSince.clear();
           return step();
         }
         update({ status: "finalizing" });
         const response = await uploadRequest(row, `${suffix}/complete`, { method: "POST", signal });
+        checkOwnership();
         const result = (await response.json()) as UploadResult;
-        update({ status: "done", result, offset: result.size, file: undefined });
-        refreshUploadedFiles(client, row, result);
-        store().announce(`${result.final_name} uploaded to ${row.destination}`);
+        checkOwnership();
+        finishUpload(row, result, client);
         return;
       } catch (error) {
-        signal.throwIfAborted();
+        checkOwnership();
         if (error instanceof UploadError && error.status === 409 && error.code === "file_exists") {
           update({ status: "conflict", error: undefined });
           return;
@@ -184,7 +205,7 @@ export async function transferUpload(
           error.status === 409 &&
           error.code === "offset_mismatch"
         ) {
-          if (++failures >= 3) throw error;
+          if (++mismatches >= 3) throw error;
           update({ offset: acknowledgedOffset(error, file.size) });
           return step();
         }
@@ -198,14 +219,22 @@ export async function transferUpload(
           needsHead = false;
           return step();
         }
-        if (!retryable(error) || ++failures >= 3) throw error;
+        if (!retryable(error)) throw error;
+        const throttled = error instanceof UploadError && error.status === 429;
+        if (throttled) {
+          const since = throttledSince.get(error.code) ?? Date.now();
+          throttledSince.set(error.code, since);
+          const budget = error.code === "upload_limit" ? 15 * 60_000 : 5 * 60_000;
+          if (Date.now() - since >= budget) throw error;
+        } else if (++failures >= 3) throw error;
         update({
           error:
             error instanceof UploadError && error.code === "upload_limit"
               ? "Waiting for session upload capacity…"
               : "Reconnecting…",
         });
-        await wait(retryDelay(error, failures - 1), signal);
+        await wait(retryDelay(error, throttled ? 0 : failures - 1), signal);
+        checkOwnership();
         needsHead =
           Boolean(row.uploadId) && !(error instanceof UploadError && error.status === 429);
       }
@@ -213,29 +242,60 @@ export async function transferUpload(
     };
     await step();
   } catch (error) {
-    if (signal.aborted) {
-      update({ status: "cancelled", file: undefined });
-      const row = store().rows[key];
-      if (row?.uploadId) await deleteUpload(row);
+    if (signal.aborted || !ownsFile()) {
+      const live = store().rows[key];
+      if (live?.controller === initial.controller && live.status !== "done")
+        update({ status: "cancelled", file: undefined });
+      await deleteUpload(admitted, client);
     } else {
       const message = error instanceof Error ? error.message : "Upload failed";
       update({ status: "failed", error: message });
       store().announce(`${initial.name} upload failed: ${message}`);
     }
+  } finally {
+    if (transfers.get(key) === initial.controller) transfers.delete(key);
+    batchSummary(initial.batch);
   }
 }
 
-async function deleteUpload(row: UploadRow): Promise<void> {
-  if (!row.uploadId) return;
-  try {
-    await uploadRequest(row, `/${encodeURIComponent(row.uploadId)}`, {
-      method: "DELETE",
-      keepalive: true,
-    });
-  } catch (error) {
-    if (error instanceof UploadError && [404, 410].includes(error.status)) return;
-    toast.error(`Could not cancel ${row.name}. Temporary upload expires automatically.`);
-  }
+function finishUpload(row: UploadRow, result: UploadResult, client?: QueryClient): void {
+  const store = useUploadStore.getState();
+  const live = store.rows[row.key];
+  if (live?.controller !== row.controller || live.status === "done") return;
+  store.update(row.key, {
+    status: "done",
+    result,
+    offset: result.size,
+    file: undefined,
+    error: undefined,
+  });
+  if (client) refreshUploadedFiles(client, row, result);
+  store.announce(`${result.final_name} uploaded to ${row.destination}`);
+}
+
+function deleteUpload(row: UploadRow, client = clients.get(row.controller)): Promise<void> {
+  const id = row.uploadId;
+  if (!id) return Promise.resolve();
+  const pending = deletions.get(row.controller) ?? new Map<string, Promise<void>>();
+  deletions.set(row.controller, pending);
+  const previous = pending.get(id);
+  if (previous) return previous;
+  const deletion = (async () => {
+    try {
+      const response = await uploadRequest(row, `/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        keepalive: true,
+      });
+      // Publication can win cancellation; DELETE then carries the committed receipt.
+      if (response.status === 200)
+        finishUpload(row, (await response.json()) as UploadResult, client);
+    } catch (error) {
+      if (error instanceof UploadError && [404, 410].includes(error.status)) return;
+      toast.error(`Could not cancel ${row.name}. Temporary upload expires automatically.`);
+    }
+  })();
+  pending.set(id, deletion);
+  return deletion;
 }
 
 export async function cancelUpload(key: string): Promise<void> {
@@ -249,7 +309,12 @@ export async function cancelUpload(key: string): Promise<void> {
 
 function batchSummary(batch: string): void {
   const rows = Object.values(useUploadStore.getState().rows).filter((row) => row.batch === batch);
-  if (!rows.length || rows.some(isActiveUpload) || reportedBatches.has(batch)) return;
+  if (
+    !rows.length ||
+    rows.some((row) => isActiveUpload(row) || transfers.get(row.key) === row.controller) ||
+    reportedBatches.has(batch)
+  )
+    return;
   reportedBatches.add(batch);
   const done = rows.filter((row) => row.status === "done").length;
   const failed = rows.filter((row) => row.status === "failed").length;
@@ -269,6 +334,13 @@ export function pumpUploads(owner: UploadOwner, client: QueryClient): void {
   for (const row of rows) {
     if (active >= limit) break;
     if (row.status !== "queued" || running.has(row.key)) continue;
+    if (!row.file) {
+      const message = "File is unavailable. Select it again to upload.";
+      useUploadStore.getState().update(row.key, { status: "failed", error: message });
+      useUploadStore.getState().announce(`${row.name} upload failed: ${message}`);
+      batchSummary(row.batch);
+      continue;
+    }
     active += 1;
     running.add(row.key);
     void transferUpload(row.key, client).finally(() => {
@@ -317,7 +389,11 @@ export function enqueueUploads(
     };
   });
   useUploadStore.getState().add(rows);
-  useUploadStore.getState().announce(`Uploading ${files.length} files to ${destination}`);
+  useUploadStore
+    .getState()
+    .announce(
+      `Uploading ${files.length} ${files.length === 1 ? "file" : "files"} to ${destination}`,
+    );
   pumpUploads(owner, client);
 }
 
@@ -327,16 +403,30 @@ export async function retryUpload(
   conflict?: ConflictChoice,
 ): Promise<void> {
   const row = useUploadStore.getState().rows[key];
-  if (!row?.file || !["failed", "conflict"].includes(row.status)) return;
-  if (conflict && row.uploadId) await deleteUpload(row);
-  useUploadStore.getState().update(key, {
-    status: "queued",
-    error: undefined,
-    controller: new AbortController(),
-    ...(conflict ? { conflict, uploadId: undefined, offset: 0 } : {}),
-  });
-  reportedBatches.delete(row.batch);
-  pumpUploads(row, client);
+  if (!row?.file || !["failed", "conflict"].includes(row.status) || deciding.has(key)) return;
+  deciding.add(key);
+  clients.set(row.controller, client);
+  try {
+    if (conflict && row.uploadId) await deleteUpload(row, client);
+    const live = useUploadStore.getState().rows[key];
+    if (
+      live?.controller !== row.controller ||
+      live.file !== row.file ||
+      live.status !== row.status ||
+      row.controller.signal.aborted
+    )
+      return;
+    useUploadStore.getState().update(key, {
+      status: "queued",
+      error: undefined,
+      controller: new AbortController(),
+      ...(conflict ? { conflict, uploadId: undefined, offset: 0 } : {}),
+    });
+    reportedBatches.delete(row.batch);
+    pumpUploads(row, client);
+  } finally {
+    deciding.delete(key);
+  }
 }
 
 export function discardUploads(origin: string, identity: string): void {
