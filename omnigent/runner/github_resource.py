@@ -574,14 +574,15 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     return None
 
 
-def _checks_refused(fields: str, stderr: str) -> bool:
-    """Whether a failed ``gh pr view`` was refused only its ``statusCheckRollup`` field.
-
-    GitHub reports a field it refuses as a GraphQL error at that field's path
-    (``Resource not accessible by personal access token (…statusCheckRollup)``),
-    so the PR itself resolved; a missing PR or a sign-in failure never names it.
-    """
-    return _PR_CHECKS_FIELD in fields.split(",") and _PR_CHECKS_FIELD in stderr
+def _refused_pr_fields(stderr: str) -> set[str]:
+    """Read rejected JSON fields or GraphQL error paths, excluding CLI help catalogs."""
+    if match := re.search(r'^Unknown JSON field: "([^"]+)"', stderr, re.MULTILINE):
+        return {match[1]}
+    return {
+        field
+        for path in re.findall(r"\(([\w.]+(?:,\s*[\w.]+)*)\)", stderr)
+        for field in re.findall(r"\w+", path)
+    }
 
 
 def _gh_pr_view(
@@ -594,8 +595,9 @@ def _gh_pr_view(
     """
     rc, out, err = _gh(["pr", "view", *args, "--json", fields], cwd=cwd, token=token)
     while rc != 0:
-        refused = {_PR_CHECKS_FIELD} if _checks_refused(fields, err) else set()
-        if any(field in err for field in _PR_REVIEW_FIELDS):
+        refused = _refused_pr_fields(err) & set(fields.split(","))
+        refused &= _PR_REVIEW_FIELDS | {_PR_CHECKS_FIELD}
+        if refused & _PR_REVIEW_FIELDS:
             refused.update(_PR_REVIEW_FIELDS)
         remaining = ",".join(field for field in fields.split(",") if field not in refused)
         if not remaining or remaining == fields:

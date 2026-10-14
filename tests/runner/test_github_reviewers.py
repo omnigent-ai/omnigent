@@ -195,12 +195,38 @@ def test_reference_info_shapes_reviewers_with_one_gh_request() -> None:
 
 
 @pytest.mark.parametrize("lookup", ["workspace", "reference"])
-def test_reviewer_field_failure_preserves_pr(lookup: str) -> None:
+@pytest.mark.parametrize(
+    "error",
+    [
+        'Unknown JSON field: "latestReviews"',
+        'Unknown JSON field: "latestReviews"\nAvailable fields:\n'
+        "  reviewRequests\n  statusCheckRollup",
+        'Unknown JSON field: "reviewRequests"\nAvailable fields:\n'
+        "  latestReviews\n  statusCheckRollup",
+        "GraphQL: Resource not accessible by integration (repository.pullRequest.latestReviews)",
+    ],
+)
+def test_reviewer_field_failure_preserves_pr(lookup: str, error: str) -> None:
     data = _pr_data()
     del data["reviewRequests"], data["latestReviews"]
+    data["statusCheckRollup"] = [
+        {
+            "name": "unit",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://example.com/check",
+        }
+    ]
     reference = PullRequestRef(
         host="github.com", repository="acme/widgets", number=17, url=str(data["url"])
     )
+
+    def run_gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int, str, str]:
+        fields = argv[-1].split(",")
+        if "latestReviews" in fields or "reviewRequests" in fields:
+            return 1, "", error
+        return 0, json.dumps({field: data[field] for field in fields}), ""
+
     with (
         patch.object(github_resource, "_git", return_value=(0, "reviewer-status\n", "")),
         patch.object(github_resource.shutil, "which", return_value="/usr/bin/gh"),
@@ -208,15 +234,7 @@ def test_reviewer_field_failure_preserves_pr(lookup: str) -> None:
         patch.object(github_resource, "_pr_token", return_value="selected-token"),
         patch.object(github_resource, "_list_accounts", return_value=(True, [])),
         patch.object(github_resource._config, "github_account_preference", return_value=None),
-        # Older gh versions reject the enrichment fields but can still load the PR.
-        patch.object(
-            github_resource,
-            "_gh",
-            side_effect=[
-                (1, "", 'Unknown JSON field: "latestReviews"'),
-                (0, json.dumps(data), ""),
-            ],
-        ) as run_gh,
+        patch.object(github_resource, "_gh", side_effect=run_gh) as gh_mock,
     ):
         payload = (
             github_resource._workspace_github_info("/workspace")
@@ -227,8 +245,16 @@ def test_reviewer_field_failure_preserves_pr(lookup: str) -> None:
     assert payload["authenticated"] is True
     assert payload["pr"]["title"] == data["title"]
     assert payload["pr"]["body"] == data["body"]
+    assert payload["pr"]["checks_supported"] is True
+    assert payload["pr"]["checks"] == {
+        "passing": 1,
+        "failing": 0,
+        "pending": 0,
+        "total": 1,
+        "runs": [{"name": "unit", "bucket": "passing", "url": "https://example.com/check"}],
+    }
     assert "reviewers" not in payload["pr"]
-    first_call, fallback_call = run_gh.call_args_list
+    first_call, fallback_call = gh_mock.call_args_list
     _assert_reviewer_fields(first_call.args[0])
     assert fallback_call.args[0][:-1] == first_call.args[0][:-1]
     assert (
@@ -244,6 +270,31 @@ def test_reviewer_field_failure_preserves_pr(lookup: str) -> None:
         for field in first_call.args[0][-1].split(",")
         if field not in {"reviewRequests", "latestReviews"}
     ]
+
+
+def test_checks_field_failure_preserves_reviewers() -> None:
+    data = _pr_data()
+    error = (
+        'Unknown JSON field: "statusCheckRollup"\nAvailable fields:\n'
+        "  latestReviews\n  reviewRequests"
+    )
+
+    def run_gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int, str, str]:
+        fields = argv[-1].split(",")
+        if "statusCheckRollup" in fields:
+            return 1, "", error
+        return 0, json.dumps({field: data[field] for field in fields}), ""
+
+    with patch.object(github_resource, "_gh", side_effect=run_gh) as gh_mock:
+        result = github_resource._gh_pr_view([], github_resource._PR_VIEW_FIELDS, cwd="/workspace")
+
+    assert result == {
+        field: value
+        for field, value in data.items()
+        if field in github_resource._PR_VIEW_FIELDS.split(",") and field != "statusCheckRollup"
+    }
+    assert gh_mock.call_count == 2
+    _assert_reviewer_fields(gh_mock.call_args.args[0])
 
 
 def test_title_only_failure_does_not_retry() -> None:
@@ -262,7 +313,15 @@ def test_title_only_failure_does_not_retry() -> None:
 
 
 @pytest.mark.parametrize(
-    "error", ["network offline", "no pull requests found", "authentication failed"]
+    "error",
+    [
+        "network offline",
+        "no pull requests found",
+        "authentication failed",
+        'Unknown JSON field: "notSupported"\nAvailable fields:\n'
+        "  latestReviews\n  reviewRequests\n  statusCheckRollup",
+        "GraphQL: Resource not accessible (repository.pullRequest.latestReviewsCount)",
+    ],
 )
 def test_unrelated_pr_failure_does_not_retry(error: str) -> None:
     reference = PullRequestRef(
