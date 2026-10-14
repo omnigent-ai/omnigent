@@ -333,12 +333,16 @@ def _limits(runner: dict[str, Any] | None = None) -> PublicLimits:
 
 
 async def _read_capped(request: Request, maximum: int) -> bytes:
-    body = bytearray()
+    parts: list[bytes] = []
+    size = 0
     async for chunk in request.stream():
-        body.extend(chunk[: max(0, maximum + 1 - len(body))])
-        if len(body) > maximum:
+        size += len(chunk)
+        if size > maximum:
             raise UploadError(ErrorCode.TOO_LARGE)
-    return bytes(body)
+        if chunk:
+            parts.append(chunk)
+    # A single received part is returned as-is; join copies only multi-part bodies.
+    return b"".join(parts)
 
 
 def _response_error(response: httpx.Response) -> UploadError:
