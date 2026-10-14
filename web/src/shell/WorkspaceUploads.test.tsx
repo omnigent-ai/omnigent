@@ -338,6 +338,16 @@ it("shows accessible file-specific progress, failure and cancel controls in a du
   useUploadStore.getState().update(row.key, { status: "failed", error: "No space" });
   expect(await screen.findByRole("alert")).toHaveProperty("textContent", "No space");
   expect(screen.getByRole("button", { name: "Retry a.txt" })).toBeTruthy();
+  useUploadStore.getState().update(row.key, {
+    status: "cancelled",
+    file: undefined,
+    cancellationPending: false,
+    error: "Server did not confirm cancellation. Temporary staging expires automatically.",
+  });
+  await waitFor(() =>
+    expect(screen.getByRole("alert")).toHaveTextContent(/server did not confirm cancellation/i),
+  );
+  expect(screen.getByRole("button", { name: "Dismiss" })).toBeEnabled();
 });
 
 it("allows an asleep runner to connect before workspace metadata is available", async () => {
