@@ -7,7 +7,6 @@ import json
 import logging
 import socket
 import threading
-import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -1276,6 +1275,7 @@ async def test_hello_does_not_wait_for_blocked_probe_or_cleanup(
     interrupted = threading.Event()
     closing = threading.Event()
     release = threading.Event()
+    closed = threading.Event()
 
     class BlockedHelper:
         def __init__(self, environment):
@@ -1284,7 +1284,7 @@ async def test_hello_does_not_wait_for_blocked_probe_or_cleanup(
         def call(self, metadata, *, timeout_s=None):
             entered.set()
             if blocked_probe:
-                interrupted.wait(1)
+                interrupted.wait(30)
             return {"raw_upload": True}
 
         def interrupt(self):
@@ -1292,7 +1292,8 @@ async def test_hello_does_not_wait_for_blocked_probe_or_cleanup(
 
         def close(self):
             closing.set()
-            release.wait(1)
+            release.wait(30)
+            closed.set()
 
     async def environment(sid, eid):
         return env
@@ -1310,6 +1311,8 @@ async def test_hello_does_not_wait_for_blocked_probe_or_cleanup(
     monkeypatch.setattr(workspace_upload, "UploadHelperClient", BlockedHelper)
     monkeypatch.setattr(serve_module, "runner_primary_session_id", lambda: "session")
     monkeypatch.setattr(serve_module, "_UPLOAD_HELLO_PROBE_TIMEOUT_S", 0.04)
+    # Helper threads stay blocked far past this bound, so hello within it joined neither.
+    bound = 50 * serve_module._UPLOAD_HELLO_PROBE_TIMEOUT_S
     frames = []
 
     async def send(raw):
@@ -1318,18 +1321,15 @@ async def test_hello_does_not_wait_for_blocked_probe_or_cleanup(
     try:
         await manager.start()
         serve_module._start_workspace_upload_hello_probe(app)
-        assert await asyncio.to_thread(entered.wait, 0.5)
-        started = time.monotonic()
-        await asyncio.wait_for(_send_hello(send, "test", app=app), 0.25)
-        assert time.monotonic() - started < 0.25
+        assert await asyncio.to_thread(entered.wait, bound)
+        await asyncio.wait_for(_send_hello(send, "test", app=app), bound)
         assert "workspace_upload_v1" not in frames[-1].capabilities
-        assert await asyncio.to_thread(closing.wait, 0.5)
+        assert await asyncio.to_thread(closing.wait, bound)
         assert interrupted.is_set()
-        started = time.monotonic()
-        await asyncio.wait_for(_send_hello(send, "test", app=app), 0.25)
-        assert time.monotonic() - started < 0.25
+        await asyncio.wait_for(_send_hello(send, "test", app=app), bound)
+        assert not closed.is_set()
         assert "workspace_upload_v1" not in frames[-1].capabilities
-        await asyncio.wait_for(app.state.workspace_upload_hello_capability.probe, 0.5)
+        await asyncio.wait_for(app.state.workspace_upload_hello_capability.probe, bound)
     finally:
         interrupted.set()
         release.set()
