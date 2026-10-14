@@ -26,8 +26,9 @@ failure, it does not fix it):
     The claude-native terminal avoids exactly this by launching with
     ``keep_alive_after_exit=True`` (``remain-on-exit on``): an exiting CLI
     leaves a dead-but-capturable pane, so ``capture-pane`` still succeeds,
-    ``_pane_is_dead()`` fires, and the exit is reported deterministically
-    instead of via the generic "tmux unavailable" cascade.
+    ``_capture_pane_state_or_none()`` reports the dead pane, and the exit is
+    reported deterministically instead of via the generic "tmux unavailable"
+    cascade.
 
 This test drives the REAL journey end-to-end: it brings a host online, creates
 a pi-native session so the runner launches the real ``pi`` CLI inside a
