@@ -1,7 +1,7 @@
 import { QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "./identity";
-import { useUploadStore, type UploadRow } from "@/store/uploadStore";
+import { uploadTotals, useUploadStore, type UploadRow } from "@/store/uploadStore";
 import {
   adaptiveChunk,
   cancelUpload,
@@ -612,3 +612,170 @@ it("allows three offset resyncs separated by acknowledged PATCH progress", async
   expect(resyncs).toBe(3);
   expect(useUploadStore.getState().rows.id).toMatchObject({ status: "done", offset: 20 });
 });
+
+it.each([
+  ["request", 20, 150_001],
+  ["request", 1024 ** 3, 450_000],
+  ["receipt body", 20, 150_001],
+])("bounds a stalled cancellation %s for %s bytes", async (stall, size, deadline) => {
+  vi.useFakeTimers();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  useUploadStore
+    .getState()
+    .update(row.key, { uploadId: "remote", status: "conflict", size: Number(size) });
+  let release!: (response: Response) => void;
+  const pending = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  let cleanupSignal: AbortSignal | undefined;
+  fetchMock.mockImplementation(async (_url, init) => {
+    cleanupSignal = init?.signal ?? undefined;
+    if (stall === "receipt body") {
+      const response = json({});
+      vi.spyOn(response, "json").mockImplementation(async () => (await pending).json());
+      return response;
+    }
+    return pending;
+  });
+  let settled = false;
+  const cancellation = cancelUpload(row.key).then(() => {
+    settled = true;
+  });
+  try {
+    await vi.advanceTimersByTimeAsync(Number(deadline) - 1);
+    expect(settled).toBe(false);
+    useUploadStore.getState().dismiss([row.key]);
+    expect(useUploadStore.getState().rows.id.cancellationPending).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toBe(true);
+    expect(cleanupSignal?.aborted).toBe(true);
+    const live = useUploadStore.getState().rows.id;
+    expect(live).toMatchObject({
+      status: "cancelled",
+      cancellationPending: false,
+      file: undefined,
+    });
+    expect(live.error).toMatch(/server did not confirm cancellation.*staging expires/i);
+    expect(uploadTotals([live]).active).toBe(false);
+    expect(toast).toHaveBeenCalledWith("0 of 1 uploaded, 1 cancelled");
+    useUploadStore.getState().dismiss([row.key]);
+    expect(useUploadStore.getState().rows.id).toBeUndefined();
+  } finally {
+    release(
+      json({
+        path: "src/a.bin",
+        final_name: "a.bin",
+        size: Number(size),
+        sha256: "digest",
+        outcome: "replaced",
+      }),
+    );
+    await cancellation;
+    await vi.advanceTimersByTimeAsync(300);
+  }
+  expect(invalidate).not.toHaveBeenCalled();
+});
+
+it("starts the queued file immediately on cancel and reconciles a receipt within the deadline", async () => {
+  vi.useFakeTimers();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  useUploadStore.getState().update(row.key, { limits: { ...row.limits, parallel_files: 1 } });
+  const next = {
+    ...row,
+    id: "next",
+    key: "next",
+    controller: new AbortController(),
+    file: new File([new Uint8Array(20)], "next.bin"),
+  };
+  useUploadStore.getState().add([next]);
+  let reached!: () => void;
+  const patchReached = new Promise<void>((resolve) => {
+    reached = resolve;
+  });
+  let release!: (response: Response) => void;
+  const deletion = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  let first = true;
+  fetchMock.mockImplementation((url, init) => {
+    if (init?.method === "PATCH" && first) {
+      first = false;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject(new DOMException("Cancelled", "AbortError")),
+        );
+        reached();
+      });
+    }
+    if (init?.method === "DELETE") return deletion;
+    return server(url, init);
+  });
+  let transferSettled = false;
+  const transfer = transferUpload(row.key, client, wait).then(() => {
+    transferSettled = true;
+  });
+  await patchReached;
+  const cancellation = cancelUpload(row.key);
+  const result = {
+    path: "src/a.bin",
+    final_name: "a.bin",
+    size: 20,
+    sha256: "digest",
+    outcome: "replaced",
+  };
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(transferSettled).toBe(true);
+    expect(useUploadStore.getState().rows.next.status).toBe("done");
+    expect(useUploadStore.getState().rows.id).toMatchObject({
+      status: "cancelled",
+      file: undefined,
+      cancellationPending: true,
+    });
+    useUploadStore.getState().dismiss([row.key]);
+    expect(useUploadStore.getState().rows.id).toBeDefined();
+    expect(toast).not.toHaveBeenCalledWith(expect.stringContaining("of 2 uploaded"));
+    await vi.advanceTimersByTimeAsync(149_000);
+  } finally {
+    release(json(result));
+    await Promise.all([cancellation, transfer]);
+    await vi.advanceTimersByTimeAsync(300);
+  }
+  expect(useUploadStore.getState().rows.id).toMatchObject({
+    status: "done",
+    result,
+    cancellationPending: false,
+  });
+  expect(invalidate).toHaveBeenCalledWith({
+    queryKey: ["workspace-dir", "s", "src"],
+    refetchType: "active",
+  });
+  expect(invalidate).toHaveBeenCalledWith({
+    queryKey: ["file-content", "s", "src/a.bin"],
+    refetchType: "active",
+  });
+  expect(toast).toHaveBeenCalledWith("2 of 2 uploaded");
+});
+
+it.each(["offline", "relay timeout"])(
+  "settles an unconfirmed %s cancellation without retaining its deadline",
+  async (fault) => {
+    vi.useFakeTimers();
+    useUploadStore.getState().update(row.key, { uploadId: "remote", status: "conflict" });
+    if (fault === "offline") fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
+    else fetchMock.mockResolvedValue(errorResponse(504, "upload_timeout"));
+    await cancelUpload(row.key);
+    expect(useUploadStore.getState().rows.id).toMatchObject({
+      status: "cancelled",
+      file: undefined,
+      cancellationPending: false,
+    });
+    expect(useUploadStore.getState().rows.id.error).toMatch(
+      /server did not confirm cancellation.*staging expires/i,
+    );
+    expect(toast).toHaveBeenCalledWith("0 of 1 uploaded, 1 cancelled");
+    expect(vi.getTimerCount()).toBe(0);
+    useUploadStore.getState().dismiss([row.key]);
+    expect(useUploadStore.getState().rows.id).toBeUndefined();
+  },
+);
