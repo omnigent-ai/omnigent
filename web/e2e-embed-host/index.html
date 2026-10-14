@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Omnigent embed host (e2e)</title>
+    <style>
+      html,
+      body,
+      #host-root {
+        height: 100%;
+        margin: 0;
+      }
+      #host-root {
+        display: flex;
+        flex-direction: column;
+        font:
+          14px system-ui,
+          sans-serif;
+      }
+      .host-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 12px;
+        background: #1f2937;
+        color: #f9fafb;
+      }
+      .host-header button {
+        padding: 4px 10px;
+      }
+      .host-embed {
+        flex: 1;
+        min-height: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="host-root"></div>
+    <script type="module" src="./host-main.tsx"></script>
+  </body>
+</html>

@@ -305,6 +305,40 @@ let serverLoginUrl: string | null = null;
 // navigations. Boot also reads this to skip mounting the app when the
 // session is already on its way out (see `isLoginRedirectPending`).
 let loginRedirectPending = false;
+// Server the cached identity was read from (`undefined` until first bound). A
+// host can repoint the app at another Server in place, so the cache is dropped
+// when it changes; keyed on the Server, not the (re-render-bumped) generation.
+let identityServer: string | null | undefined;
+
+/**
+ * The Server the host config names (`null` standalone or unnamed: one Server
+ * per page). Only a change here is a switch, so same-Server remounts keep the
+ * cache. Read from the config so partial `./host` mocks need no extra export.
+ */
+export function getConfiguredServer(): string | null {
+  return getOmnigentHostConfig().serverIdentity?.trim() || null;
+}
+
+/**
+ * Drop the cached identity when the host has switched Servers. Every reader
+ * below calls this first, so no synchronous caller sees the previous Server's
+ * user or admin flag; standalone has one Server per page, so it never fires.
+ */
+function syncIdentityServer(): void {
+  const server = getConfiguredServer();
+  if (identityServer === undefined) {
+    identityServer = server;
+    return;
+  }
+  if (server === identityServer) return;
+  identityServer = server;
+  currentUserId = null;
+  currentIsAdmin = false;
+  identityResolved = false;
+  identityPromise = null;
+  serverLoginUrl = null;
+  // loginRedirectPending stays: it guards this document's single navigation.
+}
 
 /**
  * Hand the browser to `loginUrl`, at most once per document.
@@ -362,11 +396,24 @@ function isOnLoginPath(): boolean {
  * redirects the browser to the login page.
  */
 export async function resolveIdentity(): Promise<string | null> {
+  syncIdentityServer();
   if (identityResolved) return currentUserId;
   if (identityPromise) return identityPromise;
-  identityPromise = (async () => {
+  // Accept replies only while this Server is active and this probe owns the
+  // slot; otherwise release the slot for another probe. Until the slot is
+  // assigned (a synchronous adapter throw lands here) no other probe can own it.
+  let probe: Promise<string | null> | undefined;
+  const probeServer = getConfiguredServer();
+  const isStale = () =>
+    getConfiguredServer() !== probeServer || (probe !== undefined && identityPromise !== probe);
+  const discard = (): null => {
+    if (identityPromise === probe) identityPromise = null;
+    return null;
+  };
+  probe = (async () => {
     try {
       const res = await hostFetch("/v1/me");
+      if (isStale()) return discard();
       if (res.status === 401) {
         // OIDC / accounts mode: server requires authentication.
         // Redirect to the login URL provided in the response body —
@@ -377,6 +424,7 @@ export async function resolveIdentity(): Promise<string | null> {
             user_id: null;
             login_url?: string;
           };
+          if (isStale()) return discard();
           if (data.login_url) {
             serverLoginUrl = data.login_url;
             if (!isOnLoginPath()) {
@@ -393,20 +441,24 @@ export async function resolveIdentity(): Promise<string | null> {
           user_id: string | null;
           is_admin?: boolean;
         };
+        if (isStale()) return discard();
         currentUserId = data.user_id;
         currentIsAdmin = data.is_admin ?? false;
       }
     } catch {
       // Server unreachable — leave as null.
     }
+    if (isStale()) return discard();
     identityResolved = true;
     return currentUserId;
   })();
-  return identityPromise;
+  identityPromise = probe;
+  return probe;
 }
 
 /** Return the cached user ID (null before resolveIdentity completes). */
 export function getCurrentUserId(): string | null {
+  syncIdentityServer();
   return currentUserId;
 }
 
@@ -416,6 +468,7 @@ export function getCurrentUserId(): string | null {
  * AND OIDC. Returns false before `resolveIdentity` completes.
  */
 export function getCurrentIsAdmin(): boolean {
+  syncIdentityServer();
   return currentIsAdmin;
 }
 
@@ -425,6 +478,7 @@ export function getCurrentIsAdmin(): boolean {
  * resolves and for the `"local"` sentinel, so those stay unlabeled.
  */
 export function getCurrentAuthorId(): string | null {
+  syncIdentityServer();
   if (currentUserId === null || currentUserId === RESERVED_USER_LOCAL) {
     return null;
   }
@@ -462,6 +516,18 @@ export async function authenticatedFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> {
+  syncIdentityServer();
+  // A switch while this request waits means it was meant for the previous
+  // Server; dispatching it through the new fetcher would forward that user.
+  const requestServer = getConfiguredServer();
+  const ensureSameServer = () => {
+    if (getConfiguredServer() !== requestServer) {
+      throw new DOMException(
+        "The host switched Servers while the request was pending",
+        "AbortError",
+      );
+    }
+  };
   const headers = new Headers(init?.headers);
   if (currentUserId && currentUserId !== RESERVED_USER_LOCAL && !headers.has("X-Forwarded-Email")) {
     headers.set("X-Forwarded-Email", currentUserId);
@@ -477,7 +543,10 @@ export async function authenticatedFetch(
   // bootstrap is needed — we skip the await so the fetch still dispatches in the
   // same tick, exactly as before the gate.
   const hostResolve = beginSessionHostResolve(url);
-  if (hostResolve !== null) await hostResolve;
+  if (hostResolve !== null) {
+    await hostResolve;
+    ensureSameServer();
+  }
   // Whether WE (not the caller) stamped the slice key on this request; only then
   // is a keyless re-address meaningful on a wrong-replica (wrong_replica) response.
   let stampedSliceKey = false;
@@ -525,6 +594,9 @@ export async function authenticatedFetch(
     headers,
     cache: "no-store",
   });
+  // Nothing below may act on a previous Server's answer, including the shared
+  // session-host and keyless-host caches the replica fallbacks update.
+  ensureSameServer();
 
   // Wrong-replica fallback: a keyed request that reached the wrong replica comes
   // back 400 wrong_replica. Re-address ONCE with the key removed so it routes by
@@ -538,11 +610,13 @@ export async function authenticatedFetch(
     // (callers/tests hold it by reference).
     const retryHeaders = new Headers(headers);
     retryHeaders.delete(SLICE_KEY_HEADER);
+    ensureSameServer();
     res = await hostFetch(url, {
       ...init,
       headers: retryHeaders,
       cache: "no-store",
     });
+    ensureSameServer();
     // Only a successful keyless retry proves this host uses the default replica.
     // Failed retries must preserve the host key for subsequent requests.
     if (derivedHostId && res.ok) {
@@ -556,11 +630,13 @@ export async function authenticatedFetch(
   ) {
     // The first managed message can outlive provisioning and acquire a host.
     // Refresh its original hostless lookup, then retry once on that host.
+    ensureSameServer();
     const sessionId = sessionIdForHostResolve(url);
     if (sessionId !== null) {
       init?.signal?.throwIfAborted();
       await resolveSessionHost(sessionId, { force: true });
       init?.signal?.throwIfAborted();
+      ensureSameServer();
       const hostId = getSessionHost(sessionId);
       if (hostId !== null) {
         clearHostKeyless(hostId);
@@ -571,6 +647,7 @@ export async function authenticatedFetch(
           headers: retryHeaders,
           cache: "no-store",
         });
+        ensureSameServer();
       }
     }
   } else if (
@@ -584,8 +661,12 @@ export async function authenticatedFetch(
     // wrong_replica — so keying was not the problem (e.g. the host re-registered
     // keyed after a CLI upgrade). Clear the demotion so the next request
     // re-evaluates by trying keyed again.
+    ensureSameServer();
     clearHostKeyless(derivedHostId);
   }
+  // A wrong-replica body read can span a switch without entering a guarded
+  // branch, so re-check before handing the answer back.
+  ensureSameServer();
 
   if (
     // When embedded, the host owns auth (e.g. cookie/session via

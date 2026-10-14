@@ -30,5 +30,5 @@
       "@/*": ["./src/*"]
     }
   },
-  "include": ["src", ".storybook/preview.tsx"]
+  "include": ["src", ".storybook/preview.tsx", "e2e-embed-host"]
 }

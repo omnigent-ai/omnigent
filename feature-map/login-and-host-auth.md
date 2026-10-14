@@ -33,6 +33,12 @@ be able to write resources without a separate Omnigent account.
   remain restricted.
 - `embedded-auth-context`: HTTP, WebSocket, and background writes use the
   app's account mode; an embedded app must not weaken a separate accounts app.
+- `embedded-host-server-switch`: an application that embeds the web UI can
+  repoint it at another Omnigent Server in place (a new host config and a
+  remount). The embed then asks the new Server who the user is, sends only that
+  user with its requests, and shows admin chrome only when the new Server says
+  so. States: switch after the first Server answered `/v1/me`; switch while that
+  answer is still pending (it must be ignored when it lands).
 - `desktop-oidc-browser-sign-in`: the desktop app signs in to an OIDC server in
   the system browser and never shows the identity provider inside its window.
   States: Connect with no session, Connect with a still-valid session (no
@@ -78,6 +84,11 @@ application's provider and stores, then use its authenticated REST client to
 create a project, rename it, reorder projects, and read the result back.
 This entry point has no CLI login step.
 
+**Embedded web UI:** the embedding application's own Server switcher (the e2e
+host page's **Connect Server A** / **Connect Server B** buttons stand in for it);
+then Settings, where the Admin group (Members / Policies / Sharing) must follow
+the current Server's user.
+
 ## Driving it with the repro environment
 
 Preconditions: the verification instance runs a header-mode server with no
@@ -114,6 +125,12 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   handling; revocation and saved-identity restrictions must still hold. Report backend
   skips separately. These are not browser or live identity-provider checks.
 
+- **`embedded-host-server-switch` (real embed, two header-mode servers):**
+  `tests/e2e_ui/embed/test_embed_server_switch_identity.py`. It builds the test
+  host page (`web/e2e-embed-host`) and spawns both servers itself, so it needs
+  the web toolchain and Playwright Chromium; the verification instance cannot
+  show it. Module contract: the "host Server switch" cases in
+  `web/src/lib/identity.test.ts` and `web/src/hooks/useIsAdmin.test.tsx`.
 - **`desktop-oidc-browser-sign-in` (desktop shell, own environment):** drive the
   desktop app per `web/electron/README.md` ("OIDC sign-in through the system
   browser", Manual verification) against an OIDC server. The verification

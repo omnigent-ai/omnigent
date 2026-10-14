@@ -108,6 +108,21 @@ describe("resolveIdentity", () => {
     expect(getCurrentUserId()).toBeNull();
   });
 
+  it("swallows a host adapter that throws synchronously and resolves to null", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { resolveIdentity, getCurrentUserId } = await import("./identity");
+    const exploding = vi.fn((): Promise<Response> => {
+      throw new Error("adapter exploded");
+    });
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: exploding });
+
+    expect(await resolveIdentity()).toBeNull();
+    expect(getCurrentUserId()).toBeNull();
+    // Cached like any other failed probe: no re-probe on the next call.
+    expect(await resolveIdentity()).toBeNull();
+    expect(exploding).toHaveBeenCalledTimes(1);
+  });
+
   it("treats non-2xx as null without throwing", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 500 }));
     const { resolveIdentity } = await import("./identity");
@@ -706,5 +721,434 @@ describe("login redirect", () => {
 
     expect(isLoginRedirectPending()).toBe(false);
     expect(hrefWrites).toEqual([]);
+  });
+});
+
+describe("host Server switch", () => {
+  // An embedded host can point the app at another Server in place by
+  // installing a new host config. Identity is per-Server, so everything the
+  // previous Server told us must be dropped rather than reused or forwarded.
+
+  function serverFetcher(userId: string, isAdmin = false) {
+    return vi.fn(async (path: string, _init?: RequestInit) =>
+      mockJsonResponse(path === "/v1/me" ? { user_id: userId, is_admin: isAdmin } : {}),
+    );
+  }
+
+  it("re-probes /v1/me on the new Server instead of reusing the cached user", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { resolveIdentity } = await import("./identity");
+    const serverA = serverFetcher("alice");
+    const serverB = serverFetcher("bob");
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    expect(await resolveIdentity()).toBe("alice");
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+
+    expect(await resolveIdentity()).toBe("bob");
+    expect(serverB.mock.calls.map((c) => c[0])).toContain("/v1/me");
+  });
+
+  it("drops the previous Server's admin flag the moment the host switches", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { resolveIdentity, getCurrentUserId, getCurrentIsAdmin } = await import("./identity");
+    const serverA = serverFetcher("alice", true);
+    const serverB = serverFetcher("bob", false);
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    await resolveIdentity();
+    expect(getCurrentIsAdmin()).toBe(true);
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+
+    // Synchronous readers run before the new probe settles; admin chrome must
+    // not follow the previous Server's user into the new one.
+    expect(getCurrentIsAdmin()).toBe(false);
+    expect(getCurrentUserId()).toBeNull();
+    await resolveIdentity();
+    expect(getCurrentIsAdmin()).toBe(false);
+  });
+
+  it("never stamps the previous Server's user on requests to the new Server", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { resolveIdentity, authenticatedFetch } = await import("./identity");
+    const serverA = serverFetcher("alice");
+    const serverB = serverFetcher("bob");
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    await resolveIdentity();
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    await authenticatedFetch("/v1/sessions");
+
+    const forwarded = serverB.mock.calls
+      .map((c) => new Headers((c[1] as RequestInit | undefined)?.headers).get("X-Forwarded-Email"))
+      .filter((v): v is string => v !== null);
+    expect(forwarded).not.toContain("alice");
+  });
+
+  it("ignores a /v1/me response from the previous Server that lands after the switch", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { resolveIdentity, getCurrentUserId } = await import("./identity");
+    let settleServerA: ((r: Response) => void) | null = null;
+    const serverA = vi.fn(
+      () =>
+        new Promise<Response>((r) => {
+          settleServerA = r;
+        }),
+    );
+    const serverB = serverFetcher("bob");
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const pendingA = resolveIdentity();
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    settleServerA!(mockJsonResponse({ user_id: "alice", is_admin: true }));
+    await pendingA;
+
+    expect(getCurrentUserId()).not.toBe("alice");
+    expect(await resolveIdentity()).toBe("bob");
+  });
+
+  it("keeps the cached identity when the host reinstalls a config for the same Server", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { resolveIdentity, getCurrentIsAdmin } = await import("./identity");
+    const serverA = serverFetcher("alice", true);
+    const serverAAgain = serverFetcher("alice", true);
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    expect(await resolveIdentity()).toBe("alice");
+
+    // A remount reinstalls an equivalent config; the Server did not change.
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverAAgain });
+
+    expect(await resolveIdentity()).toBe("alice");
+    expect(getCurrentIsAdmin()).toBe(true);
+    expect(serverA).toHaveBeenCalledTimes(1);
+    expect(serverAAgain).not.toHaveBeenCalled();
+  });
+
+  it("re-probes a Server whose first answer was discarded while the host was elsewhere", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { resolveIdentity } = await import("./identity");
+    let settleServerA: ((r: Response) => void) | null = null;
+    const serverA = vi.fn(
+      () =>
+        new Promise<Response>((r) => {
+          settleServerA = r;
+        }),
+    );
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const pendingA = resolveIdentity();
+
+    // Away and back without any identity reader running in between.
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverFetcher("bob") });
+    settleServerA!(mockJsonResponse({ user_id: "alice", is_admin: true }));
+    expect(await pendingA).toBeNull();
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+
+    const again = resolveIdentity();
+    expect(serverA).toHaveBeenCalledTimes(2);
+    settleServerA!(mockJsonResponse({ user_id: "alice", is_admin: true }));
+    expect(await again).toBe("alice");
+  });
+
+  it("ignores a superseded probe's answer after the host left and returned to its Server", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { resolveIdentity, getCurrentIsAdmin, getCurrentUserId } = await import("./identity");
+    const answers: ((r: Response) => void)[] = [];
+    const serverA = vi.fn(
+      () =>
+        new Promise<Response>((r) => {
+          answers.push(r);
+        }),
+    );
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const first = resolveIdentity();
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverFetcher("bob") });
+    await resolveIdentity();
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const second = resolveIdentity();
+    expect(answers).toHaveLength(2);
+
+    // The newer probe answers first; the superseded one lands afterwards.
+    answers[1](mockJsonResponse({ user_id: "alice", is_admin: false }));
+    expect(await second).toBe("alice");
+    answers[0](mockJsonResponse({ user_id: "alice", is_admin: true }));
+    expect(await first).toBeNull();
+
+    expect(getCurrentIsAdmin()).toBe(false);
+    expect(getCurrentUserId()).toBe("alice");
+    expect(await resolveIdentity()).toBe("alice");
+    expect(serverA).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts instead of retrying on the new Server after a wrong-replica answer", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { setSessionHost } = await import("./sessionHost");
+    const { authenticatedFetch, resolveIdentity } = await import("./identity");
+    let readBody!: () => void;
+    const wrongReplica = {
+      ok: false,
+      status: 400,
+      // The replica check reads a clone; hold that read so the host can switch meanwhile.
+      clone: () => ({
+        json: () =>
+          new Promise<unknown>((resolve) => {
+            readBody = () => resolve({ error: { code: "wrong_replica" } });
+          }),
+      }),
+    } as unknown as Response;
+    const serverA = vi.fn(async (path: string) =>
+      path === "/v1/me" ? mockJsonResponse({ user_id: "alice" }) : wrongReplica,
+    );
+    const serverB = serverFetcher("bob");
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    await resolveIdentity();
+    setSessionHost("session-a", "host-a");
+    const pending = authenticatedFetch("/v1/sessions/session-a/items");
+    await vi.waitFor(() => expect(readBody).toBeDefined());
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    readBody();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(serverA.mock.calls.filter((c) => c[0] === "/v1/sessions/session-a/items")).toHaveLength(
+      1,
+    );
+    expect(serverB).not.toHaveBeenCalled();
+  });
+
+  it("aborts a replica retry whose answer lands after the host switched Servers", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { isHostKeyless, setSessionHost } = await import("./sessionHost");
+    const { authenticatedFetch, resolveIdentity } = await import("./identity");
+    const wrongReplica = {
+      ok: false,
+      status: 400,
+      clone: () => ({ json: async () => ({ error: { code: "wrong_replica" } }) }),
+    } as unknown as Response;
+    let answerRetry!: (r: Response) => void;
+    let attempts = 0;
+    const serverA = vi.fn((path: string) => {
+      if (path === "/v1/me") return Promise.resolve(mockJsonResponse({ user_id: "alice" }));
+      attempts += 1;
+      return attempts === 1
+        ? Promise.resolve(wrongReplica)
+        : new Promise<Response>((r) => {
+            answerRetry = r;
+          });
+    });
+    const serverB = serverFetcher("bob");
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    await resolveIdentity();
+    setSessionHost("session-a", "host-a");
+    const pending = authenticatedFetch("/v1/sessions/session-a/items");
+    await vi.waitFor(() => expect(attempts).toBe(2));
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    answerRetry(mockJsonResponse({ items: [] }));
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(isHostKeyless("host-a")).toBe(false);
+    expect(serverB).not.toHaveBeenCalled();
+  });
+
+  it("aborts a hostless wrong-replica recovery when the host switched during the body read", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { authenticatedFetch, resolveIdentity, setSessionHostResolver } =
+      await import("./identity");
+    let readBody!: () => void;
+    const wrongReplica = {
+      ok: false,
+      status: 400,
+      clone: () => ({
+        json: () =>
+          new Promise<unknown>((resolve) => {
+            readBody = () => resolve({ error: { code: "wrong_replica" } });
+          }),
+      }),
+    } as unknown as Response;
+    const serverA = vi.fn(async (path: string) =>
+      path === "/v1/me" ? mockJsonResponse({ user_id: "alice" }) : wrongReplica,
+    );
+    const serverB = serverFetcher("bob");
+    const resolver = vi.fn(async () => {});
+    setSessionHostResolver(resolver);
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    await resolveIdentity();
+    const pending = authenticatedFetch("/v1/sessions/session-x/items");
+    await vi.waitFor(() => expect(readBody).toBeDefined());
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    readBody();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(resolver).not.toHaveBeenCalledWith("session-x", { force: true });
+    expect(serverB).not.toHaveBeenCalled();
+  });
+
+  it("aborts when the host switches during an error body read that is not wrong_replica", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { setSessionHost } = await import("./sessionHost");
+    const { authenticatedFetch, resolveIdentity } = await import("./identity");
+    let readBody!: () => void;
+    const otherError = {
+      ok: false,
+      status: 400,
+      clone: () => ({
+        json: () =>
+          new Promise<unknown>((resolve) => {
+            readBody = () => resolve({ error: { code: "bad_request" } });
+          }),
+      }),
+    } as unknown as Response;
+    const serverA = vi.fn(async (path: string) =>
+      path === "/v1/me" ? mockJsonResponse({ user_id: "alice" }) : otherError,
+    );
+    const serverB = serverFetcher("bob");
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    await resolveIdentity();
+    setSessionHost("session-a", "host-a");
+    const pending = authenticatedFetch("/v1/sessions/session-a/items");
+    await vi.waitFor(() => expect(readBody).toBeDefined());
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    readBody();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(serverB).not.toHaveBeenCalled();
+  });
+
+  it("aborts a hostless recovery whose forced host refresh completes after the host switched", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { authenticatedFetch, resolveIdentity, setSessionHostResolver } =
+      await import("./identity");
+    const wrongReplica = {
+      ok: false,
+      status: 400,
+      clone: () => ({ json: async () => ({ error: { code: "wrong_replica" } }) }),
+    } as unknown as Response;
+    const serverA = vi.fn(async (path: string) =>
+      path === "/v1/me" ? mockJsonResponse({ user_id: "alice" }) : wrongReplica,
+    );
+    const serverB = serverFetcher("bob");
+    let finishRefresh!: () => void;
+    setSessionHostResolver((_sessionId, options) =>
+      options?.force
+        ? new Promise<void>((resolve) => {
+            finishRefresh = resolve;
+          })
+        : Promise.resolve(),
+    );
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    await resolveIdentity();
+    const pending = authenticatedFetch("/v1/sessions/session-x/items");
+    await vi.waitFor(() => expect(finishRefresh).toBeDefined());
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    finishRefresh();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(serverA.mock.calls.filter((c) => c[0] === "/v1/sessions/session-x/items")).toHaveLength(
+      1,
+    );
+    expect(serverB).not.toHaveBeenCalled();
+  });
+
+  it("aborts a hostless recovery whose keyed retry lands after the host switched", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { setSessionHost } = await import("./sessionHost");
+    const { authenticatedFetch, resolveIdentity, setSessionHostResolver } =
+      await import("./identity");
+    const wrongReplica = {
+      ok: false,
+      status: 400,
+      clone: () => ({ json: async () => ({ error: { code: "wrong_replica" } }) }),
+    } as unknown as Response;
+    let answerRetry!: (r: Response) => void;
+    let attempts = 0;
+    const serverA = vi.fn((path: string) => {
+      if (path === "/v1/me") return Promise.resolve(mockJsonResponse({ user_id: "alice" }));
+      attempts += 1;
+      return attempts === 1
+        ? Promise.resolve(wrongReplica)
+        : new Promise<Response>((r) => {
+            answerRetry = r;
+          });
+    });
+    const serverB = serverFetcher("bob");
+    setSessionHostResolver(async (sessionId, options) => {
+      if (options?.force) setSessionHost(sessionId, "host-x");
+    });
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    await resolveIdentity();
+    const pending = authenticatedFetch("/v1/sessions/session-x/items");
+    await vi.waitFor(() => expect(attempts).toBe(2));
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    answerRetry(mockJsonResponse({ items: [] }));
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(serverB).not.toHaveBeenCalled();
+  });
+
+  it("aborts a request whose answer lands after the host switched Servers", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { authenticatedFetch, resolveIdentity } = await import("./identity");
+    let answerA: ((r: Response) => void) | null = null;
+    const serverA = vi.fn((path: string) =>
+      path === "/v1/me"
+        ? Promise.resolve(mockJsonResponse({ user_id: "alice" }))
+        : new Promise<Response>((r) => {
+            answerA = r;
+          }),
+    );
+    const serverB = serverFetcher("bob");
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    await resolveIdentity();
+    const pending = authenticatedFetch("/v1/sessions");
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    answerA!(mockJsonResponse({ sessions: [] }));
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(serverB).not.toHaveBeenCalled();
+  });
+
+  it("aborts a request still waiting for its session host when the host switches Servers", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { authenticatedFetch, resolveIdentity, setSessionHostResolver } =
+      await import("./identity");
+    const serverA = serverFetcher("alice");
+    const serverB = serverFetcher("bob");
+    let hostResolved!: () => void;
+    setSessionHostResolver(
+      () =>
+        new Promise<void>((resolve) => {
+          hostResolved = resolve;
+        }),
+    );
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    await resolveIdentity();
+    const pending = authenticatedFetch("/v1/sessions/session-a/items");
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    hostResolved();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(serverB.mock.calls.map((c) => c[0])).not.toContain("/v1/sessions/session-a/items");
   });
 });

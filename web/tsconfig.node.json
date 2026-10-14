@@ -24,5 +24,10 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["vite.config.ts", "vite.storybook.config.ts", ".storybook/main.ts"]
+  "include": [
+    "vite.config.ts",
+    "vite.storybook.config.ts",
+    "vite.e2e-embed-host.config.ts",
+    ".storybook/main.ts"
+  ]
 }
