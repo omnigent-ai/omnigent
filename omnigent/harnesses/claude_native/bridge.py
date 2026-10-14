@@ -72,7 +72,12 @@ from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
-from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
+from omnigent.harnesses.diagnostics import (
+    detect_launcher_question,
+    detect_sign_in_prompt,
+    may_end_with_answer_cue,
+    sign_in_next_step,
+)
 from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
@@ -584,28 +589,50 @@ class ClaudeTerminalDialog(RuntimeError):
     """
 
 
-class ClaudeSignInPending(RuntimeError):
+class ClaudeLauncherPending(RuntimeError):
     """
-    Claude Code's terminal is parked on a launcher sign-in prompt.
+    Claude Code's terminal is parked on a prompt its launcher printed first.
 
-    A wrapper in front of the ``claude`` binary printed an address to open
-    (often with a device code) and is waiting for the person to sign in.
-    Like :class:`ClaudeTerminalDialog` this is deliberately not a
-    :class:`ClaudePromptTimeout`: the pane is alive and the sign-in is
-    finished from the card's link, so delivery handlers must not reap it.
+    A wrapper in front of the ``claude`` binary (Databricks' ``ug``/``isaac``)
+    stopped before Claude Code runs and is waiting for the person. Like
+    :class:`ClaudeTerminalDialog` this is deliberately not a
+    :class:`ClaudePromptTimeout`: the pane is alive and the launcher continues
+    into Claude Code once answered, so delivery handlers must report the
+    ``code``, ``title`` and ``remediation`` and must not reap the pane.
+    ``code`` is the generic startup-pending code; subclasses refine it.
 
     :param message: Human-readable failure text.
-    :param title: Card headline, e.g.
-        ``"Claude Code can't start until you sign in to Databricks"``.
-    :param remediation: The link (and code) to open, phrased as the next step.
+    :param title: Card headline.
+    :param remediation: The next step, phrased for the card.
     """
 
-    code = "databricks_sign_in_pending"
+    code = "agent_startup_pending"
 
     def __init__(self, message: str, *, title: str, remediation: str) -> None:
         super().__init__(message)
         self.title = title
         self.remediation = remediation
+
+
+class ClaudeSignInPending(ClaudeLauncherPending):
+    """
+    Claude Code's terminal is parked on a launcher sign-in prompt.
+
+    The launcher printed an address to open (often with a device code); the
+    sign-in is finished from the card's link, under a headline such as
+    ``"Claude Code can't start until you sign in to Databricks"``.
+    """
+
+    code = "databricks_sign_in_pending"
+
+
+class ClaudeLauncherQuestionPending(ClaudeLauncherPending):
+    """
+    Claude Code's terminal is parked on a yes/no question the launcher asked.
+
+    E.g. ``ug``'s "Upgrade Claude Code if available? (Y/n)"; it is answered
+    from the embedded terminal.
+    """
 
 
 class ClaudeInjectionCancelled(RuntimeError):
@@ -6159,6 +6186,10 @@ def _wait_for_claude_prompt_ready(
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
         card can offer it; the pane is left alive for the sign-in to finish.
+    :raises ClaudeLauncherQuestionPending: If a yes/no question the launcher
+        printed (see :func:`detect_launcher_question`) is the pane's last line
+        on two consecutive polls while the pane is alive. Raised within a poll
+        interval naming the question; the pane is left for it to be answered.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
@@ -6184,6 +6215,7 @@ def _wait_for_claude_prompt_ready(
     pane_exited = False
     dialog_headline: str | None = None
     sign_in_url: str | None = None
+    launcher_question: str | None = None
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -6233,6 +6265,36 @@ def _wait_for_claude_prompt_ready(
                 remediation=sign_in_next_step("Claude Code"),
             )
         sign_in_url = sign_in.url if sign_in is not None else None
+        # A launcher parked on a yes/no question of its own ("Upgrade Claude
+        # Code if available? (Y/n)"), real when the same question ends two
+        # consecutive polls. Fail now rather than reap the pane holding it. The
+        # plain capture only says whether the pane ends like a cue; the question
+        # is read with wrapped rows joined so a cue split across rows or a
+        # question wider than the pane comes back whole.
+        question = (
+            detect_launcher_question(_capture_pane(socket_path, tmux_target, join_wrapped=True))
+            if not billing_notice and _composer_row(pane) is None and may_end_with_answer_cue(pane)
+            else None
+        )
+        if question is not None and question == launcher_question:
+            # A launcher that printed its question and died leaves the text on a
+            # retained pane; that is an exit to report, not something to answer.
+            state = _claude_pane_state(socket_path, tmux_target)
+            if state.alive is False:
+                pane_exited = state.exited
+                exited_status = state.exit_status
+                break
+            raise ClaudeLauncherQuestionPending(
+                "Claude Code's launcher is waiting for an answer in this session's "
+                "terminal, so the message was not delivered."
+                + _format_terminal_failure_tail(pane),
+                title="Claude Code can't start until you answer a question in the terminal",
+                remediation=(
+                    f'Open the terminal and answer "{question}". Claude Code continues '
+                    "on its own once the launcher finishes; then send your message again."
+                ),
+            )
+        launcher_question = question
         now = time.monotonic()
         if now >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)

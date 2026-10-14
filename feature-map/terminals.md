@@ -25,7 +25,8 @@ reattach when the session moves to another host.
   failures and still notice a real exit afterwards.
 - `hidden-terminal`: in chat view, the background terminal never draws over the
   chat or composer.
-- `dialog-routing`: when the harness is waiting on a dialog in its terminal, chat
+- `dialog-routing`: when the harness is waiting on a dialog in its terminal, or
+  its launcher is parked on a yes/no question before the harness runs, chat
   says so and routes the user to the terminal.
 
 ## How to get to it (user POV)
@@ -120,7 +121,11 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`hidden-terminal`:**
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**
-  `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
+  `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`,
+  `tests/e2e_ui/messages/test_native_claude_launcher_prompt.py::test_launcher_question_is_announced_in_chat`
+  (nightly; a stand-in launcher wrapper parks Claude Code's start on
+  `Upgrade Claude Code if available? (Y/n)`: chat shows the card, the question
+  is answered in Terminal view, and the resent message gets its reply).
 
 ## Gotchas
 

@@ -15,6 +15,8 @@ import pytest
 from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
+    ClaudeLauncherPending,
+    ClaudeLauncherQuestionPending,
     ClaudePromptTimeout,
     ClaudeSignInPending,
     ClaudeTerminalDialog,
@@ -1818,28 +1820,54 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
 
 
 @pytest.mark.asyncio
-async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
+@pytest.mark.parametrize(
+    ("pending", "expected_code"),
+    [
+        (
+            ClaudeSignInPending(
+                "Claude Code is waiting for a sign-in in this session's terminal, "
+                "so the message was not delivered.",
+                title="Claude Code can't start until you sign in to Databricks",
+                remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+            ),
+            "databricks_sign_in_pending",
+        ),
+        (
+            ClaudeLauncherQuestionPending(
+                "Claude Code's launcher is waiting for an answer in this session's "
+                "terminal, so the message was not delivered.",
+                title="Claude Code can't start until you answer a question in the terminal",
+                remediation=(
+                    'Open the terminal and answer "Upgrade Claude Code if available? (Y/n)". '
+                    "Claude Code continues on its own once the launcher finishes; then send "
+                    "your message again."
+                ),
+            ),
+            "agent_startup_pending",
+        ),
+    ],
+    ids=["sign-in", "launcher-question"],
+)
+async def test_run_turn_keeps_the_pane_when_a_launcher_prompt_blocks_delivery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    pending: ClaudeLauncherPending,
+    expected_code: str,
 ) -> None:
     """
-    A launcher sign-in prompt fails the turn with the link and leaves the pane.
+    A launcher prompt fails the turn with its next step and leaves the pane.
 
-    The person signs in from the card's link and the launcher continues into
-    Claude Code on its own; reaping the pane would destroy that prompt. The
-    error carries the semantic code, headline and next step.
+    The person finishes a sign-in from the card's link or answers a question in
+    the embedded terminal, and the launcher continues into Claude Code on its
+    own; reaping the pane would destroy the prompt. The error carries the
+    semantic code, headline and next step.
     """
     bridge_dir = tmp_path / "bridge"
     killed: list[Path] = []
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
-        raise ClaudeSignInPending(
-            "Claude Code is waiting for a sign-in in this session's terminal, "
-            "so the message was not delivered.",
-            title="Claude Code can't start until you sign in to Databricks",
-            remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
-        )
+        raise pending
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(
@@ -1862,10 +1890,9 @@ async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
     assert len(events) == 1
     error = events[0]
     assert isinstance(error, ExecutorError)
-    assert error.code == "databricks_sign_in_pending"
-    assert error.title == "Claude Code can't start until you sign in to Databricks"
-    assert error.remediation is not None
-    assert "HQ7M-2KPD" in error.remediation
+    assert error.code == expected_code
+    assert error.title == pending.title
+    assert error.remediation == pending.remediation
     # The gate failed before the prompt was typed: the message never reached Claude Code.
     assert error.undelivered is True
 

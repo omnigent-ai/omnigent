@@ -79,6 +79,15 @@ turn, and Stop separately. For an offline host use the reconnect paths in
 [sessions](./sessions.md); a detached terminal has its own paths in
 [terminals](./terminals.md).
 
+**Claude launcher question:** on a managed host the launcher wrapper set as
+`harness.claude-native.command` (Databricks' `ug`) can stop on a yes/no
+question such as `Upgrade Claude Code if available? (Y/n)` before Claude Code
+runs. Send a message from Chat: a card says Claude Code can't start until you
+answer a question in the terminal and quotes it. Answer in Terminal view, then
+send the message again. Journey test:
+`tests/e2e_ui/messages/test_native_claude_launcher_prompt.py::test_launcher_question_is_announced_in_chat`
+(nightly; a stand-in wrapper plays the launcher).
+
 **Codex side chat:** type `/side <question>` in the parent composer, send a
 follow-up in the side pane, then close its tab. The parent conversation stays
 separate. See [sessions](./sessions.md) for all side-chat entry points.

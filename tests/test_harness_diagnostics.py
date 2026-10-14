@@ -8,7 +8,9 @@ import pytest
 
 from omnigent.harnesses.diagnostics import (
     bounded_diagnostic_tail,
+    detect_launcher_question,
     detect_sign_in_prompt,
+    may_end_with_answer_cue,
     sanitize_diagnostic_text,
     sign_in_next_step,
 )
@@ -375,6 +377,99 @@ def test_detect_sign_in_prompt_does_not_treat_an_auth_shaped_hostname_as_the_end
     prompt = detect_sign_in_prompt(screen)
     assert prompt is not None
     assert prompt.url == authorize_url
+
+
+# What Databricks' ``ug`` launcher prints before Claude Code runs when the
+# installed Claude Code is older than it requires; it then blocks on a keypress.
+_UG_UPGRADE_SCREEN = (
+    "Generating claude-code MCP client config...\n"
+    "No changes made to /home/user/.claude.json.\n"
+    "Managed settings drift detected, applying updates...\n"
+    "Installing ug CLI...\n"
+    "ug CLI installed (0.1.0+5f7eed4).\n"
+    "! ug requires Claude Code 2.1.290 or newer. Your current version is Claude Code 2.1.287.\n"
+    "Upgrade Claude Code if available? (Y/n) \n\n\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("screen", "expected"),
+    [
+        (_UG_UPGRADE_SCREEN, "Upgrade Claude Code if available? (Y/n)"),
+        ("Continue with the install? [y/N]: ", "Continue with the install? [y/N]:"),
+        ("Overwrite the existing settings (yes/no)?", "Overwrite the existing settings (yes/no)?"),
+        ("Proceed  (Y/N)\n", "Proceed (Y/N)"),
+        # Keys echoed into the waiting pane are not output the launcher printed.
+        (_UG_UPGRADE_SCREEN + "^[^[\n^[[A\n", "Upgrade Claude Code if available? (Y/n)"),
+        (
+            "Upgrade Claude Code if available? (Y/n) ^[[B",
+            "Upgrade Claude Code if available? (Y/n)",
+        ),
+    ],
+)
+def test_detect_launcher_question_lifts_the_waiting_question(screen: str, expected: str) -> None:
+    assert detect_launcher_question(screen) == expected
+
+
+@pytest.mark.parametrize(
+    "screen",
+    [
+        None,
+        "",
+        "\n\n",
+        "Starting MCP servers: omnigent",
+        # A cue mid-line is prose, not a prompt awaiting a key.
+        "Answer (Y/n) to each question as it appears.\n",
+        "Run with --yes to skip the [y/N] prompts and continue.\n",
+        # Output below the question means the launcher moved on.
+        _UG_UPGRADE_SCREEN + "Upgrading Claude Code...\n",
+        _UG_UPGRADE_SCREEN + "╭── Claude Code ──╮\n❯ \n",
+        # A fraction or a path is not an answer cue.
+        "Downloaded 3/4 files (1/2)\n",
+        # Mismatched delimiters are prose, not a cue.
+        "Continue (y/n]\n",
+    ],
+)
+def test_detect_launcher_question_ignores_other_screens(screen: str | None) -> None:
+    assert detect_launcher_question(screen) is None
+
+
+def test_detect_launcher_question_keeps_the_cue_of_a_long_line() -> None:
+    question = detect_launcher_question("x" * 200 + " (y/n)")
+    assert question is not None
+    assert len(question) <= 120
+    assert question.startswith("xxxx")
+    assert question.endswith("(y/n)")
+
+
+@pytest.mark.parametrize(
+    "screen",
+    [
+        _UG_UPGRADE_SCREEN,
+        # The cue wrapped at the pane edge: only its tail is on the last row.
+        "Upgrade Claude Code if available? (Y/\nn) \n",
+        "Continue? [y/N]: ^[[B",
+    ],
+)
+def test_may_end_with_answer_cue_accepts_a_closing_bracket_tail(screen: str) -> None:
+    assert may_end_with_answer_cue(screen)
+
+
+@pytest.mark.parametrize(
+    "screen",
+    [
+        None,
+        "",
+        "Loading Omnigent...\n",
+        "Claude Code v2.1.283\n",
+        _UG_UPGRADE_SCREEN + "Upgrading...\n",
+        # A long line ending in a bracket is ordinary output, not a wrapped cue.
+        "JSON Parse error: Unrecognized token\n  at parse (unknown)\n",
+        "  ⏵⏵ auto mode on (shift+tab to cycle)\n",
+    ],
+)
+def test_may_end_with_answer_cue_rejects_other_tails(screen: str | None) -> None:
+    assert not may_end_with_answer_cue(screen)
 
 
 def test_sign_in_next_step_names_the_agent_and_carries_no_address() -> None:

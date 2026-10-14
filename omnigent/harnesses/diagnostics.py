@@ -193,6 +193,71 @@ def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     return SignInPrompt(url=url, code=code)
 
 
+# A yes/no answer cue ending a question a launcher waits on: ``(Y/n)``,
+# ``[y/N]``, ``(yes/no)``, optionally followed by ``:`` or ``?``.
+_YES_NO = r"\s*(?:y(?:es)?\s*/\s*no?|no?\s*/\s*y(?:es)?)\s*"
+_YES_NO_CUE = re.compile(rf"(?:\({_YES_NO}\)|\[{_YES_NO}\])\s*[:?]?\s*$", re.IGNORECASE)
+_QUESTION_MAX_CHARS = 120
+# What a cue wrapped at the pane edge leaves on the last row: one short token
+# ending in a closing bracket, optionally followed by ``:`` or ``?``.
+_CUE_TAIL = re.compile(r"^\S{1,8}[\])]\s*[:?]?\s*$")
+
+
+def detect_launcher_question(screen: str | None) -> str | None:
+    """Find a yes/no question a launcher is waiting on at the bottom of the screen.
+
+    A launcher wrapper can stop before the agent binary runs and ask a question
+    of its own — ``ug``'s "Upgrade Claude Code if available? (Y/n)" — then block
+    on a keypress. The question counts only while it is the last thing printed,
+    since any output below it means the launcher has moved on; keys echoed into
+    the waiting pane (Escape as ``^[``, arrows as ``^[[A``) are not output.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: The question line with its answer cue, whitespace-normalized and
+        capped at :data:`_QUESTION_MAX_CHARS` by eliding its middle, e.g.
+        ``"Upgrade Claude Code if available? (Y/n)"``, or ``None``.
+    """
+    if not screen:
+        return None
+    lines = [
+        " ".join(line.split())
+        for line in (_ECHOED_CONTROL.sub("", raw) for raw in screen.splitlines())
+        if line.strip()
+    ]
+    if not lines or not _YES_NO_CUE.search(lines[-1]):
+        return None
+    line = lines[-1]
+    if len(line) <= _QUESTION_MAX_CHARS:
+        return line
+    head = _QUESTION_MAX_CHARS // 2
+    return f"{line[:head]}…{line[-(_QUESTION_MAX_CHARS - head - 1) :]}"
+
+
+def may_end_with_answer_cue(screen: str | None) -> bool:
+    """Whether the screen's last non-blank line may be a yes/no cue, possibly wrapped.
+
+    A cue can wrap at the pane edge so only a short tail (``n)``, ``N]:``) sits
+    on the last row. Callers use this cheap test on a plain capture to decide
+    when to re-read the pane with wrapped rows joined before
+    :func:`detect_launcher_question`; echoed keys are ignored.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: ``True`` when the last non-blank line ends with a complete cue or
+        is a short bracket-terminated fragment of one.
+    """
+    if not screen:
+        return False
+    lines = [
+        line
+        for line in (_ECHOED_CONTROL.sub("", raw) for raw in screen.splitlines())
+        if line.strip()
+    ]
+    if not lines:
+        return False
+    last = lines[-1].strip()
+    return _YES_NO_CUE.search(last) is not None or _CUE_TAIL.match(last) is not None
+
+
 def sign_in_next_step(agent: str) -> str:
     """Phrase the next step for a card whose harness is waiting on a launcher sign-in.
 
