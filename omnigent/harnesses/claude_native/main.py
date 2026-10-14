@@ -1724,10 +1724,10 @@ async def claude_model_catalog(
     # probe rows rather than blank the picker on a blip). Fetched off-thread.
     # For ambient gateways (no config), the probe is made with the CLI's own
     # credentials and headers; see _ambient_gateway_rejects_canonical_ids().
+    gateway_concrete_ids: tuple[str, ...] = ()
     if claude_config is not None:
         listing_provider = claude_config.listing_provider
         gateway_serves_canonical: bool | None = None
-        gateway_concrete_ids: tuple[str, ...] = ()
         if listing_provider is not None:
             gateway_serves_canonical, gateway_concrete_ids = await asyncio.to_thread(
                 _gateway_claude_listing, listing_provider
