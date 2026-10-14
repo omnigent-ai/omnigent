@@ -7820,6 +7820,9 @@ def _native_terminal_start_error_payload(
         # The raise site composes a client-safe message (versions + upgrade
         # command), so it can be shown verbatim.
         message = str(exc)
+    elif isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED:
+        # Only the person can fix the host's setup, and the message says how.
+        message = exc.message
     elif IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
         # Give the client an actionable message instead of a log pointer.
