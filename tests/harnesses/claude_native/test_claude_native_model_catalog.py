@@ -711,6 +711,8 @@ async def test_catalog_drops_bare_rows_when_configured_databricks_listing_is_und
     catalog = await claude_native.claude_model_catalog(config)
 
     assert [row for row in catalog or [] if str(row.get("model", "")).startswith("claude-")] == []
+
+
 _PASSTHROUGH_PICKER: list[dict[str, Any]] = [
     {"value": "default", "resolvedModel": "claude-opus-5-5[1m]", "displayName": "Default"},
     {"value": "opus[1m]", "resolvedModel": "claude-opus-5-5[1m]", "displayName": "Opus"},
