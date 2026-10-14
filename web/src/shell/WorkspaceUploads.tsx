@@ -278,7 +278,12 @@ export function UploadPicker({ directory }: { directory: string }) {
 export function resolveUploadTarget(event: DragEvent, browsedDirectory: string): string {
   const row =
     event.target instanceof Element ? event.target.closest<HTMLElement>("[data-drop-dir]") : null;
-  return [browsedDirectory.replace(/\/$/, ""), row?.dataset.dropDir].filter(Boolean).join("/");
+  return [
+    browsedDirectory.replace(/\/$/, ""),
+    row?.closest("[data-upload-tree]") ? row.dataset.dropDir : undefined,
+  ]
+    .filter(Boolean)
+    .join("/");
 }
 
 export function droppedUploadFiles(event: DragEvent, files: File[]): File[] {
