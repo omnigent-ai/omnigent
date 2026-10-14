@@ -83,10 +83,10 @@ jobs:
 
   integration:
     name: Integration (${{ matrix.name }})
-    # Draft PRs resolve to an EMPTY matrix in `setup`, so this job produces zero
-    # leg runs (and thus no skipped placeholder check). Fork PRs DO run (mock
-    # LLM, no secrets) -- same as ci.yml.
+    # Skip empty draft matrices before GitHub expands the strategy.
+    # Ready fork PRs run with mock LLM replies and no secrets.
     needs: setup
+    if: needs.setup.outputs.matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     # Per-leg ceiling; inner test step caps at 25 min, rest covers install +
     # junit upload. Legs run in parallel; longest gates wall-time.
