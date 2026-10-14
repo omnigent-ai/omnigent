@@ -30,7 +30,12 @@ function carriesFiles(transfer: DataTransfer | null | undefined): boolean {
 export function useFileDropTarget(
   target: HTMLElement | null,
   onFiles: (files: File[], event: DragEvent) => void,
-  options: { ignore?: (event: DragEvent) => boolean } = {},
+  options: {
+    ignore?: (event: DragEvent) => boolean;
+    onOver?: (event: DragEvent) => void;
+    onClear?: () => void;
+    clearOnScroll?: boolean;
+  } = {},
 ): boolean {
   const owner = useSyncExternalStore(
     subscribe,
@@ -40,8 +45,8 @@ export function useFileDropTarget(
   // A rebind between dragenter and drop would lose the depth count.
   const onFilesRef = useRef(onFiles);
   onFilesRef.current = onFiles;
-  const ignoreRef = useRef(options.ignore);
-  ignoreRef.current = options.ignore;
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
 
   useEffect(() => {
     if (!target) return;
@@ -49,10 +54,13 @@ export function useFileDropTarget(
     let depth = 0;
     const setIsDragActive = (active: boolean) => {
       if (active) setActiveTarget(target);
-      else if (activeTarget === target) setActiveTarget(null);
+      else {
+        if (activeTarget === target) setActiveTarget(null);
+        optionsRef.current.onClear?.();
+      }
     };
     const ignored = (event: DragEvent) => {
-      if (!ignoreRef.current?.(event)) return false;
+      if (!optionsRef.current.ignore?.(event)) return false;
       depth = 0;
       setIsDragActive(false);
       return true;
@@ -63,6 +71,7 @@ export function useFileDropTarget(
       if (ignored(e)) return;
       depth += 1;
       setIsDragActive(true);
+      optionsRef.current.onOver?.(e);
     };
 
     const leave = (e: DragEvent): void => {
@@ -78,6 +87,7 @@ export function useFileDropTarget(
       e.preventDefault();
       // A drag entering from another window can arrive without a dragenter.
       setIsDragActive(true);
+      optionsRef.current.onOver?.(e);
     };
 
     const drop = (e: DragEvent): void => {
@@ -96,6 +106,10 @@ export function useFileDropTarget(
       setIsDragActive(false);
     };
 
+    const scroll = () => {
+      if (optionsRef.current.clearOnScroll) end();
+    };
+    target.addEventListener("scroll", scroll);
     target.addEventListener("dragenter", enter);
     target.addEventListener("dragleave", leave);
     target.addEventListener("dragover", over);
@@ -113,6 +127,7 @@ export function useFileDropTarget(
     document.addEventListener("drop", end);
     document.addEventListener("dragend", end);
     return () => {
+      target.removeEventListener("scroll", scroll);
       target.removeEventListener("dragenter", enter);
       target.removeEventListener("dragleave", leave);
       target.removeEventListener("dragover", over);
