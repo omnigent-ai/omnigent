@@ -179,6 +179,7 @@ import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import type { FilePosition, OpenFileOptions, FileNavigationGuard } from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
 import { selectPullRequestInPanel } from "./PullRequestPanel";
+import { UploadWindowGuard } from "@/components/UploadWindowGuard";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
@@ -3503,6 +3504,7 @@ function AppShellImpl() {
           />
         </Suspense>
       )}
+      <UploadWindowGuard />
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
         <ForkDialogContextProvider value={forkDialogContextValue}>
           {/* `app-shell` paints the shared canvas behind the sidebar and
