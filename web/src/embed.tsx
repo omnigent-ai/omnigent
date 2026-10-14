@@ -67,8 +67,7 @@ import "./index.css";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
-import { restoreFontPreferences } from "./lib/restoreFontPreferences";
-import { setWebFontsEnabled } from "./lib/webFontLoader";
+import { applyWebFontCapability, restoreFontPreferences } from "./lib/restoreFontPreferences";
 
 // Restore saved font CSS when the embed module loads. Downloadable fonts wait
 // for the server capability probe. The UI/code font controls stay visible when
@@ -151,9 +150,7 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
     let alive = true;
     const boot = createBootServerInfo(resolveServerInfo());
     function applyCapabilities(resolved: ServerInfo): void {
-      const webfontsEnabled = isFeatureEnabled(resolved, "webfonts");
-      setWebFontsEnabled(webfontsEnabled);
-      if (webfontsEnabled) restoreFontPreferences();
+      applyWebFontCapability(isFeatureEnabled(resolved, "webfonts"));
       setInfo(resolved);
     }
     void boot.initial.then((resolved) => {
