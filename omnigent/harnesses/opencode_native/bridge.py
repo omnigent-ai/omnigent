@@ -512,6 +512,48 @@ def seed_opencode_auth(bridge_dir: Path) -> Path | None:
     return dest
 
 
+def user_gh_config_dir() -> Path:
+    """
+    Return the user's real GitHub CLI config directory (``gh``'s ``hosts.yml``).
+
+    Honors ``XDG_CONFIG_HOME`` (the runner's own env, the user's real config
+    home), defaulting to ``~/.config/gh``.
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "gh"
+
+
+def seed_gh_config(bridge_dir: Path) -> Path | None:
+    """
+    Copy the user's ``gh`` config into the per-session ``XDG_CONFIG_HOME``.
+
+    The server runs with a per-session ``XDG_CONFIG_HOME`` that hides the
+    user's ``gh auth login`` state (``gh/hosts.yml``), so ``gh`` run from the
+    OpenCode bash tool reports "not logged in". Copy the directory in
+    (best-effort, ``0700``/``0600``). Refreshed on every spawn so re-logins
+    propagate.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :returns: The destination directory written, or ``None`` when there is no
+        source ``gh`` config or the copy fails.
+    """
+    src = user_gh_config_dir()
+    if not src.is_dir():
+        return None
+    dest = xdg_config_home_for_bridge_dir(bridge_dir) / "gh"
+    try:
+        shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(src, dest)
+        os.chmod(dest, 0o700)
+        for path in dest.rglob("*"):
+            if path.is_file():
+                os.chmod(path, 0o600)
+    except OSError:
+        return None
+    return dest
+
+
 def auth_secret_path(bridge_dir: Path) -> Path:
     """
     Return the auth-secret file path for *bridge_dir*.
