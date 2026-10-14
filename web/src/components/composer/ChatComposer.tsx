@@ -45,6 +45,7 @@ import {
   NO_PAIRS,
   editAfterKeystroke,
   editBeforeKeystroke,
+  emptyPairAt,
   followKeystroke,
   isPairChar,
   pairsAround,
@@ -341,10 +342,12 @@ export function ComposerTextInput({
   keyboard,
 }: Pick<ChatComposerProps, "input" | "keyboard">) {
   const parsedRef = useRef<ComposerParse | null>(null);
+  const typingRef = useRef<ComposerTyping | null>(null);
   return (
     <ComposerTextarea
       {...input}
       parsedRef={parsedRef}
+      typingRef={typingRef}
       onKeyDown={(event) => {
         const textarea = event.currentTarget;
         // Keys reuse the draft's current parse; one that's stale or missing
@@ -388,7 +391,8 @@ export function ComposerTextInput({
           !event.metaKey &&
           !event.ctrlKey;
         const listEdit = insertNewline ? composerListEdit(textarea) : null;
-        const listStartEdit = event.key === " " && plain ? composerListStartEdit(textarea) : null;
+        const listStartEdit =
+          event.key === " " && plain ? composerListStartEdit(textarea, typingRef.current) : null;
         const shouldSubmitFromKeyboard =
           inFence === null &&
           isComposerSendKey(
@@ -431,7 +435,7 @@ export function ComposerTextInput({
   );
 }
 
-function composerListStartEdit(textarea: HTMLTextAreaElement) {
+function composerListStartEdit(textarea: HTMLTextAreaElement, typing: ComposerTyping | null) {
   const { value, selectionStart, selectionEnd } = textarea;
   if (selectionStart !== selectionEnd) return null;
   const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
@@ -441,7 +445,8 @@ function composerListStartEdit(textarea: HTMLTextAreaElement) {
   const [, indent, marker] = match;
   return {
     start: lineStart,
-    end: selectionStart,
+    // A `*` that was auto-paired loses its inserted closer with the conversion.
+    end: selectionStart + (typing?.emptyPairCloser(selectionStart) ?? 0),
     text: `${indent || "  "}${marker} `,
   };
 }
@@ -565,9 +570,17 @@ export interface ComposerParse {
   markdown: ComposerMarkdown | null;
 }
 
+/** What the typing edits track, for key handling. */
+export interface ComposerTyping {
+  /** The size of the inserted closer of an empty pair the caret is in (`*|*`), else 0. */
+  emptyPairCloser: (caret: number) => number;
+}
+
 type ComposerTextareaProps = ComponentPropsWithoutRef<"textarea"> & {
   /** Receives the draft's current parse after each render, for key handling. */
   parsedRef?: MutableRefObject<ComposerParse | null>;
+  /** Receives the typing edits' tracked closers while mounted, for key handling. */
+  typingRef?: MutableRefObject<ComposerTyping | null>;
   /** Draft range to tint as a slash command or skill token. */
   accentRange?: ComposerAccentRange | null;
   /**
@@ -611,6 +624,7 @@ export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComposerTextarea
       onMouseUp,
       accentRange,
       parsedRef,
+      typingRef,
       onCompactChange,
       value,
       ...props
@@ -677,7 +691,7 @@ export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComposerTextarea
       document.addEventListener("selectionchange", readSelection);
       return () => document.removeEventListener("selectionchange", readSelection);
     }, [highlighted, readSelection]);
-    useTypingEdits(textareaRef, isComposingRef);
+    useTypingEdits(textareaRef, isComposingRef, typingRef);
     useHighlightLayerSync(textareaRef, layerRef, highlighted, shown?.text);
     const scheduleUnfocused = useSettledBlur(textareaRef, setUnfocused);
     const compact = useMemo(
@@ -925,6 +939,7 @@ function useStableRanges(ranges: readonly RevealRange[]): readonly RevealRange[]
 function useTypingEdits(
   textareaRef: RefObject<HTMLTextAreaElement | null>,
   isComposingRef: RefObject<boolean>,
+  typingRef?: MutableRefObject<ComposerTyping | null>,
 ) {
   useEffect(() => {
     const textarea = textareaRef.current;
@@ -1005,15 +1020,23 @@ function useTypingEdits(
       };
       snapshot();
     };
+    const typing: ComposerTyping = {
+      emptyPairCloser: (caret) =>
+        textarea.value === trackedValue
+          ? (emptyPairAt(textarea.value, caret, state.pairs)?.size ?? 0)
+          : 0,
+    };
+    if (typingRef) typingRef.current = typing;
     textarea.addEventListener("beforeinput", onBeforeInput);
     textarea.addEventListener("input", onInput);
     document.addEventListener("selectionchange", onSelection);
     return () => {
+      if (typingRef?.current === typing) typingRef.current = null;
       textarea.removeEventListener("beforeinput", onBeforeInput);
       textarea.removeEventListener("input", onInput);
       document.removeEventListener("selectionchange", onSelection);
     };
-  }, [textareaRef, isComposingRef]);
+  }, [textareaRef, isComposingRef, typingRef]);
 }
 
 /**

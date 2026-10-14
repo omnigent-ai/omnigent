@@ -1273,6 +1273,20 @@ def test_auto_paired_markers_show_and_send_real_text(
         page.keyboard.press("ControlOrMeta+z")
         expect(composer).to_have_value(undone)
 
+    # A `*` and Space start a list: the conversion takes the inserted closer
+    # too, as one undo step.
+    composer.fill("")
+    page.keyboard.type("*")
+    expect(composer).to_have_value("**")
+    page.keyboard.type(" ")
+    expect(composer).to_have_value("  * ")
+    assert caret() == len("  * ")
+    page.keyboard.press("ControlOrMeta+z")
+    expect(composer).to_have_value("**")
+    composer.fill("")
+    page.keyboard.type("* item")
+    expect(composer).to_have_value("  * item")
+
 
 def test_code_block_in_a_quoted_list_item_stays_code(
     page: Page,

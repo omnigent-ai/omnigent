@@ -158,10 +158,15 @@ describe("ChatComposer", () => {
   });
 
   it("leaves Enter inside a code block to the block, not list continuation", () => {
-    const { input } = renderEditor("```\n- First item", true);
+    const { input, onKeyDown } = renderEditor("```\n- First item", true);
     caretToEnd(input);
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(input).not.toHaveValue("```\n- First item\n- ");
+    // Not cancelled: the browser inserts the code block's newline.
+    expect(fireEvent.keyDown(input, { key: "Enter" })).toBe(true);
+    expect(input).toHaveValue("```\n- First item");
+    expect(onKeyDown).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ shouldSubmitFromKeyboard: false }),
+    );
   });
 
   it("keeps route-owned input and submit handlers on the shared surface", () => {
@@ -1307,6 +1312,32 @@ describe("ComposerTextarea Markdown editing and new styles", () => {
     expect(shown()).toBe("say **bold**|");
     await type("`");
     expect(shown()).toBe("say **bold**`|");
+  });
+
+  it("drops the auto-paired closer when a typed `*` and Space start a list", async () => {
+    place("");
+    await type("*");
+    expect(shown()).toBe("*|*");
+    expect(fireEvent.keyDown(input(), { key: " " })).toBe(false);
+    expect(shown()).toBe("  * |");
+    await type("i");
+    await type("t");
+    await type("e");
+    await type("m");
+    expect(shown()).toBe("  * item|");
+    cleanup();
+    place("  ");
+    await type("*");
+    fireEvent.keyDown(input(), { key: " " });
+    expect(shown()).toBe("  * |");
+  });
+
+  it("keeps a restored `*` after the caret when a list starts", () => {
+    render(<Controlled initial="**" />);
+    act(() => input().focus());
+    input().setSelectionRange(1, 1);
+    fireEvent.keyDown(input(), { key: " " });
+    expect(shown()).toBe("  * |*");
   });
 
   it("pairs input that comes without a beforeinput (execCommand)", async () => {

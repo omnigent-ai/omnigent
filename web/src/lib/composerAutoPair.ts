@@ -197,6 +197,18 @@ export function spaceAfterOpener(
   };
 }
 
+/** The inserted pair still in the draft with nothing between its markers but the caret. */
+export function emptyPairAt(
+  text: string,
+  caret: number,
+  tracked: readonly AutoPair[],
+): AutoPair | null {
+  return (
+    live(text, tracked).find((pair) => pair.open + pair.size === caret && pair.close === caret) ??
+    null
+  );
+}
+
 /** Backspace in an empty inserted pair takes a marker from each side (`**|**` to `*|*`). */
 export function backspaceInPair(
   text: string,
@@ -204,7 +216,7 @@ export function backspaceInPair(
   tracked: readonly AutoPair[],
 ): PairEdit | null {
   const pairs = live(text, tracked);
-  const at = pairs.find((pair) => pair.open + pair.size === caret && pair.close === caret);
+  const at = emptyPairAt(text, caret, pairs);
   if (!at) return null;
   const others = pairs.filter((pair) => pair !== at);
   return {
