@@ -112,7 +112,10 @@ function isAbortTimeout(error: unknown): boolean {
  */
 const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 
+export type SessionSortBy = "updated_at" | "created_at";
+
 export interface UseConversationsOptions {
+  sortBy?: SessionSortBy;
   refreshIntervalMs?: number | false;
   snapshot?: boolean;
   reconcileWhileConnected?: boolean;
@@ -512,6 +515,7 @@ export async function fetchConversationsPage({
   queryClient,
   signal: requestSignal,
   limit = sidebarConfig.sessionPageSize,
+  sortBy = "updated_at",
 }: {
   after?: string;
   searchQuery: string;
@@ -521,13 +525,12 @@ export async function fetchConversationsPage({
   queryClient: QueryClient;
   signal?: AbortSignal;
   limit?: number;
+  sortBy?: SessionSortBy;
 }): Promise<ConversationsPage> {
-  // `updated_at` matches the sidebar's sort, which keeps server
-  // pagination consistent with the visible order as the user scrolls.
-  // See sidebarNav.ts.
+  // Match the visible order so pagination selects the same session window.
   const params = new URLSearchParams({
     order: "desc",
-    sort_by: "updated_at",
+    sort_by: sortBy,
     limit: String(limit),
     visibility: visibility ?? "all",
   });
@@ -649,11 +652,15 @@ export function useConversations(
   // append `project` for a concrete name; append `visibility` only when set so
   // the "mine"/"shared" tab queries get their own cache entries without
   // disturbing the existing all-sessions key used by every other caller.
-  const queryKey = visibility
-    ? ["conversations", searchQuery, includeArchived, project ?? null, visibility]
-    : project
-      ? ["conversations", searchQuery, includeArchived, project]
-      : ["conversations", searchQuery, includeArchived];
+  const sortBy = options.sortBy ?? "updated_at";
+  const queryKey =
+    sortBy === "created_at"
+      ? ["conversations", searchQuery, includeArchived, project ?? null, visibility, sortBy]
+      : visibility
+        ? ["conversations", searchQuery, includeArchived, project ?? null, visibility]
+        : project
+          ? ["conversations", searchQuery, includeArchived, project]
+          : ["conversations", searchQuery, includeArchived];
   const query = useInfiniteQuery({
     queryKey,
     queryFn: async ({ pageParam }) => {
@@ -666,6 +673,7 @@ export function useConversations(
           visibility,
           queryClient,
           limit: sessionPageSize,
+          sortBy,
         });
       return timeInitialConversationLoad(pageParam, visibility, fetchPage);
     },
@@ -2322,9 +2330,10 @@ export function useMoveToProject() {
     // insert a deep row (outside the flat window) into the first page.
     let visibleOutsideOldFolders = inWindow;
     if (targetProjectName !== null) {
-      const targetKey = ["project-sessions", targetProjectName];
-      const targetData = queryClient.getQueryData<ConversationsInfiniteData>(targetKey);
-      if (targetData) {
+      for (const [targetKey, targetData] of queryClient.getQueriesData<ConversationsInfiniteData>({
+        queryKey: ["project-sessions", targetProjectName],
+      })) {
+        if (!targetData) continue;
         const { data: merged, found } = mergeItemsIntoPages(
           targetData,
           itemsById,
@@ -2499,10 +2508,11 @@ async function fetchProjectSessionsPage(
   project: string,
   after?: string,
   limit = 20,
+  sortBy: SessionSortBy = "updated_at",
 ): Promise<ConversationsPage> {
   const params = new URLSearchParams({
     order: "desc",
-    sort_by: "updated_at",
+    sort_by: sortBy,
     limit: String(limit),
     visibility: "mine",
     project,
@@ -2524,11 +2534,16 @@ async function fetchProjectSessionsPage(
  * Folders keep their own 20-row pages and infinite-scroll sentinel,
  * independently of the global list's configured page size.
  */
-export function useProjectSessions(project: string, enabled: boolean) {
-  const queryKey = ["project-sessions", project];
+export function useProjectSessions(
+  project: string,
+  enabled: boolean,
+  sortBy: SessionSortBy = "updated_at",
+) {
+  const queryKey = ["project-sessions", project, ...(sortBy === "created_at" ? [sortBy] : [])];
   const query = useInfiniteQuery({
     queryKey,
-    queryFn: ({ pageParam }) => fetchProjectSessionsPage(project, pageParam as string | undefined),
+    queryFn: ({ pageParam }) =>
+      fetchProjectSessionsPage(project, pageParam as string | undefined, 20, sortBy),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,

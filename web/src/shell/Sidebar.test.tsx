@@ -238,15 +238,15 @@ function renderSidebar(
   const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
-      <SidebarDataProvider config={config}>
-        <ExtensionCatalogProvider extensions={extensions}>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={[initialEntry]}>
-              {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
-            </MemoryRouter>
-          </TooltipProvider>
-        </ExtensionCatalogProvider>
-      </SidebarDataProvider>
+      <CapabilitiesProvider info={info ?? "loading"}>
+        <SidebarDataProvider config={config}>
+          <ExtensionCatalogProvider extensions={extensions}>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={[initialEntry]}>{sidebar}</MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </CapabilitiesProvider>
     </QueryClientProvider>,
   );
 }
@@ -3259,22 +3259,56 @@ describe("Sidebar view options", () => {
     expect(within(groupSection("Older")).getByText("conv_old")).toBeInTheDocument();
   });
 
-  it("orders the flat list by status, newest first within a status", () => {
-    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "status" }));
+  it("orders the flat list by creation time instead of status or updates", () => {
     mockConversations([
-      conv("conv_done_new", "Codex", { status: "idle", updated_at: 300 }),
-      conv("conv_running", "Codex", { status: "running", updated_at: 100 }),
-      conv("conv_done_old", "Codex", { status: "idle", updated_at: 200 }),
+      conv("conv_done_new", "Codex", { status: "idle", created_at: 3, updated_at: 300 }),
+      conv("conv_running", "Codex", { status: "running", created_at: 1, updated_at: 100 }),
+      conv("conv_done_old", "Codex", { status: "idle", created_at: 2, updated_at: 400 }),
     ]);
     renderGroupingSidebar();
 
+    openViewSubmenu("session-ordering-menu");
+    expect(screen.queryByTestId("session-ordering-status")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Created" }));
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("created");
     const links = within(groupSection("Sessions")).getAllByRole("link", { name: /^conv_/ });
     expect(links.map((link) => link.textContent)).toEqual([
-      "conv_running",
       "conv_done_new",
       "conv_done_old",
+      "conv_running",
     ]);
   });
+
+  it.each(["default", "status", "updated"])(
+    "uses Created within %s groups and project folders",
+    (grouping) => {
+      localStorage.setItem(
+        "omnigent:sidebar-view",
+        JSON.stringify({ ordering: "created", grouping }),
+      );
+      projectsMock.push("Customer X");
+      mockConversations([
+        conv("conv_old", "Codex", { created_at: 1, updated_at: 200 }),
+        conv("conv_new", "Codex", { created_at: 2, updated_at: 100 }),
+        conv("conv_project_old", "Codex", {
+          created_at: 3,
+          updated_at: 400,
+          labels: { omni_project: "Customer X" },
+        }),
+        conv("conv_project_new", "Codex", {
+          created_at: 4,
+          updated_at: 300,
+          labels: { omni_project: "Customer X" },
+        }),
+      ]);
+      renderGroupingSidebar();
+      if (grouping === "default")
+        fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+      expect(
+        screen.getAllByRole("link", { name: /^conv_/ }).map((link) => link.textContent),
+      ).toEqual(["conv_project_new", "conv_project_old", "conv_new", "conv_old"]);
+    },
+  );
 
   it("shows the toggled metadata under the title and the updated time in the trailing slot", () => {
     useHostsMock.mockReturnValue({
@@ -3461,14 +3495,25 @@ describe("Sidebar view options", () => {
 
 describe("sidebar_grouping_ui release flag", () => {
   const SHARED_AND_OWNED = [
-    conv("conv_mine", "Claude Code", { status: "idle", host_id: "host_box", git_branch: "fix/x" }),
-    conv("conv_shared", "Claude Code", { status: "idle", owner: "other@example.com" }),
+    conv("conv_mine", "Claude Code", {
+      status: "idle",
+      host_id: "host_box",
+      git_branch: "fix/x",
+      created_at: 1,
+      updated_at: 200,
+    }),
+    conv("conv_shared", "Claude Code", {
+      status: "idle",
+      owner: "other@example.com",
+      created_at: 2,
+      updated_at: 100,
+    }),
   ];
 
   it("keeps the default sidebar while off, ignoring stored view options", async () => {
     localStorage.setItem(
       "omnigent:sidebar-view",
-      JSON.stringify({ grouping: "status", ordering: "status", show: ["environment", "updated"] }),
+      JSON.stringify({ grouping: "status", ordering: "created", show: ["environment", "updated"] }),
     );
     useHostsMock.mockReturnValue({
       data: [{ host_id: "host_box", name: "Build box", sandbox_provider: null }],
@@ -3481,6 +3526,11 @@ describe("sidebar_grouping_ui release flag", () => {
     const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
     expect(within(sessions).getByTestId("session-filter")).toBeInTheDocument();
     expect(within(sessions).getByText("conv_shared")).toBeInTheDocument();
+    expect(
+      within(sessions)
+        .getAllByRole("link", { name: /^conv_/ })
+        .map((link) => link.textContent),
+    ).toEqual(["conv_mine", "conv_shared"]);
     expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Done" })).toBeNull();
     expect(screen.queryByTestId("session-row-meta")).toBeNull();
@@ -3511,7 +3561,9 @@ describe("sidebar_grouping_ui release flag", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderGroupingSidebar();
 
-    expect(screen.getAllByRole("button", { name: "Filter sessions" })).toHaveLength(1);
+    expect(
+      screen.getAllByRole("button", { name: "Group, sort, and filter sessions" }),
+    ).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Select sessions" })).toHaveLength(1);
     const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
     expect(within(sessions).queryByTestId("session-filter")).toBeNull();

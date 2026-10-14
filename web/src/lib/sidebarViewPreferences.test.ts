@@ -15,7 +15,7 @@ describe("sidebarViewPreferences", () => {
   });
 
   it("round-trips a stored selection", () => {
-    const view = { grouping: "status", ordering: "status", show: ["updated", "branch"] } as const;
+    const view = { grouping: "status", ordering: "created", show: ["updated", "branch"] } as const;
     writeSidebarViewPreferences(view);
     expect(readSidebarViewPreferences()).toEqual(view);
   });
@@ -23,7 +23,7 @@ describe("sidebarViewPreferences", () => {
   it("falls back per field on unknown or corrupt values", () => {
     localStorage.setItem(
       "omnigent:sidebar-view",
-      JSON.stringify({ grouping: "project", ordering: "updated", show: ["pr", "branch", 3] }),
+      JSON.stringify({ grouping: "project", ordering: "status", show: ["pr", "branch", 3] }),
     );
     expect(readSidebarViewPreferences()).toEqual({
       grouping: "default",

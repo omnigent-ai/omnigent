@@ -6,6 +6,7 @@ grouping is deterministic; everything else comes from the live server.
 
 from __future__ import annotations
 
+from time import time
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -32,11 +33,14 @@ def _row(session_id: str, title: str, **extra: object) -> dict[str, object]:
 
 
 _ROWS = [
-    _row(_RUNNING, "Running session", status="running", updated_at=300),
-    _row(_AWAITING, "Awaiting session", pending_elicitations_count=1, updated_at=200),
+    _row(_RUNNING, "Running session", status="running", created_at=10, updated_at=300),
+    _row(
+        _AWAITING, "Awaiting session", pending_elicitations_count=1, created_at=20, updated_at=200
+    ),
     _row(
         _IDLE,
         "Idle session",
+        created_at=30,
         updated_at=100,
         git_branch="fix/payment-retries",
         workspace="/tmp/sidebar-view-options",
@@ -47,7 +51,15 @@ _ROWS = [
 
 def _serve_sessions(route: Route) -> None:
     params = parse_qs(urlparse(route.request.url).query)
-    data = [] if "pinned" in params else _ROWS
+    data = (
+        []
+        if "pinned" in params
+        else sorted(
+            _ROWS,
+            key=lambda row: (row[params.get("sort_by", ["created_at"])[0]], row["id"]),
+            reverse=True,
+        )
+    )
     route.fulfill(
         json={
             "data": data,
@@ -58,13 +70,13 @@ def _serve_sessions(route: Route) -> None:
     )
 
 
-def _enable_grouping_ui(page: Page) -> None:
+def _enable_grouping_ui(page: Page, enabled: bool = True) -> None:
     """Advertise the ``sidebar_grouping_ui`` release flag on the live server's info."""
 
     def serve_info(route: Route) -> None:
         response = route.fetch()
         info = response.json()
-        info["features"] = {**info.get("features", {}), "sidebar_grouping_ui": True}
+        info["features"] = {**info.get("features", {}), "sidebar_grouping_ui": enabled}
         route.fulfill(response=response, json=info)
 
     page.route("**/v1/info", serve_info)
@@ -83,7 +95,7 @@ def stubbed_sidebar(page: Page, request: pytest.FixtureRequest) -> str:
 
 
 def _open_view_submenu(page: Page, submenu_test_id: str) -> None:
-    page.get_by_test_id("session-filter").click()
+    page.get_by_test_id("session-filter").press("ArrowDown")
     page.get_by_test_id(submenu_test_id).click()
 
 
@@ -97,6 +109,9 @@ def test_status_grouping_and_show_toggles_persist_across_reload(
     """Status grouping titles the list by state, Show adds the branch line, and both persist."""
     expect(_section_header(page, "Sessions")).to_be_visible()
     filter_button = page.get_by_test_id("session-filter")
+    expect(filter_button).to_have_accessible_name("Group, sort, and filter sessions")
+    filter_button.hover()
+    expect(page.get_by_role("tooltip")).to_have_text("Group, sort, and filter sessions")
     before = filter_button.bounding_box()
 
     _open_view_submenu(page, "session-grouping-menu")
@@ -170,3 +185,67 @@ def test_tooltip_fetches_repo_and_pr_only_when_opened(
     )
     assert github_requests
     assert all(f"/v1/sessions/{_IDLE}/" in url for url in github_requests)
+
+
+def test_created_ordering_persists_and_flag_off_uses_updated(
+    page: Page, stubbed_sidebar: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The selected order reaches the API, survives reload, and is ignored with the flag off."""
+    requests: list[str] = []
+    page.on(
+        "request",
+        lambda request: requests.append(request.url) if "/v1/sessions?" in request.url else None,
+    )
+    links = page.locator('section a[href^="/c/"]')
+    expect(links).to_have_text(["Running session", "Awaiting session", "Idle session"])
+    _open_view_submenu(page, "session-ordering-menu")
+    expect(page.get_by_test_id("session-ordering-status")).to_have_count(0)
+    page.get_by_role("menuitemradio", name="Created", exact=True).click()
+    page.keyboard.press("Escape")
+    expect(links).to_have_text(["Idle session", "Awaiting session", "Running session"])
+    assert any("sort_by=created_at" in url for url in requests)
+    # Change the API row while the old Updated snapshot is still fresh.
+    monkeypatch.setitem(_ROWS[2], "updated_at", int(time()))
+    requests.clear()
+    pending: list[Route] = []
+
+    def defer_sessions(route: Route) -> None:
+        pending.append(route)
+
+    page.route("**/v1/sessions?*", defer_sessions)
+    _open_view_submenu(page, "session-ordering-menu")
+    page.get_by_role("menuitemradio", name="Updated", exact=True).click()
+    page.keyboard.press("Escape")
+    try:
+        expect(links).to_have_count(0)
+        expect(page.get_by_text("Loading…", exact=True)).to_be_visible()
+    finally:
+        page.unroute("**/v1/sessions?*", defer_sessions)
+        for route in pending:
+            _serve_sessions(route)
+    # Leaving the sidebar releases its hover-order freeze.
+    page.get_by_text("What should we build?", exact=True).hover()
+    expect(links).to_have_text(["Idle session (unread)", "Running session", "Awaiting session"])
+    assert any("sort_by=updated_at" in url for url in requests)
+    page.locator(f'a[href="/c/{_IDLE}"]').click(button="right")
+    page.get_by_test_id("mark-read-conversation").click()
+    _open_view_submenu(page, "session-show-menu")
+    page.get_by_test_id("session-show-updated").click()
+    page.keyboard.press("Escape")
+    idle_row = page.locator("li").filter(has=page.locator(f'a[href="/c/{_IDLE}"]'))
+    expect(idle_row.get_by_test_id("session-row-updated")).to_have_text("now")
+    _open_view_submenu(page, "session-ordering-menu")
+    page.get_by_role("menuitemradio", name="Created", exact=True).click()
+    page.keyboard.press("Escape")
+    page.reload()
+    expect(links).to_have_text(["Idle session", "Awaiting session", "Running session"])
+    _enable_grouping_ui(page, enabled=False)
+    requests.clear()
+    page.reload()
+    expect(links).to_have_text(["Idle session", "Running session", "Awaiting session"])
+    assert requests and all("sort_by=updated_at" in url for url in requests)
+    filter_button = page.get_by_role("button", name="Filter sessions", exact=True)
+    filter_button.hover()
+    expect(page.get_by_role("tooltip")).to_have_text("Filter sessions")
+    filter_button.click()
+    expect(page.get_by_test_id("session-ordering-menu")).to_have_count(0)

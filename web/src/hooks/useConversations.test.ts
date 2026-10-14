@@ -258,28 +258,34 @@ describe("useConversations project filter", () => {
   });
 });
 
-describe("fetchConversationsPage visibility", () => {
-  it.each([undefined, "mine", "shared", "archived"] as const)(
-    "sends explicit visibility for %s",
-    async (visibility) => {
-      fetchMock.mockResolvedValueOnce(
-        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
-      );
-      const queryClient = new QueryClient();
+describe.each([undefined, "updated_at", "created_at"] as const)(
+  "fetchConversationsPage sorting %s",
+  (sortBy) => {
+    it.each([undefined, "mine", "shared", "archived"] as const)(
+      "sends explicit visibility for %s",
+      async (visibility) => {
+        fetchMock.mockResolvedValueOnce(
+          mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+        );
+        const queryClient = new QueryClient();
 
-      await fetchConversationsPage({
-        searchQuery: "",
-        includeArchived: false,
-        visibility,
-        queryClient,
-      });
+        await fetchConversationsPage({
+          searchQuery: "",
+          includeArchived: false,
+          visibility,
+          sortBy,
+          queryClient,
+        });
 
-      const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
-      expect(params.get("visibility")).toBe(visibility ?? "all");
-      queryClient.clear();
-    },
-  );
-});
+        const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
+        expect(params.get("visibility")).toBe(visibility ?? "all");
+        expect(params.get("sort_by")).toBe(sortBy ?? "updated_at");
+        expect(params.get("order")).toBe("desc");
+        queryClient.clear();
+      },
+    );
+  },
+);
 
 describe("useConversations search timeout", () => {
   function renderSearch(searchQuery: string) {
@@ -2459,32 +2465,39 @@ describe("useProjectSessions", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("fetches the viewer's active project sessions, newest-first, when enabled", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
-        data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 9 }],
-        first_id: "conv_a",
-        last_id: "conv_a",
-        has_more: false,
-      }),
-    );
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useProjectSessions("Sprint 42", true), { wrapper });
+  it.each(["updated_at", "created_at"] as const)(
+    "fetches active project sessions by %s",
+    async (sortBy) => {
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            { id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 9 },
+          ],
+          first_id: "conv_a",
+          last_id: "conv_a",
+          has_more: false,
+        }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useProjectSessions("Sprint 42", true, sortBy), {
+        wrapper,
+      });
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    const url = fetchMock.mock.calls[0][0] as string;
-    expect(url).toContain("/v1/sessions?");
-    expect(url).toContain("project=Sprint+42");
-    expect(url).toContain("order=desc");
-    expect(url).toContain("sort_by=updated_at");
-    expect(url).toContain("limit=20");
-    expect(url).toContain("visibility=mine");
-    // Folders show active sessions only — archived ones leave the sidebar.
-    expect(url).not.toContain("include_archived");
-    expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");
-  });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      const url = fetchMock.mock.calls[0][0] as string;
+      expect(url).toContain("/v1/sessions?");
+      expect(url).toContain("project=Sprint+42");
+      expect(url).toContain("order=desc");
+      expect(url).toContain(`sort_by=${sortBy}`);
+      expect(url).toContain("limit=20");
+      expect(url).toContain("visibility=mine");
+      // Folders show active sessions only — archived ones leave the sidebar.
+      expect(url).not.toContain("include_archived");
+      expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");
+    },
+  );
 });
 
 describe("fetchProjectSessionIds", () => {
@@ -2877,64 +2890,70 @@ describe("useMoveToProject", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
   });
 
-  it("moves a folder-only row into the target folder's cache (no sidebar vanish)", async () => {
-    // A row loaded only through an expanded folder's own pagination is absent
-    // from every ["conversations"] page, so the folder union can't re-home it.
-    // The overlay must insert it into the target folder's cache in the same
-    // pass that removes it from the source folder's.
-    let resolveList: (value: Response) => void = () => {};
-    fetchMock.mockReset();
-    fetchMock
-      .mockReturnValueOnce(
-        new Promise<Response>((resolve) => {
-          resolveList = resolve;
-        }),
-      )
-      .mockResolvedValueOnce(
-        mockResponse({
-          id: "conv_deep",
-          object: "conversation",
-          title: "t",
-          created_at: 0,
-          updated_at: 1,
-          project_id: "p_sprint",
-          labels: {},
-        }),
+  it.each([false, true])(
+    "moves a folder-only row into target caches (Created: %s)",
+    async (created) => {
+      const sortKey = created ? ["created_at"] : [];
+      // A row loaded only through an expanded folder's own pagination is absent
+      // from every ["conversations"] page, so the folder union can't re-home it.
+      // The overlay must insert it into the target folder's cache in the same
+      // pass that removes it from the source folder's.
+      let resolveList: (value: Response) => void = () => {};
+      fetchMock.mockReset();
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            resolveList = resolve;
+          }),
+        )
+        .mockResolvedValueOnce(
+          mockResponse({
+            id: "conv_deep",
+            object: "conversation",
+            title: "t",
+            created_at: 0,
+            updated_at: 1,
+            project_id: "p_sprint",
+            labels: {},
+          }),
+        );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
+      queryClient.setQueryData(["conversations", "", false], infinitePage([]));
+      queryClient.setQueryData(
+        ["project-sessions", "Old folder", ...sortKey],
+        infinitePage([conversation({ id: "conv_deep", project_id: "p_old" })]),
       );
-    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
-    queryClient.setQueryData(["conversations", "", false], infinitePage([]));
-    queryClient.setQueryData(
-      ["project-sessions", "Old folder"],
-      infinitePage([conversation({ id: "conv_deep", project_id: "p_old" })]),
-    );
-    queryClient.setQueryData(
-      ["project-sessions", "Sprint 42"],
-      infinitePage([conversation({ id: "conv_resident" })]),
-    );
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+      queryClient.setQueryData(
+        ["project-sessions", "Sprint 42", ...sortKey],
+        infinitePage([conversation({ id: "conv_resident" })]),
+      );
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useMoveToProject(), { wrapper });
 
-    result.current.mutate({ id: "conv_deep", project: "Sprint 42" });
+      result.current.mutate({ id: "conv_deep", project: "Sprint 42" });
 
-    await waitFor(() => {
-      const target = queryClient.getQueryData<ConversationsInfiniteData>([
+      await waitFor(() => {
+        const target = queryClient.getQueryData<ConversationsInfiniteData>([
+          "project-sessions",
+          "Sprint 42",
+          ...sortKey,
+        ]);
+        const moved = target!.pages[0].data.find((c) => c.id === "conv_deep")!;
+        expect(moved.project_id).toBe("p_sprint");
+      });
+      const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
         "project-sessions",
-        "Sprint 42",
+        "Old folder",
+        ...sortKey,
       ]);
-      const moved = target!.pages[0].data.find((c) => c.id === "conv_deep")!;
-      expect(moved.project_id).toBe("p_sprint");
-    });
-    const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
-      "project-sessions",
-      "Old folder",
-    ]);
-    expect(oldFolder!.pages[0].data.find((c) => c.id === "conv_deep")).toBeUndefined();
+      expect(oldFolder!.pages[0].data.find((c) => c.id === "conv_deep")).toBeUndefined();
 
-    resolveList(mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }));
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-  });
+      resolveList(mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }));
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    },
+  );
 
   it("keeps a folder-only row in its source folder when nothing else can show it", async () => {
     // Same deep row, but the target folder has never been expanded (no cache

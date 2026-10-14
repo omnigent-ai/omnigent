@@ -16,6 +16,7 @@ import {
   pinOrderWrites,
   resolveSidebarDrop,
   sessionsListAcceptsDrop,
+  sortConversations,
   STATUS_BUCKETS,
   statusBucket,
   updatedBucket,
@@ -751,4 +752,20 @@ describe("sessionsListAcceptsDrop", () => {
     expect(sessionsListAcceptsDrop(drag("Customer X", true), true)).toBe(false);
     expect(sessionsListAcceptsDrop(drag(null, true), true)).toBe(true);
   });
+});
+
+it("keeps Created stable across updates, active-row overrides, and hover freezes", () => {
+  const old = { ...conversation("a", "old", new Date(1000)), created_at: 1, updated_at: 300 };
+  const newer = { ...conversation("b", "new", new Date(2000)), created_at: 2, updated_at: 100 };
+  const sameSecond = { ...newer, id: "c" };
+  const frozen = new Map([
+    [old.id, 999],
+    [newer.id, 1],
+  ]);
+  const active = { id: newer.id, updatedAt: 500 };
+  const ids = (rows: Conversation[]) =>
+    sortConversations(rows, active, frozen, "created_at").map((row) => row.id);
+  expect(ids([old, newer, sameSecond])).toEqual(["c", "b", "a"]);
+  expect(ids([{ ...old, updated_at: 1000 }, sameSecond, newer])).toEqual(["c", "b", "a"]);
+  expect(sortConversations([old, newer], null).map((row) => row.id)).toEqual(["a", "b"]);
 });

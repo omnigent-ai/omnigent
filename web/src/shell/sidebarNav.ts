@@ -1,4 +1,4 @@
-import type { Conversation } from "@/hooks/useConversations";
+import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
@@ -211,38 +211,24 @@ export function filterConversations(
   });
 }
 
-// Sort by `updated_at` desc so the order matches the row's relative-time
-// pill. The active chat uses its frozen snapshot from
-// `activeOverride` instead of its live `updated_at`, so sending a message
-// in the chat you're already viewing doesn't move it.
-//
-// `frozenKeys` (when non-null) pins EVERY row's sort key at its
-// first-seen value: a row's key is read from the map, or captured into it
-// on first sight. The sidebar passes its map while the pointer is inside
-// the list, so background `updated_at` bumps can't slide rows under the
-// cursor — a mid-interaction reorder sends clicks, right-clicks, and the
-// renames they trigger to the wrong session. Rows first seen while frozen
-// (a folder expanding, a page loading) capture their key on entry, and
-// the caller clears the map when the pointer leaves so the order snaps
-// back to reality.
-export function sortByUpdatedAtDesc(
+// Newest first. Freeze update timestamps for the active chat and hovered list;
+// creation timestamps stay immutable, including when the selected order changes.
+export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
   frozenKeys?: Map<string, number> | null,
+  sortBy: SessionSortBy = "updated_at",
 ): Conversation[] {
   const effective = (c: Conversation): number => {
-    if (frozenKeys) {
-      const frozen = frozenKeys.get(c.id);
-      if (frozen !== undefined) return frozen;
-      // Capture the override value for the active row so dropping the
-      // override mid-hover (navigating to another chat) can't move it.
-      const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
-      frozenKeys.set(c.id, live);
-      return live;
-    }
-    return activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+    const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+    const updatedAt = frozenKeys?.get(c.id) ?? live;
+    frozenKeys?.set(c.id, updatedAt);
+    return sortBy === "created_at" ? c.created_at : updatedAt;
   };
-  return [...conversations].sort((a, b) => effective(b) - effective(a));
+  return [...conversations].sort(
+    (a, b) =>
+      effective(b) - effective(a) || (sortBy === "created_at" ? b.id.localeCompare(a.id) : 0),
+  );
 }
 
 /** Status groups, in the order the grouped sidebar renders them. */

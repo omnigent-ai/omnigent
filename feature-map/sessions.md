@@ -83,8 +83,13 @@ the header menu), and each place is a separate entry point.
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Updated), Display (All / My / Shared / Archived), Ordering
-  (Updated / Status) and Show (Updated / Environment / Repo / Branch) submenus,
-  saved per device. Shared sessions get their own section above Sessions. A
+  (Updated / Created) and Show (Updated / Environment / Repo / Branch) submenus,
+  saved per device. Created keeps sessions newest-created first as messages arrive;
+  requests, pagination, and project folders use that order too. Switching order
+  clears the cached rows and shows loading while session timestamps refresh,
+  including project folders, pins, and Archived. With the flag off,
+  sessions always use Updated regardless of the saved preference. Shared sessions
+  get their own section above Sessions. A
   Status or Updated grouping replaces Projects, Shared and Sessions with titled
   groups; the first group's header takes the Projects header's place. Select
   sessions sits beside the filter and selects every list below it at once. Behind
@@ -314,7 +319,7 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`workspace-recovery`, desktop and mobile conversation, Canvas, and side-chat cards:**
   `tests/browser_ui/chat/test_workspace_missing_recovery.py::test_continue_missing_workspace_in_another_directory`
   runs without a repro instance using `uv run pytest <test>
-  --browser-ui-skip-build --video=on --output=<evidence-directory>`.
+--browser-ui-skip-build --video=on --output=<evidence-directory>`.
   The browser contract covers the error action, visible explanation, blank
   destination, rejected missing directory, directory browser, preflight before
   fork and launch, and navigation to copied history while the original remains
@@ -555,8 +560,9 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
 - **`view-options`:**
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_status_grouping_and_show_toggles_persist_across_reload`,
-  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`
-  (both enable the flag by patching `GET /v1/info`). Unit tests in
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
+  (enable the flag by patching `GET /v1/info`). Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
   that the flag-off sidebar ignores stored view options.
 
