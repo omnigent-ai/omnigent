@@ -19,10 +19,17 @@ import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { isEditorLevel } from "@/lib/permissionsApi";
 import {
   getUploadCapability,
+  UploadError,
   type UploadCapability,
   type UploadOwner,
 } from "@/lib/workspaceUploadsApi";
-import { cancelUpload, enqueueUploads, retryUpload } from "@/lib/workspaceUploadController";
+import type { SessionStatus } from "@/lib/types";
+import {
+  cancelUpload,
+  enqueueUploads,
+  retryUpload,
+  retryDelay,
+} from "@/lib/workspaceUploadController";
 import {
   isActiveUpload,
   ownerKey,
@@ -39,19 +46,22 @@ import { formatBytes } from "./fileStatusUtils";
 export function uploadGate(
   permission: number | null,
   capability: UploadCapability | null | undefined,
-  status: string | undefined,
+  status: SessionStatus | undefined,
   directory: string,
+  archived = false,
 ) {
   const visible = permission !== null && isEditorLevel(permission) && capability != null;
-  const reason = ["failed", "ended"].includes(status ?? "")
-    ? "Reconnect this session to upload files"
-    : directory.startsWith("/") || directory.split("/").includes("..")
-      ? "Uploads must stay inside the workspace"
-      : capability && !capability.supported && capability.reason !== "runner_unavailable"
-        ? capability.reason === "runner_capability_mismatch"
-          ? "Update the host and restart the session to upload files"
-          : (capability.reason ?? "Workspace uploads are unsupported")
-        : undefined;
+  const reason = archived
+    ? "Restore this archived session to upload files"
+    : status === "failed"
+      ? "Reconnect this session to upload files"
+      : directory.startsWith("/") || directory.split("/").includes("..")
+        ? "Uploads must stay inside the workspace"
+        : capability && !capability.supported && capability.reason !== "runner_unavailable"
+          ? capability.reason === "runner_capability_mismatch"
+            ? "Update the host and restart the session to upload files"
+            : (capability.reason ?? "Workspace uploads are unsupported")
+          : undefined;
   return { visible, reason, enabled: visible && !reason };
 }
 
@@ -61,6 +71,8 @@ interface UploadContextValue {
   visible: boolean;
   enabled: boolean;
   reason?: string;
+  retryCapability?: () => void;
+  probing: boolean;
   directory: string;
   destination: string;
   setDirectory: (directory: string) => void;
@@ -111,18 +123,64 @@ export function WorkspaceUploadProvider({
     queryFn: () => getUploadCapability(owner),
     enabled: identity !== null && permission !== null && isEditorLevel(permission),
     staleTime: 30_000,
-    retry: false,
+    retry: (attempt, error) =>
+      error instanceof UploadError && [429, 503].includes(error.status) && attempt < 5,
+    retryDelay: (attempt, error) =>
+      error instanceof UploadError && error.headers.has("Retry-After")
+        ? retryDelay(error, attempt)
+        : Math.min(30_000, retryDelay(error, attempt)),
   });
-  const gate = useMemo(
-    () => uploadGate(permission, capability.data, liveStatus ?? session?.status, directory),
-    [permission, capability.data, liveStatus, session?.status, directory],
-  );
+  const { refetch: refetchCapability } = capability;
+  const probeError = capability.failureReason ?? capability.error;
+  const probeReason =
+    probeError instanceof UploadError
+      ? probeError.status === 401
+        ? "Sign in again to upload files, then retry"
+        : probeError.status === 403
+          ? "Upload permission denied. Ask the session owner for access, then retry"
+          : probeError.status === 429
+            ? capability.isFetching
+              ? "Upload service is busy. Waiting before retrying"
+              : "Upload service is busy. Retry availability shortly"
+            : probeError.status === 503
+              ? capability.isFetching
+                ? "Upload service is unavailable. Retrying shortly"
+                : "Upload service is unavailable. Retry availability"
+              : "Could not check upload availability. Retry the check"
+      : probeError
+        ? "Could not check upload availability. Retry the check"
+        : undefined;
+  const gate = useMemo(() => {
+    const current = uploadGate(
+      permission,
+      capability.data,
+      liveStatus ?? session?.status,
+      directory,
+      session?.archived,
+    );
+    if (!probeReason || permission === null || !isEditorLevel(permission)) return current;
+    return { visible: true, enabled: false, reason: probeReason };
+  }, [
+    permission,
+    capability.data,
+    liveStatus,
+    session?.status,
+    session?.archived,
+    directory,
+    probeReason,
+  ]);
   const destination = directory || root?.split("/").filter(Boolean).at(-1) || "workspace";
   const value = useMemo<UploadContextValue>(
     () => ({
       owner,
       capability: capability.data,
       ...gate,
+      probing: capability.isFetching,
+      retryCapability: probeReason
+        ? () => {
+            void refetchCapability();
+          }
+        : undefined,
       directory,
       destination,
       setDirectory,
@@ -134,7 +192,18 @@ export function WorkspaceUploadProvider({
         enqueueUploads(owner, files, target, target || destination, capability.data.limits, client);
       },
     }),
-    [owner, capability.data, gate, directory, destination, setDirectory, client],
+    [
+      owner,
+      capability.data,
+      capability.isFetching,
+      refetchCapability,
+      probeReason,
+      gate,
+      directory,
+      destination,
+      setDirectory,
+      client,
+    ],
   );
   return <UploadContext.Provider value={value}>{children}</UploadContext.Provider>;
 }
@@ -178,6 +247,18 @@ export function UploadPicker({ directory }: { directory: string }) {
           <TooltipContent>{context.reason ?? "Upload files to this folder"}</TooltipContent>
         </Tooltip>
       </TooltipProvider>
+      {context.retryCapability && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          aria-label="Retry upload availability"
+          disabled={context.probing}
+          onClick={context.retryCapability}
+        >
+          Retry
+        </Button>
+      )}
       <input
         ref={input}
         type="file"
