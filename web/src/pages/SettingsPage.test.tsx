@@ -1228,7 +1228,7 @@ describe("SettingsPage", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Font for the code editor and terminal. Pick from the catalog or type any font installed on this device.",
+        "Font for the code editor and terminal. Pick from the catalog or type any installed font.",
       ),
     ).toBeInTheDocument();
     expect(
