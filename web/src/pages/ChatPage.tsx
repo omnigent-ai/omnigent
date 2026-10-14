@@ -4466,7 +4466,6 @@ function ComposerImpl(
           container={dropTarget}
           label="Attach to message"
           subtext="Sent with your next message"
-          variant="attach"
         />
       ) : null}
       {/* The composer stack above the card: trays dock onto the inset
