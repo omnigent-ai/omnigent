@@ -68,7 +68,7 @@ class _Rig:
     def capabilities(self, model: str) -> set[str]:
         row = next((row for row in self.catalog["models"] if row["slug"] == model), None)
         if row is None:
-            if model == _STANDARD_MODEL or any(
+            if any(
                 os.environ.get(name) == model
                 for name in (
                     "OMNIGENT_TEST_CODEX_STANDARD_MODEL",
