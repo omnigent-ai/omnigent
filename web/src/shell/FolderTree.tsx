@@ -763,22 +763,34 @@ function FolderTreeInner({
     dropRoot &&
     upload &&
     (dropHover.row && hoverBounds && rootBounds ? (
-      // The rail's transform must not offset the label's viewport coordinates.
-      createPortal(
-        <div
-          aria-hidden="true"
-          data-drop-variant="upload"
-          className="pointer-events-none fixed z-40 truncate rounded-md border border-info bg-card-solid px-2 py-1 text-ui text-info shadow-composer"
-          style={{
-            left: rootBounds.left + 8,
-            top: Math.min(hoverBounds.bottom, rootBounds.bottom - 32),
-            maxWidth: rootBounds.width - 16,
-          }}
-        >
-          Upload to {dropHover.directory || upload.destination}
-        </div>,
-        document.body,
-      )
+      <>
+        {/* A root-level file row targets the browsed root, so outline the root too. */}
+        {dropHover.directory === browseLocation.replace(/\/$/, "") &&
+          createPortal(
+            <div
+              aria-hidden="true"
+              data-upload-root-outline=""
+              className="pointer-events-none absolute inset-0 z-40 m-2 rounded-md border-2 border-dashed border-info"
+            />,
+            dropRoot,
+          )}
+        {/* The rail's transform must not offset the label's viewport coordinates. */}
+        {createPortal(
+          <div
+            aria-hidden="true"
+            data-drop-variant="upload"
+            className="pointer-events-none fixed z-40 truncate rounded-md border border-info bg-card-solid px-2 py-1 text-ui text-info shadow-composer"
+            style={{
+              left: rootBounds.left + 8,
+              top: Math.min(hoverBounds.bottom, rootBounds.bottom - 32),
+              maxWidth: rootBounds.width - 16,
+            }}
+          >
+            Upload to {dropHover.directory || upload.destination}
+          </div>,
+          document.body,
+        )}
+      </>
     ) : (
       <FileDropOverlay
         container={dropRoot}
