@@ -57,7 +57,10 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     EventBatchFrame,
     decode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.runner.transports.ws_tunnel.serve import (
+    RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
+    RUNNER_TUNNEL_REJECTION_PREFIX,
+)
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -2792,30 +2795,35 @@ async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
     assert "/v1/sessions/conv_test/agent/contents" in message
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    [RUNNER_TUNNEL_REJECTION_PREFIX, RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX],
+    ids=["rejected-by-server", "no-credential"],
+)
 def test_main_reports_tunnel_rejection_without_traceback(
+    prefix: str,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Fatal tunnel rejections are rendered as concise CLI errors.
+    """Fatal tunnel auth failures are rendered as concise CLI errors.
 
+    :param prefix: Fatal-class message prefix emitted by ``serve_tunnel``.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param capsys: Pytest stdout/stderr capture fixture.
     :returns: None.
     """
 
-    async def _raise_tunnel_rejection() -> None:
+    async def _raise_tunnel_failure() -> None:
         """Raise the RuntimeError shape emitted by ``serve_tunnel``.
 
         :returns: None.
-        :raises RuntimeError: Always, matching fatal server rejection.
+        :raises RuntimeError: Always, matching a fatal tunnel auth failure.
         """
-        raise RuntimeError(
-            f"{RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP 401); check remote server authentication"
-        )
+        raise RuntimeError(f"{prefix}(HTTP 401); check remote server authentication")
 
     monkeypatch.setattr(
         "omnigent.runner._entry._run_tunnel_from_env",
-        _raise_tunnel_rejection,
+        _raise_tunnel_failure,
     )
 
     with pytest.raises(SystemExit) as exc_info:
@@ -2823,11 +2831,9 @@ def test_main_reports_tunnel_rejection_without_traceback(
 
     assert exc_info.value.code == 1
     stderr = capsys.readouterr().err
-    # The CLI should expose the actionable rejection message without
-    # dumping the asyncio/serve_tunnel traceback onto stderr.
-    assert stderr == (
-        f"error: {RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP 401); check remote server authentication\n"
-    )
+    # The CLI should expose the actionable message without dumping the
+    # asyncio/serve_tunnel traceback onto stderr.
+    assert stderr == f"error: {prefix}(HTTP 401); check remote server authentication\n"
     assert "Traceback" not in stderr
 
 

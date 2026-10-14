@@ -660,6 +660,53 @@ async def test_serve_tunnel_fails_loud_on_auth_redirect(
 
 
 @pytest.mark.asyncio
+async def test_serve_tunnel_auth_redirect_hint_uses_wrapper_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_WRAPPER_COMMAND`` names the wrapper CLI in the redirect hints.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        """Redirect every upgrade to the OAuth login page.
+
+        :param app: Runner ASGI app.
+        :raises InvalidURI: Always, carrying the OAuth target.
+        """
+        del app
+        raise InvalidURI(
+            "https://example.databricks.com/oidc/oauth2/v2.0/authorize", "scheme isn't ws or wss"
+        )
+
+    async def _sleep(_delay: float) -> None:
+        """No-op sleep.
+
+        :param _delay: Reconnect delay (unused).
+        """
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://example.databricksapps.com",
+            runner_id="runner_redirect_env_hint",
+            runner_version="0.1.0",
+        )
+
+    message = str(exc_info.value)
+    assert message.startswith(serve_module.RUNNER_TUNNEL_REJECTION_PREFIX)
+    # Both hints name the wrapper the user actually runs, not the naked binary.
+    assert "`isaac omni login https://example.databricksapps.com` to re-authenticate" in message
+    assert "run `isaac omni setup` to configure credentials" in message
+    assert "`omnigent " not in message
+
+
+@pytest.mark.asyncio
 async def test_serve_tunnel_retries_auth_redirect_after_successful_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

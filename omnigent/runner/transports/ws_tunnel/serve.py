@@ -555,10 +555,9 @@ async def serve_tunnel(
                         and not getattr(auth_token_factory, "declined", False)
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):
-                        # Same streak as the rejection below, so a transient
-                        # mint failure (factory returns None) still gets the
-                        # loop-top re-mint; only the message differs, naming
-                        # the local credential source instead of the server.
+                        # Same streak as the rejection below: a transient mint
+                        # failure (factory returned None) still gets the loop-top
+                        # re-mint; only the message names the local cause.
                         raise RuntimeError(
                             f"{RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX}"
                             f"(HTTP {http_status} persisted across "
