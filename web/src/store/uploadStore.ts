@@ -26,6 +26,7 @@ export interface UploadRow extends UploadOwner {
   controller: AbortController;
   limits: UploadLimits;
   status: UploadStatus;
+  cancellationPending?: boolean;
   conflict: ConflictChoice;
   error?: string;
   result?: UploadResult;
@@ -36,7 +37,7 @@ export function ownerKey(owner: UploadOwner): string {
 }
 
 export function isActiveUpload(row: UploadRow): boolean {
-  return !["done", "failed", "cancelled"].includes(row.status);
+  return Boolean(row.cancellationPending) || !["done", "failed", "cancelled"].includes(row.status);
 }
 
 interface UploadStore {
