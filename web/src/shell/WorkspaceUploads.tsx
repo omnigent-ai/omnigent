@@ -68,6 +68,10 @@ interface UploadContextValue {
 }
 const UploadContext = createContext<UploadContextValue | null>(null);
 
+export function useWorkspaceUpload() {
+  return useContext(UploadContext);
+}
+
 export function WorkspaceUploadProvider({
   sessionId,
   children,
@@ -190,8 +194,10 @@ export function UploadPicker({ directory }: { directory: string }) {
   );
 }
 
-export function resolveUploadTarget(_event: DragEvent, browsedDirectory: string): string {
-  return browsedDirectory;
+export function resolveUploadTarget(event: DragEvent, browsedDirectory: string): string {
+  const row =
+    event.target instanceof Element ? event.target.closest<HTMLElement>("[data-drop-dir]") : null;
+  return [browsedDirectory.replace(/\/$/, ""), row?.dataset.dropDir].filter(Boolean).join("/");
 }
 
 export function droppedUploadFiles(event: DragEvent, files: File[]): File[] {
@@ -207,13 +213,20 @@ export function droppedUploadFiles(event: DragEvent, files: File[]): File[] {
 export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
   const context = useContext(UploadContext);
   const [target, setTarget] = useState<HTMLDivElement | null>(null);
-  const active = useFileDropTarget(context?.enabled ? target : null, (files, event) => {
-    if (context)
-      context.enqueue(
-        droppedUploadFiles(event, files),
-        resolveUploadTarget(event, context.directory),
-      );
-  });
+  const active = useFileDropTarget(
+    context?.enabled ? target : null,
+    (files, event) => {
+      if (context)
+        context.enqueue(
+          droppedUploadFiles(event, files),
+          resolveUploadTarget(event, context.directory),
+        );
+    },
+    {
+      ignore: (event) =>
+        event.target instanceof Element && event.target.closest("[data-upload-tree]") !== null,
+    },
+  );
   return (
     <div
       ref={setTarget}

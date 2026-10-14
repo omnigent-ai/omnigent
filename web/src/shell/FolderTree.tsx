@@ -1,6 +1,10 @@
 import { ChevronRightIcon, FolderIcon, FolderOpenIcon } from "lucide-react";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
+import { createPortal } from "react-dom";
+import { FileDropOverlay } from "@/components/FileDropOverlay";
+import { droppedUploadFiles, resolveUploadTarget, useWorkspaceUpload } from "./WorkspaceUploads";
+import { useTreeUploadDrop } from "./useTreeUploadDrop";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   type DirectoryResult,
@@ -738,6 +742,53 @@ function FolderTreeInner({
     getItemKey: (index) => flatRows[index]?.key ?? index,
   });
 
+  const upload = useWorkspaceUpload();
+  const { active: dropActive, hover: dropHover } = useTreeUploadDrop(scrollElementRef, {
+    enabled:
+      !!upload?.enabled && !!visibleTree?.length && !searchQuery.trim() && !isLoading && !isError,
+    directory: browseLocation,
+    onFiles: (droppedFiles, event) =>
+      upload?.enqueue(
+        droppedUploadFiles(event, droppedFiles),
+        resolveUploadTarget(event, browseLocation),
+      ),
+    onExpand: togglePath,
+  });
+  const dropRoot = scrollElementRef.current?.closest<HTMLElement>("[data-upload-drop-root]");
+  const hoverBounds = dropHover?.row?.getBoundingClientRect();
+  const rootBounds = dropRoot?.getBoundingClientRect();
+  const dropFeedback =
+    dropActive &&
+    dropHover &&
+    dropRoot &&
+    upload &&
+    (dropHover.row && hoverBounds && rootBounds ? (
+      // The rail's transform must not offset the label's viewport coordinates.
+      createPortal(
+        <div
+          aria-hidden="true"
+          data-drop-variant="upload"
+          className="pointer-events-none fixed z-40 truncate rounded-md border border-info bg-card px-2 py-1 text-ui text-info shadow-composer"
+          style={{
+            left: rootBounds.left + 8,
+            top: Math.min(hoverBounds.bottom, rootBounds.bottom - 32),
+            maxWidth: rootBounds.width - 16,
+          }}
+        >
+          Upload to {dropHover.directory || upload.destination}
+        </div>,
+        document.body,
+      )
+    ) : (
+      <FileDropOverlay
+        container={dropRoot}
+        variant="upload"
+        label="Upload to workspace"
+        destination={upload.destination}
+        subtext="Saved to this session's files"
+      />
+    ));
+
   // Once a revealed directory's row exists in the flat tree (its ancestors'
   // lazy listings have landed), smooth-scroll it into view and start the
   // highlight flash — exactly once. Re-runs as `flatRows` changes so it can
@@ -901,6 +952,9 @@ function FolderTreeInner({
                   dirtyDirMap={dirtyDirMap}
                   onNavigateDir={onNavigateDir}
                   highlighted={row.kind === "node" && row.key === revealedPath}
+                  dropHighlighted={
+                    dropHover?.directory === [browseLocation, row.key].filter(Boolean).join("/")
+                  }
                 />
               )}
             </div>
@@ -920,6 +974,7 @@ function FolderTreeInner({
           {spacer}
         </div>
       )}
+      {dropFeedback}
     </TooltipProvider>
   );
 }
@@ -976,6 +1031,7 @@ function FileRowItem({
     <li className="list-none">
       <div
         onContextMenu={reveal.onContextMenu}
+        data-drop-dir={path.split("/").slice(0, -1).join("/")}
         className={cn(
           "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1",
           isDeleted ? "opacity-50" : "hover:bg-muted",
@@ -1106,6 +1162,7 @@ function SearchDirRow({
     <li className="list-none">
       <div
         onContextMenu={reveal.onContextMenu}
+        data-drop-dir={file.path}
         className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1 pl-2 hover:bg-muted"
       >
         <button
@@ -1184,6 +1241,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
   dirtyDirMap,
   onNavigateDir,
   highlighted = false,
+  dropHighlighted = false,
 }: {
   node: TreeNode;
   depth: number;
@@ -1197,6 +1255,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
   onNavigateDir?: (relativePath: string) => void;
   /** Briefly flash this row — used when a folder is revealed from search. */
   highlighted?: boolean;
+  dropHighlighted?: boolean;
 }) {
   const reveal = useRevealMenu(node.type === "file" ? null : node.path, true);
   if (node.type === "file") {
@@ -1226,11 +1285,15 @@ const TreeNodeRow = memo(function TreeNodeRow({
     // toggle rather than nesting one button inside another.
     <div
       onContextMenu={reveal.onContextMenu}
+      data-drop-dir={node.path}
+      data-drop-folder=""
+      data-upload-hover={dropHighlighted ? "" : undefined}
       className={cn(
         "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1 hover:bg-muted",
         // Reveal flash: reuse the chat nav-jump ring pulse so a folder opened
         // from search catches the eye briefly, then settles.
         highlighted && "animate-user-msg-flash",
+        dropHighlighted && "ring-2 ring-info ring-inset",
       )}
       style={{ paddingLeft: `${indentFor(depth)}px` }}
     >
