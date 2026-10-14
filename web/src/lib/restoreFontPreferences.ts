@@ -19,7 +19,7 @@ import { setWebFontsEnabled } from "./webFontLoader";
  * - UI font: applies the size (`--desktop-ui-font-size`) and family
  *   (`--ui-font-family`) to the document root.
  * - Fixed-width font: applies `--ui-mono-font-family`.
- * - Code font: loads the saved family for mounted editors and terminals.
+ * - Code font: travels via pub/sub, not a CSS variable, so load only when asked.
  *
  * Font loading is a no-op until `applyWebFontCapability` enables it.
  */
