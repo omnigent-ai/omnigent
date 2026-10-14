@@ -2266,6 +2266,137 @@ def test_read_transcript_items_since_ignores_observed_status_records(tmp_path: P
     assert current_response_id == items[0].response_id
 
 
+@pytest.mark.parametrize("from_offset", [False, True], ids=["line-cursor", "byte-cursor"])
+def test_read_transcript_items_ignores_api_request_snapshots(
+    tmp_path: Path, from_offset: bool
+) -> None:
+    """Request copies must not duplicate items or split the active response."""
+    transcript_path = tmp_path / "session.jsonl"
+    canonical = [
+        {"type": "user", "uuid": "prompt", "message": {"role": "user", "content": "hello"}},
+        {
+            "type": "assistant",
+            "uuid": "tool-call",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Read",
+                        "input": {"file_path": "TODO.md"},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "tool-result",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "todo contents"}
+                ],
+            },
+        },
+        _assistant_text_entry("reply", "Done."),
+    ]
+    records = []
+    for index, record in enumerate(canonical):
+        records.append(record)
+        # Observed blobs have a hash and message, but no uuid or timestamp.
+        records.append(
+            {"type": "api-request-blob", "hash": f"copy-{index}", "message": record["message"]}
+        )
+    records.extend(
+        [
+            {"type": "api-request-shape", "shapeHash": "shape-1", "shape": {}},
+            {"type": "api-request", "id": "request-1", "tail": ["copy-0"]},
+            {
+                "type": "api-request-blob",
+                "hash": "reminder",
+                "message": {
+                    "role": "user",
+                    "content": "<system-reminder>context</system-reminder>",
+                },
+            },
+        ]
+    )
+    transcript_path.write_text(
+        "".join(_transcript_line(record) for record in records), encoding="utf-8"
+    )
+
+    if from_offset:
+        result = read_transcript_items_from_offset(
+            transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+        )
+    else:
+        result = claude_native_bridge.read_transcript_items_since_with_position(
+            transcript_path, 0, agent_name="claude-native-ui"
+        )
+
+    assert result.line_cursor == len(records)
+    assert result.byte_offset == transcript_path.stat().st_size
+    assert [item.item_type for item in result.items] == [
+        "message",
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    assert result.items[0].data["content"] == [{"type": "input_text", "text": "hello"}]
+    assert result.items[1].data["call_id"] == "tool-1"
+    assert result.items[2].data == {"call_id": "tool-1", "output": "todo contents"}
+    assert result.items[3].data["content"] == [{"type": "output_text", "text": "Done."}]
+    assert result.current_response_id == result.items[1].response_id
+    assert all(item.response_id == result.current_response_id for item in result.items[1:])
+    assert [len(record.items) for record in result.record_items] == [
+        1,
+        0,
+        1,
+        0,
+        1,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+    ]
+    resumed = read_transcript_items_from_offset(
+        transcript_path,
+        result.byte_offset,
+        start_line=result.line_cursor,
+        current_response_id=result.current_response_id,
+        agent_name="claude-native-ui",
+    )
+    assert resumed.items == []
+    assert resumed.current_response_id == result.current_response_id
+
+
+@pytest.mark.parametrize("record_type", ["api-request-blob", "future-record", "system", None])
+@pytest.mark.parametrize("role", ["user", "assistant"])
+@pytest.mark.parametrize("include_sidechains", [False, True])
+def test_non_conversation_records_preserve_settled_response(
+    record_type: str | None, role: str, include_sidechains: bool
+) -> None:
+    """Metadata must not reset a turn or manufacture a scheduled wake."""
+    response_id, items = claude_native_bridge._transcript_items_from_entry(
+        {
+            "type": record_type,
+            "isSidechain": include_sidechains,
+            "message": {"role": role, "content": [{"type": "text", "text": "copied context"}]},
+        },
+        line_number=1,
+        record_offset=0,
+        agent_name="claude-native-ui",
+        current_response_id="resp-settled",
+        settled_response_id="resp-settled",
+        include_sidechains=include_sidechains,
+    )
+    assert items == []
+    assert response_id == "resp-settled"
+
+
 def test_read_transcript_items_since_parses_interruption_queued_prompt(tmp_path: Path) -> None:
     """
     Queued prompt attachments become user messages in the transcript.
@@ -2867,8 +2998,10 @@ def test_read_transcript_items_since_surfaces_bash_output_as_terminal_command(
     assert items[0].response_id.startswith("resp_claude_")
 
 
+@pytest.mark.parametrize("record_type", ["user", "system"])
 def test_read_transcript_items_since_surfaces_top_level_local_command(
     tmp_path: Path,
+    record_type: str,
 ) -> None:
     """
     Top-level ``local_command`` shell records become terminal items.
@@ -2885,7 +3018,7 @@ def test_read_transcript_items_since_surfaces_top_level_local_command(
             [
                 json.dumps(
                     {
-                        "type": "user",
+                        "type": record_type,
                         "subtype": "local_command",
                         "uuid": "bash-in-local",
                         "content": "<bash-input>pwd</bash-input>",
@@ -2893,7 +3026,7 @@ def test_read_transcript_items_since_surfaces_top_level_local_command(
                 ),
                 json.dumps(
                     {
-                        "type": "user",
+                        "type": record_type,
                         "subtype": "local_command",
                         "uuid": "bash-out-local",
                         "content": (

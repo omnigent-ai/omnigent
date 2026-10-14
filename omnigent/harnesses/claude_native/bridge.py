@@ -8026,6 +8026,12 @@ def _transcript_items_from_entry(
     """
     if not include_sidechains and entry.get("isSidechain") is True:
         return current_response_id, []
+    # Request snapshots contain copies of messages, not new conversation turns.
+    record_type = entry.get("type")
+    if record_type not in ("user", "assistant", "attachment") and not (
+        record_type == "system" and entry.get("subtype") == "local_command"
+    ):
+        return current_response_id, []
     if entry.get("type") == "attachment":
         return _attachment_transcript_items_from_entry(
             entry,

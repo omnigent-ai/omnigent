@@ -214,10 +214,11 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
     transcript_path.write_text(
         json.dumps(
             {
+                "type": "assistant",
                 "message": {
                     "role": "assistant",
                     "content": [{"type": "text", "text": "owned by executor"}],
-                }
+                },
             }
         )
         + "\n",
