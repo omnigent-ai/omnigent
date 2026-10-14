@@ -400,6 +400,9 @@ _OVERLAY_SURFACE = "an overlay"
 # lacks it is not such a surface — e.g. a launch wrapper's output before
 # Claude Code has drawn its input box — and an Escape cannot clear it.
 _ESCAPE_DISMISS_HINT = re.compile(r"\bEsc to \w", re.IGNORECASE)
+# An option row offering to quit, as on the workspace trust dialog. Cancelling
+# such a startup prompt exits Claude Code, so its Escape ends the session.
+_EXIT_OPTION_ROW = re.compile(r"^\s*(?:❯\s*)?(?:\d+\.\s*)?No, exit\s*$", re.MULTILINE)
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -4693,6 +4696,14 @@ def inject_slash_command(
     surface = _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
     if surface is not None:
         # No readiness gate follows; a blind Enter would answer the dialog.
+        pane = _capture_pane(socket_path, tmux_target)
+        headline = _terminal_dialog_headline(pane)
+        if headline is not None and _EXIT_OPTION_ROW.search(pane) is not None:
+            # Dismissing this dialog quits Claude Code, so name it instead.
+            raise ClaudeTerminalDialog(
+                f"Claude Code is waiting for an answer in its terminal ({headline}), so the "
+                "command was not sent. Open the terminal, answer the prompt, then retry."
+            )
         raise ClaudeTerminalDialog(
             f"Claude Code's input box is occupied by {surface}, so the command was "
             "not sent. Open the terminal, dismiss it, then retry."
@@ -5735,7 +5746,9 @@ def _restore_occupied_input(
     the web-UI message wins the pane.
 
     Questions and permission prompts are protected by their hook wait markers
-    and visible decision controls; they require an explicit answer.
+    and visible decision controls; they require an explicit answer. So does
+    a startup prompt that offers "No, exit", such as the workspace trust
+    dialog: cancelling it quits Claude Code.
 
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
@@ -5790,8 +5803,11 @@ def _restore_occupied_input(
             )
             return surface
         # Nothing an Escape can clear: launcher output before the input box
-        # mounts, or a dialog that offers no dismissal.
-        unclearable = surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane)
+        # mounts, a dialog that offers no dismissal, or a startup prompt whose
+        # cancel quits Claude Code.
+        unclearable = surface == _OVERLAY_SURFACE and (
+            not _ESCAPE_DISMISS_HINT.search(pane) or _EXIT_OPTION_ROW.search(pane) is not None
+        )
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
             # composer Escape interrupts the running turn, and a single frame

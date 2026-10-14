@@ -11178,6 +11178,39 @@ def test_terminal_dialog_headline_ignores_other_panes(pane: str) -> None:
     assert claude_native_bridge._terminal_dialog_headline(pane) is None
 
 
+@pytest.mark.parametrize("entry", ["message", "slash_command"])
+def test_delivery_never_escapes_the_workspace_trust_dialog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    """
+    The trust dialog's "Esc to cancel" is refused, not pressed.
+
+    Cancelling the dialog quits Claude Code (it exits with status 0), so the
+    reclaim's Escape ended the session it was trying to deliver to. The web
+    message or command is refused with the dialog named instead.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_TRUST_DIALOG_PANE])
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_args: claude_native_bridge._ClaudePaneState(alive=True),
+    )
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog) as excinfo:
+        if entry == "message":
+            inject_user_message(bridge_dir, content="hello from the web")
+        else:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert "Escape" not in [args[-1] for args in sends]
+    assert str(excinfo.value).startswith(
+        "Claude Code is waiting for an answer in its terminal (Accessing workspace:)"
+    )
+
+
 def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
