@@ -1264,6 +1264,97 @@ def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Pat
     }
 
 
+def _blocked_prompt_entry(reason: str, prompt: str, **overrides: Any) -> dict[str, Any]:
+    """
+    Build Claude Code's record of a prompt a ``UserPromptSubmit`` hook blocked.
+
+    :param reason: The hook's block reason.
+    :param prompt: The prompt Claude dropped.
+    :param overrides: Record keys to replace.
+    :returns: The ``system`` transcript record.
+    """
+    return {
+        "type": "system",
+        "subtype": "informational",
+        "level": "warning",
+        "uuid": "blocked-record",
+        "content": (
+            f"UserPromptSubmit operation blocked by hook:\n{reason}\n\nOriginal prompt: {prompt}"
+        ),
+        "preventContinuation": True,
+        "promptSubmitEnding": {
+            "ending": {"kind": "blocked_by_hook", "reason": reason},
+            "promptKept": False,
+        },
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize(
+    "reason,prompt",
+    [
+        ("Security: a token was detected in the prompt.", "deploy with this key"),
+        # Both the reason and the prompt contain the separator Claude writes between them.
+        ("Blocked.\n\nOriginal prompt: was refused", "line one\n\nOriginal prompt: quoted"),
+    ],
+)
+def test_transcript_mirrors_prompt_blocked_by_hook(
+    tmp_path: Path, reason: str, prompt: str
+) -> None:
+    """A hook-blocked prompt mirrors as its user message plus the hook's reason."""
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(_blocked_prompt_entry(reason, prompt)), encoding="utf-8"
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id="active"
+    )
+
+    assert current_response_id == "active"
+    assert [item.item_type for item in items] == ["message", "error"]
+    assert items[0].data == {"role": "user", "content": [{"type": "input_text", "text": prompt}]}
+    assert items[1].data == {
+        "source": "harness",
+        "code": "native_prompt_blocked_by_hook",
+        "message": (
+            "Claude Code did not run this message: a UserPromptSubmit hook blocked it.\n\n"
+            + reason
+        ),
+        "level": "info",
+    }
+    assert items[0].response_id == items[1].response_id
+    assert len({item.source_id for item in items}) == 2
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"type": "system", "subtype": "informational", "content": "Conversation compacted"},
+        _blocked_prompt_entry(
+            "No.", "hi", promptSubmitEnding={"ending": {"kind": "stopped_by_hook"}}
+        ),
+        _blocked_prompt_entry(
+            "No.", "", content="UserPromptSubmit operation blocked by hook:\nNo."
+        ),
+    ],
+    ids=["other-notice", "not-a-block", "prompt-missing"],
+)
+def test_transcript_skips_system_records_without_a_blocked_prompt(
+    tmp_path: Path, entry: dict[str, Any]
+) -> None:
+    """Only a hook block that names its prompt becomes conversation items."""
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(_transcript_line(entry), encoding="utf-8")
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id="active"
+    )
+
+    assert current_response_id == "active"
+    assert items == []
+
+
 _TEAMMATE_MESSAGE = '<teammate-message teammate_id="reviewer">Done</teammate-message>'
 _TASK_COMPLETION = (
     "<task-notification><task-id>agent-1</task-id><status>completed</status></task-notification>"

@@ -2,11 +2,14 @@
 
 import json
 import logging
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
 from omnigent.debug_logging import record_to_row
+from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
+from omnigent.harnesses.claude_native.forwarder import _external_conversation_item_event
 from omnigent.runtime import pending_inputs, session_stream
 from omnigent.server.routes._sessions.orchestration import _persist_external_conversation_item
 from omnigent.server.schemas import SessionEventInput
@@ -115,6 +118,62 @@ async def test_skipped_message_logs_committed_ids_once_and_keeps_enqueue_identit
     )
     assert [p["pending_id"] for p in pending_inputs.snapshot_for(conv.id)] == [newer]
     pending_inputs.resolve(conv.id, newer)
+
+
+@pytest.mark.asyncio
+async def test_hook_blocked_prompt_settles_its_web_message_with_the_reason(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "claude-native-ui"})
+    monkeypatch.setattr(session_stream, "publish", Mock())
+    for text, stable_id in (("deploy with this key", "a" * 32), ("deploy without it", "b" * 32)):
+        pending_inputs.record(
+            conv.id,
+            [{"type": "input_text", "text": text}],
+            stable_id=stable_id,
+            background_titles_enabled=False,
+        )
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {
+            "type": "system",
+            "subtype": "informational",
+            "uuid": "blocked-record",
+            "content": (
+                "UserPromptSubmit operation blocked by hook:\nA token was detected."
+                "\n\nOriginal prompt: deploy with this key"
+            ),
+            "promptSubmitEnding": {
+                "ending": {"kind": "blocked_by_hook", "reason": "A token was detected."}
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "later-record",
+            "message": {"role": "user", "content": "deploy without it"},
+        },
+    ]
+    transcript.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    _cursor, _response_id, items = read_transcript_items_since(transcript, 0, agent_name="Claude")
+
+    for item in items:
+        event = _external_conversation_item_event(item)
+        await _persist_external_conversation_item(
+            conv.id, conv, SessionEventInput.model_validate(event), store
+        )
+
+    saved = store.list_items(conv.id).data
+    # The blocked message settles with the hook's reason; the later match
+    # finds nothing left to report as never recorded.
+    errors = [item.data for item in saved if item.type == "error"]
+    assert [(e.code, e.level) for e in errors] == [("native_prompt_blocked_by_hook", "info")]
+    assert "A token was detected." in errors[0].message
+    assert [item.data.content[0]["text"] for item in saved if item.type == "message"] == [
+        "deploy with this key",
+        "deploy without it",
+    ]
+    assert pending_inputs.snapshot_for(conv.id) == []
 
 
 @pytest.mark.asyncio

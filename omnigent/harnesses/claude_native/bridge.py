@@ -8041,6 +8041,11 @@ def _transcript_items_from_entry(
             agent_name=agent_name,
             current_response_id=current_response_id,
         )
+    if entry.get("type") == "system" and (block := _hook_block_outcome(entry)) is not None:
+        # A blocked prompt neither starts nor ends a turn.
+        return current_response_id, _blocked_prompt_transcript_items(
+            entry, block, line_number=line_number, record_offset=record_offset
+        )
     message = entry.get("message")
     if not isinstance(message, dict):
         return current_response_id, []
@@ -8133,6 +8138,99 @@ def _attachment_transcript_items_from_entry(
         ),
     )
     return None, [item]
+
+
+# Claude Code's notice for a prompt a UserPromptSubmit hook blocked reads
+# "<header><reason><separator><original prompt>".
+_BLOCKED_PROMPT_HEADER = "UserPromptSubmit operation blocked by hook:\n"
+_BLOCKED_PROMPT_SEPARATOR = "\n\nOriginal prompt: "
+_BLOCKED_PROMPT_NOTICE = (
+    "Claude Code did not run this message: a UserPromptSubmit hook blocked it."
+)
+
+
+def _hook_block_outcome(entry: _JsonObject) -> _JsonObject | None:
+    """
+    Return the outcome of Claude's record of a prompt a hook blocked.
+
+    :param entry: Decoded Claude transcript record of ``type == "system"``.
+    :returns: Its ``promptSubmitEnding.ending`` object, e.g.
+        ``{"kind": "blocked_by_hook", "reason": "Token detected."}``, or
+        ``None`` when the record is not a hook block.
+    """
+    ending = entry.get("promptSubmitEnding")
+    outcome = ending.get("ending") if isinstance(ending, dict) else None
+    if isinstance(outcome, dict) and outcome.get("kind") == "blocked_by_hook":
+        return cast(_JsonObject, outcome)
+    return None
+
+
+def _blocked_prompt_transcript_items(
+    entry: _JsonObject,
+    outcome: _JsonObject,
+    *,
+    line_number: int,
+    record_offset: int | None,
+) -> list[ClaudeTranscriptItem]:
+    """
+    Mirror a prompt a ``UserPromptSubmit`` hook blocked, with the hook's reason.
+
+    Claude Code drops a blocked prompt before the model sees it and records
+    only a ``system`` notice holding the reason and the original prompt, so
+    a web message that carried the prompt otherwise stays queued until a
+    later message is recorded and is then reported as never recorded,
+    without the reason. The prompt is mirrored as the user message it was,
+    which settles that web message, followed by an informational notice
+    carrying the reason Claude showed in its terminal.
+
+    :param entry: Claude ``system`` record of the blocked prompt.
+    :param outcome: Its outcome from :func:`_hook_block_outcome`.
+    :param line_number: One-based transcript line number.
+    :param record_offset: Byte offset where the transcript record
+        starts, or ``None`` for legacy line-cursor reads.
+    :returns: The user message and the notice, or no items when the
+        original prompt cannot be recovered from the record.
+    """
+    content = entry.get("content")
+    if not isinstance(content, str) or not content.startswith(_BLOCKED_PROMPT_HEADER):
+        return []
+    body = content.removeprefix(_BLOCKED_PROMPT_HEADER)
+    reason = outcome.get("reason")
+    reason = reason if isinstance(reason, str) else ""
+    # The structured reason marks where the prompt starts even when either
+    # one contains the separator text.
+    if body.startswith(reason + _BLOCKED_PROMPT_SEPARATOR):
+        prompt = body[len(reason + _BLOCKED_PROMPT_SEPARATOR) :]
+    else:
+        prompt = body.partition(_BLOCKED_PROMPT_SEPARATOR)[2]
+    prompt = _unwrap_pasted_content_markers(prompt)
+    if not prompt.strip():
+        return []
+    source_key = _transcript_source_key(entry, line_number, record_offset)
+    response_id = _response_id_from_source(source_key)
+    notice = _BLOCKED_PROMPT_NOTICE
+    if reason.strip():
+        notice = f"{notice}\n\n{reason.strip()}"
+    return [
+        ClaudeTranscriptItem(
+            source_id=_source_id(source_key, 0, "message"),
+            item_type="message",
+            data={"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+            response_id=response_id,
+            agent_message_candidate=_is_agent_notification_text(prompt),
+        ),
+        ClaudeTranscriptItem(
+            source_id=_source_id(source_key, 1, "error"),
+            item_type="error",
+            data={
+                "source": "harness",
+                "code": "native_prompt_blocked_by_hook",
+                "message": notice,
+                "level": "info",
+            },
+            response_id=response_id,
+        ),
+    ]
 
 
 # Slash-command marker handling. Claude Code's embedded TUI emits
