@@ -917,7 +917,7 @@ class PolicyEngine:
         """
         return replace(ctx, conversation_id=self._conversation_id)
 
-    def _inject_conversation_title(self, ctx: EvaluationCOntext) -> EvaluationContext:
+    def _inject_conversation_title(self, ctx: EvaluationContext) -> EvaluationContext:
         """
         Return a copy of *ctx* with ``conversation_title`` populated.
 

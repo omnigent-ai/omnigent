@@ -1329,7 +1329,7 @@ async def test_engine_injects_conversation_title_matching_engine_conversation(
     into every event, even when the caller's ``EvaluationContext``
     doesn't set one.
 
-    What breaks if this fails: policy callables buildig a
+    What breaks if this fails: policy callables building a
     human-readable, session-scoped path would see
     ``conversation_title: None`` even though the engine was built
     with a title.
@@ -1354,7 +1354,7 @@ async def test_engine_conversation_title_none_when_untitled(
 ) -> None:
     """
     ``PolicyEngine.evaluate`` injects ``conversation_title: None`` for
-    an engine bulit without one, rather than omitting the key.
+    an engine built without one, rather than omitting the key.
     """
     captured: dict[str, Any] = {}
 

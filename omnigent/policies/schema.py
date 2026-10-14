@@ -186,7 +186,7 @@ class EventContext(TypedDict, total=False):
     :param conversation_id: The conversation this event belongs to.
         Injected by the engine, which already owns this identity.
         Read via ``event["context"]["conversation_id"]``.
-    :param conversation_title: The convesation's readable title
+    :param conversation_title: The conversation's readable title
         (``Conversation.title``). ``None`` when the conversation has no
         title yet. Read via ``event["context"]["conversation_title"]``.
     :param turn_final: On ``RESPONSE``, the runner relay sets ``True`` for
