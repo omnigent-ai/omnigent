@@ -27,6 +27,7 @@ import {
 import type { SessionStatus } from "@/lib/types";
 import {
   cancelUpload,
+  cancelUploads,
   enqueueUploads,
   retryUpload,
   retryDelay,
@@ -452,6 +453,7 @@ export function UploadsTray({ visible }: { visible: boolean }) {
                       variant="ghost"
                       size="sm"
                       aria-label={`Retry ${row.name}`}
+                      disabled={row.cancellationPending}
                       onClick={() => void retryUpload(row.key, client)}
                     >
                       Retry
@@ -502,19 +504,19 @@ export function UploadsTray({ visible }: { visible: boolean }) {
                 size="sm"
                 variant="ghost"
                 onClick={() =>
-                  rows.filter(isActiveUpload).forEach((row) => void cancelUpload(row.key))
+                  void cancelUploads(rows.filter(isActiveUpload).map((row) => row.key))
                 }
               >
                 Cancel remaining
               </Button>
             )}
-            {rows.some((row) => row.status === "failed") && (
+            {rows.some((row) => row.status === "failed" && !row.cancellationPending) && (
               <Button
                 size="sm"
                 variant="ghost"
                 onClick={() =>
                   rows
-                    .filter((row) => row.status === "failed")
+                    .filter((row) => row.status === "failed" && !row.cancellationPending)
                     .forEach((row) => void retryUpload(row.key, client))
                 }
               >
