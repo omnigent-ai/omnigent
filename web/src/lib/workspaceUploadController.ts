@@ -33,9 +33,9 @@ const refreshes = new Map<
   }
 >();
 const reportedBatches = new Set<string>();
-// A steady stream of completions keeps resetting the trailing debounce; flush session-wide
-// queries at least this often so search and listings stay fresh during long uploads.
-const SESSION_REFRESH_MAX_WAIT_MS = 1500;
+// A steady stream of completions keeps resetting the trailing debounce; flush at least
+// this often so folders, open files and search stay fresh during long uploads.
+const REFRESH_MAX_WAIT_MS = 1500;
 
 function debounceRefresh(
   key: string,
@@ -72,15 +72,20 @@ export function refreshUploadedFiles(
   const key = `${ownerKey(row)}:${row.directory}`;
   const paths = refreshes.get(key)?.paths ?? new Set<string>();
   if (result.outcome === "replaced") paths.add(result.path);
-  debounceRefresh(key, row, paths, () =>
-    refetch([
-      ["workspace-dir", sid, row.directory],
-      ...(row.directory ? [["workspace-dir", sid, "", row.directory]] : []),
-      ...Array.from(paths).flatMap((path) => [
-        ["file-content", sid, path],
-        ["file-diff", sid, path],
+  debounceRefresh(
+    key,
+    row,
+    paths,
+    () =>
+      refetch([
+        ["workspace-dir", sid, row.directory],
+        ...(row.directory ? [["workspace-dir", sid, "", row.directory]] : []),
+        ...Array.from(paths).flatMap((path) => [
+          ["file-content", sid, path],
+          ["file-diff", sid, path],
+        ]),
       ]),
-    ]),
+    REFRESH_MAX_WAIT_MS,
   );
   // Session-wide queries share one debounce across every destination folder.
   debounceRefresh(
@@ -98,7 +103,7 @@ export function refreshUploadedFiles(
         refetchType: "none",
       });
     },
-    SESSION_REFRESH_MAX_WAIT_MS,
+    REFRESH_MAX_WAIT_MS,
   );
 }
 

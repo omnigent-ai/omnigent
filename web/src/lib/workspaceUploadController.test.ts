@@ -1,4 +1,4 @@
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "./identity";
 import { uploadTotals, useUploadStore, type UploadRow } from "@/store/uploadStore";
@@ -420,6 +420,53 @@ it("flushes session-wide refetches during a sustained completion stream", async 
   discardUploads(row.origin, row.identity);
   await vi.advanceTimersByTimeAsync(5000);
   expect(counts()).toEqual(during.map((count) => count + 1));
+});
+
+it("refreshes an active folder and its replaced files during a sustained same-folder stream", async () => {
+  discardUploads(row.origin, row.identity);
+  vi.useFakeTimers();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  let fetches = 0;
+  const observer = new QueryObserver(client, {
+    queryKey: ["workspace-dir", "s", "src"],
+    queryFn: async () => ++fetches,
+  });
+  const unsubscribe = observer.subscribe(() => {});
+  await vi.advanceTimersByTimeAsync(0);
+  expect(fetches).toBe(1);
+  const path = (i: number) => `src/f${i}.bin`;
+  const refreshed = (i: number) =>
+    ["file-content", "file-diff"].map(
+      (kind) =>
+        invalidate.mock.calls.filter(
+          ([arg]) => JSON.stringify(arg?.queryKey) === JSON.stringify([kind, "s", path(i)]),
+        ).length,
+    );
+  // Replaced files land in one folder 200 ms apart for 4 s, so the 300 ms debounce never settles.
+  for (let i = 0; i < 20; i++)
+    setTimeout(
+      () =>
+        refreshUploadedFiles(client, row, {
+          path: path(i),
+          final_name: `f${i}.bin`,
+          size: 20,
+          sha256: "hash",
+          outcome: "replaced",
+        }),
+      i * 200,
+    );
+  await vi.advanceTimersByTimeAsync(4000);
+  const during = fetches - 1;
+  expect(during).toBeGreaterThanOrEqual(1);
+  expect(during).toBeLessThanOrEqual(3);
+  for (let i = 0; i < 16; i++) expect(refreshed(i)).toEqual([1, 1]);
+  for (let i = 16; i < 20; i++) expect(refreshed(i)).toEqual([0, 0]);
+  await vi.advanceTimersByTimeAsync(100);
+  expect(fetches).toBe(during + 2);
+  for (let i = 0; i < 20; i++) expect(refreshed(i)).toEqual([1, 1]);
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(fetches).toBe(during + 2);
+  unsubscribe();
 });
 
 it("cancels retry waits and distinguishes long upload-limit backoff from busy", async () => {
