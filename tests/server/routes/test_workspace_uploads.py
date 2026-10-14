@@ -786,7 +786,14 @@ async def test_capability_probe_coalesces_and_reconnect_invalidates(scenario, mo
         tasks = [asyncio.create_task(scenario.client.get(scenario.base)) for _ in range(3)]
         try:
             await asyncio.wait_for(entered.wait(), 0.5)
-            await asyncio.sleep(0.01)
+            tunnel = scenario.app.state.tunnel_registry.get("binary-test")
+            probe = tunnel.workspace_upload_capabilities[
+                (scenario.session_id, DEFAULT_ENVIRONMENT_ID)
+            ]
+            # Release the probe only once both other requests await the shared future.
+            async with asyncio.timeout(0.5):
+                while len(probe._done_callbacks) < 2:
+                    await asyncio.sleep(0)
             blocked.set()
             results = await asyncio.gather(*tasks)
             assert all(r.json()["supported"] for r in results)
