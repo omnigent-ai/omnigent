@@ -335,6 +335,14 @@ def test_workspace_upload_asleep_runner_wakes_without_a_message(
         )
         assert launched.status_code == 200, launched.text
         runner_id = launched.json()["runner_id"]
+        # Launch returns before the tunnel connects; uploads need the runner online first.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if client.get(f"/v1/runners/{runner_id}/status").json()["online"]:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("Launched runner never came online")
         _open_uploads(page, (base, sid, workspace))
         pid = _runner_pid_from_daemon_log(host.log_path)
         assert pid is not None, host.log_path.read_text()[-3000:]
