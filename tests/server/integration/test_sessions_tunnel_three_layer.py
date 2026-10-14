@@ -1920,6 +1920,82 @@ async def test_runner_disconnect_waits_rehome_window_for_runner_this_server_reti
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_retired_runner_live_elsewhere_at_the_short_grace_is_not_failed_later(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retired runner another replica already adopted is that replica's to fail.
+
+    The adopter later drops it ordinarily, clearing its stamp and starting its
+    own grace before this replica's re-home window ends. This replica must
+    stand down at the short grace, as it would without the window, instead
+    of failing the adopter's outage when the window ends.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.2
+    rehome = budget(2.0)
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.RUNNER_REHOME_GRACE_S", rehome, raising=False
+    )
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-adopted"
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+    try:
+        registry = ap_app.state.tunnel_registry
+        assert registry.deregister(runner_id, registry.get(runner_id)) is not None
+        await communicator.wait(timeout=budget(2.0))
+        own = session_live_state.last_liveness_stamp(runner_id)
+        assert own is not None, "the hello did not record this replica's own stamp"
+        # Another replica adopts the runner at once.
+        store.touch_runner_liveness([runner_id], own + 1)
+
+        async def _settled() -> None:
+            while sessions_module._session_status_cache.get(session_id) == "running":
+                await asyncio.sleep(0.02)
+
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(_settled(), timeout=rehome / 2)
+        cached = sessions_module._session_status_cache.get(session_id)
+        assert cached is None, f"expected a stand-down at the short grace, got {cached!r}"
+
+        # The adopter's ordinary drop clears its stamp; this replica's old
+        # window must not fail that outage when it ends.
+        store.clear_runner_liveness(runner_id)
+        await asyncio.sleep(rehome)
+        cached = sessions_module._session_status_cache.get(session_id)
+        assert cached is None, f"the old replica failed the adopter's outage: {cached!r}"
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
 async def test_server_initiated_close_never_fails_the_turn(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,

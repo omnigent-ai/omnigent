@@ -229,11 +229,14 @@ def test_server_retirement_uses_its_bounded_window_only(
                     }
                 )
                 (tmp_path / "observations.json").write_text(json.dumps(observations, indent=2))
-                if snapshot["status"] == "failed":
+                # The failed status is published just before its cause labels persist.
+                if snapshot["status"] == "failed" and snapshot.get("last_task_error"):
                     break
                 time.sleep(2)
             assert snapshot["status"] == "failed", snapshot
             assert expected - 3 <= elapsed <= expected + 25, observations
-            assert snapshot["last_task_error"]["code"] == "runner_disconnected"
+            assert (snapshot.get("last_task_error") or {}).get("code") == "runner_disconnected", (
+                snapshot
+            )
             release_mock_gate(mock_url)
         (tmp_path / "final-snapshot.json").write_text(json.dumps(snapshot, indent=2))

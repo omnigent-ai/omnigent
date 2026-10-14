@@ -242,6 +242,61 @@ async def test_retired_runner_keeps_relay_retrying_through_rehome_window(
 
 
 @pytest.mark.asyncio
+async def test_retired_runner_live_elsewhere_at_the_grace_is_not_failed_later(
+    db_uri: str,
+    relay_clock: _RelayClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retired runner adopted elsewhere stands the relay down at the 10 s grace.
+
+    The adopter later drops it ordinarily, clearing its stamp at t=24, before
+    this relay's 30 s re-home window ends; failing the turn then would cut
+    the adopter's own grace short.
+    """
+    import time
+
+    monkeypatch.setattr(orchestration, "RUNNER_REHOME_GRACE_S", 30.0, raising=False)
+    store = SqlAlchemyConversationStore(db_uri)
+    runner_id = "runner-adopted"
+    session_id = store.create_conversation(runner_id=runner_id).id
+    adopted_at = int(time.time())
+    monkeypatch.setattr(
+        "omnigent.server.session_live_state.last_liveness_stamp",
+        lambda _runner_id: adopted_at - 60,
+    )
+    store.touch_runner_liveness([runner_id], adopted_at)
+    orchestration._session_status_cache[session_id] = "running"
+    attempts = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal attempts
+        attempts += 1
+        relay_clock.now += 4.0
+        if relay_clock.now >= 20.0:
+            store.clear_runner_liveness(runner_id)
+        return httpx.Response(
+            200,
+            stream=_NaturalEofStream(b'data: {"type":"session.status","status":"running"}\n\n'),
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://runner", transport=_RetiredRunnerTransport(respond, relay_clock)
+        ) as client:
+            await asyncio.wait_for(
+                orchestration._relay_runner_stream(session_id, client, store), timeout=10
+            )
+        assert attempts == 3
+        assert relay_clock.now == pytest.approx(14.0)
+        assert orchestration._session_status_cache.get(session_id) is None
+    finally:
+        orchestration._session_status_cache.pop(session_id, None)
+        orchestration._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stopped_runner", [None, "runner-current", "runner-old"])
 async def test_natural_eof_matches_intent_to_the_relay_runner(
     db_uri: str, monkeypatch: pytest.MonkeyPatch, stopped_runner: str | None

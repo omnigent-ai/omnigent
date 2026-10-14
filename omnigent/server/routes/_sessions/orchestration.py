@@ -7920,8 +7920,9 @@ async def _relay_runner_stream(
     lost stream retries inside that window instead of failing the
     session. An intentional Stop exits quietly at once.
 
-    A runner whose tunnel this server retired (a replica re-home) gets
-    :data:`RUNNER_REHOME_GRACE_S` instead, to reconnect to another replica.
+    A runner whose tunnel this server retired (a replica re-home) and that
+    is live nowhere else when that grace ends keeps retrying through
+    :data:`RUNNER_REHOME_GRACE_S`, to reconnect to another replica.
 
     Past the grace the runner is genuinely gone — unless this server is the
     one shutting down (:func:`omnigent.server.shutdown_state.server_shutting_down`):
@@ -8031,7 +8032,18 @@ async def _relay_runner_stream(
             # Keep the ordinary deadline separate: a local registration clears
             # the retirement window even when its stream never reaches ready.
             retry_deadline = max(deadline, now + retire_remaining)
-            if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < retry_deadline:
+            # Past the ordinary grace a runner live on another replica belongs to
+            # it; only one still gone everywhere gets the rest of the window.
+            adopted = (
+                not lost.intentional
+                and deadline <= now + _RELAY_RETRY_INTERVAL_S < retry_deadline
+                and await _relay_runner_live_elsewhere(session_id, conversation_store)
+            )
+            if (
+                not lost.intentional
+                and not adopted
+                and now + _RELAY_RETRY_INTERVAL_S < retry_deadline
+            ):
                 retries += 1
                 _logger.info(
                     "Relay: runner transport lost for session=%s; retrying for %.1fs",
@@ -8046,15 +8058,20 @@ async def _relay_runner_stream(
                 # reason (an HTTP error), so keep the interval backoff: the
                 # waiter would return at once and spin. A client without a
                 # tunnel transport (in-process tests) also keeps the interval.
+                # Park to the ordinary deadline first, where adoption is checked.
                 wait = getattr(transport, "wait_for_runner", None)
-                if wait is None or await wait(retry_deadline - now):
+                if now + _RELAY_RETRY_INTERVAL_S < deadline:
+                    park_until = deadline
+                else:
+                    park_until = retry_deadline
+                if wait is None or await wait(park_until - now):
                     await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
             if lost.intentional:
                 decision = "intentional_stop"
             elif shutdown_state.server_shutting_down():
                 decision = "server_shutdown"
-            elif await _relay_runner_live_elsewhere(session_id, conversation_store):
+            elif adopted or await _relay_runner_live_elsewhere(session_id, conversation_store):
                 decision = "live_elsewhere"
             elif await _runner_disconnect_requires_failure(
                 session_id, conversation_store, origin="runner_disconnected_mid_turn"
