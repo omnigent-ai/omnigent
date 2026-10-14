@@ -131,3 +131,22 @@ it("file rows target their parent without spring-loading; text drags do nothing"
   expect(onFiles).not.toHaveBeenCalled();
   expect(screen.getByTestId("feedback")).toHaveTextContent("idle");
 });
+
+it("preserves depth after scroll so crossing rows does not clear hover or restart spring-load", () => {
+  vi.useFakeTimers();
+  const onExpand = vi.fn();
+  render(<Harness onExpand={onExpand} />);
+  const file = screen.getByTestId("file");
+  const folder = screen.getByTestId("folder");
+  fireEvent.dragEnter(file, { dataTransfer: transfer });
+  fireEvent.scroll(screen.getByTestId("scroll"));
+  expect(screen.getByTestId("feedback")).toHaveTextContent("idle");
+  fireEvent.dragEnter(folder, { dataTransfer: transfer });
+  fireEvent.dragLeave(file, { dataTransfer: transfer });
+  expect(screen.getByTestId("feedback")).toHaveTextContent("Upload to src/assets");
+  act(() => vi.advanceTimersByTime(599));
+  fireEvent.dragEnter(screen.getByTestId("folder-label"), { dataTransfer: transfer });
+  fireEvent.dragLeave(folder, { dataTransfer: transfer });
+  act(() => vi.advanceTimersByTime(1));
+  expect(onExpand).toHaveBeenCalledExactlyOnceWith("assets");
+});

@@ -18,7 +18,7 @@ export function useTreeUploadDrop(
 ) {
   const [target, setTarget] = useState<HTMLElement | null>(null);
   const [hover, setHover] = useState<TreeDropHover | null>(null);
-  const hoveredRow = useRef<HTMLElement | null>(null);
+  const currentHover = useRef<TreeDropHover | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const latest = useRef(options);
   latest.current = options;
@@ -26,7 +26,7 @@ export function useTreeUploadDrop(
   const clear = useCallback(() => {
     clearTimeout(timer.current);
     timer.current = undefined;
-    hoveredRow.current = null;
+    currentHover.current = null;
     setHover(null);
   }, []);
   const active = useFileDropTarget(options.enabled ? target : null, options.onFiles, {
@@ -37,10 +37,13 @@ export function useTreeUploadDrop(
         event.target instanceof Element
           ? event.target.closest<HTMLElement>("[data-drop-dir]")
           : null;
-      setHover({ directory: resolveUploadTarget(event, options.directory), row });
-      if (row === hoveredRow.current) return;
+      const directory = resolveUploadTarget(event, options.directory);
+      if (currentHover.current?.row === row && currentHover.current.directory === directory) return;
+      const rowChanged = row !== currentHover.current?.row;
+      currentHover.current = { directory, row };
+      setHover(currentHover.current);
+      if (!rowChanged) return;
       clearTimeout(timer.current);
-      hoveredRow.current = row;
       if (row?.hasAttribute("data-drop-folder") && row.querySelector('[aria-expanded="false"]')) {
         timer.current = setTimeout(() => {
           if (!row.isConnected || !target?.contains(row)) {
@@ -59,7 +62,7 @@ export function useTreeUploadDrop(
     }
     target.dataset.uploadTree = "";
     const observer = new MutationObserver(() => {
-      if (hoveredRow.current && !target.contains(hoveredRow.current)) clear();
+      if (currentHover.current?.row && !target.contains(currentHover.current.row)) clear();
     });
     observer.observe(target, { childList: true, subtree: true });
     return () => {

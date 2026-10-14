@@ -7,6 +7,7 @@ import os
 import re
 import threading
 from pathlib import Path
+from typing import Any
 
 import psutil
 import pytest
@@ -130,13 +131,14 @@ def test_workspace_upload_tree_folder_file_and_spring_load(
     assert (nested / "rerooted.txt").read_bytes() == b"rail bytes"
 
 
-def test_workspace_upload_tree_large_binary_bounded_rss(
+@pytest.fixture
+def large_tree_transfer(
     page: Page,
     upload_session: tuple[str, str, Path],
     upload_server_pids: dict[str, int],
     tmp_path: Path,
-) -> None:
-    """A multi-file nested drop includes a 200MiB raw binary with bounded server memory."""
+) -> tuple[dict[str, Any], list[tuple[Path, Path]], Path]:
+    """Drive one real multi-file transfer for independent byte and memory assertions."""
     base, sid, workspace = upload_session
     nested = workspace / "src" / "assets"
     nested.mkdir(parents=True)
@@ -191,7 +193,6 @@ def test_workspace_upload_tree_large_binary_bounded_rss(
             )
             if event == "dragover":
                 expect(page.get_by_text("Upload to src/assets", exact=True)).to_be_visible()
-                page.wait_for_timeout(800)
         tray = rail.get_by_role("region", name="Uploads")
         expect(tray.get_by_role("progressbar", name="large.bin upload progress")).to_be_visible()
         expect(tray.get_by_text("Done", exact=True)).to_have_count(3, timeout=180_000)
@@ -206,7 +207,6 @@ def test_workspace_upload_tree_large_binary_bounded_rss(
     files = []
     for path in [binary, *texts]:
         local, disk = _sha256(path), _sha256(nested / path.name)
-        assert local == disk
         files.append(
             {
                 "name": path.name,
@@ -234,4 +234,24 @@ def test_workspace_upload_tree_large_binary_bounded_rss(
     output = os.environ.get("WORKSPACE_UPLOAD_TREE_EVIDENCE")
     if output:
         Path(output).write_text(json.dumps(evidence, indent=2))
-    assert max(samples) < limit, evidence
+    return evidence, [(path, nested / path.name) for path in [binary, *texts]], workspace
+
+
+def test_workspace_upload_tree_large_binary_byte_exact(
+    large_tree_transfer: tuple[dict[str, Any], list[tuple[Path, Path]], Path],
+) -> None:
+    """The 200MiB binary and siblings arrive unchanged only in the nested destination."""
+    _, files, workspace = large_tree_transfer
+    for source, destination in files:
+        assert destination.parent == workspace / "src" / "assets"
+        assert destination.stat().st_size == source.stat().st_size
+        assert _sha256(destination) == _sha256(source)
+        assert not (workspace / source.name).exists()
+
+
+def test_workspace_upload_tree_isolated_rss(
+    large_tree_transfer: tuple[dict[str, Any], list[tuple[Path, Path]], Path],
+) -> None:
+    """Keep the transfer-layer memory gate independent of byte and destination coverage."""
+    evidence, _, _ = large_tree_transfer
+    assert evidence["server_peak_rss"] < evidence["rss_limit"], evidence

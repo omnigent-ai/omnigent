@@ -768,7 +768,7 @@ function FolderTreeInner({
         <div
           aria-hidden="true"
           data-drop-variant="upload"
-          className="pointer-events-none fixed z-40 truncate rounded-md border border-info bg-card px-2 py-1 text-ui text-info shadow-composer"
+          className="pointer-events-none fixed z-40 truncate rounded-md border border-info bg-card-solid px-2 py-1 text-ui text-info shadow-composer"
           style={{
             left: rootBounds.left + 8,
             top: Math.min(hoverBounds.bottom, rootBounds.bottom - 32),
