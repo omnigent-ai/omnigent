@@ -313,23 +313,22 @@ def build_native_controls(
     async def _defer_codex_native_settings_unreachable(
         conv_id: str,
         settings: _JsonObject,
+        bridge_dir: Path,
     ) -> Response:
         """Defer an update whose app-server refused the connection.
 
-        A pane still alive on the dead app-server is marked for replacement;
-        one that is already gone (idle reap) needs nothing.
+        A pane still alive on the dead app-server is marked for replacement in
+        *bridge_dir*, the bridge its state came from; one that is already gone
+        (idle reap) needs nothing.
         """
-        from omnigent.harnesses.codex_native.bridge import (
-            bridge_dir_for_bridge_id,
-            record_app_server_stopped,
-        )
+        from omnigent.harnesses.codex_native.bridge import record_app_server_stopped
 
         registry = resource_registry.terminal_registry
         pane = registry.get(conv_id, "codex", "main") if registry is not None else None
         pane_running = pane is not None and await pane.is_alive()
         if pane_running:
             # The pane outlives its app-server; mark it so the next ensure replaces it.
-            record_app_server_stopped(bridge_dir_for_bridge_id(conv_id))
+            record_app_server_stopped(bridge_dir)
         return _defer_codex_native_settings(
             conv_id,
             settings,
@@ -477,7 +476,9 @@ def build_native_controls(
                 # Nothing reached the app-server, so this is not a refusal of the update.
                 if not defer_if_not_live:
                     raise
-                unreachable = await _defer_codex_native_settings_unreachable(conv_id, settings)
+                unreachable = await _defer_codex_native_settings_unreachable(
+                    conv_id, settings, bridge_dir
+                )
                 return unreachable, settings
             if "model" in settings or "effort" in settings:
                 # Only an absent key inherits config; null selects the model's default.

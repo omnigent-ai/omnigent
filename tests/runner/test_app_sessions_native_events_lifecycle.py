@@ -1123,6 +1123,7 @@ async def _post_codex_native_event(
     *,
     client: _RecordingCodexAppServerClient | None = None,
     pane: bool | None = None,
+    bridge_id: str | None = None,
 ) -> tuple[Any, Path]:
     """
     Post *event_payload* to a codex-native session the runner knows nothing more about.
@@ -1134,12 +1135,23 @@ async def _post_codex_native_event(
         bridge state, like a session that never launched.
     :param pane: ``True`` seeds a running ``codex:main`` pane, ``False`` a dead one, and
         ``None`` none at all, like an idle-reaped session.
+    :param bridge_id: Bridge-id label the session resolves to, as after a Codex
+        ``/new`` rotation; ``None`` bridges under the conversation id.
     :returns: The runner's response and the session's bridge directory.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.runner import app as runner_app_module
 
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
-    bridge_dir = codex_native_bridge.prepare_bridge_dir(_CODEX_SETTINGS_CONV_ID)
+    if bridge_id is not None:
+        label_value = bridge_id
+
+        async def _labels(*, server_client: Any, session_id: str) -> dict[str, str]:
+            del server_client, session_id
+            return {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: label_value}
+
+        monkeypatch.setattr(runner_app_module, "_session_labels_for_runner_spawn", _labels)
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(bridge_id or _CODEX_SETTINGS_CONV_ID)
     if client is not None:
         codex_native_bridge.write_bridge_state(
             bridge_dir,
@@ -1147,7 +1159,7 @@ async def _post_codex_native_event(
                 session_id=_CODEX_SETTINGS_CONV_ID,
                 socket_path=client.transport,
                 thread_id="thread_codex",
-                codex_home=str(tmp_path / "codex-home"),
+                codex_home=str(codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)),
             ),
         )
         monkeypatch.setattr(
@@ -1295,6 +1307,41 @@ async def test_events_codex_native_settings_change_marks_a_live_pane_whose_app_s
         id="terminal_codex_main", type="terminal", session_id=_CODEX_SETTINGS_CONV_ID, name="Codex"
     )
     assert not orchestration._is_runner_owned_codex_terminal(_CodexPaneRegistry(), pane)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_events_codex_native_settings_change_marks_a_rotated_sessions_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    After a Codex ``/new`` rotation the stop record lands in the label's bridge.
+
+    The bridge-id label, not the conversation id, names the bridge the state came
+    from, and that is where the next terminal ensure looks for the record.
+    """
+    bridge_id = "b1d9e0a7c3f24e5d8a6b0c1d2e3f4a5b"
+    client = _FailingCodexAppServerClient(
+        "ws://127.0.0.1:43210",
+        "omnigent-codex-native-runner",
+        connect_error=ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 43210)"),
+    )
+
+    resp, bridge_dir = await _post_codex_native_event(
+        monkeypatch,
+        tmp_path,
+        {"type": "model_change", "model": "gpt-5.6-terra"},
+        client=client,
+        pane=True,
+        bridge_id=bridge_id,
+    )
+
+    assert resp.status_code == 204, resp.text
+    assert bridge_dir == codex_native_bridge.bridge_dir_for_bridge_id(bridge_id)
+    assert (
+        codex_native_bridge.read_bridge_startup_failure(bridge_dir)
+        == codex_native_bridge.CODEX_APP_SERVER_STOPPED
+    )
 
 
 @pytest.mark.asyncio
