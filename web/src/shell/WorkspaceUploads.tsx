@@ -462,7 +462,9 @@ export function UploadsTray({ visible }: { visible: boolean }) {
                 </div>
                 {row.error && (
                   <p
-                    role={row.status === "failed" ? "alert" : undefined}
+                    role={
+                      row.status === "failed" || row.status === "cancelled" ? "alert" : undefined
+                    }
                     className="text-destructive"
                   >
                     {row.error}
