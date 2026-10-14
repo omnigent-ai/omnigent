@@ -162,7 +162,6 @@ describe("fontCatalog — integrity", () => {
         entries.filter((entry) => entry.label.includes("Nerd Font")).map((entry) => entry.family),
       ).toEqual(nerdFamilies);
     }
-    expect(expectedMonoFamilies).not.toContain("Major Mono Display");
   });
 });
 

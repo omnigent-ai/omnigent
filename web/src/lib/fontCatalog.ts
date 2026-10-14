@@ -145,145 +145,38 @@ const SANS_FONTS: readonly FontCatalogEntry[] = [
   ...SANS_GOOGLE_FONTS.map(([id, family, weights]) => googleFont("sans", id, family, weights)),
 ];
 
-interface MonospaceGoogleFont {
-  readonly fixedWidthId: string;
-  readonly codeId: string;
-  readonly family: string;
-  readonly weights: readonly number[];
-}
-
 // Google Fonts popularity order, excluding typewriter/display faces that are
 // poor fits for the file paths, terminals, and source text shown by the app.
-const MONOSPACE_GOOGLE_FONTS: readonly MonospaceGoogleFont[] = [
-  {
-    fixedWidthId: "jetbrains-mono-fixed-width",
-    codeId: "jetbrains-mono",
-    family: "JetBrains Mono",
-    weights: [400, 500, 600, 700],
-  },
-  {
-    fixedWidthId: "roboto-mono",
-    codeId: "roboto-mono-code",
-    family: "Roboto Mono",
-    weights: [400, 500, 600, 700],
-  },
-  {
-    fixedWidthId: "fira-code-fixed-width",
-    codeId: "fira-code",
-    family: "Fira Code",
-    weights: [400, 500, 600, 700],
-  },
-  {
-    fixedWidthId: "inconsolata",
-    codeId: "inconsolata-code",
-    family: "Inconsolata",
-    weights: [400, 500, 600, 700],
-  },
-  {
-    fixedWidthId: "ibm-plex-mono",
-    codeId: "ibm-plex-mono-code",
-    family: "IBM Plex Mono",
-    weights: [400, 500, 600, 700],
-  },
-  {
-    fixedWidthId: "source-code-pro-fixed-width",
-    codeId: "source-code-pro",
-    family: "Source Code Pro",
-    weights: [400, 500, 600, 700],
-  },
-  { fixedWidthId: "b612-mono", codeId: "b612-mono-code", family: "B612 Mono", weights: [400, 700] },
-  {
-    fixedWidthId: "martian-mono",
-    codeId: "martian-mono-code",
-    family: "Martian Mono",
-    weights: [400, 500, 600, 700],
-  },
-  {
-    fixedWidthId: "geist-mono-google",
-    codeId: "geist-mono-google-code",
-    family: "Geist Mono",
-    weights: [400, 500, 600, 700],
-  },
-  {
-    fixedWidthId: "sometype-mono",
-    codeId: "sometype-mono-code",
-    family: "Sometype Mono",
-    weights: [400, 500, 600, 700],
-  },
-  { fixedWidthId: "dm-mono", codeId: "dm-mono-code", family: "DM Mono", weights: [400, 500] },
-  {
-    fixedWidthId: "space-mono",
-    codeId: "space-mono-code",
-    family: "Space Mono",
-    weights: [400, 700],
-  },
-  {
-    fixedWidthId: "google-sans-code",
-    codeId: "google-sans-code-code",
-    family: "Google Sans Code",
-    weights: [400, 500, 600, 700],
-  },
-  { fixedWidthId: "pt-mono", codeId: "pt-mono-code", family: "PT Mono", weights: [400] },
-  {
-    fixedWidthId: "ubuntu-mono",
-    codeId: "ubuntu-mono-code",
-    family: "Ubuntu Mono",
-    weights: [400, 700],
-  },
-  {
-    fixedWidthId: "red-hat-mono",
-    codeId: "red-hat-mono-code",
-    family: "Red Hat Mono",
-    weights: [400, 500, 600, 700],
-  },
-  {
-    fixedWidthId: "fira-mono",
-    codeId: "fira-mono-code",
-    family: "Fira Mono",
-    weights: [400, 500, 700],
-  },
-  {
-    fixedWidthId: "anonymous-pro",
-    codeId: "anonymous-pro-code",
-    family: "Anonymous Pro",
-    weights: [400, 700],
-  },
-  { fixedWidthId: "cousine", codeId: "cousine-code", family: "Cousine", weights: [400, 700] },
-  {
-    fixedWidthId: "azeret-mono",
-    codeId: "azeret-mono-code",
-    family: "Azeret Mono",
-    weights: [400, 500, 600, 700],
-  },
-  {
-    fixedWidthId: "overpass-mono",
-    codeId: "overpass-mono-code",
-    family: "Overpass Mono",
-    weights: [400, 500, 600, 700],
-  },
-  {
-    fixedWidthId: "chivo-mono",
-    codeId: "chivo-mono-code",
-    family: "Chivo Mono",
-    weights: [400, 500, 600, 700],
-  },
-  {
-    fixedWidthId: "spline-sans-mono",
-    codeId: "spline-sans-mono-code",
-    family: "Spline Sans Mono",
-    weights: [400, 500, 600, 700],
-  },
-  {
-    fixedWidthId: "oxygen-mono",
-    codeId: "oxygen-mono-code",
-    family: "Oxygen Mono",
-    weights: [400],
-  },
-  { fixedWidthId: "lekton", codeId: "lekton-code", family: "Lekton", weights: [400, 700] },
+const MONOSPACE_GOOGLE_FONTS: readonly [string, string, string, readonly number[]][] = [
+  ["jetbrains-mono-fixed-width", "jetbrains-mono", "JetBrains Mono", [400, 500, 600, 700]],
+  ["roboto-mono", "roboto-mono-code", "Roboto Mono", [400, 500, 600, 700]],
+  ["fira-code-fixed-width", "fira-code", "Fira Code", [400, 500, 600, 700]],
+  ["inconsolata", "inconsolata-code", "Inconsolata", [400, 500, 600, 700]],
+  ["ibm-plex-mono", "ibm-plex-mono-code", "IBM Plex Mono", [400, 500, 600, 700]],
+  ["source-code-pro-fixed-width", "source-code-pro", "Source Code Pro", [400, 500, 600, 700]],
+  ["b612-mono", "b612-mono-code", "B612 Mono", [400, 700]],
+  ["martian-mono", "martian-mono-code", "Martian Mono", [400, 500, 600, 700]],
+  ["geist-mono-google", "geist-mono-google-code", "Geist Mono", [400, 500, 600, 700]],
+  ["sometype-mono", "sometype-mono-code", "Sometype Mono", [400, 500, 600, 700]],
+  ["dm-mono", "dm-mono-code", "DM Mono", [400, 500]],
+  ["space-mono", "space-mono-code", "Space Mono", [400, 700]],
+  ["google-sans-code", "google-sans-code-code", "Google Sans Code", [400, 500, 600, 700]],
+  ["pt-mono", "pt-mono-code", "PT Mono", [400]],
+  ["ubuntu-mono", "ubuntu-mono-code", "Ubuntu Mono", [400, 700]],
+  ["red-hat-mono", "red-hat-mono-code", "Red Hat Mono", [400, 500, 600, 700]],
+  ["fira-mono", "fira-mono-code", "Fira Mono", [400, 500, 700]],
+  ["anonymous-pro", "anonymous-pro-code", "Anonymous Pro", [400, 700]],
+  ["cousine", "cousine-code", "Cousine", [400, 700]],
+  ["azeret-mono", "azeret-mono-code", "Azeret Mono", [400, 500, 600, 700]],
+  ["overpass-mono", "overpass-mono-code", "Overpass Mono", [400, 500, 600, 700]],
+  ["chivo-mono", "chivo-mono-code", "Chivo Mono", [400, 500, 600, 700]],
+  ["spline-sans-mono", "spline-sans-mono-code", "Spline Sans Mono", [400, 500, 600, 700]],
+  ["oxygen-mono", "oxygen-mono-code", "Oxygen Mono", [400]],
+  ["lekton", "lekton-code", "Lekton", [400, 700]],
 ];
 
 function monospaceFonts(category: "fixedWidth" | "code"): readonly FontCatalogEntry[] {
-  return MONOSPACE_GOOGLE_FONTS.map(({ fixedWidthId, codeId, family, weights }) =>
+  return MONOSPACE_GOOGLE_FONTS.map(([fixedWidthId, codeId, family, weights]) =>
     googleFont(category, category === "fixedWidth" ? fixedWidthId : codeId, family, weights),
   );
 }

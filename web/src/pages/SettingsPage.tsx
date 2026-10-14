@@ -2402,8 +2402,7 @@ function UiFontSizeControl() {
  */
 function UiFontFamilyControl() {
   const [family, setFamily] = useState(() => readUiFontFamily());
-  const info = useServerInfo();
-  const catalogEnabled = isFeatureEnabled(info, "webfonts");
+  const catalogEnabled = isFeatureEnabled(useServerInfo(), "webfonts");
 
   const update = useCallback((next: string) => {
     setFamily(next);
@@ -2454,8 +2453,7 @@ function UiFontFamilyControl() {
  */
 function FixedWidthFontFamilyControl() {
   const [family, setFamily] = useState(() => readFixedWidthFontFamily());
-  const info = useServerInfo();
-  const catalogEnabled = isFeatureEnabled(info, "webfonts");
+  const catalogEnabled = isFeatureEnabled(useServerInfo(), "webfonts");
 
   const update = useCallback((next: string) => {
     setFamily(next);
@@ -2593,8 +2591,7 @@ function UiCodeFontSizeControl() {
  */
 function UiCodeFontFamilyControl() {
   const [family, setFamily] = useState(() => readCodeFontFamily());
-  const info = useServerInfo();
-  const catalogEnabled = isFeatureEnabled(info, "webfonts");
+  const catalogEnabled = isFeatureEnabled(useServerInfo(), "webfonts");
 
   const update = useCallback((next: string) => {
     setFamily(next);
