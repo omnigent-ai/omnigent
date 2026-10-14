@@ -958,7 +958,7 @@ def _resolve_harness_cli_binary(
     resolution_errors: list[str] | None = None,
 ) -> str | None:
     """Resolve the executable whose version gate applies for *key*."""
-    path_binary = resolve_cli_binary(spec.binary)
+    path_binary = harness_cli_binary(key)
     if key != KIMI_NATIVE_KEY or path_binary is None:
         return path_binary
 
