@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
-import { cancelUpload, enqueueUploads } from "@/lib/workspaceUploadController";
+import { cancelUpload, enqueueUploads, transferUpload } from "@/lib/workspaceUploadController";
 import type * as UploadController from "@/lib/workspaceUploadController";
 import { useUploadStore } from "@/store/uploadStore";
 import type { SessionStatus } from "@/lib/types";
@@ -338,6 +338,57 @@ it("shows accessible file-specific progress, failure and cancel controls in a du
     expect(screen.getByRole("alert")).toHaveTextContent(/server did not confirm cancellation/i),
   );
   expect(screen.getByRole("button", { name: "Dismiss" })).toBeEnabled();
+});
+
+it("shows server-busy waits apart from network reconnects in the tray", async () => {
+  let creates = 0;
+  vi.mocked(authenticatedFetch).mockImplementation(async (_url, init) => {
+    if (init?.method !== "POST") return new Response(JSON.stringify(capability));
+    creates += 1;
+    if (creates === 1) throw new TypeError("Failed to fetch");
+    if (creates === 2)
+      return new Response(JSON.stringify({ error: { code: "busy", message: "busy" } }), {
+        status: 429,
+      });
+    return new Response(JSON.stringify({ error: { code: "unsupported", message: "No" } }), {
+      status: 501,
+    });
+  });
+  view();
+  await screen.findByRole("button", { name: "Upload files" });
+  const row = {
+    origin: window.location.origin,
+    identity: "alice",
+    session: "s",
+    environment: "default",
+    key: "upload",
+    id: "upload",
+    batch: "batch",
+    file: new File(["x"], "a.txt"),
+    name: "a.txt",
+    size: 1,
+    directory: "src",
+    destination: "src",
+    offset: 0,
+    controller: new AbortController(),
+    limits,
+    status: "queued" as const,
+    conflict: "fail" as const,
+  };
+  act(() => useUploadStore.getState().add([row]));
+  let release!: () => void;
+  const wait = () =>
+    new Promise<void>((resolve) => {
+      release = resolve;
+    });
+  const transfer = transferUpload(row.key, client, wait);
+  expect(await screen.findByText("Reconnecting…")).toBeTruthy();
+  act(() => release());
+  expect(await screen.findByText("Server busy. Waiting to retry… (HTTP 429 busy)")).toBeTruthy();
+  expect(screen.queryByText("Reconnecting…")).toBeNull();
+  act(() => release());
+  await act(() => transfer);
+  expect(useUploadStore.getState().rows.upload.status).toBe("failed");
 });
 
 it("allows an asleep runner to connect before workspace metadata is available", async () => {

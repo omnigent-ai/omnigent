@@ -346,6 +346,35 @@ it("debounces refresh by directory, actively refetches the target and replaced f
   ).toHaveLength(4);
 });
 
+it("coalesces session-wide refetches across folders and refreshes each folder listing once", async () => {
+  vi.useFakeTimers();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  const result = {
+    path: "a.bin",
+    final_name: "a.bin",
+    size: 20,
+    sha256: "hash",
+    outcome: "created" as const,
+  };
+  for (const directory of ["one", "two", "three"])
+    refreshUploadedFiles(client, { ...row, directory }, result);
+  await vi.advanceTimersByTimeAsync(300);
+  const count = (queryKey: unknown[]) =>
+    invalidate.mock.calls.filter(
+      ([arg]) => JSON.stringify(arg?.queryKey) === JSON.stringify(queryKey),
+    ).length;
+  for (const queryKey of [
+    ["workspace-all-files", "s"],
+    ["workspace-changed-files", "s"],
+    ["workspace-file-search", "s"],
+    ["workspace-dir-listing", "s"],
+    ["workspace-dir", "s", "one"],
+    ["workspace-dir", "s", "two"],
+    ["workspace-dir", "s", "three"],
+  ])
+    expect(count(queryKey)).toBe(1);
+});
+
 it("cancels retry waits and distinguishes long upload-limit backoff from busy", async () => {
   vi.useFakeTimers();
   const controller = new AbortController();
