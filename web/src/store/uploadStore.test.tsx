@@ -75,3 +75,14 @@ it("weights progress by bytes and protects active rows from dismissal", () => {
   useUploadStore.getState().dismiss([row.key, done.key]);
   expect(Object.keys(useUploadStore.getState().rows)).toEqual([row.key]);
 });
+
+it("protects cancelled rows from dismissal until reconciliation settles", () => {
+  const row = testUploadRow({ status: "cancelled", file: undefined, cancellationPending: true });
+  useUploadStore.getState().add([row]);
+  expect(uploadTotals([row]).active).toBe(true);
+  useUploadStore.getState().dismiss([row.key]);
+  expect(useUploadStore.getState().rows[row.key]).toBeDefined();
+  useUploadStore.getState().update(row.key, { cancellationPending: false });
+  useUploadStore.getState().dismiss([row.key]);
+  expect(useUploadStore.getState().rows[row.key]).toBeUndefined();
+});
