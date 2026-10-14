@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -71,6 +72,7 @@ interface UploadContextValue {
   visible: boolean;
   enabled: boolean;
   reason?: string;
+  probeReason?: string;
   retryCapability?: () => void;
   probing: boolean;
   directory: string;
@@ -118,10 +120,11 @@ export function WorkspaceUploadProvider({
     }),
     [identity, sessionId],
   );
+  const canProbe = identity !== null && permission !== null && isEditorLevel(permission);
   const capability = useQuery({
     queryKey: ["workspace-upload-capability", owner.origin, owner.identity, sessionId],
     queryFn: () => getUploadCapability(owner),
-    enabled: identity !== null && permission !== null && isEditorLevel(permission),
+    enabled: canProbe,
     staleTime: 30_000,
     retry: (attempt, error) =>
       error instanceof UploadError && [429, 503].includes(error.status) && attempt < 5,
@@ -139,13 +142,9 @@ export function WorkspaceUploadProvider({
         : probeError.status === 403
           ? "Upload permission denied. Ask the session owner for access, then retry"
           : probeError.status === 429
-            ? capability.isFetching
-              ? "Upload service is busy. Waiting before retrying"
-              : "Upload service is busy. Retry availability shortly"
+            ? "Upload service is busy. Retry availability shortly"
             : probeError.status === 503
-              ? capability.isFetching
-                ? "Upload service is unavailable. Retrying shortly"
-                : "Upload service is unavailable. Retry availability"
+              ? "Upload service is unavailable. Retry availability"
               : "Could not check upload availability. Retry the check"
       : probeError
         ? "Could not check upload availability. Retry the check"
@@ -159,7 +158,11 @@ export function WorkspaceUploadProvider({
       session?.archived,
     );
     if (!probeReason || permission === null || !isEditorLevel(permission)) return current;
-    return { visible: true, enabled: false, reason: probeReason };
+    return {
+      visible: current.visible || probeError instanceof UploadError,
+      enabled: false,
+      reason: probeReason,
+    };
   }, [
     permission,
     capability.data,
@@ -168,6 +171,7 @@ export function WorkspaceUploadProvider({
     session?.archived,
     directory,
     probeReason,
+    probeError,
   ]);
   const destination = directory || root?.split("/").filter(Boolean).at(-1) || "workspace";
   const value = useMemo<UploadContextValue>(
@@ -176,11 +180,13 @@ export function WorkspaceUploadProvider({
       capability: capability.data,
       ...gate,
       probing: capability.isFetching,
-      retryCapability: probeReason
-        ? () => {
-            void refetchCapability();
-          }
-        : undefined,
+      probeReason: canProbe ? probeReason : undefined,
+      retryCapability:
+        canProbe && probeReason
+          ? () => {
+              void refetchCapability();
+            }
+          : undefined,
       directory,
       destination,
       setDirectory,
@@ -197,6 +203,7 @@ export function WorkspaceUploadProvider({
       capability.data,
       capability.isFetching,
       refetchCapability,
+      canProbe,
       probeReason,
       gate,
       directory,
@@ -210,6 +217,7 @@ export function WorkspaceUploadProvider({
 
 export function UploadPicker({ directory }: { directory: string }) {
   const context = useContext(UploadContext);
+  const errorId = useId();
   const input = useRef<HTMLInputElement>(null);
   const button = useRef<HTMLButtonElement>(null);
   const selectedDirectory = useRef(directory);
@@ -221,56 +229,66 @@ export function UploadPicker({ directory }: { directory: string }) {
     element?.addEventListener("cancel", restoreFocus);
     return () => element?.removeEventListener("cancel", restoreFocus);
   }, [context?.visible]);
-  if (!context?.visible) return null;
+  if (!context || (!context.visible && !context.retryCapability)) return null;
   return (
     <>
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span title={context.reason}>
-              <Button
-                ref={button}
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label="Upload files"
-                disabled={!context.enabled}
-                onClick={() => {
-                  selectedDirectory.current = directory;
-                  input.current?.click();
-                }}
-              >
-                <Upload />
-              </Button>
-            </span>
-          </TooltipTrigger>
-          <TooltipContent>{context.reason ?? "Upload files to this folder"}</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+      {context.visible && (
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span title={context.reason}>
+                <Button
+                  ref={button}
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Upload files"
+                  disabled={!context.enabled}
+                  onClick={() => {
+                    selectedDirectory.current = directory;
+                    input.current?.click();
+                  }}
+                >
+                  <Upload />
+                </Button>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>{context.reason ?? "Upload files to this folder"}</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      )}
+      {context.probeReason && (
+        <p id={errorId} role="alert" className="max-w-48 text-destructive">
+          {context.probeReason}
+        </p>
+      )}
       {context.retryCapability && (
         <Button
           type="button"
           variant="ghost"
           size="sm"
           aria-label="Retry upload availability"
+          aria-describedby={errorId}
           disabled={context.probing}
           onClick={context.retryCapability}
         >
           Retry
         </Button>
       )}
-      <input
-        ref={input}
-        type="file"
-        multiple
-        className="hidden"
-        aria-label="Choose workspace files"
-        onChange={(event) => {
-          context.enqueue(Array.from(event.target.files ?? []), selectedDirectory.current);
-          event.target.value = "";
-          button.current?.focus();
-        }}
-      />
+      {context.visible && (
+        <input
+          ref={input}
+          type="file"
+          multiple
+          className="hidden"
+          aria-label="Choose workspace files"
+          onChange={(event) => {
+            context.enqueue(Array.from(event.target.files ?? []), selectedDirectory.current);
+            event.target.value = "";
+            button.current?.focus();
+          }}
+        />
+      )}
     </>
   );
 }
@@ -400,6 +418,7 @@ export function UploadsTray({ visible }: { visible: boolean }) {
                       variant="ghost"
                       size="sm"
                       aria-label={`Cancel ${row.name}`}
+                      disabled={row.cancellationPending}
                       onClick={() => void cancelUpload(row.key)}
                     >
                       Cancel

@@ -21,7 +21,15 @@ const transfers = new Map<string, AbortController>();
 const deciding = new Set<string>();
 const clients = new WeakMap<AbortController, QueryClient>();
 const deletions = new WeakMap<AbortController, Map<string, Promise<void>>>();
-const refreshes = new Map<string, { timer: ReturnType<typeof setTimeout>; paths: Set<string> }>();
+const refreshes = new Map<
+  string,
+  {
+    timer: ReturnType<typeof setTimeout>;
+    paths: Set<string>;
+    origin: string;
+    identity: string;
+  }
+>();
 const reportedBatches = new Set<string>();
 
 export function refreshUploadedFiles(
@@ -54,7 +62,7 @@ export function refreshUploadedFiles(
       refetchType: "none",
     });
   }, 300);
-  refreshes.set(key, { timer, paths });
+  refreshes.set(key, { timer, paths, origin: row.origin, identity: row.identity });
 }
 
 export function adaptiveChunk(bytes: number, elapsedMs: number, limits: UploadLimits): number {
@@ -184,6 +192,7 @@ export async function transferUpload(
           update({ offset });
           chunk = adaptiveChunk(chunk, performance.now() - start, row.limits);
           failures = 0;
+          mismatches = 0;
           throttledSince.clear();
           return step();
         }
@@ -254,6 +263,9 @@ export async function transferUpload(
     }
   } finally {
     if (transfers.get(key) === initial.controller) transfers.delete(key);
+    const live = store().rows[key];
+    if (live?.controller === initial.controller && live.cancellationPending)
+      update({ cancellationPending: false });
     batchSummary(initial.batch);
   }
 }
@@ -300,10 +312,17 @@ function deleteUpload(row: UploadRow, client = clients.get(row.controller)): Pro
 
 export async function cancelUpload(key: string): Promise<void> {
   const row = useUploadStore.getState().rows[key];
-  if (!row || !isActiveUpload(row)) return;
+  if (!row || !isActiveUpload(row) || row.cancellationPending) return;
   row.controller.abort();
-  useUploadStore.getState().update(key, { status: "cancelled", file: undefined });
+  useUploadStore.getState().update(key, {
+    status: "cancelled",
+    file: undefined,
+    cancellationPending: true,
+  });
   await deleteUpload(row);
+  const live = useUploadStore.getState().rows[key];
+  if (live?.controller === row.controller && transfers.get(key) !== row.controller)
+    useUploadStore.getState().update(key, { cancellationPending: false });
   batchSummary(row.batch);
 }
 
@@ -430,6 +449,11 @@ export async function retryUpload(
 }
 
 export function discardUploads(origin: string, identity: string): void {
+  for (const [key, refresh] of refreshes) {
+    if (refresh.origin !== origin || refresh.identity !== identity) continue;
+    clearTimeout(refresh.timer);
+    refreshes.delete(key);
+  }
   const rows = Object.values(useUploadStore.getState().rows).filter(
     (row) => row.origin === origin && row.identity === identity,
   );
