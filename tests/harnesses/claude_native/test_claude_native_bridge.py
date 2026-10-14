@@ -4828,6 +4828,128 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
     )
 
 
+def _claude_keybindings(chat_bindings: dict[str, str | None]) -> str:
+    """
+    Render a Claude Code ``keybindings.json`` with one ``Chat`` block.
+
+    :param chat_bindings: Keystroke to action, e.g. ``{"enter": "chat:newline"}``.
+    :returns: The file contents.
+    """
+    return json.dumps({"bindings": [{"context": "Chat", "bindings": chat_bindings}]})
+
+
+def test_inject_user_message_submits_with_a_rebound_submit_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message is delivered when the user moved Claude's submit key off Enter.
+
+    With ``enter`` bound to ``chat:newline`` in ``keybindings.json``, Enter only
+    adds a newline: a bridge that always presses Enter leaves the draft in the
+    box and fails the turn. The submit has to press the user's ``chat:submit`` key.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.5)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    config_dir = tmp_path / "claude-config"
+    config_dir.mkdir()
+    (config_dir / "keybindings.json").write_text(
+        _claude_keybindings({"enter": "chat:newline", "shift+enter": "chat:submit"})
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    shift_enter = "\x1b[13;2u"
+    submits: list[str] = []
+    tui = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI whose Enter adds a newline and Shift+Enter submits.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("fix the flaky test")
+        elif cmd[-1] in ("Enter", shift_enter):
+            submits.append(cmd[-1])
+            if cmd[-1] == shift_enter:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="fix the flaky test")
+
+    assert submits == [shift_enter]
+
+
+@pytest.mark.parametrize(
+    ("keybindings", "expected"),
+    [
+        pytest.param(None, None, id="no-file"),
+        pytest.param("{not json", None, id="malformed"),
+        pytest.param(
+            json.dumps(
+                {"bindings": [{"context": "Confirmation", "bindings": {"enter": "confirm:no"}}]}
+            ),
+            None,
+            id="other-context",
+        ),
+        pytest.param(
+            _claude_keybindings({"enter": "chat:submit", "ctrl+s": "chat:submit"}),
+            None,
+            id="enter-still-submits",
+        ),
+        pytest.param(
+            _claude_keybindings({"enter": "chat:newline", "ctrl+s": "chat:submit"}),
+            "\x1b[115;5u",
+            id="ctrl-s",
+        ),
+        pytest.param(
+            _claude_keybindings({"Return": None, "Control+Enter": "chat:submit"}),
+            "\x1b[13;5u",
+            id="aliases",
+        ),
+        pytest.param(
+            _claude_keybindings({"enter": "chat:newline", "ctrl+x s": "chat:submit"}),
+            "\x1b[120;5u\x1b[115u",
+            id="chord",
+        ),
+        pytest.param(
+            _claude_keybindings({"enter": "chat:newline", "up": "chat:submit"}),
+            None,
+            id="key-csi-u-cannot-carry",
+        ),
+    ],
+)
+def test_rebound_submit_sequence_reads_the_chat_keybindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    keybindings: str | None,
+    expected: str | None,
+) -> None:
+    """The submit key follows the user's ``Chat`` bindings and falls back to Enter."""
+    if keybindings is not None:
+        (tmp_path / "keybindings.json").write_text(keybindings)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+
+    assert claude_native_bridge._rebound_submit_sequence() == expected
+
+
 def test_inject_user_message_raises_when_draft_never_submits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10829,6 +10951,48 @@ def test_a_swallowed_slash_submit_enter_is_retried_while_the_draft_persists(
     assert tails == ["C-u", "/effort high", "Enter", "Enter"], (
         f"Expected the swallowed submit Enter to be retried once; got {tails}."
     )
+
+
+@pytest.mark.parametrize(
+    ("command", "typed"),
+    [
+        pytest.param("/compact", "/compact ", id="bare-command"),
+        pytest.param("/effort high", "/effort high", id="with-argument"),
+    ],
+)
+def test_a_slash_command_submits_with_a_rebound_submit_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    typed: str,
+) -> None:
+    """
+    A slash command is submitted with the user's ``chat:submit`` key.
+
+    Claude's command menu, open while a bare ``/compact`` sits in the box, only
+    answers Enter, so the bridge types a trailing space that closes it first.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    (tmp_path / "keybindings.json").write_text(
+        _claude_keybindings({"enter": "chat:newline", "ctrl+s": "chat:submit"})
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    ctrl_s = "\x1b[115;5u"
+    tails: list[str] = []
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        if typed in tails and ctrl_s not in tails:
+            return _composer_pane(typed)
+        return _IDLE_PANE
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *args: tails.append(args[-1]))
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command=command)
+
+    assert tails == ["C-u", typed, ctrl_s]
 
 
 def test_a_slash_command_stuck_in_the_composer_fails_loud(

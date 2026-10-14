@@ -4262,6 +4262,89 @@ def inject_user_message(
     )
 
 
+# CSI-u key codes and modifier bits for Claude Code's keystroke names.
+_CSI_U_KEY_CODES = {"enter": 13, "return": 13, "tab": 9, "escape": 27, "esc": 27, "space": 32}
+_CSI_U_MODIFIER_BITS = {
+    "shift": 1,
+    "alt": 2,
+    "opt": 2,
+    "option": 2,
+    "meta": 2,
+    "ctrl": 4,
+    "control": 4,
+    "cmd": 8,
+    "command": 8,
+    "super": 8,
+    "win": 8,
+}
+
+
+def _keys_csi_u(keys: str) -> str | None:
+    """
+    Encode a Claude Code keystroke or chord as CSI-u sequences.
+
+    :param keys: A ``keybindings.json`` key, e.g. ``"ctrl+s"`` or ``"ctrl+x s"``.
+    :returns: The sequences, e.g. ``"\\x1b[115;5u"``, or ``None`` when a
+        keystroke is one CSI-u does not carry, e.g. ``"up"``.
+    """
+    sequences = ""
+    for keystroke in keys.split():
+        *modifiers, key = keystroke.split("+")
+        code = _CSI_U_KEY_CODES.get(key, ord(key) if len(key) == 1 else None)
+        if code is None or any(modifier not in _CSI_U_MODIFIER_BITS for modifier in modifiers):
+            return None
+        bits = sum({_CSI_U_MODIFIER_BITS[modifier] for modifier in modifiers})
+        sequences += f"\x1b[{code};{bits + 1}u" if bits else f"\x1b[{code}u"
+    return sequences or None
+
+
+def _rebound_submit_sequence() -> str | None:
+    """
+    Return the user's submit key when their keybindings moved it off Enter.
+
+    Claude Code reads ``keybindings.json`` from ``$CLAUDE_CONFIG_DIR``, else
+    ``~/.claude``; a ``Chat`` binding there can move ``chat:submit`` to another
+    key, and Enter then only adds a newline.
+
+    :returns: The submit key as CSI-u, e.g. ``"\\x1b[13;2u"`` for
+        ``shift+enter``, or ``None`` when Enter still submits.
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = Path(configured).expanduser() if configured else Path.home() / ".claude"
+    chat: dict[str, Any] = {}
+    try:
+        config = json.loads((config_dir / "keybindings.json").read_text(encoding="utf-8"))
+        for block in config["bindings"]:
+            if block.get("context") == "Chat":
+                chat.update(block["bindings"])
+    except (OSError, ValueError, LookupError, TypeError, AttributeError):
+        # Claude falls back to its defaults for a missing or malformed file.
+        return None
+    bindings = {" ".join(key.lower().split()): action for key, action in chat.items()}
+    if bindings.get("enter", bindings.get("return", "chat:submit")) == "chat:submit":
+        return None
+    for keys, action in bindings.items():
+        sequence = _keys_csi_u(keys) if action == "chat:submit" else None
+        if sequence is not None:
+            return sequence
+    return None
+
+
+def _press_submit(socket_path: str, tmux_target: str) -> None:
+    """
+    Press the key that submits Claude's input box.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: None.
+    """
+    sequence = _rebound_submit_sequence()
+    if sequence is None:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    else:
+        _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, sequence)
+
+
 def _paste_and_submit(
     bridge_dir: Path,
     socket_path: str,
@@ -4371,7 +4454,7 @@ def _paste_and_submit(
             "Claude is waiting for an explicit answer; message not sent."
         )
     delivery_diagnostics.set_stage("submitting")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    _press_submit(socket_path, tmux_target)
     delivery_diagnostics.record_details(submit_sent=True)
     if not draft_seen:
         delivery_diagnostics.record_details(verification="unverified")
@@ -4476,7 +4559,7 @@ def _verify_submit_accepted(
             )
         if now - last_enter >= retry_interval:
             _raise_if_user_prompt_pending(bridge_dir, pane)
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            _press_submit(socket_path, tmux_target)
             retries += 1
             delivery_diagnostics.record_details(retries=retries)
             last_enter = now
@@ -4706,8 +4789,12 @@ def inject_slash_command(
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
     # not interrupt an in-flight generation.
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
-    # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
+    # ``-l`` pastes ``/`` and spaces literally; the submit key follows.
+    typed = command
+    if " " not in command and _rebound_submit_sequence() is not None:
+        # Claude's command menu takes only Enter; a trailing space closes it.
+        typed = f"{command} "
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, typed)
     # Same delivery hazards as inject_user_message: a coalesced or dropped
     # Enter leaves the command drafted while the persisted session value
     # claims it applied. Wait for the command to render, submit, verify it
@@ -4727,7 +4814,7 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    _press_submit(socket_path, tmux_target)
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
         # is pending. A dialog replacing the composer counts as submission.
