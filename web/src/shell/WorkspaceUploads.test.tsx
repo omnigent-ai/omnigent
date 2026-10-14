@@ -159,6 +159,17 @@ it.each([401, 403, 429, 503])(
             : /unavailable/i,
     );
     const retry = screen.getByRole("button", { name: "Retry upload availability" });
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      statusCode === 401
+        ? /sign in/i
+        : statusCode === 403
+          ? /permission/i
+          : statusCode === 429
+            ? /busy/i
+            : /unavailable/i,
+    );
+    expect(retry).toHaveAttribute("aria-describedby", alert.id);
     fireEvent.drop(screen.getByTestId("files-content"), {
       dataTransfer: { types: ["Files"], files: [new File(["x"], "a")] },
     });
@@ -166,6 +177,7 @@ it.each([401, 403, 429, 503])(
     vi.mocked(authenticatedFetch).mockResolvedValue(new Response(JSON.stringify(capability)));
     if (statusCode === 401 || statusCode === 403) fireEvent.click(retry);
     await waitFor(() => expect(button).toBeEnabled(), { timeout: 4000 });
+    expect(screen.queryByRole("alert")).toBeNull();
   },
 );
 
@@ -335,3 +347,70 @@ it("backs off successive unavailable capability probes without Retry-After", asy
     random.mockRestore();
   }
 });
+
+it.each([429, 503])(
+  "keeps the capability %s alert stable throughout automatic retries",
+  async (statusCode) => {
+    vi.useFakeTimers();
+    vi.mocked(authenticatedFetch).mockImplementation(
+      async () => new Response(null, { status: statusCode, headers: { "Retry-After": "2" } }),
+    );
+    view();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    const alert = screen.getByRole("alert");
+    const explanation = alert.textContent;
+    let changes = 0;
+    const observer = new MutationObserver(() => {
+      changes++;
+    });
+    observer.observe(alert, { childList: true, characterData: true, subtree: true });
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(authenticatedFetch).toHaveBeenCalledTimes(6);
+      expect(screen.getByRole("alert")).toBe(alert);
+      expect(alert.textContent).toBe(explanation);
+      expect(changes).toBe(0);
+      expect(screen.getByRole("button", { name: "Retry upload availability" })).toBeEnabled();
+    } finally {
+      observer.disconnect();
+    }
+  },
+);
+
+it.each([false, true])(
+  "keeps a no-response capability failure pending until HTTP recovery, supported %s",
+  async (supported) => {
+    vi.mocked(authenticatedFetch).mockRejectedValue(new TypeError("Failed to fetch"));
+    view();
+    const retry = await screen.findByRole("button", { name: "Retry upload availability" });
+    expect(screen.queryByRole("button", { name: "Upload files" })).toBeNull();
+    expect(screen.queryByLabelText("Choose workspace files")).toBeNull();
+    expect(document.querySelector("[data-upload-drop-root]")).toBeNull();
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(/could not check upload availability/i);
+    expect(retry).toHaveAttribute("aria-describedby", alert.id);
+    expect(
+      fireEvent.drop(screen.getByTestId("files-content"), {
+        dataTransfer: { types: ["Files"], files: [new File(["x"], "a")] },
+      }),
+    ).toBe(true);
+    expect(enqueueUploads).not.toHaveBeenCalled();
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      supported ? new Response(JSON.stringify(capability)) : new Response(null, { status: 404 }),
+    );
+    fireEvent.click(retry);
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Retry upload availability" })).toBeNull(),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    if (supported) expect(screen.getByRole("button", { name: "Upload files" })).toBeEnabled();
+    else {
+      expect(screen.queryByRole("button", { name: "Upload files" })).toBeNull();
+      expect(document.querySelector("[data-upload-drop-root]")).toBeNull();
+    }
+  },
+);

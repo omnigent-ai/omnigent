@@ -529,3 +529,86 @@ it.each([
   );
   expect(useUploadStore.getState().announcement).toBe(message);
 });
+
+it.each(["dismiss", "discard", "discard after receipt"])(
+  "settles a delayed committed cancellation receipt across %s",
+  async (action) => {
+    vi.useFakeTimers();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const result = {
+      path: "src/a.bin",
+      final_name: "a.bin",
+      size: 20,
+      sha256: "digest",
+      outcome: "replaced",
+    };
+    let reached!: () => void;
+    const finalizing = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    let release!: (response: Response) => void;
+    const deletion = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    fetchMock.mockImplementation((url, init) => {
+      if (String(url).endsWith("/complete"))
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("Cancelled", "AbortError")),
+          );
+          reached();
+        });
+      if (init?.method === "DELETE") return deletion;
+      return server(url, init);
+    });
+    const transfer = transferUpload(row.key, client, wait);
+    await finalizing;
+    const cancellation = cancelUpload(row.key);
+    if (action === "dismiss") useUploadStore.getState().dismiss([row.key]);
+    if (action === "discard") discardUploads(row.origin, row.identity);
+    release(json(result));
+    await Promise.all([transfer, cancellation]);
+    if (action === "discard after receipt") {
+      useUploadStore.getState().dismiss([row.key]);
+      discardUploads(row.origin, row.identity);
+    }
+    await vi.advanceTimersByTimeAsync(300);
+    if (action === "dismiss") {
+      for (const queryKey of [
+        ["workspace-dir", "s", "src"],
+        ["file-content", "s", "src/a.bin"],
+        ["file-diff", "s", "src/a.bin"],
+      ])
+        expect(invalidate).toHaveBeenCalledWith({ queryKey, refetchType: "active" });
+      expect(useUploadStore.getState().rows.id).toMatchObject({
+        status: "done",
+        result,
+        file: undefined,
+      });
+      expect(toast).toHaveBeenCalledWith("1 of 1 uploaded");
+      useUploadStore.getState().dismiss([row.key]);
+    } else {
+      expect(invalidate).not.toHaveBeenCalled();
+      if (action === "discard") expect(toast).not.toHaveBeenCalledWith("1 of 1 uploaded");
+    }
+    expect(useUploadStore.getState().rows.id).toBeUndefined();
+  },
+);
+
+it("allows three offset resyncs separated by acknowledged PATCH progress", async () => {
+  let resyncs = 0;
+  const rejectedOffsets = new Set<number>();
+  fetchMock.mockImplementation((url, init) => {
+    if (init?.method === "PATCH" && !rejectedOffsets.has(offset)) {
+      rejectedOffsets.add(offset);
+      resyncs++;
+      return Promise.resolve(
+        errorResponse(409, "offset_mismatch", { "Upload-Offset": String(offset) }),
+      );
+    }
+    return server(url, init);
+  });
+  await transferUpload(row.key, client, wait);
+  expect(resyncs).toBe(3);
+  expect(useUploadStore.getState().rows.id).toMatchObject({ status: "done", offset: 20 });
+});
