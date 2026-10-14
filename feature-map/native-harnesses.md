@@ -56,6 +56,8 @@ view appear in the session.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+Codex cold resume keeps the session's saved model unless a new `--model` is
+supplied. Attaching to an already-running terminal keeps its active model.
 
 **Approval inbox:** open Inbox in the sidebar to answer a pending permission
 without opening its session. Antigravity's Chat and Inbox cards both offer
