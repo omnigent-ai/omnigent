@@ -15,7 +15,7 @@ import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { prefetchSessionHostChain } from "./hooks/useSession";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { getBasePath, withBasePath } from "./lib/basePath";
-import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
+import { isFeatureEnabled, resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
@@ -26,6 +26,7 @@ import { applyMobileAppTargetAttribute } from "./lib/mobileAppTargets";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import { restoreFontPreferences } from "./lib/restoreFontPreferences";
+import { setWebFontsEnabled } from "./lib/webFontLoader";
 import { migrateLegacyProjectFolderPagination } from "./lib/projectFolderPaginationPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
@@ -91,9 +92,8 @@ applyMobileAppTargetAttribute();
 // can never float it — on any route, chat or auth. No-op off the iOS shell.
 hideNativeChatTerminalBar();
 
-// Apply the saved UI + code font preferences before first paint so there's no
-// flash, and kick off the catalog webfont loads so a chosen font is fetched on
-// boot rather than only on the next Settings change.
+// Apply saved font CSS before first paint. Downloadable fonts wait for the
+// server capability probe below.
 restoreFontPreferences();
 
 // The standalone sidebar font size control was removed. Clear its legacy value
@@ -130,7 +130,11 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
   useEffect(() => {
     let alive = true;
     void bootServerInfo.settled.then((resolved) => {
-      if (alive) setInfo(resolved);
+      if (!alive) return;
+      const webfontsEnabled = isFeatureEnabled(resolved, "webfonts");
+      setWebFontsEnabled(webfontsEnabled);
+      if (webfontsEnabled) restoreFontPreferences();
+      setInfo(resolved);
     });
     return () => {
       alive = false;

@@ -39,6 +39,13 @@ const DATA_ATTR = "data-omnigent-font";
 // fallback cell.
 const loads = new Map<string, Promise<boolean>>();
 
+let webFontsEnabled = false;
+
+/** Set by the resolved server capabilities before downloadable fonts may load. */
+export function setWebFontsEnabled(enabled: boolean): void {
+  webFontsEnabled = enabled;
+}
+
 // load key → the node(s) this loader injected for it. Tracked in a Map rather
 // than found via a DOM attribute selector: the key is a URL (with `:?&;@`) and a
 // quoted attribute selector over such a value is unreliable across engines. The
@@ -168,6 +175,7 @@ export function loadFont(entry: FontCatalogEntry): Promise<boolean> {
   // Nothing to fetch: bundled faces are in the app CSS; an empty family is the
   // system default. Either way the browser already has it — treat as ready.
   if (entry.source === "bundled" || !entry.family) return Promise.resolve(true);
+  if (!webFontsEnabled) return Promise.resolve(false);
 
   const key = fontLoadKey(entry);
   const existing = loads.get(key);
@@ -248,4 +256,5 @@ export function resetFontLoaderForTests(): void {
     for (const node of nodes) node.remove();
   }
   injected.clear();
+  webFontsEnabled = false;
 }
