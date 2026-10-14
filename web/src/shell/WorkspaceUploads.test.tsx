@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
-import { enqueueUploads } from "@/lib/workspaceUploadController";
+import { cancelUpload, enqueueUploads } from "@/lib/workspaceUploadController";
 import type * as UploadController from "@/lib/workspaceUploadController";
 import { useUploadStore } from "@/store/uploadStore";
 import type { SessionStatus } from "@/lib/types";
@@ -322,7 +322,12 @@ it("shows accessible file-specific progress, failure and cancel controls in a du
   expect(screen.getByRole("button", { name: "Cancel a.txt" })).toBeTruthy();
   useUploadStore.getState().update(row.key, { status: "failed", error: "No space" });
   expect(await screen.findByRole("alert")).toHaveProperty("textContent", "No space");
-  expect(screen.getByRole("button", { name: "Retry a.txt" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Retry a.txt" })).toBeEnabled();
+  act(() => useUploadStore.getState().update(row.key, { cancellationPending: true }));
+  expect(screen.getByRole("button", { name: "Retry a.txt" })).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "Retry failed" })).toBeNull();
+  act(() => useUploadStore.getState().update(row.key, { cancellationPending: false }));
+  expect(screen.getByRole("button", { name: "Retry a.txt" })).toBeEnabled();
   useUploadStore.getState().update(row.key, {
     status: "cancelled",
     file: undefined,
@@ -561,4 +566,65 @@ it("keeps typed route evidence and a stable alert through a later gateway retry"
   expect(screen.getByRole("alert")).toBe(alert);
   expect(screen.getByRole("button", { name: "Upload files" })).toBeDisabled();
   expect(alert).toHaveTextContent(/could not check upload availability/i);
+});
+
+it("Cancel remaining leaves 100 queued files unadmitted while reconciling two in-flight creates", async () => {
+  const controller = await vi.importActual<typeof UploadController>(
+    "@/lib/workspaceUploadController",
+  );
+  vi.mocked(cancelUpload).mockImplementation(controller.cancelUpload);
+  view();
+  await screen.findByRole("button", { name: "Upload files" });
+  vi.useFakeTimers();
+  const admissions: ((response: Response) => void)[] = [];
+  vi.mocked(authenticatedFetch).mockImplementation(async (_url, init) => {
+    if (init?.method === "POST")
+      return new Promise<Response>((resolve) => {
+        admissions.push(resolve);
+      });
+    return new Response(null, { status: 204 });
+  });
+  const owner = {
+    origin: window.location.origin,
+    identity: "alice",
+    session: "s",
+    environment: "default",
+  };
+  let creates = 0;
+  let pending = 0;
+  try {
+    act(() =>
+      controller.enqueueUploads(
+        owner,
+        Array.from({ length: 102 }, (_, index) => new File([new Uint8Array(20)], `file-${index}`)),
+        "src",
+        "src",
+        { ...limits, max_files_per_batch: 102, max_batch_bytes: 2040 },
+        client,
+      ),
+    );
+    expect(admissions).toHaveLength(2);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel remaining" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    creates = admissions.length;
+    const rows = Object.values(useUploadStore.getState().rows);
+    pending = rows.filter((item) => item.cancellationPending).length;
+    expect(rows.every((item) => item.status === "cancelled" && !item.file)).toBe(true);
+  } finally {
+    await act(async () => {
+      admissions.forEach((resolve, index) =>
+        resolve(new Response(JSON.stringify({ upload_id: `late-${index}`, offset: 0 }))),
+      );
+      await vi.advanceTimersByTimeAsync(300);
+      controller.discardUploads(owner.origin, owner.identity);
+    });
+    vi.mocked(cancelUpload).mockReset();
+  }
+  expect(creates).toBe(2);
+  expect(pending).toBe(2);
+  expect(
+    vi.mocked(authenticatedFetch).mock.calls.filter(([, init]) => init?.method === "DELETE"),
+  ).toHaveLength(2);
 });
