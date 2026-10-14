@@ -75,10 +75,13 @@ checkout revisions. The feature stays disabled by default.
   `tests/e2e_ui/files/test_workspace_upload_tree.py::test_workspace_upload_tree_folder_file_and_spring_load`.
 - **Large nested multi-file drop (own environment):**
   `tests/e2e_ui/files/test_workspace_upload_tree.py::test_workspace_upload_tree_large_binary_byte_exact`.
-  The separate `test_workspace_upload_tree_isolated_rss` measures the unchanged memory bound;
-  its disposition remains pending the backend investigation.
-  Set `WORKSPACE_UPLOAD_TREE_EVIDENCE` to an external JSON path to retain source
-  and disk SHA-256, baseline and peak RSS, chunk and concurrency limits.
+  The separate `test_workspace_upload_tree_isolated_rss` gates server RSS on one
+  process: the 200 MiB peak stays at or below baseline + 3 × chunk × in-flight +
+  64 MiB, at most a fixed 32 MiB above a small upload's peak, and RSS settles to
+  baseline + 64 MiB or less within 30 s. Set `WORKSPACE_UPLOAD_TREE_EVIDENCE` to an
+  external JSON path to retain source and disk SHA-256, and
+  `WORKSPACE_UPLOAD_TREE_RSS_EVIDENCE` to retain baseline, small and large peaks,
+  settled RSS, and chunk and concurrency limits.
 - **Sleeping host-bound runner (own environment):**
   `tests/e2e_ui/files/test_workspace_upload.py::test_workspace_upload_asleep_runner_wakes_without_a_message`.
 - **Desktop shell, Android and iOS:** repeat the picker from the respective Files
@@ -88,9 +91,11 @@ checkout revisions. The feature stays disabled by default.
   already-configured host and credentials. On an older runner, verify Upload is
   disabled with an update/restart reason. On a capable remote or managed runner,
   drop multiple files into a nested folder plus a binary of at least 50 MiB and
-  compare SHA-256 on disk. Record server peak RSS against its baseline, plus
-  twice chunk size times concurrency and stated baseline headroom. Stop for
-  missing credentials, login, new resources or excessive memory. Unavailable
+  compare SHA-256 on disk. Record server baseline, small-upload and large-upload
+  peak and settled RSS; the large peak must stay at or below baseline + 3 × chunk ×
+  in-flight + 64 MiB and within 32 MiB of the small peak, and RSS must return to
+  baseline + 64 MiB or less within 30 s. Stop for missing credentials, login,
+  new resources or excessive memory. Unavailable
   lanes and ingress binary-frame checks remain manual gates before enabling
   the feature by default.
 
