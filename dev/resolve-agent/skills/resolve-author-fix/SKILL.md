@@ -202,8 +202,10 @@ fallback if rendering is blocked; keep any usable footage.
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the corrected error message.
 - Record your fix on the author path, or the reviewed PR head on the review
-  path. Save the clip as `recordings/<slug>/after-<facet>.<ext>` with
-  `kind: "after"`, and include it in the PR Demo section and handoff.
+  path. Save the raw capture as `recordings/<slug>/raw/after-<facet>.<ext>`.
+  Render to `recordings/<slug>/after-<facet>.mp4`, inspect it, then declare
+  that final path with `kind: "after"` in the PR Demo and handoff. If captioning
+  fails, use the shared guide's explicit fallback path instead.
 - Keep any recovered before-clip unchanged. A missing before-clip is not a
   reason to skip the after-clip; note the missing before-clip in your evidence.
 - For internal/API-only results with no visible user interaction, written

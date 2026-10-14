@@ -388,7 +388,7 @@ below the attachment; it does not replace captions visible during playback.
    Always render from raw footage; choose a fresh output path when revising cues.
    Keep the raw clip, cue JSON and render command as uncommitted workspace
    evidence. Once the selected capture is under `raw/`, retain it for rerendering;
-   do not delete it as a duplicate or declare it as another recording.
+   do not delete it as a duplicate or declare it alongside the finished clip.
 5. Play the result and inspect the opening, each caption transition, and the
    final frame. Confirm text is legible, fits in the band, matches the action's
    timing, and describes only what was observed. Declare only the inspected,
@@ -396,11 +396,18 @@ below the attachment; it does not replace captions visible during playback.
    PR Demo. CI's later media normalization preserves the burned-in text.
 
 Captioning is best effort, like capture. If the renderer, font or filter is
-unavailable, or rendering fails and cannot be repaired, keep the usable raw
-product clip under its stable name, declare it, and explain the captioning
-blocker in `evidence`. Do not discard valid footage or block the verdict, fix,
-or PR just because captions could not be rendered. Do not claim an unrendered
-cue file is a captioned recording.
+unavailable, or rendering fails and cannot be repaired, copy the usable source
+from `recordings/<slug>/raw/<kind>-<facet>.<ext>` to
+`recordings/<slug>/uncaptioned-<kind>-<facet>.<ext>`, preserving its format and
+the raw source. Use a new destination if that fallback name already exists;
+never overwrite another recording. Inspect the copy, then declare only that
+actual fallback path and matching `format` in the handoff and PR Demo. Do not
+declare the failed render's path or the raw source as an additional recording.
+Explain the captioning blocker in `evidence` and label the attachment as
+uncaptioned. This fallback does not occupy the final captioned MP4 path.
+Do not discard valid footage or block the verdict, fix, or PR just because
+captions could not be rendered. Do not claim an unrendered cue file is a
+captioned recording.
 
 For each recording, also write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in

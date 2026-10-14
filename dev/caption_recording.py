@@ -151,6 +151,7 @@ def caption_recording(
         raise ValueError("Capture at least 320 pixels wide so captions remain legible")
     font_size = max(14, width // 42)
     margin = max(12, font_size // 2)
+    # Leave room beyond DejaVu Sans Mono's ~0.6-em advance for glyph overhangs.
     columns = int((width - margin * 2) / (font_size * 0.7))
     cues = validate_cues(
         json.loads(cues_path.read_text(encoding="utf-8")), info["duration"], columns
@@ -159,7 +160,8 @@ def caption_recording(
     output.parent.mkdir(parents=True, exist_ok=True)
     # Fixed relative textfile names avoid ffmpeg filter escaping for paths and
     # text. expansion=none makes expressions such as %{...} literal captions.
-    with tempfile.TemporaryDirectory(prefix=".caption-", dir=output.parent) as directory:
+    # Keep interrupted renders and the copied font outside the evidence directory.
+    with tempfile.TemporaryDirectory(prefix="omnigent-caption-") as directory:
         temporary = Path(directory)
         shutil.copyfile(caption_font(), temporary / "caption-font.ttf")
         filters = [f"pad={width}:{height + band}:0:0:color=0x111827", "setsar=1"]

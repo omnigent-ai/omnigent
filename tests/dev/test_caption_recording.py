@@ -219,8 +219,13 @@ def test_failed_render_leaves_raw_footage_and_no_partial_output(tmp_path, monkey
         "dev.caption_recording.probe", lambda _: {"width": 640, "height": 360, "duration": 3}
     )
 
+    render_directories = []
+
     def fail(*args, **kwargs):
         assert kwargs["timeout"] == 900
+        directory = Path(kwargs["cwd"])
+        assert not directory.is_relative_to(tmp_path)
+        render_directories.append(directory)
         raise RuntimeError("drawtext unavailable")
 
     monkeypatch.setattr("dev.caption_recording.run", fail)
@@ -229,7 +234,7 @@ def test_failed_render_leaves_raw_footage_and_no_partial_output(tmp_path, monkey
         caption_recording(source, cues, output, render_timeout=900)
     assert source.read_bytes() == b"source"
     assert not output.exists()
-    assert not list(tmp_path.glob(".caption-*"))
+    assert render_directories and all(not path.exists() for path in render_directories)
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
