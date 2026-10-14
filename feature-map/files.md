@@ -33,7 +33,7 @@ surfaces; Reveal in file manager is available only on a host with that support.
 
 **Uploads in the rail:** choose Upload in the Files header, or drag local files
 onto a folder, a file, the tree's empty space or the header. Rest over a collapsed
-folder to expand it, then drop inside. Changed targets the browsed root. Select
+folder to expand it, then drop inside. Changed and search results target the browsed root. Select
 Cancel or Retry in Uploads, choose Replace / Keep both / Skip for duplicates,
 open a file or switch sessions while the transfer runs, or close the rail to see
 its persistent progress notification.
@@ -74,7 +74,9 @@ checkout revisions. The feature stays disabled by default.
 - **Folder and file drops, spring-load and preserved expansion/scroll (own environment):**
   `tests/e2e_ui/files/test_workspace_upload_tree.py::test_workspace_upload_tree_folder_file_and_spring_load`.
 - **Large nested multi-file drop (own environment):**
-  `tests/e2e_ui/files/test_workspace_upload_tree.py::test_workspace_upload_tree_large_binary_bounded_rss`.
+  `tests/e2e_ui/files/test_workspace_upload_tree.py::test_workspace_upload_tree_large_binary_byte_exact`.
+  The separate `test_workspace_upload_tree_isolated_rss` measures the unchanged memory bound;
+  its disposition remains pending the backend investigation.
   Set `WORKSPACE_UPLOAD_TREE_EVIDENCE` to an external JSON path to retain source
   and disk SHA-256, baseline and peak RSS, chunk and concurrency limits.
 - **Sleeping host-bound runner (own environment):**
@@ -105,7 +107,7 @@ checkout revisions. The feature stays disabled by default.
 - Expanded folders and scroll survive commit refreshes. Virtualized offscreen rows
   are absent from the browser; scroll to the destination before expecting it.
 - Upload controls disappear with the feature off. Empty and Changed views accept
-  root drops when enabled. Touch devices use the header picker.
+  root drops when enabled; search-result drops also use the browsed root. Touch devices use the header picker.
 - The folder-row Upload menu is deferred until the row-actions menu lands.
 - Staging files may be visible to the operating system and agents during a transfer;
   the Files tree hides them until atomic publication.
