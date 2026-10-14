@@ -1036,6 +1036,8 @@ async def test_startup_recovers_publish_before_receipt(
         resolve_registry=registry_for,
         state_path=manager.state_path,
     )
+    # Block start() on the startup sweep's ready event rather than its wall-clock budget.
+    monkeypatch.setattr("omnigent.runner.workspace_upload.STARTUP_SWEEP_BUDGET_S", None)
     try:
         await fresh.start()
         assert fresh.records[uid].result == result.json()
@@ -1114,6 +1116,8 @@ async def test_production_manual_lifespan_sweeps_restored_uploads(
     monkeypatch.setattr(
         "omnigent.runner.workspace_upload.upload_state_path", lambda _: old.state_path
     )
+    # Block start() on the startup sweep's ready event rather than its wall-clock budget.
+    monkeypatch.setattr("omnigent.runner.workspace_upload.STARTUP_SWEEP_BUDGET_S", None)
     monkeypatch.setattr(HarnessProcessManager, "start", AsyncMock())
     monkeypatch.setattr(HarnessProcessManager, "shutdown", AsyncMock())
     monkeypatch.setattr("omnigent.runner.subagent_work.run_subagent_launch_reaper", AsyncMock())

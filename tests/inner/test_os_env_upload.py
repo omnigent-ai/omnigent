@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import GitSshBinding, OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import CallerProcessOSEnvironment, create_os_environment
 from omnigent.inner.os_env_upload import UploadHelperClient, read_frame, write_frame
 
@@ -354,10 +354,62 @@ def test_platform_negative_probe(
         engine.close()
 
 
-def test_upload_helper_has_no_network_or_credentials(helper: UploadHelperClient) -> None:
-    assert helper.sandbox.allow_network is False
-    assert helper._egress_rules is None
-    assert helper.sandbox.credential_proxy is None
+@pytest.mark.parametrize(
+    "sandbox_type",
+    [
+        pytest.param(
+            "linux_bwrap",
+            marks=pytest.mark.skipif(
+                not (sys.platform.startswith("linux") and shutil.which("bwrap")),
+                reason="linux_bwrap requires Linux + bwrap on PATH",
+            ),
+        ),
+        pytest.param(
+            "darwin_seatbelt",
+            marks=pytest.mark.skipif(
+                not (sys.platform == "darwin" and shutil.which("sandbox-exec")),
+                reason="darwin_seatbelt requires macOS + sandbox-exec on PATH",
+            ),
+        ),
+    ],
+)
+def test_upload_helper_has_no_network_or_credentials(tmp_path: Path, sandbox_type: str) -> None:
+    workspace = tmp_path / "workspace"
+    keys = tmp_path / "keys"
+    workspace.mkdir()
+    keys.mkdir()
+    (keys / "key").write_text("key")
+    (keys / "known_hosts").write_text("host key")
+    binding = GitSshBinding(
+        host="git.example.test",
+        port=22,
+        username="git",
+        repository="org/repo.git",
+        operations=frozenset({"fetch"}),
+        identity_file=str(keys / "key"),
+        known_hosts_file=str(keys / "known_hosts"),
+    )
+    env = create_os_environment(
+        OSEnvSpec(
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type=sandbox_type, write_paths=["."], git_ssh=[binding]),
+        ),
+        additional_read_roots=[Path(__file__).resolve().parents[2]],
+    )
+    assert isinstance(env, CallerProcessOSEnvironment)
+    assert env.sandbox.git_ssh
+    helper = UploadHelperClient(env)
+    try:
+        assert helper.sandbox.allow_network is False
+        assert helper._egress_rules is None
+        assert helper.sandbox.credential_proxy is None
+        assert helper.sandbox.git_ssh is None
+        assert helper.sandbox.git_ssh_socket_path is None
+        assert helper.call({"op": "probe"})["raw_upload"] is True
+        assert helper._git_ssh_broker is None
+    finally:
+        helper.close()
+        env.close()
 
 
 def test_real_pipe_is_raw(helper: UploadHelperClient) -> None:
