@@ -2370,11 +2370,7 @@ def _cross_user_fork(
     *,
     source_owner: str | None = "owner@example.com",
 ) -> tuple[TestClient, _ConversationStore]:
-    """A header-auth client for a session whose agent belongs to *source_owner*.
-
-    ``None`` is a legacy session agent with no recorded owner. The store also
-    holds the server agent ``44b4151d…`` as a switch target.
-    """
+    """Build a fork client for a session agent with the given owner."""
     agent_id = "30f9aa4d441e344d3eb273f8cc13e4a5"
     conv_store = _ConversationStore(
         conversations={"e9f8f58523cec9a57d3bdf93be543e8c": _make_conversation(agent_id=agent_id)},
@@ -2469,7 +2465,6 @@ async def test_failed_cross_user_fork_removes_its_copied_bundle() -> None:
 async def test_fork_needing_a_copy_of_a_missing_bundle_is_refused_cleanly(
     caller: str, source_owner: str | None
 ) -> None:
-    """Missing bundles fail before any fork writes; switching to another agent still works."""
     artifacts = _ArtifactStore(blobs={})
     client, conv_store = _cross_user_fork(artifact_store=artifacts, source_owner=source_owner)
 

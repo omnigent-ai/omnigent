@@ -262,8 +262,6 @@ SESSION_AGENT_MISSING_MESSAGE = (
     "This agent no longer exists. Fork this session into another agent to continue."
 )
 
-# Client-facing text for ``SESSION_AGENT_MISSING`` when the agent row survives
-# but the artifact store no longer holds its bundle, so it cannot be copied.
 SESSION_AGENT_BUNDLE_MISSING_MESSAGE = (
     "This agent's bundle no longer exists, so it cannot be copied. "
     "Choose another agent to continue."

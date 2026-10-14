@@ -564,7 +564,6 @@ def test_content_digest_is_none_for_an_unreadable_bundle() -> None:
 
 
 def test_copy_agent_bundle_reports_a_missing_source_blob(tmp_path: Path) -> None:
-    """A copy whose source blob is gone fails as ``session_agent_missing``, not ``KeyError``."""
     root = tmp_path / "artifacts"
     artifacts = LocalArtifactStore(str(root))
 
@@ -582,8 +581,6 @@ def test_copy_agent_bundle_reports_a_missing_source_blob(tmp_path: Path) -> None
 def test_agent_for_user_creates_no_row_when_the_bundle_is_missing(
     db_uri: str, tmp_path: Path
 ) -> None:
-    """Session create and scheduled tasks copy through ``agent_for_user``; a lost
-    blob surfaces as the same clean error and leaves no half-made agent behind."""
     agents = SqlAlchemyAgentStore(db_uri)
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
     agent_id = generate_agent_id()

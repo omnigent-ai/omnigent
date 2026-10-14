@@ -190,10 +190,7 @@ def agent_needs_own_copy(agent: Agent, user_id: str | None) -> bool:
 
 
 def copy_agent_bundle(artifact_store: ArtifactStore, location: str, new_agent_id: str) -> str:
-    """Store a copy of the bundle at *location* under *new_agent_id*; return its location.
-
-    :raises OmnigentError: ``session_agent_missing`` when the blob at *location* is gone.
-    """
+    """Store a copy of the bundle at *location* under *new_agent_id*; return its location."""
     try:
         data = artifact_store.get(location)
     except KeyError as exc:
