@@ -149,6 +149,13 @@ function renderChanges() {
   return r;
 }
 
+/** Render, then switch to the Comments tab (see renderChanges). */
+function renderComments() {
+  const r = renderPanel();
+  fireEvent.mouseDown(screen.getByRole("tab", { name: /^Comments/ }));
+  return r;
+}
+
 /** Silences console.error for the current test and returns a reader for the React
  *  duplicate- and missing-key warnings logged so far. */
 function watchKeyWarnings(): () => string[] {
@@ -160,8 +167,8 @@ function watchKeyWarnings(): () => string[] {
       .filter((message) => /same key|unique "key"/.test(message));
 }
 
-/** The markdown body of each comment card, in rendered order. The fixtures used
- *  with it have no PR description, so every markdown block is a comment. */
+/** The markdown body of each comment card, in rendered order. Only the active
+ *  tab mounts, so on the Comments tab every markdown block is a comment. */
 function commentBodies(): (string | null)[] {
   return screen.getAllByTestId("markdown").map((el) => el.textContent);
 }
@@ -279,7 +286,7 @@ describe("PullRequestPanel", () => {
     expect(screen.getByRole("link", { name: /chore: dummy PR/ })).not.toHaveClass("flex-1");
   });
 
-  it("lands on the Summary tab, showing the PR description and comments", async () => {
+  it("lands on Summary with the description and counts comments on their own tab", async () => {
     state.info!.data!.pr!.body = "## Overview\nThis PR does the thing.";
     state.info!.data!.pr!.comments = [
       {
@@ -293,9 +300,19 @@ describe("PullRequestPanel", () => {
     // Summary is the default — the diff sections aren't mounted yet.
     expect(screen.queryByTestId("diff")).toBeNull();
     expect(await screen.findByText(/This PR does the thing\./)).toBeInTheDocument();
-    expect(screen.getByText("Comments (1)")).toBeInTheDocument();
+    // Comments have their own tab, which shows how many there are.
+    expect(screen.queryByText("Looks good to me!")).toBeNull();
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "Summary",
+      "Comments 1",
+      "Changes",
+    ]);
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Comments 1" }));
     expect(screen.getByText("octocat")).toBeInTheDocument();
     expect(screen.getByText("Looks good to me!")).toBeInTheDocument();
+    expect(screen.queryByText(/This PR does the thing\./)).toBeNull();
+    expect(screen.queryByText("Checks")).toBeNull();
   });
 
   it("renders GitHub comments in order, including ones without a URL or time", () => {
@@ -316,19 +333,23 @@ describe("PullRequestPanel", () => {
       { author: null, body: "Third", created_at: null, url: null },
       { author: null, body: "Fourth", created_at: null, url: null },
     ];
-    renderPanel();
+    renderComments();
 
-    expect(screen.getByText("Comments (4)")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Comments 4" })).toBeInTheDocument();
     expect(commentBodies()).toEqual(["First", "Second", "Third", "Fourth"]);
     expect(keyWarnings()).toEqual([]);
   });
 
-  it("shows Summary empty states when the PR has no body or comments", () => {
+  it("shows empty states when the PR has no body or comments", () => {
     // The default fixture carries neither a body nor comments.
     renderPanel();
     expect(screen.getByText("No description provided.")).toBeInTheDocument();
-    expect(screen.getByText("No comments yet.")).toBeInTheDocument();
     expect(screen.queryByTestId("diff")).toBeNull();
+
+    const commentsTab = screen.getByRole("tab", { name: "Comments" });
+    expect(commentsTab).toHaveTextContent(/^Comments\s*$/);
+    fireEvent.mouseDown(commentsTab);
+    expect(screen.getByText("No comments yet.")).toBeInTheDocument();
   });
 
   it("marks incomplete checks and comments without claiming they are empty", () => {
@@ -345,6 +366,7 @@ describe("PullRequestPanel", () => {
 
     expect(screen.getByText("Checks")).toBeInTheDocument();
     expect(screen.getByText(/Some checks are unavailable/)).toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Comments" }));
     expect(screen.getByText("Some comments are unavailable.")).toBeInTheDocument();
     expect(screen.queryByText("No comments yet.")).not.toBeInTheDocument();
   });
@@ -369,9 +391,9 @@ describe("PullRequestPanel", () => {
     state.info!.data!.pr!.comments = [
       { author: "reviewer", body: "Loaded comment", created_at: null, url: null },
     ];
-    renderPanel();
+    renderComments();
 
-    expect(screen.getByText("Comments (1+)")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Comments 1+" })).toBeInTheDocument();
     expect(screen.getByText("Loaded comment")).toBeInTheDocument();
     expect(screen.getByText("Some comments are unavailable.")).toBeInTheDocument();
   });
@@ -1109,9 +1131,9 @@ describe("PullRequestPanel", () => {
             comment({ body: "Fair, resolving this.", created_at: "2026-09-05T08:15:09.000Z" }),
           ],
         });
-        renderPanel();
+        renderComments();
 
-        expect(screen.getByText("Comments (3)")).toBeInTheDocument();
+        expect(screen.getByRole("tab", { name: "Comments 3" })).toBeInTheDocument();
         expect(commentBodies()).toEqual([
           "Why not reuse the helper?",
           "It predates the helper.",
@@ -1131,7 +1153,7 @@ describe("PullRequestPanel", () => {
         state.info!.data = withPr({
           comments: [comment({ body: "First of two" }), comment({ body: "Second of two" })],
         });
-        renderPanel();
+        renderComments();
 
         expect(commentBodies()).toEqual(["First of two", "Second of two"]);
         expect(keyWarnings()).toEqual([]);
@@ -1157,7 +1179,7 @@ describe("PullRequestPanel", () => {
           url: first.url,
         });
         state.info!.data = withPr({ comments: [first, second] });
-        const { rerender } = renderPanel();
+        const { rerender } = renderComments();
         const card = screen.getByText("Thread two").closest("li");
 
         // The next poll returns a reply to the first thread, ahead of the second.

@@ -116,10 +116,10 @@ PR.
 On a host with an Azure repository, run `az login` or set
 `AZURE_DEVOPS_EXT_PAT` before starting Omnigent. Open a session in that repository,
 then click the composer’s `!N` link or open **Pull Requests** in the workspace
-panel. Confirm the Azure DevOps heading, request title, Summary, and Changes.
-Repeat at a mobile viewport to check the full-screen drawer. Link a request from
-another repository and confirm its summary loads while the diff explains the
-workspace limitation.
+panel. Confirm the Azure DevOps heading, request title, Summary, Comments, and
+Changes. Repeat at a mobile viewport to check the full-screen drawer. Link a
+request from another repository and confirm its summary loads while the diff
+explains the workspace limitation.
 
 The automated suites under `tests/runner/test_azure_devops_*` and
 `tests/e2e_ui/azure_devops/` use local Git and mocked REST responses. They verify
