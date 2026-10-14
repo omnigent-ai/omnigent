@@ -7,6 +7,8 @@ selection and its refresh behaviour are asserted in one place.
 
 from __future__ import annotations
 
+import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,7 @@ def _run_generated_helper(
     force_refresh_works: bool,
     cached_token_works: bool,
     bearer: str | None = None,
+    sdk_token: str | None = None,
 ) -> str:
     """
     Run *command* against a fake ``databricks`` CLI and return its stdout.
@@ -30,6 +33,7 @@ def _run_generated_helper(
         is the stale-refresh-token case.
     :param cached_token_works: Whether plain ``auth token`` succeeds.
     :param bearer: Value for ``DATABRICKS_BEARER``, or ``None`` to unset it.
+    :param sdk_token: Optional PAT in the isolated SDK profile.
     :returns: The helper's stdout, stripped.
     """
     import os
@@ -63,12 +67,48 @@ def _run_generated_helper(
         if key.startswith("DATABRICKS_"):
             env.pop(key, None)
     env["DATABRICKS_CONFIG_FILE"] = str(tmp_path / "nonexistent-databrickscfg")
+    if sdk_token is not None:
+        Path(env["DATABRICKS_CONFIG_FILE"]).write_text(
+            "[agent]\nhost = https://example.databricks.com\n"
+            f"token = {sdk_token}\nauth_type = pat\n"
+        )
     if bearer is not None:
         env["DATABRICKS_BEARER"] = bearer
     result = subprocess.run(
         ["sh", "-c", command], env=env, capture_output=True, text=True, check=False
     )
     return result.stdout.strip()
+
+
+@pytest.mark.posix_only
+def test_sdk_fallback_uses_the_omnigent_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A different python3 on PATH must not prevent a configured SDK token mint."""
+    import os
+
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    # Keep the SDK's metadata discovery local; the actual PAT resolver still runs.
+    (tmp_path / "sitecustomize.py").write_text(
+        "from databricks.sdk.config import Config\n"
+        "Config._resolve_host_metadata = lambda self: None\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", f"{tmp_path}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    python = tmp_path / "python3"
+    python.write_text("#!/bin/sh\nexit 93\n")
+    python.chmod(0o755)
+    command = databricks_bearer_token_command("https://example.databricks.com", "agent")
+    assert (
+        _run_generated_helper(
+            command,
+            tmp_path,
+            force_refresh_works=False,
+            cached_token_works=False,
+            sdk_token="sdk-profile-token",
+        )
+        == "sdk-profile-token"
+    )
 
 
 def _recorded_fallback(tmp_path: Path) -> str:
@@ -286,7 +326,7 @@ def test_the_broker_sidecar_becomes_the_fallback_for_the_connected_workspace(
 
     _write_broker_sidecar(monkeypatch, tmp_path, "https://example.databricks.com")
     command = databricks_bearer_token_command("https://example.databricks.com", "omnigent")
-    assert "python3 -m omnigent.host.databricks_credential token" in command
+    assert f"{shlex.quote(sys.executable)} -m omnigent.host.databricks_credential token" in command
 
 
 def test_the_broker_sidecar_is_ignored_for_a_different_workspace(
@@ -344,7 +384,7 @@ def test_no_sidecar_falls_back_to_the_sdk_mint_not_the_broker(
     cmd = databricks_bearer_token_command("https://example.databricks.com", "myprofile")
     assert "omnigent.host.databricks_credential" not in cmd
     assert (
-        "python3 -m omnigent.inner.databricks_token "
+        f"{shlex.quote(sys.executable)} -m omnigent.inner.databricks_token "
         "--host https://example.databricks.com --profile myprofile" in cmd
     )
     # The eval-fallback clause now carries the sdk mint.
@@ -362,7 +402,8 @@ def test_the_sdk_fallback_selects_by_host_when_no_profile(
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     cmd = databricks_bearer_token_command("https://example.databricks.com/", None)
     assert (
-        "python3 -m omnigent.inner.databricks_token --host https://example.databricks.com" in cmd
+        f"{shlex.quote(sys.executable)} -m omnigent.inner.databricks_token "
+        "--host https://example.databricks.com" in cmd
     )
 
 

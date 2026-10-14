@@ -5,7 +5,9 @@ from __future__ import annotations
 import configparser
 import json
 import os
+import shlex
 import stat
+import sys
 from pathlib import Path
 
 import httpx
@@ -178,11 +180,18 @@ def test_broker_token_command_bakes_sidecar_path_for_the_connected_workspace(
 ) -> None:
     _connected(monkeypatch)
     assert dc.configure_host_databricks("https://omni.example", "h") is True
+    monkeypatch.setattr(sys, "executable", "/runtime with spaces/python")
     # Trailing-slash-insensitive match against the connected workspace host.
     cmd = dc.broker_token_command("https://ws.example/")
     assert cmd is not None
-    assert "python3 -m omnigent.host.databricks_credential token" in cmd
-    assert str(tmp_path / dc._SIDECAR_NAME) in cmd
+    assert shlex.split(cmd) == [
+        sys.executable,
+        "-m",
+        "omnigent.host.databricks_credential",
+        "token",
+        "--coords",
+        str(tmp_path / dc._SIDECAR_NAME),
+    ]
 
 
 def test_broker_token_command_none_for_a_different_workspace(

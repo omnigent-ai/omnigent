@@ -201,14 +201,15 @@ def broker_token_command(host: str, cfg_path: Path | None = None) -> str | None:
 
     The sidecar path is baked as an absolute literal so the command works in the
     harness process regardless of its inherited environment (like git's
-    credential helper baking its coordinates).
+    credential helper baking its coordinates). The interpreter is pinned to
+    this installation so another Python on PATH cannot lose the broker module.
     """
     path = _sidecar_path(cfg_path)
     coords = _read_sidecar(path)
     if coords is None or coords["workspace_host"].rstrip("/") != host.rstrip("/"):
         return None
     module = "omnigent.host.databricks_credential"
-    return f"python3 -m {module} token --coords {shlex.quote(str(path))}"
+    return f"{shlex.quote(sys.executable)} -m {module} token --coords {shlex.quote(str(path))}"
 
 
 def https_url_on_workspace_host(url: str, workspace_host: str) -> bool:

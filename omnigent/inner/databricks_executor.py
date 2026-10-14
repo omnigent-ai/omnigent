@@ -22,6 +22,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import AsyncIterator, Generator
 from dataclasses import dataclass, field
@@ -254,6 +255,8 @@ def _databricks_sdk_token_command(host: str, profile: str | None) -> str:
     ``--host`` is always passed (the gateway's workspace) so the entrypoint can
     fail closed when a named profile resolves to a *different* workspace; a named
     ``--profile`` is added on top and pins identity to that section.
+    The current interpreter keeps the helper in this installation when the
+    harness's PATH selects a different Python.
 
     :param host: Databricks workspace host, e.g.
         ``"https://example.databricks.com"``.
@@ -264,7 +267,7 @@ def _databricks_sdk_token_command(host: str, profile: str | None) -> str:
     args = f"--host {shlex.quote(host.rstrip('/'))}"
     if profile:
         args += f" --profile {shlex.quote(profile)}"
-    return f"python3 -m omnigent.inner.databricks_token {args}"
+    return f"{shlex.quote(sys.executable)} -m omnigent.inner.databricks_token {args}"
 
 
 def databricks_bearer_token_command(
