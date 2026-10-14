@@ -1285,6 +1285,7 @@ async def test_engine_conversation_id_distinct_per_conversation(
     assert captured[0] != captured[1]
     assert None not in captured
 
+
 # -- _build_event forwards conversation_title ----------
 
 
@@ -1342,7 +1343,9 @@ async def test_engine_injects_conversation_title_matching_engine_conversation(
 
     policy = FunctionPolicy(_spec(), fn)
     engine = _build_engine(
-        conversation_store, [policy], conversation_title="Fix login bug",
+        conversation_store,
+        [policy],
+        conversation_title="Fix login bug",
     )
     await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hi"))
     assert captured["conversation_title"] == "Fix login bug"
@@ -1366,4 +1369,3 @@ async def test_engine_conversation_title_none_when_untitled(
     engine = _build_engine(conversation_store, [policy])
     await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hi"))
     assert captured["conversation_title"] is None
-
