@@ -108,6 +108,11 @@ path is on the execution host, which may differ from the server or browser's
 machine. The harness receives an absolute path. Attaching a file adds no file,
 directory, or symlink to the working checkout, and archives are not extracted.
 
+Codex rejects a turn whose text exceeds 1,048,576 characters, so the runner also
+writes text past 900,000 characters to this cache, as `pasted_text_<digest>.txt`
+(an oversized text file keeps its own name). The message then carries an
+`[Attached file: <path>]` reference in place of that text.
+
 The cache key derives from the session's native bridge path. Claude Code and
 Codex can recreate copies from the artifact store when rebuilding session
 history. Native session cleanup removes the corresponding cache; the cache

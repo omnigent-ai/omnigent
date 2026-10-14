@@ -20,6 +20,7 @@ from omnigent.inner.native_attachments import (
     codex_resize_metadata_path,
     has_unresolved_file_id,
     materialize_attachment,
+    materialize_text,
     parse_data_uri,
     requires_filesystem,
     resize_notice,
@@ -394,6 +395,51 @@ def test_materialize_cache_refuses_symlinked_attachments_dir(tmp_path: Path) -> 
 
     assert materialize_attachment(_zip_block(), tmp_path) is None
     assert list(elsewhere.iterdir()) == []
+
+
+def test_materialize_text_writes_utf8_under_a_digest_name(tmp_path: Path) -> None:
+    """Text lands in the session cache as a private, non-executable UTF-8 file."""
+    text = "caf\u00e9 \u2014 na\u00efve\nsecond line\n"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+    path = materialize_text(text, tmp_path)
+
+    assert path == attachment_cache_dir(tmp_path) / f"pasted_text_{digest}.txt"
+    assert path.read_text(encoding="utf-8") == text
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_materialize_text_reuses_identical_text(tmp_path: Path) -> None:
+    """Writing the same text again returns the file already there; other text gets its own."""
+    first = materialize_text("same words", tmp_path)
+    second = materialize_text("same words", tmp_path)
+    third = materialize_text("different words", tmp_path)
+
+    assert first is not None
+    assert second == first
+    assert third is not None and third != first
+    assert len(list(attachment_cache_dir(tmp_path).iterdir())) == 2
+
+
+def test_materialize_text_keeps_text_that_cannot_be_encoded(tmp_path: Path) -> None:
+    """A lone surrogate is replaced instead of losing the whole text."""
+    path = materialize_text("before\ud800after", tmp_path)
+
+    assert path is not None
+    assert path.read_text(encoding="utf-8") == "before?after"
+
+
+def test_materialize_text_refuses_a_symlinked_destination(tmp_path: Path) -> None:
+    """The digest name cannot redirect the write outside the cache."""
+    attachments_dir = attachment_cache_dir(tmp_path)
+    attachments_dir.mkdir(parents=True)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    outside.write_bytes(b"precious")
+    digest = hashlib.sha256(b"text").hexdigest()[:12]
+    (attachments_dir / f"pasted_text_{digest}.txt").symlink_to(outside)
+
+    assert materialize_text("text", tmp_path) is None
+    assert outside.read_bytes() == b"precious"
 
 
 def test_materialize_cache_does_not_overwrite_when_both_names_taken(
