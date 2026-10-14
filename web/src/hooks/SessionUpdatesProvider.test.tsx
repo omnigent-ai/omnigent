@@ -12,12 +12,16 @@ import type { ContextType, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  clearRecentlyCreated,
   clearSessionTombstones,
   useArchiveConversation,
+  useConversations,
+  useProjectSessions,
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import { sortConversations } from "@/shell/sidebarNav";
 
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
@@ -30,6 +34,8 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
     stop: vi.fn(),
     setWatched: (...args: unknown[]) => setWatched(...args),
     subscribe: (fn: () => void) => subscribe(fn),
+    subscribeStatus: () => () => {},
+    isConnected: () => true,
   },
 }));
 
@@ -38,6 +44,7 @@ import { useCanEdit } from "./usePermissions";
 import { sidebarConfig } from "@/lib/sidebarConfig";
 import { SessionUpdatesProvider } from "./SessionUpdatesProvider";
 import { useSaveProjectOrder } from "./useProjectOrder";
+import { useScopeCache } from "./useScopeCache";
 import * as projectsApi from "@/lib/projectsApi";
 
 type SidebarDataValue = NonNullable<ContextType<typeof SidebarDataContext>>;
@@ -462,6 +469,423 @@ describe("SessionUpdatesProvider list invalidation", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// Fake `GET /v1/sessions`: 20-row pages per list, newest first. Folder rows
+// carry their project's first-class id, as sessions born filed do. `hold`
+// parks matching requests until `release()`.
+function listBackend(
+  options: { endless?: boolean; hold?: (params: URLSearchParams) => boolean } = {},
+) {
+  const calls: URLSearchParams[] = [];
+  const held: (() => void)[] = [];
+  const fetch = vi.fn(async (url: string) => {
+    const params = new URL(url, "http://localhost").searchParams;
+    let body: unknown = {};
+    if (url.startsWith("/v1/sessions?")) {
+      calls.push(params);
+      if (options.hold?.(params)) {
+        await new Promise<void>((resolve) => {
+          held.push(resolve);
+        });
+      }
+      const project = params.get("project");
+      const page = params.get("after") ? 1 : 0;
+      const prefix = project ?? params.get("search_query") ?? params.get("visibility") ?? "all";
+      const data = params.has("pinned")
+        ? []
+        : Array.from({ length: 20 }, (_, i) =>
+            // The list endpoint omits null fields (`exclude_none`).
+            Object.fromEntries(
+              Object.entries({
+                ...conv(`${prefix}-${page}-${i}`),
+                updated_at: 1_000 - page * 100 - i,
+                ...(project ? { project_id: `id-${project}` } : {}),
+              }).filter(([, value]) => value !== null),
+            ),
+          );
+      body = {
+        data,
+        first_id: data[0]?.id ?? null,
+        last_id: data.at(-1)?.id ?? null,
+        has_more: (options.endless || page === 0) && data.length > 0,
+      };
+    }
+    return { ok: true, status: 200, json: async () => body };
+  });
+  const release = () => {
+    for (const resolve of held.splice(0)) resolve();
+  };
+  return { calls, fetch, release };
+}
+
+const PROJECTS = [
+  { id: "id-Alpha", name: "Alpha" },
+  { id: "id-Beta", name: "Beta" },
+];
+
+function renderSidebarLists(client: QueryClient, search?: string) {
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={["/"]}>
+        <SessionUpdatesProvider>{children}</SessionUpdatesProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+  return renderHook(
+    ({ betaExpanded }: { betaExpanded: boolean }) => ({
+      mine: useScopeCache("mine", false),
+      alpha: useProjectSessions("Alpha", true),
+      beta: useProjectSessions("Beta", betaExpanded),
+      search: useConversations(search ?? "", false, { enabled: search !== undefined }),
+    }),
+    { wrapper, initialProps: { betaExpanded: true } },
+  );
+}
+
+async function loadSecondFolderPages(
+  result: ReturnType<typeof renderSidebarLists>["result"],
+): Promise<void> {
+  await waitFor(() => {
+    expect(result.current.mine.isFetching).toBe(false);
+    expect(result.current.alpha.isFetching).toBe(false);
+    expect(result.current.beta.isFetching).toBe(false);
+  });
+  await act(async () => {
+    await result.current.alpha.fetchNextPage();
+    await result.current.beta.fetchNextPage();
+  });
+  await waitFor(() => {
+    expect(result.current.alpha.data?.pages).toHaveLength(2);
+    expect(result.current.beta.data?.pages).toHaveLength(2);
+  });
+}
+
+// Lets the provider's debounced reconcile fire and any refetch settle.
+async function settle(): Promise<void> {
+  await act(
+    () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 300);
+      }),
+  );
+}
+
+function folderRows(client: QueryClient, name: string): Conversation[] {
+  return (
+    client
+      .getQueryData<ConversationsInfiniteData>(["project-sessions", name])
+      ?.pages.flatMap((page) => page.data) ?? []
+  );
+}
+
+describe("SessionUpdatesProvider list reconciliation", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    // Placed rows arm the create keep-alive, which would leak into later lists.
+    clearRecentlyCreated();
+  });
+
+  it("keeps updated_at bumps on loaded rows and sub-agent frames local", async () => {
+    const backend = listBackend();
+    vi.stubGlobal("fetch", backend.fetch);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["projects"], PROJECTS);
+    const { result } = renderSidebarLists(client);
+    await loadSecondFolderPages(result);
+    const baseline = backend.calls.length;
+
+    for (let tick = 1; tick <= 5; tick++) {
+      act(() =>
+        frameHandler()({
+          type: "changed",
+          items: [
+            // A page-2 folder row and a sidebar row, both bumped by running agents.
+            {
+              ...conv("Alpha-1-3"),
+              project_id: "id-Alpha",
+              updated_at: 2_000 + tick,
+              status: "running",
+            },
+            { ...conv("mine-0-5"), updated_at: 2_000 + tick, status: "running" },
+            { ...conv(`child-${tick}`), parent_session_id: "mine-0-5", updated_at: 2_000 + tick },
+          ],
+        }),
+      );
+      // Sequential on purpose: each tick must clear the reconcile debounce.
+      // eslint-disable-next-line no-await-in-loop
+      await settle();
+    }
+
+    expect(backend.calls.slice(baseline)).toEqual([]);
+    // The bumped row leads its folder; page boundaries are kept.
+    expect(sortConversations(folderRows(client, "Alpha"), null)[0]).toMatchObject({
+      id: "Alpha-1-3",
+      updated_at: 2_005,
+      status: "running",
+    });
+    expect(result.current.alpha.data?.pages).toHaveLength(2);
+  });
+
+  it("places a new filed session in its folder without a fetch", async () => {
+    const backend = listBackend();
+    vi.stubGlobal("fetch", backend.fetch);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["projects"], PROJECTS);
+    const { result } = renderSidebarLists(client);
+    await loadSecondFolderPages(result);
+    const baseline = backend.calls.length;
+
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...conv("fresh"), project_id: "id-Beta", updated_at: 5_000 }],
+      }),
+    );
+    await settle();
+
+    expect(backend.calls.slice(baseline)).toEqual([]);
+    expect(folderRows(client, "Beta").map((row) => row.id)).toContain("fresh");
+    expect(folderRows(client, "Alpha").map((row) => row.id)).not.toContain("fresh");
+  });
+
+  it("refetches only the first page of a folder it can't resolve", async () => {
+    const backend = listBackend();
+    vi.stubGlobal("fetch", backend.fetch);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // Beta's project row isn't cached, so its membership is the server's call.
+    client.setQueryData(["projects"], PROJECTS.slice(0, 1));
+    const { result } = renderSidebarLists(client);
+    await loadSecondFolderPages(result);
+    const baseline = backend.calls.length;
+
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...conv("fresh"), updated_at: 5_000 }],
+      }),
+    );
+    await settle();
+    await waitFor(() => expect(result.current.beta.isFetching).toBe(false));
+
+    const refetched = backend.calls.slice(baseline);
+    expect(refetched).toHaveLength(1);
+    expect(refetched[0]!.get("project")).toBe("Beta");
+    expect(refetched[0]!.has("after")).toBe(false);
+    expect(result.current.beta.data?.pages).toHaveLength(1);
+    expect(result.current.alpha.data?.pages).toHaveLength(2);
+  });
+
+  it("leaves folder membership to the server for a project it hasn't cached", async () => {
+    const backend = listBackend();
+    vi.stubGlobal("fetch", backend.fetch);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["projects"], PROJECTS);
+    const { result } = renderSidebarLists(client);
+    await loadSecondFolderPages(result);
+    const baseline = backend.calls.length;
+
+    // Moved into a project created in another tab: not evicted on a guess.
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...conv("Alpha-0-2"), project_id: "id-New", updated_at: 990 }],
+      }),
+    );
+    await settle();
+    await waitFor(() => {
+      expect(result.current.alpha.isFetching).toBe(false);
+      expect(result.current.beta.isFetching).toBe(false);
+    });
+
+    const refetched = backend.calls.slice(baseline);
+    expect(refetched.map((params) => params.get("project")).sort()).toEqual(["Alpha", "Beta"]);
+    expect(refetched.every((params) => !params.has("after"))).toBe(true);
+  });
+
+  it("reconciles open search results when a session's content may have changed", async () => {
+    const backend = listBackend();
+    vi.stubGlobal("fetch", backend.fetch);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["projects"], PROJECTS);
+    const { result } = renderSidebarLists(client, "needle");
+    await loadSecondFolderPages(result);
+    await waitFor(() => expect(result.current.search.isSuccess).toBe(true));
+    await settle();
+    const baseline = backend.calls.length;
+
+    // A new message (which may mention "needle") only moves updated_at.
+    act(() =>
+      frameHandler()({ type: "changed", items: [{ ...conv("mine-0-5"), updated_at: 2_000 }] }),
+    );
+    await settle();
+    await waitFor(() => expect(result.current.search.isFetching).toBe(false));
+
+    const refetched = backend.calls.slice(baseline);
+    expect(refetched.map((params) => params.get("search_query"))).toEqual(["needle"]);
+  });
+
+  it("ignores another owner's private project when resolving folders", async () => {
+    const backend = listBackend();
+    vi.stubGlobal("fetch", backend.fetch);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["projects"], PROJECTS);
+    const { result } = renderSidebarLists(client);
+    await loadSecondFolderPages(result);
+    const baseline = backend.calls.length;
+
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [
+          {
+            ...conv("shared-1"),
+            owner: "someone-else",
+            project_id: "id-their-project",
+            title: "renamed by its owner",
+            updated_at: 2_000,
+          },
+        ],
+      }),
+    );
+    await settle();
+
+    expect(backend.calls.slice(baseline).filter((params) => params.has("project"))).toEqual([]);
+  });
+
+  it("replays a frame that lands while a folder page is loading", async () => {
+    let holdPages = false;
+    const backend = listBackend({ hold: (params) => holdPages && params.has("after") });
+    vi.stubGlobal("fetch", backend.fetch);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["projects"], PROJECTS);
+    const { result } = renderSidebarLists(client);
+    await waitFor(() => {
+      expect(result.current.mine.isFetching).toBe(false);
+      expect(result.current.alpha.isFetching).toBe(false);
+      expect(result.current.beta.isFetching).toBe(false);
+    });
+
+    holdPages = true;
+    let nextPage!: Promise<unknown>;
+    act(() => {
+      nextPage = result.current.alpha.fetchNextPage();
+    });
+    await waitFor(() => expect(backend.calls.some((params) => params.has("after"))).toBe(true));
+    // Archived elsewhere while page 2 is in flight: evicted now...
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...conv("Alpha-0-3"), project_id: "id-Alpha", updated_at: 990, archived: true }],
+      }),
+    );
+    expect(folderRows(client, "Alpha").map((row) => row.id)).not.toContain("Alpha-0-3");
+    backend.release();
+    await act(async () => {
+      await nextPage;
+    });
+
+    // ...and still gone once the page lands on top of the pre-frame pages.
+    await waitFor(() => expect(result.current.alpha.data?.pages).toHaveLength(2));
+    expect(folderRows(client, "Alpha").map((row) => row.id)).not.toContain("Alpha-0-3");
+  });
+
+  it("refetches a folder whose cursor row was deleted elsewhere", async () => {
+    const backend = listBackend({ endless: true });
+    vi.stubGlobal("fetch", backend.fetch);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["projects"], PROJECTS);
+    const { result } = renderSidebarLists(client);
+    await loadSecondFolderPages(result);
+    const baseline = backend.calls.length;
+
+    // Every row of Beta's last loaded page, cursor anchor included.
+    const ids = Array.from({ length: 20 }, (_, i) => `Beta-1-${i}`);
+    act(() => frameHandler()({ type: "removed", ids }));
+    await settle();
+    await waitFor(() => expect(result.current.beta.isFetching).toBe(false));
+
+    const refetched = backend.calls.slice(baseline);
+    expect(refetched.map((params) => [params.get("project"), params.get("after")])).toEqual([
+      ["Beta", null],
+    ]);
+    expect(result.current.beta.hasNextPage).toBe(true);
+  });
+
+  it("cancels a collapsed folder's in-flight page before trimming it", async () => {
+    let holdPages = false;
+    const backend = listBackend({
+      endless: true,
+      hold: (params) => holdPages && params.has("after"),
+    });
+    vi.stubGlobal("fetch", backend.fetch);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // Beta is unresolved, so a new session makes it reconcile with the server.
+    client.setQueryData(["projects"], PROJECTS.slice(0, 1));
+    const { result, rerender } = renderSidebarLists(client);
+    await loadSecondFolderPages(result);
+
+    holdPages = true;
+    act(() => {
+      void result.current.beta.fetchNextPage();
+    });
+    await waitFor(() => expect(backend.calls.filter((p) => p.has("after"))).toHaveLength(3));
+    // Collapsed mid-fetch: the query goes inactive, so invalidation won't cancel it.
+    rerender({ betaExpanded: false });
+    act(() =>
+      frameHandler()({ type: "changed", items: [{ ...conv("fresh"), updated_at: 5_000 }] }),
+    );
+    await settle();
+    backend.release();
+    await settle();
+
+    const beta = client.getQueryData<ConversationsInfiniteData>(["project-sessions", "Beta"]);
+    expect(beta?.pages).toHaveLength(1);
+  });
+
+  it("reconciles a rename only in lists whose membership the server decides", async () => {
+    const backend = listBackend();
+    vi.stubGlobal("fetch", backend.fetch);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["projects"], PROJECTS);
+    const { result } = renderSidebarLists(client, "needle");
+    await loadSecondFolderPages(result);
+    await waitFor(() => expect(result.current.search.isSuccess).toBe(true));
+    const baseline = backend.calls.length;
+
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...conv("mine-0-5"), title: "now mentions needle", updated_at: 990 }],
+      }),
+    );
+    await settle();
+    await waitFor(() => expect(result.current.search.isFetching).toBe(false));
+
+    const refetched = backend.calls.slice(baseline);
+    expect(refetched.map((params) => params.get("search_query"))).toEqual(["needle"]);
+  });
+
+  it("evicts a remotely archived folder row locally without a fetch", async () => {
+    const backend = listBackend();
+    vi.stubGlobal("fetch", backend.fetch);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["projects"], PROJECTS);
+    const { result } = renderSidebarLists(client);
+    await loadSecondFolderPages(result);
+    const baseline = backend.calls.length;
+
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...conv("Alpha-1-3"), project_id: "id-Alpha", updated_at: 900, archived: true }],
+      }),
+    );
+    await settle();
+
+    expect(backend.calls.slice(baseline)).toEqual([]);
+    expect(folderRows(client, "Alpha").map((row) => row.id)).not.toContain("Alpha-1-3");
   });
 });
 

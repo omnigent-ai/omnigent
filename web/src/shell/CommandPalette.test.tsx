@@ -273,6 +273,28 @@ describe("CommandPalette — sessions", () => {
     }
   });
 
+  it("orders the idle list by recency, not by cached page order", () => {
+    // A live update can bump a row on a later page without a refetch.
+    useConversations.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: Array.from({ length: 5 }, (_, i) => ({
+              ...conv(`c${i}`, `Session ${i}`),
+              updated_at: 100 - i,
+            })),
+          },
+          { data: [{ ...conv("bumped", "Just bumped"), updated_at: 500 }] },
+        ],
+      },
+      isFetching: false,
+    });
+    renderPalette();
+
+    expect(screen.getByText("Just bumped")).toBeTruthy();
+    expect(screen.queryByText("Session 4")).toBeNull();
+  });
+
   it("dedupes sessions that appear on overlapping pages", () => {
     useConversations.mockReturnValue({
       data: {

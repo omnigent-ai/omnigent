@@ -1819,7 +1819,6 @@ function restorePinLabelInCaches(queryClient: QueryClient, id: string, pin: stri
       data,
       new Map([[id, { id, labels: withPin(row.labels) } satisfies SessionListWireItem]]),
       filtersFromConversationQueryKey(key),
-      undefined,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
@@ -1854,7 +1853,6 @@ function patchPinnedCaches(
       data,
       itemsById,
       filtersFromConversationQueryKey(key),
-      undefined,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
@@ -2322,7 +2320,6 @@ export function useMoveToProject() {
         data,
         itemsById,
         filtersFromConversationQueryKey(key),
-        undefined,
       );
       if (found.has(id)) windowSorts.add(key[5] === "created_at" ? "created_at" : "updated_at");
       if (next !== data) queryClient.setQueryData(key, next);
@@ -2340,7 +2337,6 @@ export function useMoveToProject() {
           targetData,
           itemsById,
           PROJECT_FOLDER_FILTERS,
-          undefined,
         );
         let next = merged ?? targetData;
         const [first, ...rest] = next.pages;

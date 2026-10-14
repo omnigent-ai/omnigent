@@ -1,11 +1,14 @@
 import { describe, it, expect } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import { sortConversations } from "@/shell/sidebarNav";
+import { mergeScopeRows } from "./sidebarData";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
   collectConversationIds,
   filtersFromConversationQueryKey,
+  firstPageOnly,
   insertNewRowsIntoPages,
   mergeItemsIntoPages,
   nullsToUndefined,
@@ -41,9 +44,6 @@ function data(...pages: Conversation[][]): ConversationsInfiniteData {
 
 const DEFAULT_FILTERS = { searchQuery: "", includeArchived: false };
 
-// Most cases aren't on a chat route, so no row is the pinned active one.
-const NO_ACTIVE = undefined;
-
 describe("mergeItemsIntoPages", () => {
   it("overlays changed fields onto the matching row", () => {
     const before = data([conv("a", { status: "idle", title: "old" }), conv("b")]);
@@ -51,7 +51,7 @@ describe("mergeItemsIntoPages", () => {
       ["a", { id: "a", status: "running", title: "new" }],
     ]);
 
-    const { data: after, found } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS, NO_ACTIVE);
+    const { data: after, found } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS);
 
     // The matched row reflects the wire values; the proof the delta
     // traversed into the cache (a broken merge would leave "old"/"idle").
@@ -74,7 +74,7 @@ describe("mergeItemsIntoPages", () => {
     // key-absent overlay would leave the stale "rnr_old".
     const items = new Map<string, SessionListWireItem>([["a", { id: "a", runner_id: undefined }]]);
 
-    const { data: after, found } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS, NO_ACTIVE);
+    const { data: after, found } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS);
 
     // runner_id went non-null → cleared: the cached value must be replaced,
     // landing as undefined (the list's absent-field shape), not the stale value.
@@ -91,7 +91,7 @@ describe("mergeItemsIntoPages", () => {
     const before = data([conv("a", { search_snippet: "…setup.py test…" })]);
     const items = new Map<string, SessionListWireItem>([["a", { id: "a", status: "running" }]]);
 
-    const { data: after } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS, NO_ACTIVE);
+    const { data: after } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS);
 
     // Snippet survives; only the field the frame carried is applied.
     expect(after!.pages[0].data[0].search_snippet).toBe("…setup.py test…");
@@ -103,7 +103,7 @@ describe("mergeItemsIntoPages", () => {
     // Wire item restates the current values — an idempotent snapshot replay.
     const items = new Map<string, SessionListWireItem>([["a", { id: "a", status: "running" }]]);
 
-    const { data: after, found } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS, NO_ACTIVE);
+    const { data: after, found } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS);
 
     // Same reference → React Query notify (and re-render) is skipped.
     // If this returned a new object, idle snapshots would churn the UI.
@@ -123,9 +123,9 @@ describe("mergeItemsIntoPages", () => {
     ]);
 
     // Equal labels by value → no change.
-    expect(mergeItemsIntoPages(before, sameLabels, DEFAULT_FILTERS, NO_ACTIVE).data).toBe(before);
+    expect(mergeItemsIntoPages(before, sameLabels, DEFAULT_FILTERS).data).toBe(before);
     // Different label value → row rewritten with the new labels.
-    const { data: after } = mergeItemsIntoPages(before, changedLabels, DEFAULT_FILTERS, NO_ACTIVE);
+    const { data: after } = mergeItemsIntoPages(before, changedLabels, DEFAULT_FILTERS);
     expect(after).not.toBe(before);
     expect(after!.pages[0].data[0].labels).toEqual({ x: "2" });
   });
@@ -137,7 +137,7 @@ describe("mergeItemsIntoPages", () => {
       ["zzz", { id: "zzz", title: "new session" }],
     ]);
 
-    const { found } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS, NO_ACTIVE);
+    const { found } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS);
 
     // "zzz" isn't in the cache, so it's NOT found — the caller uses this
     // to trigger a refetch rather than guessing its sort position.
@@ -153,7 +153,7 @@ describe("mergeItemsIntoPages", () => {
       data: after,
       found,
       needsRefetch,
-    } = mergeItemsIntoPages(before, items, { includeArchived: false, searchQuery: "" }, NO_ACTIVE);
+    } = mergeItemsIntoPages(before, items, { includeArchived: false, searchQuery: "" });
 
     // A pushed archive delta must not leave the row visible in the
     // default sidebar query while the server refetch is in flight.
@@ -170,12 +170,7 @@ describe("mergeItemsIntoPages", () => {
     const before = data([conv("a", { runner_online: true }), conv("b", { runner_online: true })]);
     const items = new Map<string, SessionListWireItem>([["a", { id: "a", runner_online: false }]]);
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(
-      before,
-      items,
-      DEFAULT_FILTERS,
-      NO_ACTIVE,
-    );
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS);
 
     expect(after!.pages[0].data.map((row) => [row.id, row.runner_online])).toEqual([
       ["a", false],
@@ -188,12 +183,10 @@ describe("mergeItemsIntoPages", () => {
     const before = data([conv("a", { title: "alpha" })]);
     const items = new Map<string, SessionListWireItem>([["a", { id: "a", title: "beta" }]]);
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(
-      before,
-      items,
-      { searchQuery: "alp", includeArchived: false },
-      NO_ACTIVE,
-    );
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, {
+      searchQuery: "alp",
+      includeArchived: false,
+    });
 
     // The local cache cannot know whether the server-side search still
     // matches via title or item content, so it patches the row then
@@ -202,49 +195,100 @@ describe("mergeItemsIntoPages", () => {
     expect(needsRefetch).toBe(true);
   });
 
-  it("asks for a refetch when updated_at changes the server sort key", () => {
-    const before = data([conv("a", { updated_at: 1 })]);
-    const items = new Map<string, SessionListWireItem>([["a", { id: "a", updated_at: 2 }]]);
+  it("re-sorts repeated updated_at bumps locally without asking for a refetch", () => {
+    const before = data(
+      [conv("a", { updated_at: 3 }), conv("b", { updated_at: 2 })],
+      [conv("c", { updated_at: 1 })],
+    );
+    let current: ConversationsInfiniteData | undefined = before;
+    for (const [id, updatedAt] of [
+      ["c", 4],
+      ["b", 5],
+      ["c", 6],
+    ] as const) {
+      const result = mergeItemsIntoPages(
+        current,
+        new Map([[id, { id, updated_at: updatedAt }]]),
+        DEFAULT_FILTERS,
+      );
+      // A bump only raises a row, so the loaded pages stay a prefix of the
+      // server's order and no reconcile is needed.
+      expect(result.needsRefetch).toBe(false);
+      current = result.data;
+    }
+    // Rows stay on their pages (sorted within them); the sidebar orders the
+    // whole list by updated_at at render time.
+    expect(current!.pages.map((page) => page.data.map((row) => row.id))).toEqual([
+      ["b", "a"],
+      ["c"],
+    ]);
+    expect(
+      sortConversations(
+        current!.pages.flatMap((page) => page.data),
+        null,
+      ).map((row) => row.id),
+    ).toEqual(["c", "b", "a"]);
+  });
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(
+  it("moves a legacy cursor off a bumped anchor so the window boundary stays valid", () => {
+    const before = data([
+      conv("a", { updated_at: 30 }),
+      conv("b", { updated_at: 20 }),
+      conv("c", { updated_at: 10 }),
+    ]);
+    before.pages[0].has_more = true;
+
+    const { data: after } = mergeItemsIntoPages(
       before,
-      items,
+      new Map([["c", { id: "c", updated_at: 40 }]]),
       DEFAULT_FILTERS,
-      NO_ACTIVE,
     );
 
-    // The pushed delta updates the visible timestamp immediately, then
-    // the refetch restores the server's descending updated_at order.
-    expect(after!.pages[0].data[0].updated_at).toBe(2);
-    expect(needsRefetch).toBe(true);
+    const page = after!.pages[0];
+    expect(page.data.map((row) => row.id)).toEqual(["c", "a", "b"]);
+    // The next page continues after "b"; "after=c" would replay a and b.
+    expect(page.last_id).toBe("b");
+    // The All view's watermark is the true oldest row, not the bumped one.
+    const merged = mergeScopeRows(page.data, [], true, false, page.last_id);
+    expect(merged.rows.map((row) => row.id)).toEqual(["c", "a", "b"]);
   });
 
-  it("skips the refetch when only the active row's updated_at changed", () => {
-    const before = data([conv("a", { updated_at: 1 }), conv("b", { updated_at: 1 })]);
-    const items = new Map<string, SessionListWireItem>([["a", { id: "a", updated_at: 2 }]]);
+  it("leaves a creation-ordered page and its cursor alone when updated_at moves", () => {
+    const before = data([
+      conv("a", { created_at: 30, updated_at: 30 }),
+      conv("b", { created_at: 20, updated_at: 20 }),
+      conv("c", { created_at: 10, updated_at: 10 }),
+    ]);
+    before.pages[0].has_more = true;
 
-    // "a" is the active chat — pinned in place by ActiveChatOverride.
-    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS, "a");
+    const { data: after } = mergeItemsIntoPages(
+      before,
+      new Map([["c", { id: "c", updated_at: 40 }]]),
+      { ...DEFAULT_FILTERS, sortBy: "created_at" },
+    );
 
-    // The timestamp is still patched into the cache (the row stays current)...
-    expect(after!.pages[0].data[0].updated_at).toBe(2);
-    // ...but no refetch fires: re-sorting wouldn't move the pinned active row,
-    // so the per-tick list poll the old code triggered for an actively-used
-    // session is eliminated. A regression that dropped the active-row carve-out
-    // would flip this back to true.
-    expect(needsRefetch).toBe(false);
+    expect(after!.pages[0].data.map((row) => row.id)).toEqual(["a", "b", "c"]);
+    expect(after!.pages[0].last_id).toBe("c");
   });
 
-  it("still refetches when a non-active row's updated_at changes", () => {
-    const before = data([conv("a", { updated_at: 1 }), conv("b", { updated_at: 1 })]);
-    // "b" changed, but "a" is the active/pinned row — "b" still needs resorting.
-    const items = new Map<string, SessionListWireItem>([["b", { id: "b", updated_at: 2 }]]);
+  it("keeps an opaque cursor when its page reorders", () => {
+    const before = data([conv("a", { updated_at: 30 }), conv("b", { updated_at: 20 })]);
+    before.pages[0] = { ...before.pages[0], has_more: true, last_id: "opaque-token" };
 
-    const { needsRefetch } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS, "a");
+    const { data: after } = mergeItemsIntoPages(
+      before,
+      new Map([["b", { id: "b", updated_at: 40 }]]),
+      DEFAULT_FILTERS,
+    );
 
-    // The active-row carve-out must not suppress resorts for other rows, or a
-    // bumped sibling would sit in the wrong sidebar position until the next poll.
-    expect(needsRefetch).toBe(true);
+    expect(after!.pages[0].last_id).toBe("opaque-token");
+  });
+
+  it("asks for a refetch when a first-class project move changes project_id", () => {
+    const before = data([conv("a", { project_id: "p1" })]);
+    const items = new Map<string, SessionListWireItem>([["a", { id: "a", project_id: "p2" }]]);
+
+    expect(mergeItemsIntoPages(before, items, DEFAULT_FILTERS).needsRefetch).toBe(true);
   });
 });
 
@@ -284,7 +328,7 @@ describe("mergeItemsIntoPages project-filtered membership", () => {
       ["a", { id: "a", archived: true, labels: { omni_project: "Beta" } }],
     ]);
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, alpha, NO_ACTIVE);
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, alpha);
 
     // `a` no longer belongs in the Alpha cache; `b` (still Alpha) stays.
     expect(after!.pages[0].data.map((c) => c.id)).toEqual(["b"]);
@@ -300,7 +344,7 @@ describe("mergeItemsIntoPages project-filtered membership", () => {
       ["a", { id: "a", archived: true, labels: { omni_project: "Alpha" } }],
     ]);
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, unfiltered, NO_ACTIVE);
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, unfiltered);
 
     expect(after!.pages[0].data.map((c) => c.id)).toEqual(["a"]);
     expect(needsRefetch).toBe(true);
@@ -314,7 +358,7 @@ describe("mergeItemsIntoPages project-filtered membership", () => {
       ["a", { id: "a", archived: true, status: "running", labels: { omni_project: "Alpha" } }],
     ]);
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, alpha, NO_ACTIVE);
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, alpha);
 
     // Membership holds, so the row is patched in place (not evicted), and a
     // status-only change needs no server reconcile.
@@ -333,7 +377,7 @@ describe("mergeItemsIntoPages project-filtered membership", () => {
       ["a", { id: "a", archived: true, labels: { omni_project: "Alpha" } }],
     ]);
 
-    const { data: after } = mergeItemsIntoPages(before, items, allProjects, NO_ACTIVE);
+    const { data: after } = mergeItemsIntoPages(before, items, allProjects);
 
     expect(after!.pages[0].data.map((c) => c.id)).toEqual(["a"]);
   });
@@ -360,7 +404,13 @@ describe("filtersFromConversationQueryKey", () => {
   it("accepts creation-order caches for live updates and optimistic mutations", () => {
     expect(
       filtersFromConversationQueryKey(["conversations", "", false, null, "mine", "created_at"]),
-    ).toEqual({ searchQuery: "", includeArchived: false, project: undefined, visibility: "mine" });
+    ).toEqual({
+      searchQuery: "",
+      includeArchived: false,
+      project: undefined,
+      visibility: "mine",
+      sortBy: "created_at",
+    });
   });
 
   it("rejects non-canonical conversation query keys", () => {
@@ -527,5 +577,119 @@ describe("insertNewRowsIntoPages", () => {
       (id) => id === "gone",
     );
     expect(inserted).toHaveLength(0);
+  });
+
+  it("leaves a row older than the loaded window for its unloaded page", () => {
+    const before = data([conv("a", { updated_at: 30 }), conv("b", { updated_at: 20 })]);
+    before.pages[0].has_more = true;
+
+    const older = insertNewRowsIntoPages(
+      before,
+      candidate("old", { updated_at: 10 }),
+      DEFAULT_FILTERS,
+    );
+    expect(older.inserted).toHaveLength(0);
+    expect(older.data).toBe(before);
+
+    const newer = insertNewRowsIntoPages(
+      before,
+      candidate("new", { updated_at: 25 }),
+      DEFAULT_FILTERS,
+    );
+    expect(newer.inserted.map((c) => c.id)).toEqual(["new"]);
+  });
+
+  it("places rows by creation time in a creation-ordered list", () => {
+    const createdOrder = { ...DEFAULT_FILTERS, sortBy: "created_at" as const };
+    const before = data([
+      conv("a", { created_at: 30, updated_at: 30 }),
+      conv("b", { created_at: 20, updated_at: 20 }),
+    ]);
+    before.pages[0].has_more = true;
+    const rows = new Map<string, SessionListWireItem>([
+      // Recently active, but created before the loaded window.
+      ["busy-old", { id: "busy-old", created_at: 10, updated_at: 99 }],
+      ["new", { id: "new", created_at: 40, updated_at: 40 }],
+    ]);
+
+    const { inserted } = insertNewRowsIntoPages(before, rows, createdOrder);
+
+    expect(inserted.map((c) => c.id)).toEqual(["new"]);
+  });
+
+  it("breaks updated_at ties at the window boundary by id, like the server", () => {
+    const before = data([conv("m", { updated_at: 30 }), conv("m2", { updated_at: 20 })]);
+    before.pages[0].has_more = true;
+
+    // Same second as the oldest row: "z…" sorts before "m2", "a…" after it.
+    const rows = new Map<string, SessionListWireItem>([
+      ["zz", { id: "zz", updated_at: 20 }],
+      ["aa", { id: "aa", updated_at: 20 }],
+    ]);
+    const { inserted } = insertNewRowsIntoPages(before, rows, DEFAULT_FILTERS);
+
+    expect(inserted.map((c) => c.id)).toEqual(["zz"]);
+  });
+
+  it("places an older row when the list is fully loaded", () => {
+    const before = data([conv("a", { updated_at: 30 })]);
+    const { inserted } = insertNewRowsIntoPages(
+      before,
+      candidate("old", { updated_at: 10 }),
+      DEFAULT_FILTERS,
+    );
+    expect(inserted.map((c) => c.id)).toEqual(["old"]);
+  });
+
+  it("decides project-folder membership from project_id or the legacy label", () => {
+    const folder = {
+      searchQuery: "",
+      includeArchived: false,
+      visibility: "mine" as const,
+      folder: { id: "p1", name: "Alpha" },
+    };
+    const before = data([conv("a", { project_id: "p1", updated_at: 5 })]);
+    const rows = new Map<string, SessionListWireItem>([
+      ["byId", { id: "byId", project_id: "p1", updated_at: 9 }],
+      ["byLabel", { id: "byLabel", labels: { omni_project: "Alpha" }, updated_at: 8 }],
+      ["elsewhere", { id: "elsewhere", project_id: "p2", updated_at: 7 }],
+      ["unfiled", { id: "unfiled", updated_at: 6 }],
+      ["foreign", { id: "foreign", project_id: "p1", owner: "someone-else", updated_at: 9 }],
+    ]);
+
+    const { inserted } = insertNewRowsIntoPages(before, rows, folder, undefined, "viewer");
+
+    expect(inserted.map((c) => c.id)).toEqual(["byId", "byLabel"]);
+  });
+});
+
+describe("mergeItemsIntoPages project-folder membership", () => {
+  it("evicts a row moved out of the folder", () => {
+    const folder = {
+      searchQuery: "",
+      includeArchived: false,
+      visibility: "mine" as const,
+      folder: { id: "p1", name: "Alpha" },
+    };
+    const before = data([conv("a", { project_id: "p1" }), conv("b", { project_id: "p1" })]);
+    const items = new Map<string, SessionListWireItem>([["a", { id: "a", project_id: "p2" }]]);
+
+    const { data: after } = mergeItemsIntoPages(before, items, folder);
+
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(["b"]);
+  });
+});
+
+describe("firstPageOnly", () => {
+  it("drops every page after the first so a refetch costs one request", () => {
+    const before = data([conv("a")], [conv("b")], [conv("c")]);
+    before.pageParams = [undefined, "a", "b"];
+
+    const after = firstPageOnly(before);
+
+    expect(after!.pages.map((page) => page.data.map((c) => c.id))).toEqual([["a"]]);
+    expect(after!.pageParams).toEqual([undefined]);
+    const single = data([conv("a")]);
+    expect(firstPageOnly(single)).toBe(single);
   });
 });
