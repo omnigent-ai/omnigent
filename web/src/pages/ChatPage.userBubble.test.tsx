@@ -297,6 +297,31 @@ describe("UserBubble entrance motion", () => {
   });
 });
 
+describe("UserBubble awaiting-agent marker", () => {
+  const content: MessageContentBlock[] = [{ type: "input_text", text: "steer" }];
+
+  it("tells the user a mid-turn message waits for the agent's current step", () => {
+    const [pending] = buildPendingBubbles([{ tempId: "pend_1", content, sentMidTurn: true }], null);
+    renderBubble(pending!);
+    expect(screen.getByTestId("message-awaiting-agent")).toHaveTextContent(
+      "The agent will read this after its current step",
+    );
+  });
+
+  it("stays hidden for a send that started a turn and for committed history", () => {
+    const [pending] = buildPendingBubbles([{ tempId: "pend_2", content }], null);
+    const { rerender } = renderBubble(pending!);
+    expect(screen.queryByTestId("message-awaiting-agent")).toBeNull();
+    // A promoted bubble drops the marker even if a stale flag were carried over.
+    rerender(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BubbleView bubble={userBubble("steer", { awaitingAgent: true })} />
+      </FileViewerContext.Provider>,
+    );
+    expect(screen.queryByTestId("message-awaiting-agent")).toBeNull();
+  });
+});
+
 describe("UserBubble copy button", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
