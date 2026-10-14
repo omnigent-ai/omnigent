@@ -18,7 +18,10 @@ the header menu), and each place is a separate entry point.
 - `rename`: from the row, the header menu, or the header title; long titles are
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
-  view, which can be filtered by project and paged.
+  view, which can be filtered by project and paged. On a server with worktree
+  cleanup, archiving a session that has a git worktree first asks whether to
+  also delete the worktree (the branch is kept); Remember my choice saves the
+  answer, which Settings → Git can change later.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
@@ -115,6 +118,12 @@ mode pickers. Your custom
 agents (installed with `omnigent agent add`, imported in the Create custom agent
 dialog, or uploaded by running a session with their spec) stay available until
 you remove them.
+
+**Archive worktree prompt:** archive a worktree session from the row menu,
+bulk selection, or header menu; the "Also delete the worktree?" dialog offers
+"No, archive only" and "Yes, delete worktree", plus Remember my choice.
+Dismissing it cancels the archive. Settings → Git → Worktrees holds the saved
+choice only when the server supports cleanup.
 
 **Archived view:** choose Display → Archived sessions in the sidebar filter
 menu, then filter by project.
@@ -258,6 +267,17 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_load_more_pages_through`
+- **`archive`, worktree prompt:**
+  `tests/server/integration/test_sessions_archive.py::test_archive_stop_removes_worktree_when_requested`
+  and
+  `tests/server/integration/test_sessions_archive.py::test_delete_worktree_requires_archive`
+  (plain `uv run pytest`) cover the opt-in teardown that keeps the branch and
+  the rejected request without archive. The prompt, remembered choice, and the
+  archive-only fallback on a server without cleanup have component coverage in
+  `web/src/shell/Sidebar.archive.test.tsx` and
+  `web/src/shell/HeaderConversationMenu.test.tsx`. Manually: archive a
+  worktree session from the row menu, bulk selection, and header menu, and
+  expect the dialog each time; a session without a worktree archives silently.
 - **`unarchive`, header menu:**
   `tests/e2e_ui/sessions/test_archived_session_header_menu.py::test_archived_session_header_menu_offers_unarchive`.
   The sidebar row and bulk unarchive have web unit coverage only: archive a
@@ -567,6 +587,9 @@ plain `uv run pytest`, which starts a private server for the test.
   that the undo toast restores the session.
 - The header menu of an archived session must offer Unarchive, not Archive.
   Open an archived session directly to see it.
+- The worktree prompt appears only when the server advertises worktree cleanup
+  and the session has a worktree. A remembered answer skips it on every later
+  archive; reset the choice in Settings → Git before re-testing.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
