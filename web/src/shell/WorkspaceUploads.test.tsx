@@ -500,6 +500,39 @@ it("shows a single folder ring and upload label, then freezes the DROP row despi
   expect(assets.closest("[data-upload-hover]")).toBeNull();
 });
 
+it("outlines the browsed root while a root-level file row is the drop target", async () => {
+  view(
+    "src",
+    tree({
+      files: [
+        { path: "top.txt", name: "top.txt", type: "file", bytes: 1, modified_at: null },
+        { path: "other", name: "other", type: "directory", bytes: null, modified_at: null },
+      ],
+    }),
+  );
+  await screen.findByRole("button", { name: "Upload files" });
+  const transfer = { types: ["Files"], files: [new File(["bytes"], "new.txt")] };
+  fireEvent.dragOver(screen.getByText("top.txt"), { dataTransfer: transfer });
+  expect(screen.getByText("Upload to src")).toBeVisible();
+  const outline = document.querySelector("[data-upload-root-outline]");
+  expect(outline).toBeTruthy();
+  expect(outline?.parentElement).toBe(document.querySelector("[data-upload-drop-root]"));
+  expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(1);
+  fireEvent.dragOver(screen.getByText("other/"), { dataTransfer: transfer });
+  expect(screen.getByText("Upload to src/other")).toBeVisible();
+  expect(document.querySelector("[data-upload-root-outline]")).toBeNull();
+  fireEvent.drop(screen.getByText("top.txt"), { dataTransfer: transfer });
+  expect(enqueueUploads).toHaveBeenCalledExactlyOnceWith(
+    expect.anything(),
+    transfer.files,
+    "src",
+    "src",
+    limits,
+    client,
+  );
+  expect(document.querySelector("[data-upload-root-outline]")).toBeNull();
+});
+
 it("uploads a file-row drop to its parent once and a header drop to the browsed root", async () => {
   view("src", tree());
   await screen.findByRole("button", { name: "Upload files" });
