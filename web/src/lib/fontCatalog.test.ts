@@ -59,11 +59,15 @@ describe("fontCatalog — integrity", () => {
   });
 
   it("includes the bundled Geist Mono and a system default with no fetch", () => {
+    const bundledGeistFamily = "Geist Mono Variable";
     const geist = getFontById("geist-mono");
     expect(geist?.source).toBe("bundled");
-    expect(geist?.family).toBe("Geist Mono Variable");
+    expect(geist?.family).toBe(bundledGeistFamily);
 
-    expect(getFontById("geist-mono-code-bundled")).toBeUndefined();
+    const codeBundledEntries = FONT_CATALOG_BY_CATEGORY.code.filter(
+      (entry) => entry.source === "bundled" || entry.family === bundledGeistFamily,
+    );
+    expect(codeBundledEntries).toEqual([]);
 
     const system = getFontById("system-ui");
     expect(system?.source).toBe("bundled");
