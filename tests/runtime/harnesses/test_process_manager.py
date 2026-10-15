@@ -41,6 +41,7 @@ import pytest
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
 from omnigent.runtime.harnesses.process_manager import (
+    _AP_LOCK_FILE,
     _AP_PID_FILE,
     _TMP_PARENT_ENV_VAR,
     HarnessProcessManager,
@@ -1289,6 +1290,22 @@ async def test_orphan_sweep_removes_dead_omnigent_dirs(
         assert fresh.instance_dir.exists()
     finally:
         await fresh.shutdown()
+
+
+@pytest.mark.posix_only
+async def test_orphan_sweep_removes_unlocked_dir_even_if_its_pid_was_reused(
+    short_tmp_parent: Path,
+) -> None:
+    """An unheld instance lock means the owner is gone, whatever its PID now names."""
+    stale_dir = short_tmp_parent / "ap-reusedpid"
+    stale_dir.mkdir(mode=0o700)
+    (stale_dir / _AP_LOCK_FILE).touch()
+    # The dead owner's PID now belongs to an unrelated live process.
+    (stale_dir / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+
+    await sweep_orphaned_harness_processes(tmp_parent=short_tmp_parent)
+
+    assert not stale_dir.exists()
 
 
 async def test_orphan_sweep_preserves_live_omnigent_dirs(
