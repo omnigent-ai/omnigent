@@ -278,8 +278,14 @@ def _await_answer(child: Any, server: str, conv: str, marker: str) -> list[dict[
     deadline = time.monotonic() + _TURN_TIMEOUT
     items: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
-        with contextlib.suppress(pexpect.TIMEOUT):
+        try:
             child.read_nonblocking(65536, timeout=0.1)
+        except pexpect.TIMEOUT:
+            pass
+        except pexpect.EOF as exc:
+            raise AssertionError(
+                f"Pi CLI exited before {marker}; last mirrored items: {items[-8:]}"
+            ) from exc
         response = httpx.get(f"{server}/v1/sessions/{conv}/items", timeout=10)
         response.raise_for_status()
         items = response.json().get("data", [])
@@ -356,7 +362,7 @@ def test_pi_native_smart_routing_applies_pick(pi_home: Path, mock_llm: str, surf
             json.dumps({"surface": surface, "requests": requests, "items": items}, indent=2)
         )
     except BaseException:
-        with contextlib.suppress(httpx.HTTPError):
+        with contextlib.suppress(Exception):
             (pi_home / "routing-failure.json").write_text(
                 json.dumps(
                     {"requests": get_mock_requests(mock_llm), "session": _snapshot(server, conv)},
@@ -380,9 +386,11 @@ def _teardown(child: Any, env: dict[str, str]) -> None:
     time.sleep(2)
     with contextlib.suppress(Exception):
         child.kill(signal.SIGKILL)
-    child.close(force=True)
+    with contextlib.suppress(Exception):
+        child.close(force=True)
     if child.logfile_read is not None:
-        child.logfile_read.close()
+        with contextlib.suppress(Exception):
+            child.logfile_read.close()
     omni_bin = Path(sys.executable).parent / "omni"
     if omni_bin.exists():
         with contextlib.suppress(Exception):
