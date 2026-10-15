@@ -44,9 +44,10 @@ review ids, and the final pushed head (step 8).
    review, or merge.
 7. Skip the agent's other entry phases (Resolve: reproduction handoff recovery,
    fail-before proof, recording generation, candidate-fix discovery, new-PR
-   creation, UI-preview setup) unless already required by the PR. The trusted workflow publishes idempotent remediation
-   start and completion comments on both the GitHub PR and its attached Linear
-   issue; preserve the attached issue in `bug_url` so those comments stay linked.
+   creation, UI-preview setup) unless already required by the PR. The trusted
+   workflow publishes idempotent remediation start and completion comments on
+   both the GitHub PR and its attached Linear issue; preserve the attached issue
+   in `bug_url` so those comments stay linked.
 8. Finish with the normal handoff using `mode: "review_remediation"`. Set
    `bug_url` to an attached bug when one is clear, otherwise `""`; set
    `reviewed_pr_url` and `pr_url` to `review_pr`; include the review fingerprint,
