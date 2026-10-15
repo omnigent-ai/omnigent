@@ -3346,33 +3346,52 @@ async def test_auto_create_claude_terminal_resumes_in_place_when_the_registry_ch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("env_chdir", [False, True], ids=["workspace-cwd", "env-chdir-wrapper"])
 async def test_auto_create_claude_terminal_drops_stored_args_claude_cannot_start_with(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    env_chdir: bool,
 ) -> None:
     """
-    Stored print mode and deleted MCP config files never reach the launch.
+    Stored print mode and missing MCP config files never reach the launch.
 
     Either one makes Claude exit at startup, and the session replays its stored
-    launch args on every relaunch, so it could never start again.
+    launch args on every relaunch, so it could never start again. Relative
+    config paths are checked where Claude runs: under an ``env --chdir``
+    wrapper that is the wrapper's directory, not the workspace.
+
+    :param env_chdir: Whether config wraps the launch in ``env --chdir=sub``.
     """
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    launch_dir = workspace / "sub" if env_chdir else workspace
+    launch_dir.mkdir(parents=True)
+    if env_chdir:
+        (workspace / ".omnigent").mkdir()
+        (workspace / ".omnigent" / "config.yaml").write_text(
+            "harness:\n  claude-native:\n    command: env\n    args: ['--chdir=sub', 'claude']\n"
+        )
+    (launch_dir / "servers.json").write_text('{"mcpServers": {}}', encoding="utf-8")
+    (workspace / "root-only.json").write_text('{"mcpServers": {}}', encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    stored_args = ["--print", "--mcp-config", str(tmp_path / "gone.json"), "--model", "opus"]
-
-    async def _ignore_forwarder(**kwargs: Any) -> None:
-        """Skip the forwarder; this test only inspects the launch."""
-        del kwargs
-
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
-        _ignore_forwarder,
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", _no_op_forwarder
     )
+    stored_args = [
+        "--print",
+        "--mcp-config",
+        "servers.json",
+        str(tmp_path / "gone.json"),
+        "--mcp-config",
+        "root-only.json",
+        "--model",
+        "opus",
+    ]
 
     class _SnapshotServerClient(NullServerClient):
         """Server client whose session snapshot carries the stored launch args."""
@@ -3395,45 +3414,23 @@ async def test_auto_create_claude_terminal_drops_stored_args_claude_cannot_start
 
             return _Response()
 
-    launched_args: list[str] = []
-
-    class _FakeResourceRegistry:
-        """Resource registry that records the launch without spawning a TTY."""
-
-        terminal_registry = None
-
-        async def launch_required_terminal(
-            self,
-            *,
-            session_id: str,
-            terminal_name: str,
-            session_key: str,
-            spec: Any,
-            resource_role: str | None = None,
-            parent_os_env: Any = None,
-        ) -> SessionResourceView:
-            """Return a terminal resource view without spawning a TTY."""
-            del terminal_name, session_key, resource_role, parent_os_env
-            launched_args.extend(spec.args)
-            return SessionResourceView(
-                id="terminal_claude_main",
-                type="terminal",
-                session_id=session_id,
-                name="claude:main",
-                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
-            )
-
+    captured: dict[str, Any] = {}
     await _auto_create_claude_terminal(
         "5cdbea97a2fb0c659bc09605401e2bb2",
-        _FakeResourceRegistry(),
+        _RecordingClaudeRegistry(captured),
         lambda _sid, _evt: None,
         server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
     )
 
+    launched_args = list(captured["spec"].args)
     assert "--print" not in launched_args
     assert str(tmp_path / "gone.json") not in launched_args
-    model_index = launched_args.index("--model")
-    assert launched_args[model_index + 1] == "opus"
+    assert "servers.json" in launched_args
+    assert ("root-only.json" in launched_args) is not env_chdir
+    assert launched_args[launched_args.index("--model") + 1] == "opus"
+    if env_chdir:
+        assert captured["spec"].command == "env"
+        assert launched_args[:2] == ["--chdir=sub", "claude"]
 
 
 @pytest.mark.asyncio

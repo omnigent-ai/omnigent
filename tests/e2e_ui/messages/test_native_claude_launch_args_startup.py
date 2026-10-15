@@ -69,7 +69,7 @@ def _await_startup(base_url: str, session_id: str) -> tuple[str, str, list[str]]
         trail.append(f"{status}/{int(has_terminal)}")
         if status == "failed":
             return "failed", status, trail
-        if has_terminal and status in {"idle", "running", "working"}:
+        if has_terminal and status in {"idle", "running"}:
             up_since = up_since or time.time()
             if time.time() - up_since >= _SETTLE_S:
                 return "up", status, trail

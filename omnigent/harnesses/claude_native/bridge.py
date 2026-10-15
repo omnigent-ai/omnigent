@@ -3154,7 +3154,9 @@ def drop_startup_fatal_claude_args(args: Sequence[str], *, workspace: Path) -> l
     leaves it unable to start. ``--print`` runs Claude headless, which a
     terminal session can't use, and Claude refuses to start when an
     ``--mcp-config`` file has since been deleted. Tokens after an option
-    terminator ``--`` are positional text and are kept as they are.
+    terminator ``--`` are positional text and are kept as they are. Options
+    that exist only in print mode (``--no-session-persistence`` and the like)
+    are left alone: a session stored with them never started.
 
     :param args: The session's Claude Code launch args, e.g. ``["--print"]``.
     :param workspace: Directory Claude runs in, which relative config paths
