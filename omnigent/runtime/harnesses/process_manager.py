@@ -203,7 +203,9 @@ def _default_tmp_parent() -> Path:
     the host's real ``/tmp`` is unavailable or unsuitable. Relative
     values are intentionally preserved: Unix socket paths have tight
     length limits, and a short path such as ``.tmp/oa`` is useful
-    for local worktrees whose absolute path is long.
+    for local worktrees whose absolute path is long. Prefer storage
+    cleared at boot: the orphan sweep never reclaims a dir whose
+    owner ran under an earlier boot.
 
     :returns: Configured parent path, or the per-uid default
         ``/tmp/omnigent-<uid>`` on POSIX.
