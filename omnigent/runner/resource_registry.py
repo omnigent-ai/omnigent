@@ -45,6 +45,7 @@ from omnigent.inner.sandbox import contained_realpath, containment_prefix
 from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.native_dispatch import resolve_hook_for_key
+from omnigent.server.feature_flags import Feature, resolve_feature_flags
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
@@ -467,6 +468,7 @@ class SessionResourceRegistry:
         *,
         per_session_workspace: bool = False,
     ) -> None:
+        self._feature_flags = resolve_feature_flags()
         self._terminal_registry = terminal_registry
         if terminal_registry is not None:
             terminal_registry.environment_resolver = self._resolve_terminal_environment
@@ -1268,7 +1270,7 @@ class SessionResourceRegistry:
         program_status_args = (
             {"program_status_app": "claude-code"}
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
-            and os.environ.get("OMNIGENT_CLAUDE_OSC_STATUS") == "1"
+            and self._feature_flags.enabled(Feature.CLAUDE_OSC_STATUS)
             else {}
         )
         try:

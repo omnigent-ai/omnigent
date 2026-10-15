@@ -56,10 +56,26 @@ future tmux implementation of OSC 7501 could remove that need.
 
 ## Ownership and fallback
 
-Set `OMNIGENT_CLAUDE_OSC_STATUS=1` in the **runner process environment**, then
-create a new Claude-native session. The flag applies only to the Claude terminal
-role; it is not serialized in portable agent specs. Existing sessions retain
-their launch configuration. Unset the flag and restart the runner to disable it.
+Add `claude_osc_status` to the standard `OMNIGENT_FEATURES` enabled set in the
+**host/runner environment**, preserving any other enabled features:
+
+```sh
+OMNIGENT_FEATURES=claude_osc_status
+```
+
+Restart the host and affected runners, then create a new Claude-native session.
+The host forwards the feature set through CLI → daemon → runner. Setting it only
+on a remote server does not enable it on separately running hosts. Directly
+launched runners read their own environment.
+
+The flag defaults off and is resolved once when the runner resource registry
+starts. It applies only to the Claude terminal role; it is neither a frontend
+capability nor part of portable agent specs. Existing terminals retain their
+launch configuration; this is not a hot switch for an active session. To roll
+back, remove only `claude_osc_status` from `OMNIGENT_FEATURES`, restart the
+host/runners, and launch a fresh terminal. The draft's earlier
+`OMNIGENT_CLAUDE_OSC_STATUS` toggle is replaced and no longer enables the relay.
+Review the temporary flag by release 0.20.0.
 
 | Claude root report | Published status |
 | --- | --- |
@@ -98,21 +114,28 @@ uv run --no-sync pytest \
   tests/inner/test_terminal.py \
   tests/terminals/test_launch_failure_cleanup.py \
   tests/harnesses/claude_native/test_claude_native_status_file.py \
+  tests/server/test_feature_flags.py \
+  tests/cli/test_host_daemon_env.py \
   --reruns 0 -n 4 --dist loadfile -q
 ```
 
 The runner scenario launches a protocol peer through the real registries, tmux
 and relay, both unsandboxed and in the available native sandbox. It sends the
 capability query and device-attributes query together and requires the OSC reply
-first. It covers a non-emitting peer, conflicting legacy state, elapsed-time
+first. It covers the disabled flag without a relay, a non-emitting peer with
+the flag enabled, conflicting legacy state, elapsed-time
 silence, blocked input, resize/input forwarding, root/child isolation, clear,
 error, resync and process exit. Existing terminal scenarios cover final output,
 exit codes and cancellation with and without the relay. Parser matrices stay at
-the byte-stream layer. These peers do not substitute for a real Claude canary.
+the byte-stream layer. Environment-boundary tests feed the CLI daemon and
+runner environment builders into registry startup in local/remote server modes;
+they do not spawn a host daemon. These peers do not substitute for a real Claude
+canary.
 
 Before activation, verify with Claude 2.1.295 or later in an isolated dev runner:
 
-1. Enable the flag for that runner and start a new Claude-native session.
+1. Add `claude_osc_status` to `OMNIGENT_FEATURES` on the host/runner, restart
+   those processes, and start a new Claude-native session.
 2. Submit a task with a long quiet tool operation. The indicator should stay
    working while the operation runs, including after closing and reopening the
    terminal viewer.

@@ -69,6 +69,14 @@ def test_arca_shutdown_warnings_are_frontend_visible() -> None:
     assert flags.frontend_dict()["arca_shutdown_warnings"] is True
 
 
+def test_claude_osc_status_is_runner_only() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "claude_osc_status"})
+
+    assert flags.enabled(Feature.CLAUDE_OSC_STATUS)
+    assert "claude_osc_status" in flags.enabled_names()
+    assert "claude_osc_status" not in flags.frontend_dict()
+
+
 def test_unknown_feature_fails_with_known_names() -> None:
     with pytest.raises(ValueError) as exc_info:
         resolve_feature_flags({FEATURES_ENV_VAR: "usage-pgae"})

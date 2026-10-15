@@ -41,7 +41,7 @@ from tests.runner.helpers import make_test_terminal_instance
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
 @pytest.mark.asyncio
-@pytest.mark.parametrize("protocol", ["osc", "legacy"])
+@pytest.mark.parametrize("protocol", ["osc", "legacy", "disabled"])
 @pytest.mark.parametrize(
     "sandbox_type",
     [
@@ -59,7 +59,7 @@ async def test_claude_program_status_real_launch_and_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str, sandbox_type: str
 ) -> None:
     """Exercise startup negotiation, raw PTY transport, status arbitration and cleanup."""
-    monkeypatch.setenv("OMNIGENT_CLAUDE_OSC_STATUS", "1")
+    monkeypatch.setenv("OMNIGENT_FEATURES", "claude_osc_status" if protocol != "disabled" else "")
     config = tmp_path / "claude-config"
     sessions = config / "sessions"
     sessions.mkdir(parents=True)
@@ -119,12 +119,19 @@ async def test_claude_program_status_real_launch_and_fallback(
             "osc-test", "claude", "main", spec, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
         )
         instance = terminals.get("osc-test", "claude", "main")
-        assert instance is not None and instance.program_status is not None
+        assert instance is not None
         reader = instance.program_status
-        async with asyncio.timeout(5):
-            while reader.child_pid is None:
-                await asyncio.sleep(0.02)
-        status_file = sessions / f"{reader.child_pid}.json"
+        if protocol == "disabled":
+            assert reader is None
+            status_pid = instance.pane_pid_sync()
+            assert status_pid is not None
+        else:
+            assert reader is not None
+            async with asyncio.timeout(5):
+                while reader.child_pid is None:
+                    await asyncio.sleep(0.02)
+            status_pid = reader.child_pid
+        status_file = sessions / f"{status_pid}.json"
         status_file.write_text(json.dumps({"kind": "interactive", "status": "busy"}))
         await wait_status("running")
         await instance._tmux("resize-window", "-t", "main", "-x", "93", "-y", "37")
@@ -135,11 +142,12 @@ async def test_claude_program_status_real_launch_and_fallback(
                 assert await instance.is_alive(), instance.last_exit_text()
                 await instance.send(keys="r")
                 await asyncio.sleep(0.05)
-        if protocol == "legacy":
-            assert reader.status is None
+        if protocol != "osc":
+            assert reader is None or reader.status is None
             status_file.write_text(json.dumps({"kind": "interactive", "status": "idle"}))
             await wait_status("idle")
             return
+        assert reader is not None
         async with asyncio.timeout(5):
             while reader.status is None:
                 await asyncio.sleep(0.02)
@@ -195,9 +203,12 @@ async def test_claude_program_status_real_launch_and_fallback(
 async def test_program_status_is_opt_in_and_claude_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str, enabled: bool, expected: str | None
 ) -> None:
-    monkeypatch.setenv("OMNIGENT_CLAUDE_OSC_STATUS", "1" if enabled else "0")
+    monkeypatch.setenv("OMNIGENT_FEATURES", "claude_osc_status" if enabled else "")
+    monkeypatch.setenv("OMNIGENT_CLAUDE_OSC_STATUS", "1")
     terminals = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminals)
+    # Like server release flags, the runner keeps one startup snapshot.
+    monkeypatch.setenv("OMNIGENT_FEATURES", "" if enabled else "claude_osc_status")
     seen = []
 
     async def launch(**kwargs):
