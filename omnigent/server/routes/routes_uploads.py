@@ -269,7 +269,7 @@ class UploadIndex:
         if record.finished:
             return False
         self.release(key, record)
-        if record.idempotency_key is not None:
+        if record.idempotency_key is not None and aborted:
             self.idempotency_keys.pop((*key[:2], record.owner, record.idempotency_key), None)
         record.finished = True
         record.aborted = aborted
@@ -681,7 +681,7 @@ def register_upload_routes(
                     if replay is not None
                     else None
                 )
-                if live is not None and not live.finished:
+                if live is not None and not live.aborted:
                     if replay is not None and replay[1] != digest:
                         raise UploadError(ErrorCode.IDEMPOTENCY_KEY_CONFLICT)
                     cached_id = replay[0] if replay is not None else None
