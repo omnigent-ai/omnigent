@@ -43,6 +43,7 @@ import os
 import pathlib
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -127,6 +128,20 @@ def _fetch_shell_command_token(command: str) -> str | None:
         logger.debug("Pi Databricks auth command failed: %s", result.stderr.strip())
         return None
     return token
+
+
+def _write_gateway_token(tmp_dir: str, token: str) -> pathlib.Path:
+    """Atomically publish a private credential for a running Pi process."""
+    token_path = pathlib.Path(tmp_dir) / "gateway-token"
+    with tempfile.NamedTemporaryFile(mode="w", dir=tmp_dir, delete=False) as f:
+        pending_path = pathlib.Path(f.name)
+        try:
+            f.write(token)
+            f.close()
+            pending_path.replace(token_path)
+        finally:
+            pending_path.unlink(missing_ok=True)
+    return token_path
 
 
 class ToolExecutor(Protocol):
@@ -730,7 +745,7 @@ def _build_models_json(
 
     :param host: Databricks workspace URL used for legacy profile-only
         defaults.
-    :param token: Bearer token to write into Pi's provider entries.
+    :param token: Pi API-key configuration value (literal or ``!command``).
     :param base_urls: Optional provider base URLs keyed by model family,
         e.g. ``{"claude": "...", "openai": "..."}`` — from ucode state or
         a generic (OpenRouter/LiteLLM) provider entry.
@@ -2300,9 +2315,12 @@ class PiExecutor(Executor):
 
         if self._gateway:
             effective_model = model
+            token_path = _write_gateway_token(tmp_dir, self._databricks_token)
             models_json = _build_models_json(
                 self._gateway_workspace_url or self._databricks_host,
-                self._databricks_token,
+                # Pi resolves this local read on each request. Auth helpers stay
+                # in the parent, where their credentials and environment exist.
+                f"!cat {shlex.quote(str(token_path))}",
                 self._base_urls_override,
                 model=effective_model,
                 catalog_models=self._gateway_model_entries or (),
@@ -2475,6 +2493,9 @@ class PiExecutor(Executor):
             and state.system_prompt == system_prompt
             and state.model == effective_model
         ):
+            if self._gateway:
+                assert state.rpc._tmp_dir is not None
+                _write_gateway_token(state.rpc._tmp_dir, self._databricks_token)
             return state.rpc
 
         wire_catalog = await self._load_gateway_model_wire_apis()

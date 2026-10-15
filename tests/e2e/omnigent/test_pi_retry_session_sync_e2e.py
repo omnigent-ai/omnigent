@@ -1,17 +1,22 @@
 """A pi RPC session stays in sync after a turn that pi auto-retried: on one real
 ``pi --mode rpc`` process the first prompt's provider call 503s and pi recovers,
-and the second prompt must complete with only its own answer."""
+and later prompts retain history while picking up rotated credentials."""
 
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import sys
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import httpx
 import pytest
 
-from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
+from omnigent.inner.executor import ExecutorError, TextChunk, ToolCallComplete, TurnComplete
 from omnigent.inner.pi_harness import _build_pi_executor
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, reset_mock_llm
@@ -25,6 +30,14 @@ _SECOND_PROMPT = "Reply with the second answer."
 _RETRYABLE_ERROR = "503 Service Unavailable: upstream overloaded, please retry"
 _SYSTEM_PROMPT = "You are a helpful assistant."
 _SESSION_ID = "pi-retry-session-sync"
+_TOOL_RESULT = "PI_RETAINED_TOOL_RESULT"
+_TOOLS = [
+    {
+        "name": "remember",
+        "description": "Remember a value",
+        "parameters": {"type": "object", "properties": {}},
+    }
+]
 
 # Env the pi harness reads (see ``omnigent/inner/pi_harness.py``) that must
 # not leak in from the developer's shell or an earlier test.
@@ -44,7 +57,7 @@ _STALE_HARNESS_ENV = (
 
 async def _run_turn(executor, prompt: str) -> list:
     messages = [{"role": "user", "content": prompt, "session_id": _SESSION_ID}]
-    return [event async for event in executor.run_turn(messages, [], _SYSTEM_PROMPT)]
+    return [event async for event in executor.run_turn(messages, _TOOLS, _SYSTEM_PROMPT)]
 
 
 def _streamed_text(events: list) -> str:
@@ -55,24 +68,70 @@ def _errors(events: list) -> list[str]:
     return [e.message for e in events if isinstance(e, ExecutorError)]
 
 
+@pytest.fixture
+def rotating_gateway(
+    tmp_path: Path, mock_llm_server_url: str
+) -> Iterator[tuple[str, Path, list[bool]]]:
+    """Enforce the current token before forwarding to the existing mock provider."""
+    token_file = tmp_path / "helper's token"
+    token_file.write_text("first-token")
+    accepted: list[bool] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            valid = self.headers.get("Authorization") == f"Bearer {token_file.read_text()}"
+            accepted.append(valid)
+            if valid:
+                response = httpx.post(
+                    mock_llm_server_url + self.path,
+                    content=body,
+                    headers={"Content-Type": "application/json"},
+                    timeout=30,
+                )
+                status, payload = response.status_code, response.content
+                content_type = response.headers["Content-Type"]
+            else:
+                status, payload = 401, b'{"error":{"message":"stale credential"}}'
+                content_type = "application/json"
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", token_file, accepted
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("sandboxed", [False, True], ids=["unsandboxed", "sandboxed"])
 async def test_pi_session_stays_in_sync_after_retry_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mock_llm_server_url: str,
+    rotating_gateway: tuple[str, Path, list[bool]],
     sandboxed: bool,
 ) -> None:
-    """The prompt after a retry-recovered turn gets only its own answer."""
+    """Retries and credential rotation preserve the process and tool history."""
     skip_if_harness_cli_missing("pi")
     if sandboxed and sys.platform != "darwin" and not shutil.which("bwrap"):
         pytest.skip("requires Seatbelt or bubblewrap")
-    home = tmp_path / "home"
+    gateway_url, token_file, accepted = rotating_gateway
+    home = tmp_path / "Pi's home"
     workspace = tmp_path / "workspace"
     home.mkdir()
     workspace.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", home / ".pi/agent")
 
     mock_model = "mock-pi-retry-session-sync"
     reset_mock_llm(mock_llm_server_url)
@@ -80,8 +139,10 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
         mock_llm_server_url,
         [
             {"error": _RETRYABLE_ERROR, "status_code": 503},
+            {"tool_calls": [{"call_id": "remember-1", "name": "remember", "arguments": "{}"}]},
             {"text": _FIRST_ANSWER},
             {"text": _SECOND_ANSWER},
+            {"text": "THIRD_ANSWER"},
         ],
         key=mock_model,
     )
@@ -89,15 +150,16 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     # The harness env the runtime emits for an OpenAI-compatible provider.
     monkeypatch.setenv("HARNESS_PI_MODEL", mock_model)
     monkeypatch.setenv("HARNESS_PI_GATEWAY", "true")
-    monkeypatch.setenv(
-        "HARNESS_PI_GATEWAY_BASE_URLS", json.dumps({"openai": f"{mock_llm_server_url}/v1"})
-    )
-    monkeypatch.setenv("HARNESS_PI_GATEWAY_HOST", mock_llm_server_url)
-    monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_COMMAND", "printf %s mock-key")
+    monkeypatch.setenv("HARNESS_PI_GATEWAY_BASE_URLS", json.dumps({"openai": f"{gateway_url}/v1"}))
+    monkeypatch.setenv("HARNESS_PI_GATEWAY_HOST", gateway_url)
+    monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_COMMAND", f"cat {shlex.quote(str(token_file))}")
     monkeypatch.setenv("HARNESS_PI_CWD", str(workspace))
     monkeypatch.setenv("HARNESS_PI_CONTEXT_FILES", "false")
     for name in _STALE_HARNESS_ENV:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", home / ".pi" / "agent")
+    monkeypatch.setenv("HARNESS_PI_SKILLS_FILTER", '"none"')
     if sandboxed:
         monkeypatch.setenv(
             "HARNESS_PI_OS_ENV",
@@ -114,13 +176,28 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
         )
 
     executor = _build_pi_executor()
+    executor._tool_executor = lambda name, args, **kwargs: {"value": _TOOL_RESULT}
     try:
         assert executor._sandboxed is sandboxed
         first = await _run_turn(executor, _FIRST_PROMPT)
+        assert _errors(first) == []
+        rpc = executor._session_states[_SESSION_ID].rpc
+        assert rpc is not None and rpc.process is not None and rpc._tmp_dir is not None
+        pid, agent_dir = rpc.process.pid, Path(rpc._tmp_dir)
+        token_file.write_text("second-token")
         second = await _run_turn(executor, _SECOND_PROMPT)
+        assert executor._session_states[_SESSION_ID].rpc.process.pid == pid
+        token_file.write_text("third-token")
+        third = await _run_turn(executor, "Reply with the third answer.")
+        assert executor._session_states[_SESSION_ID].rpc.process.pid == pid
     finally:
         await executor.close()
 
+    assert not agent_dir.exists()
+    assert _errors(third) == []
+    assert _streamed_text(third) == "THIRD_ANSWER"
+    assert any(isinstance(e, ToolCallComplete) for e in first)
+    assert accepted == [True] * 5
     assert _errors(first) == [], (
         "the first turn was reported as a failure instead of completing with pi's "
         f"recovered answer: {_errors(first)}"
@@ -147,7 +224,12 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     )
 
     requests = get_mock_requests(mock_llm_server_url)
-    assert len(requests) == 3, (
-        f"expected the 503 call, pi's retry and the second prompt; got {len(requests)} "
+    assert len(requests) == 5, (
+        f"expected the 503, retry, tool follow-up and two later prompts; got {len(requests)} "
         "provider call(s)"
     )
+    for request in requests[-2:]:
+        history = request["messages"]
+        assert _FIRST_PROMPT in json.dumps(history)
+        assert _FIRST_ANSWER in json.dumps(history)
+        assert any(m["role"] == "tool" and _TOOL_RESULT in m["content"] for m in history)

@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import socket
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -2083,6 +2084,77 @@ def test_pi_tools_arg_skips_unnamed_entries() -> None:
 # ---------------------------------------------------------------------------
 # PiExecutor.run_turn tests (with mocked RPC)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("credential_source", ["command", "profile"])
+async def test_gateway_refresh_publishes_private_token_for_reused_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credential_source: str
+) -> None:
+    from omnigent.inner import pi_executor
+
+    private_dir = tmp_path / "Pi's config"
+    private_dir.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", str(private_dir))
+    current_token = "initial-token"
+    monkeypatch.setattr(pi_executor, "_fetch_shell_command_token", lambda _: current_token)
+    monkeypatch.setattr(
+        pi_executor,
+        "_read_databrickscfg",
+        lambda _: (
+            DatabricksCredentials(host="https://example.test", token=current_token)
+            if current_token
+            else None
+        ),
+    )
+
+    async def start(rpc, *args, **kwargs):
+        rpc.process = _FakeProcess()
+
+    monkeypatch.setattr(_PiRpcSession, "start", start)
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        model="mock-model",
+        gateway_host="https://example.test" if credential_source == "command" else None,
+        gateway_auth_command="get-token" if credential_source == "command" else None,
+    )
+    monkeypatch.setattr(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={}))
+    try:
+        original_rpc = None
+        # A failed credential refresh retains the last valid credential.
+        expected_token = current_token
+        for current_token in (
+            "initial-token",
+            "!literal-$TOKEN-$(no-execution)",
+            None,
+            "recovered-token",
+        ):
+            if current_token:
+                expected_token = current_token
+            # Empty prompts still run refresh/startup, without needing fake LLM events.
+            events = [e async for e in executor.run_turn([], [], "")]
+            assert not [e for e in events if isinstance(e, ExecutorError)]
+            rpc = executor._session_states["__default__"].rpc
+            assert rpc is not None and rpc._tmp_dir is not None
+            if original_rpc is None:
+                original_rpc = rpc
+            assert rpc is original_rpc
+            agent_dir = Path(rpc._tmp_dir)
+            token_file = agent_dir / "gateway-token"
+            assert token_file.read_text() == expected_token
+            assert token_file.stat().st_mode & 0o777 == 0o600
+            assert agent_dir.stat().st_mode & 0o777 == 0o700
+            models_text = (agent_dir / "models.json").read_text()
+            assert expected_token not in models_text
+            for provider in json.loads(models_text)["providers"].values():
+                assert (
+                    subprocess.check_output(provider["apiKey"][1:], shell=True, text=True)
+                    == expected_token
+                )
+    finally:
+        await executor.close()
+    assert not agent_dir.exists()
 
 
 class TestRunTurn(unittest.TestCase):
