@@ -149,6 +149,11 @@ _GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S = 5.0
 _GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S = 5.0
 RUNNER_TUNNEL_REJECTION_PREFIX = "runner tunnel rejected by server "
 
+
+class RunnerTunnelAuthRejectedError(RuntimeError):
+    """The server refused this runner's credentials before its tunnel ever connected."""
+
+
 # Schemes that, when surfaced through ``InvalidURI.uri``, indicate
 # the WebSocket upgrade request was redirected somewhere the
 # websockets library cannot follow. The common case on Databricks
@@ -516,7 +521,7 @@ async def serve_tunnel(
                     # through `omnigent login` to the same server.
                     from omnigent.util.server_url import display_server_url
 
-                    raise RuntimeError(
+                    raise RunnerTunnelAuthRejectedError(
                         f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                         f"(redirect to non-WebSocket URL {redirect_url} "
                         f"persisted across {login_redirect_streak} attempts); "
@@ -550,7 +555,7 @@ async def serve_tunnel(
                             )
                         else:
                             login_hint = "check remote server authentication"
-                        raise RuntimeError(
+                        raise RunnerTunnelAuthRejectedError(
                             f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                             f"(HTTP {http_status} persisted across "
                             f"{http_auth_rejection_streak} attempts); "
