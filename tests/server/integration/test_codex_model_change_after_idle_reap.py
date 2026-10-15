@@ -8,6 +8,7 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -59,11 +60,13 @@ class _LoopbackCodex:
     rpc_errors: list[dict[str, Any]] = field(default_factory=list)
     response_errors: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     refuse_handshake: bool = False
+    proc: SimpleNamespace | None = None
 
     async def start(self) -> None:
         assert self.server is None
         bridge.clear_bridge_state(self.bridge_dir)
         self.ready.clear()
+        self.proc = SimpleNamespace(returncode=None)
         self.server = await serve(
             self.handle,
             "127.0.0.1",
@@ -109,6 +112,8 @@ class _LoopbackCodex:
         self.ready.set()
 
     async def close(self) -> None:
+        if self.proc is not None:
+            self.proc.returncode = 0
         if self.startup_task is not None:
             self.startup_task.cancel()
             await asyncio.gather(self.startup_task, return_exceptions=True)
@@ -381,6 +386,65 @@ async def test_model_change_recovers_dead_backend_while_codex_pane_is_alive(
 
     session.assert_applied(response, effort="low" if combined else "high")
     assert session.codex.launches == 2
+
+
+async def test_codex_listener_refusal_preserves_a_live_backend_connection(
+    client: httpx.AsyncClient, native_session: _NativeSession
+) -> None:
+    session = native_session
+    accepted = app_server.CodexAppServerClient(ws_url=session.codex.transport)
+    await accepted.connect()
+    server = session.codex.server
+    assert server is not None
+    server.close(close_connections=False)
+    while server.is_serving():
+        await asyncio.sleep(0)
+
+    try:
+        response = await client.patch(
+            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+        )
+        _assert_codex_refusal(session, response)
+        assert session.codex.stops == 0
+        assert session.codex.launches == 1
+        result = await accepted.request("thread/list/loaded", {})
+        assert result["result"] == {
+            "data": [session.codex.thread_id],
+            "nextCursor": None,
+        }
+    finally:
+        await accepted.close()
+
+
+async def test_codex_refused_connection_does_not_close_a_replacement_backend(
+    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = native_session
+    await session.codex.close()
+    replacement = SimpleNamespace(
+        bridge_dir=session.codex.bridge_dir,
+        proc=SimpleNamespace(returncode=0),
+        close=AsyncMock(),
+    )
+    connect = app_server.CodexAppServerClient.connect
+    replaced = False
+
+    async def replace_before_refusal(rpc: app_server.CodexAppServerClient) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] = replacement
+            raise ConnectionRefusedError("The old listener disappeared during replacement")
+        await connect(rpc)
+
+    monkeypatch.setattr(app_server.CodexAppServerClient, "connect", replace_before_refusal)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    _assert_codex_refusal(session, response)
+    replacement.close.assert_not_awaited()
+    assert native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] is replacement
+    assert session.codex.launches == 1
 
 
 async def test_codex_live_handshake_refusal_does_not_restart_backend(

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
 
 import httpx
@@ -343,9 +344,12 @@ def build_native_controls(
         return None
 
     async def _close_unreachable_owned_codex(
-        conv_id: str, state: CodexNativeBridgeState, bridge_dir: Path
+        conv_id: str,
+        state: CodexNativeBridgeState,
+        bridge_dir: Path,
+        failed_backend: CodexNativeAppServer | None,
     ) -> bool:
-        """Retire only the owned launch whose listener refused this connection."""
+        """Retire the same stopped, owned launch whose listener refused this connection."""
         from omnigent.entities.session_resources import terminal_resource_id
         from omnigent.harnesses.codex_native.bridge import read_bridge_state
         from omnigent.runner.native.orchestration import (
@@ -367,7 +371,12 @@ def build_native_controls(
             ):
                 return False
             backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
-            if backend is not None and backend.bridge_dir != bridge_dir:
+            if backend is not failed_backend:
+                return False
+            if backend is not None and (
+                backend.bridge_dir != bridge_dir
+                or (backend.proc is not None and backend.proc.returncode is None)
+            ):
                 return False
             _logger.info(
                 "Recreating unreachable owned Codex backend before settings update for session=%s",
@@ -398,6 +407,7 @@ def build_native_controls(
             read_codex_config_effort,
             read_codex_config_model,
         )
+        from omnigent.runner.native.orchestration import _AUTO_CODEX_APP_SERVERS
         from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
         from omnigent.util.reasoning_effort import effort_for_model_switch
 
@@ -458,6 +468,7 @@ def build_native_controls(
             state.socket_path,
             client_name="omnigent-codex-native-runner",
         )
+        failed_backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
         try:
             try:
                 await asyncio.wait_for(
@@ -470,7 +481,7 @@ def build_native_controls(
                 # No settings request was sent. Recreate this owned launch once,
                 # sharing the original readiness budget with cleanup and startup.
                 retired = await asyncio.wait_for(
-                    _close_unreachable_owned_codex(conv_id, state, bridge_dir),
+                    _close_unreachable_owned_codex(conv_id, state, bridge_dir, failed_backend),
                     timeout=ready_deadline - asyncio.get_running_loop().time(),
                 )
                 if not retired:
