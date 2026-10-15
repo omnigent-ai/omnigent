@@ -68,6 +68,10 @@ def test_repro_agent_films_likely_repro_facets_as_before_clips() -> None:
     )
     assert '`"before"` for a `reproduced` or `likely_repro` facet\'s failing run' in instructions
     assert (
+        "A `likely_repro` clip films the stand-in you drove; its caption names that stand-in"
+        in instructions
+    )
+    assert (
         "`not_reproduced`, `needs_more_info`, and `needs_manual_review` facets have "
         "nothing to film" in instructions
     )
