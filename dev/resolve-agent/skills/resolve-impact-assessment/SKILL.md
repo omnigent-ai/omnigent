@@ -71,7 +71,9 @@ require an inherited repro; their publication/branch permissions are unchanged.
    checked before `fixed` or approval. If a fix is only partly verified, preserve
    the work, use `partially_fixed`, and name the failing/unrun checks in
    `remaining_work`; use `needs_more_info` when verification cannot establish a
-   resolution. Setup failures are blockers, not proof of a product regression.
+   resolution, with `failure_class: "infrastructure"` when a broken runner or
+   tooling is the blocker. Setup failures are blockers, not proof of a product
+   regression.
    A missing recording alone still follows the recording rules below.
 
 Summarize the affected behavior, checks, and gaps in the PR's Test Plan or review
