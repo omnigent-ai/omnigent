@@ -429,7 +429,7 @@ def test_codex_model_rejection_explains_how_to_fix_configuration(model: str) -> 
     assert diagnosis.title == "Model unavailable with ChatGPT login"
     assert diagnosis.cause == message
     assert diagnosis.remediation is not None
-    assert "/model in the Codex terminal" in diagnosis.remediation
+    assert "model picker or /model" in diagnosis.remediation
     assert "another provider, configure it for Codex" in diagnosis.remediation
     assert "start a new session" in diagnosis.remediation
     assert diagnosis.category is ErrorCategory.CONFIG

@@ -402,7 +402,7 @@ def test_codex_model_rejection_shows_recovery_hint_live_and_after_reload(
                 page.reload()
             expect(pill, f"reload={reload}").to_contain_text(headline, timeout=15_000)
             pill.locator('button[aria-expanded="false"]').click()
-            expect(pill).to_contain_text("/model in the Codex terminal")
+            expect(pill).to_contain_text("model picker or /model")
             expect(pill).to_contain_text("another provider, configure it for Codex")
             expect(pill).to_contain_text("on the host, then start a new session")
             expect(pill.get_by_test_id("error-message-content")).to_contain_text(message)

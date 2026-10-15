@@ -316,7 +316,7 @@ def diagnose_codex_model_rejection(message: str) -> FailureDiagnosis | None:
         title="Model unavailable with ChatGPT login",
         cause=message.strip(),
         remediation=(
-            "Choose a model supported by your ChatGPT account using /model in the Codex terminal. "
+            "Choose a model supported by your ChatGPT account using the model picker or /model. "
             f"To use another provider, configure it for Codex with `{cli_invocation()} setup` "
             "on the host, then start a new session."
         ),
