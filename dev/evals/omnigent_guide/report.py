@@ -16,7 +16,68 @@ from dev.evals.omnigent_guide.stats import agreement, paired_bootstrap
 
 #: Per-case metrics, each a mean over that case's runs.
 METRICS = ("score", "fabricated", "loaded", "yaml_invalid")
-_PINNED_RE = re.compile(r"raw\.githubusercontent\.com/omnigent-ai/omnigent/(v\d+\.\d+\.\d+)/")
+_RAW_RE = re.compile(r"raw\.githubusercontent\.com/omnigent-ai/omnigent/([^/\s\"']+)/")
+_FETCH_FAILED_RE = re.compile(
+    r"404: Not Found|Could not resolve host|Couldn't connect|Operation not permitted|"
+    r"\"exit_code\": (?!0[,}])\d+"
+)
+_HELP_RE = re.compile(r"\bomni(gent)?\b[^\n]*(--help|\s-h\b)")
+_VERSION_RE = re.compile(r"\bomni(gent)?\s+--version")
+_SOURCE_KEYS = (
+    "pinned_own",
+    "pinned_other",
+    "main",
+    "llms_txt",
+    "fetch_failed",
+    "cli_help",
+    "cli_version",
+)
+
+
+def doc_sources(runs: Sequence[GradedRun], version: str) -> dict[str, float]:
+    """
+    How the agent looked things up, as a share of *runs*.
+
+    ``pinned_own`` counts runs that fetched repo docs at the build's own
+    release tag (``v0.18.0`` for 0.18.0); ``main`` counts fetches from main.
+    """
+    if not runs:
+        return {}
+    tag = f"v{version}" if version and "dev" not in version else None
+    counts: Counter[str] = Counter()
+    for run in runs:
+        seen: set[str] = set()
+        for call in run.record.tool_calls:
+            args = str(call.get("arguments") or "")
+            out = str(call.get("output") or "")
+            for ref in _RAW_RE.findall(args):
+                if ref == tag:
+                    seen.add("pinned_own")
+                else:
+                    seen.add("main" if ref == "main" else "pinned_other")
+                if _FETCH_FAILED_RE.search(out):
+                    seen.add("fetch_failed")
+            if "omnigent.ai/llms" in args:
+                seen.add("llms_txt")
+            if _HELP_RE.search(args):
+                seen.add("cli_help")
+            if _VERSION_RE.search(args):
+                seen.add("cli_version")
+        counts.update(seen)
+    return {key: counts[key] / len(runs) for key in _SOURCE_KEYS}
+
+
+def failure_breakdown(runs: Sequence[GradedRun]) -> dict[str, float | None]:
+    """Where the lost score sits: answers with a fabrication versus the rest."""
+    scored = [(r, r.score) for r in runs if r.score is not None]
+    lost = sum(1 - score for _, score in scored)
+    fabricated = [score for r, score in scored if r.fabricated]
+    clean = [score for r, score in scored if not r.fabricated]
+    return {
+        "score_fabricated": fmean(fabricated) if fabricated else None,
+        "score_clean": fmean(clean) if clean else None,
+        "lost_in_fabricated": sum(1 - x for x in fabricated) / lost if lost else None,
+    }
 
 
 def per_case(runs: Sequence[GradedRun], cases: Mapping[str, Case]) -> dict[str, dict[str, float]]:
@@ -36,17 +97,14 @@ def per_case(runs: Sequence[GradedRun], cases: Mapping[str, Case]) -> dict[str, 
     return {m: {cid: fmean(v) for cid, v in b.items()} for m, b in buckets.items()}
 
 
-def _arm_summary(runs: Sequence[GradedRun], cases: Mapping[str, Case]) -> dict[str, Any]:
+def _arm_summary(
+    runs: Sequence[GradedRun], cases: Mapping[str, Case], version: str = ""
+) -> dict[str, Any]:
     ok = [r for r in runs if r.record.status != INFRA_ERROR]
     pos = [r for r in ok if cases[r.record.case_id].should_trigger]
     neg = [r for r in ok if not cases[r.record.case_id].should_trigger]
     metrics = per_case(runs, cases)
     kinds = Counter(f["kind"] for r in pos for f in r.findings if f.get("counts"))
-    pinned = [
-        r
-        for r in pos
-        if any(_PINNED_RE.search(str(c.get("arguments"))) for c in r.record.tool_calls)
-    ]
     tokens = [r.record.total_tokens for r in ok if r.record.total_tokens is not None]
 
     def mean_of(values: dict[str, float], wanted: Sequence[str]) -> float | None:
@@ -64,7 +122,8 @@ def _arm_summary(runs: Sequence[GradedRun], cases: Mapping[str, Case]) -> dict[s
         "loaded": mean_of(metrics["loaded"], positives),
         "false_loads": mean_of(metrics["loaded"], negatives),
         "yaml_invalid": mean_of(metrics["yaml_invalid"], positives),
-        "pinned_doc_runs": len(pinned),
+        "doc_sources": doc_sources(pos, version),
+        "failure_breakdown": failure_breakdown(pos),
         "fabrication_kinds": dict(kinds.most_common()),
         "tokens": fmean(tokens) if tokens else None,
         "seconds": fmean(r.record.duration_s for r in ok) if ok else None,
@@ -116,7 +175,11 @@ def write_report(
             arm_runs = {
                 arm: rs for (s, h, arm), rs in by_key.items() if s == split and h == harness
             }
-            summaries = {arm: _arm_summary(rs, cases) for arm, rs in sorted(arm_runs.items())}
+            versions = {name: str(meta.get("version", "")) for name, meta in (arms or {}).items()}
+            summaries = {
+                arm: _arm_summary(rs, cases, versions.get(arm, ""))
+                for arm, rs in sorted(arm_runs.items())
+            }
             metrics = {arm: per_case(rs, cases) for arm, rs in arm_runs.items()}
             comparisons = []
             wanted = [

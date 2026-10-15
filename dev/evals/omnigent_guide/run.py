@@ -57,11 +57,12 @@ from dev.evals.omnigent_guide.record import (
 )
 from dev.evals.omnigent_guide.referee import Referee, Surface
 from tests._helpers.compat import COMPAT_RUNNER_PYTHON_ENV, COMPAT_SERVER_PYTHON_ENV
-from tests.harness_bench.driver import TurnResult, infra_failure_reason
+from tests.harness_bench.driver import ProvisioningError, TurnResult, infra_failure_reason
 from tests.harness_bench.profile import resolve_profile
 
 _RUNS_PER_DRIVER = 15
 _INFRA_RETRIES = 4
+_PROVISION_ATTEMPTS = 4
 # The gateway limits input tokens per minute per workspace, and an agent turn
 # resends its whole context on every tool call, so parallel lanes can exceed it.
 _RATE_LIMIT_MARKERS = ("429", "REQUEST_LIMIT_EXCEEDED", "ReadTimeout")
@@ -335,23 +336,40 @@ def _drive(
     if harness == "openai-agents":
         kwargs["os_env"] = _sandboxed_os_env(arm, scratch)
     for start in range(0, len(todo), _RUNS_PER_DRIVER):
-        # Fresh provisioning per batch mints fresh gateway credentials.
-        driver_cm = _DRIVERS[harness](**kwargs)
-        if hasattr(driver_cm, "keep_logs_in"):
-            driver_cm.keep_logs_in = scratch / "logs"
-        with driver_cm as driver:
-            for case, index in todo[start : start + _RUNS_PER_DRIVER]:
-                record = RunRecord(case_id=case.id, harness=harness, arm=arm.name, run_index=index)
-                driver.run(case.prompt, record)
-                if record.status == "failed" and is_infra_error(record.error):
-                    record.status = INFRA_ERROR
-                    if _rate_limited(record.error):
-                        time.sleep(_RATE_LIMIT_PAUSE_S)
-                with path.open("a", encoding="utf-8") as runs_file:
-                    runs_file.write(json.dumps(dataclasses.asdict(record)) + "\n")
-                print(
-                    f"   {case.id} #{index}: {record.status}, {record.duration_s:.0f}s", flush=True
-                )
+        batch = todo[start : start + _RUNS_PER_DRIVER]
+        for attempt in range(_PROVISION_ATTEMPTS):
+            try:
+                _run_batch(harness, arm, batch, path, kwargs, scratch)
+                break
+            except ProvisioningError as exc:
+                # A stack that fails to start ran no session, so the batch can rerun.
+                print(f"   provisioning failed ({exc}); retrying", flush=True)
+                time.sleep(30 * (attempt + 1))
+
+
+def _run_batch(
+    harness: str,
+    arm: Arm,
+    batch: list[tuple[Case, int]],
+    path: Path,
+    kwargs: dict[str, Any],
+    scratch: Path,
+) -> None:
+    # Fresh provisioning per batch mints fresh gateway credentials.
+    driver_cm = _DRIVERS[harness](**kwargs)
+    if hasattr(driver_cm, "keep_logs_in"):
+        driver_cm.keep_logs_in = scratch / "logs"
+    with driver_cm as driver:
+        for case, index in batch:
+            record = RunRecord(case_id=case.id, harness=harness, arm=arm.name, run_index=index)
+            driver.run(case.prompt, record)
+            if record.status == "failed" and is_infra_error(record.error):
+                record.status = INFRA_ERROR
+                if _rate_limited(record.error):
+                    time.sleep(_RATE_LIMIT_PAUSE_S)
+            with path.open("a", encoding="utf-8") as runs_file:
+                runs_file.write(json.dumps(dataclasses.asdict(record)) + "\n")
+            print(f"   {case.id} #{index}: {record.status}, {record.duration_s:.0f}s", flush=True)
 
 
 # ── grade ───────────────────────────────────────────────────────────────
