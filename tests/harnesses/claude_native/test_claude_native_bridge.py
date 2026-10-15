@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from http.client import BadStatusLine, RemoteDisconnected
@@ -37,6 +38,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _LOGIN_GUIDANCE,
     _build_tools,
     _claude_prompt_rendered,
+    _escape_slash_command_text,
     _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
     _is_box_rule,
@@ -2956,6 +2958,153 @@ def test_read_transcript_items_since_surfaces_combined_shell_record(
     assert items[0].response_id == items[1].response_id
 
 
+@pytest.mark.parametrize(
+    ("content", "kind", "name", "arguments"),
+    [
+        (
+            "<command-name>/model</command-name>\n"
+            "            <command-message>model</command-message>\n"
+            "            <command-args>example-model</command-args>",
+            "command",
+            "model",
+            "example-model",
+        ),
+        (
+            "<command-message>example:simplify</command-message>\n"
+            "<command-name>/example:simplify</command-name>\n"
+            "<command-args>the parser</command-args>",
+            "skill",
+            "example:simplify",
+            "the parser",
+        ),
+    ],
+    ids=["builtin", "plugin-skill-message-first"],
+)
+def test_read_transcript_items_since_surfaces_top_level_slash_command_echo(
+    tmp_path: Path,
+    content: str,
+    kind: str,
+    name: str,
+    arguments: str,
+) -> None:
+    """
+    A top-level ``local_command`` command echo becomes a ``slash_command`` item.
+
+    Claude Code can record ``/model`` as a ``type="system"`` record instead of
+    a ``role=user`` message. Dropping it leaves the web input that ran the
+    command queued until a later message reports it as lost. The stdout record
+    Claude writes next stays hidden.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "type": "system",
+                    "subtype": "local_command",
+                    "level": "info",
+                    "isMeta": False,
+                    "uuid": "command-echo",
+                    "content": content,
+                },
+                {
+                    "type": "system",
+                    "subtype": "local_command",
+                    "level": "info",
+                    "isMeta": False,
+                    "uuid": "command-stdout",
+                    "commandRun": {"command": name, "args": arguments},
+                    "content": "<local-command-stdout>Set model to Example</local-command-stdout>",
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items] == ["slash_command"]
+    assert items[0].data == {
+        "agent": "claude-native-ui",
+        "kind": kind,
+        "name": name,
+        "arguments": arguments,
+    }
+    assert items[0].response_id == response_id
+    byte_result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert byte_result.items == items
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        # Tags printed by a shell command or by a command's own output.
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<bash-stdout><command-name>/model</command-name></bash-stdout>",
+        },
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<local-command-stderr><command-name>/model</command-name>"
+            "</local-command-stderr>",
+        },
+        # UI-only built-ins stay hidden, as in the ``role=user`` shape.
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<command-name>/resume</command-name><command-args></command-args>",
+        },
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<command-name>  </command-name>",
+        },
+    ],
+    ids=["bash-stdout", "command-stderr", "dropped-builtin", "empty-name"],
+)
+def test_read_transcript_items_since_ignores_non_echo_local_command_tags(
+    tmp_path: Path, record: dict[str, Any]
+) -> None:
+    """Command tags that are not Claude's own echo never become a ``slash_command``."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(json.dumps({"uuid": "rec", **record}) + "\n", encoding="utf-8")
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items if item.item_type == "slash_command"] == []
+
+
+def test_read_transcript_items_since_keeps_prose_mentioning_command_tags(
+    tmp_path: Path,
+) -> None:
+    """A typed prompt quoting ``<command-name>`` stays the user's message."""
+    text = "Why does the transcript contain <command-name>/model</command-name>?"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "user", "uuid": "prose", "message": {"role": "user", "content": text}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [(item.item_type, item.data) for item in items] == [
+        ("message", {"role": "user", "content": [{"type": "input_text", "text": text}]})
+    ]
+
+
 def test_read_transcript_items_since_surfaces_skill_when_command_name_is_not_first_tag(
     tmp_path: Path,
 ) -> None:
@@ -4194,10 +4343,10 @@ def test_inject_user_message_pastes_content_then_submits(
     ("content", "expected"),
     [
         ("plain text", "plain text"),
-        ("/help", "\ufeff/help"),
-        ("/exit", "\ufeff/exit"),
-        ("/quit now", "\ufeff/quit now"),
-        ("  /help", "  \ufeff/help"),
+        ("/help", " /help"),
+        ("/exit", " /exit"),
+        ("/quit now", " /quit now"),
+        ("  /help", "   /help"),
         ("/clear", "/clear"),
         ("/compact", "/compact"),
         ("/model sonnet-4", "/model sonnet-4"),
@@ -4214,6 +4363,20 @@ def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
     supported commands and skills are left untouched.
     """
     assert _escape_unsupported_slash_command(content) == expected
+
+
+@pytest.mark.parametrize("content", ["/help", "/exit now", "/not-a-real-skill hello"])
+def test_escaped_slash_command_survives_invisible_character_removal(content: str) -> None:
+    """
+    Claude Code drops invisible characters from a draft before it parses a
+    command, so the escaped text must still not lead with ``/`` after that.
+    Its transcript echo must also still match the queued message once
+    leading whitespace is ignored.
+    """
+    escaped = _escape_slash_command_text(content)
+    visible = "".join(ch for ch in escaped if unicodedata.category(ch) != "Cf")
+    assert not visible.startswith("/")
+    assert escaped.lstrip() == content
 
 
 @pytest.mark.parametrize(
@@ -4245,7 +4408,7 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
 ) -> None:
     """
     Unsupported slash commands land in the tmux buffer with a leading
-    zero-width escape so Claude Code treats them as user text.
+    space so Claude Code treats them as user text.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -4279,10 +4442,10 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
     monkeypatch.setattr("subprocess.run", _fake_run)
 
     inject_user_message(bridge_dir, content="/help")
-    assert loaded_payloads[0].startswith("\ufeff/help".encode("utf-8"))
+    assert loaded_payloads[0].startswith(b" /help")
 
     inject_user_message(bridge_dir, content="/clear")
-    assert not loaded_payloads[1].startswith("\ufeff".encode("utf-8"))
+    assert loaded_payloads[1].startswith(b"/clear")
 
 
 def _rejection_pane(name: str, draft: str = "") -> str:
@@ -4380,7 +4543,7 @@ def test_unknown_command_rejection_redelivers_escaped(
     Claude Code drops a message whose leading ``/name`` it does not
     recognize without ever calling the model — the message would be
     silently swallowed. The bridge must watch for the rejection and paste
-    the message again with the zero-width escape so it reaches the model
+    the message again with the space escape so it reaches the model
     as plain user text.
     """
     payloads = _run_unknown_command_injection(
@@ -4394,7 +4557,7 @@ def test_unknown_command_rejection_redelivers_escaped(
         f"got {len(payloads)} paste(s)."
     )
     assert payloads[0].startswith(b"/not-a-real-skill")
-    assert payloads[1].startswith("\ufeff/not-a-real-skill hello world".encode("utf-8"))
+    assert payloads[1].startswith(b" /not-a-real-skill hello world")
 
 
 def test_unknown_name_accepted_as_skill_is_not_redelivered(
@@ -9660,6 +9823,34 @@ def test_wait_for_claude_prompt_ready_fails_fast_with_the_sign_in_link(
     )
     # Two plain polls saw the address; each looked again with wrapped rows joined.
     assert captures == [False, True, False, True]
+    assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
+
+
+def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launcher waiting on another session's sign-in fails delivery as a pending
+    sign-in instead of waiting out the budget and reaping the waiting pane.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target, *, join_wrapped=False: (
+            "Waiting for another process to finish OAuth on port 8020...\n^[^[\n"
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudeSignInPending) as raised:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert raised.value.code == "databricks_sign_in_pending"
+    assert raised.value.remediation.startswith("Finish the sign-in that another session opened")
     assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
 
 

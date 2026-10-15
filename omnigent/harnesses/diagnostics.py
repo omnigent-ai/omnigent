@@ -193,6 +193,26 @@ def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     return SignInPrompt(url=url, code=code)
 
 
+# A launcher that runs one sign-in at a time prints this while another
+# process's sign-in holds the lock, e.g. "Waiting for another process to finish
+# OAuth on port 8020...".
+_SIGN_IN_ELSEWHERE = re.compile(
+    r"waiting for another process to finish (?:oauth|sign[ -]?in|log[ -]?in)", re.IGNORECASE
+)
+
+
+def sign_in_running_elsewhere(screen: str | None) -> bool:
+    """Whether a launcher is waiting for a sign-in that another process started.
+
+    The screen shows no address of its own: the sign-in to finish is in the
+    browser tab or terminal of whichever launch started it first.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: ``True`` when the wait message is on screen.
+    """
+    return bool(screen) and _SIGN_IN_ELSEWHERE.search(screen) is not None
+
+
 def sign_in_next_step(agent: str) -> str:
     """Phrase the next step for a card whose harness is waiting on a launcher sign-in.
 

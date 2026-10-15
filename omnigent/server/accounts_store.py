@@ -152,6 +152,35 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
         delete_host_in_session(session, host)
 
 
+def _carry_registration_work(session: Session, user_id: str, *, old: str, new: str) -> None:
+    """Move *user_id*'s scheduled tasks and hosts from generation *old* to *new*.
+
+    Runs under the account lock when the generation rotates. Tasks and hosts belong
+    to the registration, so they keep working; grants and magic links stay revoked.
+    Like :func:`_revoke_durable_authority`, this updates every row the user owns in
+    one transaction, which only accounts mode does, and only on a password change.
+    """
+    workspace_id = current_workspace_id()
+    session.execute(
+        update(SqlScheduledTask)
+        .where(
+            SqlScheduledTask.workspace_id == workspace_id,
+            SqlScheduledTask.user_id == user_id,
+            SqlScheduledTask.account_generation == old,
+        )
+        .values(account_generation=new)
+    )
+    session.execute(
+        update(SqlHost)
+        .where(
+            SqlHost.workspace_id == workspace_id,
+            SqlHost.user_id == user_id,
+            SqlHost.account_generation == old,
+        )
+        .values(account_generation=new)
+    )
+
+
 def _to_account_token(row: SqlAccountToken) -> AccountToken:
     """Convert a :class:`SqlAccountToken` row to a domain entity."""
     return AccountToken(
@@ -522,30 +551,47 @@ class SqlAlchemyAccountStore:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
             return row.password_hash if row is not None and row.deleted_at is None else None
 
-    def update_password(self, user_id: str, password_hash: str) -> None:
+    def update_password(
+        self, user_id: str, password_hash: str, *, revoke_sessions: bool = False
+    ) -> str | None:
         """Replace a user's stored password hash.
 
-        Used by self-serve ``/auth/users/me/password`` and
-        admin-initiated reset. Provision a generation when a passwordless
-        sharing identity first receives credentials. Existing generations stay
-        unchanged. No-op if the user does not exist (the route should 404 first).
+        Used by self-serve ``/auth/users/me/password``, admin-initiated
+        reset, and the login-time rehash. Provision a generation when a
+        passwordless sharing identity first receives credentials. With
+        *revoke_sessions*, an existing generation is rotated: session and
+        runner JWTs, refresh and device grants, and magic links carry the
+        generation they were issued under, so the per-request check rejects
+        them afterwards on every replica, while the user's scheduled tasks
+        and hosts move to the new generation. Otherwise the generation stays
+        unchanged. No-op if the user does not exist (the route should 404
+        first).
+
+        :returns: The account generation after the write, or ``None`` when
+            the user does not exist.
         """
 
-        def write(session: Session) -> None:
+        def write(session: Session) -> str | None:
             generation = require_active_account(session, user_id)
-            session.execute(
-                update(SqlUser)
-                .where(
-                    SqlUser.workspace_id == current_workspace_id(),
-                    SqlUser.id == user_id,
-                )
-                .values(
-                    password_hash=password_hash,
-                    account_generation=generation or uuid.uuid4().hex,
-                )
+            new_generation = generation
+            if generation is None or revoke_sessions:
+                new_generation = uuid.uuid4().hex
+                if generation is not None:
+                    _carry_registration_work(session, user_id, old=generation, new=new_generation)
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlUser)
+                    .where(
+                        SqlUser.workspace_id == current_workspace_id(),
+                        SqlUser.id == user_id,
+                    )
+                    .values(password_hash=password_hash, account_generation=new_generation)
+                ),
             )
+            return new_generation if result.rowcount == 1 else None
 
-        run_write_transaction(self._session_immediate, "update_password", write)
+        return run_write_transaction(self._session_immediate, "update_password", write)
 
     def mark_logged_in(self, user_id: str, when_epoch_seconds: int) -> None:
         """Bump ``last_login_at`` on every successful login.

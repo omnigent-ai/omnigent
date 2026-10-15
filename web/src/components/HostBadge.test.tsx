@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -310,6 +310,72 @@ describe("HostBadge", () => {
     render(<HostBadge sessionId="conv_1" appearance="composer" />);
     fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
     expect(screen.getByText("My machines")).toBeTruthy();
+  });
+
+  it.each([
+    ["online", true, false, "Connected"],
+    ["offline", false, false, "Disconnected"],
+    ["dormant resumable", false, true, "Asleep — wakes on next message"],
+    ["unsettled", null, false, "Unknown"],
+  ] as const)(
+    "shows the %s host's name and connection in the composer tooltip",
+    async (_state, online, hostResumable, status) => {
+      useSessionMock.mockReturnValue({
+        session: { hostId: "host_a1b2", hostResumable },
+        isLoading: false,
+        error: null,
+      });
+      useSessionHostOnlineMock.mockReturnValue(online);
+      render(<HostBadge sessionId="conv_1" appearance="composer" />);
+      const trigger = screen.getByTestId("composer-host-select");
+      // The styled tooltip replaces the native title hover.
+      expect(trigger).not.toHaveAttribute("title");
+      fireEvent.focus(trigger);
+      const tooltip = await screen.findByTestId("composer-host-tooltip");
+      expect(tooltip).toHaveTextContent("Host: mac-laptop");
+      expect(tooltip).toHaveTextContent(`Status: ${status}`);
+      for (const key of within(tooltip).getAllByText(/^(Host|Status):$/)) {
+        expect(key).toHaveClass("font-semibold");
+      }
+    },
+  );
+
+  it("names no host in the composer tooltip for an unbound session", async () => {
+    useSessionMock.mockReturnValue({ session: { hostId: null }, isLoading: false, error: null });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.focus(screen.getByTestId("composer-host-select"));
+    const tooltip = await screen.findByTestId("composer-host-tooltip");
+    expect(tooltip).toHaveTextContent("Host: None");
+    expect(tooltip).not.toHaveTextContent("Status:");
+  });
+
+  it("keeps the composer host tooltip closed while the host menu is open", async () => {
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    const trigger = screen.getByTestId("composer-host-select");
+    const settle = () =>
+      act(
+        () =>
+          new Promise<void>((resolve) => {
+            setTimeout(resolve, 25);
+          }),
+      );
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    const menu = screen.getByTestId("composer-host-menu");
+    fireEvent.focus(trigger);
+    await settle();
+    expect(screen.queryByTestId("composer-host-tooltip")).toBeNull();
+
+    // Focus returning to the trigger on close must not reopen it.
+    fireEvent.keyDown(menu, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("composer-host-menu")).toBeNull());
+    fireEvent.focus(trigger);
+    await settle();
+    expect(screen.queryByTestId("composer-host-tooltip")).toBeNull();
+
+    // A fresh hover over the trigger's wrapper lets it open again.
+    fireEvent.pointerEnter(trigger.parentElement!);
+    fireEvent.focus(trigger);
+    expect(await screen.findByTestId("composer-host-tooltip")).toBeInTheDocument();
   });
 
   it("renders nothing when the session is not host-bound", () => {

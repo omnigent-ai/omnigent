@@ -320,6 +320,10 @@ async def _wake_runner_for_model_change(
     return conv
 
 
+# Allow runtime recovery (15s), connect/catalog/update (12s), and confirmation
+# mirroring/cleanup (6s) to finish before the server restores a selection.
+_CODEX_SETTINGS_FORWARD_TIMEOUT_S = 40.0
+
 _CODEX_SETTINGS_RESTORED_MESSAGE = (
     "The terminal did not apply the model and reasoning effort changes. "
     "The previous selections have been restored."
@@ -2892,6 +2896,9 @@ def register_core_routes(
         # This server rolls back Codex refusals and keeps unconfirmed changes, so the
         # runner neither saves a refusal nor waits out this server's forward timeout.
         negotiation: dict[str, object] = {"rollback_on_refusal": True} if codex_native else {}
+        settings_forward_timeout = (
+            _CODEX_SETTINGS_FORWARD_TIMEOUT_S if codex_native else _TUI_INJECT_FORWARD_TIMEOUT_S
+        )
         combined_model_forward = False
         _model_forward = None
         if (
@@ -2921,10 +2928,7 @@ def register_core_routes(
                 session_id,
                 runner_router,
                 event,
-                # Same TUI injection budget as the model change below: the
-                # ``/effort`` confirm dialog can render seconds after the
-                # command.
-                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                timeout_s=settings_forward_timeout,
             )
             model_applied = bool(
                 combined_model_forward
@@ -2941,7 +2945,7 @@ def register_core_routes(
                         session_id,
                         runner_router,
                         effort_event,
-                        timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                        timeout_s=settings_forward_timeout,
                     )
             if codex_native and (
                 (effort_forward is None and model_applied)
@@ -2986,8 +2990,7 @@ def register_core_routes(
                     session_id,
                     runner_router,
                     {"type": "model_change", "model": updated.model_override, **negotiation},
-                    # The runner can answer by confirming a TUI model dialog.
-                    timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                    timeout_s=settings_forward_timeout,
                 )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
@@ -3307,7 +3310,9 @@ def register_core_routes(
             owns a session-scoped ``body.agent_id``; 400 if the source
             has no agent binding, ``body.up_to_response_id`` names
             no response in the source session, or a managed fork asks
-            for a sandbox this server has not configured.
+            for a sandbox this server has not configured; 410 if the
+            source's agent was removed or a required bundle copy finds
+            its source missing.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
