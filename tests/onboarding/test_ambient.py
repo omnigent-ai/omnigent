@@ -995,6 +995,32 @@ def test_claude_managed_gateway_first_readable_file_decides(clean_env, monkeypat
     assert ambient.claude_managed_gateway() == (None, False)
 
 
+def test_claude_managed_env_uses_the_first_readable_file(tmp_path: Path) -> None:
+    """The first readable settings file decides, and only non-empty strings count."""
+    first = tmp_path / "first.json"
+    first.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": " sk-managed ",
+                    "ANTHROPIC_MODEL": "",
+                    "CLAUDE_CODE_USE_GATEWAY": 1,
+                }
+            }
+        )
+    )
+    second = tmp_path / "second.json"
+    second.write_text(json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "sk-lower-precedence"}}))
+    listed = tmp_path / "list.json"
+    listed.write_text("[]")
+
+    assert ambient.claude_managed_env((tmp_path / "missing.json", first, second)) == {
+        "ANTHROPIC_AUTH_TOKEN": "sk-managed"
+    }
+    assert ambient.claude_managed_env((listed,)) == {}
+    assert ambient.claude_managed_env(()) == {}
+
+
 def test_claude_managed_model_picker_reads_replacement_options(tmp_path: Path) -> None:
     path = tmp_path / "managed-settings.json"
     path.write_text(

@@ -39,7 +39,7 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -541,6 +541,25 @@ def _expand_agent_config(page: Page, label: str) -> None:
     row.press("ArrowRight", timeout=5_000)
 
 
+def _read_model_rows(scope: Page | Locator) -> list[dict[str, str]]:
+    """The model rows currently rendered under *scope*, sentinel entries dropped."""
+    rows: list[dict[str, str]] = []
+    for option in scope.locator(
+        f'[role="menuitemcheckbox"][data-testid^="{_MODEL_ROW_PREFIX}"]'
+    ).all():
+        row_id = (option.get_attribute("data-testid") or "")[len(_MODEL_ROW_PREFIX) :]
+        if row_id in _MODEL_ROW_SENTINELS:
+            continue
+        rows.append(
+            {
+                "id": row_id,
+                "text": " ".join((option.inner_text() or "").split()),
+                "checked": option.get_attribute("aria-checked") or "",
+            }
+        )
+    return rows
+
+
 def _model_rows(page: Page, rig: PickerRig, agent_label: str) -> list[dict[str, str]]:
     """Read the selected agent's model rows from the landing agent dropdown.
 
@@ -558,21 +577,7 @@ def _model_rows(page: Page, rig: PickerRig, agent_label: str) -> list[dict[str, 
             with contextlib.suppress(AssertionError, PlaywrightError):
                 _expand_agent_config(page, agent_label)
         page.wait_for_timeout(500)
-        rows: list[dict[str, str]] = []
-        for option in page.locator(
-            f'[role="menuitemcheckbox"][data-testid^="{_MODEL_ROW_PREFIX}"]'
-        ).all():
-            testid = option.get_attribute("data-testid") or ""
-            row_id = testid[len(_MODEL_ROW_PREFIX) :]
-            if row_id in _MODEL_ROW_SENTINELS:
-                continue
-            rows.append(
-                {
-                    "id": row_id,
-                    "text": " ".join((option.inner_text() or "").split()),
-                    "checked": option.get_attribute("aria-checked") or "",
-                }
-            )
+        rows = _read_model_rows(page)
         if rows:
             return rows
     raise AssertionError(
