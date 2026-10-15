@@ -10,6 +10,9 @@ and steers messages while the agent is busy.
 
 ## Sub-features
 
+- `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
+  revealing five at a time in server recency order in a scrollable list. The selected
+  offline host and desktop reconnect action stay visible. Closing the menu resets it.
 - `pill-tooltip`: hovering the pill shows one tooltip with Harness, Model, and
   Connection rows (plus effort when the harness has it).
 - `pill-tooltip-suppressed`: the tooltip stays hidden while the model picker is
@@ -97,6 +100,9 @@ and steers messages while the agent is busy.
 
 **New-session composer** (landing page, or New session):
 
+- Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
+  same menu on mobile and with a managed sandbox available. Offline rows remain
+  disabled; a remembered offline selection still requires an explicit switch.
 - From any page, press ⌘/Ctrl+Alt+N to open and focus a clean new-session
   composer.
 - Hover the model/effort pill to see the tooltip.
@@ -159,6 +165,11 @@ managed MCP services. Use a fictional local OAuth provider for live sign-in
 checks and allow popups; the browser tests below stub the catalog and callbacks.
 Other connection providers alone do not enable the managed MCP picker.
 
+- **`offline-hosts`:**
+  `tests/e2e_ui/start_session/test_start_session.py::test_start_session_keeps_offline_host_selected`
+  covers the connected-host and managed-sandbox variants with stubbed host responses.
+  Repeat at a phone viewport; desktop reconnect exceptions also have component
+  coverage in `web/src/shell/NewChatDialog.test.tsx`.
 - **`pill-tooltip`, `pill-tooltip-suppressed`, in-session:**
   `tests/browser_ui/chat/test_composer_tooltips.py::test_pill_uses_one_tooltip_and_suppresses_it_while_picker_is_open`
   (runs with zero and one turn).
@@ -192,9 +203,11 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`
 - **`model-picker`, `effort-picker`, refused change:** the rollback cases in
   `web/src/store/chatStore.test.ts` and the composer case in
-  `web/src/pages/ChatPage.composer.test.tsx` (`pnpm --dir web test`). Manually,
-  pick another effort in a Codex session right after Start session, while the
-  terminal is still starting: the pill keeps the previous effort.
+  `web/src/pages/ChatPage.composer.test.tsx` (`pnpm --dir web test`). A pick
+  during Codex startup waits for the terminal, then applies. If startup does
+  not become ready within the recovery budget, the pill keeps the previous
+  selection; server/runner coverage is in
+  `tests/server/integration/test_codex_model_change_after_idle_reap.py`.
 - **`effort-terminal-mirror`:**
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_codex_terminal_effort_change_reaches_composer`,
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`

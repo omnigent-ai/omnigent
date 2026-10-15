@@ -44,6 +44,7 @@ import {
   GitPullRequestIcon,
   KeyRoundIcon,
   Loader2Icon,
+  MessageCircleIcon,
   type LucideIcon,
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
@@ -92,6 +93,7 @@ import {
   type PullRequestChecks,
   type PullRequestComment,
   type PullRequestInfo,
+  type PullRequestReviewer,
 } from "@/hooks/usePullRequests";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
@@ -135,13 +137,14 @@ function PullRequestEmptyState({
   );
 }
 
-/** Keep the provider name accessible without taking space from the PR picker. */
-function PanelTitle({ copy }: { copy: GitProviderCopy }) {
+/** The provider icon with the panel title, or icon-only (provider named for screen
+ *  readers) where the PR picker needs the room. */
+function PanelTitle({ copy, showTitle = false }: { copy: GitProviderCopy; showTitle?: boolean }) {
   const Icon = copy.Icon;
   return (
-    <h2 className="shrink-0" title={copy.label}>
+    <h2 className="flex shrink-0 items-center gap-2 font-medium text-ui" title={copy.label}>
       <Icon size={14} className="shrink-0" aria-hidden />
-      <span className="sr-only">{copy.label}</span>
+      {showTitle ? "Pull Requests" : <span className="sr-only">{copy.label}</span>}
     </h2>
   );
 }
@@ -575,29 +578,143 @@ function CheckPill({
 }
 
 // ── Summary and Comments tabs ────────────────────────────────────────────
-// The PR's description and its conversation comments (from `gh pr view`), both
-// rendered as GitHub-flavored markdown via the shared MessageResponse.
+// Reviewer assignments, CI checks, the PR description, and conversation comments.
 
+const REVIEWER_STATE_META: Record<
+  PullRequestReviewer["state"],
+  { label: string; className: string; Icon: LucideIcon }
+> = {
+  PENDING: {
+    label: "Pending",
+    className: "text-amber-700 dark:text-amber-400",
+    Icon: CircleDotIcon,
+  },
+  APPROVED: {
+    label: "Approved",
+    className: "text-green-700 dark:text-green-400",
+    Icon: CircleCheckIcon,
+  },
+  COMMENTED: {
+    label: "Commented",
+    className: "text-blue-700 dark:text-blue-400",
+    Icon: MessageCircleIcon,
+  },
+  CHANGES_REQUESTED: {
+    label: "Changes requested",
+    className: "text-red-700 dark:text-red-400",
+    Icon: CircleXIcon,
+  },
+  DISMISSED: {
+    label: "Dismissed",
+    className: "text-muted-foreground",
+    Icon: AlertCircleIcon,
+  },
+};
+
+/**
+ * Space colors evenly and group shared suffixes without provider-specific rules.
+ * The same author set keeps its colors; adding or removing authors can shift them.
+ */
+function pullRequestAuthorHues(comments: PullRequestComment[]): Map<string, number> {
+  const identities = comments.flatMap(({ author }) => (author ? [author.toLowerCase()] : []));
+  const authors = [...new Set(identities)].sort((a, b) => {
+    const reversedA = [...a].reverse().join("");
+    const reversedB = [...b].reverse().join("");
+    return reversedA < reversedB ? -1 : reversedA > reversedB ? 1 : 0;
+  });
+  return new Map(authors.map((author, index) => [author, (index * 360) / authors.length]));
+}
+
+function PullRequestAuthorAvatar({
+  author,
+  hue,
+}: {
+  author: string | null | undefined;
+  hue: number | undefined;
+}) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "inline-flex size-4 shrink-0 items-center justify-center rounded-full text-[9px] font-semibold",
+        hue === undefined && "bg-muted text-muted-foreground",
+      )}
+      style={
+        // Uniform perceptual lightness keeps white initials legible across the hue wheel.
+        hue === undefined
+          ? undefined
+          : { backgroundColor: `oklch(0.48 0.13 ${hue})`, color: "#fff" }
+      }
+    >
+      {author?.[0]?.toUpperCase() ?? "?"}
+    </span>
+  );
+}
+
+/** Keep reviewer colors for review state; author colors belong in comments. */
+function PullRequestReviewerRow({ reviewer }: { reviewer: PullRequestReviewer }) {
+  const state = REVIEWER_STATE_META[reviewer.state];
+  const StateIcon = state.Icon;
+  const subject = reviewer.kind === "team" ? `Team ${reviewer.login}` : reviewer.login;
+
+  return (
+    <li
+      aria-label={`${subject}: ${state.label}`}
+      className="inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-md border border-border bg-muted/20 px-2 py-1 text-xs"
+    >
+      <span className="min-w-0 truncate font-medium text-foreground">{reviewer.login}</span>
+      {reviewer.kind === "team" && <span className="shrink-0 text-muted-foreground">(team)</span>}
+      <span className={cn("inline-flex shrink-0 items-center gap-1", state.className)}>
+        <StateIcon aria-hidden className="size-3" />
+        <span>{state.label}</span>
+      </span>
+    </li>
+  );
+}
+
+/** Compact reviewer rows that keep the assignment and current review state together. */
+function PullRequestReviewers({ reviewers }: { reviewers: PullRequestReviewer[] }) {
+  const reviewerKeys = listKeys(reviewers, (reviewer) => [reviewer.login, reviewer.kind]);
+
+  return (
+    <section className="space-y-1.5" aria-labelledby="pull-request-reviewers-heading">
+      <h3
+        id="pull-request-reviewers-heading"
+        className="text-xs font-medium tracking-wide text-muted-foreground uppercase"
+      >
+        Reviewers
+      </h3>
+      {reviewers.length === 0 ? (
+        <p className="text-ui text-muted-foreground">No reviewers assigned.</p>
+      ) : (
+        <ul className="flex flex-wrap gap-1.5">
+          {reviewers.map((reviewer, index) => (
+            <PullRequestReviewerRow key={reviewerKeys[index]} reviewer={reviewer} />
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+// The PR's description and its conversation comments (from `gh pr view`) are both
+// rendered as GitHub-flavored markdown via the shared MessageResponse.
 /** One comment card: an author + relative-time header over the markdown body. */
 function PullRequestCommentCard({
   comment,
   providerLabel,
+  authorHue,
 }: {
   comment: PullRequestComment;
   providerLabel: string;
+  authorHue: number | undefined;
 }) {
   const ts = comment.created_at ? Date.parse(comment.created_at) : NaN;
   const rel = relativeTime(ts);
-  const initial = comment.author?.[0]?.toUpperCase() ?? "?";
   return (
     <li className="rounded-lg border border-border bg-muted/20 p-3">
       <div className="mb-1.5 flex items-center gap-2 text-xs">
-        <span
-          aria-hidden
-          className="inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-muted text-[9px] font-semibold text-muted-foreground"
-        >
-          {initial}
-        </span>
+        <PullRequestAuthorAvatar author={comment.author} hue={authorHue} />
         <span className="min-w-0 truncate font-medium text-foreground">
           {comment.author ?? "unknown"}
         </span>
@@ -625,14 +742,16 @@ function PullRequestCommentCard({
   );
 }
 
-/** The Summary tab body: CI checks, then the PR description. When the token
+/** The Summary tab body: reviewers, CI checks, then the PR description. When the token
  *  can't read check runs, the Checks area says so instead of counts. */
 function PullRequestSummaryTab({
+  reviewers,
   checks,
   checksSupported,
   checksUnavailableHint,
   body,
 }: {
+  reviewers: PullRequestReviewer[] | undefined;
   checks: PullRequestChecks;
   checksSupported: boolean;
   checksUnavailableHint?: string;
@@ -642,6 +761,7 @@ function PullRequestSummaryTab({
     // Extra bottom padding so the end of a long description can scroll clear
     // of the very bottom edge, where it's awkward to read.
     <div className="space-y-4 p-3 pb-16">
+      {reviewers !== undefined && <PullRequestReviewers reviewers={reviewers} />}
       {/* CI status checks (from the PR's statusCheckRollup) as pills; hover a
           pill to see the job names in that bucket. */}
       {(checks.total > 0 || checks.partial || !checksSupported) && (
@@ -713,6 +833,7 @@ function PullRequestCommentsTab({
   providerLabel: string;
 }) {
   const commentKeys = listKeys(comments, (c) => [c.url, c.created_at, c.author_id ?? c.author]);
+  const authorHues = useMemo(() => pullRequestAuthorHues(comments), [comments]);
   return (
     // Extra bottom padding so the last comment can scroll clear of the very
     // bottom edge, where it's awkward to read.
@@ -731,6 +852,7 @@ function PullRequestCommentsTab({
               key={commentKeys[i]}
               comment={c}
               providerLabel={providerLabel}
+              authorHue={authorHues.get(c.author?.toLowerCase() ?? "")}
             />
           ))}
         </ul>
@@ -1027,7 +1149,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
     <div className="flex h-full min-h-0 flex-col">
       {showTrackingControls ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} />
+          <PanelTitle copy={copy} showTitle={prs.length === 0} />
           <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
             {prs.length > 0 && (
               <TooltipProvider>
@@ -1123,7 +1245,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
         </div>
       ) : panelState.kind !== "ready" ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} />
+          <PanelTitle copy={copy} showTitle />
         </div>
       ) : null}
       {showTrackingControls && (linking || update.isError) && (
@@ -1554,9 +1676,10 @@ function PullRequestPanelDetails({
           </TabsList>
         </div>
 
-        {/* Summary: CI checks + the PR description. */}
+        {/* Summary: reviewers, CI checks, and the PR description. */}
         <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
           <PullRequestSummaryTab
+            reviewers={pr.reviewers}
             checks={checks}
             checksSupported={pr.checks_supported !== false}
             checksUnavailableHint={copy.checksUnavailableHint}
