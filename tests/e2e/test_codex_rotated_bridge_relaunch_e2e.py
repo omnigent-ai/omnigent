@@ -174,6 +174,12 @@ def test_rotated_codex_session_relaunches_into_its_bridge_directory(
             if terminal is None:
                 _send_user_text(client, session_id=session_id, text=prompt)
             else:
+                _wait(
+                    lambda: codex_terminal_interactive(
+                        bridge_dir, _tmux(terminal, "capture-pane", "-p")
+                    ),
+                    "relaunched native terminal to render its input",
+                )
                 _tmux(terminal, "send-keys", "-l", prompt)
                 time.sleep(0.3)
                 _tmux(terminal, "send-keys", "Enter")
