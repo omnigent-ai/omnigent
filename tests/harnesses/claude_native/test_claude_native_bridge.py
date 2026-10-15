@@ -9663,6 +9663,34 @@ def test_wait_for_claude_prompt_ready_fails_fast_with_the_sign_in_link(
     assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
 
 
+def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launcher waiting on another session's sign-in fails delivery as a pending
+    sign-in instead of waiting out the budget and reaping the waiting pane.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target, *, join_wrapped=False: (
+            "Waiting for another process to finish OAuth on port 8020...\n^[^[\n"
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudeSignInPending) as raised:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert raised.value.code == "databricks_sign_in_pending"
+    assert raised.value.remediation.startswith("Finish the sign-in that another session opened")
+    assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
+
+
 def test_wait_for_claude_prompt_ready_prefers_a_rendered_prompt_over_a_link(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

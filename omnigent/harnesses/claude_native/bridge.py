@@ -72,7 +72,11 @@ from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
-from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
+from omnigent.harnesses.diagnostics import (
+    detect_sign_in_prompt,
+    sign_in_next_step,
+    sign_in_running_elsewhere,
+)
 from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
@@ -6182,6 +6186,8 @@ def _wait_for_claude_prompt_ready(
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
         card can offer it; the pane is left alive for the sign-in to finish.
+        Also raised when the launcher waits on two consecutive polls for a
+        sign-in that another process started.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
@@ -6207,6 +6213,7 @@ def _wait_for_claude_prompt_ready(
     pane_exited = False
     dialog_headline: str | None = None
     sign_in_url: str | None = None
+    waited_on_sign_in = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -6255,6 +6262,21 @@ def _wait_for_claude_prompt_ready(
                 remediation=sign_in_next_step("Claude Code"),
             )
         sign_in_url = sign_in.url if sign_in is not None else None
+        # Another launch's sign-in holds the launcher's lock. Reaping the pane at
+        # the budget would kill this wait, so report the sign-in instead.
+        waiting_on_sign_in = sign_in is None and sign_in_running_elsewhere(pane)
+        if waiting_on_sign_in and waited_on_sign_in:
+            raise ClaudeSignInPending(
+                "Claude Code is waiting for a sign-in that another session started, "
+                "so the message was not delivered.",
+                title="Claude Code can't start until you sign in to Databricks",
+                remediation=(
+                    "Finish the sign-in that another session opened, in your browser or in "
+                    "that session's terminal. Claude Code continues on its own once it "
+                    "completes; then send your message again."
+                ),
+            )
+        waited_on_sign_in = waiting_on_sign_in
         now = time.monotonic()
         if now >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)
