@@ -20,7 +20,6 @@ import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.harnesses.codex_native.app_server import (
-    NativeCodexLaunch,
     build_codex_native_server,
     codex_session_meta_model_provider,
     resolve_native_codex_launch,
@@ -1011,17 +1010,6 @@ def test_explicit_profile_selecting_builtin_routes_without_login(
     assert launch.config_overrides == ['model_provider="amazon-bedrock"']
     assert codex_session_meta_model_provider(launch) == "amazon-bedrock"
     assert launch.login_required is False
-
-
-def test_session_meta_provider_takes_the_last_model_provider_override() -> None:
-    """Codex applies the last repeated ``-c`` override, so resume metadata names that provider."""
-    launch = NativeCodexLaunch(
-        config_overrides=['model_provider="openai"', 'model_provider="Databricks"'],
-        model=None,
-        profile=None,
-    )
-
-    assert codex_session_meta_model_provider(launch) == "Databricks"
 
 
 def test_explicit_legacy_profile_table_routes_without_login(_isolated: Path) -> None:

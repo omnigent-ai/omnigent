@@ -15,7 +15,7 @@ import socket
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
@@ -3302,9 +3302,7 @@ def build_codex_native_server(
     :param socket_path: Unix socket path for the app-server.
     :param codex_home: Private per-session ``CODEX_HOME`` path.
     :param cwd: Working directory for Codex, e.g. the user's repo.
-    :param model: Optional model id, e.g. ``"gpt-5.4-mini"``. A catalog-spelled
-        id (``"system.ai.gpt-6-1-sol"``) is pinned as codex's own slug when the
-        launch runs on codex's login (see :func:`_routes_through_codex_login`).
+    :param model: Optional Codex model id, e.g. ``"gpt-5.4-mini"``.
     :param profile: Optional Databricks CLI profile, e.g.
         ``"<your-profile>"``.
     :param bridge_dir: Native Codex bridge directory; the policy hook is
@@ -3368,8 +3366,6 @@ def build_codex_native_server(
         )
     env = _clean_codex_env()
     config_overrides: list[str] = []
-    config_profile = codex_config_profile(terminal_launch_args)
-    provider_override = _model_provider_override(extra_config_overrides or ())
     pinned_model = model
     if profile is not None:
         databricks = _databricks_launch_materialization(
@@ -3384,10 +3380,6 @@ def build_codex_native_server(
         # forwarder mirror and cost gate report the model this session runs
         # instead of whatever the shared file was last left on.
         pinned_model = codex_spawn_model(databricks.model) or databricks.model
-    elif model and _routes_through_codex_login(provider_override, config_profile):
-        # Codex's own backend knows a model only by codex's slug; the catalog
-        # spelling (``system.ai.gpt-6-1-sol``) is rejected with a 400.
-        pinned_model = codex_spawn_model(model) or model
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
     if bypass_sandbox:
@@ -3416,7 +3408,7 @@ def build_codex_native_server(
         codex_home=codex_home,
         env=env,
         config_overrides=config_overrides,
-        config_profile=config_profile,
+        config_profile=codex_config_profile(terminal_launch_args),
         cwd=cwd,
         bridge_dir=bridge_dir,
         session_id=session_id,
@@ -3507,56 +3499,15 @@ def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
     :returns: Provider id for ``session_meta.model_provider``, e.g.
         ``"omnigent_databricks"``.
     """
-    pinned = _model_provider_override(launch.config_overrides)
-    if pinned is not None:
-        return pinned
-    if launch.profile is not None:
-        return "omnigent_databricks"
-    return "openai"
-
-
-def _model_provider_override(config_overrides: Iterable[str]) -> str | None:
-    """Provider id an explicit ``model_provider`` ``-c`` override pins, or ``None``.
-
-    Codex applies the last ``-c`` override when a key repeats, so the last one wins.
-
-    :param config_overrides: Codex ``-c`` overrides, e.g.
-        ``['model_provider="openai"']``.
-    :returns: The decoded provider id, e.g. ``"openai"``.
-    :raises ValueError: When an override value is not a TOML basic string.
-    """
-    pinned: str | None = None
-    for override in config_overrides:
+    for override in launch.config_overrides:
         if override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX):
             decoded: object = json.loads(override.removeprefix(_MODEL_PROVIDER_OVERRIDE_PREFIX))
             if not isinstance(decoded, str):
                 raise ValueError("model_provider override must decode to a string")
-            pinned = decoded
-    return pinned
-
-
-def _routes_through_codex_login(provider_override: str | None, config_profile: str | None) -> bool:
-    """Whether a profile-free launch runs on codex's built-in ``openai`` provider.
-
-    Mirrors codex's own precedence: the ``model_provider`` ``-c`` override, else
-    the shared config.toml's effective provider (active profile before
-    top-level), else the built-in ``openai`` provider. A config or profile
-    codex itself cannot read is left alone.
-
-    :param provider_override: The launch's ``model_provider`` override (see
-        :func:`_model_provider_override`), or ``None``.
-    :param config_profile: Config-file profile the launch selects, or ``None``.
-    :returns: ``True`` when the launch's model reaches codex's own backend.
-    """
-    from omnigent.onboarding.codex_auth_readiness import effective_codex_model_provider
-
-    pinned = provider_override
-    if pinned is None:
-        config = _shared_codex_config(config_profile)
-        if config is None:
-            return False
-        pinned = effective_codex_model_provider(config)
-    return pinned is None or pinned == "openai"
+            return decoded
+    if launch.profile is not None:
+        return "omnigent_databricks"
+    return "openai"
 
 
 def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
@@ -3837,13 +3788,16 @@ def _codex_login_usable() -> bool:
     return codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json")
 
 
-def _shared_codex_config(config_profile: str | None) -> dict[str, object] | None:
-    """The user's shared ``config.toml`` with the selected profile layered over it.
+def _ambient_builtin_codex_provider(config_profile: str | None) -> str | None:
+    """Built-in provider the bridged config selects without any Codex login, if any.
 
-    Layers the profile the way :func:`materialize_codex_config_profile` does at
-    start. ``None`` when the file or the selected profile cannot be read.
+    Layers the selected profile over ``config.toml`` the way
+    :func:`materialize_codex_config_profile` does at start.
     """
-    from omnigent.onboarding.codex_auth_readiness import load_codex_config
+    from omnigent.onboarding.codex_auth_readiness import (
+        effective_self_sufficient_builtin_provider,
+        load_codex_config,
+    )
 
     source_home = _codex_home_config_source_from_env()
     config_path = source_home / "config.toml"
@@ -3860,15 +3814,7 @@ def _shared_codex_config(config_profile: str | None) -> dict[str, object] | None
         if not isinstance(overlay, dict):
             return None
         _merge_tables(config, copy.deepcopy(overlay))
-    return config
-
-
-def _ambient_builtin_codex_provider(config_profile: str | None) -> str | None:
-    """Built-in provider the bridged config selects without any Codex login, if any."""
-    from omnigent.onboarding.codex_auth_readiness import effective_self_sufficient_builtin_provider
-
-    config = _shared_codex_config(config_profile)
-    return None if config is None else effective_self_sufficient_builtin_provider(config)
+    return effective_self_sufficient_builtin_provider(config)
 
 
 def _resolve_subscription_launch(

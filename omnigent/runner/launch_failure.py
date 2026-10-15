@@ -29,6 +29,7 @@ __all__ = [
     "classify_terminal_failure",
     "describe_failure_code",
     "diagnose_client_update_required",
+    "diagnose_codex_model_rejection",
 ]
 
 
@@ -304,6 +305,21 @@ def diagnose_client_update_required(message: str) -> FailureDiagnosis | None:
             f"version {match.group('required')} or newer is required."
         ),
         remediation="Run `claude update` on the host, then start a new session.",
+    )
+
+
+def diagnose_codex_model_rejection(message: str) -> FailureDiagnosis | None:
+    """Explain Codex's explicit refusal of a model on a ChatGPT account."""
+    if "model is not supported when using codex with a chatgpt account" not in message.lower():
+        return None
+    return FailureDiagnosis(
+        title="Model unavailable with ChatGPT login",
+        cause=message.strip(),
+        remediation=(
+            "Choose a model available to your ChatGPT account using /model in the Codex terminal. "
+            f"For a Databricks model, run `{cli_invocation()} setup` on the host to select a "
+            "Databricks provider for Codex, then start a new session."
+        ),
     )
 
 
