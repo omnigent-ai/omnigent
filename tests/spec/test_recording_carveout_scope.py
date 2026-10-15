@@ -32,6 +32,18 @@ def test_lane_recording_blockers_are_explicit_and_do_not_block_delivery() -> Non
     assert "Do not block the verdict, fix, or PR" in lanes
 
 
+def test_repro_agent_loads_the_per_step_caption_rule_as_instructions() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+    assert "Keep prompts that are part of the reported bug" in lanes
+    assert "wait for the shell prompt before typing the next command" in lanes
+    spec = load(_REPRO_AGENT, expand_env=False)
+
+    assert spec.instructions is not None
+    assert "Caption each step from its own recorded evidence" in " ".join(
+        spec.instructions.split()
+    )
+
+
 def test_repro_recording_rules_match_the_shared_guide() -> None:
     instructions = _normalized(_REPRO_AGENT / "AGENTS.md")
 

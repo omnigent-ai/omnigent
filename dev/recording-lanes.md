@@ -283,6 +283,14 @@ tape and note that rendering was skipped.
   message), with only a short trailing `Sleep` after it lands — never a bare
   `Sleep`/short total duration as the stop condition. The clip must show the
   outcome, not the moment before it.
+- Wait for each command's claimed output before typing the next command. If
+  the wait times out, investigate and correct the tape or caption. A sleep
+  does not confirm the output appeared.
+- Handle unrelated first-run prompts before filming, using the recording's
+  isolated configuration. For Claude, set `CLAUDE_CONFIG_DIR` before calling
+  `ensure_claude_workspace_trusted(Path(cwd))`; keep it set for the tape.
+  Keep prompts that are part of the reported bug. After an interactive view,
+  wait for the shell prompt before typing the next command.
 - **A clip of the reproduction TEST running is NOT the journey.** If the tape
   won't render (server boot times out, `ttyd` missing, VHS unavailable), do
   **not** substitute a recording of `pytest … FAILS` / an `AssertionError`. That
@@ -335,6 +343,9 @@ already displayed. Keep backend findings in `evidence`; describe the visible
 outcome in the caption. Check each claimed moment, especially claims that text
 or controls are absent. If the frames contradict the caption, correct it or
 re-record.
+
+Check each captioned step against its recorded frame or visible-output assertion,
+including intermediate steps. Describe what appeared, not the intended output.
 
 ### Timed captions inside the video
 

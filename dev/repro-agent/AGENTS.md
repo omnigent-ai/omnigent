@@ -668,6 +668,10 @@ Follow these rules for each clip:
   inspected frames or visible-state assertions from the clip. Backend storage
   and logs do not establish what the UI displayed; keep those findings in
   `evidence`. Correct captions that conflict with the frames.
+- Caption each step from its own recorded evidence. Wait for claimed command
+  output before continuing; a sleep proves nothing. Handle unrelated first-run
+  prompts in isolated recording config, keeping any prompt involved in the bug.
+  See the CLI lane in `dev/recording-lanes.md`.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.
