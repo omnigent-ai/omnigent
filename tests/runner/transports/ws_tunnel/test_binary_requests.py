@@ -1149,6 +1149,10 @@ class _ClosingAsyncIteratorByteStream(transport_module.AsyncIteratorByteStream):
         await self._stream.aclose()
 
 
+class _InheritingAsyncIteratorByteStream(transport_module.AsyncIteratorByteStream):
+    pass
+
+
 async def test_async_iterator_byte_stream_subclass_closes_once_and_queues_frame() -> None:
     async with _tunnel([_CAPABILITY]) as (client, ws, registry):
         source = _NonIdempotentAsyncIterator(b"payload")
@@ -1196,6 +1200,58 @@ async def test_async_iterator_byte_stream_subclass_closes_once_on_overlimit(
             await client.send(request)
 
         assert stream.close_calls == 1
+        assert source.close_calls == 1
+        session = registry.get(_RUNNER)
+        assert session is not None
+        assert not session.binary_requests
+        assert not session.in_flight
+
+
+async def test_async_iterator_byte_stream_inheriting_noop_closes_source_and_queues_frame() -> None:
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        source = _NonIdempotentAsyncIterator(b"payload")
+        stream = _InheritingAsyncIteratorByteStream(source)
+        request = httpx.Request(
+            "PATCH",
+            "http://runner/upload",
+            stream=stream,
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        task = asyncio.create_task(client.send(request, stream=True))
+        try:
+            raw = await asyncio.wait_for(ws.recv(), 2)
+            assert isinstance(raw, bytes)
+            request_id = _envelope_header(raw)["id"]
+            assert source.close_calls == 1
+            await _reply(ws, request_id)
+            response = await asyncio.wait_for(task, 2)
+            assert response.status_code == 204
+            await response.aclose()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        session = registry.get(_RUNNER)
+        assert session is not None
+        assert not session.binary_requests
+
+
+async def test_async_iterator_byte_stream_inheriting_noop_closes_source_on_overlimit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transport_module, "RUNNER_TUNNEL_MAX_MESSAGE_BYTES", 1024)
+    async with _tunnel([_CAPABILITY]) as (client, _, registry):
+        source = _NonIdempotentAsyncIterator(b"x" * 2048)
+        stream = _InheritingAsyncIteratorByteStream(source)
+        request = httpx.Request(
+            "PATCH",
+            "http://runner/upload",
+            stream=stream,
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        with pytest.raises(httpx.LocalProtocolError, match=r"binary request.*message limit"):
+            await client.send(request)
+
         assert source.close_calls == 1
         session = registry.get(_RUNNER)
         assert session is not None
