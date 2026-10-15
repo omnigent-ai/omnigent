@@ -410,6 +410,27 @@ def test_stop_failure_detail_warns_when_no_error_details(
     assert (detail is not None) is (failure_category is not None)
 
 
+def test_stop_failure_detail_uses_transcript_api_error_without_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The transcript's explicit API error is the detail, not a logged fallback."""
+    record = ClaudeHookRecord(
+        event_cursor=5,
+        byte_offset=100,
+        event_name="StopFailure",
+        failure_category="rate_limit",
+    )
+    message = "API Error: Request rejected (429) · Quota exceeded for model serving endpoint"
+    with caplog.at_level(logging.WARNING, logger=forwarder.__name__):
+        detail = forwarder._stop_failure_detail(
+            record,
+            session_id="conv_test",
+            transcript_context={"native_api_error_message": True, "native_error_message": message},
+        )
+    assert detail == message
+    assert not [record for record in caplog.records if record.levelno == logging.WARNING]
+
+
 @pytest.mark.asyncio
 async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
     tmp_path: Path,

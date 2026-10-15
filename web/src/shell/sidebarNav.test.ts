@@ -16,9 +16,10 @@ import {
   pinOrderWrites,
   resolveSidebarDrop,
   sessionsListAcceptsDrop,
+  sortConversations,
   STATUS_BUCKETS,
   statusBucket,
-  updatedBucket,
+  dateBucket,
 } from "./sidebarNav";
 
 function conversation(
@@ -695,18 +696,18 @@ describe("statusBucket", () => {
   });
 });
 
-describe("updatedBucket", () => {
+describe("dateBucket", () => {
   const now = new Date(2026, 8, 30, 10, 0);
   const at = (date: Date) => date.getTime() / 1000;
   it("buckets by local calendar day", () => {
-    expect(updatedBucket(at(new Date(2026, 8, 30, 0, 0)), now)).toBe("Today");
-    expect(updatedBucket(at(new Date(2026, 8, 29, 23, 59)), now)).toBe("Yesterday");
-    expect(updatedBucket(at(new Date(2026, 8, 29, 0, 0)), now)).toBe("Yesterday");
-    expect(updatedBucket(at(new Date(2026, 8, 28, 23, 59)), now)).toBe("Previous 7 days");
-    expect(updatedBucket(at(new Date(2026, 8, 23, 0, 0)), now)).toBe("Previous 7 days");
-    expect(updatedBucket(at(new Date(2026, 8, 22, 23, 59)), now)).toBe("Previous 30 days");
-    expect(updatedBucket(at(new Date(2026, 7, 31, 0, 0)), now)).toBe("Previous 30 days");
-    expect(updatedBucket(at(new Date(2026, 7, 30, 23, 59)), now)).toBe("Older");
+    expect(dateBucket(at(new Date(2026, 8, 30, 0, 0)), now)).toBe("today");
+    expect(dateBucket(at(new Date(2026, 8, 29, 23, 59)), now)).toBe("yesterday");
+    expect(dateBucket(at(new Date(2026, 8, 29, 0, 0)), now)).toBe("yesterday");
+    expect(dateBucket(at(new Date(2026, 8, 28, 23, 59)), now)).toBe("in the last 7 days");
+    expect(dateBucket(at(new Date(2026, 8, 23, 0, 0)), now)).toBe("in the last 7 days");
+    expect(dateBucket(at(new Date(2026, 8, 22, 23, 59)), now)).toBe("in the last 30 days");
+    expect(dateBucket(at(new Date(2026, 7, 31, 0, 0)), now)).toBe("in the last 30 days");
+    expect(dateBucket(at(new Date(2026, 7, 30, 23, 59)), now)).toBe("earlier");
   });
 });
 
@@ -751,4 +752,20 @@ describe("sessionsListAcceptsDrop", () => {
     expect(sessionsListAcceptsDrop(drag("Customer X", true), true)).toBe(false);
     expect(sessionsListAcceptsDrop(drag(null, true), true)).toBe(true);
   });
+});
+
+it("keeps Created stable across updates, active-row overrides, and hover freezes", () => {
+  const old = { ...conversation("a", "old", new Date(1000)), created_at: 1, updated_at: 300 };
+  const newer = { ...conversation("b", "new", new Date(2000)), created_at: 2, updated_at: 100 };
+  const sameSecond = { ...newer, id: "c" };
+  const frozen = new Map([
+    [old.id, 999],
+    [newer.id, 1],
+  ]);
+  const active = { id: newer.id, updatedAt: 500 };
+  const ids = (rows: Conversation[]) =>
+    sortConversations(rows, active, frozen, "created_at").map((row) => row.id);
+  expect(ids([old, newer, sameSecond])).toEqual(["c", "b", "a"]);
+  expect(ids([{ ...old, updated_at: 1000 }, sameSecond, newer])).toEqual(["c", "b", "a"]);
+  expect(sortConversations([old, newer], null).map((row) => row.id)).toEqual(["a", "b"]);
 });

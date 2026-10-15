@@ -12,8 +12,7 @@ from zipfile import ZipFile
 import pytest
 
 SCRIPT = (
-    Path(__file__).resolve().parents[2]
-    / "dev/resolve-agent/skills/resolve-drive-pr/review_cycle.py"
+    Path(__file__).resolve().parents[2] / "dev/agent-skills/otto-pr-review-loop/review_cycle.py"
 )
 spec = importlib.util.spec_from_file_location("resolve_review_cycle", SCRIPT)
 cycle = importlib.util.module_from_spec(spec)

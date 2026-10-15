@@ -1348,6 +1348,7 @@ def create_app(
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
     base_path: str | None = None,
+    host_sharded: bool = False,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1484,6 +1485,13 @@ def create_app(
         reverse proxy, e.g. ``"/proxy/6767"`` (code-server port proxy).
         ``None`` reads ``OMNIGENT_WEB_BASE_PATH``; empty/``"/"`` is a normal
         root deployment.
+    :param host_sharded: Whether replicas sit behind a router that keys host
+        and runner tunnels by host_id. When ``True``, a host-scoped request
+        for a live host whose tunnel is on another replica returns 400
+        ``wrong_replica``; otherwise it returns 409 "host is offline". The
+        400 recovers only for a client that sent the slice-key header and
+        retries without it, which the web client does only for requests it
+        keyed itself.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -1546,7 +1554,9 @@ def create_app(
     from omnigent.runner.routing import RunnerRouter
     from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
     from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+    from omnigent.server.routes._host_launch import configure_host_sharding
 
+    configure_host_sharding(host_sharded)
     tunnel_registry = TunnelRegistry()
     host_registry = HostRegistry()
     runner_router = RunnerRouter(

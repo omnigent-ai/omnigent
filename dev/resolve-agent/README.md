@@ -267,7 +267,7 @@ Run the bundled helper against a ready PR in a repository with both review
 workflows installed (read-only):
 
 ```bash
-python3 dev/resolve-agent/skills/resolve-drive-pr/review_cycle.py snapshot --repository omnigent-ai/omnigent --pr-number <pr>
+python3 dev/agent-skills/otto-pr-review-loop/review_cycle.py snapshot --repository omnigent-ai/omnigent --pr-number <pr>
 ```
 
 A new head must show both reviews incomplete until that head has Polly's reviewed
