@@ -2038,11 +2038,15 @@ class CodexNativeAppServer:
             await self._start()
         except RuntimeError as exc:
             catalog = _codex_home_model_catalog(self.codex_home)
+            stderr = self.recent_stderr or []
             if (
                 self._without_model_catalog
                 or catalog is None
-                or not _CODEX_CONFIG_FALLBACK_EXIT.search(str(exc))
-                or not _codex_config_error_may_be_model_catalog(self.recent_stderr or [])
+                # The error holds stderr as of the exit; cleanup can drain the rest.
+                or not any(
+                    _CODEX_CONFIG_FALLBACK_EXIT.search(text) for text in (str(exc), *stderr)
+                )
+                or not _codex_config_error_may_be_model_catalog(stderr)
             ):
                 raise
             _logger.warning(
@@ -3224,13 +3228,14 @@ def _codex_config_error_may_be_model_catalog(stderr: Sequence[str]) -> bool:
 def _drop_codex_model_catalog(codex_home: Path) -> None:
     """Remove ``model_catalog_json`` from the private session config only."""
     config_path = codex_home / "config.toml"
-    _materialize_config_symlink(config_path)
     try:
+        _materialize_config_symlink(config_path)
         document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        if document.pop("model_catalog_json", None) is not None:
+            config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
     except (OSError, tomlkit.exceptions.TOMLKitError):
-        return
-    if document.pop("model_catalog_json", None) is not None:
-        config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+        # The retry then reports the startup error instead of this one.
+        _logger.warning("Could not drop model_catalog_json from %s", config_path, exc_info=True)
 
 
 def _add_codex_writable_roots(codex_home: Path, roots: Sequence[str]) -> None:
