@@ -326,15 +326,15 @@ async def test_codex_native_reset_without_a_current_model_is_rejected_before_con
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stalled", ["connect", "update"])
+@pytest.mark.parametrize("stalled", ["connect", "update", "resume", "retry", "close"])
 async def test_codex_native_settings_update_times_out_and_releases_the_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     stalled: str,
 ) -> None:
-    """A hung connect is refused (503) and a hung update is unconfirmed (504); neither blocks."""
+    """Only a pending write is unconfirmed; all timeout paths release the settings lock."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-    from omnigent.runner import turn_routing
+    from omnigent.runner import native_controls, turn_routing
 
     conv_id = "1f2e3d4c5b6a49788796a5b4c3d2e1f0"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -349,18 +349,35 @@ async def test_codex_native_settings_update_times_out_and_releases_the_lock(
         ),
     )
     monkeypatch.setattr(turn_routing, "SETTINGS_UPDATE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_CLOSE_TIMEOUT_S", 0.05)
     stall = {"active": True}
 
     class _StallingClient(_RecordingCodexAppServerClient):
+        rejected_unloaded_thread = False
+
         async def connect(self) -> None:
             if stalled == "connect" and stall["active"]:
                 await asyncio.Event().wait()
             await super().connect()
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-            if stalled == "update" and method == "thread/settings/update" and stall["active"]:
-                await asyncio.Event().wait()
+            if stall["active"]:
+                if method == "thread/settings/update":
+                    if stalled in {"resume", "retry"} and not self.rejected_unloaded_thread:
+                        self.rejected_unloaded_thread = True
+                        raise codex_native_app_server.CodexAppServerResponseError(
+                            {"code": -32600, "message": "thread not found: thread_codex"}
+                        )
+                    if stalled in {"update", "retry"}:
+                        await asyncio.Event().wait()
+                elif method == "thread/resume" and stalled == "resume":
+                    await asyncio.Event().wait()
             return await super().request(method, params)
+
+        async def close(self) -> None:
+            await super().close()
+            if stalled == "close" and stall["active"]:
+                await asyncio.Event().wait()
 
     clients: list[_StallingClient] = []
 
@@ -390,8 +407,8 @@ async def test_codex_native_settings_update_times_out_and_releases_the_lock(
             f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": "low"}
         )
 
-    # A stalled update may still apply, so it is unconfirmed rather than refused.
-    assert stalled_resp.status_code == (504 if stalled == "update" else 503), stalled_resp.text
+    expected_status = {"connect": 503, "update": 504, "resume": 503, "retry": 504, "close": 204}
+    assert stalled_resp.status_code == expected_status[stalled], stalled_resp.text
     assert next_resp.status_code == 204, next_resp.text
     assert all(stalled_client.closed for stalled_client in clients)
     assert clients[-1].requests == [

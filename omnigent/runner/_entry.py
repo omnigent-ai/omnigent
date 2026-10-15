@@ -16,12 +16,14 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Generator
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, cast
 
 import httpx
@@ -30,7 +32,10 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
-from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.runner.transports.ws_tunnel.serve import (
+    RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
+    RUNNER_TUNNEL_REJECTION_PREFIX,
+)
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
@@ -1348,10 +1353,24 @@ async def _resolve_agent_spec_from_server(
     # unsupported sub-agent and launch the parent with what this runner
     # *does* support, rather than failing every dispatch of the agent.
     # See omnigent.spec.load.
-    if not dest.exists():
-        dest.mkdir(parents=True)
-        load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    try:
+        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    except FileNotFoundError:
+        # Temp cleanup can leave a version directory without its bundle.
+        # Validate privately before replacing an incomplete cache entry.
+        spec_cache_root.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix=".spec-", dir=spec_cache_root) as staging_dir:
+            staging = Path(staging_dir)
+            load(resp.content, dest=staging, expand_env=expand_env, prune_invalid_sub_agents=True)
+            if dest.exists():
+                shutil.rmtree(dest)
+                _logger.warning(
+                    "Rebuilding incomplete agent bundle cache for %s",
+                    agent_id,
+                    extra={"session_id": session_id},
+                )
+            staging.rename(dest)
+        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     spec = selected_mcp_spec(spec, json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}")))
     _apply_host_interactive_shells(spec)
     return ResolvedSpec(spec=spec, workdir=dest)
@@ -2135,9 +2154,11 @@ def main() -> None:
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:
-        if not str(exc).startswith(RUNNER_TUNNEL_REJECTION_PREFIX):
+        if not str(exc).startswith(
+            (RUNNER_TUNNEL_REJECTION_PREFIX, RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+        ):
             raise
-        # A fatal server rejection is an expected, actionable exit — log the
+        # A fatal tunnel auth failure is an expected, actionable exit — log the
         # reason but keep stderr to the concise message (no traceback).
         _logger.error("runner exiting: %s", exc, extra={"session_id": runner_primary_session_id()})
         print(f"error: {exc}", file=sys.stderr)

@@ -271,6 +271,70 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText(/pending/)).toBeNull();
   });
 
+  it("shows each assigned reviewer with its current state and team kind", () => {
+    state.info!.data!.pr!.reviewers = [
+      { login: "alice", kind: "user", state: "PENDING" },
+      { login: "bob", kind: "user", state: "APPROVED" },
+      { login: "carol", kind: "user", state: "COMMENTED" },
+      { login: "platform-team", kind: "team", state: "CHANGES_REQUESTED" },
+      { login: "former-reviewer", kind: "user", state: "DISMISSED" },
+    ];
+    renderPanel();
+
+    expect(screen.getByRole("heading", { name: "Reviewers" })).toBeInTheDocument();
+    for (const [subject, status] of [
+      ["alice", "Pending"],
+      ["bob", "Approved"],
+      ["carol", "Commented"],
+      ["Team platform-team", "Changes requested"],
+      ["former-reviewer", "Dismissed"],
+    ]) {
+      expect(screen.getByRole("listitem", { name: `${subject}: ${status}` })).toBeInTheDocument();
+    }
+    expect(screen.getByText("(team)")).toBeInTheDocument();
+
+    const reviewersSection = screen.getByRole("heading", { name: "Reviewers" }).closest("section");
+    const checksSection = screen.getByRole("heading", { name: "Checks" }).closest("section");
+    expect(reviewersSection).not.toBeNull();
+    expect(checksSection).not.toBeNull();
+    expect(
+      reviewersSection!.compareDocumentPosition(checksSection!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("shows an empty reviewer section when the host reports no reviewers", () => {
+    state.info!.data!.pr!.reviewers = [];
+    renderPanel();
+
+    expect(screen.getByRole("heading", { name: "Reviewers" })).toBeInTheDocument();
+    expect(screen.getByText("No reviewers assigned.")).toBeInTheDocument();
+  });
+
+  it("omits reviewers for a host that does not include the optional field", () => {
+    renderPanel();
+
+    expect(screen.queryByRole("heading", { name: "Reviewers" })).toBeNull();
+  });
+
+  it("updates reviewers when the active PR changes", () => {
+    state.info!.data!.pr!.reviewers = [{ login: "alice", kind: "user", state: "PENDING" }];
+    const { rerender } = renderPanel();
+    expect(screen.getByRole("listitem", { name: "alice: Pending" })).toBeInTheDocument();
+
+    state.info!.data!.pr = {
+      ...state.info!.data!.pr!,
+      number: 6001,
+      title: "chore: another PR",
+      reviewers: [{ login: "platform-team", kind: "team", state: "APPROVED" }],
+    };
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+
+    expect(screen.queryByRole("listitem", { name: "alice: Pending" })).toBeNull();
+    expect(
+      screen.getByRole("listitem", { name: "Team platform-team: Approved" }),
+    ).toBeInTheDocument();
+  });
+
   it.each([
     ["OPEN", "Open", "text-green-700"],
     ["CLOSED", "Closed", "text-red-700"],
@@ -338,6 +402,43 @@ describe("PullRequestPanel", () => {
     expect(screen.getByRole("tab", { name: "Comments 4" })).toBeInTheDocument();
     expect(commentBodies()).toEqual(["First", "Second", "Third", "Fourth"]);
     expect(keyWarnings()).toEqual([]);
+  });
+
+  it.each([
+    ["shared suffixes", ["zoe_data", "amy_data", "a-bot", "z-bot"]],
+    ["other suffixes", ["build[bot]", "lint[bot]", "zoe_acme", "amy_acme"]],
+    ["ordinary usernames", ["ci[bot]", "bob", "alice"]],
+  ])("spaces comment colors consistently for %s", (_, orderedAuthors) => {
+    const comments = [...orderedAuthors].reverse().map((author) => ({
+      author,
+      body: `Comment by ${author}`,
+      created_at: null,
+      url: null,
+    }));
+    const repeatedAuthor = orderedAuthors[0]!.toUpperCase();
+    state.info!.data!.pr!.comments = [
+      ...comments,
+      { author: repeatedAuthor, body: "Another comment", created_at: null, url: null },
+      { author: null, body: "Deleted author", created_at: null, url: null },
+    ];
+    const assertColors = () => {
+      orderedAuthors.forEach((author, index) => {
+        expect(screen.getByText(author).previousElementSibling).toHaveStyle({
+          backgroundColor: `oklch(0.48 0.13 ${(index * 360) / orderedAuthors.length})`,
+          color: "#fff",
+        });
+      });
+      expect(screen.getByText(repeatedAuthor).previousElementSibling).toHaveStyle({
+        backgroundColor: "oklch(0.48 0.13 0)",
+      });
+      expect(screen.getByText("unknown").previousElementSibling).not.toHaveAttribute("style");
+    };
+    const view = renderComments();
+    assertColors();
+    view.unmount();
+    state.info!.data!.pr!.comments.reverse();
+    renderComments();
+    assertColors();
   });
 
   it("shows empty states when the PR has no body or comments", () => {

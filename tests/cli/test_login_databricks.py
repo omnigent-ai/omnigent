@@ -14,6 +14,8 @@ app-rejects-token failure, and non-interference with accounts mode.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,7 +57,15 @@ class _FakeHttpx:
         """
         headers = kwargs.get("headers")
         auth = headers.get("Authorization") if isinstance(headers, dict) else None
-        self.requests.append({"url": url, "authorization": auth, "params": kwargs.get("params")})
+        verifier = headers.get("X-Omnigent-Code-Verifier") if isinstance(headers, dict) else None
+        self.requests.append(
+            {
+                "url": url,
+                "authorization": auth,
+                "params": kwargs.get("params"),
+                "verifier": verifier,
+            }
+        )
         return self.responses.pop(0)
 
 
@@ -767,11 +777,16 @@ def test_login_oidc_mode_sets_default_server(
         ]
     )
     _patch_login_env(monkeypatch, fake_httpx=fake)
-    monkeypatch.setattr(
-        httpx,
-        "post",
-        lambda url, **kw: _response(200, body={"ticket": "t", "login_url": "/auth/go"}),
-    )
+    post_calls: list[dict[str, object]] = []
+
+    def _post(url: str, **kwargs: object) -> httpx.Response:
+        post_calls.append(kwargs)
+        return _response(
+            200,
+            body={"ticket": "t", "login_url": "/auth/go", "user_code": "ABCD-2345"},
+        )
+
+    monkeypatch.setattr(httpx, "post", _post)
     monkeypatch.setattr(webbrowser, "open", lambda url: True)
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
@@ -779,6 +794,52 @@ def test_login_oidc_mode_sets_default_server(
 
     assert result.exit_code == 0, result.output
     assert cli_mod._load_global_config().get("server") == server
+    body = post_calls[0]["json"]
+    assert isinstance(body, dict)
+    challenge = body["code_challenge"]
+    assert body["code_challenge_method"] == "S256"
+    params = fake.requests[-1]["params"]
+    assert params == {"ticket": "t"}
+    verifier = fake.requests[-1]["verifier"]
+    assert isinstance(verifier, str)
+    expected = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    assert challenge == expected
+
+
+@pytest.mark.parametrize("stage,status", [("create", 400), ("poll", 403), ("poll", 410)])
+def test_login_oidc_failure_leaves_default_server_unchanged(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, stage: str, status: int
+) -> None:
+    import time
+    import webbrowser
+
+    server = "http://omni-oidc.internal:6767"
+    cli_mod._save_global_config({"server": "https://existing.example.com"})
+    error = "Login request rejected"
+    responses = [_response(401, body={"login_url": "/auth/login"})]
+    if stage == "poll":
+        responses.append(_response(status, body={"error": error}))
+    fake = _FakeHttpx(responses=responses)
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+    creation = (
+        _response(status, body={"error": error})
+        if stage == "create"
+        else _response(200, body={"ticket": "t", "login_url": "/auth/go"})
+    )
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: creation)
+    monkeypatch.setattr(webbrowser, "open", lambda url: True)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    result = CliRunner().invoke(cli_group, ["login", server])
+
+    assert result.exit_code != 0
+    assert error in result.output
+    assert cli_mod._load_global_config().get("server") == "https://existing.example.com"
+    assert len(fake.requests) == (1 if stage == "create" else 2)
 
 
 def test_login_failure_leaves_default_server_unchanged(
