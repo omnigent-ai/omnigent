@@ -272,7 +272,7 @@ def test_connected_codex_resume_routes_to_configured_provider(
         if selection == "model-pick":
             client.patch(
                 f"/v1/sessions/{session_id}",
-                json={"model_override": _ALTERNATE_MODEL, "reasoning_effort": None},
+                json={"model_override": _ALTERNATE_MODEL},
             ).raise_for_status()
         select_provider(
             "legacy" if selection in {"unchanged-default", "model-pick"} else "current"
