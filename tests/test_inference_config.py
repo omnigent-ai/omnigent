@@ -20,6 +20,7 @@ from omnigent.inference_config import (
     resolve_bound_model,
     resolve_bound_provider,
     snapshot_runtime_config,
+    validate_bound_agent_model,
 )
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth
 
@@ -414,3 +415,40 @@ def test_revision_changes_with_routing_or_discovery_inputs(
         target = target[key]
     target[path[-1]] = replacement
     assert inference_revision(config, discovery) != before
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "native-claude", "acp:custom", "acp:other"])
+@pytest.mark.parametrize("pin", [None, "model-a", "obsolete-model"])
+def test_agent_pin_policy(harness, pin):
+    binding = {"provider": "bifrost", "model_allowlist": ["model-a"]}
+    config = _config(**{"claude-native": binding, "acp": binding, "acp:custom": binding})
+    if pin == "obsolete-model":
+        with pytest.raises(OmnigentError, match=r"Remove executor\.model") as exc:
+            validate_bound_agent_model(config, harness, pin)
+        assert exc.value.code == ErrorCode.INVALID_INPUT
+        assert pin in str(exc.value)
+    else:
+        validate_bound_agent_model(config, harness, pin)
+
+
+def test_agent_pin_policy_only_restricts_explicit_allowlists():
+    validate_bound_agent_model({}, "codex", "obsolete-model")
+    validate_bound_agent_model(_config(codex={"provider": "bifrost"}), "codex", "obsolete-model")
+    config = _config(codex={"provider": "bifrost", "model_allowlist": []})
+    validate_bound_agent_model(config, "pi", "obsolete-model")
+    validate_bound_agent_model(config, "codex", None)
+    with pytest.raises(OmnigentError, match="obsolete-model"):
+        validate_bound_agent_model(config, "codex", "obsolete-model")
+
+
+def test_agent_pin_uses_exact_acp_policy_before_generic_fallback():
+    config = _config(
+        **{
+            "acp": {"provider": "bifrost", "model_allowlist": ["generic"]},
+            "acp:custom": {"provider": "bifrost", "model_allowlist": ["custom"]},
+        }
+    )
+    validate_bound_agent_model(config, "acp:custom", "custom")
+    validate_bound_agent_model(config, "acp:other", "generic")
+    with pytest.raises(OmnigentError):
+        validate_bound_agent_model(config, "acp:custom", "generic")
