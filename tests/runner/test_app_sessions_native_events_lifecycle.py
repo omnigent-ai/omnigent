@@ -4320,7 +4320,10 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
     instance.command = "worker-cli"
     instance.args = ["--profile", "test"]
     instance.launch_cwd = str(tmp_path)
-    instance._remember_pane_snapshot("startup failed\ncomplete setup first")
+    instance._remember_pane_snapshot(
+        "startup failed\ncomplete setup first\n"
+        "Cookie: sid=canary-cookie-7b2c\npassword canary-password-5e1a"
+    )
     terminal_registry._by_conversation.setdefault(conv_id, {})[("worker", "main")] = instance
     callbacks: dict[str, Any] = {}
 
@@ -4421,6 +4424,10 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
     assert exit_record.attributes["error_category"] == "runner"
     assert exit_record.attributes["error_impact"] == "blocking"
     assert exit_record.attributes["error_code"] == "required_terminal_exited"
+    # The default log redactor misses these, so the message is sanitized first.
+    assert "complete setup first" in exit_record.getMessage()
+    assert "canary-cookie-7b2c" not in exit_record.getMessage()
+    assert "canary-password-5e1a" not in exit_record.getMessage()
     assert parent_events == [
         {
             "type": "session.child_session.updated",
@@ -4675,7 +4682,10 @@ async def test_required_terminal_exit_while_idle_logs_its_diagnostics(
                     session_key="main",
                     lifecycle=TerminalLifecycle.REQUIRED,
                     command="claude",
-                    last_output="Error: launcher config is unreadable",
+                    last_output=(
+                        "Error: launcher config is unreadable\n"
+                        "Cookie: sid=canary-cookie-1f2e\npassword canary-password-3d4c"
+                    ),
                     exit_status=1,
                     session_was_idle=True,
                 )
@@ -4692,8 +4702,12 @@ async def test_required_terminal_exit_while_idle_logs_its_diagnostics(
     ]
     assert record.levelno == logging.WARNING
     assert "Error: launcher config is unreadable" in record.getMessage()
+    assert "canary-cookie-1f2e" not in record.getMessage()
+    assert "canary-password-3d4c" not in record.getMessage()
     assert record.attributes["terminal_exit_status"] == 1
     assert record.attributes["error_code"] == "required_terminal_exited"
+    # The next turn re-launches the terminal, so the exit loses no progress.
+    assert record.attributes["error_impact"] == "transient"
     assert not [
         event
         for event in events
@@ -4909,18 +4923,20 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
     assert pm.released == [conv_id]
 
 
+@pytest.mark.parametrize("session_was_idle", [False, True])
 @pytest.mark.asyncio
 async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, session_was_idle: bool
 ) -> None:
     """A required terminal exit while the runner is shutting down is not a crash.
 
-    The host stopping a runner mid-turn (SIGINT/SIGTERM) tears down tmux with
-    the process group, so the idle watcher reports the required terminal as
+    The host stopping a runner (SIGINT/SIGTERM) tears down tmux with the
+    process group, so the idle watcher reports the required terminal as
     exited even though nothing crashed. With ``app.state.shutting_down`` set,
     the runner must still remove the terminal resource and release the
-    harness, but must not log an ERROR or publish ``session.status: failed``
-    — the server already handles a runner going away via the dropped tunnel.
+    harness, but must not log a warning or error, active or idle, or publish
+    ``session.status: failed`` — the server already handles a runner going
+    away via the dropped tunnel.
     """
     import logging
 
@@ -4952,7 +4968,7 @@ async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
                     session_key="main",
                     lifecycle=TerminalLifecycle.REQUIRED,
                     exit_status=None,
-                    session_was_idle=False,
+                    session_was_idle=session_was_idle,
                 )
             )
             queued_events: list[dict[str, Any]] = []
@@ -4979,7 +4995,7 @@ async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
         for event in queued_events
         if event.get("type") == "session.status" and event.get("status") == "failed"
     ] == []
-    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
+    assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
     assert any(
         "shutting down" in record.getMessage() and record.levelno == logging.INFO
         for record in caplog.records

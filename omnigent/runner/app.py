@@ -1781,6 +1781,7 @@ def create_runner_app(
         event: TerminalExitEvent,
         error: dict[str, str],
         diagnosis: FailureDiagnosis | None,
+        impact: ErrorImpact,
     ) -> dict[str, object]:
         """Return the debug-log attributes for a required-terminal exit."""
         return {
@@ -1797,7 +1798,7 @@ def create_runner_app(
             "error_code": error["code"],
             # An unrecognized exit is the harness CLI dying under the runner.
             "error_category": (diagnosis.category if diagnosis else ErrorCategory.RUNNER).value,
-            "error_impact": ErrorImpact.BLOCKING.value,
+            "error_impact": impact.value,
         }
 
     def _publish_terminal_exit(event: TerminalExitEvent) -> None:
@@ -1856,21 +1857,6 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
-        if event.session_was_idle:
-            # No turn fails, so this is the only record of why the terminal died;
-            # without it a startup exit stays unattributed.
-            idle_log = debug_event("required_terminal_exited_idle", session_id=event.session_id)
-            idle_log["attributes"] = _required_terminal_exit_attributes(event, error, diagnosis)
-            _logger.warning(
-                "required terminal %s exited while %s was idle: %s",
-                event.terminal_name,
-                event.session_id,
-                error.get("message"),
-                extra=idle_log,
-            )
-            _release_required_terminal_session(event.session_id)
-            return
-
         if _shutting_down.is_set():
             # tmux died with this runner's process group on a stop signal, not
             # a crash; the server settles the turn from the dropped tunnel.
@@ -1884,13 +1870,37 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
+        # The message embeds pane output, which can carry credentials that the
+        # default log redactor misses.
+        from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+
+        logged_message = sanitize_diagnostic_text(error["message"])
+        if event.session_was_idle:
+            # No turn fails, so this is the only record of why the terminal died;
+            # the next turn re-launches it, so the exit itself loses no progress.
+            idle_log = debug_event("required_terminal_exited_idle", session_id=event.session_id)
+            idle_log["attributes"] = _required_terminal_exit_attributes(
+                event, error, diagnosis, ErrorImpact.TRANSIENT
+            )
+            _logger.warning(
+                "required terminal %s exited while %s was idle: %s",
+                event.terminal_name,
+                event.session_id,
+                logged_message,
+                extra=idle_log,
+            )
+            _release_required_terminal_session(event.session_id)
+            return
+
         exit_log = debug_event("required_terminal_exited", session_id=event.session_id)
-        exit_log["attributes"] = _required_terminal_exit_attributes(event, error, diagnosis)
+        exit_log["attributes"] = _required_terminal_exit_attributes(
+            event, error, diagnosis, ErrorImpact.BLOCKING
+        )
         _logger.error(
             "required terminal %s exited; failing turn for %s: %s",
             event.terminal_name,
             event.session_id,
-            error.get("message"),
+            logged_message,
             extra=exit_log,
         )
         _publish_event(
