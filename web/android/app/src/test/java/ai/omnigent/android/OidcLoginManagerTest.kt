@@ -208,7 +208,10 @@ class OidcLoginManagerTest {
         assertTrue(verifier.matches(Regex("[A-Za-z0-9_-]{43}")))
         val challenge =
             Base64.getUrlEncoder().withoutPadding().encodeToString(
-                MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray(Charsets.US_ASCII)),
+                MessageDigest
+                    .getInstance(
+                        "SHA-256",
+                    ).digest(verifier.toByteArray(Charsets.US_ASCII)),
             )
         assertEquals(challenge, body.getString("code_challenge"))
         val deadline = System.currentTimeMillis() + 10_000
