@@ -628,8 +628,15 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
         entered.set()
         await asyncio.Event().wait()
 
+    disconnected: list[str] = []
+
+    async def on_disconnect(host_id: str, _owner: str | None) -> None:
+        disconnected.append(host_id)
+
     app.include_router(
-        create_host_tunnel_router(registry, store, on_host_connect=on_connect),
+        create_host_tunnel_router(
+            registry, store, on_host_connect=on_connect, on_host_disconnect=on_disconnect
+        ),
         prefix="/v1",
     )
     cancel_scopes: list[anyio.CancelScope] = []
@@ -663,12 +670,13 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
             cancel_scopes[0].cancel()
         done, _ = await asyncio.wait({comm.future}, timeout=budget(2.0))
         assert done
-        if cancellation == "task" and not offline_fails:
+        if cancellation == "task":
             with pytest.raises(asyncio.CancelledError):
                 comm.future.result()
         else:
             comm.future.result()
         assert cleanup_completed.is_set()
+        assert disconnected == [_HOST_ID]
         assert all(task.done() for task in helpers)
         assert registry.get(_HOST_ID) is None
         persisted = HostStore(db_uri).get_host(_HOST_ID)

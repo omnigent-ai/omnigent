@@ -500,7 +500,14 @@ def create_host_tunnel_router(
                         # was replaced; only the current one may mark it offline.
                         try:
                             if host_registry.deregister(host_id, conn=conn):
-                                await asyncio.to_thread(host_store.set_offline, host_id)
+                                try:
+                                    await asyncio.to_thread(host_store.set_offline, host_id)
+                                except Exception:
+                                    # A failed write must not swallow cancellation or skip the
+                                    # disconnect callback; the row ages out via the liveness TTL.
+                                    _logger.exception(
+                                        "Failed to mark host %s offline after disconnect", host_id
+                                    )
                         finally:
                             await diagnostics_cleanup.aclose()
                     if on_host_disconnect is not None:
