@@ -664,10 +664,11 @@ Declare the inspected captioned MP4, or use the shared guide's explicit
 Follow these rules for each clip:
 
 - Show the user action and the product's response.
-- **Caption the screen from screen evidence.** Compare claimed outcomes with
-  inspected frames or visible-state assertions from the clip. Backend storage
-  and logs do not establish what the UI displayed; keep those findings in
-  `evidence`. Correct captions that conflict with the frames.
+- **Caption the screen from screen evidence.** Check that claimed elements are
+  in view and unobstructed, and quote only visibly rendered text. DOM attributes,
+  hidden accessibility labels and backend logs are not screen evidence. Disclose
+  unavailable frame inspection and limit claims to verified states. Follow
+  `dev/recording-lanes.md` and correct captions that conflict with the frames.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.
@@ -831,7 +832,7 @@ Field meanings:
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
   behavior (the journey completing). Each screen claim comes from screen
-  evidence, not from a transcript or API check (Step 4). This attachment description
+  evidence, not from a transcript, API check, or DOM attribute read (Step 4). This attachment description
   is separate from the timed captions burned into the video using
   `dev/caption_recording.py`. This is per-recording
   (each clip drives its own steps), distinct from the bug-level `journey`
