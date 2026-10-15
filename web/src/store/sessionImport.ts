@@ -5,7 +5,6 @@ import type { QueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
 import {
   importLocalSessions,
-  type ImportedSessionRef,
   type ImportSourceSelector,
   type LocalImportResult,
 } from "@/lib/sessionsApi";
@@ -21,8 +20,8 @@ export interface SessionImportRequest {
 interface SessionImportState {
   /** True from the Import click until the stream settles with a result or error. */
   importing: boolean;
-  /** Sessions appended as their frames stream in, so lists fill live. */
-  streamed: ImportedSessionRef[];
+  importedCount: number;
+  request: SessionImportRequest | null;
   result: LocalImportResult | null;
   error: string | null;
   /** Run one import; resolves when the stream settles. Ignored while one is in flight. */
@@ -35,18 +34,18 @@ const LIST_REFRESH_MS = 5000;
 
 export const useSessionImportStore = create<SessionImportState>((set, get) => ({
   importing: false,
-  streamed: [],
+  importedCount: 0,
+  request: null,
   result: null,
   error: null,
   start: async (request, queryClient) => {
     if (get().importing) return;
-    set({ importing: true, streamed: [], result: null, error: null });
+    set({ importing: true, importedCount: 0, request, result: null, error: null });
     const refreshList = () => void queryClient.invalidateQueries({ queryKey: ["conversations"] });
     const refresh = setInterval(refreshList, LIST_REFRESH_MS);
     try {
       const { hostId, source, limit, sessionId } = request;
-      const onSession = (s: ImportedSessionRef) =>
-        set((state) => ({ streamed: [...state.streamed, s] }));
+      const onSession = () => set((state) => ({ importedCount: state.importedCount + 1 }));
       const result =
         sessionId !== undefined
           ? await importLocalSessions(hostId, source, limit, onSession, sessionId)

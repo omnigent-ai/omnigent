@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
 import uuid
 from collections.abc import Iterator
@@ -84,7 +83,7 @@ def _imported_count(live_server: str, title_prefix: str) -> int:
     """Sessions persisted so far for this import, read through the public list API."""
     response = httpx.get(
         f"{live_server}/v1/sessions",
-        params={"limit": 1000, "search_query": title_prefix},
+        params={"limit": 1000, "search_query": title_prefix, "visibility": "all"},
         timeout=10.0,
     )
     response.raise_for_status()
@@ -118,7 +117,7 @@ def test_session_list_shows_import_in_progress(
     session_list = page.get_by_test_id("sidebar-conversation-list")
     expect(session_list).to_be_visible(timeout=30_000)
     aside = page.locator("aside[aria-label='Conversations']")
-    indicator = aside.get_by_text(re.compile("import", re.I))
+    indicator = aside.get_by_test_id("sidebar-import-progress")
 
     indicator_seen_in_flight = False
     checks_in_flight = 0
@@ -128,6 +127,11 @@ def test_session_list_shows_import_in_progress(
             break
         checks_in_flight += 1
         if indicator.count() > 0 and indicator.first.is_visible():
+            expect(
+                aside.get_by_role("heading").filter(
+                    has=page.get_by_test_id("sidebar-import-progress")
+                )
+            ).to_contain_text("Sessions")
             indicator_seen_in_flight = True
             break
         if time.monotonic() - started > _IMPORT_TIMEOUT_S:

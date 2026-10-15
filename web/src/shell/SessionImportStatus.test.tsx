@@ -14,7 +14,13 @@ function renderStatus() {
 }
 
 beforeEach(() => {
-  useSessionImportStore.setState({ importing: false, streamed: [], result: null, error: null });
+  useSessionImportStore.setState({
+    importing: false,
+    importedCount: 0,
+    request: null,
+    result: null,
+    error: null,
+  });
 });
 
 afterEach(cleanup);
@@ -26,10 +32,10 @@ describe("SessionImportStatus", () => {
   });
 
   it("shows the running import with its count, links to the panel, and clears when done", () => {
-    act(() => useSessionImportStore.setState({ importing: true, streamed: [] }));
+    act(() => useSessionImportStore.setState({ importing: true, importedCount: 0 }));
     renderStatus();
     const status = screen.getByTestId("sidebar-import-progress");
-    expect(status).toHaveTextContent("Importing sessions…");
+    expect(status).toHaveTextContent("Importing (0)");
     expect(screen.getByRole("link", { name: /Importing sessions/ })).toHaveAttribute(
       "href",
       "/settings/import",
@@ -37,14 +43,10 @@ describe("SessionImportStatus", () => {
 
     act(() =>
       useSessionImportStore.setState({
-        streamed: [
-          { id: "c1", title: "One" },
-          { id: "c2", title: null },
-          { id: "c3", title: "Three" },
-        ],
+        importedCount: 3,
       }),
     );
-    expect(status).toHaveTextContent("Importing sessions, 3 so far…");
+    expect(status).toHaveTextContent("Importing (3)");
 
     act(() => useSessionImportStore.setState({ importing: false }));
     expect(screen.queryByTestId("sidebar-import-progress")).toBeNull();

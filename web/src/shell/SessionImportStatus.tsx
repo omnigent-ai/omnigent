@@ -1,32 +1,34 @@
 import type { MouseEvent } from "react";
-import { Loader2Icon } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import { Link } from "@/lib/routing";
 import { useSessionImportStore } from "@/store/sessionImport";
 
-/** Sidebar status row for an in-flight Settings › Import; links back to the panel. */
+/** Compact import progress beside the session-list heading. */
 export function SessionImportStatus({
   onNavigate,
 }: {
   onNavigate?: (e: MouseEvent<HTMLAnchorElement>) => void;
 }) {
   const importing = useSessionImportStore((s) => s.importing);
-  const count = useSessionImportStore((s) => s.streamed.length);
+  const count = useSessionImportStore((s) => s.importedCount);
   if (!importing) return null;
   return (
-    <p
+    <span
       role="status"
       data-testid="sidebar-import-progress"
-      className="flex items-center gap-2 px-2 py-1 text-ui text-muted-foreground"
+      className="flex min-w-0 items-center gap-1 text-xs text-primary"
     >
-      <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden="true" />
+      <Spinner className="size-3.5 shrink-0" />
       <Link
         to="/settings/import"
         onClick={onNavigate}
         className="truncate hover:underline"
+        aria-label={`Importing sessions, ${count} imported. View import progress`}
+        title={`Importing sessions, ${count} imported`}
         componentId="sidebar.import_progress"
       >
-        Importing sessions{count > 0 ? `, ${count} so far` : ""}…
+        Importing ({count})
       </Link>
-    </p>
+    </span>
   );
 }

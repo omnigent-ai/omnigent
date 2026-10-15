@@ -42,7 +42,13 @@ function spyInvalidate(queryClient: QueryClient) {
 
 beforeEach(() => {
   importMock.mockReset();
-  useSessionImportStore.setState({ importing: false, streamed: [], result: null, error: null });
+  useSessionImportStore.setState({
+    importing: false,
+    importedCount: 0,
+    request: null,
+    result: null,
+    error: null,
+  });
 });
 
 afterEach(() => {
@@ -50,7 +56,7 @@ afterEach(() => {
 });
 
 describe("useSessionImportStore", () => {
-  it("exposes the in-flight import and its streamed sessions until the stream settles", async () => {
+  it("exposes the in-flight import and the imported count until the stream settles", async () => {
     const stream = pendingImport();
     const queryClient = new QueryClient();
     const invalidate = spyInvalidate(queryClient);
@@ -63,7 +69,7 @@ describe("useSessionImportStore", () => {
 
     stream.session({ id: "c1", title: "One" });
     stream.session({ id: "c2", title: null });
-    expect(useSessionImportStore.getState().streamed.map((s) => s.id)).toEqual(["c1", "c2"]);
+    expect(useSessionImportStore.getState().importedCount).toBe(2);
     expect(useSessionImportStore.getState().importing).toBe(true);
 
     stream.resolve(DONE);
@@ -72,11 +78,12 @@ describe("useSessionImportStore", () => {
     expect(state.importing).toBe(false);
     expect(state.result).toEqual(DONE);
     expect(state.error).toBeNull();
-    expect(state.streamed).toHaveLength(2);
+    expect(state.importedCount).toBe(2);
+    expect(state.request).toEqual({ hostId: "host_1", source: "claude", limit: 25 });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
 
-  it("keeps the streamed sessions and records the message when the import fails", async () => {
+  it("keeps the imported count and records the message when the import fails", async () => {
     importMock.mockImplementation(async (_host, _source, _limit, onSession) => {
       onSession?.({ id: "c1", title: "One" });
       throw new Error("Host went offline");
@@ -90,7 +97,7 @@ describe("useSessionImportStore", () => {
     expect(state.importing).toBe(false);
     expect(state.error).toBe("Host went offline");
     expect(state.result).toBeNull();
-    expect(state.streamed.map((s) => s.id)).toEqual(["c1"]);
+    expect(state.importedCount).toBe(1);
   });
 
   it("passes an exact session id through and ignores a second start while importing", async () => {

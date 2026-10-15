@@ -6,9 +6,9 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 
 // The session list tells the user that sessions are being imported while
 // Settings › Import sessions has a stream in flight, even though that panel
-// is no longer mounted. The row reads the shared import store.
+// is no longer mounted. The heading reads the shared import store.
 
-import { act, cleanup, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen } from "@testing-library/react";
 
 import { useSessionImportStore } from "@/store/sessionImport";
 
@@ -25,22 +25,31 @@ const useConvMock = vi.mocked(useConversations);
 
 beforeEach(() => {
   useConvMock.mockImplementation(() => conversationPage([conv("conv_1")]));
-  useSessionImportStore.setState({ importing: false, streamed: [], result: null, error: null });
+  useSessionImportStore.setState({
+    importing: false,
+    importedCount: 0,
+    request: null,
+    result: null,
+    error: null,
+  });
 });
 
 afterEach(cleanup);
 
 describe("sidebar import progress", () => {
-  it("shows a status row in the session list only while an import is running", () => {
+  it("shows status beside the session heading only while an import is running", () => {
     renderSidebar();
     expect(screen.queryByTestId("sidebar-import-progress")).toBeNull();
 
-    act(() =>
-      useSessionImportStore.setState({ importing: true, streamed: [{ id: "c1", title: "One" }] }),
-    );
+    act(() => useSessionImportStore.setState({ importing: true, importedCount: 1 }));
     const status = screen.getByTestId("sidebar-import-progress");
     expect(screen.getByTestId("sidebar-conversation-list")).toContainElement(status);
-    expect(status).toHaveTextContent("Importing sessions, 1 so far…");
+    expect(status).toHaveTextContent("Importing (1)");
+    expect(screen.getByRole("heading", { name: /Sessions/ })).toContainElement(status);
+    expect(status.closest("button")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    expect(status).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
     // Existing rows stay listed beneath the status.
     expect(screen.getByText("conv_1")).toBeInTheDocument();
 
