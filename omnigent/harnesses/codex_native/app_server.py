@@ -55,10 +55,12 @@ from omnigent.harnesses.codex_native.launch_args import (
     absolute_codex_path,
     canonical_codex_launch_args,
     codex_config_profile,
+    codex_workspace_roots,
     materialize_codex_config_profile,
     read_codex_mcp_servers,
     reject_reserved_codex_transport_args,
     validate_codex_config_profile_state,
+    without_codex_add_dirs,
     without_codex_config_profile,
 )
 from omnigent.harnesses.codex_native.process_registry import (
@@ -1975,6 +1977,9 @@ class CodexNativeAppServer:
         it to the host janitor; standalone callers keep the safe default.
     :param config_profile: Codex user config-file profile materialized into
         the private user layer before app-server and terminal startup.
+    :param writable_roots: Absolute ``--add-dir`` directories from the launch
+        args, added to the private config's workspace-write roots at start
+        because a ``--remote`` TUI cannot carry them.
     """
 
     codex_path: str
@@ -2006,6 +2011,7 @@ class CodexNativeAppServer:
     reconcile_process_registry: bool = True
     config_profile: str | None = None
     session_id: str | None = None
+    writable_roots: tuple[str, ...] = ()
     stderr_capture_error_type: str | None = field(default=None, init=False)
     # First TLS certificate failure the launcher printed; mirrored into the
     # bridge so the forwarder can fail a stuck turn with the cause.
@@ -2114,6 +2120,7 @@ class CodexNativeAppServer:
         )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
+        _add_codex_writable_roots(self.codex_home, self.writable_roots)
         # Write the MCP server config into config.toml so the app-server
         # discovers it at config load. The -c overrides may not be honored
         # by `codex app-server`, so we write directly to the file.
@@ -3150,6 +3157,36 @@ def _trust_codex_project(codex_home: Path, cwd: Path) -> None:
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
+def _add_codex_writable_roots(codex_home: Path, roots: Sequence[str]) -> None:
+    """
+    Append ``--add-dir`` roots to the private config's workspace-write roots.
+
+    Codex rejects ``--add-dir`` on a ``--remote`` TUI and asks for the roots on
+    the server, so threads the TUI starts get them from this config instead.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :param roots: Absolute directories, e.g. ``("/home/me/shared",)``.
+    :returns: None.
+    """
+    if not roots:
+        return
+    config_path = codex_home / "config.toml"
+    _materialize_config_symlink(config_path)
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    document = tomlkit.parse(existing) if existing else tomlkit.document()
+    sandbox = document.get("sandbox_workspace_write")
+    if sandbox is None:
+        sandbox = tomlkit.table()
+        document["sandbox_workspace_write"] = sandbox
+    if not isinstance(sandbox, dict):
+        raise ValueError("sandbox_workspace_write must be a table")
+    configured = sandbox.get("writable_roots", [])
+    if not isinstance(configured, list):
+        raise ValueError("sandbox_workspace_write.writable_roots must be an array of paths")
+    sandbox["writable_roots"] = list(dict.fromkeys([*configured, *roots]))
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+
+
 @dataclass(frozen=True)
 class _DatabricksLaunchMaterialization:
     """
@@ -3168,6 +3205,28 @@ class _DatabricksLaunchMaterialization:
     host: str
 
 
+class CodexDatabricksProfileMissingError(OmnigentError, OSError):
+    """The provider config names a Databricks profile the runner cannot resolve.
+
+    Coded ``HARNESS_NOT_CONFIGURED``: only the person can fix the profile, and
+    the message says how, so a terminal start failure shows it verbatim.
+    Subclasses :class:`OSError`, the documented error of this launch step.
+    """
+
+    def __init__(self, profile: str) -> None:
+        """
+        :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
+        """
+        super().__init__(
+            f"Native Codex with Databricks profile {profile!r} (from your "
+            "provider config) requires a matching ~/.databrickscfg section "
+            "with a host visible to the runner process. Add it with "
+            f"`databricks auth login --profile {profile}`, or point the provider "
+            "at an existing profile.",
+            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+        )
+
+
 def _databricks_launch_materialization(
     *, model: str | None, profile: str, codex_path: str | None = None
 ) -> _DatabricksLaunchMaterialization:
@@ -3183,15 +3242,12 @@ def _databricks_launch_materialization(
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
     :param codex_path: Executable whose shared catalog may resolve the model.
     :returns: The materialized overrides, pinned model, and host.
-    :raises OSError: When the profile resolves no workspace host.
+    :raises CodexDatabricksProfileMissingError: When the profile resolves no
+        workspace host.
     """
     host = _databricks_gateway_host(profile)
     if not host:
-        raise OSError(
-            f"Native Codex with Databricks profile {profile!r} (from your "
-            "provider config) requires a matching ~/.databrickscfg section "
-            "with a host visible to the runner process."
-        )
+        raise CodexDatabricksProfileMissingError(profile)
     host = host.rstrip("/")
     resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
     return _DatabricksLaunchMaterialization(
@@ -3372,7 +3428,8 @@ def build_codex_native_server(
         host janitor owns it; standalone callers keep the
         synchronous safety default.
     :param terminal_launch_args: Original CLI options used to select the Codex
-        config-file profile (distinct from the Databricks routing profile).
+        config-file profile (distinct from the Databricks routing profile)
+        and the ``--add-dir`` roots the app-server owns.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -3443,6 +3500,7 @@ def build_codex_native_server(
         trust_project=trust_project,
         trust_all_hooks=trust_all_hooks,
         reconcile_process_registry=reconcile_process_registry,
+        writable_roots=tuple(codex_workspace_roots(terminal_launch_args, cwd)[1]),
     )
 
 
@@ -4454,36 +4512,9 @@ async def preload_codex_thread_for_resume(
         # config and the refreshed rollout name a different one.
         if model_provider is not None:
             params["modelProvider"] = model_provider
-        args = canonical_codex_launch_args(terminal_launch_args or ())
-        additional_roots: list[str] = []
-        effective_cwd = cwd or Path.cwd()
-        index = 0
-        while index < len(args):
-            arg = args[index]
-            if arg == "--":
-                break
-            if arg in {"--add-dir", "--cd", "-C"}:
-                if index + 1 == len(args) or args[index + 1].startswith("-"):
-                    raise ValueError(f"Codex requires a directory for {arg}")
-                index += 1
-                if arg == "--add-dir":
-                    additional_roots.append(args[index])
-                else:
-                    effective_cwd = Path(absolute_codex_path(args[index], effective_cwd))
-            elif arg in {
-                "-c",
-                "--config",
-                "-m",
-                "--model",
-                "-s",
-                "--sandbox",
-                "-a",
-                "--ask-for-approval",
-                "-p",
-                "--profile",
-            }:
-                index += 1
-            index += 1
+        effective_cwd, additional_roots = codex_workspace_roots(
+            terminal_launch_args or (), cwd or Path.cwd()
+        )
         if additional_roots:
             response = await client.request(
                 "config/read", {"includeLayers": False, "cwd": str(effective_cwd)}
@@ -4511,7 +4542,7 @@ async def preload_codex_thread_for_resume(
                 dict.fromkeys(
                     [
                         str(effective_cwd),
-                        *(absolute_codex_path(root, effective_cwd) for root in additional_roots),
+                        *additional_roots,
                         *(absolute_codex_path(root, effective_cwd) for root in roots),
                     ]
                 )
@@ -4836,7 +4867,9 @@ def build_codex_remote_args(
     if bypass_hook_trust:
         passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
     if thread_id is None:
-        return [*override_args, *passthrough, "--remote", remote_url]
+        # Codex refuses --add-dir with --remote; app-server startup writes
+        # those roots into the private config (see CodexNativeAppServer.start).
+        return [*override_args, *without_codex_add_dirs(passthrough), "--remote", remote_url]
     if not codex_remote_resume_omits_permission_args(codex_cli_version):
         return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
     # Codex rejects explicit permission overrides on remote resume, even

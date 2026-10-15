@@ -587,6 +587,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # spawn the wrong auth mode while the operator set the switch on the CLI.
         # Not a secret.
         "OMNIGENT_AUTH_ENABLED",
+        # Wrapper CLI name (e.g. ``isaac omni``). Runner-side hints built by
+        # cli_invocation() must name the command the user actually runs.
+        # Not a secret.
+        "OMNIGENT_WRAPPER_COMMAND",
         # Process logging controls. These are diagnostics knobs, not secrets.
         "OMNIGENT_LOG_LEVEL",
         "OMNIGENT_LOG_TO_STDERR",
@@ -2473,10 +2477,8 @@ class HostProcess:
             await self._report_runner_exit(runner_id, error, had_connected=had_connected)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-        # A non-zero runner exit is a runner-process fault that blocks the
-        # session; the specific cause lives in the unparsed log tail (lifecycle
-        # stage unknown). A runner refused on credentials before connecting is
-        # instead a launch-time sign-in the person must renew.
+        # A credential refusal before connecting needs renewed sign-in.
+        # Other exits remain runner faults; the log tail carries the cause.
         auth_rejected = (
             handle.proc.returncode == RUNNER_AUTH_REJECTED_EXIT_CODE and had_connected is not True
         )
