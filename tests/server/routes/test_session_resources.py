@@ -9857,6 +9857,7 @@ async def test_relay_settles_a_message_codex_refused_and_the_next_mirror_is_clea
             pass
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "turn/start", f"unexpected pre-delivery request: {method}"
             raise CodexAppServerResponseError(
                 {
                     "code": -32602,
@@ -9886,9 +9887,11 @@ async def test_relay_settles_a_message_codex_refused_and_the_next_mirror_is_clea
     ctx = TurnContext(
         response_id="resp_refused", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
     )
-    with pytest.raises(InnerExecutorError) as raised:
-        await adapter.run_turn(CreateResponseRequest(model="test-agent", input="huge paste"), ctx)
-    await adapter.on_shutdown()
+    try:
+        with pytest.raises(InnerExecutorError) as raised:
+            await adapter.run_turn(CreateResponseRequest(model="test-agent", input="huge paste"), ctx)
+    finally:
+        await adapter.on_shutdown()
     refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
 
     pending_inputs.reset_for_tests()

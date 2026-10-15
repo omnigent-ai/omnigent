@@ -1275,10 +1275,9 @@ def _file_block_to_input_item(
 
 def _attached_file_item(path: Path) -> dict[str, object]:
     """Text item that points the model at a file it can open with its tools."""
-    # Marker format is load-bearing: codex echoes this text item back
-    # in the mirrored user message, and title seeding strips lines
-    # matching _ATTACHMENT_MARKER_RE in
-    # omnigent/entities/conversation.py. Keep in sync.
+    # Load-bearing format: codex echoes this item back in the mirrored user
+    # message, and title seeding strips lines matching _ATTACHMENT_MARKER_RE
+    # in omnigent/entities/conversation.py. Keep in sync.
     return {"type": "text", "text": f"[Attached file: {path}]"}
 
 
