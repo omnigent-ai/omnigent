@@ -30,7 +30,10 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
-from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.runner.transports.ws_tunnel.serve import (
+    RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
+    RUNNER_TUNNEL_REJECTION_PREFIX,
+)
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
@@ -1304,6 +1307,7 @@ async def _resolve_agent_spec_from_server(
     :raises RuntimeError: If the server returns a non-200 status
         other than 404.
     """
+    from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
 
@@ -1315,7 +1319,7 @@ async def _resolve_agent_spec_from_server(
         )
         return None
     path = f"/v1/sessions/{session_id}/agent/contents"
-    resp = await server_client.get(path)
+    resp = await server_client.get(path, headers={MCP_SELECTION_HEADER: "1"})
     if resp.status_code == 404:
         _logger.info(
             "spec_resolver: GET %s returned 404 for missing agent",
@@ -1351,6 +1355,7 @@ async def _resolve_agent_spec_from_server(
         dest.mkdir(parents=True)
         load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
     spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    spec = selected_mcp_spec(spec, json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}")))
     _apply_host_interactive_shells(spec)
     return ResolvedSpec(spec=spec, workdir=dest)
 
@@ -2133,9 +2138,11 @@ def main() -> None:
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:
-        if not str(exc).startswith(RUNNER_TUNNEL_REJECTION_PREFIX):
+        if not str(exc).startswith(
+            (RUNNER_TUNNEL_REJECTION_PREFIX, RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+        ):
             raise
-        # A fatal server rejection is an expected, actionable exit — log the
+        # A fatal tunnel auth failure is an expected, actionable exit — log the
         # reason but keep stderr to the concise message (no traceback).
         _logger.error("runner exiting: %s", exc, extra={"session_id": runner_primary_session_id()})
         print(f"error: {exc}", file=sys.stderr)

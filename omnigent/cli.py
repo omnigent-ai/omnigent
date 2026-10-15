@@ -6,9 +6,11 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import errno
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -97,6 +99,7 @@ from omnigent.process_logging import (
     LOG_LEVEL_ENV_VAR,
     LOG_TO_STDERR_ENV_VAR,
     data_dir,
+    ensure_stdio_survives_unencodable_output,
     env_truthy,
     process_log_dir_reference,
 )
@@ -2214,40 +2217,6 @@ def _enforce_wrapper_guard() -> None:
         raise SystemExit(2)
 
 
-def _ensure_stdio_survives_unencodable_output() -> None:
-    """Keep stdio writes from aborting when the stream encoding is legacy.
-
-    A shell on a legacy non-UTF-8 encoding (Windows ANSI codepage like
-    cp1252, a C/latin-1 locale, or an explicit ``PYTHONIOENCODING``) hands
-    Python stdio streams that can't encode the CLI's decorative glyphs
-    (emoji, ``✓``, ``←``, …), so a plain ``print`` raises
-    ``UnicodeEncodeError`` mid-command. Reconfigure such streams so the
-    unencodable character degrades to a stand-in instead of killing the
-    command: on Windows switch to UTF-8 outright (modern terminals render
-    it, and it preserves the glyphs); elsewhere keep the stream's own
-    encoding and only relax the error handler, so output stays in the
-    encoding the consumer asked for. ``PYTHONUTF8`` can't help here since
-    PEP 540 reads it only at interpreter startup.
-    """
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None:
-            continue
-        encoding = (getattr(stream, "encoding", "") or "").lower().replace("_", "-")
-        if encoding in {"utf-8", "utf8"}:
-            continue
-        # Trade-off: errors="replace" is process-wide, so any genuinely
-        # unencodable output (not just decorative glyphs) degrades to "?"
-        # instead of raising — acceptable for a CLI's human-facing stdio.
-        # Detached/replaced streams (or a test's capture object) can't be
-        # reconfigured; the glyph fallback still guards the actual writes.
-        with contextlib.suppress(ValueError, OSError):
-            if sys.platform == "win32":
-                reconfigure(encoding="utf-8", errors="replace")
-            else:
-                reconfigure(errors="replace")
-
-
 @capture_cli_entry
 def main() -> None:
     """
@@ -2292,7 +2261,7 @@ def main() -> None:
     # Legacy-codepage stdio (Windows ANSI, C locale, PYTHONIOENCODING)
     # can't encode the CLI's glyphs; harden the streams before any command
     # renders so the write degrades instead of aborting.
-    _ensure_stdio_survives_unencodable_output()
+    ensure_stdio_survives_unencodable_output()
 
     # Relocate pre-rename ~/.omniagents state before anything reads ~/.omnigent
     # (update-check cache, diagnostics logs, config). No-op once migrated.
@@ -3613,12 +3582,23 @@ def _build_host_daemon_env(
     )
 
     if not server_url:
+        from omnigent.telemetry.environment import CI_ENV_VARS
+
+        # The local server detects CI and usage opt-outs in its own environment.
+        local_server_env_vars = (
+            _LOCAL_DAEMON_ENV_ALLOWLIST
+            | CI_ENV_VARS
+            | {
+                "DISABLE_TELEMETRY",
+                "DO_NOT_TRACK",
+            }
+        )
         daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, *_LOCAL_DAEMON_ENV_PREFIXES)
         env = {
             key: value
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST
-            or key in _LOCAL_DAEMON_ENV_ALLOWLIST
+            or key in local_server_env_vars
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
             or key.startswith(daemon_env_prefixes)
@@ -4606,6 +4586,20 @@ def server(
 
             databricks_store = DatabricksConnectionStore(db_uri, dbx_cipher)
 
+    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig
+
+    mcp_registry = None
+    registry_config = McpRegistryConfig.from_env()
+    if registry_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+        from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+
+        registry_cipher = build_secret_cipher()
+        mcp_registry = McpRegistry(
+            registry_config,
+            CredentialStore(db_uri, registry_cipher) if registry_cipher else None,
+        )
+
     # Accounts mode ergonomics: when accounts mode is selected
     # (OMNIGENT_AUTH_ENABLED=1 without OIDC config, or an explicit
     # OMNIGENT_AUTH_PROVIDER=accounts), supply sensible defaults
@@ -4675,6 +4669,7 @@ def server(
         sandbox_config=sandbox_config,
         github_config=github_config,
         github_store=github_store,
+        mcp_registry=mcp_registry,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
         server_config=title_server_config,
@@ -6010,20 +6005,96 @@ def _bundle(source: Path) -> bytes:
     resolved = _resolve_bundle_env_vars(source)
 
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for file_path in source.rglob("*"):
-            if file_path.is_file():
-                arcname = str(file_path.relative_to(source))
-                if arcname in resolved:
-                    # Write the resolved YAML instead of the
-                    # original file (which has ${VAR} refs).
-                    data = resolved[arcname].encode("utf-8")
-                    info = tarfile.TarInfo(name=arcname)
-                    info.size = len(data)
-                    tf.addfile(info, io.BytesIO(data))
-                else:
-                    tf.add(str(file_path), arcname=arcname)
+    # dereference: linked paths can share an inode, and the server refuses hardlink members.
+    with tarfile.open(fileobj=buf, mode="w:gz", dereference=True) as tf:
+        for file_path, arcname in _bundle_files(source):
+            if arcname in resolved:
+                # Write the resolved YAML instead of the
+                # original file (which has ${VAR} refs).
+                data = resolved[arcname].encode("utf-8")
+                info = tarfile.TarInfo(name=arcname)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+            else:
+                tf.add(str(file_path), arcname=arcname)
     return buf.getvalue()
+
+
+def _bundle_files(source: Path) -> Iterator[tuple[Path, str]]:
+    """
+    Yield ``(real_path, arcname)`` for every file in an agent directory.
+
+    Symlinks are followed and bundled as regular files, since the server
+    refuses links, so shared skills can be linked into ``skills/``. A link must
+    resolve inside the enclosing Git checkout (or *source* outside one); dangling,
+    escaping and looping links fail instead of silently dropping content, as do
+    links into the repository's ``.git`` directory and unreadable directories.
+    Entries that are not regular files (FIFOs, sockets, devices) are skipped as before.
+
+    :param source: The agent image directory.
+    :raises OmnigentError: If a symlink is dangling, loops, or resolves outside
+        the allowed root.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime.filesystem_registry import detect_git_root
+
+    def resolve(path: Path) -> Path:
+        rel = path.relative_to(source)
+        try:
+            return path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            # Python 3.12 reports loops as RuntimeError; 3.13+ as OSError(ELOOP).
+            if isinstance(exc, RuntimeError) or exc.errno == errno.ELOOP:
+                reason = "is a symlink loop"
+            elif exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                reason = "is a dangling symlink"
+            else:
+                reason = f"cannot be resolved ({exc.strerror})"
+            raise OmnigentError(
+                f"{rel} {reason}; cannot bundle it.", code=ErrorCode.INVALID_INPUT
+            ) from exc
+
+    def unreadable(exc: OSError) -> None:
+        raise OmnigentError(
+            f"{exc.filename} cannot be read ({exc.strerror}); cannot bundle it.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+    root = source.resolve()
+    boundary = detect_git_root(root) or root
+    # Links must not pull in repository metadata such as remote URLs with credentials.
+    git_dir = boundary / ".git"
+    # Real directories on the walk's path to each visited directory, itself included.
+    lineage: dict[str, tuple[Path, ...]] = {}
+    for dirpath, dirnames, filenames in os.walk(source, followlinks=True, onerror=unreadable):
+        current = Path(dirpath)
+        real_dir = resolve(current)
+        ancestors = lineage.get(os.path.dirname(dirpath), ()) if current != source else ()
+        if real_dir in ancestors:
+            raise OmnigentError(
+                f"{current.relative_to(source)} is a symlink loop; cannot bundle it.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        lineage[dirpath] = (*ancestors, real_dir)
+        dirnames.sort()
+        files = set(filenames)
+        for name in [*dirnames, *sorted(files)]:
+            path = current / name
+            real = resolve(path)
+            rel = path.relative_to(source)
+            if real != root / rel and not real.is_relative_to(boundary):
+                raise OmnigentError(
+                    f"{rel} resolves to {real}, outside {boundary}; "
+                    "only symlinks within the agent's checkout can be bundled.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if real != root / rel and real.is_relative_to(git_dir):
+                raise OmnigentError(
+                    f"{rel} resolves into the repository's .git directory; cannot bundle it.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if name in files and real.is_file():
+                yield real, str(rel)
 
 
 def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
@@ -11592,37 +11663,236 @@ def agent_grp() -> None:
     """
 
 
-@agent_grp.command("add")
-@click.argument("source", type=click.Path(exists=True, path_type=Path))
-@_AGENT_SERVER_OPTION
-def agent_add(source: Path, server: str | None) -> None:
-    """Install SOURCE (an agent directory, YAML file, or .tar.gz bundle).
+_GITHUB_SOURCE_RE = re.compile(
+    r"^(?:github:|https://github\.com/)?"
+    r"(?P<owner>\w[\w.-]*)/(?P<repo>\w[\w.-]*?)(?:\.git)?"
+    r"(?:/tree/(?P<tree_ref>[^/@]+))?(?P<subpath>(?:/\w[\w.-]*)*)/?(?:@(?P<name>[\w.-]+))?$"
+)
 
-    Re-adding an agent with the same name replaces your copy in place.
-    Workers, skills, guardrails, and supporting files in the directory are
-    all kept. For a directory, ``${VAR}`` references are resolved from this
-    shell, as ``omnigent run`` does; a YAML file or tarball is uploaded as is.
 
-    \b
-    Examples:
-      omnigent agent add ./orion
-      omnigent agent add ./orion.tar.gz --server https://myserver.com
+def _parse_github_source(source: str) -> tuple[str, str | None, str, str | None] | None:
+    """``(clone_url, ref, subpath, agent_name)`` for ``owner/repo[/path][@agent]`` or a URL.
+
+    As in ``npx skills add``, ``@name`` picks one agent; a ref comes from ``/tree/<ref>``
+    (a branch or tag without ``/``; commit SHAs can't be shallow-cloned by name).
     """
-    with _agent_api_client(server) as client:
-        bundle_bytes = _bundle(source)
-        resp = client.post(
-            "/v1/agents",
-            files={"bundle": ("bundle.tar.gz", bundle_bytes, "application/gzip")},
+    m = _GITHUB_SOURCE_RE.match(source)
+    if m is None:
+        return None
+    url = f"https://github.com/{m['owner']}/{m['repo']}.git"
+    return url, m["tree_ref"], m["subpath"].strip("/"), m["name"]
+
+
+def _find_agent_dirs(root: Path) -> list[Path]:
+    """Outermost directories under ``root`` holding a ``config.yaml`` (nested ones are workers)."""
+    found: list[Path] = []
+    for cfg in sorted(root.rglob("config.yaml"), key=lambda p: (len(p.parts), p)):
+        if ".git" in cfg.parts or any(d in cfg.parents for d in found):
+            continue
+        if cfg.is_symlink():
+            # Checked before anything reads it, so even --list can't follow it.
+            raise _agent_cli_error(
+                f"{_printable(cfg.relative_to(root).as_posix())} is a symlink; refusing to "
+                "read an agent config through a symlink from a remote repo."
+            )
+        found.append(cfg.parent)
+    return found
+
+
+def _agent_dir_name(agent_dir: Path) -> str:
+    """The agent's ``name`` from its ``config.yaml``, else the directory name."""
+    try:
+        name = yaml.safe_load((agent_dir / "config.yaml").read_text()).get("name")
+    except (yaml.YAMLError, AttributeError, OSError, ValueError):  # ValueError: bad UTF-8
+        name = None
+    return name if isinstance(name, str) and name else agent_dir.name
+
+
+def _printable(text: str) -> str:
+    """Escape control characters so repo-supplied text can't rewrite the terminal."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
+
+
+_LFS_POINTER = b"version https://git-lfs.github.com/spec/"
+
+
+def _bundle_untrusted_dir(source: Path) -> bytes:
+    """Tar an agent directory from a remote repo as is.
+
+    Unlike :func:`_bundle`, ``${VAR}`` references are left unexpanded so a
+    repo can't pull this shell's secrets into its config, and symlinks are
+    refused so it can't pull in files from outside the checkout. ``.git`` is
+    skipped, and Git LFS pointers (never downloaded) are refused.
+    """
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for file_path in sorted(source.rglob("*")):
+            rel = file_path.relative_to(source)
+            if ".git" in rel.parts:
+                continue
+            if file_path.is_symlink():
+                raise _agent_cli_error(
+                    f"{_printable(str(rel))} is a symlink; refusing to install "
+                    "an agent with symlinks from a remote repo."
+                )
+            if file_path.is_file():
+                with file_path.open("rb") as fh:
+                    if fh.read(len(_LFS_POINTER)) == _LFS_POINTER:
+                        raise _agent_cli_error(
+                            f"{_printable(str(rel))} is stored in Git LFS, which "
+                            "`omnigent agent add` doesn't download."
+                        )
+                tf.add(str(file_path), arcname=str(rel))
+    return buf.getvalue()
+
+
+def _clone_github_source(clone_url: str, ref: str | None, dest: Path) -> None:
+    """Shallow-clone without submodules, hooks, or credential prompts."""
+    cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
+           "-c", "protocol.https.allow=always", "clone", "--depth", "1",
+           "--no-recurse-submodules", "--quiet"]  # fmt: skip
+    if ref:
+        cmd += ["--branch", ref]
+    try:
+        proc = subprocess.run(
+            [*cmd, "--", clone_url, str(dest)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"},
+            check=False,
+            timeout=300,
         )
+    except FileNotFoundError:
+        raise _agent_cli_error("Installing from GitHub needs git on your PATH.") from None
+    except subprocess.TimeoutExpired:
+        raise _agent_cli_error(f"Timed out cloning {clone_url}.") from None
+    if proc.returncode != 0:
+        hint = (
+            "\n(Only branch and tag names work as a ref, not commit SHAs.)"
+            if ref and re.fullmatch(r"[0-9a-f]{7,40}", ref)
+            else ""
+        )
+        raise _agent_cli_error(f"Could not clone {clone_url}: {proc.stderr.strip()}{hint}")
+
+
+def _upload_agent(client: Any, bundle_bytes: bytes) -> None:  # type: ignore[explicit-any]  # httpx.Client
+    resp = client.post(
+        "/v1/agents",
+        files={"bundle": ("bundle.tar.gz", bundle_bytes, "application/gzip")},
+    )
     _raise_for_agent_api(resp)
     agent = resp.json()
-    click.echo(f"Installed {agent['name']} (version {agent['version']}, id {agent['id']})")
+    name = _printable(str(agent["name"]))
+    click.echo(f"Installed {name} (version {agent['version']}, id {agent['id']})")
     if agent["version"] > 1:
         # Terminal (TUI) harnesses keep the agent they launched with.
         click.echo(
             "Sessions using it pick up this version on their next turn; "
             "terminal sessions do when they relaunch."
         )
+
+
+@agent_grp.command("add")
+@click.argument("source")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation for a GitHub repo.")
+@click.option(
+    "--list", "list_only", is_flag=True, help="List a GitHub repo's agents; install none."
+)
+@_AGENT_SERVER_OPTION
+def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> None:
+    """Install SOURCE: an agent directory, YAML file, .tar.gz bundle, or GitHub repo.
+
+    Re-adding an agent with the same name replaces your copy in place.
+    Workers, skills, guardrails, and supporting files in the directory are
+    all kept. For a directory, ``${VAR}`` references are resolved from this
+    shell, as ``omnigent run`` does; a YAML file or tarball is uploaded as is.
+
+    A GitHub repo (``owner/repo[/path][@agent]`` or a github.com URL) is
+    shallow-cloned and every agent directory in it (or just ``@agent``) is
+    installed after you confirm. Its ``${VAR}`` references are not resolved
+    from this shell. A ``/tree/<ref>`` must be a branch or tag without ``/``.
+
+    \b
+    Examples:
+      omnigent agent add ./orion
+      omnigent agent add ./orion.tar.gz --server https://myserver.com
+      omnigent agent add acme/agents --list
+      omnigent agent add acme/agents@orion
+      omnigent agent add https://github.com/acme/agents/tree/main/orion
+    """
+    path = Path(source)
+    github = None if path.exists() else _parse_github_source(source)
+    if github is None:
+        if not path.exists():
+            raise click.BadParameter(
+                f"{source!r} is neither a local path nor a GitHub repo.", param_hint="SOURCE"
+            )
+        if list_only:
+            raise click.UsageError("--list only applies to a GitHub repo.")
+        with _agent_api_client(server) as client:
+            _upload_agent(client, _bundle(path))
+        return
+
+    clone_url, ref, subpath, wanted = github
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Never resolved: a symlinked TMPDIR would make discovered paths disagree with it.
+        checkout = Path(tmpdir) / "repo"
+        try:
+            _clone_github_source(clone_url, ref, checkout)
+        except click.ClickException as exc:
+            if not source.startswith(("github:", "https://")):
+                exc.message += f"\n(If {source!r} is a local path, it doesn't exist.)"
+            raise
+        # The parser rejects `..`, so only a symlinked component can leave the subpath.
+        root = checkout / subpath
+        if any(
+            p.is_symlink()
+            for p in (root, *root.parents)
+            if p != checkout and p.is_relative_to(checkout)
+        ):
+            raise _agent_cli_error(f"{subpath!r} goes through a symlink in {clone_url}.")
+        if not root.is_dir():
+            raise _agent_cli_error(f"{subpath!r} is not a directory in {clone_url}.")
+        agents = [(_agent_dir_name(d), d) for d in _find_agent_dirs(root)]
+        if not agents:
+            raise _agent_cli_error(f"No agent (a directory with config.yaml) in {source}.")
+        by_name: dict[str, list[Path]] = {}
+        for n, d in agents:
+            by_name.setdefault(n.lower(), []).append(d)
+        dupes = [ds for ds in by_name.values() if len(ds) > 1]
+        if dupes:
+            where = "; ".join(
+                ", ".join(d.relative_to(checkout).as_posix() for d in ds) for ds in dupes
+            )
+            raise _agent_cli_error(f"Agents in {source} share a name: {_printable(where)}.")
+        if wanted:
+            match = [(n, d) for n, d in agents if n.lower() == wanted.lower()]
+            if not match:
+                found = _printable(", ".join(n for n, _ in agents))
+                raise _agent_cli_error(f"No agent named {wanted!r} in {source}; found: {found}.")
+            agents = match
+        click.echo(f"Found {len(agents)} agent(s) in {source}:")
+        for n, d in agents:
+            click.echo(f"  {_printable(n)}  ({_printable(d.relative_to(checkout).as_posix())})")
+        if list_only:
+            return
+        if not yes:
+            click.confirm("Install them? Only install agents from repos you trust", abort=True)
+        bundles = {n: _bundle_untrusted_dir(d) for n, d in agents}
+        failed: list[str] = []
+        with _agent_api_client(server) as client:
+            for n, bundle_bytes in bundles.items():
+                # One conflict (e.g. a built-in's name) shouldn't skip the rest.
+                try:
+                    _upload_agent(client, bundle_bytes)
+                except click.ClickException as exc:
+                    click.echo(f"Skipped {_printable(n)}: {_printable(exc.message)}", err=True)
+                    failed.append(n)
+        if failed:
+            raise _agent_cli_error(f"{len(failed)} of {len(bundles)} agent(s) not installed.")
 
 
 def _list_agents(client: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-any]  # httpx.Client + JSON rows
@@ -13681,6 +13951,24 @@ def _reject_reserved_kiro_resume_args(kiro_args: tuple[str, ...]) -> None:
         raise click.UsageError(
             "Kiro resume flags are reserved for Omnigent resume handling; use "
             f"`{cli_invocation()} kiro --resume [CONVERSATION]` instead."
+        )
+
+
+def _reject_reserved_codex_transport_args(codex_args: tuple[str, ...]) -> None:
+    """Reject Codex transport args that the runner owns in passthrough args.
+
+    The runner starts Codex's app-server and attaches the TUI itself, so a
+    session created with ``app-server``/``--listen``/``--remote`` could only
+    fail at terminal start.
+    """
+    from omnigent.harnesses.codex_native.launch_args import reserved_codex_transport_arg
+
+    reserved = reserved_codex_transport_arg(codex_args)
+    if reserved is not None:
+        raise click.UsageError(
+            f"{reserved!r} is reserved for Omnigent, which starts Codex's app-server "
+            f"and attaches the TUI itself. Drop it from `{cli_invocation()} codex`, "
+            "or run `codex app-server` directly for a standalone app-server."
         )
 
 

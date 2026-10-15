@@ -28,6 +28,7 @@ def test_only_harness_settings_defaults_on(environ: dict[str, str]) -> None:
         "harness_settings_ui": True,
         "import_review": False,
         "custom_agents_settings_ui": False,
+        "sidebar_grouping_ui": False,
     }
 
 

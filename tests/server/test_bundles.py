@@ -22,8 +22,11 @@ from pathlib import Path
 import pytest
 import yaml
 
-from omnigent.errors import OmnigentError
-from omnigent.server.bundles import validate_agent_bundle
+from omnigent.db.utils import generate_agent_id
+from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, ErrorCode, OmnigentError
+from omnigent.server.bundles import agent_for_user, copy_agent_bundle, validate_agent_bundle
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 
 _SECRET_ENV_VAR = "OMNIGENT_W7_BUNDLE_SECRET"
 _SECRET_VALUE = "server-side-secret-token"
@@ -399,22 +402,56 @@ def test_validate_bundle_allows_server_callable_tool_when_not_enforced() -> None
     assert spec.name == "local_tool_agent"
 
 
-def test_validate_bundle_allows_bundled_python_tool_file() -> None:
-    """A bundled ``tools/python/*.py`` tool file is not a ``callable:`` and is allowed.
-
-    File tools ship the agent's own code (path ``tools/python/echo.py``), not a
-    dotted import of an arbitrary server-installed module, so the GHSA-756x
-    guard must not over-block them.
-    """
+@pytest.mark.parametrize("trusted", [False, True])
+@pytest.mark.parametrize(
+    "tool_path,content",
+    [
+        ("tools/python/echo.py", "def echo(text: str) -> str:\n    return text\n"),
+        ("tools/typescript/echo.ts", "export function echo(text: string) { return text; }\n"),
+    ],
+)
+def test_validate_bundle_source_tools_require_trusted_upload(
+    trusted: bool, tool_path: str, content: str
+) -> None:
+    """Operator-authored bundles retain source-file tools."""
     bundle = _make_bundle_bytes(
         {
             "config.yaml": _MIN_CONFIG.format(name="filetool_agent"),
-            "tools/python/echo.py": "def echo(text: str) -> str:\n    return text\n",
+            tool_path: content,
         }
     )
-    spec = validate_agent_bundle(bundle)
+    if not trusted:
+        with pytest.raises(OmnigentError, match="may not ship a server-side Python/TS tool file"):
+            validate_agent_bundle(bundle)
+        return
+    spec = validate_agent_bundle(bundle, enforce_handler_allowlist=False)
     assert spec.name == "filetool_agent"
     assert any(t.name == "echo" for t in spec.local_tools)
+
+
+@pytest.mark.parametrize("suffix", ["py", "ts"])
+@pytest.mark.parametrize("runtime", ["server", "client"])
+def test_uploaded_source_tool_validation_covers_nested_agents(suffix: str, runtime: str) -> None:
+    from omnigent.server.bundles import _reject_uploaded_callable_tools
+    from omnigent.spec import AgentSpec
+    from omnigent.spec.types import LocalToolInfo, ToolRuntime
+
+    sub = AgentSpec(name="child", spec_version=1)
+    sub.local_tools = [
+        LocalToolInfo(
+            name="echo",
+            path=f"tools/echo.{suffix}",
+            language="python" if suffix == "py" else "typescript",
+            runtime=ToolRuntime(runtime),
+        )
+    ]
+    root = AgentSpec(name="root", spec_version=1)
+    root.sub_agents = [sub]
+    if runtime == "server":
+        with pytest.raises(OmnigentError, match="may not ship a server-side Python/TS tool file"):
+            _reject_uploaded_callable_tools(root)
+    else:
+        _reject_uploaded_callable_tools(root)
 
 
 def test_reject_uploaded_callable_tools_recurses_into_sub_agents() -> None:
@@ -524,3 +561,35 @@ def test_content_digest_is_none_for_an_unreadable_bundle() -> None:
     assert bundle_content_digest(b"not a tarball") is None
     # The location still names the bytes, so nothing is ever stored keyless.
     assert content_bundle_location("ag", b"not a tarball").startswith("ag/")
+
+
+def test_copy_agent_bundle_reports_a_missing_source_blob(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    artifacts = LocalArtifactStore(str(root))
+
+    with pytest.raises(OmnigentError) as excinfo:
+        copy_agent_bundle(
+            artifacts, "30f9aa4d441e344d3eb273f8cc13e4a5/e70dc208", generate_agent_id()
+        )
+
+    assert excinfo.value.code == ErrorCode.SESSION_AGENT_MISSING
+    assert excinfo.value.http_status == 410
+    assert excinfo.value.message == SESSION_AGENT_BUNDLE_MISSING_MESSAGE
+    assert [p for p in root.rglob("*") if p.is_file()] == [], "nothing is written without a source"
+
+
+def test_agent_for_user_creates_no_row_when_the_bundle_is_missing(
+    db_uri: str, tmp_path: Path
+) -> None:
+    agents = SqlAlchemyAgentStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_id = generate_agent_id()
+    source = agents.create_user_agent(
+        agent_id, "orion", f"{agent_id}/e70dc208", owner="alice@example.com"
+    )
+
+    with pytest.raises(OmnigentError) as excinfo:
+        agent_for_user(agents, artifacts, source, "bob@example.com")
+
+    assert excinfo.value.code == ErrorCode.SESSION_AGENT_MISSING
+    assert agents.list_user_agents("bob@example.com").data == []

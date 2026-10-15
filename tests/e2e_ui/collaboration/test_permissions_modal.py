@@ -30,6 +30,7 @@ import pytest
 from playwright.sync_api import Browser, Page, expect
 
 from omnigent.runner.identity import token_bound_runner_id
+from tests._helpers.browser import user_page
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
@@ -363,20 +364,22 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         json={"runner_id": runner_id},
         timeout=30,
     ).raise_for_status()
-    admin_context = browser.new_context(
-        viewport={"width": 1280, "height": 900},
-        extra_http_headers=admin_headers,
-        record_video_dir=str(tmp_path / "video"),
-        record_video_size={"width": 1280, "height": 900},
-    )
-    member_context = browser.new_context(
-        viewport={"width": 1280, "height": 900},
-        extra_http_headers=member_headers,
-        record_video_dir=str(tmp_path / "video"),
-        record_video_size={"width": 1280, "height": 900},
-    )
-    try:
-        page = admin_context.new_page()
+    with (
+        user_page(
+            browser,
+            headers=admin_headers,
+            viewport={"width": 1280, "height": 900},
+            record_video_dir=str(tmp_path / "video"),
+            record_video_size={"width": 1280, "height": 900},
+        ) as page,
+        user_page(
+            browser,
+            headers=member_headers,
+            viewport={"width": 1280, "height": 900},
+            record_video_dir=str(tmp_path / "video"),
+            record_video_size={"width": 1280, "height": 900},
+        ) as member,
+    ):
         page.goto(f"{multi_user_server.public_url}/settings/sharing")
         ceiling = page.get_by_role("combobox", name="Maximum public permission")
         expect(ceiling).to_have_text("Read", timeout=30_000)
@@ -400,7 +403,6 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         )
         page.screenshot(path=str(tmp_path / "public-sharing-desktop.png"))
 
-        member = member_context.new_page()
         member.goto(f"{multi_user_server.public_url}/c/{session_id}")
         composer = member.get_by_placeholder("Send a message…")
         expect(composer).to_be_enabled(timeout=30_000)
@@ -464,9 +466,6 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         ) as snapshot:
             member.reload()
         assert snapshot.value.status == 404
-    finally:
-        admin_context.close()
-        member_context.close()
 
 
 def test_multi_user_shows_enabled_share_button(

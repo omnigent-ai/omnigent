@@ -63,7 +63,8 @@ export type FeatureKey =
   | "canvas"
   | "arca_shutdown_warnings"
   | "import_review"
-  | "custom_agents_settings_ui";
+  | "custom_agents_settings_ui"
+  | "sidebar_grouping_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -128,7 +129,7 @@ export interface ServerInfo {
    */
   sandbox_provider_capabilities?: Record<
     string,
-    { multi_repo?: boolean; inference_models?: boolean }
+    { multi_repo?: boolean; inference_models?: boolean; default_models?: boolean }
   >;
   /**
    * Connection providers this deploy has wired (config + store present),
@@ -216,6 +217,8 @@ export interface ServerInfo {
    * and the Import bundle button. Absent on older servers (off).
    */
   agent_install?: boolean;
+  /** True when GET /v1/agents/{id} is available; absent on older servers (off). */
+  agent_detail?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -388,6 +391,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           agent_install: data.agent_install === true,
+          agent_detail: data.agent_detail === true,
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;

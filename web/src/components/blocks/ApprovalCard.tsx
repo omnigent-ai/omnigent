@@ -46,6 +46,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useDescendantSession } from "@/hooks/useChildSessions";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -55,11 +56,18 @@ import {
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
-import type { CodexPersistMode, RememberScope } from "@/lib/types";
+import { Link, useLocation } from "@/lib/routing";
+import { sessionNavigationSearch } from "@/lib/sessionNavigation";
+import type { AgyPermission, CodexPersistMode, RememberScope } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { childPrimaryLabel } from "@/shell/subagentLabel";
 import { useChatStore } from "@/store/chatStore";
-import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import {
+  ConversationScopeContext,
+  useScopedConversationId,
+} from "@/components/chat/conversationScope";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
+import { ElicitationMessage } from "./ElicitationMessage";
 import {
   type ElicitationAnswers,
   ElicitationSchemaForm,
@@ -105,6 +113,38 @@ export type SubmitApprovalFn = (
   content?: Record<string, unknown>,
   meta?: Record<string, unknown>,
 ) => void;
+
+/** Sub-agent session behind a prompt mirrored into an ancestor's view. */
+export interface SubagentRequester {
+  /** Sub-agent session that owns the prompt, e.g. ``"conv_child123"``. */
+  sessionId: string;
+  /** Session whose view shows the mirrored card, e.g. ``"conv_root"``. */
+  ancestorSessionId: string;
+}
+
+/**
+ * Names and links the sub-agent behind a mirrored prompt, so the card is not
+ * read as a request from the session being viewed.
+ */
+function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequester) {
+  const child = useDescendantSession(ancestorSessionId, sessionId);
+  const search = sessionNavigationSearch(useLocation().search);
+  const label = (child && childPrimaryLabel(child)) || null;
+  const link = (
+    <Link
+      to={{ pathname: `/c/${sessionId}`, search }}
+      componentId="approval.open_subagent"
+      className="font-medium text-foreground"
+    >
+      {label ?? "sub-agent"}
+    </Link>
+  );
+  return (
+    <span data-testid="approval-card-requester" className="text-sm">
+      {label ? <>Requested by sub-agent {link}</> : <>Requested by a {link}</>}
+    </span>
+  );
+}
 
 interface ApprovalCardProps {
   elicitationId: string;
@@ -182,6 +222,8 @@ interface ApprovalCardProps {
   rememberScope?: RememberScope | null;
   /** Codex-native MCP persistence scopes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
+  /** Antigravity prompt details (see {@link AgyPermission}); null outside agy permission requests. */
+  agyPermission?: AgyPermission | null;
   /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`
    * (the in-chat path: optimistic block flip + resolve POST + rollback).
@@ -189,6 +231,8 @@ interface ApprovalCardProps {
    * sessions other than the chat store's active one.
    */
   onSubmit?: SubmitApprovalFn;
+  /** Set when the prompt was mirrored up from a sub-agent session. */
+  requester?: SubagentRequester | null;
   /** Extra classes for the card container, e.g. to drop its border when embedded. */
   className?: string;
 }
@@ -212,7 +256,9 @@ export function ApprovalCard({
   allowAutoMode,
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
+  agyPermission,
   onSubmit,
+  requester,
   className,
 }: ApprovalCardProps) {
   // In a side-chat pane this resolves to the child id, so the verdict targets
@@ -274,7 +320,8 @@ export function ApprovalCard({
     // permission update back to the PermissionRequest hook.
     submit(elicitationId, "accept", { remember: true });
   };
-  const submitCodexPersist = (mode: CodexPersistMode) => {
+  // Codex MCP and agy persist accepts share the `_meta.persist` verdict shape.
+  const submitPersist = (mode: CodexPersistMode) => {
     submit(elicitationId, "accept", undefined, { persist: mode });
   };
   const submitPlanRejection = (feedback: string) => {
@@ -351,7 +398,7 @@ export function ApprovalCard({
   const acceptedAutoMode =
     response?.action === "accept" && response.content?.allow_auto_mode === true;
   const acceptedRemember = response?.content?.remember === true;
-  const acceptedCodexPersist = response?.["_meta"]?.persist;
+  const acceptedPersist = response?.["_meta"]?.persist;
   // Persistent "don't ask again" affordance: label by the WebFetch
   // domain when present, else the tool name. Drives the third binary
   // button and the responded-state pill.
@@ -370,11 +417,50 @@ export function ApprovalCard({
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
+      {agyPermission?.alwaysAllowPattern && (
+        <>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-auto max-w-full whitespace-normal text-left"
+            onClick={() => submitPersist("session")}
+            title={`Ask Antigravity to allow commands starting with “${agyPermission.alwaysAllowPattern}” for this conversation`}
+            data-testid="approval-card-agy-session-allow"
+            componentId="approval.approve_session_agy"
+          >
+            <CheckIcon className="mr-1 size-3.5 shrink-0" />
+            <span className="min-w-0">
+              Allow commands starting with{" "}
+              <code className="break-all rounded bg-muted px-1 font-mono">
+                {agyPermission.alwaysAllowPattern}
+              </code>{" "}
+              for this session
+            </span>
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-auto max-w-full whitespace-normal text-left"
+            onClick={() => submitPersist("always")}
+            title={`Ask Antigravity to save a rule allowing commands starting with “${agyPermission.alwaysAllowPattern}” for this Omnigent session`}
+            data-testid="approval-card-agy-always-allow"
+            componentId="approval.approve_always_agy"
+          >
+            <CheckIcon className="mr-1 size-3.5 shrink-0" />
+            <span className="min-w-0">
+              Always allow commands starting with{" "}
+              <code className="break-all rounded bg-muted px-1 font-mono">
+                {agyPermission.alwaysAllowPattern}
+              </code>
+            </span>
+          </Button>
+        </>
+      )}
       {codexPersistModes.includes("session") && (
         <Button
           size="sm"
           variant="outline"
-          onClick={() => submitCodexPersist("session")}
+          onClick={() => submitPersist("session")}
           componentId="approval.approve_session"
         >
           <CheckIcon className="mr-1 size-3.5" />
@@ -385,7 +471,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
-          onClick={() => submitCodexPersist("always")}
+          onClick={() => submitPersist("always")}
           componentId="approval.approve_always"
         >
           <CheckIcon className="mr-1 size-3.5" />
@@ -467,6 +553,8 @@ export function ApprovalCard({
     </div>
   );
 
+  const requesterLine = requester ? <SubagentRequesterLine {...requester} /> : null;
+
   if (status === "responded" && response) {
     const autoResolved = response.action === "auto_resolved";
     const promptExpired = autoResolved && response.reason === "unanswered";
@@ -545,10 +633,16 @@ export function ApprovalCard({
       label = rememberTarget
         ? `Approved · won't ask again for ${rememberTarget}`
         : "Approved · won't ask again";
-    } else if (acceptedCodexPersist === "session") {
+    } else if (
+      phase === "agy_permission" &&
+      (acceptedPersist === "session" || acceptedPersist === "always")
+    ) {
+      icon = <InfoIcon className="size-4 text-muted-foreground" />;
+      label = acceptedPersist === "session" ? "Session allow requested" : "Always allow requested";
+    } else if (acceptedPersist === "session") {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Approved for this session";
-    } else if (acceptedCodexPersist === "always") {
+    } else if (acceptedPersist === "always") {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Always allowed";
     } else if (accepted) {
@@ -564,6 +658,7 @@ export function ApprovalCard({
     // for the same reason: purposeful content instead of the raw ask.
     const showGatingMessage = !isCodexCommandApproval && !isAskUserQuestion && !isExitPlanMode;
     const hasBody =
+      requesterLine !== null ||
       showGatingMessage ||
       isCodexCommandApproval ||
       submittedAnswers !== null ||
@@ -583,6 +678,7 @@ export function ApprovalCard({
         </AlertTitle>
         {hasBody && (
           <AlertDescription className="flex flex-col gap-1 text-sm">
+            {requesterLine}
             {isCodexCommandApproval ? (
               <>
                 {codexCommand.reason && <span>{codexCommand.reason}</span>}
@@ -599,7 +695,17 @@ export function ApprovalCard({
                 )}
               </>
             ) : showGatingMessage ? (
-              <span>{message}</span>
+              <>
+                <ElicitationMessage message={message} />
+                {agyPermission?.actionDescription && (
+                  <span
+                    className="text-sm text-muted-foreground"
+                    data-testid="agy-action-description"
+                  >
+                    {agyPermission.actionDescription}
+                  </span>
+                )}
+              </>
             ) : null}
             {submittedAnswers !== null && (
               <ul className="flex flex-col gap-0.5">
@@ -661,6 +767,7 @@ export function ApprovalCard({
         )}
       </AlertTitle>
       <AlertDescription className="flex flex-col gap-2">
+        {requesterLine}
         {isExitPlanMode ? (
           <>
             <span>Claude finished planning and wants to proceed.</span>
@@ -694,7 +801,18 @@ export function ApprovalCard({
           </>
         ) : (
           <>
-            <span>{message}</span>
+            <ElicitationMessage message={message} />
+            {agyPermission?.actionDescription && (
+              <span className="text-sm text-muted-foreground" data-testid="agy-action-description">
+                {agyPermission.actionDescription}
+              </span>
+            )}
+            {agyPermission?.alwaysAllowPattern && (
+              <span className="text-sm text-muted-foreground">
+                Always allow saves a rule for this Omnigent session. New sessions have separate
+                rules.
+              </span>
+            )}
             {formattedPreview && (
               <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
                 {formattedPreview}
@@ -752,6 +870,13 @@ export function ElicitationCard({
   item: Extract<RenderItem, { kind: "elicitation" }>;
   onSubmit?: SubmitApprovalFn;
 }) {
+  // A sub-agent's prompt is mirrored into its ancestors' streams with
+  // ``targetSessionId`` naming the sub-agent that asked.
+  const conversationId = useScopedConversationId();
+  const requester =
+    item.targetSessionId && conversationId && item.targetSessionId !== conversationId
+      ? { sessionId: item.targetSessionId, ancestorSessionId: conversationId }
+      : null;
   return (
     <ApprovalCard
       elicitationId={item.elicitationId}
@@ -770,7 +895,9 @@ export function ElicitationCard({
       allowAutoMode={item.allowAutoMode}
       rememberScope={item.rememberScope}
       codexPersistModes={item.codexPersistModes}
+      agyPermission={item.agyPermission}
       onSubmit={onSubmit}
+      requester={requester}
     />
   );
 }

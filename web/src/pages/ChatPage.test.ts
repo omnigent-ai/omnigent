@@ -496,6 +496,15 @@ describe("buildPendingBubbles", () => {
     ) as [Extract<Bubble, { kind: "user" }>];
     expect(replayed.createdAtS).toBeUndefined();
   });
+
+  it("flags only mid-turn sends as awaiting the agent", () => {
+    const [midTurn, plain] = buildPendingBubbles(
+      [{ ...pending[0]!, sentMidTurn: true }, pending[0]!],
+      null,
+    ) as [Extract<Bubble, { kind: "user" }>, Extract<Bubble, { kind: "user" }>];
+    expect(midTurn.awaitingAgent).toBe(true);
+    expect(plain.awaitingAgent).toBeUndefined();
+  });
 });
 
 // ── mergePendingBubbles ────────────────────────────────────────────────────

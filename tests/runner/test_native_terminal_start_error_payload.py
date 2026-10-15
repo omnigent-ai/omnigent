@@ -21,7 +21,7 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.inner.terminal import TerminalInstance, TmuxUnavailableError
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
     _NATIVE_TERMINAL_START_FAILED_CODE,
@@ -102,6 +102,7 @@ def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> Non
             OmnigentError("workspace gone", code=ErrorCode.WORKSPACE_MISSING),
             "user",
         ),
+        (TmuxUnavailableError("tmux is not installed or not on PATH."), "config"),
     ],
 )
 def test_start_failure_log_row_is_blocking_with_derived_category(
@@ -243,6 +244,43 @@ def test_codex_early_exit_diagnostic_failure_preserves_exit_cause(
     assert "Codex startup terminal output:" not in payload["message"]
     assert "private diagnostic failure detail" not in payload["message"]
     read_output.assert_called_once_with()
+
+
+def test_outdated_pi_cli_surfaces_its_actionable_message() -> None:
+    """An outdated Pi CLI shows the upgrade message, not the log pointer.
+
+    The raise site composes a client-safe message (installed version, floor,
+    upgrade command); the payload must carry it verbatim so the person sees
+    the remedy instead of "see the runner log".
+    """
+    from omnigent.harnesses.pi_native.main import PiNativeCliOutdatedError
+
+    remedy = (
+        "The installed Pi CLI (0.83.0) is older than the minimum Omnigent "
+        "supports (0.84.2). Upgrade with: npm install -g "
+        "@earendil-works/pi-coding-agent, then start the session again."
+    )
+    payload = _native_terminal_start_error_payload(
+        PiNativeCliOutdatedError(remedy), "Pi", session_id="conv_1"
+    )
+
+    assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
+    assert remedy in payload["message"]
+    assert "see the runner log" not in payload["message"]
+    assert _ERROR_ID_RE.search(payload["message"]) is not None
+
+
+def test_host_setup_error_surfaces_its_remedy() -> None:
+    """A host without usable tmux shows how to fix it, not the log pointer."""
+    remedy = "tmux 3.2 is too old; managed terminals require tmux 3.3 or newer"
+    payload = _native_terminal_start_error_payload(
+        TmuxUnavailableError(remedy), "Claude", session_id="conv_1"
+    )
+
+    assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
+    assert remedy in payload["message"]
+    assert "see the runner log" not in payload["message"]
+    assert _ERROR_ID_RE.search(payload["message"]) is not None
 
 
 def test_claude_early_exit_surfaces_classified_diagnosis(

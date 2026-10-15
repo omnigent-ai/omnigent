@@ -964,6 +964,40 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
         assert leaked.lower() not in flat
 
 
+@pytest.mark.parametrize("count", [0, 2])
+def test_sse_status_preserves_background_task_count_without_details(count: int) -> None:
+    attrs = session_stream._sse_safe_attributes(
+        {
+            "type": "session.status",
+            "status": "idle",
+            "background_task_count": count,
+            "background_tasks": [{"description": "private shell command"}],
+            "blocked_on": "private task description",
+        }
+    )
+    assert attrs == {"status": "idle", "background_task_count": count}
+
+
+@pytest.mark.parametrize("count", [None, -1, True, False, 1.5, "2", "private text", {}, []])
+def test_sse_status_omits_invalid_background_task_count(count: object) -> None:
+    assert (
+        session_stream._sse_safe_attributes(
+            {"type": "session.status", "background_task_count": count}
+        )
+        == {}
+    )
+
+
+def test_sse_background_task_count_is_status_specific() -> None:
+    assert session_stream._sse_safe_attributes({"type": "session.status"}) == {}
+    assert (
+        session_stream._sse_safe_attributes(
+            {"type": "response.completed", "background_task_count": 2}
+        )
+        == {}
+    )
+
+
 def test_sse_child_creation_preserves_relationship_without_content() -> None:
     attrs = session_stream._sse_safe_attributes(
         {

@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -326,15 +326,15 @@ async def test_codex_native_reset_without_a_current_model_is_rejected_before_con
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stalled", ["connect", "update"])
+@pytest.mark.parametrize("stalled", ["connect", "update", "resume", "retry", "close"])
 async def test_codex_native_settings_update_times_out_and_releases_the_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     stalled: str,
 ) -> None:
-    """A hung connect is refused (503) and a hung update is unconfirmed (504); neither blocks."""
+    """Only a pending write is unconfirmed; all timeout paths release the settings lock."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-    from omnigent.runner import turn_routing
+    from omnigent.runner import native_controls, turn_routing
 
     conv_id = "1f2e3d4c5b6a49788796a5b4c3d2e1f0"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -349,18 +349,35 @@ async def test_codex_native_settings_update_times_out_and_releases_the_lock(
         ),
     )
     monkeypatch.setattr(turn_routing, "SETTINGS_UPDATE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_CLOSE_TIMEOUT_S", 0.05)
     stall = {"active": True}
 
     class _StallingClient(_RecordingCodexAppServerClient):
+        rejected_unloaded_thread = False
+
         async def connect(self) -> None:
             if stalled == "connect" and stall["active"]:
                 await asyncio.Event().wait()
             await super().connect()
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-            if stalled == "update" and method == "thread/settings/update" and stall["active"]:
-                await asyncio.Event().wait()
+            if stall["active"]:
+                if method == "thread/settings/update":
+                    if stalled in {"resume", "retry"} and not self.rejected_unloaded_thread:
+                        self.rejected_unloaded_thread = True
+                        raise codex_native_app_server.CodexAppServerResponseError(
+                            {"code": -32600, "message": "thread not found: thread_codex"}
+                        )
+                    if stalled in {"update", "retry"}:
+                        await asyncio.Event().wait()
+                elif method == "thread/resume" and stalled == "resume":
+                    await asyncio.Event().wait()
             return await super().request(method, params)
+
+        async def close(self) -> None:
+            await super().close()
+            if stalled == "close" and stall["active"]:
+                await asyncio.Event().wait()
 
     clients: list[_StallingClient] = []
 
@@ -390,8 +407,8 @@ async def test_codex_native_settings_update_times_out_and_releases_the_lock(
             f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": "low"}
         )
 
-    # A stalled update may still apply, so it is unconfirmed rather than refused.
-    assert stalled_resp.status_code == (504 if stalled == "update" else 503), stalled_resp.text
+    expected_status = {"connect": 503, "update": 504, "resume": 503, "retry": 504, "close": 204}
+    assert stalled_resp.status_code == expected_status[stalled], stalled_resp.text
     assert next_resp.status_code == 204, next_resp.text
     assert all(stalled_client.closed for stalled_client in clients)
     assert clients[-1].requests == [
@@ -5432,6 +5449,68 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
         f"No session.status: idle should be enqueued when kill_session failed; "
         f"got {status_idle!r}."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [False, True], ids=["follow-up", "side-command"])
+async def test_events_codex_side_chat_preserves_indentation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool
+) -> None:
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native import side_chat
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
+        AsyncMock(return_value=None),
+    )
+    conv_id = "acbeddbbce38421b921a7abbe82f7176"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43210", client_name="omnigent-codex-native-runner"
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native"))
+    question = "  - First\n  - Second"
+    payload: dict[str, Any] = {
+        "type": "message",
+        "content": [
+            {"type": "input_text", "text": f" \n /side {question}" if command else question}
+        ],
+    }
+    if not command:
+        payload["codex_side_thread_id"] = "thread_side"
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+    assert response.status_code == 202, response.text
+    if command:
+        assert [request.question for request in side_chat.peek_side_chat_requests(bridge_dir)] == [
+            question
+        ]
+        assert fake_client.requests == []
+    else:
+        assert fake_client.requests == [
+            (
+                "turn/start",
+                {"threadId": "thread_side", "input": [{"type": "text", "text": question}]},
+            )
+        ]
+        assert fake_client.closed
 
 
 @pytest.mark.asyncio

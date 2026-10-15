@@ -19,6 +19,7 @@ import contextlib
 import logging
 import os
 import random
+import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -147,6 +148,27 @@ _GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S = 5.0
 # cancelled — a stuck stream must not wedge shutdown forever.
 _GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S = 5.0
 RUNNER_TUNNEL_REJECTION_PREFIX = "runner tunnel rejected by server "
+# Raised instead of the rejection above when the runner had no credential
+# to send, so the message names the local cause rather than the server.
+RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX = "runner tunnel has no credential available "
+
+
+def _reauth_hint(server_url: str | None) -> str:
+    """Build the re-authentication hint for a fatal tunnel auth failure.
+
+    :param server_url: The runner's server URL, e.g.
+        ``"https://ws.databricks.com/api/2.0/omnigent"``, or ``None``.
+    :returns: e.g. ``"run `omnigent login https://ws.databricks.com/omnigent`
+        to re-authenticate"``.
+    """
+    if not server_url:
+        return "check remote server authentication"
+    # `omnigent login` detects the fronting workspace itself; the display
+    # form keeps ``?o=``, which selects the workspace on multi-workspace hosts.
+    from omnigent.util.server_url import display_server_url
+
+    return f"run `{cli_invocation()} login {display_server_url(server_url)}` to re-authenticate"
+
 
 # Schemes that, when surfaced through ``InvalidURI.uri``, indicate
 # the WebSocket upgrade request was redirected somewhere the
@@ -510,18 +532,13 @@ async def serve_tunnel(
                 # fresh token each attempt, so the session survives
                 # once credentials become valid again.
                 if not ever_connected and login_redirect_streak >= _LOGIN_REDIRECT_FATAL_ATTEMPTS:
-                    # Show the display form (workspace /omnigent URL, ?o=
-                    # when known), not the internal API mount; it round-trips
-                    # through `omnigent login` to the same server.
-                    from omnigent.util.server_url import display_server_url
-
                     raise RuntimeError(
                         f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                         f"(redirect to non-WebSocket URL {redirect_url} "
                         f"persisted across {login_redirect_streak} attempts); "
                         "the server likely requires auth — "
-                        f"run `{cli_invocation()} login {display_server_url(server_url)}` or "
-                        f"`{cli_invocation()} setup` to configure credentials"
+                        f"{_reauth_hint(server_url)}, or "
+                        f"run `{cli_invocation()} setup` to configure credentials"
                     ) from exc
                 retry_reason = (
                     f"login-page redirect during upgrade ({redirect_url}); "
@@ -533,27 +550,31 @@ async def serve_tunnel(
                     http_auth_rejection_streak += 1
                     if (
                         not ever_connected
+                        and auth_token is None
+                        and auth_token_factory is not None
+                        and not getattr(auth_token_factory, "declined", False)
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):
-                        if server_url:
-                            # `omnigent login` detects the fronting workspace
-                            # itself — unlike a raw `databricks auth login
-                            # --host`, which would need the workspace host,
-                            # not the server URL (for workspace-hosted
-                            # servers the API mount is the wrong --host).
-                            from omnigent.util.server_url import display_server_url
-
-                            login_hint = (
-                                f"run `omnigent login {display_server_url(server_url)}` "
-                                "to re-authenticate"
-                            )
-                        else:
-                            login_hint = "check remote server authentication"
+                        # Same streak as the rejection below: a transient mint
+                        # failure (factory returned None) still gets the loop-top
+                        # re-mint; only the message names the local cause.
+                        raise RuntimeError(
+                            f"{RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX}"
+                            f"(HTTP {http_status} persisted across "
+                            f"{http_auth_rejection_streak} unauthenticated attempts; the "
+                            "credential source returned no token, e.g. the host "
+                            "credential service's grant expired or was rejected); "
+                            f"{_reauth_hint(server_url)}"
+                        ) from exc
+                    if (
+                        not ever_connected
+                        and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+                    ):
                         raise RuntimeError(
                             f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                             f"(HTTP {http_status} persisted across "
                             f"{http_auth_rejection_streak} attempts); "
-                            f"{login_hint}"
+                            f"{_reauth_hint(server_url)}"
                         ) from exc
                     # Invalidate the cached token so the loop-top _refresh_auth_token
                     # fetches a fresh one on the next attempt. The loop-top call is
@@ -627,6 +648,45 @@ async def serve_tunnel(
                     local_shutdown=local_shutdown,
                     resumed_from_suspend=woke_from_suspend,
                 )
+            terminal_error = sys.exception()
+            if terminal_error is not None or (
+                shutdown_event is not None and shutdown_event.is_set()
+            ):
+                close = (
+                    _CloseDetails.from_error(disconnect_error)
+                    if disconnect_error is not None
+                    else (close_details if close_details is not None else _CloseDetails())
+                )
+                with contextlib.suppress(Exception):
+                    _logger.info(
+                        "Runner tunnel attempt ended without retry",
+                        extra=debug_event(
+                            "runner_tunnel_attempt_finished",
+                            session_id=runner_primary_session_id(),
+                            runner_id=runner_id,
+                            connection_id=connection_id,
+                            attempt=attempt,
+                            connected=connected_this_attempt,
+                            outcome=(
+                                "cancelled"
+                                if isinstance(terminal_error, asyncio.CancelledError)
+                                else "fatal"
+                                if terminal_error is not None
+                                else "graceful_shutdown"
+                            ),
+                            terminal_error_type=type(terminal_error).__name__
+                            if terminal_error is not None
+                            else None,
+                            source_error_type=type(disconnect_error).__name__
+                            if disconnect_error is not None
+                            else None,
+                            http_status=_websocket_http_status(disconnect_error)
+                            if disconnect_error is not None
+                            else None,
+                            close_code=close.code,
+                            **diagnostics.snapshot(),
+                        ),
+                    )
         resumed_from_suspend = woke_from_suspend
         if woke_from_suspend:
             # A wake from system suspend already aborted the live tunnel (see
@@ -773,16 +833,61 @@ async def _refresh_auth_token(
     """
     if factory is None:
         return current_token
+    refresh_id = uuid.uuid4().hex
+    started = time.monotonic()
+    fields = {
+        "credential_scope": "runner_tunnel",
+        "token_refresh_id": refresh_id,
+        "cached_token_present": current_token is not None,
+        "factory_type": type(factory).__name__,
+    }
+    with contextlib.suppress(Exception):
+        _logger.debug(
+            "Runner tunnel token refresh started",
+            extra=debug_event(
+                "runner_tunnel_token_refresh_started",
+                session_id=runner_primary_session_id(),
+                **fields,
+            ),
+        )
+    outcome = "raised"
+    error_type = None
     try:
         fresh = await asyncio.to_thread(factory)
         if fresh is not None:
+            outcome = "token_returned"
             return fresh
-    except (ValueError, OSError, ImportError):
+        outcome = "no_token_fallback"
+    except (ValueError, OSError, ImportError) as exc:
+        outcome = "error_fallback"
+        error_type = type(exc).__name__
         _logger.warning(
             "auth token refresh failed; falling back to previous token",
             exc_info=True,
             extra={"session_id": runner_primary_session_id()},
         )
+    finally:
+        pending = sys.exception()
+        if isinstance(pending, asyncio.CancelledError):
+            outcome = "cancelled"
+        if pending is not None:
+            error_type = type(pending).__name__
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        with contextlib.suppress(Exception):
+            _logger.log(
+                logging.WARNING if outcome in {"raised", "error_fallback"} else logging.DEBUG,
+                "Runner tunnel token refresh finished: outcome=%s elapsed_ms=%d",
+                outcome,
+                elapsed_ms,
+                extra=debug_event(
+                    "runner_tunnel_token_refresh_finished",
+                    session_id=runner_primary_session_id(),
+                    **fields,
+                    outcome=outcome,
+                    error_type=error_type,
+                    elapsed_ms=elapsed_ms,
+                ),
+            )
     return current_token
 
 
@@ -1249,6 +1354,7 @@ async def _send_hello(
     except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
         pass
 
+    from omnigent.host.frames import CAP_MCP_REGISTRY
     from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 
     await send_text(
@@ -1258,6 +1364,7 @@ async def _send_hello(
                 frame_protocol_version=1,
                 capabilities=[
                     CAP_FILESYSTEM_ATTACHMENTS,
+                    CAP_MCP_REGISTRY,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,

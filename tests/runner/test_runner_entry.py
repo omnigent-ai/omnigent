@@ -57,7 +57,10 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     EventBatchFrame,
     decode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.runner.transports.ws_tunnel.serve import (
+    RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
+    RUNNER_TUNNEL_REJECTION_PREFIX,
+)
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -2792,30 +2795,35 @@ async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
     assert "/v1/sessions/conv_test/agent/contents" in message
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    [RUNNER_TUNNEL_REJECTION_PREFIX, RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX],
+    ids=["rejected-by-server", "no-credential"],
+)
 def test_main_reports_tunnel_rejection_without_traceback(
+    prefix: str,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Fatal tunnel rejections are rendered as concise CLI errors.
+    """Fatal tunnel auth failures are rendered as concise CLI errors.
 
+    :param prefix: Fatal-class message prefix emitted by ``serve_tunnel``.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param capsys: Pytest stdout/stderr capture fixture.
     :returns: None.
     """
 
-    async def _raise_tunnel_rejection() -> None:
+    async def _raise_tunnel_failure() -> None:
         """Raise the RuntimeError shape emitted by ``serve_tunnel``.
 
         :returns: None.
-        :raises RuntimeError: Always, matching fatal server rejection.
+        :raises RuntimeError: Always, matching a fatal tunnel auth failure.
         """
-        raise RuntimeError(
-            f"{RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP 401); check remote server authentication"
-        )
+        raise RuntimeError(f"{prefix}(HTTP 401); check remote server authentication")
 
     monkeypatch.setattr(
         "omnigent.runner._entry._run_tunnel_from_env",
-        _raise_tunnel_rejection,
+        _raise_tunnel_failure,
     )
 
     with pytest.raises(SystemExit) as exc_info:
@@ -2823,11 +2831,9 @@ def test_main_reports_tunnel_rejection_without_traceback(
 
     assert exc_info.value.code == 1
     stderr = capsys.readouterr().err
-    # The CLI should expose the actionable rejection message without
-    # dumping the asyncio/serve_tunnel traceback onto stderr.
-    assert stderr == (
-        f"error: {RUNNER_TUNNEL_REJECTION_PREFIX}(HTTP 401); check remote server authentication\n"
-    )
+    # The CLI should expose the actionable message without dumping the
+    # asyncio/serve_tunnel traceback onto stderr.
+    assert stderr == f"error: {prefix}(HTTP 401); check remote server authentication\n"
     assert "Traceback" not in stderr
 
 
@@ -3168,3 +3174,43 @@ def test_runner_global_cleanup_ownership_is_explicit(
         monkeypatch.setenv(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR, raw_value)
 
     assert _runner_host_owns_global_cleanup_from_env() is expected
+
+
+@pytest.mark.asyncio
+async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path):
+    import json
+
+    from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle("selected-agent")
+    labels = [{MCP_SELECTION_PREFIX + "tracker": "1"}, {MCP_SELECTION_PREFIX + "tracker": "0"}, {}]
+
+    def handler(request):
+        assert request.headers[MCP_SELECTION_HEADER] == "1"
+        return httpx.Response(
+            200,
+            content=bundle,
+            headers={
+                "X-Agent-Version": "1",
+                "X-Agent-Session-Scoped": "true",
+                MCP_SELECTION_HEADER: json.dumps(labels.pop(0)),
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        results = [
+            await _resolve_agent_spec_from_server(
+                client, tmp_path, "ag_selected", session_id="session"
+            )
+            for _ in range(3)
+        ]
+    assert [[s.name for s in result.spec.mcp_servers] for result in results] == [
+        ["tracker"],
+        [],
+        [],
+    ]
+    assert len({result.workdir for result in results}) == 1
+    assert "registry" not in (results[0].workdir / "config.yaml").read_text()

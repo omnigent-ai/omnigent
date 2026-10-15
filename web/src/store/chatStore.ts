@@ -542,6 +542,13 @@ export interface PendingUserMessage {
    * receipt names. Snapshot-replayed entries carry that id as `tempId`.
    */
   pendingId?: string;
+  /**
+   * Sent to a native-terminal session while its turn was running. The vendor
+   * agent reads such a message only after its current step (e.g. a running
+   * tool call), so the bubble says so until `session.input.consumed` promotes
+   * it. Unset on snapshot-replayed entries.
+   */
+  sentMidTurn?: boolean;
 }
 
 /**
@@ -1035,6 +1042,8 @@ export interface ConversationState {
  */
 /** One side chat's unsent composer contents. */
 export interface SideChatComposerDraft {
+  starting?: boolean;
+  quotes?: string[];
   text: string;
   files: File[];
 }
@@ -1071,6 +1080,8 @@ export interface AppChatState {
    * tabs.
    */
   sideChatToOpen: { childId: string; parentId: string } | null;
+  /** Visible, writable side chat that receives selections from its parent. */
+  sideChatSelectionTarget: { childId: string; parentId: string } | null;
   /**
    * Initial composer text for a freshly-opened side chat, keyed by its child
    * conversation id. Set when a generic `/side <question>` opens an empty side
@@ -1901,6 +1912,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionHarness: null,
   awaitingSideChatFor: null,
   sideChatToOpen: null,
+  sideChatSelectionTarget: null,
   sideChatDrafts: {},
   sideChatComposers: {},
   subAgentName: null,
@@ -2320,6 +2332,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               (targetState.sessionModelSeeded && targetState.sessionHarness === null))
           ? { text, files: files ?? [] }
           : undefined;
+    // Non-native sends persist at POST time, so only a native session leaves
+    // the bubble pending until the agent actually reads it.
+    const sentMidTurn =
+      targetState?.isNativeTerminalSession === true && targetState.sessionStatus === "running";
     const alreadyStreaming =
       opts?.reusePendingTempId != null
         ? false
@@ -2378,6 +2394,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+                ...(sentMidTurn ? { sentMidTurn } : {}),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -4861,7 +4878,11 @@ async function reconcileActiveSessionStatus(
   ) {
     return;
   }
-  set((s) => reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch));
+  set((s) => {
+    const patch = reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch);
+    const blocks = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
+    return blocks === null ? patch : { ...patch, blocks };
+  });
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
   const ignored = nativePreviewTombstonesByController.get(controller);
   if (
@@ -5101,18 +5122,21 @@ async function rehydrateWindowOnReconnect(
       windowBlocks,
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
+    const statusPatch = reconnectStatusPatch(session, s, launchBeforeFetch);
+    const blocks =
+      reconcileElicitationBlocks(
+        merged,
+        snapshotPending,
+        preGapElicitations.pending,
+        preGapElicitations.autoResolved,
+      ) ?? merged;
     return {
-      ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      ...statusPatch,
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
       blocks:
-        reconcileElicitationBlocks(
-          merged,
-          snapshotPending,
-          preGapElicitations.pending,
-          preGapElicitations.autoResolved,
-        ) ?? merged,
+        snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
       hasMoreHistory: fresh.hasMore,
       oldestItemId: fresh.items[0]?.id ?? null,
       loadingMoreHistory: false,
@@ -5299,6 +5323,8 @@ async function reconcileOnReconnect(
       preGapElicitations.autoResolved,
     );
     if (reconciled !== null) nextBlocks = reconciled;
+    nextBlocks =
+      snapshotCompactionSpinners(nextBlocks, s.activeResponse, patch.activeResponse) ?? nextBlocks;
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
@@ -6051,6 +6077,60 @@ export function adoptTrailingUnattributedBlocks(
   return next;
 }
 
+/**
+ * Assign visible "Compacting…" spinners to the starting turn, because
+ * compaction progress can arrive before the turn that compacts is dispatched.
+ *
+ * @returns the rewritten blocks, or `null` when nothing needed adopting.
+ */
+export function adoptCompactionSpinners(blocks: AnyBlock[], responseId: string): AnyBlock[] | null {
+  const foreign = (b: AnyBlock) =>
+    b.type === "compaction_loading" && b.ctx.responseId !== responseId;
+  if (!blocks.some(foreign)) return null;
+  return blocks.map((b) => (foreign(b) ? { ...b, ctx: { ...b.ctx, responseId } } : b));
+}
+
+/**
+ * Remove "Compacting…" spinners owned by the just-settled turn; a lost
+ * compaction terminal is not replayed.
+ *
+ * @returns the remaining blocks, or `null` when the turn owned no spinner.
+ */
+export function withoutSettledCompactionSpinners(
+  blocks: AnyBlock[],
+  responseId: string,
+): AnyBlock[] | null {
+  const owned = (b: AnyBlock) => b.type === "compaction_loading" && b.ctx.responseId === responseId;
+  if (!blocks.some(owned)) return null;
+  return blocks.filter((b) => !owned(b));
+}
+
+/**
+ * Apply the turn transition a status snapshot makes to the "Compacting…"
+ * spinners, as the live edge it stands in for would: settling the open turn
+ * retires its spinners, and revealing a newly running turn hands them to it.
+ *
+ * @param before The conversation's `activeResponse` before the snapshot.
+ * @param after The snapshot patch's `activeResponse`; `undefined` when the
+ *   snapshot left it unchanged.
+ * @returns the rewritten blocks, or `null` when nothing changes.
+ */
+function snapshotCompactionSpinners(
+  blocks: AnyBlock[],
+  before: ActiveResponse | null,
+  after: ActiveResponse | null | undefined,
+): AnyBlock[] | null {
+  if (after == null) return null;
+  if (after.state === "streaming") {
+    return after.responseId !== before?.responseId
+      ? adoptCompactionSpinners(blocks, after.responseId)
+      : null;
+  }
+  return before?.state === "streaming"
+    ? withoutSettledCompactionSpinners(blocks, before.responseId)
+    : null;
+}
+
 // How long after a terminal edge a delta still belongs to the finished
 // turn. A scheduled wake (cron / wakeup fires at 60s minimum) streams
 // its FIRST deltas ahead of the transcript batch that names the new
@@ -6126,25 +6206,34 @@ export async function pumpStreamEvents(
   // Ignore the rest of messages whose previews are stale or already replaced
   // by authoritative items, so late transport delivery cannot recreate them.
   const events = tapLiveDeltas(
-    tapSessionEvents(rawEvents, id, (elicitationId) => {
-      // A fast native approval can resolve in the few milliseconds between
-      // the reducer yielding its card and the next animation-frame flush.
-      // `handleSessionEvent` can only update committed blocks, so settle the
-      // buffered copy here instead of dropping that resolved edge.
-      const at = buffer.findIndex(
-        (block) =>
-          block.type === "elicitation" &&
-          block.elicitationId === elicitationId &&
-          block.status === "pending",
-      );
-      if (at === -1) return;
-      const target = buffer[at] as ElicitationBlock;
-      buffer[at] = {
-        ...target,
-        status: "responded",
-        response: { action: "auto_resolved" },
-      };
-    }),
+    tapSessionEvents(
+      rawEvents,
+      id,
+      (elicitationId) => {
+        // A fast native approval can resolve in the few milliseconds between
+        // the reducer yielding its card and the next animation-frame flush.
+        // `handleSessionEvent` can only update committed blocks, so settle the
+        // buffered copy here instead of dropping that resolved edge.
+        const at = buffer.findIndex(
+          (block) =>
+            block.type === "elicitation" &&
+            block.elicitationId === elicitationId &&
+            block.status === "pending",
+        );
+        if (at === -1) return;
+        const target = buffer[at] as ElicitationBlock;
+        buffer[at] = {
+          ...target,
+          status: "responded",
+          response: { action: "auto_resolved" },
+        };
+      },
+      () => {
+        // Commit what the stream emitted before a turn edge applies, so the
+        // edge's adoption and cleanup (e.g. of a "Compacting…" spinner) see it.
+        flush();
+      },
+    ),
     id,
     ignoredMessages,
     set,
@@ -6230,6 +6319,8 @@ export async function pumpStreamEvents(
           activeResponse: { responseId: block.responseId, state: "streaming", error: null },
           status: "streaming",
         });
+        const adopted = adoptCompactionSpinners(get().blocks, block.responseId);
+        if (adopted !== null) set({ blocks: adopted });
         continue;
       }
 
@@ -6388,6 +6479,9 @@ export async function pumpStreamEvents(
         if (active !== null && active.responseId !== endedId) {
           continue;
         }
+        // A terminal for an already-settled (or stopped) turn must not take a
+        // spinner published after it (an idle `/compact` is stamped with it).
+        const settlesTurn = endedId !== "" && (active === null || active.state === "streaming");
         // If the active response was already marked cancelled by an
         // earlier `session.interrupted`, keep that. Session events
         // are the authoritative source for user-initiated terminals.
@@ -6404,12 +6498,16 @@ export async function pumpStreamEvents(
         // had their preview replaced when their `text_done` committed, so
         // this is usually a no-op.
         get().blocks.forEach((candidate) => ignoreLivePreview(candidate, ignoredMessages));
-        set((s) => ({
-          status: "idle",
-          blocks: s.blocks.some(isLiveProvisionalBlock)
+        set((s) => {
+          const blocks = s.blocks.some(isLiveProvisionalBlock)
             ? s.blocks.filter((b) => !isLiveProvisionalBlock(b))
-            : s.blocks,
-        }));
+            : s.blocks;
+          return {
+            status: "idle",
+            blocks:
+              (settlesTurn ? withoutSettledCompactionSpinners(blocks, endedId) : null) ?? blocks,
+          };
+        });
         const convId = get().conversationId;
         if (convId) {
           queryClient?.invalidateQueries({ queryKey: sessionItemsQueryKey(convId) });
@@ -7314,10 +7412,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // Blocks the reducer emitted before this edge named the turn
           // (codex opens reasoning ~2s earlier) carry no response id, so
           // they'd group into their own bubble beside the turn's own.
-          // Attribute them to the turn they belong to.
-          const adopted = adoptTrailingUnattributedBlocks(s.blocks, event.responseId);
-          if (adopted !== null) patch.blocks = adopted;
+          // Attribute them to the turn they belong to. The turn also takes
+          // over any "Compacting…" spinner still on screen.
+          const attributed =
+            adoptTrailingUnattributedBlocks(s.blocks, event.responseId) ?? s.blocks;
+          const adopted = adoptCompactionSpinners(attributed, event.responseId) ?? attributed;
+          if (adopted !== s.blocks) patch.blocks = adopted;
         }
+        // The open turn this edge settles, whose spinner goes with it.
+        let settledResponseId: string | null = null;
         // `waiting` is a TURN-END edge (the turn already finished; only
         // background work — background shells / sub-agents — outlives it). It
         // must finalize the local send lifecycle exactly like `idle`, NOT keep
@@ -7331,6 +7434,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         if (event.status === "idle" || event.status === "failed" || event.status === "waiting") {
           if (event.responseId !== undefined && s.activeResponse?.responseId === event.responseId) {
             patch.status = "idle";
+            if (s.activeResponse.state === "streaming") settledResponseId = event.responseId;
             if (s.activeResponse.state !== "cancelled") {
               patch.activeResponse = {
                 responseId: event.responseId,
@@ -7351,6 +7455,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             // no longer publish status. A `cancelled` turn is preserved as-is.
             patch.status = "idle";
             if (s.activeResponse?.state === "streaming") {
+              settledResponseId = s.activeResponse.responseId;
               patch.activeResponse = {
                 ...s.activeResponse,
                 state: event.status === "failed" ? "failed" : "completed",
@@ -7433,6 +7538,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ...structuredErrorFields(statusError, statusAgentName),
             } satisfies ErrorBlock,
           ];
+        }
+        if (settledResponseId !== null) {
+          const settled = withoutSettledCompactionSpinners(
+            patch.blocks ?? s.blocks,
+            settledResponseId,
+          );
+          if (settled !== null) patch.blocks = settled;
         }
         // A `runner_disconnected` card is an observation ("can't reach the
         // runner"), not a turn result: any live status edge from the runner
@@ -7723,6 +7835,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         });
       }
       finalizeCurrentActive("cancelled", event.responseId, sourceConversationId);
+      // Stopping the turn stops its compaction, and the idle that follows a
+      // native stop may name no turn, so the stop itself retires the spinner.
+      applyToConversation((s) => {
+        const stopped = s.activeResponse?.responseId;
+        const blocks = stopped ? withoutSettledCompactionSpinners(s.blocks, stopped) : null;
+        return blocks === null ? {} : { blocks };
+      });
       return;
     case "session_created":
       // A side chat the user asked for (via `/side`, the `+` tray, or the rail's
@@ -8057,10 +8176,14 @@ async function* tapSessionEvents(
   events: AsyncIterable<StreamEvent>,
   conversationId: string,
   onElicitationResolved?: (elicitationId: string) => void,
+  beforeTurnEdge?: () => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
     if (!isConversationDisposed(conversationId)) {
       streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
+    }
+    if (event.type === "session_status" || event.type === "session_interrupted") {
+      beforeTurnEdge?.();
     }
     handleSessionEvent(event, conversationId);
     if (event.type === "elicitation_resolved") {

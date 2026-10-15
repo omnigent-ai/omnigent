@@ -66,6 +66,15 @@ export interface PullRequestComment {
   url: string | null;
 }
 
+export type PullRequestReviewerState =
+  "PENDING" | "APPROVED" | "COMMENTED" | "CHANGES_REQUESTED" | "DISMISSED";
+
+export interface PullRequestReviewer {
+  login: string;
+  kind: "user" | "team";
+  state: PullRequestReviewerState;
+}
+
 export interface PullRequest {
   number: number;
   title: string;
@@ -80,6 +89,9 @@ export interface PullRequest {
   base_ref: string | null;
   head_ref: string | null;
   checks: PullRequestChecks;
+  /** False when the signed-in token cannot read check runs (GitHub refuses them to
+   *  fine-grained personal access tokens), so `checks` is empty. Absent means supported. */
+  checks_supported?: boolean;
   head_sha?: string;
   base_sha?: string;
   /** PR description (GitHub-flavored markdown); null when empty. Optional: a
@@ -88,6 +100,8 @@ export interface PullRequest {
   /** Top-level PR comments GitHub shows by default; absent from an older host. */
   comments?: PullRequestComment[];
   comments_partial?: boolean;
+  /** Assigned reviewers and their current review state; absent from older hosts. */
+  reviewers?: PullRequestReviewer[];
 }
 
 export interface PullRequestRepo {

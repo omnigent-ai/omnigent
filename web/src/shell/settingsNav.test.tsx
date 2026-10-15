@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   isAdmin: false,
   customAgentsEnabled: false as boolean | undefined,
   agentInstall: false,
+  enabledConnections: [] as string[],
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -35,6 +36,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
       custom_agents_settings_ui: mocks.customAgentsEnabled,
     },
     agent_install: mocks.agentInstall,
+    enabled_connections: mocks.enabledConnections,
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -70,6 +72,7 @@ beforeEach(() => {
   mocks.isAdmin = false;
   mocks.customAgentsEnabled = false;
   mocks.agentInstall = false;
+  mocks.enabledConnections = [];
 });
 afterEach(cleanup);
 
@@ -172,6 +175,23 @@ describe("settingsNavGroups", () => {
 });
 
 describe("SettingsSidebarBody", () => {
+  it.each([
+    { connections: [], mcp: false, integrations: false },
+    { connections: ["mcp"], mcp: true, integrations: false },
+    { connections: ["github", "mcp"], mcp: true, integrations: true },
+    { connections: ["github"], mcp: false, integrations: true },
+  ])(
+    "separates MCP navigation from sandbox accounts: $connections",
+    ({ connections, mcp, integrations }) => {
+      mocks.enabledConnections = connections;
+      renderBody();
+      expect(!!screen.queryByTestId("settings-nav-mcp")).toBe(mcp);
+      expect(!!screen.queryByTestId("settings-nav-integrations")).toBe(integrations);
+      if (mcp)
+        expect(screen.getByTestId("settings-nav-mcp")).toHaveAttribute("href", "/settings/mcp");
+    },
+  );
+
   it("renders Back as a standard sidebar row without a collapse button", () => {
     renderBody();
     const backLink = screen.getByRole("link", { name: "Back" });
@@ -442,6 +462,30 @@ function routeHook(path: string) {
 }
 
 describe("custom agent settings availability", () => {
+  it.each(["agent/space %2F?#é", "a%percent", "simple-id"])(
+    "decodes the agent ID once: %s",
+    (agentId) => {
+      mocks.customAgentsEnabled = true;
+      mocks.agentInstall = true;
+      expect(
+        routeHook(`/ml/omnigent-embed/settings/custom-agents/${encodeURIComponent(agentId)}`),
+      ).toEqual({
+        inSettings: true,
+        section: "custom-agents",
+        agentId,
+      });
+    },
+  );
+
+  it("falls back to the agent list for malformed URL escapes", () => {
+    mocks.customAgentsEnabled = true;
+    mocks.agentInstall = true;
+    expect(routeHook("/settings/custom-agents/%E0%A4%A")).toEqual({
+      inSettings: true,
+      section: "custom-agents",
+    });
+  });
+
   it.each([
     [undefined, true],
     [false, false],

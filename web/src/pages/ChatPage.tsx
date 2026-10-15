@@ -1,3 +1,4 @@
+import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useConversationRedirect } from "@/hooks/useConversationRedirect";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
@@ -23,15 +24,7 @@ import {
   useRef,
   useState,
 } from "react";
-import {
-  BotIcon,
-  WandSparklesIcon,
-  CornerUpLeftIcon,
-  FileTextIcon,
-  Loader2Icon,
-  MessagesSquareIcon,
-  XIcon,
-} from "lucide-react";
+import { BotIcon, WandSparklesIcon, FileTextIcon, Loader2Icon, XIcon } from "lucide-react";
 import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   composerSendShortcutKeys,
@@ -88,7 +81,9 @@ import {
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
-import { createSideChat, retrySession } from "@/lib/sessionsApi";
+import { ApiError, createSideChat, retrySession } from "@/lib/sessionsApi";
+import { getProject } from "@/lib/projectsApi";
+import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
@@ -241,6 +236,7 @@ import {
   formatStatusModelLabel,
   formatStatusEffortLabel,
   formatModelEffortStatusLabel,
+  nativeModelTooltip,
 } from "@/lib/composerModelLabel";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -1089,6 +1085,24 @@ export function ChatPage() {
     else void reconnect();
   }, [isUnboundFork, canResumeOnLocalHost, reconnect]);
 
+  const newSessionProjectId =
+    activeConv?.project_id !== undefined ? activeConv.project_id : activeSession?.projectId;
+  const newSessionProjectLabel = (activeConv?.labels ?? activeSession?.labels)?.[PROJECT_LABEL_KEY];
+  const openNewSession = useCallback(async () => {
+    try {
+      const projectName = newSessionProjectId
+        ? (await getProject(newSessionProjectId)).name
+        : newSessionProjectLabel;
+      navigate(projectName ? `/?project=${encodeURIComponent(projectName)}` : "/");
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        navigate("/");
+        return;
+      }
+      toast.error("Couldn't open a new session in this project. Please try again.");
+    }
+  }, [newSessionProjectId, newSessionProjectLabel, navigate]);
+
   // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
   // early return can't change the hook order between renders.
   if (urlConvId) {
@@ -1115,6 +1129,7 @@ export function ChatPage() {
       agentsError={agentsError}
       disabled={!agentId || agentsError !== null}
       onSend={onSend}
+      onNewSession={openNewSession}
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
       onShowReconnectHelp={onShowReconnectHelp}
@@ -1233,133 +1248,8 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
   );
 }
 
-function SelectionPopup({
-  containerRef,
-  onReply,
-  onAskInSideChat,
-}: {
-  containerRef: React.RefObject<HTMLElement | null>;
-  onReply: (text: string) => void;
-  // Present only when the session's harness supports side chat; renders the
-  // "Ask in side chat" action beside Reply.
-  onAskInSideChat?: (text: string) => void;
-}) {
-  const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
-  const selectedTextRef = useRef<string>("");
-
-  const updatePopup = useCallback(() => {
-    const sel = window.getSelection();
-    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
-      setPopupPos(null);
-      selectedTextRef.current = "";
-      return;
-    }
-
-    const text = sel.toString().trim();
-    if (!text) {
-      setPopupPos(null);
-      selectedTextRef.current = "";
-      return;
-    }
-
-    // Scope to the conversation container — ignore selections in the composer.
-    const container = containerRef.current;
-    if (!container) {
-      setPopupPos(null);
-      selectedTextRef.current = "";
-      return;
-    }
-    const anchor = sel.anchorNode;
-    if (!anchor || !container.contains(anchor)) {
-      setPopupPos(null);
-      selectedTextRef.current = "";
-      return;
-    }
-
-    const range = sel.getRangeAt(0);
-    const rect = range.getBoundingClientRect();
-    // Position the button just above the selection, horizontally centered.
-    setPopupPos({
-      x: rect.left + rect.width / 2,
-      y: rect.top,
-    });
-    selectedTextRef.current = text;
-  }, [containerRef]);
-
-  useEffect(() => {
-    document.addEventListener("mouseup", updatePopup);
-    document.addEventListener("selectionchange", updatePopup);
-    return () => {
-      document.removeEventListener("mouseup", updatePopup);
-      document.removeEventListener("selectionchange", updatePopup);
-    };
-  }, [updatePopup]);
-
-  if (!popupPos) return null;
-
-  return (
-    <div
-      style={{
-        position: "fixed",
-        // Translate left by 50% to center the button over the midpoint of the
-        // selection, and up by 100% + 6px to sit just above the selection rect.
-        left: popupPos.x,
-        top: popupPos.y,
-        transform: "translate(-50%, calc(-100% - 6px))",
-        zIndex: 50,
-      }}
-    >
-      <Button
-        type="button"
-        variant="secondary"
-        size="sm"
-        // Override shared-variant translucent hover — this button floats over text.
-        className="gap-1 shadow-md hover:bg-secondary hover:brightness-95 dark:hover:brightness-110"
-        onMouseDown={(e) => {
-          // Prevent the mousedown from clearing the selection before we read it.
-          e.preventDefault();
-        }}
-        onClick={() => {
-          const text = selectedTextRef.current;
-          if (text) {
-            onReply(text);
-            window.getSelection()?.removeAllRanges();
-            setPopupPos(null);
-            selectedTextRef.current = "";
-          }
-        }}
-      >
-        <CornerUpLeftIcon className="size-3.5" />
-        Reply ↵
-      </Button>
-      {onAskInSideChat ? (
-        <Button
-          type="button"
-          variant="secondary"
-          size="sm"
-          className="gap-1 shadow-md hover:bg-secondary hover:brightness-95 dark:hover:brightness-110"
-          onMouseDown={(e) => {
-            e.preventDefault();
-          }}
-          onClick={() => {
-            const text = selectedTextRef.current;
-            if (text) {
-              onAskInSideChat(text);
-              window.getSelection()?.removeAllRanges();
-              setPopupPos(null);
-              selectedTextRef.current = "";
-            }
-          }}
-        >
-          <MessagesSquareIcon className="size-3.5" />
-          Ask in side chat
-        </Button>
-      ) : null}
-    </div>
-  );
-}
-
 interface MainAgentSurfaceProps {
+  onNewSession: () => void;
   /**
    * Active conversation id, or null when on the landing page. Forwarded
    * to MainTerminalView so the inline terminal can target the right
@@ -1551,6 +1441,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   disabled,
   onSend,
   onSendSlashCommand,
+  onNewSession,
   onStop,
   onShowReconnectHelp,
   agents,
@@ -1861,6 +1752,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             status={status}
             isWorking={isWorking}
             onSend={handleSend}
+            onNewSession={onNewSession}
             onSendSlashCommand={handleSendSlashCommand}
             onStop={onStop}
             agents={agents}
@@ -1960,6 +1852,7 @@ interface ComposerHandle {
 }
 
 interface ComposerProps {
+  onNewSession: () => void;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. */
   isWorking: boolean;
@@ -2333,6 +2226,7 @@ function ComposerImpl(
     disabled,
     onSend,
     onSendSlashCommand,
+    onNewSession,
     onStop,
     agents,
     selectedAgentId,
@@ -3023,6 +2917,17 @@ function ComposerImpl(
    */
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
+      case "/new": {
+        if (arg) {
+          setCommandError("/new does not accept arguments");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        onNewSession();
+        return true;
+      }
       case "/compact": {
         if (!showCompact) {
           setCommandError("/compact is not supported for this agent type");
@@ -3267,13 +3172,22 @@ function ComposerImpl(
       recallingRef.current = false;
     },
     startSideChat(selectedText) {
-      // Open an empty side-chat rail tab right away with the selection quoted in
-      // its composer; the fork is created when the user sends from that tab.
+      // Quote in the visible side chat, or open a pending tab immediately.
+      // A pending tab creates its fork only when the user sends.
       const sourceId = useChatStore.getState().conversationId;
       if (disabled || isReadOnly || unreachable || sourceId === null || !selectedText.trim()) {
         return;
       }
-      useChatStore.getState().openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
+      const store = useChatStore.getState();
+      const target = store.sideChatSelectionTarget;
+      if (target?.parentId === sourceId) {
+        store.updateSideChatComposer(target.childId, (current) => ({
+          ...current,
+          quotes: [...(current.quotes ?? []), selectedText],
+        }));
+      } else {
+        store.openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
+      }
     },
   }));
 
@@ -3457,7 +3371,8 @@ function ComposerImpl(
       };
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
-      onSend(mentionPreamble + trimmed, sendFiles);
+      const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
+      onSend(mentionPreamble + message, sendFiles);
     }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
@@ -4826,6 +4741,7 @@ function SessionHarnessPicker({
                         ? selectFusionModel(composerFusion.default)
                         : selectModel(supportsModelReset && model.isDefault ? null : model.id),
                     testId: `composer-agent-model-${model.id}`,
+                    title: nativeModelTooltip(model),
                     className: "whitespace-normal break-words",
                     data: { "data-model-id": model.id },
                   })),

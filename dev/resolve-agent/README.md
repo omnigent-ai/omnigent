@@ -154,8 +154,9 @@ to the publisher. No new test-selection gate is introduced.
    not flaky-green on a clean machine. When the repro handoff carries
    before-fix recordings, **re-records the same drivers on the fixed tree**
    (building the SPA up front, then pytest-playwright `--video` for web/terminal
-   facets, the VHS tape for CLI facets), captions each after clip with the actions
-   it performs, and carries the before clips' captions through — so the captioned
+   facets, the VHS tape for CLI facets), burns timed action/outcome captions below
+   each new after clip with `dev/caption_recording.py`, inspects the render, and
+   carries the before clips and their captions through unchanged — so the captioned
    before/after pair lands in the PR's Demo section and, for Linear bugs with a
    key available, on the ticket.
 6. *(author path)* Commits the focused, locally validated fix, then follows the
@@ -266,7 +267,7 @@ Run the bundled helper against a ready PR in a repository with both review
 workflows installed (read-only):
 
 ```bash
-python3 dev/resolve-agent/skills/resolve-drive-pr/review_cycle.py snapshot --repository omnigent-ai/omnigent --pr-number <pr>
+python3 dev/agent-skills/otto-pr-review-loop/review_cycle.py snapshot --repository omnigent-ai/omnigent --pr-number <pr>
 ```
 
 A new head must show both reviews incomplete until that head has Polly's reviewed

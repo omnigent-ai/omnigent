@@ -1245,7 +1245,7 @@ async def _drive_remembers_last_picked_host(base_url: str, session_id: str) -> N
 def test_start_session_keeps_offline_host_selected(
     seeded_session: tuple[str, str], managed: bool
 ) -> None:
-    """An offline last pick stays selected and blocks sending until an explicit switch."""
+    """An offline last pick blocks sending; other offline hosts expand in a bounded list."""
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_keeps_offline_host_selected(base_url, session_id, managed))
 
@@ -1259,6 +1259,21 @@ async def _drive_keeps_offline_host_selected(
         browser = await pw.chromium.launch()
         page = await browser.new_page()
         hosts = json.loads(_two_hosts_body())
+        # API order represents most recent activity, independent of the host name.
+        offline_names = [
+            "workstation",
+            "build-box",
+            "laptop",
+            "dev-vm",
+            "sandbox",
+            "mac",
+            "archive",
+        ]
+        hosts["hosts"].extend(
+            {"host_id": f"host_e2e_{name}", "name": name, "owner": "e2e", "status": "offline"}
+            for name in offline_names
+        )
+        stale_row = page.get_by_test_id("new-chat-landing-host-host_e2e_workstation")
         try:
             create_bodies: list[dict[str, Any]] = []
             await _register_common_routes(
@@ -1295,8 +1310,37 @@ async def _drive_keeps_offline_host_selected(
             await page.goto(f"{base_url}/")
             chip = page.get_by_test_id("new-chat-landing-host-chip")
             await chip.click()
-            await page.get_by_test_id(f"new-chat-landing-host-{beta_id}").click()
+            beta_row = page.get_by_test_id(f"new-chat-landing-host-{beta_id}")
+            await expect(beta_row).to_be_visible()
+            await expect(stale_row).to_have_count(0)
+            toggle = page.get_by_role("menuitem", name="Offline hosts (7)")
+            await expect(toggle).to_have_attribute("aria-expanded", "false")
+            await toggle.click()
+            offline = page.get_by_role("group", name="Offline hosts")
+            await expect(offline.get_by_role("menuitem")).to_have_count(5)
+            await expect(offline.get_by_role("menuitem")).to_have_text(
+                [f"{name}offline" for name in offline_names[:5]]
+            )
+            await expect(stale_row).to_have_attribute("aria-disabled", "true")
+            # Keyboard activation must also keep the menu open.
+            more = page.get_by_role("menuitem", name="Show more (2 remaining)")
+            await more.focus()
+            await more.press("Enter")
+            await expect(offline.get_by_role("menuitem")).to_have_count(7)
+            await expect(more).to_have_count(0)
+            assert await offline.evaluate("el => el.scrollHeight > el.clientHeight")
+            await offline.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+            await expect(offline.get_by_role("menuitem").last).to_be_in_viewport()
+            await toggle.click()
+            await expect(offline).to_have_count(0)
+            await toggle.click()
+            await expect(offline.get_by_role("menuitem")).to_have_count(5)
+            await beta_row.click()
             await expect(chip).to_have_attribute("aria-label", f"Host: {beta_name}, Online")
+            await expect(page.get_by_test_id("new-chat-landing-host-menu")).to_have_count(0)
+            await chip.click()
+            await expect(toggle).to_have_attribute("aria-expanded", "false")
+            await page.keyboard.press("Escape")
 
             # Reload without the in-memory draft after the chosen host disconnects.
             hosts["hosts"][1]["status"] = "offline"
@@ -1314,6 +1358,13 @@ async def _drive_keeps_offline_host_selected(
             await expect(
                 page.get_by_test_id(f"new-chat-landing-host-{beta_id}")
             ).to_have_attribute("data-active", "true")
+            await expect(stale_row).to_have_count(0)
+            await toggle.click()
+            await expect(offline.get_by_role("menuitem")).to_have_count(5)
+            await expect(beta_row).to_have_count(1)
+            await expect(offline.get_by_test_id(f"new-chat-landing-host-{beta_id}")).to_have_count(
+                0
+            )
             assert create_bodies == []
 
             # Only an explicit destination change permits creation elsewhere.
@@ -1920,10 +1971,12 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             effort = page.locator(
                 '[data-testid^="new-chat-landing-agent-effort-"][aria-checked="true"]'
             )
-            await expect(model).to_contain_text("Harness default")
+            await expect(model).to_contain_text("Default")
             await expect(effort).to_contain_text("Default")
             await expect(
-                page.get_by_role("menuitemcheckbox", name="Default", exact=True)
+                page.get_by_test_id("new-chat-landing-agent-efforts").get_by_role(
+                    "menuitemcheckbox", name="Default", exact=True
+                )
             ).to_have_count(1)
 
             # Model and effort picks commit immediately using the live host catalog.

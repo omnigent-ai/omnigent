@@ -170,6 +170,8 @@ try:
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider, warn_if_single_user_exposed
+    from omnigent.server.managed_hosts import parse_sandbox_config
+    from omnigent.server.server_config import load_server_config
     from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     # OTel: the Databricks Apps platform auto-injects
@@ -267,6 +269,18 @@ try:
         logger.warning("%s", _exposure)
 
     auth_provider = create_auth_provider()
+
+    # Managed sandbox hosts (host_type="managed" sessions): parse the server
+    # config's ``sandbox:`` section like ``omnigent server`` does, so a typo
+    # stops startup here instead of 502-ing the first managed session.
+    try:
+        sandbox_config = parse_sandbox_config(load_server_config().get("sandbox"))
+    except ValueError as exc:
+        logger.error("Invalid 'sandbox' section in the server config: %s", exc)
+        raise
+    if sandbox_config is not None:
+        logger.info("Managed sandbox hosts configured from the server config")
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -280,6 +294,7 @@ try:
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
+        sandbox_config=sandbox_config,
     )
 
     if __name__ == "__main__":

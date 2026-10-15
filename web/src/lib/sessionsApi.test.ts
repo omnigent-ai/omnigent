@@ -152,6 +152,7 @@ describe("createSession", () => {
       queuedItems: undefined,
       contextWindow: undefined,
       labels: undefined,
+      projectId: null,
       lastTaskError: undefined,
       lastTotalTokens: undefined,
       usageIncluded: true,

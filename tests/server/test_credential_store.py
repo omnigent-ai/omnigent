@@ -5,11 +5,14 @@ from __future__ import annotations
 import base64
 import json
 from typing import Any
+from unittest.mock import Mock
 
+import pytest
 import sqlalchemy as sa
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import get_or_create_engine
+from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 
 
@@ -92,6 +95,32 @@ def test_update_secret_missing_row_returns_false(db_uri: str) -> None:
     assert store.update_secret("ghost", "github", secret={"access_token": "x"}) is False
 
 
+@pytest.mark.parametrize("operation", ["insert", "upsert", "update_secret"])
+@pytest.mark.parametrize("unit", ["x", "é"], ids=["ascii", "utf8"])
+def test_encrypted_size_limit_preserves_existing_connection(db_uri, monkeypatch, operation, unit):
+    cipher = _FakeCipher()
+    store = CredentialStore(db_uri, cipher)
+    if operation != "insert":
+        store.upsert("alice", "github", secret={"access_token": "old"}, metadata={"scope": "old"})
+    before = store.get("alice", "github", with_secret=True)
+    monkeypatch.setattr(store._engine.dialect, "name", "mysql")
+    ciphertext = unit * (65_536 // len(unit.encode("utf-8")))
+    encrypt = Mock(return_value=ciphertext)
+    monkeypatch.setattr(cipher, "encrypt", encrypt)
+    write = store.update_secret if operation == "update_secret" else store.upsert
+    with pytest.raises(SecretTooLargeError, match=r"65535 bytes.*smaller credential"):
+        write("alice", "github", secret={"access_token": "new"}, metadata={"scope": "new"})
+    assert store.get("alice", "github", with_secret=True) == before
+
+    # Exactly 65,535 stored bytes fit, including non-ASCII cipher envelopes.
+    encrypt.return_value = ciphertext[:-1] + ("x" if unit == "é" else "")
+    write("alice", "github", secret={"access_token": "new"}, metadata={"scope": "new"})
+    with get_or_create_engine(db_uri).connect() as connection:
+        stored = connection.execute(sa.text("SELECT secret_enc FROM connections")).scalar_one()
+    assert stored == encrypt.return_value
+    assert len(stored.encode("utf-8")) == 65_535
+
+
 def test_secret_never_stored_in_plaintext(db_uri: str) -> None:
     # The actual at-rest guarantee: the token bytes must not appear in the
     # column, only the cipher's ciphertext.
@@ -153,3 +182,10 @@ def test_non_empty_account_id(db_uri: str) -> None:
     # The default-account view ("") is a distinct, absent row.
     assert store.get("alice", "github") is None
     assert len(store.list_for_user("alice")) == 2
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", "postgresql"])
+def test_other_databases_keep_their_existing_credential_capacity(dialect):
+    from omnigent.stores.credential_store.sqlalchemy_store import _check_encrypted_size
+
+    _check_encrypted_size("x" * 65_536, dialect)

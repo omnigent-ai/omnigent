@@ -48,6 +48,124 @@
         "title": "AddCommentRequest",
         "type": "object"
       },
+      "AgentDetailObject": {
+        "description": "Agent summary with caller ownership for management actions.",
+        "properties": {
+          "builtin": {
+            "default": false,
+            "title": "Builtin",
+            "type": "boolean"
+          },
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "mcp_registry_editable": {
+            "default": false,
+            "title": "Mcp Registry Editable",
+            "type": "boolean"
+          },
+          "mcp_servers": {
+            "items": {
+              "$ref": "#/components/schemas/MCPServerSummary"
+            },
+            "title": "Mcp Servers",
+            "type": "array"
+          },
+          "mcp_servers_editable": {
+            "default": false,
+            "title": "Mcp Servers Editable",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "object": {
+            "default": "agent",
+            "title": "Object",
+            "type": "string"
+          },
+          "policies": {
+            "items": {
+              "$ref": "#/components/schemas/PolicySummary"
+            },
+            "title": "Policies",
+            "type": "array"
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/SkillSummary"
+            },
+            "title": "Skills",
+            "type": "array"
+          },
+          "terminals": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Terminals",
+            "type": "array"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "user_owned": {
+            "title": "User Owned",
+            "type": "boolean"
+          },
+          "version": {
+            "default": 1,
+            "format": "int64",
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_at",
+          "user_owned"
+        ],
+        "title": "AgentDetailObject",
+        "type": "object"
+      },
       "AgentObject": {
         "description": "API representation of a registered agent.",
         "properties": {
@@ -91,6 +209,12 @@
             "description": "Unique agent identifier, e.g. `\"ag_abc123\"`.",
             "title": "Id",
             "type": "string"
+          },
+          "mcp_registry_editable": {
+            "default": false,
+            "description": "Whether this caller owns the session and can select managed MCP services independently of agent ownership.",
+            "title": "Mcp Registry Editable",
+            "type": "boolean"
           },
           "mcp_servers": {
             "description": "MCP servers the agent is connected to (secret fields omitted). Empty list when the spec declares no MCP servers or when the bundle cannot be loaded.",
@@ -9266,7 +9390,8 @@
           "transport": {
             "enum": [
               "http",
-              "stdio"
+              "stdio",
+              "registry"
             ],
             "title": "Transport",
             "type": "string"
@@ -9814,7 +9939,7 @@
         ]
       },
       "get": {
-        "description": "Return the list summary for a server agent or the caller's own user agent.\n\nMissing and inaccessible agents both return 404. Sharing a session\ndoes not grant access to its owner's agent through this route.\n\n**Returns:** The same redacted `AgentObject` used by the list routes.",
+        "description": "Return the list summary for a server agent or the caller's own user agent.\n\nMissing and inaccessible agents both return 404. Sharing a session\ndoes not grant access to its owner's agent through this route.\n\n**Returns:** The redacted summary plus whether the caller owns the agent.",
         "operationId": "get_agent_v1_agents__agent_id__get",
         "parameters": [
           {
@@ -9833,7 +9958,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AgentObject"
+                  "$ref": "#/components/schemas/AgentDetailObject"
                 }
               }
             },
@@ -11249,6 +11374,57 @@
         "summary": "Info",
         "tags": [
           "system"
+        ]
+      }
+    },
+    "/v1/mcp/{service_id}": {
+      "post": {
+        "operationId": "gateway_v1_mcp__service_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "service_id",
+            "required": true,
+            "schema": {
+              "title": "Service Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Omnigent-Session-Id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "X-Omnigent-Session-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Gateway",
+        "tags": [
+          "mcp_gateway"
         ]
       }
     },
@@ -16155,7 +16331,7 @@
     },
     "/v1/sessions/{source_id}/fork": {
       "post": {
-        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n`body.host_type: \"managed\"` gives the fork its own\nserver-provisioned sandbox instead of leaving it unbound for the\ncaller to bind a host to. It schedules the same background launch\na managed create does \u2014 this POST returns before the sandbox\nexists \u2014 and the sandbox is registered to the FORKING caller, not\nto the source session's owner. The fork's workspace is the\nrepository named by `body.workspace`, or the one the source\nrecorded when that field is omitted.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` names no agent; 403/404 if the caller lacks read access on the source, or on the session that owns a session-scoped `body.agent_id`; 400 if the source has no agent binding, `body.up_to_response_id` names no response in the source session, or a managed fork asks for a sandbox this server has not configured.",
+        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n`body.host_type: \"managed\"` gives the fork its own\nserver-provisioned sandbox instead of leaving it unbound for the\ncaller to bind a host to. It schedules the same background launch\na managed create does \u2014 this POST returns before the sandbox\nexists \u2014 and the sandbox is registered to the FORKING caller, not\nto the source session's owner. The fork's workspace is the\nrepository named by `body.workspace`, or the one the source\nrecorded when that field is omitted.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` names no agent; 403/404 if the caller lacks read access on the source, or on the session that owns a session-scoped `body.agent_id`; 400 if the source has no agent binding, `body.up_to_response_id` names no response in the source session, or a managed fork asks for a sandbox this server has not configured; 410 if the source's agent was removed or a required bundle copy finds its source missing.",
         "operationId": "fork_session_v1_sessions__source_id__fork_post",
         "parameters": [
           {

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from http.client import BadStatusLine, RemoteDisconnected
@@ -37,12 +38,14 @@ from omnigent.harnesses.claude_native.bridge import (
     _LOGIN_GUIDANCE,
     _build_tools,
     _claude_prompt_rendered,
+    _escape_slash_command_text,
     _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
     _is_box_rule,
     _JsonlRecord,
     _occupying_surface,
     augment_claude_args,
+    claude_global_config_path,
     count_hook_events,
     display_cost_approval_popup,
     ensure_claude_workspace_trusted,
@@ -2955,6 +2958,153 @@ def test_read_transcript_items_since_surfaces_combined_shell_record(
     assert items[0].response_id == items[1].response_id
 
 
+@pytest.mark.parametrize(
+    ("content", "kind", "name", "arguments"),
+    [
+        (
+            "<command-name>/model</command-name>\n"
+            "            <command-message>model</command-message>\n"
+            "            <command-args>example-model</command-args>",
+            "command",
+            "model",
+            "example-model",
+        ),
+        (
+            "<command-message>example:simplify</command-message>\n"
+            "<command-name>/example:simplify</command-name>\n"
+            "<command-args>the parser</command-args>",
+            "skill",
+            "example:simplify",
+            "the parser",
+        ),
+    ],
+    ids=["builtin", "plugin-skill-message-first"],
+)
+def test_read_transcript_items_since_surfaces_top_level_slash_command_echo(
+    tmp_path: Path,
+    content: str,
+    kind: str,
+    name: str,
+    arguments: str,
+) -> None:
+    """
+    A top-level ``local_command`` command echo becomes a ``slash_command`` item.
+
+    Claude Code can record ``/model`` as a ``type="system"`` record instead of
+    a ``role=user`` message. Dropping it leaves the web input that ran the
+    command queued until a later message reports it as lost. The stdout record
+    Claude writes next stays hidden.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "type": "system",
+                    "subtype": "local_command",
+                    "level": "info",
+                    "isMeta": False,
+                    "uuid": "command-echo",
+                    "content": content,
+                },
+                {
+                    "type": "system",
+                    "subtype": "local_command",
+                    "level": "info",
+                    "isMeta": False,
+                    "uuid": "command-stdout",
+                    "commandRun": {"command": name, "args": arguments},
+                    "content": "<local-command-stdout>Set model to Example</local-command-stdout>",
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items] == ["slash_command"]
+    assert items[0].data == {
+        "agent": "claude-native-ui",
+        "kind": kind,
+        "name": name,
+        "arguments": arguments,
+    }
+    assert items[0].response_id == response_id
+    byte_result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert byte_result.items == items
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        # Tags printed by a shell command or by a command's own output.
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<bash-stdout><command-name>/model</command-name></bash-stdout>",
+        },
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<local-command-stderr><command-name>/model</command-name>"
+            "</local-command-stderr>",
+        },
+        # UI-only built-ins stay hidden, as in the ``role=user`` shape.
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<command-name>/resume</command-name><command-args></command-args>",
+        },
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<command-name>  </command-name>",
+        },
+    ],
+    ids=["bash-stdout", "command-stderr", "dropped-builtin", "empty-name"],
+)
+def test_read_transcript_items_since_ignores_non_echo_local_command_tags(
+    tmp_path: Path, record: dict[str, Any]
+) -> None:
+    """Command tags that are not Claude's own echo never become a ``slash_command``."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(json.dumps({"uuid": "rec", **record}) + "\n", encoding="utf-8")
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items if item.item_type == "slash_command"] == []
+
+
+def test_read_transcript_items_since_keeps_prose_mentioning_command_tags(
+    tmp_path: Path,
+) -> None:
+    """A typed prompt quoting ``<command-name>`` stays the user's message."""
+    text = "Why does the transcript contain <command-name>/model</command-name>?"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "user", "uuid": "prose", "message": {"role": "user", "content": text}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [(item.item_type, item.data) for item in items] == [
+        ("message", {"role": "user", "content": [{"type": "input_text", "text": text}]})
+    ]
+
+
 def test_read_transcript_items_since_surfaces_skill_when_command_name_is_not_first_tag(
     tmp_path: Path,
 ) -> None:
@@ -4047,6 +4197,11 @@ def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
     assert before <= payload["updated_at"] <= after
 
 
+# Each send-keys first leaves copy mode in the same tmux call; without it,
+# a pane the reader scrolled back hands the keys to tmux instead of Claude.
+_LEAVE_COPY_MODE = ["copy-mode", "-q", "-t", "claude:0.0", ";"]
+
+
 @pytest.mark.parametrize(
     "content,expected_payload",
     [
@@ -4143,6 +4298,7 @@ def test_inject_user_message_pastes_content_then_submits(
         f"got {len(captured)}."
     )
     clear_home, clear_kill, load, paste, submit = captured
+    assert clear_home[3:8] == _LEAVE_COPY_MODE
     assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
     assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
     # The buffer file carried the normalized content + trailing CR. A
@@ -4175,6 +4331,7 @@ def test_inject_user_message_pastes_content_then_submits(
         "tmux",
         "-S",
         "/tmp/example/tmux.sock",
+        *_LEAVE_COPY_MODE,
         "send-keys",
         "-t",
         "claude:0.0",
@@ -4186,10 +4343,10 @@ def test_inject_user_message_pastes_content_then_submits(
     ("content", "expected"),
     [
         ("plain text", "plain text"),
-        ("/help", "\ufeff/help"),
-        ("/exit", "\ufeff/exit"),
-        ("/quit now", "\ufeff/quit now"),
-        ("  /help", "  \ufeff/help"),
+        ("/help", " /help"),
+        ("/exit", " /exit"),
+        ("/quit now", " /quit now"),
+        ("  /help", "   /help"),
         ("/clear", "/clear"),
         ("/compact", "/compact"),
         ("/model sonnet-4", "/model sonnet-4"),
@@ -4206,6 +4363,20 @@ def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
     supported commands and skills are left untouched.
     """
     assert _escape_unsupported_slash_command(content) == expected
+
+
+@pytest.mark.parametrize("content", ["/help", "/exit now", "/not-a-real-skill hello"])
+def test_escaped_slash_command_survives_invisible_character_removal(content: str) -> None:
+    """
+    Claude Code drops invisible characters from a draft before it parses a
+    command, so the escaped text must still not lead with ``/`` after that.
+    Its transcript echo must also still match the queued message once
+    leading whitespace is ignored.
+    """
+    escaped = _escape_slash_command_text(content)
+    visible = "".join(ch for ch in escaped if unicodedata.category(ch) != "Cf")
+    assert not visible.startswith("/")
+    assert escaped.lstrip() == content
 
 
 @pytest.mark.parametrize(
@@ -4237,7 +4408,7 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
 ) -> None:
     """
     Unsupported slash commands land in the tmux buffer with a leading
-    zero-width escape so Claude Code treats them as user text.
+    space so Claude Code treats them as user text.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -4271,10 +4442,10 @@ def test_inject_user_message_escapes_unsupported_slash_command_payload(
     monkeypatch.setattr("subprocess.run", _fake_run)
 
     inject_user_message(bridge_dir, content="/help")
-    assert loaded_payloads[0].startswith("\ufeff/help".encode("utf-8"))
+    assert loaded_payloads[0].startswith(b" /help")
 
     inject_user_message(bridge_dir, content="/clear")
-    assert not loaded_payloads[1].startswith("\ufeff".encode("utf-8"))
+    assert loaded_payloads[1].startswith(b"/clear")
 
 
 def _rejection_pane(name: str, draft: str = "") -> str:
@@ -4372,7 +4543,7 @@ def test_unknown_command_rejection_redelivers_escaped(
     Claude Code drops a message whose leading ``/name`` it does not
     recognize without ever calling the model — the message would be
     silently swallowed. The bridge must watch for the rejection and paste
-    the message again with the zero-width escape so it reaches the model
+    the message again with the space escape so it reaches the model
     as plain user text.
     """
     payloads = _run_unknown_command_injection(
@@ -4386,7 +4557,7 @@ def test_unknown_command_rejection_redelivers_escaped(
         f"got {len(payloads)} paste(s)."
     )
     assert payloads[0].startswith(b"/not-a-real-skill")
-    assert payloads[1].startswith("\ufeff/not-a-real-skill hello world".encode("utf-8"))
+    assert payloads[1].startswith(b" /not-a-real-skill hello world")
 
 
 def test_unknown_name_accepted_as_skill_is_not_redelivered(
@@ -4868,8 +5039,9 @@ def test_inject_user_message_raises_when_draft_never_submits(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="message was not delivered"):
+    with pytest.raises(RuntimeError, match="message was not delivered") as caught:
         inject_user_message(bridge_dir, content="fix the flaky test")
+    assert isinstance(caught.value, claude_native_bridge.ClaudeMessageNotAccepted)
 
 
 def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(
@@ -5112,6 +5284,7 @@ def test_inject_interrupt_sends_escape_keystroke(
         "tmux",
         "-S",
         "/tmp/example/tmux.sock",
+        *_LEAVE_COPY_MODE,
         "send-keys",
         "-t",
         "claude:0.0",
@@ -5358,6 +5531,7 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         "tmux",
         "-S",
         "/tmp/example/tmux.sock",
+        *_LEAVE_COPY_MODE,
         "send-keys",
         "-t",
         "claude:0.0",
@@ -5367,6 +5541,7 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         "tmux",
         "-S",
         "/tmp/example/tmux.sock",
+        *_LEAVE_COPY_MODE,
         "send-keys",
         "-l",
         "-t",
@@ -5377,6 +5552,7 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         "tmux",
         "-S",
         "/tmp/example/tmux.sock",
+        *_LEAVE_COPY_MODE,
         "send-keys",
         "-t",
         "claude:0.0",
@@ -8135,6 +8311,9 @@ def _redirect_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> Path:
     """
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
+    # Inherited selectors would move Claude's global config elsewhere.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
     assert Path.home() == home  # guards against env-resolution surprises
     return home / ".claude.json"
 
@@ -8273,6 +8452,261 @@ def test_ensure_trusted_refuses_malformed_config(
 
     # The original (malformed) bytes are preserved — no clobber occurred.
     assert config_path.read_text() == raw
+
+
+def test_ensure_trusted_seeds_legacy_config_when_present(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A host with a legacy ``~/.claude/.config.json`` gets the gates seeded there.
+
+    Claude Code loads that legacy file instead of ``~/.claude.json`` whenever
+    it exists, so a seed in ``~/.claude.json`` is ignored and the trust
+    dialog blocks every session rooted at the home directory.
+    """
+    home = tmp_path / "home"
+    home_config_path = _redirect_home(monkeypatch, home)
+    legacy_path = home / ".claude" / ".config.json"
+    legacy_path.parent.mkdir()
+    legacy_path.write_text(json.dumps({"oauthAccount": {"emailAddress": "user@example.com"}}))
+
+    ensure_claude_workspace_trusted(home)
+
+    data = json.loads(legacy_path.read_text())
+    assert data["oauthAccount"] == {"emailAddress": "user@example.com"}
+    assert data["hasCompletedOnboarding"] is True
+    assert data["projects"][str(home.resolve())]["hasTrustDialogAccepted"] is True
+    # Writing the file Claude ignores would leave the prompt in place.
+    assert not home_config_path.exists()
+
+
+@pytest.mark.parametrize(
+    "config_dir,legacy_in,custom_oauth,expected",
+    [
+        (None, None, False, "home/.claude.json"),
+        (None, "home/.claude", False, "home/.claude/.config.json"),
+        ("selected", None, False, "selected/.claude.json"),
+        ("selected", "selected", False, "selected/.config.json"),
+        # The legacy lookup follows the selected config dir, not ~/.claude.
+        ("selected", "home/.claude", False, "selected/.claude.json"),
+        (None, None, True, "home/.claude-custom-oauth.json"),
+        ("selected", None, True, "selected/.claude-custom-oauth.json"),
+        (None, "home/.claude", True, "home/.claude/.config.json"),
+        # An empty selector moves only the legacy lookup, to Claude's cwd.
+        ("", "home/.claude", False, "home/.claude.json"),
+        ("", "workspace", False, "workspace/.config.json"),
+        ("", None, True, "home/.claude-custom-oauth.json"),
+    ],
+)
+def test_claude_global_config_path_matches_claude_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_dir: str | None,
+    legacy_in: str | None,
+    custom_oauth: bool,
+    expected: str,
+) -> None:
+    """
+    The resolved path follows Claude Code's own global-config lookup order.
+
+    :param config_dir: ``CLAUDE_CONFIG_DIR`` as a directory under
+        ``tmp_path`` (e.g. ``"selected"``), ``""`` for an explicitly empty
+        value, or ``None`` to leave it unset.
+    :param legacy_in: Directory under ``tmp_path`` holding a legacy
+        ``.config.json``, or ``None`` for no legacy file.
+    :param custom_oauth: Whether ``CLAUDE_CODE_CUSTOM_OAUTH_URL`` is set.
+    :param expected: Expected path relative to ``tmp_path``.
+    """
+    _redirect_home(monkeypatch, tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    if config_dir:
+        (tmp_path / config_dir).mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / config_dir))
+    elif config_dir == "":
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "")
+    if legacy_in is not None:
+        (tmp_path / legacy_in).mkdir(parents=True, exist_ok=True)
+        (tmp_path / legacy_in / ".config.json").write_text("{}")
+    if custom_oauth:
+        monkeypatch.setenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", "https://oauth.example.test")
+
+    assert claude_global_config_path(workspace) == tmp_path / expected
+
+
+def test_claude_global_config_path_uses_launch_env_and_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Selectors come from Claude's launch env, and a relative dir from its cwd.
+
+    The runner's own ``HOME`` and ``CLAUDE_CONFIG_DIR`` must not decide the
+    file when the terminal is launched with different values.
+    """
+    _redirect_home(monkeypatch, tmp_path / "runner-home")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "runner-config"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    launch_env = {"HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": "relcfg"}
+
+    assert (
+        claude_global_config_path(workspace, launch_env) == workspace / "relcfg" / ".claude.json"
+    )
+    (workspace / "relcfg").mkdir()
+    (workspace / "relcfg" / ".config.json").write_text("{}")
+    assert (
+        claude_global_config_path(workspace, launch_env) == workspace / "relcfg" / ".config.json"
+    )
+    home_only = {"HOME": str(tmp_path / "home")}
+    assert claude_global_config_path(workspace, home_only) == tmp_path / "home" / ".claude.json"
+    # Claude joins both values verbatim: a relative HOME and a literal ``~``
+    # resolve against its working directory, not the runner's home or cwd.
+    assert claude_global_config_path(workspace, {"HOME": "relhome"}) == (
+        workspace / "relhome" / ".claude.json"
+    )
+    # Without a usable HOME, Claude uses the account home, not the runner's.
+    account_home = tmp_path / "account-home"
+    monkeypatch.setattr(claude_native_bridge, "_account_home_dir", lambda: account_home)
+    assert claude_global_config_path(workspace, {}) == account_home / ".claude.json"
+    assert claude_global_config_path(workspace, {"HOME": ""}) == account_home / ".claude.json"
+    tilde_env = {"HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": "~/cfg"}
+    assert (
+        claude_global_config_path(workspace, tilde_env) == workspace / "~" / "cfg" / ".claude.json"
+    )
+
+
+def test_claude_global_config_path_removes_dot_dot_like_path_join(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``..`` segments are removed lexically, as Claude's ``path.join`` does.
+
+    A missing intermediate directory or a symlink before ``..`` must not change
+    the selected file, and the legacy lookup follows the same rule. Seeding
+    writes the launch env's file and leaves the runner's ``~/.claude.json``.
+    """
+    runner_config = _redirect_home(monkeypatch, tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    (workspace / "selected").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere" / "deep"
+    elsewhere.mkdir(parents=True)
+    (workspace / "link").symlink_to(elsewhere)
+    home = {"HOME": str(tmp_path / "home")}
+
+    for config_dir in ("x/../selected", "link/../selected", str(workspace / "x/../selected")):
+        env = {**home, "CLAUDE_CONFIG_DIR": config_dir}
+        assert claude_global_config_path(workspace, env) == workspace / "selected" / ".claude.json"
+    # Seeding through the selector updates the existing file without creating ``x``.
+    env = {**home, "CLAUDE_CONFIG_DIR": "x/../selected"}
+    ensure_claude_workspace_trusted(workspace, env=env)
+    data = json.loads((workspace / "selected" / ".claude.json").read_text())
+    assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+    assert not (workspace / "x").exists()
+    assert not runner_config.exists()
+    (workspace / "selected" / ".config.json").write_text("{}")
+    assert claude_global_config_path(workspace, env) == workspace / "selected" / ".config.json"
+    assert not (workspace / "x").exists()
+
+
+def test_ensure_trusted_updates_a_symlinked_config_in_place(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A symlinked legacy config stays a symlink; its target receives the seed.
+
+    Dotfile managers often link ``~/.claude/.config.json`` into a repository,
+    so the atomic replace must not swap the link for a standalone file.
+    """
+    home = tmp_path / "home"
+    _redirect_home(monkeypatch, home)
+    target = tmp_path / "dotfiles" / "claude-config.json"
+    target.parent.mkdir()
+    target.write_text(json.dumps({"oauthAccount": {"emailAddress": "user@example.com"}}))
+    link = home / ".claude" / ".config.json"
+    link.parent.mkdir()
+    link.symlink_to(target)
+
+    ensure_claude_workspace_trusted(home)
+
+    assert link.is_symlink()
+    data = json.loads(target.read_text())
+    assert data["oauthAccount"] == {"emailAddress": "user@example.com"}
+    assert data["projects"][str(home.resolve())]["hasTrustDialogAccepted"] is True
+
+
+def test_ensure_trusted_refuses_broken_or_looping_config_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dangling or looping config symlink is refused rather than written through.
+
+    Writing through a dangling link would create a new config at an arbitrary
+    target; a loop cannot be resolved at all.
+    """
+    home = tmp_path / "home"
+    _redirect_home(monkeypatch, home)
+    link = home / ".claude.json"
+    missing_target = tmp_path / "elsewhere" / "claude.json"
+    link.symlink_to(missing_target)
+
+    with pytest.raises(ValueError, match="broken or looping symlink"):
+        ensure_claude_workspace_trusted(home)
+    assert not missing_target.parent.exists()
+
+    link.unlink()
+    loop = home / "loop.json"
+    loop.symlink_to(link)
+    link.symlink_to(loop)
+    with pytest.raises(ValueError, match="broken or looping symlink"):
+        ensure_claude_workspace_trusted(home)
+
+
+def test_ensure_trusted_refuses_a_non_file_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config path that exists but is not a regular file is refused, not replaced."""
+    home = tmp_path / "home"
+    _redirect_home(monkeypatch, home)
+    (home / ".claude" / ".config.json").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="not a regular file"):
+        ensure_claude_workspace_trusted(home)
+
+    assert (home / ".claude" / ".config.json").is_dir()
+
+
+def test_claude_global_config_path_normalizes_legacy_lookup_to_nfc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The legacy lookup uses the NFC config dir; the modern path keeps its spelling.
+
+    Claude Code normalizes its config dir to NFC before checking for a legacy
+    ``.config.json`` but joins ``.claude.json`` onto the raw value, which
+    differ on a byte-sensitive filesystem.
+    """
+    import unicodedata
+
+    _redirect_home(monkeypatch, tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    decomposed = str(tmp_path / unicodedata.normalize("NFD", "caf\u00e9"))
+    composed = unicodedata.normalize("NFC", decomposed)
+    env = {"HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": decomposed}
+
+    assert claude_global_config_path(workspace, env) == Path(decomposed) / ".claude.json"
+    Path(composed).mkdir()
+    (Path(composed) / ".config.json").write_text("{}")
+    if (Path(decomposed) / ".config.json").exists():
+        pytest.skip("filesystem treats NFC and NFD names as the same file")
+    assert claude_global_config_path(workspace, env) == Path(composed) / ".config.json"
 
 
 def test_display_cost_approval_popup_builds_detached_tmux_command(
@@ -8892,6 +9326,7 @@ def _assistant_entry(
     output_tokens: int,
     is_sidechain: bool = False,
     request_id: str | None = None,
+    message_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Build one assistant transcript record with a usage block.
@@ -8902,8 +9337,9 @@ def _assistant_entry(
     :param is_sidechain: When ``True`` mark the record ``isSidechain``
         (how a sub-agent message is inlined into a parent transcript).
     :param request_id: Top-level ``requestId`` to stamp, e.g.
-        ``"req_A"``. ``None`` omits it (records without a ``requestId``
-        are each billed once, never collapsed together).
+        ``"req_A"``. ``None`` omits it.
+    :param message_id: ``message.id`` to stamp, e.g. ``"msg_A"``.
+        ``None`` omits it.
     :returns: A decoded transcript record dict.
     """
     entry: dict[str, Any] = {
@@ -8917,45 +9353,87 @@ def _assistant_entry(
         entry["isSidechain"] = True
     if request_id is not None:
         entry["requestId"] = request_id
+    if message_id is not None:
+        entry["message"]["id"] = message_id
     return entry
 
 
-def test_compute_transcript_cumulative_cost_dedupes_by_request_id(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    "identities",
+    [
+        pytest.param([("msg_A", None), ("msg_A", None)], id="message"),
+        pytest.param([(None, "req_A"), (None, "req_A")], id="request"),
+        pytest.param([("msg_A", "req_A"), ("msg_A", "req_A")], id="both"),
+        pytest.param([("msg_A", None), ("msg_A", "req_A")], id="request-late"),
+        pytest.param([("msg_A", "req_A"), ("msg_A", None)], id="request-missing"),
+        pytest.param([(None, "req_A"), ("msg_A", "req_A")], id="message-late"),
+        pytest.param([("msg_A", "req_A"), (None, "req_A")], id="message-missing"),
+    ],
+)
+def test_compute_transcript_cumulative_cost_dedupes_inference_records(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    identities: list[tuple[str | None, str | None]],
 ) -> None:
-    """
-    Records sharing a ``requestId`` are billed once, not once per record.
-
-    Claude writes the same API response as multiple transcript records (a
-    streamed partial plus the final record), each carrying that response's
-    full ``usage`` under one ``requestId``. Summing every record
-    double-bills (observed ~2x inflation, which leaked into the parent
-    badge and the cost-budget gate). The cost must dedupe by ``requestId``.
-    """
+    """Repeated inference records retain the last priceable usage, including legacy IDs."""
     from omnigent.llms.context_window import ModelPricing
 
     pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
-    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: pricing if model == "m" else None,
+    )
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
     claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
     path = tmp_path / "transcript.jsonl"
+    (first_message_id, first_request_id), (last_message_id, last_request_id) = identities
     _write_transcript_jsonl(
         path,
         [
-            # Two records, SAME requestId = one billed response (2*10 + 3*20 = 80).
-            _assistant_entry(model="m", input_tokens=2, output_tokens=3, request_id="req_A"),
-            _assistant_entry(model="m", input_tokens=2, output_tokens=3, request_id="req_A"),
-            # Distinct requestId = a second billed response (1*10 + 1*20 = 30).
-            _assistant_entry(model="m", input_tokens=1, output_tokens=1, request_id="req_B"),
+            _assistant_entry(
+                model="m",
+                input_tokens=2,
+                output_tokens=1,
+                message_id=first_message_id,
+                request_id=first_request_id,
+            ),
+            _assistant_entry(
+                model="m", input_tokens=1, output_tokens=1, message_id="msg_B", request_id="req_B"
+            ),
+            _assistant_entry(
+                model="m",
+                input_tokens=2,
+                output_tokens=3,
+                message_id=last_message_id,
+                request_id=last_request_id,
+            ),
+            _assistant_entry(
+                model="unpriced",
+                input_tokens=99,
+                output_tokens=99,
+                message_id="msg_A",
+                request_id="req_A",
+            ),
         ],
     )
     cost = claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
-    # 80 + 30 = 110. Without dedup the duplicate req_A record adds another
-    # 80 → 190, the ~2x over-report this dedup fixes.
     assert cost == pytest.approx(110.0)
 
 
+@pytest.mark.parametrize(
+    "identities",
+    [
+        pytest.param([(None, None), (None, None)], id="anonymous"),
+        pytest.param([("", ""), ("", "")], id="empty-ids"),
+        pytest.param([(None, "req_A"), (None, "req_B")], id="distinct-requests"),
+        pytest.param([("same", None), (None, "same")], id="separate-namespaces"),
+        pytest.param([(None, None), (None, "__no_request_id_0")], id="anonymous-label-collision"),
+    ],
+)
 def test_compute_transcript_cumulative_cost_sums_priced_messages(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    identities: list[tuple[str | None, str | None]],
 ) -> None:
     """
     Cost is the sum over every priced assistant message in the transcript.
@@ -8968,14 +9446,28 @@ def test_compute_transcript_cumulative_cost_sums_priced_messages(
 
     pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)
     monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: pricing)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
     claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
     path = tmp_path / "transcript.jsonl"
+    (first_message_id, first_request_id), (last_message_id, last_request_id) = identities
     _write_transcript_jsonl(
         path,
         [
-            _assistant_entry(model="m", input_tokens=2, output_tokens=3),  # 2*10 + 3*20 = 80
+            _assistant_entry(
+                model="m",
+                input_tokens=2,
+                output_tokens=3,
+                message_id=first_message_id,
+                request_id=first_request_id,
+            ),
             {"message": {"role": "user", "content": "hi"}},  # no usage → skipped
-            _assistant_entry(model="m", input_tokens=1, output_tokens=1),  # 1*10 + 1*20 = 30
+            _assistant_entry(
+                model="m",
+                input_tokens=1,
+                output_tokens=1,
+                message_id=last_message_id,
+                request_id=last_request_id,
+            ),
         ],
     )
     cost = claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
@@ -9331,6 +9823,34 @@ def test_wait_for_claude_prompt_ready_fails_fast_with_the_sign_in_link(
     )
     # Two plain polls saw the address; each looked again with wrapped rows joined.
     assert captures == [False, True, False, True]
+    assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
+
+
+def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launcher waiting on another session's sign-in fails delivery as a pending
+    sign-in instead of waiting out the budget and reaping the waiting pane.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target, *, join_wrapped=False: (
+            "Waiting for another process to finish OAuth on port 8020...\n^[^[\n"
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudeSignInPending) as raised:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert raised.value.code == "databricks_sign_in_pending"
+    assert raised.value.remediation.startswith("Finish the sign-in that another session opened")
     assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
 
 
@@ -10706,6 +11226,40 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     assert tails[-1] == "Enter"
 
 
+def test_inject_user_message_refuses_a_shell_mode_draft_escape_cannot_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A shell-mode draft that outlives the reclaim is refused, not waited out.
+
+    Escape does not take a typed shell command out of the box, so the
+    readiness gate would poll its whole slow-boot budget for a ``❯`` that
+    cannot appear, and the delivery timeout then kills the healthy pane.
+    Only the dismissal Escapes may reach the pane.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    shell_draft_pane = (
+        "──────────────────────────────\n"
+        "! git status --short\n"
+        "──────────────────────────────\n"
+        "  ! for shell mode\n"
+    )
+    sends = _fake_tmux(monkeypatch, [shell_draft_pane])
+    # The pane is alive, so without the refusal the readiness gate keeps waiting.
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_args: claude_native_bridge._ClaudePaneState(alive=True),
+    )
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by shell mode"):
+        inject_user_message(bridge_dir, content="hello from the web")
+
+    tails = [args[-1] for args in sends]
+    assert tails and set(tails) == {"Escape"}, f"Only dismissal Escapes may be sent; got {tails}."
+
+
 _MCP_APPROVAL_DIALOG_PANE = """\
 ────────────────────────────────────────────────────────────────────────────────
   New MCP server found in this project: e2e-noop
@@ -11552,6 +12106,52 @@ def _relay_request_raw(bridge_dir: Path, path: str, payload: dict[str, object]) 
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
         return resp.read().decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_relay_tool_update_preserves_cached_policy_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cached native credentials keep enforcing policy as tools and callbacks change."""
+    verdict = {"result": "POLICY_ACTION_DENY", "reason": "blocked by test"}
+    policy_client = _ScriptedPolicyClient(verdict)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, policy_client)
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+    initial = json.loads(relay_file.read_text())
+    calls: list[str] = []
+
+    async def first_executor(name: str, arguments: dict[str, object]) -> str:
+        calls.append("first")
+        return "first result"
+
+    async def second_executor(name: str, arguments: dict[str, object]) -> str:
+        calls.append("second")
+        return "second result"
+
+    try:
+        async with httpx.AsyncClient(
+            base_url=initial["url"],
+            headers={"Authorization": f"Bearer {initial['token']}"},
+            trust_env=False,
+        ) as client:
+            for name, executor in (("first", first_executor), ("second", second_executor)):
+                relay.update_tools([{"name": name, "parameters": {"type": "object"}}], executor)
+                updated = json.loads(relay_file.read_text())
+                assert updated["url"] == initial["url"]
+                assert updated["token"] == initial["token"]
+                assert [tool["name"] for tool in updated["tools"]] == [name]
+                response = await client.post("/tool", json={"name": name, "arguments": {}})
+                assert response.status_code == 200
+                assert json.loads(response.json()["content"][0]["text"]) == {
+                    "result": f"{name} result"
+                }
+                response = await client.post("/policies/evaluate", json=_PRE_TOOL_USE_PAYLOAD)
+                assert response.status_code == 200
+                assert response.json() == verdict
+            assert calls == ["first", "second"]
+            assert policy_client.bodies == [_PRE_TOOL_USE_PAYLOAD, _PRE_TOOL_USE_PAYLOAD]
+    finally:
+        relay.close()
 
 
 @pytest.mark.asyncio

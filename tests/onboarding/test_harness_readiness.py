@@ -12,9 +12,10 @@ import yaml
 
 import omnigent.onboarding.harness_install as hi
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.harness_availability import HARNESS_VERSION_TOO_LOW
+from omnigent.harness_availability import HARNESS_BINARY_MISSING, HARNESS_VERSION_TOO_LOW
 from omnigent.onboarding.harness_readiness import (
     _READINESS_PROBE_MAX_WORKERS,
+    _binary_availability_reason,
     configured_harness_map,
     harness_is_configured,
 )
@@ -95,6 +96,8 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     import omnigent._platform as platform
 
     monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
     monkeypatch.setattr(platform, "_cli_fallback_dirs", lambda: ())
 
 
@@ -221,6 +224,50 @@ def test_cli_harness_configured_only_when_binary_installed(
     assert harness_is_configured(harness) is True
     _no_clis_installed(monkeypatch)
     assert harness_is_configured(harness) is False
+
+
+@pytest.mark.parametrize("path_env", ["OMNIGENT_PI_PATH", "HARNESS_PI_PATH"])
+@pytest.mark.parametrize(
+    ("path_version", "selected_version", "expected"),
+    [
+        (None, "0.85.1", True),
+        ("0.84.1", "0.85.1", True),
+        ("0.85.1", "0.84.1", HARNESS_VERSION_TOO_LOW),
+        ("0.85.1", None, HARNESS_BINARY_MISSING),
+        ("0.85.1", "unparseable", HARNESS_VERSION_TOO_LOW),
+    ],
+)
+def test_pi_readiness_uses_selected_executable(
+    monkeypatch: pytest.MonkeyPatch,
+    path_env: str,
+    path_version: str | None,
+    selected_version: str | None,
+    expected: bool | str,
+) -> None:
+    """Readiness, inference-bound launches and setup inspect the selected Pi."""
+    versions = {"/test/path/pi": path_version, "/test/selected/pi": selected_version}
+    monkeypatch.setenv("HARNESS_PI_PATH", "/test/missing/legacy-pi")
+    monkeypatch.setenv(path_env, "/test/selected/pi")
+
+    def resolve_binary(name: str) -> str | None:
+        binary = "/test/path/pi" if name == "pi" else name
+        return binary if versions.get(binary) is not None else None
+
+    monkeypatch.setattr(hi.shutil, "which", resolve_binary)
+
+    def version_probe(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert argv == ["/test/selected/pi", "--version"]
+        return subprocess.CompletedProcess(argv, 0, stdout=selected_version or "", stderr="")
+
+    monkeypatch.setattr(hi.subprocess, "run", version_probe)
+    assert _binary_availability_reason("pi") == expected
+    assert hi.harness_cli_version_satisfies("pi") is (expected is True)
+    version, _range = hi.harness_cli_version("pi")
+    assert version == (None if selected_version == "unparseable" else selected_version)
+    for harness in ("pi", "pi-native", "native-pi"):
+        assert harness_is_configured(harness) is (expected is True)
+    for harness in ("pi", "pi-native"):
+        assert (hi.missing_harness_cli(harness) is None) is (expected is True)
 
 
 def test_auth_aware_native_harness_reports_binary_missing(

@@ -1096,6 +1096,41 @@ async def test_engine_data_chains_sequentially_across_policies(
     assert result.data == {"query": "after-second"}
 
 
+@pytest.mark.parametrize(
+    "tool_name,expected",
+    [
+        ("sys_scheduled_task_create", PolicyAction.ASK),
+        ("sys_scheduled_task_update", PolicyAction.ASK),
+        ("sys_scheduled_task_list", PolicyAction.ALLOW),
+        ("sys_scheduled_task_delete", PolicyAction.ALLOW),
+    ],
+)
+async def test_schedule_approval_uses_dispatched_tool_identity(
+    conversation_store: SqlAlchemyConversationStore,
+    tool_name: str,
+    expected: PolicyAction,
+) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    def transform_name(_event: dict) -> PolicyResult:
+        return PolicyResult(action=PolicyAction.ALLOW, data={"name": "display-only-name"})
+
+    engine = _build_engine(
+        conversation_store,
+        [
+            FunctionPolicy(_spec(name="transform", phase=Phase.TOOL_CALL), transform_name),
+            FunctionPolicy(
+                _spec(name="schedule-approval", phase=Phase.TOOL_CALL),
+                ask_on_scheduled_task_change,
+            ),
+        ],
+    )
+    result = await engine.evaluate(
+        EvaluationContext(phase=Phase.TOOL_CALL, content={"name": tool_name}, tool_name=tool_name)
+    )
+    assert result.action == expected
+
+
 # ── Gap 7: legacy (content, phase) callable shim ─────────────────────────────
 
 

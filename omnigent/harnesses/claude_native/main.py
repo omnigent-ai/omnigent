@@ -5585,8 +5585,12 @@ def _claude_transcript_records_from_session_items(
     records: list[_JsonObject] = []
     parent_uuid: str | None = None
     tool_parent_by_call_id: dict[str, str] = {}
+    snapshot_item_ids: set[str] = set()
     previous_item: _JsonObject | None = None
     for index, item in enumerate(items):
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id in snapshot_item_ids:
+            continue
         # A forwarder retry that slipped past idempotency persists as an
         # adjacent row identical in everything but the store envelope
         # (id/created_at). Drop it so store duplicates don't become
@@ -5606,6 +5610,7 @@ def _claude_transcript_records_from_session_items(
                 records.clear()
                 parent_uuid = None
                 tool_parent_by_call_id.clear()
+                snapshot_item_ids.clear()
                 # Emit a compact_boundary system record so Claude
                 # Code recognizes the compaction on resume.
                 boundary_uuid = _synthetic_claude_transcript_uuid(
@@ -5658,6 +5663,16 @@ def _claude_transcript_records_from_session_items(
                     if cm_record is not None:
                         records.append(cm_record)
                         parent_uuid = cm_uuid
+                        source_ids = compacted_message.get("forwarded_source_ids")
+                        if isinstance(source_ids, list):
+                            snapshot_item_ids.update(
+                                uuid.uuid5(
+                                    uuid.NAMESPACE_URL,
+                                    f"omnigent-external-item:{session_id}:{source_id}",
+                                ).hex
+                                for source_id in source_ids
+                                if isinstance(source_id, str)
+                            )
             continue
         record_uuid = _synthetic_claude_transcript_uuid(
             session_id=session_id,

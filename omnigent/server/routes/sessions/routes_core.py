@@ -320,6 +320,10 @@ async def _wake_runner_for_model_change(
     return conv
 
 
+# Allow runtime recovery (15s), connect/catalog/update (12s), and confirmation
+# mirroring/cleanup (6s) to finish before the server restores a selection.
+_CODEX_SETTINGS_FORWARD_TIMEOUT_S = 40.0
+
 _CODEX_SETTINGS_RESTORED_MESSAGE = (
     "The terminal did not apply the model and reasoning effort changes. "
     "The previous selections have been restored."
@@ -1031,6 +1035,19 @@ def register_core_routes(
             enforce_handler_allowlist=not local_single_user_enabled(),
         )
 
+        if parsed_metadata.mcp_registry_services:
+            from omnigent.mcp_selection import registry_selection_labels, selected_mcp_spec
+            from omnigent.server.routes.session_mcp_servers import _require_registry_service
+
+            for service_id in parsed_metadata.mcp_registry_services:
+                _require_registry_service(request, service_id, user_id)
+            labels = {
+                **parsed_metadata.labels,
+                **registry_selection_labels(spec, parsed_metadata.mcp_registry_services),
+            }
+            parsed_metadata = parsed_metadata.model_copy(update={"labels": labels})
+            spec = selected_mcp_spec(spec, labels)
+
         # Caller-supplied external host: validate the workspace against
         # the uploaded spec's os_env boundary BEFORE creating the row
         # (mirroring the JSON path — a bad workspace never produces a
@@ -1050,6 +1067,19 @@ def register_core_routes(
                 host_registry=getattr(request.app.state, "host_registry", None),
             )
             parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
+
+        from omnigent.server.mcp_compatibility import (
+            registry_services,
+            require_registry_mcp_runtime,
+        )
+
+        require_registry_mcp_runtime(
+            registry_services(spec),
+            host_id=parsed_metadata.host_id,
+            runner_id=inherited_runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+        )
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
@@ -2647,6 +2677,11 @@ def register_core_routes(
                 runner_id = _sf._registered_runner_id(
                     runner_router, body.runner_id, user_id=user_id
                 )
+                if runner_router is not None:
+                    await asyncio.to_thread(
+                        runner_router.require_mcp_registry_support,
+                        dataclasses.replace(conv, runner_id=runner_id),
+                    )
                 try:
                     await asyncio.to_thread(
                         conversation_store.replace_runner_id, session_id, runner_id
@@ -2861,6 +2896,9 @@ def register_core_routes(
         # This server rolls back Codex refusals and keeps unconfirmed changes, so the
         # runner neither saves a refusal nor waits out this server's forward timeout.
         negotiation: dict[str, object] = {"rollback_on_refusal": True} if codex_native else {}
+        settings_forward_timeout = (
+            _CODEX_SETTINGS_FORWARD_TIMEOUT_S if codex_native else _TUI_INJECT_FORWARD_TIMEOUT_S
+        )
         combined_model_forward = False
         _model_forward = None
         if (
@@ -2890,10 +2928,7 @@ def register_core_routes(
                 session_id,
                 runner_router,
                 event,
-                # Same TUI injection budget as the model change below: the
-                # ``/effort`` confirm dialog can render seconds after the
-                # command.
-                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                timeout_s=settings_forward_timeout,
             )
             model_applied = bool(
                 combined_model_forward
@@ -2910,7 +2945,7 @@ def register_core_routes(
                         session_id,
                         runner_router,
                         effort_event,
-                        timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                        timeout_s=settings_forward_timeout,
                     )
             if codex_native and (
                 (effort_forward is None and model_applied)
@@ -2955,8 +2990,7 @@ def register_core_routes(
                     session_id,
                     runner_router,
                     {"type": "model_change", "model": updated.model_override, **negotiation},
-                    # The runner can answer by confirming a TUI model dialog.
-                    timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                    timeout_s=settings_forward_timeout,
                 )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
@@ -3276,7 +3310,9 @@ def register_core_routes(
             owns a session-scoped ``body.agent_id``; 400 if the source
             has no agent binding, ``body.up_to_response_id`` names
             no response in the source session, or a managed fork asks
-            for a sandbox this server has not configured.
+            for a sandbox this server has not configured; 410 if the
+            source's agent was removed or a required bundle copy finds
+            its source missing.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -3490,7 +3526,12 @@ def register_core_routes(
         # otherwise ride along as stale metadata that could hydrate a wrong mode
         # in generic native-wrapper UI state. Drop it whenever the agent changes.
         if switching_agent:
+            from omnigent.mcp_selection import MCP_SELECTION_PREFIX
+
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+            dropped_label_keys_set.update(
+                key for key in source.labels if key.startswith(MCP_SELECTION_PREFIX)
+            )
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always

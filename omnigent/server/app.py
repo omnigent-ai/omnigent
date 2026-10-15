@@ -12,7 +12,6 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from functools import partial
 from importlib import import_module
 from itertools import batched, groupby
 from pathlib import Path
@@ -92,6 +91,7 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
+from omnigent.server.mcp_gateway import McpGatewayBackend
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -1338,6 +1338,8 @@ def create_app(
     github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
     databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
     databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
+    mcp_registry: Any | None = None,
+    mcp_gateway_backend: McpGatewayBackend | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     public_sharing_max_level: str | Callable[[], str] | None = None,
@@ -1346,6 +1348,7 @@ def create_app(
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
     base_path: str | None = None,
+    host_sharded: bool = False,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1482,6 +1485,13 @@ def create_app(
         reverse proxy, e.g. ``"/proxy/6767"`` (code-server port proxy).
         ``None`` reads ``OMNIGENT_WEB_BASE_PATH``; empty/``"/"`` is a normal
         root deployment.
+    :param host_sharded: Whether replicas sit behind a router that keys host
+        and runner tunnels by host_id. When ``True``, a host-scoped request
+        for a live host whose tunnel is on another replica returns 400
+        ``wrong_replica``; otherwise it returns 409 "host is offline". The
+        400 recovers only for a client that sent the slice-key header and
+        retries without it, which the web client does only for requests it
+        keyed itself.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -1544,7 +1554,9 @@ def create_app(
     from omnigent.runner.routing import RunnerRouter
     from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
     from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+    from omnigent.server.routes._host_launch import configure_host_sharding
 
+    configure_host_sharding(host_sharded)
     tunnel_registry = TunnelRegistry()
     host_registry = HostRegistry()
     runner_router = RunnerRouter(
@@ -1557,6 +1569,8 @@ def create_app(
         # is the latter, not a false wrong-replica.
         host_registry=host_registry,
         host_store=host_store,
+        agent_store=agent_store,
+        agent_cache=agent_cache,
     )
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
@@ -1564,6 +1578,7 @@ def create_app(
         conversation_store=conversation_store,
         file_store=file_store,
         agent_store=agent_store,
+        agent_cache=agent_cache,
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
@@ -1857,10 +1872,46 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
-    if host_store is not None:
-        host_registry.launch_authorizer = partial(
-            host_store.admit_launch, require_account_owner=runner_account_store is not None
-        )
+    app.state.mcp_gateway_backend = mcp_gateway_backend
+    app.state.mcp_registry = mcp_registry
+    app.state.mcp_registry_auth = auth_provider
+    app.state.runner_tunnel_tokens = runner_tunnel_tokens
+
+    def _admit_host_launch(
+        host_id: str,
+        session_id: str,
+        owner: str | None,
+        generation: str | None,
+        allow_unbound: bool,
+        transfer_from_host_id: str | None,
+    ) -> None:
+        """Authorize the launch and validate its host against the saved agent."""
+        if host_store is not None:
+            host_store.admit_launch(
+                host_id,
+                session_id,
+                owner,
+                generation,
+                allow_unbound,
+                transfer_from_host_id,
+                require_account_owner=runner_account_store is not None,
+            )
+        from omnigent.host.frames import CAP_MCP_REGISTRY
+        from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+
+        connection = host_registry.get(host_id)
+        if connection is not None and CAP_MCP_REGISTRY not in connection.hello.capabilities:
+            conv = conversation_store.get_conversation(session_id)
+            if conv is not None:
+                require_session_registry_mcp_support(
+                    conv,
+                    connection.hello.capabilities,
+                    component="host",
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
+                )
+
+    host_registry.launch_authorizer = _admit_host_launch
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
@@ -3017,6 +3068,8 @@ def create_app(
             if getattr(app.state, f"{provider}_config", None) is not None
             and getattr(app.state, f"{provider}_store", None) is not None
         ]
+        if mcp_registry is not None:
+            enabled_connections.append("mcp")
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -3221,6 +3274,16 @@ def create_app(
         ),
         prefix="/v1",
         tags=["sessions"],
+    )
+    from omnigent.server.mcp_policy_adapter import McpPolicyAdapter
+    from omnigent.server.routes.mcp_gateway import create_mcp_gateway_router
+
+    app.include_router(
+        create_mcp_gateway_router(
+            McpPolicyAdapter(conversation_store, agent_store, auth_provider, permission_store)
+        ),
+        prefix="/v1",
+        tags=["mcp_gateway"],
     )
     app.include_router(
         create_imports_router(
@@ -3623,9 +3686,12 @@ def create_app(
         # cancel any pending disconnect-grace timer so it can't re-run the
         # disconnect reconciliation on top of it.
         _cancel_disconnect_grace(runner_id)
-        # A runner this replica saw connect already ran, so its idle sessions lost
-        # no work; a replica that never saw it has no stamp and keeps failing them.
-        runner_ran = session_live_state.last_liveness_stamp(runner_id) is not None
+        # Host connection evidence survives tunnel moves between replicas. Older
+        # hosts fall back to this replica's observed liveness.
+        runner_ran = (
+            runner_exit_reports.was_connected(runner_id)
+            or session_live_state.last_liveness_stamp(runner_id) is not None
+        )
         try:
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
@@ -3992,6 +4058,15 @@ def create_app(
             create_host_credentials_router(host_store),
             prefix="/v1",
             tags=["hosts"],
+        )
+
+    if mcp_registry is not None:
+        from omnigent.server.routes.mcp_registry import create_mcp_registry_router
+
+        app.include_router(
+            create_mcp_registry_router(mcp_registry, auth_provider),
+            prefix="/v1",
+            tags=["mcp_registry"],
         )
 
     # Per-user connection routes (/v1/connections/{provider}/*): connect /

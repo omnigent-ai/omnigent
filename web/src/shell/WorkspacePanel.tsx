@@ -853,6 +853,7 @@ function WorkspacePanelImpl({
       const awaiting = awaitingPendingIdsRef.current.shift();
       if (awaiting !== undefined) {
         sideChats.rekey(awaiting, childId);
+        useChatStore.getState().clearSideChatComposer(awaiting);
       } else {
         // Generic already rekeyed its own tab; this just re-selects it (idempotent).
         sideChats.open(childId);
@@ -940,6 +941,9 @@ function WorkspacePanelImpl({
       <SideChatPane
         key={selectedSideChat}
         childId={selectedSideChat}
+        selectionParentId={
+          (isMobile ? mobileSideChatsOpen : open && sideChatSelected) ? conversationId : undefined
+        }
         onStart={(text) => startPendingSideChat(selectedSideChat, text)}
         // A Codex side chat restored after a restart is a dead ephemeral
         // fork: show it read-only rather than let the user
