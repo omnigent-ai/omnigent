@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import gc
+import json
 import os
 import socket
+import subprocess
 import sys
 import tracemalloc
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
-import psutil
 import pytest
 import uvicorn
 from fastapi import FastAPI, Request
@@ -33,18 +33,6 @@ MAX_COPIES = 3
 SLACK = 512 * 1024
 # Multipart reads keep one chunk buffer plus small receive parts.
 MAX_READ_PEAK = 1.2
-
-
-def _multipart_request(payload: bytes, part: int, content_length: int | None) -> Request:
-    offsets = iter(range(0, len(payload), part))
-
-    async def receive() -> dict:
-        start = next(offsets, len(payload))
-        body = payload[start : start + part]
-        return {"type": "http.request", "body": body, "more_body": start + part < len(payload)}
-
-    headers = [] if content_length is None else [(b"content-length", str(content_length).encode())]
-    return Request({"type": "http", "method": "PATCH", "headers": headers}, receive)
 
 
 @pytest.mark.parametrize(
@@ -119,6 +107,36 @@ async def test_declared_length_preallocates_exact_buffer_for_multipart_body(monk
     assert preallocated_sizes == [len(payload)]
 
 
+async def test_unknown_length_preallocates_one_capped_buffer(monkeypatch) -> None:
+    payload = os.urandom(CHUNK)
+    offsets = iter(range(0, len(payload), 64 * 1024))
+    preallocated_sizes: list[int] = []
+    original_bytes_io = uploads.io.BytesIO
+
+    class TrackingBytesIO(original_bytes_io):
+        def write(self, data: bytes) -> int:
+            written = super().write(data)
+            if data == b"\0":
+                preallocated_sizes.append(self.tell())
+            return written
+
+    monkeypatch.setattr(uploads.io, "BytesIO", TrackingBytesIO)
+
+    async def receive() -> dict:
+        start = next(offsets, len(payload))
+        body = payload[start : start + 64 * 1024]
+        return {
+            "type": "http.request",
+            "body": body,
+            "more_body": start + 64 * 1024 < len(payload),
+        }
+
+    request = Request({"type": "http", "method": "PATCH", "headers": []}, receive)
+    body = await uploads._read_capped(request, len(payload))
+    assert body == payload
+    assert preallocated_sizes == [len(payload)]
+
+
 async def test_declared_body_longer_than_content_length_is_rejected() -> None:
     async def receive() -> dict:
         return {"type": "http.request", "body": b"four", "more_body": False}
@@ -175,17 +193,47 @@ async def test_declared_body_shorter_than_content_length_is_rejected() -> None:
     assert error.value.code == uploads.ErrorCode.UPLOAD_RELAY_FAILED
 
 
-async def test_repeated_declared_length_reads_bound_rss_growth() -> None:
-    process = psutil.Process()
+_RSS_PROBE = r"""
+import asyncio
+import gc
+import json
+import os
+
+import psutil
+from fastapi import Request
+
+from omnigent.server.routes import routes_uploads as uploads
+
+chunk_size = 8 * 1024**2
+payload = os.urandom(chunk_size)
+
+
+async def read_once():
+    offsets = iter(range(0, len(payload), 64 * 1024))
+
+    async def receive():
+        start = next(offsets, len(payload))
+        end = start + 64 * 1024
+        return {
+            "type": "http.request",
+            "body": payload[start:end],
+            "more_body": end < len(payload),
+        }
+
+    request = Request({"type": "http", "method": "PATCH", "headers": []}, receive)
+    return await uploads._read_capped(request, len(payload))
+
+
+async def main():
     try:
+        process = psutil.Process()
         baseline = process.memory_info().rss
     except (OSError, psutil.Error) as exc:
-        pytest.skip(f"process RSS is unavailable: {exc}")
+        print(json.dumps({"unavailable": str(exc)}))
+        return
 
-    payload = os.urandom(CHUNK)
     for _ in range(25):
-        request = _multipart_request(payload, 64 * 1024, content_length=None)
-        body = await uploads._read_capped(request, len(payload))
+        body = await read_once()
         assert body == payload
         del body
         gc.collect()
@@ -193,8 +241,30 @@ async def test_repeated_declared_length_reads_bound_rss_growth() -> None:
     try:
         growth = process.memory_info().rss - baseline
     except (OSError, psutil.Error) as exc:
-        pytest.skip(f"process RSS is unavailable: {exc}")
-    print(f"25 repeated 8 MiB reads: RSS growth={growth / 1024**2:.2f} MiB")
+        print(json.dumps({"unavailable": str(exc)}))
+        return
+    print(json.dumps({"growth": growth}))
+
+
+asyncio.run(main())
+"""
+
+
+def test_repeated_unknown_length_reads_bound_rss_growth() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", _RSS_PROBE],
+        check=True,
+        capture_output=True,
+        cwd=os.getcwd(),
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        text=True,
+        timeout=90,
+    )
+    measurement = json.loads(result.stdout.strip().splitlines()[-1])
+    if "unavailable" in measurement:
+        pytest.skip(f"process RSS is unavailable: {measurement['unavailable']}")
+    growth = measurement["growth"]
+    print(f"25 repeated 8 MiB unknown-length reads: RSS growth={growth / 1024**2:.2f} MiB")
     assert growth < 64 * 1024**2, f"RSS grew {growth / 1024**2:.2f} MiB"
 
 
