@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -1263,6 +1264,93 @@ async def test_failed_pending_create_key_wakes_waiters_and_clears_reservation(sc
         assert retry.status_code == 201
         assert retry.json()["upload_id"] == uid
         assert posts == 2
+
+
+@pytest.mark.parametrize("fail_first", [False, True], ids=["success", "failure"])
+async def test_pending_create_key_across_event_loops(scenario, monkeypatch, fail_first):
+    scenario.hard["max_open_uploads"] = 1
+    key = "a" * 32
+    uid = uuid.uuid4().hex
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    follower_ready = threading.Event()
+    limits = uploads._limits
+    calls = 0
+    posts = 0
+
+    def tracked_limits(*args, **kwargs):
+        nonlocal calls
+        result = limits(*args, **kwargs)
+        calls += 1
+        if calls == 2:
+            follower_ready.set()
+        return result
+
+    monkeypatch.setattr(uploads, "_limits", tracked_limits)
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        if request.method == "GET":
+            return await scenario.handle(request)
+        posts += 1
+        if posts == 1:
+            entered.set()
+            await release.wait()
+            if fail_first:
+                raise httpx.ReadTimeout("runner acknowledgement lost")
+        return httpx.Response(
+            201,
+            json={
+                "upload_id": uid,
+                "offset": 0,
+                "chunk_bytes": 1024**2,
+                "expires_at": time.time() + 3600,
+            },
+        )
+
+    async def create(client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            scenario.base,
+            json={"dir": "", "name": "payload.bin", "size": 3},
+            headers={"Idempotency-Key": key},
+        )
+
+    def create_on_other_loop() -> httpx.Response:
+        async def request() -> httpx.Response:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=scenario.app),
+                base_url="http://test",
+                headers={"X-Forwarded-Email": ALICE},
+            ) as client:
+                return await create(client)
+
+        return asyncio.run(request())
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://runner"
+    ) as runner:
+        scenario.routing._clients["binary-test"] = runner
+        leader = asyncio.create_task(create(scenario.client))
+        await asyncio.wait_for(entered.wait(), 5)
+        follower = asyncio.create_task(asyncio.to_thread(create_on_other_loop))
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(follower_ready.wait, 5), 5)
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(follower), 0.2)
+        finally:
+            release.set()
+        first, second = await asyncio.wait_for(asyncio.gather(leader, follower), 5)
+        assert posts == 1
+        if fail_first:
+            assert first.status_code == 504
+            assert second.status_code in {502, 504}
+            retry = await create(scenario.client)
+            assert retry.status_code == 201
+            assert retry.json()["upload_id"] == uid
+            assert posts == 2
+        else:
+            assert first.status_code == second.status_code == 201
+            assert first.json()["upload_id"] == second.json()["upload_id"] == uid
 
 
 async def test_finished_create_key_replay_does_not_reopen_admission(scenario):
