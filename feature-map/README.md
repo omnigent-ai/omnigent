@@ -143,8 +143,8 @@ map an area, remove it here in the same change.
 - Web sign-in: `tests/e2e_ui/auth/`
 - Branding and base-path deploys: `tests/e2e_ui/branding/`, `tests/e2e_ui/base_path/`
 - Hotkeys: `tests/e2e_ui/hotkeys/`
-- Message rendering: `tests/e2e_ui/messages/` (only per-harness render parity
-  and Claude shell-command settlement are mapped)
+- Message rendering: `tests/e2e_ui/messages/` (only per-harness render parity,
+  Claude shell-command settlement, and refused-delivery persistence are mapped)
 - Mobile layout: `tests/e2e_ui/mobile/` (only composer labels, the composer
   after an unacknowledged send, sidebar rename under the keyboard, and
   terminal touch scroll are mapped)

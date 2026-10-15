@@ -152,6 +152,6 @@ export const ReadOnlyAddressedTab: Story = {
     },
   },
   play: async ({ canvasElement }) => {
-    await userEvent.click(within(canvasElement).getByRole("button", { name: /addressed/i }));
+    await userEvent.click(within(canvasElement).getByRole("button", { name: /sent/i }));
   },
 };

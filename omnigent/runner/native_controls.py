@@ -23,11 +23,10 @@ if TYPE_CHECKING:
 
 import httpx
 from fastapi.responses import JSONResponse, Response
-from websockets.exceptions import WebSocketException
 
-from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.runner.app_support import (
     _client_safe_error_detail,
     _SpecEntry,
@@ -104,6 +103,11 @@ _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 # (Read Only appears only with a read-only permission profile), so the digit is
 # read from the live popup when possible rather than hardcoded.
 _CODEX_PERMISSION_MENU_BUDGET_S = 5.0
+# Runtime recovery and bridge publication precede any settings RPC. Keep this
+# below the server's Codex settings forward budget, including confirmation.
+_CODEX_SETTINGS_READY_TIMEOUT_S = 15.0
+_CODEX_SETTINGS_READY_POLL_S = 0.1
+_CODEX_SETTINGS_CLOSE_TIMEOUT_S = 1.0
 # Older servers read any reply as a confirmed result, so outlast their
 # 20-second forward instead of reporting an unconfirmed timeout.
 _LEGACY_SERVER_UPDATE_TIMEOUT_S = 30.0
@@ -113,6 +117,12 @@ class _CodexNativeBridgeStateForSessionFn(Protocol):
     async def __call__(
         self, conv_id: str, *, action: str, missing_state_log_level: int = logging.WARNING
     ) -> CodexNativeBridgeState | None: ...
+
+
+class _CodexNativeBridgeStateAndDirForSessionFn(Protocol):
+    async def __call__(
+        self, conv_id: str, *, action: str, missing_state_log_level: int = logging.WARNING
+    ) -> tuple[CodexNativeBridgeState | None, Path]: ...
 
 
 class _EnsureCommentRelayStartedFn(Protocol):
@@ -163,12 +173,7 @@ class _HandleCodexNativePlanModeChangeFn(Protocol):
 
 class _HandleCodexNativeSettingsUpdateFn(Protocol):
     async def __call__(
-        self,
-        conv_id: str,
-        settings: _JsonObject,
-        *,
-        legacy_server: bool = False,
-        defer_if_not_live: bool = False,
+        self, conv_id: str, settings: _JsonObject, *, legacy_server: bool = False
     ) -> Response: ...
 
 
@@ -234,6 +239,7 @@ def build_native_controls(
     _begin_turn_slot: Callable[[str], None],
     _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]],
     _codex_native_bridge_state_for_session: _CodexNativeBridgeStateForSessionFn,
+    _codex_native_bridge_state_and_dir_for_session: _CodexNativeBridgeStateAndDirForSessionFn,
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
     _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]],
     _fetch_session_model_override: Callable[[str], Coroutine[Any, Any, str | None]],
@@ -270,94 +276,12 @@ def build_native_controls(
         weakref.WeakValueDictionary()
     )
 
-    def _keep_codex_effort_for_next_turn(conv_id: str, effort: object) -> None:
-        """Remember an effort the server keeps but Codex has not applied.
-
-        A reset (``None``) forgets it, as the server no longer sends one.
-        """
-        if isinstance(effort, str) and effort:
-            _session_reasoning_effort[conv_id] = effort
-        else:
-            _session_reasoning_effort.pop(conv_id, None)
-
-    def _defer_codex_native_settings(
-        conv_id: str,
-        settings: _JsonObject,
-        *,
-        reason: str,
-    ) -> Response:
-        """Accept a settings update that no live app-server could take.
-
-        The session row already holds the pick and the next launch or turn
-        applies it (clamping an effort to the live model's levels), so a 204
-        keeps it instead of letting the caller roll it back.
-        """
-        if "effort" in settings:
-            _keep_codex_effort_for_next_turn(conv_id, settings["effort"])
-        setting_keys = ",".join(sorted(settings))
-        _logger.info(
-            "Codex-native settings update deferred for session=%s: %s (settings=%s)",
-            conv_id,
-            reason,
-            setting_keys,
-            extra=debug_event(
-                "codex_native_settings_deferred",
-                session_id=conv_id,
-                harness="codex-native",
-                reason=reason,
-                setting_keys=setting_keys,
-            ),
-        )
-        return Response(status_code=204)
-
-    async def _defer_codex_native_settings_unreachable(
-        conv_id: str,
-        settings: _JsonObject,
-        bridge_dir: Path,
-    ) -> Response:
-        """Defer an update whose app-server refused the connection.
-
-        A pane still alive on the dead app-server is marked for replacement in
-        *bridge_dir*, the bridge its state came from; one that is already gone
-        (idle reap) needs nothing.
-        """
-        from omnigent.harnesses.codex_native.bridge import record_app_server_stopped
-
-        registry = resource_registry.terminal_registry
-        pane = registry.get(conv_id, "codex", "main") if registry is not None else None
-        pane_running = pane is not None and await pane.is_alive()
-        if pane_running:
-            # The pane outlives its app-server; mark it so the next ensure replaces it.
-            record_app_server_stopped(bridge_dir)
-        return _defer_codex_native_settings(
-            conv_id,
-            settings,
-            reason="app_server_unreachable" if pane_running else "pane_not_running",
-        )
-
     async def _handle_codex_native_settings_update(
         conv_id: str,
         settings: _JsonObject,
         *,
         legacy_server: bool = False,
-        defer_if_not_live: bool = False,
     ) -> Response:
-        """Apply ``thread/settings/update`` fields to the session's Codex app-server.
-
-        :param conv_id: Session/conversation id, e.g. ``"conv_abc123"``.
-        :param settings: Fields for the update, e.g. ``{"model": "gpt-5.4"}``.
-        :param legacy_server: ``True`` when the calling server predates rollback
-            negotiation: it reads any reply as confirmed and keeps a refused effort.
-        :param defer_if_not_live: ``True`` for settings the session row carries into
-            the next launch and turn (model, effort): with no loaded bridge or no
-            reachable app-server, e.g. after the idle reaper closed the pane, the
-            update answers 204 instead of 503. The effort is clamped when the next
-            launch or turn applies it, since the model catalog needs a live
-            app-server. A JSON-RPC rejection or a connect timeout still fails. Leave
-            ``False`` for settings only the live thread holds (plan mode).
-        :returns: 204 when applied or deferred, else the error response (400, 503
-            or 504) naming the failure.
-        """
         if not settings:
             return Response(status_code=204)
         lock = _codex_settings_locks.get(conv_id)
@@ -366,19 +290,18 @@ def build_native_controls(
         # The lock also covers the public mirror so the server sees efforts in apply order.
         async with lock:
             response, resolved = await _apply_codex_native_settings_update(
-                conv_id,
-                settings,
-                legacy_server=legacy_server,
-                defer_if_not_live=defer_if_not_live,
+                conv_id, settings, legacy_server=legacy_server
             )
             if "effort" in settings and (
                 response.status_code == 504 or (legacy_server and response.status_code == 503)
             ):
                 # The server keeps this selection, so the next turn applies it; a
                 # resolved Default must stay explicit, as Codex reads null as unchanged.
-                _keep_codex_effort_for_next_turn(
-                    conv_id, resolved.get("effort", settings["effort"])
-                )
+                effort = resolved.get("effort", settings["effort"])
+                if isinstance(effort, str) and effort:
+                    _session_reasoning_effort[conv_id] = effort
+                else:
+                    _session_reasoning_effort.pop(conv_id, None)
             return response
 
     def _unmirrored_codex_settings(bridge_dir: Path) -> dict[str, str]:
@@ -395,15 +318,38 @@ def build_native_controls(
                 _logger.warning("Could not mirror pending Codex %s in %s", key, bridge_dir)
         return pending
 
+    async def _ready_codex_bridge_for_settings(conv_id: str) -> CodexNativeBridgeState | None:
+        """Recover a reaped pane and wait for startup to publish its owned bridge."""
+        from omnigent.harnesses.codex_native.bridge import read_bridge_state
+
+        terminal_registry = resource_registry.terminal_registry
+        if terminal_registry is not None:
+            await _ensure_native_terminal_for_turn(conv_id, "codex-native")
+            if terminal_registry.get(conv_id, "codex", "main") is None:
+                return None
+        state, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+            conv_id, action="settings update", missing_state_log_level=logging.DEBUG
+        )
+        if state is not None or terminal_registry is None:
+            return state
+        # Fresh launches publish asynchronously. Poll the resolved directory so
+        # waiting never repeats the server label lookup or starts another pane.
+        while terminal_registry.get(conv_id, "codex", "main") is not None:
+            state = read_bridge_state(bridge_dir)
+            if state is not None:
+                return state if state.session_id == conv_id else None
+            await asyncio.sleep(_CODEX_SETTINGS_READY_POLL_S)
+        return None
+
     async def _apply_codex_native_settings_update(
         conv_id: str,
         settings: _JsonObject,
         *,
         legacy_server: bool,
-        defer_if_not_live: bool,
     ) -> tuple[Response, _JsonObject]:
         """Apply *settings* and return the response with the settings as resolved."""
         from omnigent.harnesses.codex_native.app_server import (
+            CodexAppServerResponseError,
             client_for_transport,
             resolve_codex_effort_for_model,
         )
@@ -416,13 +362,19 @@ def build_native_controls(
         from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
         from omnigent.util.reasoning_effort import effort_for_model_switch
 
-        state = await _codex_native_bridge_state_for_session(conv_id, action="settings update")
+        try:
+            state = await asyncio.wait_for(
+                _ready_codex_bridge_for_settings(conv_id),
+                timeout=_CODEX_SETTINGS_READY_TIMEOUT_S,
+            )
+        except TimeoutError:
+            _logger.warning(
+                "Codex-native runtime was not ready for settings update for session=%s",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            state = None
         if state is None:
-            if defer_if_not_live:
-                deferred = _defer_codex_native_settings(
-                    conv_id, settings, reason="no_bridge_state"
-                )
-                return deferred, settings
             # No loaded Codex bridge means nothing applied the settings; a
             # silent 204 here would let the caller claim a switch the
             # app-server never saw.
@@ -466,20 +418,8 @@ def build_native_controls(
             client_name="omnigent-codex-native-runner",
         )
         try:
-            try:
-                # Bounded so a hung app-server cannot hold the settings lock indefinitely.
-                await asyncio.wait_for(codex_client.connect(), timeout=SETTINGS_UPDATE_TIMEOUT_S)
-            except TimeoutError:
-                # An OSError, but a slow app-server may be alive: fail rather than defer.
-                raise
-            except (OSError, WebSocketException):
-                # Nothing reached the app-server, so this is not a refusal of the update.
-                if not defer_if_not_live:
-                    raise
-                unreachable = await _defer_codex_native_settings_unreachable(
-                    conv_id, settings, bridge_dir
-                )
-                return unreachable, settings
+            # Bounded so a hung app-server cannot hold the settings lock indefinitely.
+            await asyncio.wait_for(codex_client.connect(), timeout=SETTINGS_UPDATE_TIMEOUT_S)
             if "model" in settings or "effort" in settings:
                 # Only an absent key inherits config; null selects the model's default.
                 effort = (
@@ -503,22 +443,32 @@ def build_native_controls(
                         codex_client, effort, model, transport=state.socket_path
                     )
                     settings["effort"] = resolved
+            update_pending = False
             try:
-                await asyncio.wait_for(
-                    codex_client.request(
-                        "thread/settings/update",
-                        {
-                            "threadId": state.thread_id,
-                            **settings,
-                        },
-                    ),
-                    timeout=(
-                        _LEGACY_SERVER_UPDATE_TIMEOUT_S
-                        if legacy_server
-                        else SETTINGS_UPDATE_TIMEOUT_S
-                    ),
-                )
+                async with asyncio.timeout(
+                    _LEGACY_SERVER_UPDATE_TIMEOUT_S if legacy_server else SETTINGS_UPDATE_TIMEOUT_S
+                ):
+                    params = {"threadId": state.thread_id, **settings}
+                    update_pending = True
+                    try:
+                        await codex_client.request("thread/settings/update", params)
+                    except CodexAppServerResponseError as exc:
+                        if (
+                            exc.code != -32600
+                            or exc.message != f"thread not found: {state.thread_id}"
+                        ):
+                            raise
+                        # This rejection confirms nothing applied. Resume the
+                        # saved thread and retry once within the same budget.
+                        update_pending = False
+                        await codex_client.request(
+                            "thread/resume", {"threadId": state.thread_id, "excludeTurns": True}
+                        )
+                        update_pending = True
+                        await codex_client.request("thread/settings/update", params)
             except TimeoutError:
+                if not update_pending:
+                    raise
                 # Codex may still apply the update, so this is not a refusal.
                 _logger.warning(
                     "Codex-native thread/settings/update timed out for session=%s",
@@ -552,7 +502,9 @@ def build_native_controls(
             ), settings
         finally:
             with contextlib.suppress(Exception):
-                await codex_client.close()
+                await asyncio.wait_for(
+                    codex_client.close(), timeout=_CODEX_SETTINGS_CLOSE_TIMEOUT_S
+                )
         applied: dict[str, str] = {}
         model = settings.get("model")
         if isinstance(model, str):
@@ -584,7 +536,7 @@ def build_native_controls(
                             conv_id,
                             mirrored.status_code,
                         )
-                except (httpx.HTTPError, ConnectionError):
+                except (httpx.HTTPError, ConnectionError, DatabricksAuthError):
                     _logger.warning(
                         "Could not mirror applied Codex effort for session=%s",
                         conv_id,
@@ -683,8 +635,6 @@ def build_native_controls(
                 },
             )
         developer_instructions = _di_read.value
-        # Not deferred: a relaunch does not restore plan mode, and the server
-        # records the toggle only on a confirmed 2xx.
         return await _handle_codex_native_settings_update(
             conv_id,
             {
