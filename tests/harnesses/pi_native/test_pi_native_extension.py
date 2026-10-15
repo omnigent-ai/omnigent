@@ -440,10 +440,17 @@ def test_distinct_messages_with_identical_usage_are_not_collapsed(
     _run_extension_script(node, extension_path, script)
 
 
-def test_usage_baseline_survives_native_restart() -> None:
+@pytest.mark.parametrize(
+    "baseline_source",
+    ["local", "server", "matching-local", "stale-local", "corrupt-local", "unreported-local"],
+)
+def test_usage_baseline_survives_native_restart(baseline_source: str) -> None:
     """A fresh extension restores its checkpoint before accumulating the next turn."""
     script = (
         _usage_test_preamble()
+        + "\nconst baselineSource = "
+        + json.dumps(baseline_source)
+        + ";\n"
         + r"""
 (async () => {
 
@@ -452,14 +459,30 @@ def test_usage_baseline_survives_native_restart() -> None:
   const saved = JSON.parse(fs.readFileSync(statePath));
   assert.equal(saved.cumulative_input_tokens, 150000);
   assert.equal(saved.cumulative_output_tokens, 30000);
+  if (baselineSource !== "local") {
+    const cfg = JSON.parse(fs.readFileSync(configPath));
+    cfg.usageBaseline = { ...saved };
+    delete cfg.usageBaseline.model;
+    if (baselineSource === "unreported-local") {
+      cfg.usageBaseline.cumulative_input_tokens = 100000;
+      cfg.usageBaseline.cumulative_output_tokens = 20000;
+    }
+    fs.writeFileSync(configPath, JSON.stringify(cfg));
+    if (baselineSource === "server") fs.unlinkSync(statePath);
+    if (baselineSource === "corrupt-local") fs.writeFileSync(statePath, "{bad-json");
+    if (baselineSource === "stale-local") {
+      fs.writeFileSync(statePath, JSON.stringify({cumulative_input_tokens: 100000}));
+    }
+  }
   postedEvents.length = 0;
   const resumed = launchExtension();
   await resumed.session_start({}, ctx);
   await recordUsage(resumed, 2000, 900, 250);
+  const reasserts = baselineSource === "local" || baselineSource === "unreported-local";
   assert.deepEqual(usageEvents().map(({data}) => [
     data.cumulative_input_tokens, data.cumulative_output_tokens, data.model,
   ]), [
-    [150000, 30000, "databricks-claude-sonnet-4-6"],
+    ...(reasserts ? [[150000, 30000, "databricks-claude-sonnet-4-6"]] : []),
     [150900, 30250, "databricks-claude-sonnet-4-6"],
   ]);
 })().catch(error => { console.error(error); process.exit(1); });
