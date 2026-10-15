@@ -77,6 +77,7 @@ def test_resolve_markdown_links_resolve_from_their_own_directory() -> None:
     broken = []
     # rglob does not descend into the symlinked shared skill, so list it explicitly.
     shared = _AGENT / "skills" / "otto-pr-review-loop"
+    assert shared.is_dir()
     for document in sorted({*_AGENT.rglob("*.md"), *shared.rglob("*.md")}):
         for target in re.findall(r"\]\(([^)\s]+)\)", document.read_text()):
             if re.match(r"[a-z][a-z0-9+.-]*:|#|/", target):
