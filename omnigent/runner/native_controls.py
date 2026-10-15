@@ -371,11 +371,10 @@ def build_native_controls(
             ):
                 return False
             backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
-            if backend is not failed_backend:
+            if backend is None or backend is not failed_backend:
                 return False
-            if backend is not None and (
-                backend.bridge_dir != bridge_dir
-                or (backend.proc is not None and backend.proc.returncode is None)
+            if backend.bridge_dir != bridge_dir or (
+                backend.proc is not None and backend.proc.returncode is None
             ):
                 return False
             _logger.info(

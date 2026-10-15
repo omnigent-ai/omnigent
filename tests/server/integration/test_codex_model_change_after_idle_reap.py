@@ -447,6 +447,20 @@ async def test_codex_refused_connection_does_not_close_a_replacement_backend(
     assert session.codex.launches == 1
 
 
+async def test_codex_unregistered_backend_is_not_restarted_after_connection_refusal(
+    client: httpx.AsyncClient, native_session: _NativeSession
+) -> None:
+    session = native_session
+    await session.codex.close()
+    native_runtime._AUTO_CODEX_APP_SERVERS.pop(session.session_id)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    _assert_codex_refusal(session, response)
+    assert session.codex.launches == 1
+    assert session.session_id not in native_runtime._AUTO_CODEX_APP_SERVERS
+
+
 async def test_codex_live_handshake_refusal_does_not_restart_backend(
     client: httpx.AsyncClient, native_session: _NativeSession
 ) -> None:
