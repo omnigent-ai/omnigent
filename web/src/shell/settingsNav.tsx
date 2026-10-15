@@ -24,6 +24,7 @@ import {
   UserCogIcon,
   UsersIcon,
   VectorSquareIcon,
+  CpuIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
@@ -42,6 +43,7 @@ export type SettingsSectionId =
   | "git"
   | "integrations"
   | "mcp"
+  | "models"
   | "shortcuts"
   | "import"
   | "account"
@@ -60,6 +62,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "git",
   "integrations",
   "mcp",
+  "models",
   "shortcuts",
   "import",
   "account",
@@ -111,6 +114,7 @@ export function settingsNavGroups(
     { id: "general", label: "General", icon: SettingsIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
+    { id: "models", label: "Models & providers", icon: CpuIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
