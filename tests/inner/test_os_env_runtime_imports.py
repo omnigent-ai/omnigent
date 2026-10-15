@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -18,6 +19,29 @@ from omnigent.inner.os_env import (
 )
 
 pytestmark = pytest.mark.posix_only
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("bwrap") is None,
+    reason="requires Linux and bwrap",
+)
+def test_sandbox_helper_start_failure_reaches_its_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = create_os_environment(
+        OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+    )
+    assert isinstance(env, CallerProcessOSEnvironment)
+
+    def fail_spawn(*_args: object, **_kwargs: object) -> None:
+        raise OSError("synthetic helper launch failure")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_spawn)
+    try:
+        with pytest.raises(OSError, match="synthetic helper launch failure"):
+            asyncio.run(env.read("item"))
+    finally:
+        env.close()
 
 
 @pytest.mark.parametrize(
@@ -95,6 +119,10 @@ def test_tools_repair_broken_checkout_with_normal_shell_imports(
 
         source = await env.read("omnigent/__init__.py")
         assert source.get("content") == broken_source, source
+        helper = env._helper._proc
+        assert helper is not None
+        with pytest.raises(subprocess.TimeoutExpired):
+            helper.wait(timeout=0.1)
         broken = await env.shell(f"{python} -c 'import omnigent'")
         assert broken.get("exit_code") != 0, broken
         assert "SyntaxError" in broken.get("stderr", ""), broken
@@ -110,6 +138,7 @@ def test_tools_repair_broken_checkout_with_normal_shell_imports(
         sibling = await env.shell(f"{python} scripts/check.py")
         assert sibling.get("exit_code") == 0, sibling
         assert sibling.get("stdout", "").strip() == "script sibling", sibling
+        assert env._helper._proc is helper
         if scenario == "fork":
             assert module.read_text() == broken_source
 
