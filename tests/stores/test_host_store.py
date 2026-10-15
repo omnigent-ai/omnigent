@@ -776,7 +776,7 @@ def test_reservation_preserves_live_host_and_credentials(host_store: HostStore) 
         token="launch-token",
         provider="modal",
         sandbox_id="existing-environment",
-        token_expires_at=2**31,
+        token_expires_at=now_epoch() + 3600,
     )
     connected = host_store.upsert_on_connect(
         _RESERVED_HOST_ID,
