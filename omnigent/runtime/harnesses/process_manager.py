@@ -84,10 +84,9 @@ _TMP_PARENT_ENV_VAR = HARNESS_TMP_PARENT_ENV_VAR
 # depth.
 _HARNESS_AUTH_TOKEN_ENV = "OMNIGENT_HARNESS_AUTH_TOKEN"
 
-# Sentinel file the Omnigent instance writes into its subdir on boot. The
-# orphan sweep uses it to tell whether a sibling subdir belongs to
-# a still-running Omnigent (leave alone) or a crashed one (kill its
-# children, remove the dir). Holds an owner claim; older builds wrote a bare PID.
+# Sentinel each instance writes into its subdir on boot; the orphan sweep uses it
+# to tell a still-running sibling from a crashed one (kill children, remove dir).
+# Holds an owner claim; older builds wrote a bare PID.
 _AP_PID_FILE = "AP_PID"
 
 # Mode bits applied to the per-AP subdir and the per-conversation
