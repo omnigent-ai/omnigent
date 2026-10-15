@@ -256,7 +256,7 @@ def prune_orphaned_bridge_dirs() -> int:
     A runner restart is a normal Codex resume boundary, so owner death alone
     cannot imply that the local rollout is disposable. Keep the whole bridge
     for 7 days after its latest bridge preparation or rollout activity, then
-    remove it intact.
+    remove it intact. A bridge with no owner marker gets the same 7 days.
     Explicit session deletion remains immediate. Global maintenance calls this via
     ``native_bridge_common.reap_orphaned_native_bridge_dirs`` at startup.
 
@@ -269,15 +269,38 @@ def prune_orphaned_bridge_dirs() -> int:
 
 
 def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:
-    """Return whether a dead-owner Codex bridge has been inactive for 7 days."""
+    """Return whether a dead-owner or unmarked Codex bridge has been inactive for 7 days.
+
+    An unmarked dir qualifies only if it holds bridge artifacts (``bridge.json``
+    or ``codex-home``), which keeps siblings that share this root such as the
+    process-owner locks and standalone launch state. Its latest top-level write
+    stands in for the missing marker timestamp.
+    """
     activity_cutoff = time.time() - _ORPHAN_RETENTION_SECONDS
     owner_marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
     try:
         if owner_marker.stat().st_mtime > activity_cutoff:
             return False
+    except FileNotFoundError:
+        try:
+            if not (
+                (bridge_dir / _MCP_CONFIG_FILE).exists()
+                or codex_home_for_bridge_dir(bridge_dir).exists()
+            ):
+                return False
+            if bridge_dir.stat().st_mtime > activity_cutoff or any(
+                child.lstat().st_mtime > activity_cutoff for child in bridge_dir.iterdir()
+            ):
+                return False
+        except OSError:
+            return False
     except OSError:
         return False
+    return _codex_rollouts_inactive_since(bridge_dir, activity_cutoff)
 
+
+def _codex_rollouts_inactive_since(bridge_dir: Path, activity_cutoff: float) -> bool:
+    """Return whether no rollout under *bridge_dir* was written after the cutoff."""
     sessions_dir = bridge_dir / "codex-home" / "sessions"
     try:
         sessions_mode = sessions_dir.stat().st_mode

@@ -170,6 +170,10 @@ def _reauth_hint(server_url: str | None) -> str:
     return f"run `{cli_invocation()} login {display_server_url(server_url)}` to re-authenticate"
 
 
+class RunnerTunnelAuthRejectedError(RuntimeError):
+    """The tunnel's credential was refused or is unavailable."""
+
+
 # Schemes that, when surfaced through ``InvalidURI.uri``, indicate
 # the WebSocket upgrade request was redirected somewhere the
 # websockets library cannot follow. The common case on Databricks
@@ -532,7 +536,7 @@ async def serve_tunnel(
                 # fresh token each attempt, so the session survives
                 # once credentials become valid again.
                 if not ever_connected and login_redirect_streak >= _LOGIN_REDIRECT_FATAL_ATTEMPTS:
-                    raise RuntimeError(
+                    raise RunnerTunnelAuthRejectedError(
                         f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                         f"(redirect to non-WebSocket URL {redirect_url} "
                         f"persisted across {login_redirect_streak} attempts); "
@@ -558,7 +562,7 @@ async def serve_tunnel(
                         # Same streak as the rejection below: a transient mint
                         # failure (factory returned None) still gets the loop-top
                         # re-mint; only the message names the local cause.
-                        raise RuntimeError(
+                        raise RunnerTunnelAuthRejectedError(
                             f"{RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX}"
                             f"(HTTP {http_status} persisted across "
                             f"{http_auth_rejection_streak} unauthenticated attempts; the "
@@ -570,7 +574,7 @@ async def serve_tunnel(
                         not ever_connected
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):
-                        raise RuntimeError(
+                        raise RunnerTunnelAuthRejectedError(
                             f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                             f"(HTTP {http_status} persisted across "
                             f"{http_auth_rejection_streak} attempts); "
@@ -1101,15 +1105,9 @@ async def _serve_tunnel_once(
         )
         if event_dispatcher is not None:
             event_dispatcher.connected(send_text)
-        # Reconnect work can itself await event delivery; start receiving the
-        # new generation's ready frame before that work waits for an ACK.
-        reconnect_task = (
-            asyncio.ensure_future(on_ready())
-            if on_ready is not None and event_dispatcher is not None
-            else None
-        )
-        if on_ready is not None and reconnect_task is None:
-            await on_ready()
+        # Recovery can await work sent through this tunnel, including when
+        # events use HTTP. Keep receiving requests and pings while it runs.
+        reconnect_task = asyncio.ensure_future(on_ready()) if on_ready is not None else None
         _logger.info(
             "runner %s connected to %s",
             runner_id,

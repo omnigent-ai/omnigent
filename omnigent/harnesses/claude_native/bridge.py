@@ -400,10 +400,12 @@ _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
 # What :func:`_occupying_surface` reports when no input box is drawn.
 _OVERLAY_SURFACE = "an overlay"
 # The dismissal every surface drawn over the input box advertises in its
-# footer ("Esc to cancel", "Esc to clear"). A screen without a composer that
-# lacks it is not such a surface — e.g. a launch wrapper's output before
-# Claude Code has drawn its input box — and an Escape cannot clear it.
-_ESCAPE_DISMISS_HINT = re.compile(r"\bEsc to \w", re.IGNORECASE)
+# footer ("Esc to cancel", "Esc to clear"). Claude Code joins keys that share
+# an action with "/", so the task details panels print "Esc/Enter/Space to
+# close". A screen without a composer that lacks it is not such a surface —
+# e.g. a launch wrapper's output before Claude Code has drawn its input box —
+# and an Escape cannot clear it.
+_ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)* to \w", re.IGNORECASE)
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -4308,6 +4310,9 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message."
         )
     delivery_diagnostics.set_stage("pasting")
+    # Space returns focus to the input box if the footer (shells item or agent
+    # list) holds it. Either way it types a space, which the clear removes.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     # Clear stale text first: raw controls can otherwise become pasted text.
     # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
@@ -4768,7 +4773,9 @@ def inject_slash_command(
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
+    # not interrupt an in-flight generation. Space first refocuses the input
+    # box from the footer, as in :func:`_paste_and_submit`; C-u clears its space.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
@@ -5810,8 +5817,9 @@ def _restore_occupied_input(
     in two shapes, both reported by :func:`_occupying_surface`: an overlay
     drawn where the input box was (the ctrl+r prompt-history search, a
     hand-opened ``/model`` picker, the double-Escape rewind dialog, a
-    ``/config`` or ``/resume`` panel), or the box itself switched to
-    another input mode (``!`` shell mode). Keystrokes injected into either
+    ``/config`` or ``/resume`` panel, a background task's details panel),
+    or the box itself switched to another input mode (``!`` shell mode).
+    Keystrokes injected into either
     do not become a chat message: the history search filters on the pasted
     text and its Enter replays an old prompt, the rewind dialog's Enter
     restores a checkpoint, and shell mode runs the message as a bash

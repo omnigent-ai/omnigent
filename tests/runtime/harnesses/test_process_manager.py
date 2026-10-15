@@ -716,6 +716,72 @@ async def test_get_client_respawns_after_crash(
         await manager.shutdown()
 
 
+@pytest.mark.posix_only
+@pytest.mark.parametrize("response_id", [None, "resp_socket_lost"])
+async def test_get_client_respawns_when_socket_pathname_vanishes(
+    manager: HarnessProcessManager,
+    caplog: pytest.LogCaptureFixture,
+    response_id: str | None,
+) -> None:
+    """A live harness whose socket file was removed is replaced on the next turn.
+
+    The subprocess never exits, so ``returncode`` stays ``None``; only the
+    bound Unix socket pathname disappears (a ``/tmp`` cleaner). Once the
+    pooled keepalive connection expires, a cached client can no longer
+    connect, so ``get_client`` must retire the stale entry and hand back a
+    client for a fresh harness. A turn in flight on the retired process is
+    reported through the respawn hook so the runner can resync it.
+    """
+    hook_calls: list[tuple[str, str, str]] = []
+
+    async def record_respawn(conv_id: str, reason: str, replaced: str) -> None:
+        hook_calls.append((conv_id, reason, replaced))
+
+    manager.set_respawn_hook(record_respawn)
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        original_pid = (await client.get("/pid")).json()["pid"]
+        if response_id is not None:
+            manager.mark_in_flight("conv_a", response_id)
+        socket_path = manager.socket_path("conv_a")
+        assert socket_path.exists()
+        socket_path.unlink()
+        assert _pid_alive(original_pid)
+
+        await asyncio.sleep(httpx.Limits().keepalive_expiry + 1.0)
+        assert _pid_alive(original_pid), "fixture harness exited during the keepalive wait"
+
+        # Control callers never trigger recovery and keep the live turn's client.
+        assert await manager.get_client("conv_a", "any") is client
+        assert _pid_alive(original_pid)
+
+        new_client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        new_pid = (await new_client.get("/pid")).json()["pid"]
+        assert new_pid != original_pid
+        assert _pid_alive(new_pid)
+        assert socket_path.exists()
+        assert not _pid_alive(original_pid)
+        assert not manager.has_active_turn("conv_a")
+        if response_id is None:
+            assert hook_calls == []
+        else:
+            assert hook_calls == [("conv_a", "harness_respawn_socket_missing", response_id)]
+        lost = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "harness_socket_missing"
+        ]
+        assert len(lost) == 1
+        assert lost[0].session_id == "conv_a"
+        assert lost[0].attributes == {
+            "harness": _TEST_HARNESS_NAME,
+            "pid": original_pid,
+            "socket_path": str(socket_path),
+            "tracked_response_id": response_id,
+        }
+    finally:
+        await manager.shutdown()
+
+
 async def test_release_clears_marker_before_same_session_replacement(
     manager: HarnessProcessManager,
 ) -> None:
