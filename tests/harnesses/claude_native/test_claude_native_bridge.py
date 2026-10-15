@@ -11853,7 +11853,7 @@ def test_inject_slash_command_waits_for_a_booting_prompt_before_typing(
         bridge_dir, command="/effort high", ready_timeout_s=boot_s + 5.0
     )
 
-    assert [key for _, key in pane.composer_keys()] == ["C-u", "/effort high", "Enter"]
+    assert [key for _, key in pane.composer_keys()] == ["Space", "C-u", "/effort high", "Enter"]
     assert all(at >= pane.boot_s for at, _ in pane.composer_keys()), pane.sends
 
 
@@ -11878,7 +11878,7 @@ def test_inject_slash_command_without_a_cap_waits_out_a_slow_boot_like_a_message
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high", timeout_s=1.0)
 
-    assert [key for _, key in pane.composer_keys()] == ["C-u", "/effort high", "Enter"]
+    assert [key for _, key in pane.composer_keys()] == ["Space", "C-u", "/effort high", "Enter"]
     assert all(at >= pane.boot_s for at, _ in pane.composer_keys()), pane.sends
 
 
@@ -12124,7 +12124,7 @@ def test_inject_slash_command_waits_out_launcher_output_instead_of_refusing(
         bridge_dir, command="/effort high", ready_timeout_s=9.0
     )
 
-    assert [key for _, key in pane.sends] == ["C-u", "/effort high", "Enter"]
+    assert [key for _, key in pane.sends] == ["Space", "C-u", "/effort high", "Enter"]
     assert all(at >= pane.boot_s for at, _ in pane.sends), pane.sends
 
 
