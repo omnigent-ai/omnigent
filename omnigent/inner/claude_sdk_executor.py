@@ -46,7 +46,7 @@ from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 from omnigent.inner import _proc
-from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
+from omnigent.inner.bundle_skills import bundle_skill_names, ensure_bundle_plugin_manifest
 from omnigent.inner.hook_scripts import subagent_router
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
@@ -1496,7 +1496,8 @@ class _ResolvedSkills:
     model's view of its own skill listing.
 
     :param skills: Value for ``ClaudeAgentOptions.skills``:
-        ``"all"`` / list of names / empty list for hermetic mode.
+        ``"all"`` / list of names / the bundle's own skill names
+        (possibly empty) for hermetic mode.
     :param setting_sources: Value for
         ``ClaudeAgentOptions.setting_sources``: ``None`` to let
         the SDK pick its default (``["user", "project"]``), or
@@ -1510,6 +1511,7 @@ class _ResolvedSkills:
 
 def _resolve_skills_option(
     skills_filter: str | list[str],
+    bundle_skills: Sequence[str] = (),
 ) -> _ResolvedSkills | None:
     """
     Translate the spec's ``skills_filter`` into the pair of SDK
@@ -1523,12 +1525,14 @@ def _resolve_skills_option(
       auto-defaults to ``["user", "project"]``). All host skills
       from ``~/.claude/skills/`` and ``<cwd>/.claude/skills/``
       (walking up the cwd tree) appear in the model's listing.
-    - ``"none"`` → ``skills=[]``, ``setting_sources=[]``. Both
-      the ``Skill`` tool listing AND the scope-based discovery
-      are suppressed: no host skills appear in the system
-      prompt or as invokable. Bundled skills (loaded via
-      ``--plugin-dir``) are unaffected by ``setting_sources``
-      and remain visible.
+    - ``"none"`` → ``skills=list(bundle_skills)``,
+      ``setting_sources=[]``. Scope-based discovery is suppressed,
+      so no host skills appear in the system prompt or as
+      invokable. The SDK turns ``skills`` into the CLI's
+      ``Skill(<name>)`` allowlist, and an empty allowlist blocks
+      every skill — including the bundle's own, which
+      ``--plugin-dir`` keeps listed — so the allowlist names
+      exactly the bundled skills.
     - ``list[str]`` → ``skills=[names]``, ``setting_sources=None``.
       Only the named subset is in the model's listing; the SDK's
       auto-default still loads user and project sources for
@@ -1536,6 +1540,9 @@ def _resolve_skills_option(
 
     :param skills_filter: ``"all"`` / ``"none"`` / list of skill
         names from :class:`AgentSpec.skills_filter`.
+    :param bundle_skills: Names of the skills the agent bundle
+        ships (see :func:`~omnigent.inner.bundle_skills.bundle_skill_names`);
+        only ``"none"`` uses them.
     :returns: The :class:`_ResolvedSkills` pair, or ``None`` when
         *skills_filter* is malformed — the caller falls back to
         ``"all"`` semantics.
@@ -1543,11 +1550,10 @@ def _resolve_skills_option(
     if skills_filter == "all":
         return _ResolvedSkills(skills="all", setting_sources=None)
     if skills_filter == "none":
-        # Empty ``skills`` suppresses the listing AND empty
-        # ``setting_sources`` skips the SDK's auto-default that
-        # would otherwise load ``~/.claude/skills/`` for the
-        # system prompt anyway.
-        return _ResolvedSkills(skills=[], setting_sources=[])
+        # Empty ``setting_sources`` skips the SDK's auto-default that
+        # would otherwise load ``~/.claude/skills/``; the allowlist
+        # keeps the bundle's own skills invocable.
+        return _ResolvedSkills(skills=list(bundle_skills), setting_sources=[])
     if isinstance(skills_filter, list):
         return _ResolvedSkills(skills=list(skills_filter), setting_sources=None)
     return None
@@ -1655,14 +1661,10 @@ class ClaudeSDKExecutor(Executor):
             skills_filter: Host-skill filter (``"all"`` / ``"none"`` /
                 ``list[str]``). Maps to the SDK's ``skills`` option:
                 ``"all"`` → enable every host-discovered skill,
-                ``"none"`` → empty list (no host skills exposed),
-                list of names → only the named skills. Bundled
-                skills loaded via ``bundle_dir`` are subject to the
-                same listing filter (so ``"none"`` hides every skill
-                from the model, bundled or host); agents that want
-                bundled skills always visible while opting out of
-                host skills should set this to a list naming their
-                bundled skills explicitly. Defaults to ``"all"``.
+                ``"none"`` → no host skills; the skills shipped in
+                *bundle_dir* stay listed and invocable, list of
+                names → only the named skills, so bundled skills
+                must be named too. Defaults to ``"all"``.
             api_key_helper: Shell command the Claude CLI will invoke to
                 retrieve a bearer token, e.g.
                 ``"printf %s sk-ant-..."`` (set by the harness when
@@ -1696,11 +1698,17 @@ class ClaudeSDKExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
-        # Write the bundle's plugin manifest now (idempotent) so that
-        # ``--plugin-dir <bundle>`` produces clean
-        # ``<agent-name>:<skill-name>`` labels in Claude's skill
-        # listing instead of the auto-derived tmpdir basename.
+        # Record the skill names ``skills: none`` must allow, then write the
+        # plugin manifest (idempotent) so ``--plugin-dir`` yields clean
+        # ``<agent-name>:<skill-name>`` labels instead of the tmpdir basename.
+        self._bundle_skill_names: list[str] = []
         if self._bundle_dir is not None:
+            try:
+                self._bundle_skill_names = bundle_skill_names(self._bundle_dir)
+            except OSError as exc:
+                logger.warning(
+                    "could not read bundle skill names at %s: %s", self._bundle_dir, exc
+                )
             try:
                 ensure_bundle_plugin_manifest(self._bundle_dir, self._agent_name)
             except OSError as exc:
@@ -2648,9 +2656,9 @@ class ClaudeSDKExecutor(Executor):
         # options. Falls back to ``"all"`` semantics when the
         # field is malformed (the parser already validates, so
         # this is belt-and-suspenders).
-        resolved = _resolve_skills_option(self._skills_filter) or _ResolvedSkills(
-            skills="all", setting_sources=None
-        )
+        resolved = _resolve_skills_option(
+            self._skills_filter, self._bundle_skill_names
+        ) or _ResolvedSkills(skills="all", setting_sources=None)
         # Bundle skills are exposed via the SDK's plugin mechanism.
         # The bundle's ``<bundle>/skills/<dir>/SKILL.md`` files are
         # discovered as plugin skills (no ``.claude/`` prefix needed
@@ -2678,15 +2686,9 @@ class ClaudeSDKExecutor(Executor):
             "extra_args": {"no-session-persistence": None},
             "max_buffer_size": 10 * 1024 * 1024,
         }
-        # Only forward ``setting_sources`` when explicitly set.
-        # ``None`` lets the SDK apply its default
-        # (``["user", "project"]`` when ``skills`` is non-None).
-        # An empty list — produced by ``"none"`` — is forwarded
-        # verbatim so the SDK doesn't auto-default it back to
-        # ``["user", "project"]``, which would re-load host
-        # skills into the model's system prompt despite
-        # ``skills=[]`` (the live regression that prompted this
-        # branch).
+        # Forward ``setting_sources`` only when set: the empty list from
+        # ``"none"`` must reach the SDK verbatim, or it auto-defaults to
+        # ``["user", "project"]`` and re-loads host skills.
         if resolved.setting_sources is not None:
             options_kwargs["setting_sources"] = resolved.setting_sources
         try:

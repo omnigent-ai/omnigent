@@ -2283,30 +2283,24 @@ class TestSkillsFilterTranslation(unittest.TestCase):
         Claim: setting_sources is ``None`` (not ``[]``), letting
         the SDK fill it in. A regression that hardcoded an
         explicit list here would freeze the default and miss
-        future SDK changes.
+        future SDK changes. Bundled skill names do not narrow it.
         """
         from omnigent.inner.claude_sdk_executor import _resolve_skills_option
 
-        result = _resolve_skills_option("all")
+        result = _resolve_skills_option("all", ["review"])
         assert result is not None
         self.assertEqual(result.skills, "all")
         self.assertIsNone(result.setting_sources)
 
-    def test_none_zeros_skills_and_setting_sources(self) -> None:
+    def test_none_without_bundle_skills_zeros_skills_and_setting_sources(self) -> None:
         """
-        ``"none"`` → SDK ``skills=[]`` AND
+        ``"none"`` with no bundled skills → SDK ``skills=[]`` AND
         ``setting_sources=[]``.
 
-        BOTH must be set to truly suppress host skills. The SDK's
-        ``_apply_skills_defaults`` auto-fills
-        ``setting_sources=["user","project"]`` when ``skills`` is
-        non-None — including when ``skills=[]``. That auto-default
-        loads ``~/.claude/skills/`` into the system prompt
-        listing even though the ``Skill`` tool itself is hidden.
-        Forcing ``setting_sources=[]`` is what actually keeps the
-        listing empty. The user-reported regression: with only
-        ``skills=[]`` set, ``skills: none`` in YAML still showed
-        every host skill in the model's output.
+        Both must be set: the SDK's ``_apply_skills_defaults`` auto-fills
+        ``setting_sources=["user","project"]`` whenever ``skills`` is
+        non-None, which would load ``~/.claude/skills/`` into the system
+        prompt listing even though nothing is allowlisted.
         """
         from omnigent.inner.claude_sdk_executor import _resolve_skills_option
 
@@ -2315,11 +2309,24 @@ class TestSkillsFilterTranslation(unittest.TestCase):
         self.assertEqual(result.skills, [])
         self.assertEqual(result.setting_sources, [])
 
-    def test_list_lets_sdk_default_setting_sources(self) -> None:
-        """A list of names round-trips and uses the SDK default."""
+    def test_none_allowlists_bundled_skills_without_host_sources(self) -> None:
+        """
+        ``"none"`` with bundled skills → ``skills=[<bundled names>]`` and
+        ``setting_sources=[]``: the bundle's own skills stay invocable
+        while host discovery stays off.
+        """
         from omnigent.inner.claude_sdk_executor import _resolve_skills_option
 
-        result = _resolve_skills_option(["foo", "bar:baz"])
+        result = _resolve_skills_option("none", ["brainstorm", "review"])
+        assert result is not None
+        self.assertEqual(result.skills, ["brainstorm", "review"])
+        self.assertEqual(result.setting_sources, [])
+
+    def test_list_lets_sdk_default_setting_sources(self) -> None:
+        """A list of names round-trips unchanged by bundled skills and uses the SDK default."""
+        from omnigent.inner.claude_sdk_executor import _resolve_skills_option
+
+        result = _resolve_skills_option(["foo", "bar:baz"], ["review"])
         assert result is not None
         self.assertEqual(result.skills, ["foo", "bar:baz"])
         self.assertIsNone(result.setting_sources)
@@ -2334,6 +2341,86 @@ class TestSkillsFilterTranslation(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import _resolve_skills_option
 
         self.assertIsNone(_resolve_skills_option("bogus"))
+
+
+class TestBundleSkillsReachSdkOptions(unittest.TestCase):
+    """The bundle on disk, not a hand-built list, feeds the ``"none"`` allowlist."""
+
+    @staticmethod
+    def _write_bundle(root: str) -> Path:
+        bundle_dir = Path(root) / "bundle"
+        (bundle_dir / "skills" / "review").mkdir(parents=True)
+        (bundle_dir / "skills" / "review" / "SKILL.md").write_text(
+            "---\nname: review\ndescription: d\n---\nBody.\n"
+        )
+        return bundle_dir
+
+    def _sdk_options_for_one_turn(self, executor) -> dict[str, object]:
+        """Run one turn against a fake SDK and return the options it was built with."""
+        captured: dict[str, object] = {}
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK(_sdk_types()):
+            ResultMessage = _ResultMessage
+            messages = []
+
+            class ClaudeSDKClient(_SDKClient):
+                async def query(self, prompt, session_id="default"):
+                    captured["skills"] = getattr(self.options, "skills", None)
+                    captured["setting_sources"] = getattr(self.options, "setting_sources", "unset")
+                    captured["plugins"] = getattr(self.options, "plugins", None)
+                    _FakeSDK.messages = [_ResultMessage(session_id, "done")]
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+        async def _t() -> None:
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "s"}], [], ""
+                    )
+                ]
+            self.assertIsInstance(events[-1], TurnComplete)
+
+        _run(_t())
+        return captured
+
+    def test_skills_none_options_allowlist_the_bundled_skills(self) -> None:
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = self._write_bundle(tmp)
+            executor = ClaudeSDKExecutor(
+                bundle_dir=bundle_dir, agent_name="probe", skills_filter="none"
+            )
+            captured = self._sdk_options_for_one_turn(executor)
+
+        self.assertEqual(captured["skills"], ["review"])
+        self.assertEqual(captured["setting_sources"], [])
+        self.assertEqual(captured["plugins"], [{"type": "local", "path": str(bundle_dir)}])
+
+    def test_bundled_skills_stay_allowlisted_when_the_manifest_write_fails(self) -> None:
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = self._write_bundle(tmp)
+            # A file where the manifest directory belongs makes the write fail.
+            (bundle_dir / ".claude-plugin").write_text("not a directory\n")
+            with self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING"):
+                executor = ClaudeSDKExecutor(
+                    bundle_dir=bundle_dir, agent_name="probe", skills_filter="none"
+                )
+            captured = self._sdk_options_for_one_turn(executor)
+
+        self.assertEqual(captured["skills"], ["review"])
+        self.assertEqual(captured["setting_sources"], [])
 
 
 # ---------------------------------------------------------------------------

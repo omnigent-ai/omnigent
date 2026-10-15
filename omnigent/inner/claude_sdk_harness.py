@@ -63,11 +63,12 @@ Env vars read at startup:
 - ``HARNESS_CLAUDE_SDK_SKILLS_FILTER``: JSON-encoded
   ``str | list[str]`` carrying ``spec.skills_filter``. When
   unset, falls back to ``"all"`` (the SDK's default). Plumbed
-  end-to-end so ``skills: none`` in the spec actually produces
-  ``ClaudeAgentOptions(skills=[], setting_sources=[])`` — the
-  pair that suppresses both host-discovered (user/project)
-  skills and the SDK's auto-default of
-  ``setting_sources=["user","project"]``.
+  end-to-end so ``skills: none`` in the spec produces
+  ``ClaudeAgentOptions(skills=<bundled skill names>,
+  setting_sources=[])``: the allowlist names only the bundle's
+  own skills, while the empty ``setting_sources`` excludes host
+  (user/project) settings and skips the SDK's auto-default of
+  ``["user","project"]``.
 - ``HARNESS_CLAUDE_SDK_BUNDLE_DIR``: Absolute path to the
   agent bundle's extracted root. When set, the inner executor
   passes ``plugins=[{"type": "local", "path": <bundle_dir>}]``

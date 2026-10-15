@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -62,6 +63,37 @@ def ensure_bundle_plugin_manifest(
             indent=2,
         )
         + "\n",
+    )
+
+
+# Claude Code registers a plugin skill as ``<plugin>:<dir>``, replacing each
+# directory-name character outside ``[A-Za-z0-9_-]`` with ``-``.
+_CLAUDE_SKILL_NAME_OTHER_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def bundle_skill_names(bundle_dir: Path) -> list[str]:
+    """
+    Name the skills Claude loads from a bundle passed via ``--plugin-dir``.
+
+    Claude Code keys a plugin skill by its ``skills/<dir>`` directory name,
+    normalized like :data:`_CLAUDE_SKILL_NAME_OTHER_RE`, which is what its
+    ``Skill`` tool allowlist matches on.
+
+    :param bundle_dir: Materialized agent-bundle root.
+    :returns: Sorted, normalized ``skills/<dir>`` names holding a
+        ``SKILL.md``, e.g. ``["Code_Review", "my-skill"]`` for
+        ``skills/Code_Review`` and ``skills/my.skill``; empty when the
+        bundle ships no skills.
+    """
+    skills_dir = bundle_dir / "skills"
+    if not skills_dir.is_dir():
+        return []
+    return sorted(
+        {
+            _CLAUDE_SKILL_NAME_OTHER_RE.sub("-", entry.name)
+            for entry in skills_dir.iterdir()
+            if entry.is_dir() and not entry.name.startswith(".") and (entry / "SKILL.md").is_file()
+        }
     )
 
 
