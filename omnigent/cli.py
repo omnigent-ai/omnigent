@@ -6074,8 +6074,9 @@ def _bundle_files(source: Path) -> Iterator[tuple[Path, str]]:
     Symlinks are followed and bundled as regular files, since the server
     refuses links, so shared skills can be linked into ``skills/``. A link must
     resolve inside the enclosing Git checkout (or *source* outside one); dangling,
-    escaping and looping links fail instead of silently dropping content. Entries
-    that are not regular files (FIFOs, sockets, devices) are skipped as before.
+    escaping and looping links fail instead of silently dropping content, as do
+    links into the repository's ``.git`` directory and unreadable directories.
+    Entries that are not regular files (FIFOs, sockets, devices) are skipped as before.
 
     :param source: The agent image directory.
     :raises OmnigentError: If a symlink is dangling, loops, or resolves outside
@@ -6092,17 +6093,27 @@ def _bundle_files(source: Path) -> Iterator[tuple[Path, str]]:
             # Python 3.12 reports loops as RuntimeError; 3.13+ as OSError(ELOOP).
             if isinstance(exc, RuntimeError) or exc.errno == errno.ELOOP:
                 reason = "is a symlink loop"
-            else:
+            elif exc.errno in (errno.ENOENT, errno.ENOTDIR):
                 reason = "is a dangling symlink"
+            else:
+                reason = f"cannot be resolved ({exc.strerror})"
             raise OmnigentError(
                 f"{rel} {reason}; cannot bundle it.", code=ErrorCode.INVALID_INPUT
             ) from exc
 
+    def unreadable(exc: OSError) -> None:
+        raise OmnigentError(
+            f"{exc.filename} cannot be read ({exc.strerror}); cannot bundle it.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
     root = source.resolve()
     boundary = detect_git_root(root) or root
+    # Links must not pull in repository metadata such as remote URLs with credentials.
+    git_dir = boundary / ".git"
     # Real directories on the walk's path to each visited directory, itself included.
     lineage: dict[str, tuple[Path, ...]] = {}
-    for dirpath, dirnames, filenames in os.walk(source, followlinks=True):
+    for dirpath, dirnames, filenames in os.walk(source, followlinks=True, onerror=unreadable):
         current = Path(dirpath)
         real_dir = resolve(current)
         ancestors = lineage.get(os.path.dirname(dirpath), ()) if current != source else ()
@@ -6118,10 +6129,15 @@ def _bundle_files(source: Path) -> Iterator[tuple[Path, str]]:
             path = current / name
             real = resolve(path)
             rel = path.relative_to(source)
-            if not real.is_relative_to(boundary):
+            if real != root / rel and not real.is_relative_to(boundary):
                 raise OmnigentError(
                     f"{rel} resolves to {real}, outside {boundary}; "
                     "only symlinks within the agent's checkout can be bundled.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if real != root / rel and real.is_relative_to(git_dir):
+                raise OmnigentError(
+                    f"{rel} resolves into the repository's .git directory; cannot bundle it.",
                     code=ErrorCode.INVALID_INPUT,
                 )
             if name in files and real.is_file():

@@ -3269,6 +3269,7 @@ def test_bundle_includes_symlinked_skill_as_regular_files(tmp_path: Path, link: 
         ("../../../shared-skills/review-loop", "outside", False),
         ("..", "symlink loop", True),
         ("review-loop", "symlink loop", True),
+        ("../../../.git/config", "repository's .git directory", True),
     ],
 )
 def test_bundle_rejects_unbundleable_symlinks(
@@ -3290,6 +3291,24 @@ def test_bundle_rejects_unbundleable_symlinks(
 
     with pytest.raises(OmnigentError, match=message):
         _bundle(agent)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [(0o600, r"cannot be resolved \(Permission denied\)"), (0o300, r"cannot be read")],
+)
+def test_bundle_reports_inaccessible_skill_paths(tmp_path: Path, mode: int, message: str) -> None:
+    """Permission failures are reported as such, not as dangling links or skipped content."""
+    agent = _agent_with_shared_skill(tmp_path)
+    shared = tmp_path / "shared-skills" / "review-loop"
+    (agent / "skills" / "review-loop").symlink_to(Path("../../../shared-skills/review-loop"))
+    shared.chmod(mode)
+    try:
+        with pytest.raises(OmnigentError, match=message):
+            _bundle(agent)
+    finally:
+        shared.chmod(0o755)
 
 
 def test_bundle_resolves_mcp_header_env_vars(
