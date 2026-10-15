@@ -592,6 +592,20 @@ def test_polly_cannot_be_completed_by_injected_bot_markers(mutation):
         cycle.validate(state, handoff(state))
 
 
+@pytest.mark.parametrize("stdout", ['{"state": "open"}', '{"state": "open", "head": null}'])
+def test_cli_reports_malformed_pull_payload_without_traceback(monkeypatch, capsys, stdout):
+    monkeypatch.setattr(
+        cycle.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(args, 0, stdout, ""),
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["review_cycle.py", "snapshot", "--repository", "o/r", "--pr-number", "7"]
+    )
+    assert cycle.main() == 1
+    assert capsys.readouterr().out.startswith("Review cycle not complete (")
+
+
 @pytest.mark.parametrize("stdout", ["", "null", "[]"])
 def test_cli_rejects_invalid_pull_response_with_context(monkeypatch, capsys, stdout):
     monkeypatch.setattr(
@@ -743,6 +757,37 @@ def test_zero_findings_requires_matching_trusted_receipt(monkeypatch, mutation):
         assert downloads == []
 
 
+@pytest.mark.parametrize("valid_second", [True, False])
+def test_zero_findings_skips_an_unreadable_receipt_artifact(monkeypatch, valid_second):
+    comments = [
+        Github.comment(
+            2,
+            "<!-- ocr-summary -->\n✅ **OpenCodeReview**: "
+            "Review complete: 0 finding(s) across 4 selected item(s).",
+            "github-actions[bot]",
+        )
+    ]
+    receipt = {
+        "pr": 7,
+        "head": "a" * 40,
+        "summary_url": "https://github.com/o/r/pull/7#issuecomment-2",
+    }
+
+    def read(repository, artifact_id):
+        if artifact_id == 1 or not valid_second:
+            raise RuntimeError("Invalid OCR completion artifact")
+        return receipt
+
+    monkeypatch.setattr(cycle, "ocr_receipt", read)
+    artifacts = {"10-1": 1, "12-1": 2}
+    if valid_second:
+        assert cycle.completed_zero_findings("o/r", 7, "a" * 40, comments, artifacts)
+    else:
+        # No readable receipt: fail closed and say why.
+        with pytest.raises(RuntimeError, match="Invalid OCR completion artifact"):
+            cycle.completed_zero_findings("o/r", 7, "a" * 40, comments, artifacts)
+
+
 @pytest.mark.parametrize(
     "payload", ["valid", "bad_zip", "missing_file", "bad_json", "list", "oversized", "http_error"]
 )
@@ -769,9 +814,21 @@ def test_download_ocr_completion_receipt(monkeypatch, payload):
     monkeypatch.setattr(cycle.subprocess, "run", run)
     if payload == "valid":
         assert cycle.ocr_receipt("o/r", 123) == expected
+    elif payload == "http_error":
+        with pytest.raises(cycle.GitHubError, match="HTTP 403"):
+            cycle.ocr_receipt("o/r", 123)
     else:
         with pytest.raises((RuntimeError, ValueError, subprocess.CalledProcessError)):
             cycle.ocr_receipt("o/r", 123)
+
+
+def test_request_reads_the_default_branch_once():
+    api = Github()
+    api.comments.clear()
+    state = cycle.snapshot("o/r", 7, api)
+    api.calls.clear()
+    cycle.request_reviews("o/r", 7, state, api)
+    assert [call for call in api.calls if call[1:] == ["repos/o/r"]] == [["api", "repos/o/r"]]
 
 
 @pytest.mark.parametrize("conclusion", ["failure", "timed_out", "cancelled"])
@@ -857,6 +914,39 @@ def test_unpinned_active_review_waits_without_claiming_completed_evidence(event)
     assert cycle.active_review_runs("o/r", 7, "a" * 40, "polly", api) == [run]
     run["status"] = "completed"
     assert cycle.review_attempts("o/r", 7, "a" * 40, "polly", api) == []
+
+
+def test_pull_request_target_run_without_linked_pulls_is_not_this_review():
+    api = Github()
+    run = {
+        "event": "pull_request_target",
+        "status": "in_progress",
+        "display_title": "Polly #8 @current",
+        "pull_requests": None,
+    }
+    api.active_runs["polly-review.yml"] = [run]
+    assert cycle.active_review_runs("o/r", 7, "a" * 40, "polly", api) == []
+
+
+def test_active_review_on_the_first_page_is_not_reported_twice():
+    api = Github()
+    ours = {
+        "id": 5,
+        "event": "workflow_dispatch",
+        "head_branch": "main",
+        "status": "in_progress",
+        "display_title": f"Polly #7 @{'a' * 40}",
+    }
+    api.active_runs["polly-review.yml"] = [ours, *[{"status": "completed"}] * 99]
+
+    def request(args):
+        if "/runs?status=in_progress" in args[1]:
+            return {"workflow_runs": [dict(ours)]}
+        if "/runs?status=" in args[1]:
+            return {"workflow_runs": []}
+        return api(args)
+
+    assert cycle.active_review_runs("o/r", 7, "a" * 40, "polly", request) == [ours]
 
 
 def test_active_review_beyond_recent_hundred_runs_is_still_found():

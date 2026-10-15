@@ -21,7 +21,8 @@ from zipfile import BadZipFile, ZipFile
 REVIEWERS = {"polly": "polly-review.yml", "ocr": "open-code-review.yml"}
 REVIEW_BOTS = {"github-actions[bot]", "omnigent-ci[bot]"}
 RESOLVE_BOT = "omni-resolve-agent[bot]"
-PERMISSIONS = {"admin", "maintain", "write", "push"}
+# The permission endpoint reports legacy roles only; maintain is reported as write.
+PERMISSIONS = {"admin", "write"}
 
 
 class GitHubError(RuntimeError):
@@ -108,9 +109,10 @@ def completed_review_runs(repository, number, head, default_branch, reviewer, re
     return markers
 
 
-def review_attempts(repository, number, head, reviewer, request):
+def review_attempts(repository, number, head, reviewer, request, default_branch=None):
     """Find trusted attempts and active, unpinned review requests for this PR."""
-    repo = api_object(f"repos/{repository}", request)
+    if default_branch is None:
+        default_branch = api_object(f"repos/{repository}", request)["default_branch"]
     runs = api_object(
         f"repos/{repository}/actions/workflows/{REVIEWERS[reviewer]}/runs?per_page=100",
         request,
@@ -126,6 +128,14 @@ def review_attempts(repository, number, head, reviewer, request):
                     "workflow_runs",
                 )
             )
+        # Active runs on the first page are returned again by the status pages.
+        seen, unique = set(), []
+        for run in runs:
+            if run.get("id") not in seen:
+                unique.append(run)
+            if run.get("id") is not None:
+                seen.add(run["id"])
+        runs = unique
     label = {"polly": "Polly", "ocr": "OCR"}[reviewer]
     return [
         run
@@ -134,7 +144,7 @@ def review_attempts(repository, number, head, reviewer, request):
             run.get("event") == "pull_request_target"
             or (
                 run.get("event") in {"workflow_dispatch", "issue_comment"}
-                and run.get("head_branch") == repo["default_branch"]
+                and run.get("head_branch") == default_branch
             )
         )
         and (
@@ -146,7 +156,7 @@ def review_attempts(repository, number, head, reviewer, request):
                     or (
                         run.get("event") == "pull_request_target"
                         and any(
-                            pull.get("number") == number for pull in run.get("pull_requests", [])
+                            pull.get("number") == number for pull in run.get("pull_requests") or []
                         )
                     )
                 )
@@ -155,22 +165,26 @@ def review_attempts(repository, number, head, reviewer, request):
     ]
 
 
-def active_review_runs(repository, number, head, reviewer, request):
+def active_review_runs(repository, number, head, reviewer, request, default_branch=None):
     return [
         run
-        for run in review_attempts(repository, number, head, reviewer, request)
+        for run in review_attempts(repository, number, head, reviewer, request, default_branch)
         if run.get("status") != "completed"
     ]
 
 
 def artifact_zip(repository, artifact_id):
     """Download through the caller's GitHub transport, replaceable by the CI host."""
-    return subprocess.run(
-        ["gh", "api", f"repos/{repository}/actions/artifacts/{artifact_id}/zip"],
-        check=True,
-        capture_output=True,
-        timeout=120,
-    ).stdout
+    try:
+        return subprocess.run(
+            ["gh", "api", f"repos/{repository}/actions/artifacts/{artifact_id}/zip"],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        ).stdout
+    except subprocess.CalledProcessError as exc:
+        exc.stderr = (exc.stderr or b"").decode(errors="replace")
+        raise GitHubError(exc) from exc
 
 
 def ocr_receipt(repository, artifact_id):
@@ -202,10 +216,15 @@ def completed_zero_findings(repository, number, head, comments, artifacts):
     }
     if not summary_urls:
         return False
+    error = None
     for artifact_id in artifacts.values():
         if not artifact_id:
             continue
-        receipt = ocr_receipt(repository, artifact_id)
+        try:
+            receipt = ocr_receipt(repository, artifact_id)
+        except (RuntimeError, ValueError) as exc:
+            error = exc
+            continue
         if (
             receipt.get("pr") == number
             and receipt.get("head") == head
@@ -213,6 +232,9 @@ def completed_zero_findings(repository, number, head, comments, artifacts):
             and receipt["summary_url"] in summary_urls
         ):
             return True
+    # Without a valid receipt, report why rather than presenting a quiet gap.
+    if error is not None:
+        raise error
     return False
 
 
@@ -374,7 +396,7 @@ def request_reviews(repository, number, state, request=gh_json):
     repo = api_object(f"repos/{repository}", request)
     for name, workflow in REVIEWERS.items():
         if not state["completed"][name] and not active_review_runs(
-            repository, number, state["head_sha"], name, request
+            repository, number, state["head_sha"], name, request, repo["default_branch"]
         ):
             request(
                 [
@@ -412,6 +434,8 @@ def main():
         print(json.dumps(state, indent=2))
     except (
         OSError,
+        LookupError,
+        TypeError,
         ValueError,
         RuntimeError,
         subprocess.CalledProcessError,
