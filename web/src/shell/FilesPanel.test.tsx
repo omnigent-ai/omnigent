@@ -28,6 +28,7 @@ import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ReactNode } from "react";
 
 vi.mock("./WorkspaceUploads", () => ({
+  useWorkspaceUpload: () => null,
   WorkspaceUploadProvider: ({ children }: { children: ReactNode }) => children,
   WorkspaceUploadDropRoot: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   UploadsTray: () => <div data-testid="uploads-tray-stub" />,

@@ -9,6 +9,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronUp, Upload } from "lucide-react";
 import * as Progress from "radix-ui/progress";
@@ -40,7 +41,6 @@ import {
   type UploadRow,
 } from "@/store/uploadStore";
 import { useChatStore } from "@/store/chatStore";
-import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatBytes } from "./fileStatusUtils";
@@ -79,9 +79,17 @@ interface UploadContextValue {
   directory: string;
   destination: string;
   setDirectory: (directory: string) => void;
+  /** Drop-root target: the mounted Files tree's location, else the workspace root. */
+  dropDirectory: string;
+  dropDestination: string;
+  setTreeDirectory: (directory: string | null) => void;
   enqueue: (files: File[], directory?: string) => void;
 }
 const UploadContext = createContext<UploadContextValue | null>(null);
+
+export function useWorkspaceUpload() {
+  return useContext(UploadContext);
+}
 
 export function WorkspaceUploadProvider({
   sessionId,
@@ -103,6 +111,8 @@ export function WorkspaceUploadProvider({
       ),
     [sessionId],
   );
+  // Only the Files tree browses; the Changes view mounts no tree, so its drops go to the root.
+  const [treeDirectory, setTreeDirectory] = useState<string | null>(null);
   const client = useQueryClient();
   const liveStatus = useChatStore((state) =>
     state.conversationId === sessionId ? state.sessionStatus : undefined,
@@ -193,7 +203,8 @@ export function WorkspaceUploadProvider({
     probeReason,
     routeAnswered,
   ]);
-  const destination = directory || root?.split("/").filter(Boolean).at(-1) || "workspace";
+  const rootName = root?.split("/").filter(Boolean).at(-1) || "workspace";
+  const destination = directory || rootName;
   const value = useMemo<UploadContextValue>(
     () => ({
       owner,
@@ -210,12 +221,15 @@ export function WorkspaceUploadProvider({
       directory,
       destination,
       setDirectory,
+      dropDirectory: treeDirectory ?? "",
+      dropDestination: treeDirectory || rootName,
+      setTreeDirectory,
       enqueue: (files, target = directory) => {
         if (!gate.enabled || !capability.data) {
           toast.error(gate.reason ?? "Workspace upload permission is pending");
           return;
         }
-        enqueueUploads(owner, files, target, target || destination, capability.data.limits, client);
+        enqueueUploads(owner, files, target, target || rootName, capability.data.limits, client);
       },
     }),
     [
@@ -229,6 +243,8 @@ export function WorkspaceUploadProvider({
       directory,
       destination,
       setDirectory,
+      treeDirectory,
+      rootName,
       client,
     ],
   );
@@ -313,8 +329,15 @@ export function UploadPicker({ directory }: { directory: string }) {
   );
 }
 
-export function resolveUploadTarget(_event: DragEvent, browsedDirectory: string): string {
-  return browsedDirectory;
+export function resolveUploadTarget(event: DragEvent, browsedDirectory: string): string {
+  const row =
+    event.target instanceof Element ? event.target.closest<HTMLElement>("[data-drop-dir]") : null;
+  return [
+    browsedDirectory.replace(/\/$/, ""),
+    row?.closest("[data-upload-tree]") ? row.dataset.dropDir : undefined,
+  ]
+    .filter(Boolean)
+    .join("/");
 }
 
 export function droppedUploadFiles(event: DragEvent, files: File[]): File[] {
@@ -327,16 +350,48 @@ export function droppedUploadFiles(event: DragEvent, files: File[]): File[] {
   return files.filter((file) => !directoryFiles.has(file));
 }
 
+export function WorkspaceUploadRootIndicator({
+  container,
+  destination,
+}: {
+  container: HTMLElement;
+  destination: string;
+}) {
+  return createPortal(
+    <div
+      aria-hidden="true"
+      data-drop-variant="upload"
+      className="pointer-events-none absolute inset-0 z-40 m-2 rounded-md border-2 border-dashed border-info bg-transparent"
+    >
+      <div
+        data-upload-root-label=""
+        className="absolute top-0 left-1/2 flex max-w-[calc(100%-1rem)] -translate-x-1/2 flex-col items-center rounded-b-md border-x border-b border-info bg-card-solid px-2 py-0.5 text-center text-ui text-foreground shadow-composer"
+      >
+        <span className="whitespace-nowrap font-medium">Upload to workspace</span>
+        <span className="max-w-full truncate text-muted-foreground">to {destination}</span>
+      </div>
+    </div>,
+    container,
+  );
+}
+
 export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
   const context = useContext(UploadContext);
   const [target, setTarget] = useState<HTMLDivElement | null>(null);
-  const active = useFileDropTarget(context?.enabled ? target : null, (files, event) => {
-    if (context)
-      context.enqueue(
-        droppedUploadFiles(event, files),
-        resolveUploadTarget(event, context.directory),
-      );
-  });
+  const active = useFileDropTarget(
+    context?.enabled ? target : null,
+    (files, event) => {
+      if (context)
+        context.enqueue(
+          droppedUploadFiles(event, files),
+          resolveUploadTarget(event, context.dropDirectory),
+        );
+    },
+    {
+      ignore: (event) =>
+        event.target instanceof Element && event.target.closest("[data-upload-tree]") !== null,
+    },
+  );
   return (
     <div
       ref={setTarget}
@@ -348,13 +403,12 @@ export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
     >
       {children}
       {active && target && context && (
-        <FileDropOverlay
-          container={target}
-          variant="upload"
-          label="Upload to workspace"
-          destination={context.destination}
-          subtext="Saved to this session's files"
-        />
+        <>
+          <span className="sr-only" role="status" aria-live="polite">
+            Upload to {context.dropDestination}
+          </span>
+          <WorkspaceUploadRootIndicator container={target} destination={context.dropDestination} />
+        </>
       )}
     </div>
   );

@@ -25,8 +25,13 @@ from tests.e2e_ui.conftest import (
 
 
 @pytest.fixture
+def upload_server_pids() -> dict[str, int]:
+    return {}
+
+
+@pytest.fixture
 def upload_session(
-    built_spa: None, mock_llm_server_url: str, tmp_path: Path
+    built_spa: None, mock_llm_server_url: str, tmp_path: Path, upload_server_pids: dict[str, int]
 ) -> Iterator[tuple[str, str, Path]]:
     """Uploads need a primary-session runner; the suite's shared runner has none."""
     workspace = tmp_path / "upload-workspace"
@@ -51,6 +56,8 @@ def upload_session(
             cwd=repo,
         )
         bind_session_runner(httpx.patch, stack.base_url, sid, stack.runner_id, timeout=30)
+        assert stack.server is not None
+        upload_server_pids[stack.base_url] = stack.server.pid
         try:
             yield stack.base_url, sid, workspace
         finally:
@@ -292,3 +299,86 @@ def test_workspace_upload_mobile_drawer(page: Page, upload_session: tuple[str, s
         drawer.get_by_role("region", name="Uploads").get_by_text("Done", exact=True)
     ).to_be_visible(timeout=30_000)
     assert (workspace / "mobile.txt").read_bytes() == b"mobile"
+
+
+def test_workspace_upload_asleep_runner_wakes_without_a_message(
+    page: Page,
+    upload_session: tuple[str, str, Path],
+    mock_llm_server_url: str,
+    tmp_path: Path,
+) -> None:
+    """An upload wakes a sleeping runner through its live host and commits the file."""
+    from tests._helpers.host import isolated_host
+    from tests.e2e.test_host_e2e import _runner_pid_from_daemon_log
+
+    base, sid, workspace = upload_session
+    repo = Path(__file__).resolve().parents[3]
+    env = {
+        "PYTHONPATH": str(repo),
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
+    }
+    with (
+        httpx.Client(base_url=base, timeout=60) as client,
+        isolated_host(tmp_path / "wake-host", base, env=env, cwd=repo) as host,
+    ):
+        host.wait_online(client)
+        bundle = bundle_files(
+            {"hello_world.yaml": _TEST_AGENT_YAML.replace("cwd: .", f"cwd: {workspace}").encode()}
+        )
+        response = post_session_bundle(client.post, f"{base}/v1/sessions", bundle)
+        response.raise_for_status()
+        sid = response.json()["session_id"]
+        launched = client.post(
+            f"/v1/hosts/{host.host_id}/runners",
+            json={"session_id": sid, "workspace": str(workspace)},
+        )
+        assert launched.status_code == 200, launched.text
+        runner_id = launched.json()["runner_id"]
+        # Launch returns before the tunnel connects; uploads need the runner online first.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if client.get(f"/v1/runners/{runner_id}/status").json()["online"]:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("Launched runner never came online")
+        _open_uploads(page, (base, sid, workspace))
+        pid = _runner_pid_from_daemon_log(host.log_path)
+        assert pid is not None, host.log_path.read_text()[-3000:]
+        import psutil
+
+        runner = psutil.Process(pid)
+        assert host.proc.pid in [parent.pid for parent in runner.parents()]
+        runner.terminate()
+        runner.wait(timeout=20)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if not client.get(f"/v1/runners/{runner_id}/status").json()["online"]:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("Owned runner stayed online after termination")
+        capability = client.get(f"/v1/sessions/{sid}/resources/environments/default/uploads")
+        assert capability.json()["reason"] == "runner_unavailable", capability.text
+        page.evaluate("""() => {
+          window.uploadStates = [];
+          new MutationObserver(() => {
+            for (const row of document.querySelectorAll('[data-upload-state]')) {
+              window.uploadStates.push(row.dataset.uploadState);
+            }
+          }).observe(document.body, {childList:true, subtree:true, attributes:true});
+        }""")
+        page.get_by_label("Choose workspace files").set_input_files(
+            {"name": "wake.txt", "mimeType": "text/plain", "buffer": b"woken bytes"}
+        )
+        rail = page.get_by_role("complementary", name="Workspace")
+        expect(
+            rail.get_by_role("region", name="Uploads").get_by_text("Done", exact=True)
+        ).to_be_visible(timeout=120_000)
+        assert "connecting" in page.evaluate("() => window.uploadStates")
+        assert (workspace / "wake.txt").read_bytes() == b"woken bytes"
+        refreshed = client.get(f"/v1/sessions/{sid}").json()
+        assert refreshed["runner_id"] != runner_id
+        assert client.get(f"/v1/runners/{refreshed['runner_id']}/status").json()["online"]
+        client.delete(f"/v1/sessions/{sid}").raise_for_status()
