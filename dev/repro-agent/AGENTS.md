@@ -526,6 +526,14 @@ and observe the SPA's error/recovery UI (the error pill, retry, reconnect) — t
 observed error state is the reproduction. The same journey driver can film it
 in Step 4, even when permanent coverage uses a narrower test.
 
+**Do not manufacture the symptom and call it reproduced.** Injecting a reported
+upstream fault is valid when the product still performs the failing transition.
+Writing the suspected final state directly only shows how the product displays
+that state; it does not prove the reported actions can reach it. Keep such probes
+as hypotheses in `evidence`, report what the actual journey showed, and disclose
+untested triggers. Changing `environment_fidelity` cannot turn a fabricated
+symptom into a reproduction.
+
 Judge **each sub-symptom** honestly and independently:
 
 **Global `needs_more_info` rule:** use it only for information absent from the
