@@ -10,6 +10,7 @@ logout, and expired-ticket eviction.
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,7 +22,7 @@ import pytest
 
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.server.oidc import derive_code_challenge, generate_code_verifier
+from omnigent.server.oidc import derive_code_challenge
 from omnigent.server.routes.auth import (
     _CLI_TICKET_TTL_SECONDS,
     _CliTicket,
@@ -161,16 +162,8 @@ async def test_cli_login_creates_ticket() -> None:
     assert "ticket" in body
     assert "login_url" in body
     assert body["login_url"].startswith("/auth/login?ticket=")
-    assert body["user_code"]
-
-
-async def test_cli_login_rejects_json_without_challenge() -> None:
-    transport = _build_oidc_app()
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post("/auth/cli-login", json={})
-
-    assert resp.status_code == 400
-    assert "Upgrade" in resp.json()["error"]
+    assert "reauth=1" in body["login_url"]
+    assert re.fullmatch(r"[A-Z2-9]{4}-[A-Z2-9]{4}", body["user_code"])
 
 
 # ── 3. CLI poll (pending) ─────────────────────────────────────────
@@ -356,82 +349,3 @@ async def test_evict_expired_tickets_noop_when_all_fresh() -> None:
     _evict_expired_tickets(tickets)
 
     assert len(tickets) == 2
-
-
-# ── 7. CLI ticket authorization: client binding and consent ────────
-
-
-async def _fulfill_ticket_via_browser_callback(
-    transport: httpx.ASGITransport, ticket: str, email: str
-) -> None:
-    """Drive a browser sign-in that resolves the CLI ticket at /auth/callback.
-
-    The IdP token/userinfo exchange is mocked; the /auth/* handlers run
-    unmodified.
-    """
-    state = "cli-ticket-state"
-    state_cookie = _mint_state_cookie(state, ticket=ticket)
-    mock_cm = _mock_httpx_client_for_github(
-        emails_json=[{"email": email, "primary": True, "verified": True}]
-    )
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://test", follow_redirects=False
-    ) as browser:
-        with patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=mock_cm):
-            await browser.get(
-                "/auth/callback",
-                params={"code": "auth-code", "state": state},
-                cookies={"ap_auth_state": state_cookie},
-            )
-
-
-async def test_cli_login_without_challenge_issues_no_redeemable_ticket() -> None:
-    """A mint that carries no PKCE challenge binds the ticket to no client, so
-    POST /auth/cli-login must not hand out a ticket a browser sign-in could
-    fulfil: either refuse the request or return a login link without a ticket
-    whose marker the poll endpoint reports as dead."""
-    transport = _build_oidc_app()
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post("/auth/cli-login")
-        if resp.status_code != 200:
-            assert 400 <= resp.status_code < 500, resp.text
-            return
-        body = resp.json()
-        assert "ticket=" not in body["login_url"], (
-            f"challenge-free mint handed out a login link carrying a ticket: {body}"
-        )
-        poll = await client.get("/auth/cli-poll", params={"ticket": body["ticket"]})
-
-    assert poll.status_code == 410, (
-        f"challenge-free mint issued a live ticket (poll returned {poll.status_code} {poll.text})"
-    )
-
-
-async def test_cli_poll_does_not_release_session_without_verifier() -> None:
-    """A poller that presents no code_verifier never proved it initiated the
-    login, so /auth/cli-poll must not hand it the signed-in user's session."""
-    transport = _build_oidc_app()
-    verifier = generate_code_verifier()
-    challenge = derive_code_challenge(verifier)
-
-    # A valid challenge lets the ticket mint on both the unbound and hardened build.
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as initiator:
-        mint = await initiator.post(
-            "/auth/cli-login",
-            json={"code_challenge": challenge, "code_challenge_method": "S256"},
-        )
-    ticket = mint.json().get("ticket")
-    assert ticket, f"expected a ticket from /auth/cli-login; got {mint.status_code} {mint.text}"
-
-    await _fulfill_ticket_via_browser_callback(transport, ticket, "victim@example.com")
-
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as poller:
-        poll = await poller.get(f"/auth/cli-poll?ticket={ticket}")
-
-    body = (
-        poll.json() if poll.headers.get("content-type", "").startswith("application/json") else {}
-    )
-    assert "token" not in body, (
-        "verifier-less poll leaked the signed-in user's session token "
-        f"(status {poll.status_code}, keys {sorted(body)})"
-    )

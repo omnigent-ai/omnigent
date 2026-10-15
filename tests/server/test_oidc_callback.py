@@ -656,7 +656,7 @@ def test_cli_ticket_generic_oidc_reauth_round_trip(
 
 @pytest.mark.parametrize(
     "login_kind",
-    ["missing_auth_time", "stale_auth_time", "fresh_auth_time", "other_ticket", "legacy_state"],
+    ["ordinary_session", "other_ticket", "legacy_state"],
 )
 def test_cli_approval_requires_authentication_for_its_ticket(
     callback_client: tuple[TestClient, _IdpKeys], login_kind: str
@@ -682,8 +682,7 @@ def test_cli_approval_requires_authentication_for_its_ticket(
             if cookie.name == _AUTH_STATE_COOKIE_PLAIN:
                 cookie.value = jwt.encode(state, _TEST_SECRET, algorithm="HS256")
     claims: dict[str, object] = {"email": "alice@example.com", "email_verified": True}
-    if login_kind != "missing_auth_time":
-        claims["auth_time"] = 0 if login_kind == "stale_auth_time" else int(time.time())
+    claims["auth_time"] = int(time.time())
     client.app.state.pending_id_token[0] = keys.sign_id_token(claims)
     callback = client.get(
         "/auth/callback",

@@ -15,6 +15,11 @@ be able to write resources without a separate Omnigent account.
 - `login-auto-detect`: `omnigent login <url>` detects the server's sign-in mode.
   States: accounts, OIDC, header mode, Databricks-fronted, and a workspace URL
   with an org selector.
+- `cli-browser-ticket-consent`: an OIDC sign-in opens a ticket-specific browser
+  login and then an **Authorize sign-in** page. Compare its code with the CLI,
+  choose **Approve** to complete sign-in, or **Deny** to stop it. Signing in
+  without approving leaves the CLI waiting. Older clients open an upgrade page
+  and cannot start a new session until updated.
 - `databricks-credential-kind`: the host authenticates with a user OAuth login
   made by the Databricks CLI, a personal access token, or a machine-to-machine
   service principal. Each is its own state to reproduce.
@@ -52,6 +57,12 @@ be able to write resources without a separate Omnigent account.
 ## How to get to it (user POV)
 
 **CLI sign-in:** `omnigent login <server-url>`.
+
+For an OIDC server, follow browser sign-in, compare the displayed code, and try
+both consent outcomes. Check that approval completes the waiting CLI, denial
+stops it, and closing the page without a decision leaves it pending. An older
+client should show the upgrade instructions and stop polling. Use isolated test
+credentials and configuration for these checks.
 
 **Host:** `omnigent host <server-url>` (or `--server`), `omnigent host ""` for a
 local server, `--background`, `--no-open`, `--non-interactive`, and the

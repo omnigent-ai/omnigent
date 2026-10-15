@@ -1,21 +1,4 @@
-"""Regression test for the OIDC CLI-login ticket hijack.
-
-Exercises the real ``/auth/*`` routes on a FastAPI app with OIDC auth,
-mocking only the external IdP, in the style of
-``tests/server/integration/test_oidc_auth_e2e.py``.
-
-The vulnerability: nothing bound a CLI-login ticket to the client that
-created it, and the browser callback fulfilled the ticket the instant
-whoever signed in returned from the IdP. So an attacker could mint a
-ticket, hand its ``/auth/login?ticket=T`` link to a victim, and — after
-the victim signed in normally with no explicit approval step — poll
-``/auth/cli-poll`` from a client that never authenticated and walk away
-with the victim's session token (and refresh token, when a grant store
-is wired).
-
-The security invariant this guards: a passive victim sign-in must never
-hand an unauthenticated third party the victim's credentials.
-"""
+"""A passive victim sign-in must never release credentials to the ticket creator."""
 
 from __future__ import annotations
 

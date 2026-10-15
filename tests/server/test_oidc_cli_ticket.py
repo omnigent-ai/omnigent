@@ -22,7 +22,6 @@ from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.routes.auth import create_auth_router
 from tests.server.integration.oidc_fixtures import TEST_SIGNING_KEY, make_oidc_config
 from tests.server.integration.test_oidc_auth_e2e import (
-    _build_oidc_app,
     _mint_state_cookie,
     _mock_httpx_client_for_github,
     _pkce_pair,
@@ -123,7 +122,10 @@ async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Pa
         assert body["refresh_token"]
 
 
-async def test_cli_ticket_rejects_wrong_verifier_without_consuming() -> None:
+@pytest.mark.parametrize("proof,status", [(None, 400), ("b" * 64, 403)])
+async def test_cli_ticket_rejects_invalid_proof_without_consuming(
+    proof: str | None, status: int
+) -> None:
     transport = _build_app()
     async with httpx.AsyncClient(
         transport=transport, base_url="http://test", follow_redirects=False
@@ -137,8 +139,13 @@ async def test_cli_ticket_rejects_wrong_verifier_without_consuming() -> None:
         )
         assert approved.status_code == 200
 
-        wrong = await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={'b' * 64}")
-        assert wrong.status_code == 403
+        params = {"ticket": ticket}
+        if proof is not None:
+            params["code_verifier"] = proof
+        wrong = await client.get("/auth/cli-poll", params=params)
+        assert wrong.status_code == status
+        assert "token" not in wrong.json()
+        assert "refresh_token" not in wrong.json()
         correct = await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
         assert correct.status_code == 200
 
@@ -499,25 +506,13 @@ async def test_cli_consent_unauthenticated_bounces_to_login() -> None:
     assert "reauth=1" in response.headers["location"]
 
 
-async def test_cli_login_response_contains_consent_code() -> None:
-    transport = _build_oidc_app()
-    _, challenge = _pkce_pair()
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post(
-            "/auth/cli-login",
-            json={"code_challenge": challenge, "code_challenge_method": "S256"},
-        )
-    body = response.json()
-    assert "reauth=1" in body["login_url"]
-    assert re.fullmatch(r"[A-Z2-9]{4}-[A-Z2-9]{4}", body["user_code"])
-
-
 async def test_legacy_login_opens_upgrade_instructions_and_stops_polling() -> None:
     """Old clients open login_url on 200 and stop polling on 410."""
     async with httpx.AsyncClient(transport=_build_app(), base_url="http://test") as client:
         response = await client.post("/auth/cli-login")
         assert response.status_code == 200
         body = response.json()
+        assert "ticket=" not in body["login_url"]
         page = await client.get(body["login_url"])
         assert page.status_code == 200
         assert "Update Omnigent to sign in" in page.text
@@ -527,9 +522,15 @@ async def test_legacy_login_opens_upgrade_instructions_and_stops_polling() -> No
         assert "<form" not in page.text
         assert "set-cookie" not in page.headers
         assert page.headers["cache-control"] == "no-store"
-        poll = await client.get("/auth/cli-poll", params={"ticket": body["ticket"]})
-        assert poll.status_code == 410
-        assert "omni upgrade" in poll.json()["error"]
+        for params in (
+            {"ticket": body["ticket"]},
+            {"ticket": body["ticket"], "code_verifier": _pkce_pair()[0]},
+        ):
+            poll = await client.get("/auth/cli-poll", params=params)
+            assert poll.status_code == 410
+            assert "omni upgrade" in poll.json()["error"]
+            assert "token" not in poll.json()
+            assert "refresh_token" not in poll.json()
 
 
 async def test_legacy_upgrade_notice_cannot_issue_credentials(tmp_path: Path) -> None:

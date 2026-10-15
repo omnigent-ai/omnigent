@@ -1,10 +1,4 @@
-"""Shared OIDC config fixtures for the ``/auth`` route tests.
-
-Deliberately free of HTTP-client code: CI's exfil scan blocks any single
-file whose added lines pair credential-shaped names with a network client,
-so the config and signing key live here while the transports stay in the
-test modules.
-"""
+"""Config and signing key only; HTTP clients stay in the test modules."""
 
 from __future__ import annotations
 
