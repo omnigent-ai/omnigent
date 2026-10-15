@@ -254,6 +254,9 @@ Cross-harness journeys:
   thread is resumed once before retrying a rejected update. Overlapping picks
   retain their apply order, including while recovery is in progress
   (`tests/server/integration/test_codex_model_change_after_idle_reap.py`).
+  A refused connection to an owned backend whose pane is still alive replaces
+  that launch once within the same readiness budget, then confirms the settings
+  RPC. Authentication refusals and failures after sending settings are not replayed.
   Failed startup or resume returns a retryable 503 and retains the previous
   selection; fully offline and silent saves remain deferred.
   An older server keeps such a refused change, so the updated runner applies it

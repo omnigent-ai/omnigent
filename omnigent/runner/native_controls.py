@@ -40,7 +40,7 @@ from omnigent.runner.native import (
     _CodexNativeModelOptionsNotReady,
     _resolve_opencode_compact_model,
 )
-from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.resource_registry import CODEX_NATIVE_TERMINAL_ROLE, SessionResourceRegistry
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -240,6 +240,7 @@ def build_native_controls(
     _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]],
     _codex_native_bridge_state_for_session: _CodexNativeBridgeStateForSessionFn,
     _codex_native_bridge_state_and_dir_for_session: _CodexNativeBridgeStateAndDirForSessionFn,
+    _codex_terminal_ensure_locks: dict[str, asyncio.Lock],
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
     _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]],
     _fetch_session_model_override: Callable[[str], Coroutine[Any, Any, str | None]],
@@ -341,11 +342,49 @@ def build_native_controls(
             await asyncio.sleep(_CODEX_SETTINGS_READY_POLL_S)
         return None
 
+    async def _close_unreachable_owned_codex(
+        conv_id: str, state: CodexNativeBridgeState, bridge_dir: Path
+    ) -> bool:
+        """Retire only the owned launch whose listener refused this connection."""
+        from omnigent.entities.session_resources import terminal_resource_id
+        from omnigent.harnesses.codex_native.bridge import read_bridge_state
+        from omnigent.runner.native.orchestration import (
+            _AUTO_CODEX_APP_SERVERS,
+            teardown_codex_native_app_server,
+        )
+
+        registry = resource_registry.terminal_registry
+        if registry is None:
+            return False
+        lock = _codex_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
+        async with lock:
+            if (
+                resource_registry.terminal_resource_role(
+                    conv_id, terminal_resource_id("codex", "main")
+                )
+                != CODEX_NATIVE_TERMINAL_ROLE
+                or read_bridge_state(bridge_dir) != state
+            ):
+                return False
+            backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+            if backend is not None and backend.bridge_dir != bridge_dir:
+                return False
+            _logger.info(
+                "Recreating unreachable owned Codex backend before settings update for session=%s",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            await teardown_codex_native_app_server(conv_id)
+            await registry.close(conv_id, "codex", "main")
+            return True
+
     async def _apply_codex_native_settings_update(
         conv_id: str,
         settings: _JsonObject,
         *,
         legacy_server: bool,
+        ready_deadline: float | None = None,
+        retry_unreachable: bool = True,
     ) -> tuple[Response, _JsonObject]:
         """Apply *settings* and return the response with the settings as resolved."""
         from omnigent.harnesses.codex_native.app_server import (
@@ -362,10 +401,12 @@ def build_native_controls(
         from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
         from omnigent.util.reasoning_effort import effort_for_model_switch
 
+        if ready_deadline is None:
+            ready_deadline = asyncio.get_running_loop().time() + _CODEX_SETTINGS_READY_TIMEOUT_S
         try:
             state = await asyncio.wait_for(
                 _ready_codex_bridge_for_settings(conv_id),
-                timeout=_CODEX_SETTINGS_READY_TIMEOUT_S,
+                timeout=ready_deadline - asyncio.get_running_loop().time(),
             )
         except TimeoutError:
             _logger.warning(
@@ -418,8 +459,29 @@ def build_native_controls(
             client_name="omnigent-codex-native-runner",
         )
         try:
-            # Bounded so a hung app-server cannot hold the settings lock indefinitely.
-            await asyncio.wait_for(codex_client.connect(), timeout=SETTINGS_UPDATE_TIMEOUT_S)
+            try:
+                await asyncio.wait_for(
+                    codex_client.connect(),
+                    timeout=SETTINGS_UPDATE_TIMEOUT_S,
+                )
+            except (ConnectionRefusedError, FileNotFoundError):
+                if not retry_unreachable:
+                    raise
+                # No settings request was sent. Recreate this owned launch once,
+                # sharing the original readiness budget with cleanup and startup.
+                retired = await asyncio.wait_for(
+                    _close_unreachable_owned_codex(conv_id, state, bridge_dir),
+                    timeout=ready_deadline - asyncio.get_running_loop().time(),
+                )
+                if not retired:
+                    raise
+                return await _apply_codex_native_settings_update(
+                    conv_id,
+                    settings,
+                    legacy_server=legacy_server,
+                    ready_deadline=ready_deadline,
+                    retry_unreachable=False,
+                )
             if "model" in settings or "effort" in settings:
                 # Only an absent key inherits config; null selects the model's default.
                 effort = (
