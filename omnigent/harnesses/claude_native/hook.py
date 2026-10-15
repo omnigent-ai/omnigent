@@ -14,28 +14,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from omnigent.harnesses.claude_native.bridge import (
-    BRIDGE_ID_LABEL_KEY,
-    CLAUDE_FRAMEWORK_CONTEXT_FILE,
-    approval_wait_marker_path,
-    hold_approval_wait_marker,
-    read_active_session_id,
-    read_bridge_id,
-    read_claude_session_id,
-    read_claude_status_model,
-    read_permission_hook_config,
-    read_seen_claude_session_ids,
-    record_hook_event,
-    transcript_has_forked_from_marker,
-    transcript_has_recent_local_command,
-    url_component,
-    write_active_session_id,
-)
-
-# The observer path (the default, most frequent invocation — Claude blocks
-# on it per Stop/UserPromptSubmit/TaskCreated/...) must not pay the
-# httpx/policy import cost; those are imported inside the subcommands and
-# helpers that actually speak HTTP.
+# Claude blocks on every spawn of this module, so its import stays stdlib-only:
+# the bridge, httpx and the policy machinery are imported inside the
+# subcommands and helpers that need them.
 if TYPE_CHECKING:
     import httpx
 
@@ -219,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         print("omnigent claude hook: expected JSON object", file=sys.stderr)
         return 0
     bridge_dir = Path(args.bridge_dir)
+    from omnigent.harnesses.claude_native.bridge import record_hook_event
     from omnigent.harnesses.claude_native.lifecycle import record_hook_lifecycle
 
     record_hook_lifecycle(bridge_dir, payload, time.time())
@@ -261,6 +243,11 @@ def _annotate_resume_session_context(bridge_dir: Path, payload: dict[str, object
         ``{"hook_event_name": "SessionStart", "source": "resume"}``.
     :returns: None.
     """
+    from omnigent.harnesses.claude_native.bridge import (
+        read_claude_session_id,
+        read_seen_claude_session_ids,
+    )
+
     if payload.get("hook_event_name") != "SessionStart" or payload.get("source") != "resume":
         return
     new_claude_session_id = payload.get("session_id")
@@ -336,6 +323,11 @@ def _payload_transcript_has_recent_branch_command(
     :returns: ``True`` when the transcript contains a recent
         ``/branch`` or ``/fork`` signal for the hook session.
     """
+    from omnigent.harnesses.claude_native.bridge import (
+        transcript_has_forked_from_marker,
+        transcript_has_recent_local_command,
+    )
+
     transcript_path = payload.get("transcript_path")
     claude_session_id = payload.get("session_id")
     if not isinstance(transcript_path, str) or not transcript_path:
@@ -374,6 +366,11 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
     :returns: New Omnigent session id, e.g. ``"conv_new"``, or ``None`` when
         rotation could not be completed from the hook.
     """
+    from omnigent.harnesses.claude_native.bridge import (
+        read_active_session_id,
+        read_permission_hook_config,
+    )
+
     old_session_id = read_active_session_id(bridge_dir)
     if not old_session_id:
         return None
@@ -432,6 +429,11 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     :returns: New Omnigent session id, e.g. ``"conv_fork"``, or ``None``
         when rotation could not be completed from the hook.
     """
+    from omnigent.harnesses.claude_native.bridge import (
+        read_active_session_id,
+        read_permission_hook_config,
+    )
+
     old_session_id = read_active_session_id(bridge_dir)
     if not old_session_id:
         return None
@@ -496,6 +498,13 @@ def _create_clear_replacement_session(
         new-session binding, or terminal transfer.
     :raises RuntimeError: If Omnigent returns malformed session data.
     """
+    from omnigent.harnesses.claude_native.bridge import (
+        BRIDGE_ID_LABEL_KEY,
+        read_bridge_id,
+        url_component,
+        write_active_session_id,
+    )
+
     old_resp = client.get(f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}")
     old_resp.raise_for_status()
     old = old_resp.json()
@@ -591,6 +600,11 @@ def _create_fork_replacement_session(
         new-session binding, or terminal transfer.
     :raises RuntimeError: If Omnigent returns malformed session data.
     """
+    from omnigent.harnesses.claude_native.bridge import (
+        url_component,
+        write_active_session_id,
+    )
+
     old_resp = client.get(f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}")
     old_resp.raise_for_status()
     old = old_resp.json()
@@ -659,6 +673,11 @@ def _conversation_url_for_active_session(
         ``"http://127.0.0.1:8787/c/conv_new"``, or ``None`` when no
         URL can be constructed.
     """
+    from omnigent.harnesses.claude_native.bridge import (
+        read_active_session_id,
+        read_permission_hook_config,
+    )
+
     config = read_permission_hook_config(bridge_dir)
     ap_server_url = config.get("ap_server_url")
     session_id = read_active_session_id(bridge_dir)
@@ -763,6 +782,8 @@ def _post_hook_with_reattach(
     :returns: The successful (2xx) response, or ``None`` when rejected
         or out of budget — callers fail-ask as before.
     """
+    from omnigent.harnesses.claude_native.bridge import hold_approval_wait_marker
+
     body = {
         **payload,
         "_omnigent_elicitation_id": f"elicit_claude_{secrets.token_hex(16)}",
@@ -891,6 +912,12 @@ def _main_permission_request(argv: list[str]) -> int:
     :returns: Process exit code. Returns ``0`` on transport failures so
         Claude Code falls back to its terminal prompt.
     """
+    from omnigent.harnesses.claude_native.bridge import (
+        approval_wait_marker_path,
+        read_active_session_id,
+        read_permission_hook_config,
+        url_component,
+    )
     from omnigent.native.native_policy_hook import policy_hook_reauth
 
     args = _parse_permission_args(argv)
@@ -995,6 +1022,12 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     :returns: Process exit code. Always ``0`` — blocking verdicts
         are expressed via the JSON output, not exit codes.
     """
+    from omnigent.harnesses.claude_native.bridge import (
+        read_active_session_id,
+        read_claude_status_model,
+        read_permission_hook_config,
+        url_component,
+    )
     from omnigent.native.native_policy_hook import (
         evaluation_response_to_hook_output,
         fail_ask_hook_output,
@@ -1110,6 +1143,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def _main_framework_context(argv: list[str]) -> int:
     """Add pending framework context to one submitted prompt."""
+    from omnigent.harnesses.claude_native.bridge import CLAUDE_FRAMEWORK_CONTEXT_FILE
+
     args = _parse_evaluate_policy_args(argv)
     sys.stdin.read()
     path = Path(args.bridge_dir) / CLAUDE_FRAMEWORK_CONTEXT_FILE
@@ -1218,6 +1253,11 @@ def _main_route_turn(argv: list[str]) -> int:
     :returns: Process exit code. Always ``0`` — the block is expressed via
         the JSON on stdout, never via the exit code.
     """
+    from omnigent.harnesses.claude_native.bridge import (
+        read_active_session_id,
+        read_claude_status_model,
+        url_component,
+    )
     from omnigent.runner.turn_routing import (
         ADVERTISEMENT_FILE,
         HOOK_REQUEST_TIMEOUT_S,

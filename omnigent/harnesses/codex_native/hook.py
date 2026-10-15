@@ -1,12 +1,11 @@
-"""Codex Code hook entrypoint for native Omnigent policy enforcement.
+"""Codex hook entrypoint for native Omnigent policy enforcement.
 
-Registered as the ``PreToolUse`` / ``PostToolUse`` command hook in the
-per-session private ``CODEX_HOME`` (see
-:mod:`omnigent.harnesses.codex_native.app_server`). Codex spawns this module as
-a short subprocess before/after each built-in tool call, piping the hook
-payload on stdin and reading a verdict on stdout. The conversion to/from
-the Omnigent policy schema is shared with the Claude-native hook via
-:mod:`omnigent.native.native_policy_hook`.
+Registered through the per-session private ``CODEX_HOME`` ``hooks.json`` (see
+:mod:`omnigent.harnesses.codex_native.app_server`), which answers the per-tool
+hooks from the runner's relay over curl and runs this module as their fallback
+and for ``route-turn``. Codex pipes the hook payload on stdin and reads the
+verdict on stdout. The policy schema conversion is shared with the
+Claude-native hook via :mod:`omnigent.native.native_policy_hook`.
 """
 
 from __future__ import annotations
@@ -18,21 +17,8 @@ import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from omnigent.harnesses.codex_native.bridge import (
-    read_bridge_state,
-    read_codex_config_model,
-    read_policy_hook_config,
-)
-from omnigent.native.native_policy_hook import (
-    evaluation_response_to_hook_output,
-    fail_ask_hook_output,
-    hook_payload_to_evaluation_request,
-    policy_hook_reauth,
-    post_evaluate_with_retry,
-    read_relay_policy_config,
-    relay_policy_evaluate_url,
-)
-
+# Codex blocks each tool call on this process, so the module import stays
+# stdlib-only; the bridge and the policy client load inside the subcommands.
 if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.app_server import CodexAppServerClient
 
@@ -108,6 +94,21 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         e.g. ``["--bridge-dir", "/tmp/x"]``.
     :returns: Process exit code. Always ``0``.
     """
+    from omnigent.harnesses.codex_native.bridge import (
+        read_bridge_state,
+        read_codex_config_model,
+        read_policy_hook_config,
+    )
+    from omnigent.native.native_policy_hook import (
+        evaluation_response_to_hook_output,
+        fail_ask_hook_output,
+        hook_payload_to_evaluation_request,
+        policy_hook_reauth,
+        post_evaluate_with_retry,
+        read_relay_policy_config,
+        relay_policy_evaluate_url,
+    )
+
     args = _parse_evaluate_policy_args(argv)
     raw = sys.stdin.read()
     try:
@@ -251,6 +252,7 @@ def _main_route_turn(argv: list[str]) -> int:
     :returns: Process exit code. Always ``0`` — the block is expressed via
         the JSON on stdout, never via the exit code.
     """
+    from omnigent.harnesses.codex_native.bridge import read_bridge_state
     from omnigent.runner.turn_routing import (
         ADVERTISEMENT_FILE,
         HOOK_REQUEST_TIMEOUT_S,
@@ -471,6 +473,7 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
     )
     from omnigent.harnesses.codex_native.bridge import (
         mirror_applied_codex_settings,
+        read_bridge_state,
         read_codex_config_effort,
         read_unmirrored_codex_settings,
     )

@@ -72,7 +72,20 @@ async def test_native_session_tracks_prs_across_repositories(
         loop=asyncio.get_running_loop(),
         session_id="conv_owned",
     )
-    hook = hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")
+    hook = hook_settings(
+        bridge_dir,
+        shlex.join(
+            [
+                sys.executable,
+                "-I",
+                "-m",
+                f"omnigent.harnesses.{harness}.hook",
+                "observe-tool",
+                "--bridge-dir",
+                str(bridge_dir),
+            ]
+        ),
+    )
     command = shlex.split(str(hook["command"]))
     try:
         shell_command = (

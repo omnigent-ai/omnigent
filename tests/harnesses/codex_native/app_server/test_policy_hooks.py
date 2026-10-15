@@ -559,3 +559,34 @@ def test_policy_hooks_register_user_prompt_submit() -> None:
     prompt_hook = hooks["UserPromptSubmit"][0]["hooks"][0]
     # Same evaluate-policy command as the tool phases.
     assert prompt_hook["command"] == hooks["PreToolUse"][0]["hooks"][0]["command"]
+
+
+def test_per_tool_hooks_answer_from_the_relay_and_stay_trusted() -> None:
+    """Per-tool hooks curl the runner's relay; Python runs only as the fallback.
+
+    Both commands keep the hook module in their text because the trust pass
+    matches on it: a hook without it stays untrusted and codex skips it.
+    """
+    import shlex
+
+    from omnigent.harnesses.codex_native.app_server import _POLICY_HOOK_MODULE
+
+    settings = _codex_policy_hooks_settings(Path("/b"), "/venv/bin/python")
+    policy, observer = settings["hooks"]["PostToolUse"][0]["hooks"]
+    for hook, route, subcommand in (
+        (policy, "/hook/codex/evaluate-policy", "evaluate-policy"),
+        (observer, "/hook/observe-tool", "observe-tool"),
+    ):
+        shell, flag, script = shlex.split(hook["command"])
+        assert (shell, flag) == ("/bin/sh", "-c")
+        assert f'"$OMNIGENT_RELAY_URL{route}"' in script
+        fallback = shlex.split(script.rsplit("| ", 1)[1])
+        assert fallback[:5] == ["/venv/bin/python", "-I", "-m", _POLICY_HOOK_MODULE, subcommand]
+    listed = {
+        "result": {
+            "data": [
+                {"cwd": _CWD, "hooks": [{"command": h["command"]} for h in (policy, observer)]}
+            ]
+        }
+    }
+    assert len(_our_policy_hooks_from_list(listed, _CWD)) == 2

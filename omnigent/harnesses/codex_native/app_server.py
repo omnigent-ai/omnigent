@@ -104,6 +104,7 @@ from omnigent.inner.databricks_executor import (
     _read_databrickscfg_host,
 )
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
+from omnigent.native.relay_hook import relay_hook_command
 from omnigent.process_logging import (
     harness_stderr_capture_enabled,
     log_info_once,
@@ -2626,9 +2627,11 @@ class CodexNativeAppServer:
                 diagnostics.finish()
 
 
-def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) -> str:
+def _codex_policy_hook_command(
+    bridge_dir: Path, python_executable: str | None, *, subcommand: str = "evaluate-policy"
+) -> str:
     """
-    Build the shell command codex runs for the policy hook.
+    Build the Python hook command, run when the runner's relay cannot answer.
 
     Runs python in isolated mode (``-I``): codex executes hooks with the
     session's workspace as cwd, and ``-m`` would otherwise put that
@@ -2642,6 +2645,7 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
         via ``--bridge-dir``.
     :param python_executable: Python executable to run, e.g.
         ``"/path/to/python"``. ``None`` uses :data:`sys.executable`.
+    :param subcommand: Hook subcommand, ``"evaluate-policy"`` or ``"observe-tool"``.
     :returns: A shell-escaped command string, e.g.
         ``"/path/python -I -m omnigent.harnesses.codex_native.hook evaluate-policy
         --bridge-dir /home/u/.omnigent/codex-native/abc"``.
@@ -2653,7 +2657,7 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
             "-I",
             "-m",
             _POLICY_HOOK_MODULE,
-            "evaluate-policy",
+            subcommand,
             "--bridge-dir",
             str(bridge_dir),
         ]
@@ -2692,6 +2696,10 @@ def _codex_policy_hooks_settings(
     not by a matcher, so the relay path remains the single MCP
     enforcement point.
 
+    The policy and observer hooks POST to the runner's tool relay through
+    ``curl`` and start Python only when no relay answers (see
+    :func:`omnigent.native.relay_hook.relay_hook_command`).
+
     :param bridge_dir: Native Codex bridge directory.
     :param python_executable: Python executable for the hook command.
     :param turn_routing: ``True`` when the runner advertised a ``route-turn``
@@ -2702,12 +2710,21 @@ def _codex_policy_hooks_settings(
     """
     hook: _JsonObject = {
         "type": "command",
-        "command": _codex_policy_hook_command(bridge_dir, python_executable),
+        "command": relay_hook_command(
+            bridge_dir,
+            "/hook/codex/evaluate-policy",
+            _codex_policy_hook_command(bridge_dir, python_executable),
+            max_time_s=_POLICY_HOOK_TIMEOUT_SECONDS,
+        ),
         "timeout": _POLICY_HOOK_TIMEOUT_SECONDS,
     }
     from omnigent.native.tool_observer_hook import hook_settings
 
-    observer = hook_settings(bridge_dir, python_executable or sys.executable, _POLICY_HOOK_MODULE)
+    # Keeps _POLICY_HOOK_MODULE in the command, which the trust pass matches on.
+    observer = hook_settings(
+        bridge_dir,
+        _codex_policy_hook_command(bridge_dir, python_executable, subcommand="observe-tool"),
+    )
     prompt_submit: list[_JsonObject] = [hook]
     if turn_routing:
         prompt_submit.append(_codex_route_turn_hook(bridge_dir, python_executable))
