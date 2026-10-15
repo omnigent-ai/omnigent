@@ -25,6 +25,7 @@ from websockets.frames import Close
 from websockets.http11 import Response
 
 from omnigent import debug_logging
+from omnigent.errors import ErrorCategory
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
     HostConnectError,
@@ -32,6 +33,7 @@ from omnigent.host.connect import (
     HostRetryableConnectionError,
     ModelOptionsResult,
     _build_runner_env,
+    _runner_exit_category,
     _runner_exit_error,
     _RunnerHandle,
     run_host_process,
@@ -1336,6 +1338,54 @@ async def test_handle_launch_prints_exact_runner_log_path(
     _cleanup_host(host)
 
 
+async def test_launch_and_stop_reply_when_stdout_is_unwritable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A background host whose log disk is full still answers launch and stop.
+
+    The daemon's stdout is its log file. The lifecycle line is cosmetic; if
+    printing it raised, the server would wait out its launch timeout for a
+    runner that had already started.
+    """
+
+    class _FullDiskStdout:
+        def write(self, _text: str) -> int:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        def flush(self) -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "10"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    monkeypatch.setattr(sys, "stdout", _FullDiskStdout())
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_full", binding_token="tok_full", workspace=str(workspace)
+            )
+        )
+    stop_result = await host._handle_stop(
+        HostStopRunnerFrame(
+            request_id="req_full_stop", runner_id=token_bound_runner_id("tok_full")
+        )
+    )
+
+    assert result.status == "launched", result.error
+    assert stop_result.status == "stopped"
+    _cleanup_host(host)
+
+
 class _FakeTunnel:
     """In-memory stand-in for the host's WebSocket tunnel connection.
 
@@ -1813,6 +1863,26 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     # Keep the diagnostic cause.
     assert "tunnel rejected: bad frame" in error
     assert "code 3" in error
+
+
+@pytest.mark.parametrize(("free_bytes", "disk_full"), [(0, True), (10 * 1024 * 1024, False)])
+def test_runner_exit_error_names_a_full_host_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    free_bytes: int,
+    disk_full: bool,
+) -> None:
+    """A runner that dies on a full disk usually logs nothing, so the host says why."""
+    usage = SimpleNamespace(total=100, used=100, free=free_bytes)
+    monkeypatch.setattr("omnigent.host.connect.shutil.disk_usage", lambda _path: usage)
+
+    error = _runner_exit_error(1, tmp_path / "runner-x.log")
+
+    assert error.startswith("runner process exited with code 1")
+    assert ("no space left on device" in error) is disk_full
+    assert _runner_exit_category(tmp_path / "runner-x.log") is (
+        ErrorCategory.HOST if disk_full else ErrorCategory.RUNNER
+    )
 
 
 async def test_watch_runner_silent_on_intentional_stop(

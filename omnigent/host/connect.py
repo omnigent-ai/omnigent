@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -286,6 +287,9 @@ _LOG_TAIL_MAX_BYTES = 4096
 # the error summary above it remains visible.
 _LOG_TAIL_MAX_LINES = 15
 
+# Below this much free space, a runner exit report blames the host's full disk.
+_HOST_DISK_FULL_FREE_BYTES = 1024 * 1024
+
 # Poll cadence for the per-runner exit watcher. 0.5s matches the client's
 # steady-state online-poll cadence (daemon_launch.DAEMON_POLL_INTERVAL_S),
 # so a crashed runner is reported within about one client poll.
@@ -393,7 +397,39 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     if tail.strip():
         lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
         message += "\n--- runner log tail ---\n" + _redact_log_tail("\n".join(lines))
+    if _host_disk_full(log_path):
+        # A runner on a full disk usually dies before it can log why.
+        message += "\nThe host's disk is full (no space left on device); free space and retry."
     return message
+
+
+def _host_disk_full(log_path: Path) -> bool:
+    """Whether the filesystem holding a runner log has no room left.
+
+    :param log_path: The runner's log file, e.g.
+        ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
+    :returns: ``True`` when free space is under ``_HOST_DISK_FULL_FREE_BYTES``;
+        ``False`` when it isn't, or when the usage can't be read.
+    """
+    try:
+        return shutil.disk_usage(log_path.parent).free < _HOST_DISK_FULL_FREE_BYTES
+    except OSError:
+        return False
+
+
+def _runner_exit_category(log_path: Path) -> ErrorCategory:
+    """Blame a runner exit on the host when its disk is full."""
+    return ErrorCategory.HOST if _host_disk_full(log_path) else ErrorCategory.RUNNER
+
+
+def _print_lifecycle_line(text: str) -> None:
+    """Echo a runner lifecycle line for a foreground host, best effort.
+
+    A background host's stdout is its log file. A full disk or a closed stream
+    drops the line instead of failing the launch or stop reply that follows it.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        print(text, flush=True)
 
 
 def _url_is_loopback(url: str) -> bool:
@@ -2026,7 +2062,9 @@ class HostProcess:
             self._trigger_maintenance("runner_launch_failed")
             # The returned result retains the diagnostic tail, while
             # _launch_failed limits the host lifecycle line to its first line.
-            return self._launch_failed(frame, error, error_category=ErrorCategory.RUNNER)
+            return self._launch_failed(
+                frame, error, error_category=_runner_exit_category(log_path)
+            )
 
         # One live runner per session: the session's previous runner —
         # whose binding the server has already rotated away — is
@@ -2080,11 +2118,10 @@ class HostProcess:
         # host's own terminal shows lifecycle lines, but the runner's real
         # output — the agent turn, tracebacks — lands only in this file.
         session_line = f"\n    session: {frame.session_id}" if frame.session_id else ""
-        print(
+        _print_lifecycle_line(
             f"  ↑ Runner started: {runner_id} (pid={proc.pid})\n"
             f"    log: {display_log_path(log_path)}"
-            f"{session_line}",
-            flush=True,
+            f"{session_line}"
         )
         return HostLaunchRunnerResultFrame(
             request_id=frame.request_id,
@@ -2279,10 +2316,7 @@ class HostProcess:
         # freeze the daemon's control handler.
         await self._stop_runner_and_trigger(handle.proc, "runner_stopped")
         _logger.info("Stopped runner %s", frame.runner_id)
-        print(
-            f"  ↓ Runner stopped: {frame.runner_id}",
-            flush=True,
-        )
+        _print_lifecycle_line(f"  ↓ Runner stopped: {frame.runner_id}")
         return HostStopRunnerResultFrame(
             request_id=frame.request_id,
             status="stopped",
@@ -2472,9 +2506,9 @@ class HostProcess:
             await self._report_runner_exit(runner_id, error, had_connected=had_connected)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-        # A non-zero runner exit is a runner-process fault that blocks the
-        # session; the specific cause lives in the unparsed log tail (lifecycle
-        # stage unknown).
+        # A non-zero runner exit is a runner-process fault (or a full host
+        # disk) that blocks the session; the specific cause lives in the
+        # unparsed log tail (lifecycle stage unknown).
         _logger.warning(
             "Runner %s died unexpectedly: %s",
             runner_id,
@@ -2484,7 +2518,7 @@ class HostProcess:
                 session_id=handle.session_id,
                 stage="runner_process",
                 runner_id=runner_id,
-                error_category=ErrorCategory.RUNNER.value,
+                error_category=_runner_exit_category(handle.log_path).value,
                 error_impact=ErrorImpact.BLOCKING.value,
                 error_phase=ErrorPhase.UNKNOWN.value,
             ),
