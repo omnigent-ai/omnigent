@@ -17,11 +17,13 @@ try:
 except ImportError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 from omnigent.harnesses.codex_native.app_server import (
+    CodexNativeAppServer,
     build_codex_native_server,
     codex_terminal_env,
 )
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
+    _FakeStartupClient,
     _test_app_server,
 )
 
@@ -374,6 +376,92 @@ async def test_start_pins_reasoning_effort_in_config(
     assert tomllib.loads(rendered)["model_reasoning_effort"] == "ultra"
     assert rendered.count("model_reasoning_effort") == 1
     assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
+
+
+_CONFIG_FALLBACK_EXIT = (
+    "Codex app-server exited early: Error: error loading default config after config "
+    "error: Model provider `Databricks` not found"
+)
+
+
+def _fail_first_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: list[str] | None = None,
+    error: str = _CONFIG_FALLBACK_EXIT,
+) -> list[str]:
+    """Fail the first readiness wait as a config fallback; later waits succeed."""
+    configs: list[str] = []
+
+    async def wait(self: CodexNativeAppServer) -> _FakeStartupClient:
+        configs.append((self.codex_home / "config.toml").read_text(encoding="utf-8"))
+        if len(configs) == 1:
+            self.recent_stderr = list(stderr or [])
+            raise RuntimeError(error)
+        return _FakeStartupClient()
+
+    _disable_codex_startup_rpc(monkeypatch)
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", wait)
+    return configs
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _CONFIG_FALLBACK_EXIT,
+        # Codex 0.162 reports only the provider the defaults lack.
+        "Codex app-server exited early: Error: Model provider `Databricks` not found",
+    ],
+)
+async def test_start_retries_without_a_model_catalog_codex_cannot_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: str
+) -> None:
+    """A catalog generated for another Codex build no longer fails every launch."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    original = 'model_catalog_json = "/home/me/.codex/stale-catalog.json"\nmodel = "gpt-test"\n'
+    (real_codex_home / "config.toml").write_text(original, encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    configs = _fail_first_readiness(monkeypatch, error=error)
+
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    await server.start()
+    await server.close()
+
+    assert [("model_catalog_json" in config) for config in configs] == [True, False]
+    assert tomllib.loads(configs[1])["model"] == "gpt-test"
+    assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("config", "stderr"),
+    [
+        ('model = "gpt-test"\n', []),
+        (
+            'model_catalog_json = "/home/me/.codex/catalog.json"\n',
+            ["ERROR codex_app_server: Invalid configuration; using defaults. unknown field `x`"],
+        ),
+    ],
+    ids=["no-catalog", "codex-names-another-cause"],
+)
+async def test_start_keeps_other_config_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: str, stderr: list[str]
+) -> None:
+    """Only a config that could fail on its model catalog is retried without it."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "config.toml").write_text(config, encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    configs = _fail_first_readiness(monkeypatch, stderr)
+
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    with pytest.raises(RuntimeError, match="error loading default config"):
+        await server.start()
+
+    assert len(configs) == 1
 
 
 @pytest.mark.parametrize(
