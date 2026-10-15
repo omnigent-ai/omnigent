@@ -32,14 +32,18 @@ def harness_tmp_parent() -> Iterator[Path]:
 
 async def test_next_turn_recovers_when_live_harness_socket_disappears(
     harness_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A later turn replaces a live process whose UDS pathname vanished."""
-    _HARNESS_MODULES[_TEST_HARNESS] = _TEST_HARNESS_MODULE
+    monkeypatch.setitem(_HARNESS_MODULES, _TEST_HARNESS, _TEST_HARNESS_MODULE)
     manager = HarnessProcessManager(tmp_parent=harness_tmp_parent)
-    await manager.start()
+    spawn_env = {"PYTHONPATH": str(Path(__file__).resolve().parents[2])}
     try:
+        await manager.start()
         conversation_id = "socket-disappeared"
-        first_client = await manager.get_client(conversation_id, _TEST_HARNESS)
+        first_client = await manager.get_client(
+            conversation_id, _TEST_HARNESS, env=spawn_env
+        )
         first_pid = (await first_client.get("/pid")).json()["pid"]
         socket_path = manager.socket_path(conversation_id)
 
@@ -54,11 +58,12 @@ async def test_next_turn_recovers_when_live_harness_socket_disappears(
         # next request must connect through the now-missing pathname.
         await asyncio.sleep(6)
 
-        next_turn_client = await manager.get_client(conversation_id, _TEST_HARNESS)
+        next_turn_client = await manager.get_client(
+            conversation_id, _TEST_HARNESS, env=spawn_env
+        )
         next_pid = (await next_turn_client.get("/pid")).json()["pid"]
 
         assert next_pid != first_pid
         assert socket_path.exists()
     finally:
         await manager.shutdown()
-        _HARNESS_MODULES.pop(_TEST_HARNESS, None)
