@@ -6028,7 +6028,7 @@ def test_build_models_json_catalog_reasoning_models_get_reasoning_flag() -> None
 
 
 @pytest.mark.parametrize("wire_api", ["chat", "responses"])
-def test_generic_reasoning_uses_pi_compat_detection_without_changing_databricks(wire_api):
+def test_generic_and_databricks_reasoning_use_pi_compat_detection(wire_api):
     generic = _build_models_json(
         "https://gateway.example",
         "synthetic",
@@ -6042,7 +6042,7 @@ def test_generic_reasoning_uses_pi_compat_detection_without_changing_databricks(
     databricks = _build_models_json("https://workspace.example", "synthetic")
     for provider in databricks["providers"].values():
         if provider["api"].startswith("openai"):
-            assert provider["compat"]["supportsReasoningEffort"] is False
+            assert "supportsReasoningEffort" not in provider["compat"]
 
 
 @pytest.mark.parametrize("destination", ["generic", "mixed-databricks", "catalog"])

@@ -76,7 +76,6 @@ from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.util.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     PI_EFFORTS,
-    PI_THINKING_OFF,
     to_pi_thinking_level,
     validate_effort,
 )
@@ -797,7 +796,6 @@ def _databricks_openai_provider(
             "supportsDeveloperRole": False,
             "supportsStore": False,
             "supportsStrictMode": False,
-            "supportsReasoningEffort": False,
             # stream_options is OpenAI-specific; Gemini and other non-OpenAI
             # models reject it with 400.
             "supportsUsageInStreaming": False,
@@ -1877,9 +1875,8 @@ def pi_native_provider_launch(
     :param agent_dir: The managed Pi config dir for this session.
     :param provider: The resolved provider config.
     :param reasoning_effort: Canonical omnigent effort for the session, e.g.
-        ``"high"``. Passed as ``--thinking`` on the primary provider; ignored
-        (with a warning) on a gateway-routed model, whose thinking must stay
-        off for text to surface.
+        ``"high"``. Passed as ``--thinking`` on the selected provider; Pi
+        applies the model's reasoning capabilities.
     :param selection: Optional picker value naming a generated provider and
         model. When that provider no longer serves the model, the provider that
         does is used instead.
@@ -1916,14 +1913,8 @@ def pi_native_provider_launch(
     else:
         model_provider_id = _default_model_provider_id(provider, rendered)
     write_pi_models_config(agent_dir, provider, rendered)
-    # Copy the user's global Pi settings but suppress defaultThinkingLevel.
-    # In TUI mode Pi applies the setting from ~/.pi/agent/settings.json; for
-    # non-Claude models via openai-completions, any thinking level causes the
-    # Databricks gateway to return 400 (reasoning_effort is sent even when
-    # supportsReasoningEffort is false in the compat block, because TUI mode
-    # applies the session-level thinking before the compat check fires).
-    # Passing None in the overlay makes _deep_merge_settings write null for the
-    # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
+    # Session effort or Pi's default selects thinking; don't inherit a global
+    # thinking preference that may belong to a different provider.
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
     overlay: dict[str, object] = {"defaultThinkingLevel": None}
@@ -1960,20 +1951,6 @@ def pi_native_provider_launch(
             _LOGGER.warning("pi-native: %s", exc)
         if effort is not None:
             thinking = to_pi_thinking_level(effort)
-    # For non-Claude models on openai-completions/responses, disable thinking.
-    # Gemini and other Databricks models return reasoning_tokens in their
-    # responses; Pi's TUI mode applies thinking even with defaultThinkingLevel:null
-    # in settings, causing the agent loop to complete without surfacing the text
-    # content to the extension. Explicitly passing --thinking off ensures the
-    # completions handler doesn't activate the thinking path.
-    if model_provider_id != provider.provider_id:
-        args.extend(["--thinking", PI_THINKING_OFF])
-        if thinking is not None and thinking != PI_THINKING_OFF:
-            effort_warning = (
-                f"effort ignored for gateway-routed model {provider.model}: "
-                "thinking disabled to keep text surfacing"
-            )
-            _LOGGER.warning("pi-native: %s", effort_warning)
-    elif thinking is not None:
+    if thinking is not None:
         args.extend(["--thinking", thinking])
     return PiNativeLaunch(env=env, args=args, effort_warning=effort_warning)
