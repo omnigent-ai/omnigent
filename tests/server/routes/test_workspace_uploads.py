@@ -1355,13 +1355,15 @@ async def test_pending_create_key_across_event_loops(scenario, monkeypatch, fail
 
 async def test_finished_create_key_replay_does_not_reopen_admission(scenario):
     scenario.hard["max_open_uploads"] = 1
-    ids = {"a" * 32: uuid.uuid4().hex, "b" * 32: uuid.uuid4().hex}
+    ids = {key * 32: uuid.uuid4().hex for key in "abc"}
     creates: dict[str, int] = {}
 
     async def handle(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
             return await scenario.handle(request)
         if request.url.path.endswith("/complete"):
+            return await scenario.handle(request)
+        if request.method == "DELETE":
             return await scenario.handle(request)
         key = request.headers["Idempotency-Key"]
         creates[key] = creates.get(key, 0) + 1
@@ -1390,13 +1392,19 @@ async def test_finished_create_key_replay_does_not_reopen_admission(scenario):
         assert first.status_code == 201
         completed = await scenario.client.post(scenario.base + "/" + ids["a" * 32] + "/complete")
         assert completed.status_code == 200
+        other = await create("b" * 32)
+        assert other.status_code == 201
         replay = await create("a" * 32)
         assert replay.status_code == 201
         assert replay.json()["upload_id"] == ids["a" * 32]
         assert replay.json()["offset"] == 3
-        other = await create("b" * 32)
-        assert other.status_code == 201
+        assert creates["a" * 32] == 2
         assert other.json()["upload_id"] == ids["b" * 32]
+        deleted = await scenario.client.delete(scenario.base + "/" + ids["b" * 32])
+        assert deleted.status_code == 204
+        next_upload = await create("c" * 32)
+        assert next_upload.status_code == 201
+        assert next_upload.json()["upload_id"] == ids["c" * 32]
 
 
 async def test_create_key_runner_id_change_retires_stale_admission(scenario):
