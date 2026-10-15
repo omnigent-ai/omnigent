@@ -2910,11 +2910,11 @@ function ConversationList({
           </PinSavingContext.Provider>
         </RowEditHoldContext.Provider>
         {/* The dragged row's preview follows the pointer: a compact card showing
-          the session's title. Portaled to <body>: the aside always carries a CSS
-          translate (the mobile slide-in), which makes it the containing block for
-          fixed descendants, so an inline overlay would resolve its viewport
-          coordinates against the aside's box and drift off the cursor whenever
-          the aside sits away from (0,0) — e.g. the floating peek card. */}
+          the session's title (or the dragged project name). Portaled outside the
+          transformed sidebar aside: it always carries a CSS translate (the
+          mobile slide-in / peek positioning), which makes it the containing
+          block for fixed descendants, so an inline DragOverlay would resolve its
+          viewport coordinates against the aside and drift off the cursor. */}
         {createPortal(
           <DragOverlay
             dropAnimation={null}
