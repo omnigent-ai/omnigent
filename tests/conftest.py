@@ -22,10 +22,12 @@ except ImportError:
 _TEST_OMNIGENT_DATA_DIR = Path(tempfile.mkdtemp(prefix="omnigent-pytest-")).resolve()
 os.environ["OMNIGENT_DATA_DIR"] = str(_TEST_OMNIGENT_DATA_DIR)
 # Servers and runners booted by tests otherwise sweep the developer's live
-# harness root. Kept directly under /tmp for the AF_UNIX path-length limit.
-_TEST_HARNESS_TMP_PARENT = Path(
-    tempfile.mkdtemp(prefix="omni-h-", dir="/tmp" if os.name == "posix" else None)
-)
+# harness root. Prefer /tmp for the AF_UNIX path-length limit; some sandboxes
+# only allow the default temp dir.
+try:
+    _TEST_HARNESS_TMP_PARENT = Path(tempfile.mkdtemp(prefix="omni-h-", dir="/tmp"))
+except OSError:
+    _TEST_HARNESS_TMP_PARENT = Path(tempfile.mkdtemp(prefix="omni-h-"))
 os.environ["OMNIGENT_HARNESS_TMP_PARENT"] = str(_TEST_HARNESS_TMP_PARENT)
 
 # Skip the synchronous api.litellm.ai/model_catalog HTTP fallback during
