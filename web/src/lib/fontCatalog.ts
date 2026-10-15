@@ -110,7 +110,7 @@ function googleFont(
   };
 }
 
-// 25 eligible Sans Serif families in ascending Google popularity; prior choices follow.
+// 25 eligible Sans Serif families in ascending Google popularity; base catalog families not in the ranked list follow.
 const SANS_GOOGLE_FONTS: readonly [string, string, readonly number[]][] = [
   ["open-sans", "Open Sans", [400, 500, 600, 700]],
   ["roboto", "Roboto", [400, 500, 600, 700]],
@@ -137,9 +137,6 @@ const SANS_GOOGLE_FONTS: readonly [string, string, readonly number[]][] = [
   ["mulish", "Mulish", [400, 500, 600, 700]],
   ["source-sans-3", "Source Sans 3", [400, 600, 700]],
   ["barlow", "Barlow", [400, 500, 600, 700]],
-  ["poppins", "Poppins", [400, 500, 600, 700]],
-  ["kanit", "Kanit", [400, 500, 600, 700]],
-  ["archivo", "Archivo", [400, 500, 600, 700]],
   ["geist", "Geist", [400, 500, 600, 700]],
 ];
 

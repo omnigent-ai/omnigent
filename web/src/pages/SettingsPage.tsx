@@ -2169,7 +2169,8 @@ function UiFontFamilyControl() {
 }
 
 /**
- * Fixed-width picker; catalog faces load only when webfonts is enabled.
+ * Styles chrome monospace text (paths, hashes, inline code chips, log rows) with
+ * --ui-mono-font-family / font-mono, apart from editor/terminal; catalog faces load only when webfonts is enabled.
  * "Monospace default" uses --font-mono; typed families stay honored.
  */
 function FixedWidthFontFamilyControl() {
