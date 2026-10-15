@@ -721,9 +721,10 @@ class HarnessProcessManager:
         switching support; changes to ACP startup options also require a restart.
 
         Crash detection: if the previously-spawned subprocess has
-        exited (``returncode is not None``), the entry is dropped
-        and a fresh subprocess is spawned with the ``env``
-        provided on the call that triggered the respawn.
+        exited (``returncode is not None``), or its Unix socket has
+        disappeared, the entry is dropped and a fresh subprocess is
+        spawned with the ``env`` provided on the call that triggered
+        the respawn.
         Per-conversation lock ensures concurrent callers during
         the lazy-init window don't race two subprocesses onto the
         same socket — see §Process management: Spawn lock for the
@@ -762,7 +763,7 @@ class HarnessProcessManager:
         # bumped generation and is allowed to respawn.
         async with self._registry_lock:
             start_generation = self._release_generations.get(conversation_id, 0)
-        # Non-None only for a model/harness-switch respawn of an in-flight entry
+        # Non-None only for a deliberate replacement of an in-flight entry
         # (not crash respawns — those are already covered by the orphan watchdog).
         respawn_reason: str | None = None
         # The replaced entry's in-flight response id, captured at the respawn
@@ -785,6 +786,39 @@ class HarnessProcessManager:
                     "while get_client waited"
                 )
             entry = self._entries.get(conversation_id)
+            # "any" control callers may hold an established connection past the
+            # unlink; don't kill the turn they're interrupting. Concrete-harness
+            # (new-turn) callers reconnect via the pathname and own recovery.
+            if (
+                not IS_WINDOWS
+                and entry is not None
+                and harness != "any"
+                and entry.process.returncode is None
+                and entry.endpoint is not None
+                and entry.endpoint.socket_path is not None
+                and entry.endpoint.socket_path.parent == self._instance_dir
+                and not entry.endpoint.socket_path.exists()
+            ):
+                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
+                _logger.warning(
+                    "harness %s for conversation %s lost its socket; respawning",
+                    entry.harness,
+                    conversation_id,
+                    extra={
+                        "session_id": conversation_id,
+                        "event_name": "harness_socket_missing",
+                        "attributes": {
+                            "harness": entry.harness,
+                            "pid": entry.process.pid,
+                            "socket_path": str(entry.endpoint.socket_path),
+                            "tracked_response_id": replaced_response_id,
+                        },
+                    },
+                )
+                await self._close_entry(entry)
+                self._in_flight_response_ids.pop(conversation_id, None)
+                entry = None
+                respawn_reason = "harness_respawn_socket_missing"
             if entry is not None and entry.process.returncode is not None:
                 # Prior subprocess died; drop the stale entry and
                 # respawn below. The dead client is closed on

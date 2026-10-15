@@ -3435,7 +3435,9 @@ def build_codex_native_server(
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
         credentials can be resolved.
+    :raises ValueError: If launch arguments select the runner-owned transport.
     """
+    reject_reserved_codex_transport_args(terminal_launch_args)
     resolved_codex = codex_path or _find_codex_cli()
     if not resolved_codex:
         raise ImportError(

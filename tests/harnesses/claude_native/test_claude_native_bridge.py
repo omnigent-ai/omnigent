@@ -4309,13 +4309,14 @@ def test_inject_user_message_pastes_content_then_submits(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content=content)
 
-    # CSI-u Ctrl+A, Ctrl+K (clear), load-buffer, paste-buffer, Enter — fewer than 5
-    # means a delivery step was dropped.
-    assert len(captured) == 5, (
-        f"Expected 5 tmux calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter), "
-        f"got {len(captured)}."
+    # Space (refocus), CSI-u Ctrl+A, Ctrl+K (clear), load-buffer, paste-buffer,
+    # Enter — fewer than 6 means a delivery step was dropped.
+    assert len(captured) == 6, (
+        f"Expected 6 tmux calls (Space, CSI-u Ctrl+A, Ctrl+K, load-buffer, "
+        f"paste-buffer, Enter), got {len(captured)}."
     )
-    clear_home, clear_kill, load, paste, submit = captured
+    refocus, clear_home, clear_kill, load, paste, submit = captured
+    assert refocus[-4:] == ["send-keys", "-t", "claude:0.0", "Space"]
     assert clear_home[3:8] == _LEAVE_COPY_MODE
     assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
     assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
@@ -4824,11 +4825,12 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     assert capture_calls["n"] >= 3, (
         f"Expected >=3 capture-pane polls before the prompt rendered, got {capture_calls['n']}."
     )
-    assert len(send_keys) == 5, (
-        f"Expected 5 tmux calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter), "
-        f"got {len(send_keys)}."
+    assert len(send_keys) == 6, (
+        f"Expected 6 tmux calls (Space, CSI-u Ctrl+A, Ctrl+K, load-buffer, "
+        f"paste-buffer, Enter), got {len(send_keys)}."
     )
-    clear_home, clear_kill, load, paste, submit = send_keys
+    refocus, clear_home, clear_kill, load, paste, submit = send_keys
+    assert refocus[-1] == "Space"
     assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
     assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
     # The paste fires after the gate via the buffer path. The exact
@@ -5537,14 +5539,15 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    # Three keystroke calls in order: C-u (clear), literal paste, Enter.
-    # 2 = C-u was dropped (draft can concatenate); 4+ = duplicated send.
+    # Four keystroke calls in order: Space (refocus), C-u (clear), literal
+    # paste, Enter. A missing C-u lets the draft concatenate; 5+ = duplicated send.
     # capture-pane calls (the delivery-verification polls) are not keystrokes.
     keystrokes = [cmd for cmd in captured if "send-keys" in cmd]
-    assert len(keystrokes) == 3, (
-        f"Expected 3 tmux send-keys calls (C-u + paste + Enter), got {len(keystrokes)}."
+    assert len(keystrokes) == 4, (
+        f"Expected 4 tmux send-keys calls (Space + C-u + paste + Enter), got {len(keystrokes)}."
     )
-    clear, paste, submit = keystrokes
+    refocus, clear, paste, submit = keystrokes
+    assert refocus[-1] == "Space"
     assert clear == [
         "tmux",
         "-S",
@@ -10550,6 +10553,21 @@ _SETTINGS_PANEL_PANE = """\
    Type to filter · Enter/↓ to select · ↑ to tabs · Esc to clear
 """
 
+# The details panel of a background shell, opened from the task indicator
+# below the input box. It replaces the input box, and its footer joins the
+# keys that close it into one hint: "Esc/Enter/Space to close".
+_TASK_DETAILS_PANE = """\
+⏺ Started the build in the background.
+──────────────────────────────
+  Shell details
+  Status:   running
+  Runtime:  4m 12s
+  Command:  make test
+  Output:
+  No output available
+  ← to go back · Esc/Enter/Space to close · x to stop
+"""
+
 # A sliver-height pane holding a multi-line draft: Claude Code renders the
 # box's opening rule and the draft's first row, then runs out of screen —
 # the closing rule never makes it on. The composer is live, so requiring
@@ -10671,6 +10689,7 @@ def test_a_model_switch_types_the_argument_form_and_confirms(
     )
 
     assert [args[-1] for args in sends] == [
+        "Space",
         "C-u",
         "/model databricks-claude-sonnet-5",
         "Enter",
@@ -10678,7 +10697,7 @@ def test_a_model_switch_types_the_argument_form_and_confirms(
         "Enter",
     ]
     # The id must go through literally, not as a tmux key name.
-    assert sends[1] == [
+    assert sends[2] == [
         "send-keys",
         "-l",
         "-t",
@@ -11035,7 +11054,7 @@ def test_a_swallowed_slash_submit_enter_is_retried_while_the_draft_persists(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert tails == ["C-u", "/effort high", "Enter", "Enter"], (
+    assert tails == ["Space", "C-u", "/effort high", "Enter", "Enter"], (
         f"Expected the swallowed submit Enter to be retried once; got {tails}."
     )
 
@@ -11076,7 +11095,7 @@ def test_a_slash_command_draft_that_never_renders_submits_blind(
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     tails = [args[-1] for args in sends]
-    assert tails == ["C-u", "/effort high", "Enter"], (
+    assert tails == ["Space", "C-u", "/effort high", "Enter"], (
         f"An unverifiable draft must submit blind exactly once; got {tails}."
     )
 
@@ -11156,7 +11175,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         confirm_hint=claude_native_bridge.EFFORT_DIALOG_HINT,
     )
 
-    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter", "Enter"]
+    assert [args[-1] for args in sends] == ["Space", "C-u", "/effort high", "Enter", "Enter"]
 
 
 @pytest.mark.parametrize(
@@ -11168,6 +11187,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         _SHELL_MODE_PANE,
         _REWIND_PANE,
         _SETTINGS_PANEL_PANE,
+        _TASK_DETAILS_PANE,
     ],
     ids=[
         "reverse-search",
@@ -11176,6 +11196,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         "shell-mode",
         "rewind",
         "settings-panel",
+        "task-details-panel",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
@@ -11237,7 +11258,7 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
 
     tails = [cmd[-1] for cmd in captured]
     # Escape (dismiss the surface) must precede every delivery keystroke.
-    assert tails[:3] == ["Escape", "\x1b[97;5u", "\x1b[107;5u"], (
+    assert tails[:4] == ["Escape", "Space", "\x1b[97;5u", "\x1b[107;5u"], (
         f"Expected the occupying surface to be Escaped before the clear; got {tails}."
     )
     assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
@@ -11752,7 +11773,7 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert [args[-1] for args in sends] == ["Escape", "C-u", "/effort high", "Enter"]
+    assert [args[-1] for args in sends] == ["Escape", "Space", "C-u", "/effort high", "Enter"]
 
 
 def test_inject_slash_command_fails_loud_at_a_surface_escape_cannot_clear(
@@ -11827,7 +11848,7 @@ def test_a_torn_frame_after_a_hinted_surface_does_not_refuse_the_slash_command(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter"]
+    assert [args[-1] for args in sends] == ["Space", "C-u", "/effort high", "Enter"]
 
 
 def test_a_lowercase_escape_hint_still_marks_a_surface_dismissible(
@@ -11849,7 +11870,7 @@ def test_a_lowercase_escape_hint_still_marks_a_surface_dismissible(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
 
-    assert [args[-1] for args in sends] == ["Escape", "C-u", "/compact", "Enter"]
+    assert [args[-1] for args in sends] == ["Escape", "Space", "C-u", "/compact", "Enter"]
 
 
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
@@ -11876,7 +11897,7 @@ def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
 
     tails = [args[-1] for args in sends]
     assert "Escape" not in tails, f"A one-frame sighting must not draw an Escape; got {tails}."
-    assert tails == ["C-u", "/effort high", "Enter"]
+    assert tails == ["Space", "C-u", "/effort high", "Enter"]
 
 
 def test_the_shortcuts_panel_is_not_treated_as_an_occupied_input(
@@ -11899,7 +11920,7 @@ def test_the_shortcuts_panel_is_not_treated_as_an_occupied_input(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter"]
+    assert [args[-1] for args in sends] == ["Space", "C-u", "/effort high", "Enter"]
 
 
 def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
