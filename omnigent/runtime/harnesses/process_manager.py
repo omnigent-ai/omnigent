@@ -786,10 +786,9 @@ class HarnessProcessManager:
                     "while get_client waited"
                 )
             entry = self._entries.get(conversation_id)
-            # An "any" control caller may still have an established connection
-            # after the pathname is unlinked; do not kill the turn it is trying
-            # to interrupt. Concrete-harness (new-turn) callers must reconnect
-            # through the pathname and therefore own recovery.
+            # "any" control callers may hold an established connection past the
+            # unlink; don't kill the turn they're interrupting. Concrete-harness
+            # (new-turn) callers reconnect via the pathname and own recovery.
             if (
                 not IS_WINDOWS
                 and entry is not None
@@ -800,6 +799,7 @@ class HarnessProcessManager:
                 and entry.endpoint.socket_path.parent == self._instance_dir
                 and not entry.endpoint.socket_path.exists()
             ):
+                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                 _logger.warning(
                     "harness %s for conversation %s lost its socket; respawning",
                     entry.harness,
@@ -811,13 +811,10 @@ class HarnessProcessManager:
                             "harness": entry.harness,
                             "pid": entry.process.pid,
                             "socket_path": str(entry.endpoint.socket_path),
-                            "tracked_response_id": self._in_flight_response_ids.get(
-                                conversation_id
-                            ),
+                            "tracked_response_id": replaced_response_id,
                         },
                     },
                 )
-                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                 await self._close_entry(entry)
                 self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
