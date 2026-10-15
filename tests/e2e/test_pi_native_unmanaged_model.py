@@ -79,6 +79,13 @@ _WORKTREE = Path(__file__).resolve().parents[2]
 _PI_MODEL_ID = "claude-sonnet-4-5"
 _PINNED_SPEC_MODEL = f"anthropic/{_PI_MODEL_ID}"
 
+# A custom provider declared in Pi's own models.json. It carries its own
+# apiKey, so it never appears in auth.json or models-store.json, yet Pi lists
+# and drives it; the picker must offer it next to the logged-in catalog.
+_CUSTOM_PROVIDER_ID = "ollama"
+_CUSTOM_MODEL_ID = "llama3.1:8b"
+_CUSTOM_PICKER_MODEL = f"{_CUSTOM_PROVIDER_ID}/{_CUSTOM_MODEL_ID}"
+
 # Test-owned argv observer: a seeded Pi user extension records the real
 # process identity (pid, argv, cwd -- never environment) when the launched
 # CLI loads it. Mechanism details: the module docstring.
@@ -275,10 +282,11 @@ class _UnmanagedPiHost:
 def _seed_unmanaged_pi_home(home: Path) -> str:
     """Seed *home* with a logged-in-but-unmanaged Pi and a host config.
 
-    Writes ``.pi/agent/auth.json`` (an api-key login) and
-    ``.pi/agent/models-store.json`` (one usable model) so Pi itself has
-    models, while ``.omnigent/config.yaml`` carries only a host block and
-    NO provider setup -- exactly the state where
+    Writes ``.pi/agent/auth.json`` (an api-key login),
+    ``.pi/agent/models-store.json`` (one usable model) and
+    ``.pi/agent/models.json`` (one custom provider with its own key) so Pi
+    itself has models, while ``.omnigent/config.yaml`` carries only a host
+    block and NO provider setup -- exactly the state where
     ``resolve_pi_native_provider()`` returns ``None``. Also seeds
     ``.pi/agent/extensions/`` with the test-owned argv observer (see the
     module constants), which every real Pi launch under this HOME
@@ -325,6 +333,20 @@ def _seed_unmanaged_pi_home(home: Path) -> str:
             }
         )
     )
+    (pi_agent / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    _CUSTOM_PROVIDER_ID: {
+                        "baseUrl": "http://127.0.0.1:11434/v1",
+                        "api": "openai-completions",
+                        "apiKey": "ollama",
+                        "models": [{"id": _CUSTOM_MODEL_ID}],
+                    }
+                }
+            }
+        )
+    )
     return host_id
 
 
@@ -344,7 +366,7 @@ def _wait_for_host_online(client: httpx.Client, host_id: str, timeout: float = 4
                 for host in resp.json().get("hosts", []):
                     if host["host_id"] == host_id and host["status"] == "online":
                         return
-        except httpx.ConnectError:
+        except httpx.TransportError:
             # Server isn't accepting connections yet (still starting up);
             # keep polling until the deadline.
             pass
@@ -352,42 +374,27 @@ def _wait_for_host_online(client: httpx.Client, host_id: str, timeout: float = 4
     raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
 
 
-@pytest.fixture(scope="module")
-def unmanaged_pi_host(
-    live_server: str,
-    http_client: httpx.Client,
-    tmp_path_factory: pytest.TempPathFactory,
+@contextlib.contextmanager
+def _seeded_pi_host(
+    home: Path,
+    host_id: str,
+    server_url: str,
+    client: httpx.Client,
+    *,
+    env_overrides: dict[str, str] | None = None,
 ) -> Iterator[_UnmanagedPiHost]:
-    """Spawn one host daemon with a logged-in-but-unmanaged Pi for both facets.
-
-    :param live_server: Server URL the daemon registers with.
-    :param http_client: HTTP client pointed at the server.
-    :param tmp_path_factory: Module-scoped temp dir factory (the daemon HOME).
-    :yields: The spawned :class:`_UnmanagedPiHost`.
-    """
-    home = tmp_path_factory.mktemp("unmanaged-pi-home")
-    host_id = _seed_unmanaged_pi_home(home)
+    """Run a host whose scenario has already seeded its identity and Pi files."""
     daemon_log = home / "host-daemon.log"
-    # Pin BOTH HOME and OMNIGENT_CONFIG_HOME to the seeded dir so the daemon
-    # reads the seeded (provider-less) omnigent config and Pi login, not any
-    # ambient OMNIGENT_CONFIG_HOME the surrounding session exported. Without
-    # this the daemon inherits the caller's provider config and
-    # resolve_pi_native_provider() would be None for the wrong reason (an
-    # unresolvable managed provider) instead of the reported one (no managed
-    # provider at all).
+    # Read the scenario's provider config and Pi login from its own home.
     env = {
         **os.environ,
+        **(env_overrides or {}),
         "HOME": str(home),
         "OMNIGENT_CONFIG_HOME": str(home / ".omnigent"),
         "OMNIGENT_DATA_DIR": str(home / ".omnigent"),
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
-    # Prepend ABSOLUTE worktree roots to PYTHONPATH. The runner the daemon
-    # spawns runs with cwd=<workspace>, so any relative PYTHONPATH entry (the
-    # ambient one here is ``sdks/python-client:sdks/ui``, and it omits the
-    # worktree root) dangles and the runner fails with
-    # ``ModuleNotFoundError: omnigent``. Absolute paths resolve from any cwd;
-    # in CI, where the checkout is the worktree, this is redundant-but-harmless.
+    # Spawned runners change cwd, so this checkout needs absolute import paths.
     _existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = os.pathsep.join(
         [
@@ -399,14 +406,14 @@ def unmanaged_pi_host(
     )
     with open(daemon_log, "w") as log_fh:
         proc = subprocess.Popen(
-            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", live_server],
+            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", server_url],
             env=apply_runner_env(env),
             cwd=compat_runner_cwd(),
             stdout=subprocess.DEVNULL,
             stderr=log_fh,
         )
     try:
-        _wait_for_host_online(http_client, host_id, timeout=45.0)
+        _wait_for_host_online(client, host_id, timeout=45.0)
         yield _UnmanagedPiHost(proc=proc, host_id=host_id, home=home, daemon_log=daemon_log)
     finally:
         proc.send_signal(signal.SIGTERM)
@@ -417,16 +424,29 @@ def unmanaged_pi_host(
             proc.wait()
 
 
+@pytest.fixture(scope="module")
+def unmanaged_pi_host(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[_UnmanagedPiHost]:
+    home = tmp_path_factory.mktemp("unmanaged-pi-home")
+    host_id = _seed_unmanaged_pi_home(home)
+    with _seeded_pi_host(home, host_id, live_server, http_client) as host:
+        yield host
+
+
 def test_facet1_prelaunch_model_options_offer_the_hosts_pi_models(
     unmanaged_pi_host: _UnmanagedPiHost,
     http_client: httpx.Client,
 ) -> None:
     """Facet 1: the pre-launch picker must list the host's usable Pi models.
 
-    A host with a logged-in Pi (one model in ``models-store.json``) but no
-    omnigent-managed provider must still surface that model to the
-    pre-launch picker. The buggy build returns ``{"models": []}`` (only
-    "Default" in the UI); the fix enumerates Pi's own models.
+    A host with a logged-in Pi (one model in ``models-store.json``, one
+    custom provider in ``models.json``) but no omnigent-managed provider
+    must still surface both models to the pre-launch picker. The buggy
+    build returns ``{"models": []}`` (only "Default" in the UI); the fix
+    enumerates every model Pi's own configuration can drive.
 
     :param unmanaged_pi_host: The spawned unmanaged-Pi host.
     :param http_client: HTTP client pointed at the server.
@@ -442,6 +462,12 @@ def test_facet1_prelaunch_model_options_offer_the_hosts_pi_models(
         f"host's Pi is logged in with {_PI_MODEL_ID!r} -- the Configure-Pi picker "
         "shows only 'Default'. pi_native_model_options() early-returns [] when "
         f"resolve_pi_native_provider() is None. Got: {resp.text}"
+    )
+    assert all(isinstance(model, dict) for model in models), models
+    offered = {model.get("id") for model in models}
+    assert {_PINNED_SPEC_MODEL, _CUSTOM_PICKER_MODEL} <= offered, (
+        "pi-native pre-launch model-options must offer the logged-in catalog AND the "
+        f"custom provider declared in Pi's models.json; got {sorted(offered)}"
     )
 
 
@@ -537,12 +563,15 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
             f"tail:\n{host.daemon_log.read_text()[-2000:]}"
         )
         pi_argv = [str(token) for token in observation.get("argv") or []]
-        # npm exposes the package bin as .bin/pi (a shim or symlink); resolve
-        # through it so both entry styles verify the real package identity.
+        # npm's .bin/pi resolves to a modular or bundled CLI entry point.
         resolved_entry = os.path.realpath(pi_argv[1]) if len(pi_argv) > 1 else ""
-        assert resolved_entry.endswith(os.path.join("pi-coding-agent", "dist", "cli.js")), (
-            "the observed process is not the real Pi CLI -- expected its node "
-            "entry point to resolve to .../pi-coding-agent/dist/cli.js, got "
+        entry_paths = (
+            os.path.join("pi-coding-agent", "dist", "cli.js"),
+            os.path.join("pi-coding-agent", "dist", "bundle", "cli.js"),
+        )
+        assert resolved_entry.endswith(entry_paths), (
+            "the observed process is not the real Pi CLI -- expected its resolved "
+            f"node entry point to end with one of {entry_paths}, got "
             f"argv: {pi_argv} (resolved: {resolved_entry})"
         )
         assert pi_started, (
