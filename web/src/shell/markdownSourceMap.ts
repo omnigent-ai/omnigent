@@ -94,13 +94,16 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
     for (const token of tokens) {
       const value =
         token.type === "taskList" ? (token.raw ?? "").replace(/\n$/, "") : (token.raw ?? "");
-      let found = locate(view, value, cursor);
+      if (!valid) return;
+      let found: Source | null;
       // Top-level tokens consume the source in order; only whitespace may be
       // omitted. Never locate a block inside a skipped construct's contents.
       if (top) {
         const at = view.text.indexOf(value, cursor);
         found =
           at < 0 || view.text.slice(cursor, at).trim() ? null : slice(view, at, at + value.length);
+      } else {
+        found = locate(view, value, cursor);
       }
       if (!found || !value) {
         valid = false;
@@ -185,7 +188,8 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
           valid = false;
           return;
         }
-        items.forEach((item, i) => {
+        for (let i = 0; i < items.length && valid; i++) {
+          const item = items[i];
           const line = siblings[i];
           if (line[3] !== item.text) {
             valid = false;
@@ -195,7 +199,7 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
           children(item.tokens ?? [], slice(view, from, from + line[3].length));
           const nested = slice(view, line.index + line[0].length + 1, siblings[i + 1]?.index);
           children(item.nestedTokens ?? [], nested);
-        });
+        }
         return;
       }
       case "list":
@@ -239,7 +243,7 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
       case "strong":
       case "em":
       case "del": {
-        const size = token.type === "em" ? 1 : 2;
+        const size = /^(\*\*|__|~~)/.test(view.text) ? 2 : 1;
         children(token.tokens ?? [], slice(view, size, view.text.length - size));
         return;
       }

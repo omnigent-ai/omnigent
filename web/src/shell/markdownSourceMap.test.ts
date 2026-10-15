@@ -40,6 +40,7 @@ const link = `[Details](https://example.com/${"x".repeat(2000)})`;
 const cases: [string, string, number, string?][] = [
   ["heading marker", "# ⟦#⟧ hello\n\n#", 0, "#"],
   ["ordered list marker", "1. ⟦1⟧\n2. 1", 0, "1"],
+  ["single-tilde strikethrough", `~word~ **⟦word⟧** word\n\n${link}`, 1],
   ["original repro", `# Anchors\n\n**word** and **⟦word⟧**\n\n**word**\n\n${link}`, 1],
   ["hidden URL and split bold", "[Details](word) ⟦word⟧ wo**rd**", 0],
   ["hidden URL and split HTML", "[Details](word) ⟦word⟧ wo<em>rd</em>", 0],
