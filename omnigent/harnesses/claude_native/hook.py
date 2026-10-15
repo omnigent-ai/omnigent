@@ -14,28 +14,23 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from omnigent.harnesses.claude_native.bridge import (
+from omnigent.harnesses.claude_native.bridge_state import (
     BRIDGE_ID_LABEL_KEY,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
-    approval_wait_marker_path,
-    hold_approval_wait_marker,
     read_active_session_id,
     read_bridge_id,
     read_claude_session_id,
     read_claude_status_model,
     read_permission_hook_config,
     read_seen_claude_session_ids,
-    record_hook_event,
     transcript_has_forked_from_marker,
     transcript_has_recent_local_command,
     url_component,
-    write_active_session_id,
 )
 
-# The observer path (the default, most frequent invocation — Claude blocks
-# on it per Stop/UserPromptSubmit/TaskCreated/...) must not pay the
-# httpx/policy import cost; those are imported inside the subcommands and
-# helpers that actually speak HTTP.
+# Claude blocks on every command hook, so this module import is paid per spawn:
+# stdlib + the stdlib-only bridge-state readers only. httpx, the policy machinery
+# and ``bridge`` (asyncio, filelock, MCP server, tool graph) load inside subcommands.
 if TYPE_CHECKING:
     import httpx
 
@@ -219,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         print("omnigent claude hook: expected JSON object", file=sys.stderr)
         return 0
     bridge_dir = Path(args.bridge_dir)
+    from omnigent.harnesses.claude_native.bridge import record_hook_event
     from omnigent.harnesses.claude_native.lifecycle import record_hook_lifecycle
 
     record_hook_lifecycle(bridge_dir, payload, time.time())
@@ -536,6 +532,7 @@ def _create_clear_replacement_session(
         bind_resp.raise_for_status()
 
     from omnigent.entities.session_resources import terminal_resource_id
+    from omnigent.harnesses.claude_native.bridge import write_active_session_id
 
     terminal_id = terminal_resource_id("claude", "main")
     transfer_resp = client.post(
@@ -618,6 +615,7 @@ def _create_fork_replacement_session(
         bind_resp.raise_for_status()
 
     from omnigent.entities.session_resources import terminal_resource_id
+    from omnigent.harnesses.claude_native.bridge import write_active_session_id
 
     terminal_id = terminal_resource_id("claude", "main")
     transfer_resp = client.post(
@@ -770,6 +768,7 @@ def _post_hook_with_reattach(
     backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
     import httpx
 
+    from omnigent.harnesses.claude_native.bridge import hold_approval_wait_marker
     from omnigent.native.native_policy_hook import _is_login_redirect_or_unauthorized
 
     timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
@@ -891,6 +890,7 @@ def _main_permission_request(argv: list[str]) -> int:
     :returns: Process exit code. Returns ``0`` on transport failures so
         Claude Code falls back to its terminal prompt.
     """
+    from omnigent.harnesses.claude_native.bridge import approval_wait_marker_path
     from omnigent.native.native_policy_hook import policy_hook_reauth
 
     args = _parse_permission_args(argv)

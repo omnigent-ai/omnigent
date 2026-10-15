@@ -1,7 +1,7 @@
 """Persistent installation ID for usage telemetry.
 
 Mirrors the MLflow pattern: generate a UUID4 on first run, persist it
-atomically to ``_local_data_dir() / "telemetry.json"``, and cache in
+atomically to ``data_dir() / "telemetry.json"``, and cache in
 memory behind a lock.  All errors are silently swallowed — this module
 MUST NOT raise.
 """
@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from omnigent.process_logging import data_dir
 from omnigent.version import VERSION
 
 _KEY_INSTALLATION_ID = "installation_id"
@@ -25,7 +26,7 @@ _cache_initialized = False
 def get_installation_id() -> str | None:
     """Return a persistent installation ID, creating it on first call.
 
-    Stores at ``_local_data_dir() / "telemetry.json"``.  Returns
+    Stores at ``data_dir() / "telemetry.json"``.  Returns
     ``None`` on any error — never raises.
     """
     global _cache, _cache_initialized
@@ -55,11 +56,12 @@ def get_installation_id() -> str | None:
 
 
 def _telemetry_file_path() -> Path:
-    """Return the path to the telemetry JSON file."""
-    # Late import to avoid a circular import at module load time.
-    from omnigent.host.local_server import _local_data_dir
+    """Return the path to the telemetry JSON file.
 
-    return _local_data_dir() / "telemetry.json"
+    ``data_dir`` is the lightweight resolver; the host module that also exposes
+    it drags psutil and the host runtime into short-lived callers such as hooks.
+    """
+    return data_dir() / "telemetry.json"
 
 
 def _load_from_disk() -> str | None:

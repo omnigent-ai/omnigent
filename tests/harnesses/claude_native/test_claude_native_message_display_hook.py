@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
 import subprocess
 import sys
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -220,12 +224,25 @@ def test_message_display_hook_many_appends_stay_line_clean(
 _HEAVY_IMPORTS = (
     "fastapi",
     "httpx",
+    "omnigent.harnesses.claude_native.bridge",
     "omnigent.inner.databricks_executor",
     "omnigent.inner.datamodel",
     "omnigent.models.model_catalog",
     "omnigent.spec.parser",
     "pydantic",
 )
+
+
+def _adopt_import_roots() -> str:
+    """
+    Statement that gives a child interpreter this process's import roots.
+
+    A ``python -I`` child ignores ``PYTHONPATH`` and the cwd, so without it
+    ``omnigent`` would resolve from whatever is installed rather than the
+    checkout under test.
+    """
+    roots = [path for path in sys.path if path]
+    return f"sys.path[:0] = {roots!r}"
 
 
 def _heavy_imports_after(statements: str) -> list[str]:
@@ -237,11 +254,10 @@ def _heavy_imports_after(statements: str) -> list[str]:
     :returns: The subset of :data:`_HEAVY_IMPORTS` present in the child's
         ``sys.modules`` after *statements* ran.
     """
-    repo_root = Path(hook.__file__).resolve().parent.parent
     code = "\n".join(
         (
             "import json, sys",
-            f"sys.path.insert(0, {str(repo_root)!r})",
+            _adopt_import_roots(),
             statements,
             f"heavy = [m for m in {list(_HEAVY_IMPORTS)!r} if m in sys.modules]",
             "print(json.dumps(heavy))",
@@ -304,13 +320,12 @@ def test_package_lazy_exports_resolve_on_access() -> None:
     [
         ("omnigent.harnesses.claude_native.message_display_hook", frozenset()),
         ("omnigent.harnesses.claude_native.status", frozenset()),
+        ("omnigent.harnesses.claude_native.bridge_state", frozenset()),
         (
             "omnigent.harnesses.claude_native.hook",
-            # The observer path (the most frequent invocation) is pure
-            # stdlib + light bridge state: httpx and the policy machinery
-            # are imported inside the subcommands that speak HTTP, and the
-            # bridge defers its tools/spec/pydantic graph to the launch
-            # path. Nothing heavy may ride the module import.
+            # Every subcommand pays this import per spawn: stdlib + the
+            # stdlib-only bridge-state readers; httpx, the policy machinery
+            # and ``bridge`` load inside the subcommands that need them.
             frozenset(),
         ),
     ],
@@ -326,3 +341,136 @@ def test_hook_entrypoints_stay_import_light(module: str, allowed: frozenset[str]
     """
     loaded = _heavy_imports_after(f"import {module}")
     assert set(loaded) <= allowed, f"{module} newly imports {sorted(set(loaded) - allowed)}"
+
+
+# Modules a policy evaluation never touches. Each one on the evaluate-policy run
+# path is paid per hook spawn; ``bridge`` alone pulls in most of the others.
+_POLICY_UNRELATED_IMPORTS = (
+    "asyncio",
+    "filelock",
+    "http.server",
+    "omnigent.harnesses.claude_native.bridge",
+    "omnigent.harnesses.claude_native.failure_telemetry",
+    "omnigent.harnesses.kiro_native.bridge",
+    "omnigent.host.local_server",
+    "omnigent.tools.base",
+)
+
+
+class _PolicyAllowServer(ThreadingHTTPServer):
+    """Loopback stand-in for the Omnigent server's ``/policies/evaluate``."""
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), _PolicyAllowHandler)
+        self.posts: list[str] = []
+
+
+class _PolicyAllowHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.server.posts.append(self.path)
+        body = json.dumps({"result": "POLICY_ACTION_ALLOW"}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args: object) -> None:
+        return
+
+
+@contextlib.contextmanager
+def _policy_allow_server() -> Iterator[tuple[str, list[str]]]:
+    """Serve ALLOW verdicts on a loopback port; yields ``(base_url, POSTed paths)``."""
+    server = _PolicyAllowServer()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", server.posts
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _run_isolated_hook(code: str, payload: str, env: dict[str, str]) -> dict[str, object]:
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize("direct_server", [False, True], ids=["no_config", "direct_server"])
+def test_evaluate_policy_run_imports_only_policy_modules(
+    tmp_path: Path, direct_server: bool
+) -> None:
+    """
+    An evaluate-policy hook run loads none of the modules unrelated to the check.
+
+    ``no_config`` stops at the governed-session checks. ``direct_server`` adds
+    ``permission_hook.json`` so the run builds request headers, POSTs the
+    evaluation to a loopback server and parses the verdict: the Python fallback
+    the runner's hook command takes when the relay is not up.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "bridge.json").write_text(
+        json.dumps({"bridge_id": "bridge_test", "active_session_id": "sess_test"}),
+        encoding="utf-8",
+    )
+    payload = json.dumps(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hi"},
+        }
+    )
+    code = "\n".join(
+        (
+            "import json, runpy, sys",
+            _adopt_import_roots(),
+            f"sys.argv = ['hook', 'evaluate-policy', '--bridge-dir', {str(bridge_dir)!r}]",
+            "status = 0",
+            "try:",
+            "    runpy.run_module('omnigent.harnesses.claude_native.hook', run_name='__main__')",
+            "except SystemExit as exc:",
+            "    status = exc.code if isinstance(exc.code, int) else 1",
+            f"loaded = [m for m in {list(_POLICY_UNRELATED_IMPORTS)!r} if m in sys.modules]",
+            "print(json.dumps({'status': status, 'loaded': loaded}))",
+        )
+    )
+    # A bare environment keeps the probe hermetic: CI/pytest markers would switch
+    # telemetry off and skip its installation-id lookup, and a private HOME keeps
+    # the run away from the real data dir.
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT") if key in os.environ}
+    env.update(HOME=str(home), USERPROFILE=str(home))
+    allowed: set[str] = set()
+    if direct_server:
+        with _policy_allow_server() as (base_url, posts):
+            (bridge_dir / "permission_hook.json").write_text(
+                json.dumps(
+                    {"ap_server_url": base_url, "ap_auth_headers": {"Authorization": "Bearer t"}}
+                ),
+                encoding="utf-8",
+            )
+            result = _run_isolated_hook(code, payload, env)
+        assert posts == ["/v1/sessions/sess_test/policies/evaluate"]
+        # The real POST goes through httpcore, whose anyio layer imports asyncio.
+        allowed.add("asyncio")
+    else:
+        result = _run_isolated_hook(code, payload, env)
+    assert result["status"] == 0
+    unexpected = [module for module in result["loaded"] if module not in allowed]
+    assert unexpected == [], (
+        f"evaluate-policy run imports modules the policy check never uses: {unexpected}"
+    )

@@ -56,7 +56,6 @@ import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -69,6 +68,47 @@ from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native import delivery_diagnostics
+
+# The hook-facing bridge-state readers live in ``bridge_state`` so importing
+# the hook module never pulls this one in. Names other modules import from here
+# are re-exported explicitly so an unused-import fix cannot drop them.
+from omnigent.harnesses.claude_native.bridge_state import (
+    _COMMAND_NAME_RE,
+    _CONTEXT_FILE,
+    _PERMISSION_HOOK_FILE,
+    _STATE_FILE,
+)
+from omnigent.harnesses.claude_native.bridge_state import _CONFIG_FILE as _CONFIG_FILE
+from omnigent.harnesses.claude_native.bridge_state import (
+    BRIDGE_ID_LABEL_KEY as BRIDGE_ID_LABEL_KEY,
+)
+from omnigent.harnesses.claude_native.bridge_state import (
+    CLAUDE_FRAMEWORK_CONTEXT_FILE as CLAUDE_FRAMEWORK_CONTEXT_FILE,
+)
+from omnigent.harnesses.claude_native.bridge_state import _read_json_file as _read_json_file
+from omnigent.harnesses.claude_native.bridge_state import (
+    read_active_session_id as read_active_session_id,
+)
+from omnigent.harnesses.claude_native.bridge_state import read_bridge_id as read_bridge_id
+from omnigent.harnesses.claude_native.bridge_state import (
+    read_claude_session_id as read_claude_session_id,
+)
+from omnigent.harnesses.claude_native.bridge_state import (
+    read_claude_status_model as read_claude_status_model,
+)
+from omnigent.harnesses.claude_native.bridge_state import (
+    read_permission_hook_config as read_permission_hook_config,
+)
+from omnigent.harnesses.claude_native.bridge_state import (
+    read_seen_claude_session_ids as read_seen_claude_session_ids,
+)
+from omnigent.harnesses.claude_native.bridge_state import (
+    transcript_has_forked_from_marker as transcript_has_forked_from_marker,
+)
+from omnigent.harnesses.claude_native.bridge_state import (
+    transcript_has_recent_local_command as transcript_has_recent_local_command,
+)
+from omnigent.harnesses.claude_native.bridge_state import url_component as url_component
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
@@ -98,8 +138,6 @@ from omnigent.native import native_bridge_common
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
-CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
-
 _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "claude_native_injection_cancel_event", default=None
@@ -111,7 +149,6 @@ _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
-BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
 
 
 def _bridge_injection_lock(bridge_dir: Path) -> threading.Lock:
@@ -201,26 +238,19 @@ APPROVAL_WAIT_MARKER_REFRESH_S = 60.0
 # Several refresh intervals of slack, so a hook that is slow to wake never
 # reads stale; a hook killed mid-wait leaves a marker that expires on its own.
 APPROVAL_WAIT_MARKER_TTL_S = 420.0
-_CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
 # Control socket of one ``serve-mcp`` process under the harness socket root,
 # named by owner pid so a socket left behind by a dead process can be reaped.
 _MCP_SOCKET_PREFIX = "mcp-"
 _MCP_SOCKET_SUFFIX = ".sock"
-_STATE_FILE = "state.json"
 _HOOKS_FILE = "hooks.jsonl"
 OBSERVER_HOOK_STDERR_FILE = "observer_hook.stderr"
-_RECENT_LOCAL_COMMAND_LINE_LIMIT = 200
-_RECENT_LOCAL_COMMAND_WINDOW_S = 10.0
-_FORKED_FROM_LINE_LIMIT = 200
 _TOOL_RELAY_FILE = "tool_relay.json"
 # Shell-sourceable sibling of tool_relay.json so the curl-based hook
 # commands can discover the live relay without a JSON parser. Re-written
 # on every relay start, so hooks survive runner restarts (new port).
 _TOOL_RELAY_ENV_FILE = "tool_relay.env"
 _TMUX_FILE = "tmux.json"
-_PERMISSION_HOOK_FILE = "permission_hook.json"
-_CONTEXT_FILE = "context.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 _MCP_SERVER_NAME = "omnigent"
 _MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -2008,24 +2038,6 @@ def _atomic_write_user_json(path: Path, payload: _JsonObject) -> None:
                 tmp_path.unlink()
 
 
-def read_active_session_id(bridge_dir: Path) -> str | None:
-    """
-    Read the Omnigent session currently receiving bridge-originated events.
-
-    :param bridge_dir: Bridge directory path.
-    :returns: Active Omnigent session id, e.g. ``"conv_abc123"``, or
-        ``None`` when the bridge config is absent or malformed.
-    """
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    if not isinstance(config, dict):
-        return None
-    active = config.get("active_session_id")
-    if isinstance(active, str) and active:
-        return active
-    legacy = config.get("conversation_id")
-    return legacy if isinstance(legacy, str) and legacy else None
-
-
 def read_launch_model(bridge_dir: Path) -> str | None:
     """
     Read the gateway model name that Claude was launched with.
@@ -2153,21 +2165,6 @@ def _bridge_config_write_lock(bridge_dir: Path) -> Iterator[None]:
         yield
 
 
-def read_bridge_id(bridge_dir: Path) -> str | None:
-    """
-    Read the opaque bridge id from bridge config.
-
-    :param bridge_dir: Bridge directory path.
-    :returns: Opaque bridge id, e.g. ``"bridge_abc123"``, or
-        ``None`` when the bridge config is absent or malformed.
-    """
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    if not isinstance(config, dict):
-        return None
-    bridge_id = config.get("bridge_id")
-    return bridge_id if isinstance(bridge_id, str) and bridge_id else None
-
-
 def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
     """
     Atomically update the bridge's active Omnigent session.
@@ -2185,20 +2182,6 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
     config["conversation_id"] = session_id
     config["updated_at"] = time.time()
     _write_json_file(bridge_dir / _CONFIG_FILE, config)
-
-
-def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
-    """
-    Read Omnigent routing details for the permission command hook.
-
-    :param bridge_dir: Bridge directory path.
-    :returns: Permission hook config, e.g.
-        ``{"ap_server_url": "http://127.0.0.1:8787",
-        "ap_auth_headers": {"Authorization": "Bearer token"}}``.
-        Empty dict when the file is absent or malformed.
-    """
-    payload = _read_json_file(bridge_dir / _PERMISSION_HOOK_FILE)
-    return payload if isinstance(payload, dict) else {}
 
 
 def update_permission_hook_auth_headers(
@@ -2655,16 +2638,6 @@ def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
     }
 
 
-def url_component(value: str) -> str:
-    """
-    Percent-encode one URL path component.
-
-    :param value: Raw path component, e.g. ``"conv_abc123"``.
-    :returns: URL-safe component with slashes escaped.
-    """
-    return urllib.parse.quote(value, safe="")
-
-
 # Built-in Claude Code tools that need their own custom UI to be
 # usable from the web chat. Until we ship that UI, disable them so
 # Claude falls back to plain assistant text + a normal user reply,
@@ -2958,56 +2931,6 @@ def read_transcript_path(bridge_dir: Path) -> Path | None:
     return Path(raw)
 
 
-def read_claude_session_id(bridge_dir: Path) -> str | None:
-    """
-    Return the Claude-native session id captured from hook events.
-
-    Set by :func:`record_hook_event` whenever a hook payload carries
-    a ``session_id`` field (every event Claude Code emits does).
-    Wrapper code reads it back to mirror the value into AP-side
-    conversation state (e.g. ``external_session_id`` on the
-    ``conversations`` row) so ``--resume`` can recover the prior
-    Claude transcript on a fresh runner without the user having to
-    know Claude's own id.
-
-    :param bridge_dir: Bridge directory path.
-    :returns: Claude session uuid string,
-        e.g. ``"a1b2c3d4-1234-5678-9abc-def012345678"``, or ``None``
-        when no hook has yet reported one (the first poll after a
-        cold launch).
-    """
-    state = _read_json_file(bridge_dir / _STATE_FILE)
-    raw = state.get("claude_session_id") if isinstance(state, dict) else None
-    if not isinstance(raw, str) or not raw:
-        return None
-    return raw
-
-
-def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
-    """
-    Return Claude session ids already observed by this bridge.
-
-    The set is transient local bridge state. It lets the hook
-    distinguish Claude-created branch/fork session switches from
-    ordinary resumes into sessions the wrapper already saw.
-
-    :param bridge_dir: Bridge directory path.
-    :returns: Claude session uuid strings, e.g.
-        ``{"a1b2c3d4-1234-5678-9abc-def012345678"}``.
-    """
-    state = _read_json_file(bridge_dir / _STATE_FILE)
-    if not isinstance(state, dict):
-        return set()
-    seen: set[str] = set()
-    raw_seen = state.get("seen_claude_session_ids")
-    if isinstance(raw_seen, list):
-        seen.update(value for value in raw_seen if isinstance(value, str) and value)
-    raw_current = state.get("claude_session_id")
-    if isinstance(raw_current, str) and raw_current:
-        seen.add(raw_current)
-    return seen
-
-
 def count_transcript_lines(transcript_path: Path) -> int:
     """
     Count JSONL records currently present in a Claude transcript.
@@ -3022,155 +2945,6 @@ def count_transcript_lines(transcript_path: Path) -> int:
             return sum(1 for _line in handle)
     except FileNotFoundError:
         return 0
-
-
-def transcript_has_recent_local_command(
-    transcript_path: Path,
-    *,
-    claude_session_id: str,
-    recorded_at: float,
-    command_names: frozenset[str],
-) -> bool:
-    """
-    Return whether Claude recently recorded one local command.
-
-    :param transcript_path: Claude transcript JSONL path, e.g.
-        ``"/home/user/.claude/projects/x/session.jsonl"``.
-    :param claude_session_id: Claude-native session uuid from the
-        hook payload, e.g. ``"a1b2c3d4-1234-5678-9abc-def012345678"``.
-    :param recorded_at: Unix timestamp for the hook record,
-        e.g. ``1779922393.222``.
-    :param command_names: Slash-command names to match, including
-        the leading slash, e.g. ``frozenset({"/fork", "/branch"})``.
-    :returns: ``True`` when a matching ``local_command`` transcript
-        record exists near ``recorded_at`` for ``claude_session_id``.
-    """
-    try:
-        lines = transcript_path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return False
-    for line in lines[-_RECENT_LOCAL_COMMAND_LINE_LIMIT:]:
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(record, dict):
-            continue
-        if record.get("sessionId") != claude_session_id:
-            continue
-        if record.get("subtype") != "local_command":
-            continue
-        timestamp = _transcript_timestamp(record.get("timestamp"))
-        if timestamp is None or abs(timestamp - recorded_at) > _RECENT_LOCAL_COMMAND_WINDOW_S:
-            continue
-        content = record.get("content")
-        if not isinstance(content, str):
-            continue
-        command_name = _local_command_name(content)
-        if command_name in command_names:
-            return True
-    return False
-
-
-def transcript_has_forked_from_marker(
-    transcript_path: Path,
-    *,
-    claude_session_id: str,
-    source_claude_session_id: str | None,
-) -> bool:
-    """
-    Return whether Claude marked a transcript as a fork.
-
-    Claude branch/fork transcripts carry structured ``forkedFrom``
-    metadata on copied records. This is the stable non-title signal
-    that a ``SessionStart source=resume`` event represents a new
-    branch rather than an ordinary resume.
-
-    :param transcript_path: Claude transcript JSONL path, e.g.
-        ``"/home/user/.claude/projects/x/session.jsonl"``.
-    :param claude_session_id: New Claude-native session uuid from the
-        hook payload, e.g. ``"a1b2c3d4-1234-5678-9abc-def012345678"``.
-    :param source_claude_session_id: Expected source Claude session
-        uuid, e.g. ``"9abc..."``. ``None`` accepts any different
-        non-empty source id.
-    :returns: ``True`` when the transcript records a fork from the
-        expected source session.
-    """
-    try:
-        lines = transcript_path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return False
-    for line in _sample_transcript_edges(lines, _FORKED_FROM_LINE_LIMIT):
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(record, dict):
-            continue
-        if record.get("sessionId") != claude_session_id:
-            continue
-        forked_from = record.get("forkedFrom")
-        if not isinstance(forked_from, dict):
-            continue
-        raw_source_session_id = forked_from.get("sessionId")
-        if not isinstance(raw_source_session_id, str) or not raw_source_session_id:
-            continue
-        if raw_source_session_id == claude_session_id:
-            continue
-        if (
-            source_claude_session_id is not None
-            and raw_source_session_id != source_claude_session_id
-        ):
-            continue
-        return True
-    return False
-
-
-def _sample_transcript_edges(lines: list[str], limit: int) -> list[str]:
-    """
-    Return transcript lines from the start and end of a file.
-
-    :param lines: Transcript JSONL lines.
-    :param limit: Maximum number of lines to take from each edge,
-        e.g. ``200``.
-    :returns: Sampled lines, preserving file order.
-    """
-    if limit <= 0 or len(lines) <= limit * 2:
-        return lines
-    return [*lines[:limit], *lines[-limit:]]
-
-
-def _transcript_timestamp(value: object) -> float | None:
-    """
-    Parse a Claude transcript timestamp.
-
-    :param value: Timestamp string, e.g.
-        ``"2026-05-27T22:53:13.245Z"``.
-    :returns: Unix timestamp, e.g. ``1779922393.245``, or ``None``
-        when parsing fails.
-    """
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
-
-
-def _local_command_name(content: str) -> str | None:
-    """
-    Extract a Claude local command name from transcript content.
-
-    :param content: Local-command transcript content, e.g.
-        ``"<command-name>/fork</command-name>"``.
-    :returns: Command name including leading slash, e.g.
-        ``"/fork"``, or ``None`` when no command tag exists.
-    """
-    name_match = _COMMAND_NAME_RE.search(content)
-    if name_match is None:
-        return None
-    name = name_match.group(1).strip()
-    return name or None
 
 
 def read_assistant_text_since(
@@ -7878,33 +7652,6 @@ def dismiss_btw_overlay(bridge_dir: Path) -> bool:
     return True
 
 
-def read_claude_status_model(bridge_dir: Path) -> str | None:
-    """
-    Read the active model id from the statusLine snapshot ``context.json``.
-
-    Unlike :func:`read_claude_context_state` (which returns ``None`` unless a
-    usable ``context_window_size`` is present, since it backs the context
-    ring), this returns the model whenever the wrapper captured one — the
-    model and the window are written independently, and the cost-budget gate
-    needs the model even on a render where the window field was absent. This
-    is claude-native's race-free, gate-time source of the live ``/model``
-    selection (the analogue of the codex hook reading ``config.toml``).
-
-    :param bridge_dir: Bridge directory shared with the statusLine wrapper.
-    :returns: The model id, e.g. ``"claude-sonnet-4-6"``, or ``None`` when
-        the file is missing / unreadable / carries no model string.
-    """
-    path = bridge_dir / _CONTEXT_FILE
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    model = parsed.get("model")
-    return model if isinstance(model, str) and model else None
-
-
 def read_user_status_line_command() -> str | None:
     """
     Return the user's globally-configured statusLine shell command, if any.
@@ -8191,7 +7938,6 @@ def _attachment_transcript_items_from_entry(
 # items. The original blanket drop was reverted because it
 # hid Skills; we keep the broad scaffolding filter and just
 # selectively re-surface the Skill case.
-_COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.DOTALL)
 _COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
 _COMMAND_STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL)
 _BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
@@ -9502,24 +9248,6 @@ def _wait_for_server_info(
         "Claude native bridge is not ready yet. Wait for Claude Code "
         "startup to finish before notifying tool list changes."
     )
-
-
-def _read_json_file(path: Path) -> _JsonObject:
-    """
-    Read a JSON object file.
-
-    :param path: JSON file path.
-    :returns: Parsed object, or ``{}`` when missing/malformed.
-    """
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return {}
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    return payload if isinstance(payload, dict) else {}
 
 
 def _write_json_file(path: Path, payload: _JsonObject) -> None:
