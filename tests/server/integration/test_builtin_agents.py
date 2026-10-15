@@ -102,7 +102,7 @@ async def test_list_builtin_agents_returns_registered_templates(
 ) -> None:
     """
     ``GET /v1/agents`` surfaces built-in agents registered in the store,
-    with their id and name, inside the ``PaginatedList`` envelope.
+    with their id and name, inside the ``AgentList`` envelope.
 
     This is what the new-session picker reads; if registered built-ins
     don't appear, the picker is empty and no session can be created

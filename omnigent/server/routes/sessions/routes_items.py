@@ -43,6 +43,7 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.schemas import (
     ChildSessionList,
     PaginatedList,
+    SessionItemList,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -61,7 +62,7 @@ def register_items_routes(
     @router.get(
         "/sessions/{session_id}/items",
         response_model=None,
-        responses={200: {"model": PaginatedList}, **STALE_CURSOR_RESPONSE},
+        responses={200: {"model": SessionItemList}, **STALE_CURSOR_RESPONSE},
     )
     async def list_session_items(
         request: Request,
@@ -87,7 +88,8 @@ def register_items_routes(
         :param before: Cursor — return items before this item ID.
         :param order: Sort order, ``"asc"`` (chronological,
             default) or ``"desc"``.
-        :returns: A :class:`PaginatedList` of conversation items.
+        :returns: A page of flattened conversation items, documented as
+            :class:`SessionItemList`.
         :raises OmnigentError: 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
