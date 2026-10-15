@@ -45,8 +45,9 @@ import re
 import secrets
 import shlex
 import shutil
-import subprocess
+import signal
 import tempfile
+import time
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -104,44 +105,77 @@ from .executor import (
 
 logger = logging.getLogger(__name__)
 
+_GATEWAY_AUTH_REFRESH_MS = 900_000
+# Leave time for the bridge round trip within Pi's 10-second command deadline.
+_GATEWAY_AUTH_TIMEOUT_S = 7
+_GATEWAY_BRIDGE_TIMEOUT_S = 8
+
+
+class _GatewayAuthError(OSError):
+    """Credential failure whose message is safe to show without redaction."""
+
+
 # Each line of Pi's JSONL output; the event schema is owned by the Pi CLI
 # not us, and varies across subcommands (response ack, message_update,
 # tool_execution_start/end, agent_end, message_end, etc.).
 CodexEvent: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 
-def _fetch_shell_command_token(command: str) -> str | None:
-    """Run an auth helper command and return its stdout token.
-
-    :param command: Shell command that prints a bearer token.
-    :returns: The stripped token, or ``None`` when the command fails or
-        prints no token.
-    """
-    result = subprocess.run(
-        ["sh", "-c", command],
-        check=False,
-        capture_output=True,
-        text=True,
+async def _fetch_shell_command_token(command: str) -> str:
+    """Resolve a token with a deadline, without exposing helper output on failure."""
+    process = await asyncio.create_subprocess_exec(
+        "sh",
+        "-c",
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
     )
-    token = result.stdout.strip()
-    if result.returncode != 0 or not token:
-        logger.debug("Pi Databricks auth command failed: %s", result.stderr.strip())
-        return None
-    return token
-
-
-def _write_gateway_token(tmp_dir: str, token: str) -> pathlib.Path:
-    """Atomically publish a private credential for a running Pi process."""
-    token_path = pathlib.Path(tmp_dir) / "gateway-token"
-    with tempfile.NamedTemporaryFile(mode="w", dir=tmp_dir, delete=False) as f:
-        pending_path = pathlib.Path(f.name)
+    try:
         try:
-            f.write(token)
-            f.close()
-            pending_path.replace(token_path)
-        finally:
-            pending_path.unlink(missing_ok=True)
-    return token_path
+            stdout, _ = await asyncio.wait_for(process.communicate(), _GATEWAY_AUTH_TIMEOUT_S)
+        except (TimeoutError, asyncio.CancelledError):
+            # Children may still hold stdout open after the helper shell exits.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            await process.communicate()
+            raise
+        if process.returncode != 0:
+            raise _GatewayAuthError("Pi gateway auth command failed")
+        token = stdout.decode().strip()
+        if not token:
+            raise _GatewayAuthError("Pi gateway auth command returned an empty token")
+        return token
+    except TimeoutError:
+        raise _GatewayAuthError("Pi gateway auth command timed out") from None
+
+
+def _write_gateway_auth_client(tmp_dir: str, port: int, token: str) -> pathlib.Path:
+    """Write Pi's request-time credential client; resolution stays in the parent."""
+    client_path = pathlib.Path(tmp_dir) / "gateway-auth.cjs"
+    client_path.write_text(
+        "const net = require('node:net');\n"
+        f"const request = {json.dumps({'kind': 'gateway_auth', 'token': token})};\n"
+        f"const socket = net.connect({port}, '127.0.0.1');\n"
+        "const fail = () => { socket.destroy(); process.exitCode = 1; };\n"
+        "const deadline = setTimeout(fail, 9000);\n"
+        "let buffer = '';\n"
+        "socket.on('connect', () => socket.write(JSON.stringify(request) + '\\n'));\n"
+        "socket.on('data', data => {\n"
+        "  buffer += data;\n"
+        "  if (!buffer.includes('\\n')) return;\n"
+        "  try {\n"
+        "    const response = JSON.parse(buffer.split('\\n')[0]);\n"
+        "    if (typeof response.token !== 'string' || !response.token) { fail(); return; }\n"
+        "    process.stdout.write(response.token);\n"
+        "    socket.end();\n"
+        "  } catch { fail(); }\n"
+        "});\n"
+        "socket.on('error', fail);\n"
+        "socket.on('close', () => clearTimeout(deadline));\n"
+    )
+    client_path.chmod(0o600)
+    return client_path
 
 
 class ToolExecutor(Protocol):
@@ -254,6 +288,8 @@ class _ToolServer:
         # Per-server bearer token required on every request. Minted at
         # construction (never None) so auth is always enforced.
         self.token: str = secrets.token_urlsafe(32)
+        self._gateway_auth: Callable[[], Awaitable[str]] | None = None
+        self._clients: set[asyncio.Task[None]] = set()
 
     async def start(self) -> int:
         """Start listening on a random port. Returns the port number."""
@@ -270,6 +306,11 @@ class _ToolServer:
     async def stop(self) -> None:
         if self._server is not None:
             self._server.close()
+        clients = list(self._clients)
+        for client in clients:
+            client.cancel()
+        await asyncio.gather(*clients, return_exceptions=True)
+        if self._server is not None:
             await self._server.wait_closed()
             self._server = None
 
@@ -278,6 +319,9 @@ class _ToolServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self._clients.add(task)
         try:
             while True:
                 raw = await reader.readline()
@@ -300,6 +344,20 @@ class _ToolServer:
                         ).encode("utf-8")
                         + b"\n"
                     )
+                    await writer.drain()
+                    break
+                if request.get("kind") == "gateway_auth":
+                    try:
+                        if self._gateway_auth is None:
+                            raise OSError("Pi gateway authentication is not configured")
+                        async with asyncio.timeout(_GATEWAY_BRIDGE_TIMEOUT_S):
+                            credential = await self._gateway_auth()
+                        auth_response = {"token": credential}
+                    except (OSError, TimeoutError) as exc:
+                        error = str(exc) or "Pi gateway authentication timed out"
+                        logger.warning("Pi gateway credential request failed: %s", error)
+                        auth_response = {"error": error}
+                    writer.write(json.dumps(auth_response).encode() + b"\n")
                     await writer.drain()
                     break
                 raw_req_id = request.get("id")
@@ -335,6 +393,7 @@ class _ToolServer:
             pass
         finally:
             writer.close()
+            self._clients.discard(task)
 
     def _token_ok(self, presented: JsonValue) -> bool:
         """
@@ -1825,6 +1884,7 @@ class PiExecutor(Executor):
         base_urls_override: dict[str, str] | None = None,
         openai_wire_api: str | None = None,
         gateway_auth_command: str | None = None,
+        gateway_auth_refresh_interval_ms: str | None = None,
         retry_policy: RetryPolicy | None = None,
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
@@ -1875,6 +1935,8 @@ class PiExecutor(Executor):
             ``"databricks auth token --host https://example.databricks.com ..."``
             or ``"printf %s sk-..."``. Set from
             ``HARNESS_PI_GATEWAY_AUTH_COMMAND``.
+        :param gateway_auth_refresh_interval_ms: Token cache lifetime in milliseconds;
+            defaults to 15 minutes. Zero resolves credentials on every request.
         :param retry_policy: The spec's ``llm.retry`` budget. Threads
             ``policy.pi.settings()`` into Pi's ``.pi/settings.json``
             before subprocess spawn — Pi natively does exponential
@@ -1920,6 +1982,16 @@ class PiExecutor(Executor):
         self._gateway_model_entries: tuple[model_catalog.ModelEntry, ...] | None = None
         self._gateway_model_wire_apis: dict[str, frozenset[ModelWireAPI]] | None = None
         self._gateway_auth_command = gateway_auth_command
+        interval = (
+            int(gateway_auth_refresh_interval_ms)
+            if gateway_auth_refresh_interval_ms
+            else _GATEWAY_AUTH_REFRESH_MS
+        )
+        if interval < 0:
+            raise ValueError("gateway_auth_refresh_interval_ms must be nonnegative")
+        self._gateway_auth_refresh_interval_s = interval / 1000
+        self._gateway_refresh_after = 0.0
+        self._gateway_auth_lock = asyncio.Lock()
         # Retry policy → Pi's .pi/settings.json before subprocess spawn.
         # See ``RetryPolicy.pi.settings()`` for the schema. Pi natively
         # does exponential backoff + Retry-After honoring; we just set
@@ -1980,41 +2052,17 @@ class PiExecutor(Executor):
         # Set by Session._wire_sdk_executor().
         self._tool_executor: ToolExecutor | None = None
 
+        self._databricks_host = self._gateway_host_override or ""
+        self._databricks_token = ""
         if gateway:
-            creds = None
-            if self._gateway_host_override is None:
-                creds = _read_databrickscfg(databricks_profile)
-                if creds is None:
-                    raise OSError(
-                        "PiExecutor(gateway=True) requires gateway credentials via "
-                        "the gateway base URL / auth command or a valid "
-                        "~/.databrickscfg profile."
-                    )
-            if self._gateway_host_override is not None:
-                self._databricks_host = self._gateway_host_override
-                if gateway_auth_command is None:
-                    raise OSError(
-                        "PiExecutor(gateway=True) with a gateway workspace host "
-                        "requires a gateway auth command."
-                    )
-                token = _fetch_shell_command_token(gateway_auth_command)
-                if token is None:
-                    raise OSError(
-                        "PiExecutor(gateway=True) could not fetch a gateway token "
-                        "for the workspace host."
-                    )
-                self._databricks_token = token
-            elif base_url_override:
-                # Derive the workspace host from the Anthropic gateway URL
-                # ucode wrote to state.json.
-                _parsed = _urlparse(base_url_override)
-                self._databricks_host = f"{_parsed.scheme}://{_parsed.netloc}"
-                assert creds is not None
-                self._databricks_token = creds.token
-            else:
-                assert creds is not None
-                self._databricks_host = creds.host
-                self._databricks_token = creds.token
+            if self._gateway_host_override is not None and gateway_auth_command is None:
+                raise OSError(
+                    "PiExecutor(gateway=True) with a gateway workspace host "
+                    "requires a gateway auth command."
+                )
+            if self._gateway_host_override is None and base_url_override:
+                parsed = _urlparse(base_url_override)
+                self._databricks_host = f"{parsed.scheme}://{parsed.netloc}"
 
         # True when the gateway transport was derived from a ~/.databrickscfg
         # profile (no gateway host or base URL supplied directly). Gates the
@@ -2203,6 +2251,8 @@ class PiExecutor(Executor):
         """Fetch and cache the live Databricks model catalog."""
         if self._gateway_model_wire_apis is not None:
             return self._gateway_model_wire_apis
+        if self._gateway:
+            await self._get_gateway_token()
         workspace_url = self._gateway_workspace_url if self._gateway else None
         if workspace_url is None:
             self._gateway_model_entries = ()
@@ -2240,15 +2290,47 @@ class PiExecutor(Executor):
         return self._gateway_model_wire_apis
 
     async def _ensure_tool_server(self, tools: list[ToolSpec]) -> int | None:
-        """Start the TCP tool server if there are Omnigent tools to bridge."""
-        if not tools:
+        """Start the authenticated bridge for tools or gateway credentials."""
+        if not tools and not self._gateway:
             return None
         if self._tool_server is None:
             self._tool_server = _ToolServer()
             await self._tool_server.start()
         self._tool_server._tool_executor = self._tool_executor
         self._tool_server._policy_gate = self._gate_native_tool
+        self._tool_server._gateway_auth = self._get_gateway_token if self._gateway else None
         return self._tool_server.port
+
+    async def _get_gateway_token(self) -> str:
+        """Refresh expired credentials under a lock; never fall back after failure."""
+        async with self._gateway_auth_lock:
+            if time.monotonic() < self._gateway_refresh_after:
+                return self._databricks_token
+            self._gateway_refresh_after = 0.0
+            try:
+                async with asyncio.timeout(_GATEWAY_BRIDGE_TIMEOUT_S):
+                    if self._gateway_host_override is not None:
+                        assert self._gateway_auth_command is not None
+                        token = await _fetch_shell_command_token(self._gateway_auth_command)
+                    else:
+                        creds = await run_sync_on_thread(
+                            _read_databrickscfg, self._databricks_profile
+                        )
+                        token = creds.token if creds is not None else None
+                        if creds is not None and not self._databricks_host:
+                            self._databricks_host = creds.host
+                    if not isinstance(token, str) or not token.strip():
+                        raise _GatewayAuthError("Pi gateway authentication returned no token")
+            except _GatewayAuthError:
+                raise
+            except TimeoutError:
+                raise _GatewayAuthError("Pi gateway credential refresh timed out") from None
+            except Exception:  # noqa: BLE001 — SDK/helper exceptions may contain credentials
+                raise _GatewayAuthError("Pi gateway credential refresh failed") from None
+            self._databricks_token = token
+            self._gateway_workspace_url = self._gateway_model_service_workspace_url()
+            self._gateway_refresh_after = time.monotonic() + self._gateway_auth_refresh_interval_s
+            return token
 
     async def _gate_native_tool(  # type: ignore[explicit-any]
         self,
@@ -2315,12 +2397,11 @@ class PiExecutor(Executor):
 
         if self._gateway:
             effective_model = model
-            token_path = _write_gateway_token(tmp_dir, self._databricks_token)
+            assert tool_server_port is not None and tool_server_token is not None
+            auth_client = _write_gateway_auth_client(tmp_dir, tool_server_port, tool_server_token)
             models_json = _build_models_json(
                 self._gateway_workspace_url or self._databricks_host,
-                # Pi resolves this local read on each request. Auth helpers stay
-                # in the parent, where their credentials and environment exist.
-                f"!cat {shlex.quote(str(token_path))}",
+                f"!node {shlex.quote(str(auth_client))}",
                 self._base_urls_override,
                 model=effective_model,
                 catalog_models=self._gateway_model_entries or (),
@@ -2493,9 +2574,6 @@ class PiExecutor(Executor):
             and state.system_prompt == system_prompt
             and state.model == effective_model
         ):
-            if self._gateway:
-                assert state.rpc._tmp_dir is not None
-                _write_gateway_token(state.rpc._tmp_dir, self._databricks_token)
             return state.rpc
 
         wire_catalog = await self._load_gateway_model_wire_apis()
@@ -2554,15 +2632,11 @@ class PiExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         if self._gateway:
-            if self._gateway_host_override is None:
-                creds = _read_databrickscfg(self._databricks_profile)
-                if creds is not None:
-                    self._databricks_token = creds.token
-            else:
-                assert self._gateway_auth_command is not None
-                token = _fetch_shell_command_token(self._gateway_auth_command)
-                if token:
-                    self._databricks_token = token
+            try:
+                await self._get_gateway_token()
+            except OSError as exc:
+                yield ExecutorError(message=str(exc), retryable=False)
+                return
         session_key = self._session_key(messages)
         model = await self._resolve_model(config)
         try:

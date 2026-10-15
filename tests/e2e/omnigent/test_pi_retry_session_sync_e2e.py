@@ -4,6 +4,7 @@ and later prompts retain history while picking up rotated credentials."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shlex
 import shutil
@@ -83,7 +84,10 @@ def rotating_gateway(
 
         def do_POST(self) -> None:
             body = self.rfile.read(int(self.headers["Content-Length"]))
-            valid = self.headers.get("Authorization") == f"Bearer {token_file.read_text()}"
+            expected = token_file.read_text() if token_file.exists() else None
+            valid = (
+                expected is not None and self.headers.get("Authorization") == f"Bearer {expected}"
+            )
             accepted.append(valid)
             if valid:
                 response = httpx.post(
@@ -143,6 +147,8 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
             {"text": _FIRST_ANSWER},
             {"text": _SECOND_ANSWER},
             {"text": "THIRD_ANSWER"},
+            {"tool_calls": [{"call_id": "remember-2", "name": "remember", "arguments": "{}"}]},
+            {"text": "AUTH_RECOVERED"},
         ],
         key=mock_model,
     )
@@ -153,6 +159,7 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     monkeypatch.setenv("HARNESS_PI_GATEWAY_BASE_URLS", json.dumps({"openai": f"{gateway_url}/v1"}))
     monkeypatch.setenv("HARNESS_PI_GATEWAY_HOST", gateway_url)
     monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_COMMAND", f"cat {shlex.quote(str(token_file))}")
+    monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "100")
     monkeypatch.setenv("HARNESS_PI_CWD", str(workspace))
     monkeypatch.setenv("HARNESS_PI_CONTEXT_FILES", "false")
     for name in _STALE_HARNESS_ENV:
@@ -176,7 +183,21 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
         )
 
     executor = _build_pi_executor()
-    executor._tool_executor = lambda name, args, **kwargs: {"value": _TOOL_RESULT}
+    calls: list[str] = []
+    tool_pids: list[int] = []
+
+    async def remember(name, args, *, call_id):
+        calls.append(call_id)
+        tool_pids.append(executor._session_states[_SESSION_ID].rpc.process.pid)
+        if call_id == "remember-1":
+            token_file.write_text("during-tool-token")
+        else:
+            token_file.unlink()
+        # Real elapsed time: the cached token expires while Pi awaits the tool.
+        await asyncio.sleep(0.15)
+        return {"value": _TOOL_RESULT}
+
+    executor._tool_executor = remember
     try:
         assert executor._sandboxed is sandboxed
         first = await _run_turn(executor, _FIRST_PROMPT)
@@ -185,11 +206,23 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
         assert rpc is not None and rpc.process is not None and rpc._tmp_dir is not None
         pid, agent_dir = rpc.process.pid, Path(rpc._tmp_dir)
         token_file.write_text("second-token")
+        await asyncio.sleep(0.15)
         second = await _run_turn(executor, _SECOND_PROMPT)
         assert executor._session_states[_SESSION_ID].rpc.process.pid == pid
         token_file.write_text("third-token")
+        await asyncio.sleep(0.15)
         third = await _run_turn(executor, "Reply with the third answer.")
         assert executor._session_states[_SESSION_ID].rpc.process.pid == pid
+        failed = await _run_turn(executor, "Call remember again.")
+        assert _errors(failed), "an expired token must not hide a failed credential helper"
+        assert len(accepted) == 6, "a failed refresh must stop before the next provider request"
+        token_file.write_text("recovered-token")
+        recovered = await _run_turn(executor, "Continue with the recovered answer.")
+        assert _errors(recovered) == []
+        assert _streamed_text(recovered) == "AUTH_RECOVERED"
+        assert executor._session_states[_SESSION_ID].rpc.process.pid == pid
+        assert calls == ["remember-1", "remember-2"]
+        assert tool_pids == [pid, pid]
     finally:
         await executor.close()
 
@@ -197,7 +230,7 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     assert _errors(third) == []
     assert _streamed_text(third) == "THIRD_ANSWER"
     assert any(isinstance(e, ToolCallComplete) for e in first)
-    assert accepted == [True] * 5
+    assert accepted == [True] * 7
     assert _errors(first) == [], (
         "the first turn was reported as a failure instead of completing with pi's "
         f"recovered answer: {_errors(first)}"
@@ -224,9 +257,9 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     )
 
     requests = get_mock_requests(mock_llm_server_url)
-    assert len(requests) == 5, (
-        f"expected the 503, retry, tool follow-up and two later prompts; got {len(requests)} "
-        "provider call(s)"
+    assert len(requests) == 7, (
+        "expected the retry, tool continuation, later prompts and auth recovery; "
+        f"got {len(requests)} provider call(s)"
     )
     for request in requests[-2:]:
         history = request["messages"]
