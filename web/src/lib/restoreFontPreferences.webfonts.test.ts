@@ -1,6 +1,11 @@
 import { waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { applyWebFontCapability, restoreFontPreferences } from "./restoreFontPreferences";
+import { FALLBACK_SERVER_INFO } from "./capabilities";
+import {
+  applyWebFontCapability,
+  applyWebFontCapabilityFromServerInfo,
+  restoreFontPreferences,
+} from "./restoreFontPreferences";
 import { resetFontLoaderForTests } from "./webFontLoader";
 
 afterEach(() => {
@@ -28,9 +33,22 @@ describe("restoreFontPreferences webfonts gate", () => {
     expect(document.querySelector("style[data-omnigent-font]")).toBeNull();
   });
 
-  it("loads a saved catalog font when the capability is enabled", async () => {
+  it("does not load a saved catalog font when settled info disables webfonts", () => {
     localStorage.setItem("omnigent:ui-font-family", JSON.stringify("Inter"));
-    applyWebFontCapability(true);
+    applyWebFontCapabilityFromServerInfo({
+      ...FALLBACK_SERVER_INFO,
+      features: { webfonts: false },
+    });
+
+    expect(document.querySelector("link[data-omnigent-font]")).toBeNull();
+  });
+
+  it("loads a saved catalog font when settled info enables webfonts", async () => {
+    localStorage.setItem("omnigent:ui-font-family", JSON.stringify("Inter"));
+    applyWebFontCapabilityFromServerInfo({
+      ...FALLBACK_SERVER_INFO,
+      features: { webfonts: true },
+    });
 
     await waitFor(() => {
       expect(
@@ -41,11 +59,17 @@ describe("restoreFontPreferences webfonts gate", () => {
 
   it("loads saved catalog fonts after an off-mode restore is enabled", async () => {
     localStorage.setItem("omnigent:ui-font-family", JSON.stringify("Roboto"));
-    applyWebFontCapability(false);
+    applyWebFontCapabilityFromServerInfo({
+      ...FALLBACK_SERVER_INFO,
+      features: { webfonts: false },
+    });
     restoreFontPreferences();
     expect(document.querySelector("link[data-omnigent-font]")).toBeNull();
 
-    applyWebFontCapability(true);
+    applyWebFontCapabilityFromServerInfo({
+      ...FALLBACK_SERVER_INFO,
+      features: { webfonts: true },
+    });
 
     await waitFor(() => {
       expect(
