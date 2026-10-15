@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import socket
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
 import httpx
@@ -536,13 +536,14 @@ async def _runner_dispatch(
     app,
     binary_sizes: list[int] | None = None,
     sent_frames: list | None = None,
+    send_frame: Callable[[str], Awaitable[None]] | None = None,
 ) -> AsyncIterator[dict[str, asyncio.Task[None]]]:
     dispatches: dict[str, asyncio.Task[None]] = {}
 
     async def send(raw: str) -> None:
         if sent_frames is not None:
             sent_frames.append(decode_frame(raw))
-        await ws.send(raw)
+        await (send_frame(raw) if send_frame is not None else ws.send(raw))
 
     async def receive() -> None:
         async for raw in ws:
@@ -895,6 +896,72 @@ async def test_post_head_close_recovers_binary_admission() -> None:
                 blocked.set()
                 for response in responses:
                     await response.aclose()
+
+
+async def test_cancelled_terminal_send_is_delivered_once_and_releases_binary_admission() -> None:
+    terminal_started = asyncio.Event()
+    terminal_cancelled = asyncio.Event()
+    release_terminal = asyncio.Event()
+    terminal_delivered = asyncio.Event()
+    delivered_ends: list[ResponseEndFrame] = []
+
+    async def app(scope, receive, send) -> None:
+        await receive()
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        try:
+            await send({"type": "http.response.body", "body": b""})
+        except asyncio.CancelledError:
+            terminal_cancelled.set()
+            raise
+
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        session = registry.get(_RUNNER)
+        assert session is not None
+        original_send = ws.send
+
+        async def send_frame(raw: str) -> None:
+            frame = decode_frame(raw)
+            if isinstance(frame, ResponseEndFrame):
+                terminal_started.set()
+                await release_terminal.wait()
+            await original_send(raw)
+            if isinstance(frame, ResponseEndFrame):
+                delivered_ends.append(frame)
+                terminal_delivered.set()
+
+        frames: list = []
+        async with _runner_dispatch(ws, app, sent_frames=frames, send_frame=send_frame):
+            response = await client.send(
+                client.build_request(
+                    "PATCH",
+                    "/upload",
+                    content=b"chunk",
+                    extensions={"runner_tunnel_binary_request_body": True},
+                ),
+                stream=True,
+            )
+            try:
+                await asyncio.wait_for(terminal_started.wait(), 2)
+                request_id = next(iter(session.binary_requests))
+                assert len(session.binary_requests) == 1
+
+                await response.aclose()
+                await asyncio.wait_for(terminal_cancelled.wait(), 2)
+                release_terminal.set()
+                await asyncio.wait_for(terminal_delivered.wait(), 2)
+                async with asyncio.timeout(2):
+                    while request_id in session.binary_requests:
+                        await asyncio.sleep(0.01)
+
+                ends = [frame for frame in frames if isinstance(frame, ResponseEndFrame)]
+                assert len(ends) == 1
+                assert ends[0].error is None
+                assert len(delivered_ends) == 1
+                assert delivered_ends[0].id == request_id
+                assert not session.binary_requests
+            finally:
+                release_terminal.set()
+                await response.aclose()
 
 
 async def test_cancel_after_completed_response_emits_no_duplicate_end() -> None:
