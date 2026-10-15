@@ -15,8 +15,9 @@ in the Files drawer.
 - `upload-picker`: multi-select to the browsed folder; keyboard focus returns to
   Upload after selection or cancellation.
 - `upload-tree`: folder drops, file drops to their parent, spring-loaded folders,
-  root drops and Changed-view root drops; a folder target swaps its icon to Upload
-  and glows, while root targets show a dashed zone in both themes.
+  root drops and Changed-view root drops; a folder target tints its full row,
+  swaps its icon to Upload and glows, while root targets show a dashed edge cue
+  that leaves the tree visible in both themes.
 - `upload-tray`: committed progress, cancel, retry, conflict decisions, completion
   and announcements; survives a viewer swap, drawer close and session switch.
 - `upload-gates`: flag off and viewers see no controls; pending permission waits;
@@ -34,9 +35,10 @@ surfaces; Reveal in file manager is available only on a host with that support.
 
 **Uploads in the rail:** choose Upload in the Files header, or drag local files
 onto a folder, a file, the tree's empty space or the header. Rest over a collapsed
-folder for 1000 ms to expand it, then drop inside. File rows inside a folder highlight
-their parent folder; top-level files, empty space, the header and Changed view show
-the dashed workspace drop zone. Search results target the browsed root; Changed
+folder for 1000 ms to expand it, then drop inside. Folder targets tint their full
+row; file rows inside a folder tint their parent folder. Top-level files, empty
+space, the header and Changed view show the dashed workspace edge cue, with folder
+rows still visible and targetable. Search results target the browsed root; Changed
 view targets the workspace root. Select
 Cancel or Retry in Uploads, choose Replace / Keep both / Skip for duplicates,
 open a file or switch sessions while the transfer runs, or close the rail to see
