@@ -7,6 +7,17 @@ import type { Comment } from "@/hooks/useComments";
 
 const SEP = "\n";
 
+function exactRange(
+  starts: number[],
+  start: number,
+  ends: number[],
+  end: number,
+): [number, number] | null {
+  const first = exactIndex(starts, start);
+  const last = exactIndex(ends, end);
+  return first !== -1 && last >= first ? [first, last] : null;
+}
+
 /**
  * Returns the occurrence of `needle` whose start is closest to `hint`.
  *
@@ -76,9 +87,9 @@ export function findPmRangeForComment(
   if (!/\s/u.test(anchor_content) && rawContent.slice(start_index, end_index) === anchor_content) {
     const map = markdownSourceMap(doc, rawContent, manager);
     if (map) {
-      const first = exactIndex(map.starts, start_index);
-      const last = exactIndex(map.ends, end_index);
-      if (first !== -1 && last >= first) {
+      const indexes = exactRange(map.starts, start_index, map.ends, end_index);
+      if (indexes) {
+        const [first, last] = indexes;
         const range = { from: map.positions[first], to: map.positions[last] + 1 };
         if (doc.textBetween(range.from, range.to, SEP) === anchor_content) return range;
       }
@@ -128,9 +139,9 @@ export function computeSelectionData(
   if (!/\s/u.test(anchor_content)) {
     const map = markdownSourceMap(doc, rawContent, manager);
     if (map) {
-      const first = exactIndex(map.positions, from);
-      const last = exactIndex(map.positions, to - 1);
-      if (first !== -1 && last >= first) {
+      const indexes = exactRange(map.positions, from, map.positions, to - 1);
+      if (indexes) {
+        const [first, last] = indexes;
         const start_index = map.starts[first];
         const end_index = map.ends[last];
         if (rawContent.slice(start_index, end_index) === anchor_content) {

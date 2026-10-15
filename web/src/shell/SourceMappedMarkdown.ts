@@ -17,8 +17,8 @@ export const SourceMappedMarkdown = Markdown.extend({
       }
     }
     marked = new Proxy(base, {
-      get(target, key, receiver) {
-        return key === "Lexer" ? SourceLexer : Reflect.get(target, key, receiver);
+      get(target, key) {
+        return key === "Lexer" ? SourceLexer : Reflect.get(target, key, target);
       },
     });
     return { ...options, marked };

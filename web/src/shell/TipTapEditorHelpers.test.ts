@@ -14,7 +14,10 @@ installMarkdownParserPatch();
 
 describe("repeated words in Markdown", () => {
   let editor: Editor | undefined;
-  afterEach(() => editor?.destroy());
+  afterEach(() => {
+    editor?.destroy();
+    editor = undefined;
+  });
 
   const link = `[Details](https://example.com/${"x".repeat(2000)})`;
   it.each([

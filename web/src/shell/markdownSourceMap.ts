@@ -70,8 +70,6 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
       valid = false;
       return;
     }
-    const pattern = decode ? /&(?:#\d+|#x[\da-f]+|[a-z][\da-z]+);/gi : /$^/g;
-    let cursor = 0;
     const append = (text: string, from: number, to?: number) => {
       pieces.push(text);
       for (let i = 0; i < text.length; i++) {
@@ -79,6 +77,12 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
         ends.push(offset(located, to === undefined ? from + i : to - 1) + 1);
       }
     };
+    if (!decode) {
+      append(value, 0);
+      return;
+    }
+    const pattern = /&(?:#\d+|#x[\da-f]+|[a-z][\da-z]+);/gi;
+    let cursor = 0;
     for (const match of value.matchAll(pattern)) {
       append(value.slice(cursor, match.index), cursor);
       const decoded = decodeHtmlEntities(match[0]);
@@ -277,7 +281,11 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
     for (let i = 0; i < node.text.length; i++) positions.push(pos + i);
     cursor += node.text.length;
   });
-  return valid && cursor === text.length ? { starts, ends, positions } : null;
+  const monotonic = (values: number[]) =>
+    values.every((value, i) => i === 0 || value >= values[i - 1]);
+  return valid && cursor === text.length && monotonic(starts) && monotonic(ends)
+    ? { starts, ends, positions }
+    : null;
 }
 
 export function markdownSourceMap(
@@ -299,6 +307,7 @@ export function markdownSourceMap(
 }
 
 export function exactIndex(values: number[], value: number): number {
+  // Source maps emit each array in ascending order.
   let lo = 0;
   let hi = values.length;
   while (lo < hi) {
