@@ -22,6 +22,12 @@ except ImportError:
 _TEST_OMNIGENT_DATA_DIR = Path(tempfile.mkdtemp(prefix="omnigent-pytest-")).resolve()
 os.environ["OMNIGENT_DATA_DIR"] = str(_TEST_OMNIGENT_DATA_DIR)
 
+# Tests and their subprocesses must not ship logs through the caller's sink.
+# Sink tests configure their own credentials or sender explicitly.
+for _test_env_name in tuple(os.environ):
+    if _test_env_name.startswith("OMNIGENT_DEBUG_LOG_"):
+        os.environ.pop(_test_env_name)
+
 # Skip the synchronous api.litellm.ai/model_catalog HTTP fallback during
 # tests. Hardened CI runners can't reach the public internet, so every
 # workflow startup that misses litellm's local registry would otherwise
