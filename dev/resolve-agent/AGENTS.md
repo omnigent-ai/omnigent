@@ -40,7 +40,7 @@ Exactly one work source selects the mode:
 
 - `session` or `ci_link`: recover and audit the repro, then discover an existing
   fix PR. Review it if sound; otherwise follow the author procedure.
-- `review_pr`: follow `resolve-inputs`' review-remediation resource. Work on the
+- `review_pr`: follow the shared `otto-review-remediation` skill. Work on the
   named PR's current branch, handle trusted human change requests, and use the
   workflow's fixed-target push command. Never create a replacement PR, rebase,
   rewrite history, approve, or dismiss human reviews. This mode skips inherited

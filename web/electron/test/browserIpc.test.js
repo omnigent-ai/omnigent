@@ -780,3 +780,35 @@ describe("browserIpc — navigation API helpers", () => {
     assert.equal(goForward(cantWc), false);
   });
 });
+
+it("applies navigation policy even when renderer options claim user intent", async () => {
+  for (const opts of [undefined, {}, { agent: false }, { agent: true }]) {
+    const ipcMain = makeIpcMain();
+    const calls = [];
+    const context = { serverTarget: "trusted-main-context" };
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        openOrNavigate: (...args) => {
+          calls.push(args);
+          return { ok: false, error: "blocked" };
+        },
+      }),
+      getAgentContextForEvent: () => context,
+    });
+    // oxlint-disable-next-line no-await-in-loop -- Each request checks a distinct renderer option.
+    const result = await ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "conv_1",
+        url: "https://example.com",
+        opts,
+      },
+    );
+    assert.equal(result.ok, false);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0][3], { force: false, agent: true, agentContext: context });
+  }
+});

@@ -24,6 +24,7 @@ const path = require("node:path");
 
 const {
   desktopDepsAvailable,
+  openBrowserFixture,
   spawnServer,
   launchDesktop,
   saveRecording,
@@ -178,16 +179,7 @@ async function shellWindow(electronApp, timeoutMs = 60_000) {
 // Drive the preload-exposed browser APIs from the shell renderer. Each helper
 // runs in the SPA window's context, where window.omnigentDesktop exists.
 async function openView(window, conversationId, url) {
-  return window.evaluate(
-    ([cid, u]) =>
-      window.omnigentDesktop.browserOpenOrNavigate(cid, u, {
-        x: 40,
-        y: 80,
-        width: 900,
-        height: 520,
-      }),
-    [conversationId, url],
-  );
+  return openBrowserFixture(window, conversationId, url);
 }
 
 async function execInView(window, conversationId, js) {

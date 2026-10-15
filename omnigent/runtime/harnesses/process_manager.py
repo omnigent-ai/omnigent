@@ -43,6 +43,7 @@ from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
+from omnigent.native.owner_claim import owner_is_gone, read_owner_claim, write_owner_claim
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
@@ -83,10 +84,9 @@ _TMP_PARENT_ENV_VAR = HARNESS_TMP_PARENT_ENV_VAR
 # depth.
 _HARNESS_AUTH_TOKEN_ENV = "OMNIGENT_HARNESS_AUTH_TOKEN"
 
-# Sentinel file the Omnigent instance writes into its subdir on boot. The
-# orphan sweep uses it to tell whether a sibling subdir belongs to
-# a still-running Omnigent (leave alone) or a crashed one (kill its
-# children, remove the dir).
+# Sentinel each instance writes into its subdir on boot; the orphan sweep uses it
+# to tell a still-running sibling from a crashed one (kill children, remove dir).
+# Holds an owner claim; older builds wrote a bare PID.
 _AP_PID_FILE = "AP_PID"
 
 # Mode bits applied to the per-AP subdir and the per-conversation
@@ -203,7 +203,9 @@ def _default_tmp_parent() -> Path:
     the host's real ``/tmp`` is unavailable or unsuitable. Relative
     values are intentionally preserved: Unix socket paths have tight
     length limits, and a short path such as ``.tmp/oa`` is useful
-    for local worktrees whose absolute path is long.
+    for local worktrees whose absolute path is long. Prefer storage
+    cleared at boot: the orphan sweep never reclaims a dir whose
+    owner ran under an earlier boot.
 
     :returns: Configured parent path, or the per-uid default
         ``/tmp/omnigent-<uid>`` on POSIX.
@@ -687,12 +689,10 @@ class HarnessProcessManager:
             # whose dir uuid happens to collide with ours gets cleaned first.
             await sweep_orphaned_harness_processes(tmp_parent=self._tmp_parent)
         self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        # Write the AP_PID sentinel so other instances' sweeps can
-        # tell our dir is live. Strict ``"x"`` because the dir is
-        # exclusively ours; a pre-existing sentinel would mean the
-        # uuid collided with a still-running instance — fail loud.
-        sentinel = self._instance_dir / _AP_PID_FILE
-        sentinel.write_text(str(os.getpid()), encoding="utf-8")
+        # Write the AP_PID sentinel so other instances' sweeps can tell our
+        # dir is live. The PID-namespace-qualified claim keeps a sweep that
+        # cannot see our PID (e.g. inside an agent sandbox) from deleting it.
+        write_owner_claim(self._instance_dir, filename=_AP_PID_FILE)
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -1613,17 +1613,25 @@ async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) ->
                 exc,
             )
             continue
-        try:
-            pid = int(sentinel.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError) as exc:
-            _logger.warning(
-                "could not read AP_PID sentinel at %s: %s; skipping",
-                sentinel,
-                exc,
-            )
-            continue
-        if _pid_alive(pid):
-            continue
+        claim = read_owner_claim(child, filename=_AP_PID_FILE)
+        if claim is not None:
+            # Only a sweeper in the owner's boot and PID namespace can judge it.
+            if not owner_is_gone(claim, process_alive=_pid_alive):
+                continue
+            pid = claim.pid
+        else:
+            # A bare PID from a build that predates owner claims.
+            try:
+                pid = int(sentinel.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError) as exc:
+                _logger.warning(
+                    "could not read AP_PID sentinel at %s: %s; skipping",
+                    sentinel,
+                    exc,
+                )
+                continue
+            if _pid_alive(pid):
+                continue
         _logger.info(
             "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
             child,
