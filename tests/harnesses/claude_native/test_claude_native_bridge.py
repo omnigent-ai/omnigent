@@ -3985,9 +3985,22 @@ def test_drop_startup_fatal_claude_args_drops_print_mode(tmp_path: Path) -> None
     assert args == ["fix the bug", "--model", "opus"]
 
 
+def test_drop_startup_fatal_claude_args_keeps_text_after_option_terminator(
+    tmp_path: Path,
+) -> None:
+    """Tokens after ``--`` are positional text, not flags to filter."""
+    args = drop_startup_fatal_claude_args(["--print", "--", "--print", "-p"], workspace=tmp_path)
+
+    assert args == ["--", "--print", "-p"]
+
+
 def test_drop_startup_fatal_claude_args_drops_missing_mcp_config_files(tmp_path: Path) -> None:
-    """A deleted MCP config file stops Claude from starting, so it is left out."""
+    """A deleted MCP config file stops Claude from starting, so it is left out.
+
+    An empty value and a directory are just as fatal and are dropped too.
+    """
     (tmp_path / "servers.json").write_text('{"mcpServers": {}}', encoding="utf-8")
+    (tmp_path / "configs").mkdir()
     inline = '{"mcpServers":{}}'
 
     args = drop_startup_fatal_claude_args(
@@ -4001,13 +4014,27 @@ def test_drop_startup_fatal_claude_args_drops_missing_mcp_config_files(tmp_path:
             inline,
             "--mcp-config",
             "also-missing.json",
+            "--mcp-config",
+            str(tmp_path / "configs"),
+            "--mcp-config=",
+            "--mcp-config=servers.json",
+            f"--mcp-config={inline}",
             "--model",
             "opus",
         ],
         workspace=tmp_path,
     )
 
-    assert args == ["--mcp-config", "servers.json", "--mcp-config", inline, "--model", "opus"]
+    assert args == [
+        "--mcp-config",
+        "servers.json",
+        "--mcp-config",
+        inline,
+        "--mcp-config=servers.json",
+        f"--mcp-config={inline}",
+        "--model",
+        "opus",
+    ]
 
 
 def test_generated_claude_subprocesses_pin_runner_tmpdir(

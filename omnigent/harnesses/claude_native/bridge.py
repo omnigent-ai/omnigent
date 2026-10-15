@@ -3153,7 +3153,8 @@ def drop_startup_fatal_claude_args(args: Sequence[str], *, workspace: Path) -> l
     A session replays its stored launch args on every relaunch, so one bad arg
     leaves it unable to start. ``--print`` runs Claude headless, which a
     terminal session can't use, and Claude refuses to start when an
-    ``--mcp-config`` file has since been deleted.
+    ``--mcp-config`` file has since been deleted. Tokens after an option
+    terminator ``--`` are positional text and are kept as they are.
 
     :param args: The session's Claude Code launch args, e.g. ``["--print"]``.
     :param workspace: Directory Claude runs in, which relative config paths
@@ -3165,6 +3166,9 @@ def drop_startup_fatal_claude_args(args: Sequence[str], *, workspace: Path) -> l
     while index < len(args):
         arg = args[index]
         index += 1
+        if arg == "--":
+            kept.extend(args[index - 1 :])
+            break
         if arg in _CLAUDE_PRINT_MODE_FLAGS:
             _logger.warning(
                 "Dropped %s from the Claude launch args; the session needs its TUI", arg
@@ -3194,17 +3198,24 @@ def _mcp_config_value_exists(value: str, workspace: Path) -> bool:
 
     :param value: One flag value, e.g. ``"/home/u/.mcp/servers.json"``.
     :param workspace: Directory relative paths resolve against.
-    :returns: ``False`` only for a config file that is known to be missing.
+    :returns: ``False`` for an empty value or a path that is not an existing
+        file; ``True`` for inline JSON, an existing file, or a path that
+        cannot be checked.
     """
     if value.lstrip().startswith("{"):
         return True
+    if not value:
+        _logger.warning("Dropped an empty --mcp-config value from the Claude launch args")
+        return False
     path = workspace / value
     try:
-        if path.exists():
+        if path.is_file():
             return True
     except OSError:
         return True
-    _logger.warning("Dropped missing --mcp-config file %s from the Claude launch args", path)
+    _logger.warning(
+        "Dropped --mcp-config %s from the Claude launch args; it is not an existing file", path
+    )
     return False
 
 
