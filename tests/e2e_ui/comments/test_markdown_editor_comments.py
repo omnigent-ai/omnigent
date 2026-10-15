@@ -345,17 +345,16 @@ def test_repeated_word_keeps_selected_occurrence_after_reopen(
 ) -> None:
     """Keep the selected word's raw offset and highlight through save/reopen."""
     base_url, session_id = seeded_session
-    path = fixture
-    content = (Path(__file__).parent / "fixtures" / fixture).read_text()
+    content = (Path(__file__).parent / "fixtures" / fixture).read_text(encoding="utf-8")
     response = httpx.put(
-        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{fixture}",
         json={"content": content, "encoding": "utf-8"},
         timeout=10,
     )
     response.raise_for_status()
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
-    file_button = page.get_by_role("button", name=path, exact=True)
+    file_button = page.get_by_role("button", name=fixture, exact=True)
     expect(file_button).to_be_visible(timeout=30_000)
     file_button.click()
     viewer = page.locator('[data-testid="file-viewer"]:visible')
@@ -407,7 +406,7 @@ def test_repeated_word_keeps_selected_occurrence_after_reopen(
 
     check_highlight()
     response = httpx.get(
-        f"{base_url}/v1/sessions/{session_id}/comments", params={"path": path}, timeout=10
+        f"{base_url}/v1/sessions/{session_id}/comments", params={"path": fixture}, timeout=10
     )
     response.raise_for_status()
     saved = response.json()
@@ -416,7 +415,7 @@ def test_repeated_word_keeps_selected_occurrence_after_reopen(
     assert saved[0]["end_index"] == expected_start + len(phrase)
     assert saved[0]["anchor_content"] == phrase
 
-    page.get_by_role("button", name=f"Close {path}", exact=True).first.click()
+    page.get_by_role("button", name=f"Close {fixture}", exact=True).first.click()
     file_button.click()
     expect(editor).to_be_visible()
     check_highlight()

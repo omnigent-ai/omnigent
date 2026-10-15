@@ -14,7 +14,8 @@ function exactRange(
   end: number,
 ): [number, number] | null {
   const first = exactIndex(starts, start);
-  const last = exactIndex(ends, end);
+  let last = exactIndex(ends, end);
+  while (last !== -1 && ends[last + 1] === end) last++;
   return first !== -1 && last >= first ? [first, last] : null;
 }
 
