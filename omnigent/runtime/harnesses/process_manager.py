@@ -763,7 +763,7 @@ class HarnessProcessManager:
         # bumped generation and is allowed to respawn.
         async with self._registry_lock:
             start_generation = self._release_generations.get(conversation_id, 0)
-        # Non-None only for a model/harness-switch respawn of an in-flight entry
+        # Non-None only for a deliberate replacement of an in-flight entry
         # (not crash respawns — those are already covered by the orphan watchdog).
         respawn_reason: str | None = None
         # The replaced entry's in-flight response id, captured at the respawn
@@ -789,6 +789,7 @@ class HarnessProcessManager:
             if (
                 not IS_WINDOWS
                 and entry is not None
+                and harness != "any"
                 and entry.process.returncode is None
                 and entry.endpoint.socket_path is not None
                 and entry.endpoint.socket_path.parent == self._instance_dir
@@ -811,9 +812,11 @@ class HarnessProcessManager:
                         },
                     },
                 )
+                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                 await self._close_entry(entry)
                 self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
+                respawn_reason = "harness_respawn_socket_missing"
             if entry is not None and entry.process.returncode is not None:
                 # Prior subprocess died; drop the stale entry and
                 # respawn below. The dead client is closed on
