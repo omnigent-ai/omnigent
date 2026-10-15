@@ -133,6 +133,12 @@ from omnigent.server.runner_session_init import (
     runner_response_error_body,
 )
 from omnigent.server.scheduled import ScheduledTaskScheduler
+from omnigent.server.seeded_agents import (
+    SEEDED_AGENTS_ENV,
+    record_suppressed_agents,
+    seeded_agent_allowed,
+    seeded_agent_allowlist,
+)
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -921,15 +927,44 @@ def _ensure_default_agents(
     bundle changed, so a redeploy picks up a new spec instead of
     serving the row seeded on first boot.
 
+    ``OMNIGENT_SEEDED_AGENTS`` trims the packaged roster. Each helper
+    returns the packaged names it owns (seeded or not), so whatever the
+    allowlist leaves out is published to
+    :func:`~omnigent.server.seeded_agents.record_suppressed_agents` and
+    hidden from ``GET /v1/agents``. A row seeded by an earlier boot is
+    suppressed rather than deleted: ``conversations.agent_id`` cascades on
+    delete, so dropping the row would take its session history with it.
+
+    Extras from ``OMNIGENT_BUILTIN_AGENT_DIRS`` are deliberately outside
+    the allowlist — trimming the packaged roster exists to make room for
+    them, so gating them too would empty the picker.
+
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
-    _ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
-    _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
-    _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
+    allowlist = seeded_agent_allowlist()
+    packaged = (
+        _ensure_default_native_agents(agent_store, artifact_store, agent_cache, allowlist)
+        | _ensure_default_acp_agents(agent_store, artifact_store, agent_cache, allowlist)
+        | _ensure_default_debby_agent(agent_store, artifact_store, agent_cache, allowlist)
+        | _ensure_default_polly_agent(agent_store, artifact_store, agent_cache, allowlist)
+    )
+    extras = _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
+    if allowlist is None:
+        record_suppressed_agents(frozenset())
+        return
+    unknown = allowlist - packaged
+    if unknown:
+        _logger.warning(
+            "%s names no packaged built-in: %s (packaged: %s)",
+            SEEDED_AGENTS_ENV,
+            ", ".join(sorted(unknown)),
+            ", ".join(sorted(packaged)),
+        )
+    # An extra that overrides a packaged name by design is the operator's own
+    # roster, never a suppressed row.
+    record_suppressed_agents((packaged - allowlist) - extras)
 
 
 # Env var listing extra built-in agent specs to seed at startup, in addition
@@ -946,7 +981,7 @@ def _ensure_extra_builtin_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
-) -> None:
+) -> frozenset[str]:
     """
     Seed extra built-in agents named by :data:`_EXTRA_BUILTIN_AGENTS_ENV`.
 
@@ -965,14 +1000,17 @@ def _ensure_extra_builtin_agents(
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
+    :returns: The names this helper seeded, so a same-named packaged row
+        the allowlist drops is not suppressed out from under the override.
     """
     import tempfile
 
     from omnigent.spec import materialize_bundle
 
+    seeded: set[str] = set()
     raw = os.environ.get(_EXTRA_BUILTIN_AGENTS_ENV, "").strip()
     if not raw:
-        return
+        return frozenset()
     for entry in raw.split(os.pathsep):
         entry = entry.strip()
         if not entry:
@@ -990,6 +1028,7 @@ def _ensure_extra_builtin_agents(
                 name=name,
                 bundle_bytes=bundle_bytes,
             )
+            seeded.add(name)
         except Exception:  # a bad operator path must not block server startup
             _logger.exception(
                 "Failed to register extra built-in agent from %r (%s); skipping. Check %s.",
@@ -999,6 +1038,7 @@ def _ensure_extra_builtin_agents(
             )
             continue
         _logger.info("Registered extra built-in agent %r from %s", name, source)
+    return frozenset(seeded)
 
 
 def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
@@ -1041,7 +1081,8 @@ def _ensure_default_native_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
-) -> None:
+    allowlist: frozenset[str] | None = None,
+) -> frozenset[str]:
     """
     Register or refresh every built-in native-CLI agent (claude/codex/pi/...).
 
@@ -1052,9 +1093,15 @@ def _ensure_default_native_agents(
     of the name — stays byte-identical and a redeploy does not orphan persisted
     ``conversation.agent_id`` rows.
 
+    The provider lookup runs before the allowlist check so a missing provider
+    row still fails loudly on a trimmed deployment — it is a packaging bug,
+    not something an operator's allowlist should be able to mask.
+
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
+    :param allowlist: Packaged names to seed, or ``None`` to seed all.
+    :returns: Every native agent name this helper owns, seeded or skipped.
     """
     from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
@@ -1064,6 +1111,8 @@ def _ensure_default_native_agents(
             raise OmnigentError(
                 f"native coding agent {agent.key!r} has no provider row to seed from"
             )
+        if not seeded_agent_allowed(agent.agent_name, allowlist):
+            continue
         _ensure_builtin_agent(
             agent_store,
             artifact_store,
@@ -1071,6 +1120,7 @@ def _ensure_default_native_agents(
             name=agent.agent_name,
             bundle_bytes=_build_native_bundle(provider),
         )
+    return frozenset(agent.agent_name for agent in NATIVE_CODING_AGENTS)
 
 
 # Light framing for a seeded ACP picker agent. ACP agents run their own tool
@@ -1125,13 +1175,15 @@ def _ensure_default_acp_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
-) -> None:
+    allowlist: frozenset[str] | None = None,
+) -> frozenset[str]:
     """
     Seed a picker agent per builtin ACP CLI row and per configured ``acp:`` agent.
 
     Native harnesses seed a fixed ``<harness>-ui`` agent each
-    (:func:`_ensure_default_native_agents`) unconditionally; the picker hides a row
-    the selected host cannot launch, reading that host's ``configured_harnesses``
+    (:func:`_ensure_default_native_agents`), gated by the same allowlist as the
+    ACP rows here; the picker additionally hides a row the selected host cannot
+    launch, reading that host's ``configured_harnesses``
     readiness map. Builtin ACP CLI harnesses follow the same model, because the
     vendor CLI runs on the *executing* host (the attached runner) rather than on the
     server: gating the row on the server's own PATH left Devin and Grok missing from
@@ -1156,8 +1208,12 @@ def _ensure_default_acp_agents(
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
+    :param allowlist: Packaged names to seed, or ``None`` to seed all.
+    :returns: Every ACP picker name this helper owns, seeded or skipped.
     """
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    owned: set[str] = set()
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
     try:
@@ -1174,6 +1230,9 @@ def _ensure_default_acp_agents(
         # ``[a-zA-Z0-9_-]+`` (the spec validator rejects spaces/dots), and a label
         # like "Gemini CLI" would fail to load. The web picker capitalizes the slug
         # for display (e.g. ``devin`` -> "Devin").
+        owned.add(agent.slug)
+        if not seeded_agent_allowed(agent.slug, allowlist):
+            continue
         _ensure_builtin_agent(
             agent_store,
             artifact_store,
@@ -1189,6 +1248,9 @@ def _ensure_default_acp_agents(
     for key in ACP_CLI_HARNESSES:
         if key in shadowed:
             continue
+        owned.add(key)
+        if not seeded_agent_allowed(key, allowlist):
+            continue
         _ensure_builtin_agent(
             agent_store,
             artifact_store,
@@ -1196,6 +1258,7 @@ def _ensure_default_acp_agents(
             name=key,
             bundle_bytes=_build_acp_bundle(harness=key, name=key),
         )
+    return frozenset(owned)
 
 
 def _build_debby_bundle() -> bytes:
@@ -1221,7 +1284,8 @@ def _ensure_default_debby_agent(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
-) -> None:
+    allowlist: frozenset[str] | None = None,
+) -> frozenset[str]:
     """
     Register the debby brainstorming agent if its bundle ships here.
 
@@ -1235,16 +1299,25 @@ def _ensure_default_debby_agent(
     debby spec, the existing row is refreshed in place instead of
     being ignored.
 
+    The name is owned whether or not the bundle ships here, so a deployment
+    that drops debby from the allowlist also hides a row an earlier,
+    bundle-carrying release seeded.
+
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
+    :param allowlist: Packaged names to seed, or ``None`` to seed all.
+    :returns: ``{"debby"}`` — the packaged name this helper owns.
     """
+    owned = frozenset({_DEBBY_AGENT_NAME})
+    if not seeded_agent_allowed(_DEBBY_AGENT_NAME, allowlist):
+        return owned
     if not (_DEBBY_BUNDLE_SOURCE / "config.yaml").is_file():
         _logger.debug(
             "debby bundle not found at %s; skipping seed",
             _DEBBY_BUNDLE_SOURCE,
         )
-        return
+        return owned
 
     _ensure_builtin_agent(
         agent_store,
@@ -1253,6 +1326,7 @@ def _ensure_default_debby_agent(
         name=_DEBBY_AGENT_NAME,
         bundle_bytes=_build_debby_bundle(),
     )
+    return owned
 
 
 def _build_polly_bundle() -> bytes:
@@ -1278,7 +1352,8 @@ def _ensure_default_polly_agent(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
-) -> None:
+    allowlist: frozenset[str] | None = None,
+) -> frozenset[str]:
     """
     Register the polly orchestrator agent if its bundle ships here.
 
@@ -1293,16 +1368,25 @@ def _ensure_default_polly_agent(
     polly spec, the existing row is refreshed in place instead of
     being ignored.
 
+    The name is owned whether or not the bundle ships here, so a deployment
+    that drops polly from the allowlist also hides a row an earlier,
+    bundle-carrying release seeded.
+
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
+    :param allowlist: Packaged names to seed, or ``None`` to seed all.
+    :returns: ``{"polly"}`` — the packaged name this helper owns.
     """
+    owned = frozenset({_POLLY_AGENT_NAME})
+    if not seeded_agent_allowed(_POLLY_AGENT_NAME, allowlist):
+        return owned
     if not (_POLLY_BUNDLE_SOURCE / "config.yaml").is_file():
         _logger.debug(
             "polly bundle not found at %s; skipping seed",
             _POLLY_BUNDLE_SOURCE,
         )
-        return
+        return owned
 
     _ensure_builtin_agent(
         agent_store,
@@ -1311,6 +1395,7 @@ def _ensure_default_polly_agent(
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
     )
+    return owned
 
 
 def create_app(
