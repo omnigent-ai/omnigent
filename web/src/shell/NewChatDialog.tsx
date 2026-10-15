@@ -6775,11 +6775,7 @@ export function NewChatLandingScreen() {
                                 : `Host: ${hostLabel}, ${selectedHost?.status === "online" ? "Online" : "Offline"}`
                             }
                             status={
-                              sandboxSelected
-                                ? undefined
-                                : selectedHost?.status === "online"
-                                  ? "online"
-                                  : "offline"
+                              sandboxSelected ? undefined : (selectedHost?.status ?? "offline")
                             }
                             cloud={isCloudHost}
                             className={cn(
