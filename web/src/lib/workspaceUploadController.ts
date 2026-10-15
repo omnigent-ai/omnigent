@@ -25,44 +25,86 @@ const refreshes = new Map<
   string,
   {
     timer: ReturnType<typeof setTimeout>;
+    deadline?: ReturnType<typeof setTimeout>;
     paths: Set<string>;
     origin: string;
     identity: string;
+    run: () => void;
   }
 >();
 const reportedBatches = new Set<string>();
+// A steady stream of completions keeps resetting the trailing debounce; flush at least
+// this often so folders, open files and search stay fresh during long uploads.
+const REFRESH_MAX_WAIT_MS = 1500;
+
+function debounceRefresh(
+  key: string,
+  row: UploadRow,
+  paths: Set<string>,
+  run: () => void,
+  maxWait?: number,
+): void {
+  const flush = () => {
+    const entry = refreshes.get(key);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    clearTimeout(entry.deadline);
+    refreshes.delete(key);
+    entry.run();
+  };
+  const previous = refreshes.get(key);
+  if (previous) clearTimeout(previous.timer);
+  const deadline =
+    previous?.deadline ?? (maxWait === undefined ? undefined : setTimeout(flush, maxWait));
+  const timer = setTimeout(flush, 300);
+  refreshes.set(key, { timer, deadline, paths, origin: row.origin, identity: row.identity, run });
+}
 
 export function refreshUploadedFiles(
   client: QueryClient,
   row: UploadRow,
   result: UploadResult,
 ): void {
-  const key = `${ownerKey(row)}:${row.directory}`;
-  const previous = refreshes.get(key);
-  if (previous) clearTimeout(previous.timer);
-  const paths = previous?.paths ?? new Set<string>();
-  if (result.outcome === "replaced") paths.add(result.path);
-  const timer = setTimeout(() => {
-    refreshes.delete(key);
-    const sid = row.session;
-    const keys: unknown[][] = [
-      ["workspace-dir", sid, row.directory],
-      ...(row.directory ? [["workspace-dir", sid, "", row.directory]] : []),
-      ["workspace-all-files", sid],
-      ["workspace-changed-files", sid],
-      ["workspace-file-search", sid],
-      ...Array.from(paths).flatMap((path) => [
-        ["file-content", sid, path],
-        ["file-diff", sid, path],
-      ]),
-    ];
+  const sid = row.session;
+  const refetch = (keys: unknown[][]) => {
     for (const queryKey of keys) void client.invalidateQueries({ queryKey, refetchType: "active" });
-    void client.invalidateQueries({
-      queryKey: ["workspace-dir-listing", sid],
-      refetchType: "none",
-    });
-  }, 300);
-  refreshes.set(key, { timer, paths, origin: row.origin, identity: row.identity });
+  };
+  const key = `${ownerKey(row)}:${row.directory}`;
+  const paths = refreshes.get(key)?.paths ?? new Set<string>();
+  if (result.outcome === "replaced") paths.add(result.path);
+  debounceRefresh(
+    key,
+    row,
+    paths,
+    () =>
+      refetch([
+        ["workspace-dir", sid, row.directory],
+        ...(row.directory ? [["workspace-dir", sid, "", row.directory]] : []),
+        ...Array.from(paths).flatMap((path) => [
+          ["file-content", sid, path],
+          ["file-diff", sid, path],
+        ]),
+      ]),
+    REFRESH_MAX_WAIT_MS,
+  );
+  // Session-wide queries share one debounce across every destination folder.
+  debounceRefresh(
+    ownerKey(row),
+    row,
+    new Set(),
+    () => {
+      refetch([
+        ["workspace-all-files", sid],
+        ["workspace-changed-files", sid],
+        ["workspace-file-search", sid],
+      ]);
+      void client.invalidateQueries({
+        queryKey: ["workspace-dir-listing", sid],
+        refetchType: "none",
+      });
+    },
+    REFRESH_MAX_WAIT_MS,
+  );
 }
 
 export function adaptiveChunk(bytes: number, elapsedMs: number, limits: UploadLimits): number {
@@ -95,6 +137,14 @@ export function waitForRetry(delay: number, signal: AbortSignal): Promise<void> 
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) abort();
   });
+}
+
+function retryNotice(error: unknown): string {
+  if (!(error instanceof UploadError)) return "Reconnecting…";
+  const detail = `(HTTP ${error.status} ${error.code})`;
+  if (error.code === "upload_limit") return `Waiting for session upload capacity… ${detail}`;
+  if (error.status === 429) return `Server busy. Waiting to retry… ${detail}`;
+  return `Reconnecting… ${detail}`;
 }
 
 function retryable(error: unknown): boolean {
@@ -221,12 +271,7 @@ export async function transferUpload(
           const budget = error.code === "upload_limit" ? 15 * 60_000 : 5 * 60_000;
           if (Date.now() - since >= budget) throw error;
         } else if (++failures >= 3) throw error;
-        update({
-          error:
-            error instanceof UploadError && error.code === "upload_limit"
-              ? "Waiting for session upload capacity…"
-              : "Reconnecting…",
-        });
+        update({ error: retryNotice(error) });
         await wait(retryDelay(error, throttled ? 0 : failures - 1), signal);
         checkOwnership();
         needsHead =
@@ -581,6 +626,7 @@ export function discardUploads(origin: string, identity: string): void {
   for (const [key, refresh] of refreshes) {
     if (refresh.origin !== origin || refresh.identity !== identity) continue;
     clearTimeout(refresh.timer);
+    clearTimeout(refresh.deadline);
     refreshes.delete(key);
   }
   const rows = Object.values(useUploadStore.getState().rows).filter(
