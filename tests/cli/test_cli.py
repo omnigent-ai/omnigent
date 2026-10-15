@@ -3229,7 +3229,7 @@ def _agent_with_shared_skill(checkout: Path, *, git: bool = True) -> Path:
     return agent
 
 
-@pytest.mark.parametrize("link", ["directory", "files"])
+@pytest.mark.parametrize("link", ["directory", "files", "hardlinks"])
 def test_bundle_includes_symlinked_skill_as_regular_files(tmp_path: Path, link: str) -> None:
     """A skill linked from elsewhere in the checkout survives server-side extraction."""
     from omnigent.spec import load
@@ -3239,10 +3239,17 @@ def test_bundle_includes_symlinked_skill_as_regular_files(tmp_path: Path, link: 
     linked = agent / "skills" / "review-loop"
     if link == "directory":
         linked.symlink_to(Path("../../../shared-skills/review-loop"))
-    else:
+    elif link == "files":
         linked.mkdir()
         for name in ("SKILL.md", "helper.py"):
             (linked / name).symlink_to(Path("../../../../shared-skills/review-loop") / name)
+    else:
+        # Two bundled paths sharing an inode must not become a hardlink member.
+        linked.mkdir()
+        shared = agent.parents[1] / "shared-skills" / "review-loop"
+        (linked / "SKILL.md").symlink_to(shared / "SKILL.md")
+        os.link(shared / "helper.py", linked / "helper.py")
+        (linked / "helper-alias.py").symlink_to(shared / "helper.py")
 
     bundle_bytes = _bundle(agent)
 
@@ -3265,9 +3272,18 @@ def test_bundle_includes_symlinked_skill_as_regular_files(tmp_path: Path, link: 
     ],
 )
 def test_bundle_rejects_unbundleable_symlinks(
-    tmp_path: Path, target: str, message: str, git: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str, message: str, git: bool
 ) -> None:
     """Links that cannot be bundled fail instead of silently dropping the skill."""
+    from omnigent.runtime import filesystem_registry
+
+    # Ignore any repository enclosing pytest's temp dir; only the fixture's own .git counts.
+    detect = filesystem_registry.detect_git_root
+    monkeypatch.setattr(
+        filesystem_registry,
+        "detect_git_root",
+        lambda path: root if (root := detect(path)) and root.is_relative_to(tmp_path) else None,
+    )
     agent = _agent_with_shared_skill(tmp_path / "checkout", git=git)
     (tmp_path / "outside").mkdir()
     (agent / "skills" / "review-loop").symlink_to(Path(target))

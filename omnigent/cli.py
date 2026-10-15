@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import errno
 import json
 import logging
 import os
@@ -6051,7 +6052,8 @@ def _bundle(source: Path) -> bytes:
     resolved = _resolve_bundle_env_vars(source)
 
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+    # dereference: linked paths can share an inode, and the server refuses hardlink members.
+    with tarfile.open(fileobj=buf, mode="w:gz", dereference=True) as tf:
         for file_path, arcname in _bundle_files(source):
             if arcname in resolved:
                 # Write the resolved YAML instead of the
@@ -6072,7 +6074,8 @@ def _bundle_files(source: Path) -> Iterator[tuple[Path, str]]:
     Symlinks are followed and bundled as regular files, since the server
     refuses links, so shared skills can be linked into ``skills/``. A link must
     resolve inside the enclosing Git checkout (or *source* outside one); dangling,
-    escaping and looping links fail instead of silently dropping content.
+    escaping and looping links fail instead of silently dropping content. Entries
+    that are not regular files (FIFOs, sockets, devices) are skipped as before.
 
     :param source: The agent image directory.
     :raises OmnigentError: If a symlink is dangling, loops, or resolves outside
@@ -6082,13 +6085,17 @@ def _bundle_files(source: Path) -> Iterator[tuple[Path, str]]:
     from omnigent.runtime.filesystem_registry import detect_git_root
 
     def resolve(path: Path) -> Path:
+        rel = path.relative_to(source)
         try:
-            return path.resolve()
+            return path.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
-            # A link to itself (or a pair pointing at each other) cannot resolve.
+            # Python 3.12 reports loops as RuntimeError; 3.13+ as OSError(ELOOP).
+            if isinstance(exc, RuntimeError) or exc.errno == errno.ELOOP:
+                reason = "is a symlink loop"
+            else:
+                reason = "is a dangling symlink"
             raise OmnigentError(
-                f"{path.relative_to(source)} is a symlink loop; cannot bundle it.",
-                code=ErrorCode.INVALID_INPUT,
+                f"{rel} {reason}; cannot bundle it.", code=ErrorCode.INVALID_INPUT
             ) from exc
 
     root = source.resolve()
@@ -6111,11 +6118,6 @@ def _bundle_files(source: Path) -> Iterator[tuple[Path, str]]:
             path = current / name
             real = resolve(path)
             rel = path.relative_to(source)
-            if not real.exists():
-                raise OmnigentError(
-                    f"{rel} is a dangling symlink; cannot bundle it.",
-                    code=ErrorCode.INVALID_INPUT,
-                )
             if not real.is_relative_to(boundary):
                 raise OmnigentError(
                     f"{rel} resolves to {real}, outside {boundary}; "
