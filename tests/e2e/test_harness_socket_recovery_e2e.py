@@ -30,6 +30,7 @@ def harness_tmp_parent() -> Iterator[Path]:
         shutil.rmtree(parent, ignore_errors=True)
 
 
+@pytest.mark.posix_only
 async def test_next_turn_recovers_when_live_harness_socket_disappears(
     harness_tmp_parent: Path,
     monkeypatch: pytest.MonkeyPatch,

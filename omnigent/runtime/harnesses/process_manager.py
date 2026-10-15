@@ -786,6 +786,10 @@ class HarnessProcessManager:
                     "while get_client waited"
                 )
             entry = self._entries.get(conversation_id)
+            # An "any" control caller may still have an established connection
+            # after the pathname is unlinked; do not kill the turn it is trying
+            # to interrupt. Concrete-harness (new-turn) callers must reconnect
+            # through the pathname and therefore own recovery.
             if (
                 not IS_WINDOWS
                 and entry is not None
