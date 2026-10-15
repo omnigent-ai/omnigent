@@ -374,40 +374,26 @@ async def _read_capped(request: Request, maximum: int) -> bytes:
             raise UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
         return buffer.getvalue() if buffer is not None else first or b""
 
-    segments: list[bytes] = []
-    segment: bytearray | None = None
-    segment_used = 0
-    segment_size = 0
-    buffered = 0
+    buffer: io.BytesIO | None = None
     size = 0
-    segment_view: memoryview | None = None
     async for chunk in request.stream():
         next_size = size + len(chunk)
         if next_size > maximum:
             raise UploadError(ErrorCode.TOO_LARGE)
+        if not chunk:
+            continue
+        if buffer is None:
+            buffer = io.BytesIO()
+            if maximum:
+                buffer.seek(maximum - 1)
+                buffer.write(b"\0")
+                buffer.seek(0)
+        buffer.write(chunk)
         size = next_size
-        source = memoryview(chunk)
-        offset = 0
-        while offset < len(source):
-            if segment is None:
-                segment_size = min(64 * 1024, maximum - buffered)
-                segment = bytearray(segment_size)
-                segment_view = memoryview(segment)
-            amount = min(len(source) - offset, segment_size - segment_used)
-            end = segment_used + amount
-            assert segment_view is not None
-            segment_view[segment_used:end] = source[offset : offset + amount]
-            offset += amount
-            segment_used = end
-            if end == segment_size:
-                segments.append(bytes(segment))
-                buffered += segment_size
-                segment = None
-                segment_view = None
-                segment_used = 0
-    if segment_view is not None and segment_used:
-        segments.append(bytes(segment_view[:segment_used]))
-    return b"".join(segments)
+    if buffer is None:
+        return b""
+    buffer.truncate(size)
+    return buffer.getvalue()
 
 
 def _response_error(response: httpx.Response) -> UploadError:
