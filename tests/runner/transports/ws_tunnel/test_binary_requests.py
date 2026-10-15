@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import socket
+import tracemalloc
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
@@ -17,6 +19,7 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.asyncio.server import serve
 
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
+from omnigent.runner.transports.ws_tunnel import transport as transport_module
 from omnigent.runner.transports.ws_tunnel.binary_requests import encode_binary_request
 from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -808,13 +811,17 @@ async def test_transport_reports_oversized_binary_request() -> None:
 async def test_oversized_streaming_binary_body_stops_at_envelope_limit() -> None:
     chunk_size = 64 * 1024
     consumed = 0
+    source_closed = asyncio.Event()
 
     async def body() -> AsyncIterator[bytes]:
         nonlocal consumed
-        for _ in range(RUNNER_TUNNEL_MAX_MESSAGE_BYTES // chunk_size + 2):
-            chunk = b"x" * chunk_size
-            consumed += len(chunk)
-            yield chunk
+        try:
+            for _ in range(RUNNER_TUNNEL_MAX_MESSAGE_BYTES // chunk_size + 2):
+                chunk = b"x" * chunk_size
+                consumed += len(chunk)
+                yield chunk
+        finally:
+            source_closed.set()
 
     async with _tunnel([_CAPABILITY]) as (client, ws, registry):
         request = client.build_request(
@@ -838,6 +845,7 @@ async def test_oversized_streaming_binary_body_stops_at_envelope_limit() -> None
             await client.send(request)
         assert error.value.request is request
         assert body_budget < consumed <= body_budget + chunk_size
+        assert source_closed.is_set()
 
         session = registry.get(_RUNNER)
         assert session is not None
@@ -863,6 +871,65 @@ async def test_oversized_streaming_binary_body_stops_at_envelope_limit() -> None
         finally:
             retry.cancel()
             await asyncio.gather(retry, return_exceptions=True)
+
+
+async def test_binary_envelope_releases_buffer_while_waiting_for_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message_limit = 16 * 1024 * 1024
+    body_size = 8 * 1024 * 1024
+    chunk_size = 64 * 1024
+    monkeypatch.setattr(transport_module, "RUNNER_TUNNEL_MAX_MESSAGE_BYTES", message_limit)
+    sender_resume = _pause_sender(monkeypatch)
+    request_enqueued = asyncio.Event()
+    allow_request = asyncio.Event()
+
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        original_send_request = registry.send_request
+
+        async def hold_request(session, data, *, request_id: str) -> None:
+            await original_send_request(session, data, request_id=request_id)
+            request_enqueued.set()
+            await allow_request.wait()
+
+        monkeypatch.setattr(registry, "send_request", hold_request)
+
+        async def body() -> AsyncIterator[bytes]:
+            chunk = b"x" * chunk_size
+            for _ in range(body_size // chunk_size):
+                yield chunk
+
+        request = client.build_request(
+            "PATCH",
+            "/upload",
+            content=body(),
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        gc.collect()
+        tracemalloc.start()
+        baseline, _ = tracemalloc.get_traced_memory()
+        task = asyncio.create_task(client.send(request, stream=True))
+        try:
+            await asyncio.wait_for(request_enqueued.wait(), 5)
+            gc.collect()
+            retained, _ = tracemalloc.get_traced_memory()
+            assert retained - baseline < body_size * 3 // 2
+
+            allow_request.set()
+            sender_resume.set()
+            raw = await asyncio.wait_for(ws.recv(), 5)
+            assert isinstance(raw, bytes)
+            request_id = _envelope_header(raw)["id"]
+            await _reply(ws, request_id)
+            response = await asyncio.wait_for(task, 5)
+            assert response.status_code == 204
+            await response.aclose()
+        finally:
+            allow_request.set()
+            sender_resume.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            tracemalloc.stop()
 
 
 async def test_binary_request_across_consumer_loop() -> None:

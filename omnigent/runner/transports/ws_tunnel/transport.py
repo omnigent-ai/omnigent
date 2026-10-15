@@ -25,7 +25,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
+from typing import cast
 
 import httpx
 
@@ -44,6 +45,12 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
 from omnigent.server.server_config import runner_tunnel_binary_request_body
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+
+
+async def _aclose_if_available(stream: object) -> None:
+    aclose = getattr(stream, "aclose", None)
+    if callable(aclose):
+        await cast(Awaitable[None], aclose())
 
 
 class _TunneledByteStream(httpx.AsyncByteStream):
@@ -193,17 +200,32 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             )
             if use_binary:
                 try:
-                    wire_buffer = bytearray(encode_binary_request(frame, b""))
-                    body_budget = RUNNER_TUNNEL_MAX_MESSAGE_BYTES - len(wire_buffer)
-                    body_size = 0
                     stream = request.stream
                     assert isinstance(stream, httpx.AsyncByteStream)
-                    async for chunk in stream:
-                        if body_size + len(chunk) > body_budget:
-                            raise ValueError("binary request exceeds tunnel message limit")
-                        wire_buffer.extend(chunk)
-                        body_size += len(chunk)
-                    wire: str | bytes = bytes(wire_buffer)
+                    iterator = stream.__aiter__()
+                    # httpx's async-iterator wrapper doesn't close its wrapped source.
+                    source = getattr(stream, "_stream", None)
+                    try:
+                        wire_buffer = bytearray(encode_binary_request(frame, b""))
+                        body_budget = RUNNER_TUNNEL_MAX_MESSAGE_BYTES - len(wire_buffer)
+                        body_size = 0
+                        async for chunk in iterator:
+                            if body_size + len(chunk) > body_budget:
+                                raise ValueError("binary request exceeds tunnel message limit")
+                            wire_buffer.extend(chunk)
+                            body_size += len(chunk)
+                        wire = bytes(wire_buffer)
+                        del wire_buffer
+                    finally:
+                        try:
+                            if iterator is not stream and iterator is not source:
+                                await _aclose_if_available(iterator)
+                        finally:
+                            try:
+                                if source is not None and source is not stream:
+                                    await _aclose_if_available(source)
+                            finally:
+                                await _aclose_if_available(stream)
                 except ValueError as exc:
                     raise httpx.LocalProtocolError(str(exc), request=request) from exc
             else:
