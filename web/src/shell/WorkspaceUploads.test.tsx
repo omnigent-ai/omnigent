@@ -531,6 +531,7 @@ it.each(["space", "header", "empty tree", "Changes"])(
     const transfer = { types: ["Files"], files: [new File(["bytes"], "root.txt")] };
     fireEvent.dragOver(target, { dataTransfer: transfer });
     expect(screen.getByText("Upload to workspace")).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent(`Upload to ${usesPanel ? "demo" : "src"}`);
     expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(1);
     fireEvent.drop(target, { dataTransfer: transfer });
     expect(enqueueUploads).toHaveBeenCalledExactlyOnceWith(
@@ -571,16 +572,22 @@ function tree(props: Partial<Parameters<typeof FolderTree>[0]> = {}) {
   );
 }
 
-it("shows a single folder ring and upload label, then freezes the DROP row despite stale hover", async () => {
+it("swaps the folder icon and glows its name, then freezes the DROP row despite stale hover", async () => {
   view("src", tree());
   await screen.findByRole("button", { name: "Upload files" });
   const assets = screen.getByText("assets/");
   const transfer = { types: ["Files"], files: [new File(["bytes"], "new.txt")] };
   fireEvent.dragOver(assets, { dataTransfer: transfer });
-  expect(screen.getByText("Upload to src/assets")).toBeVisible();
-  expect(screen.getByText("Upload to src/assets").parentElement).toBe(document.body);
-  expect(assets.closest("[data-upload-hover]")).toBeTruthy();
-  expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(1);
+  const folder = assets.closest("[data-drop-folder]") as HTMLElement;
+  expect(folder).toHaveAttribute("data-upload-hover");
+  expect(folder.querySelector("svg.lucide-upload")).toBeTruthy();
+  expect(folder.querySelector("svg.lucide-folder, svg.lucide-folder-open")).toBeNull();
+  expect(assets).toHaveAttribute("data-upload-glow");
+  expect(assets).toHaveClass("text-foreground");
+  expect(assets.style.textShadow).toContain("var(--info)");
+  expect(folder).not.toHaveClass("ring-2");
+  expect(screen.getByRole("status")).toHaveTextContent("Upload to src/assets");
+  expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
   expect(screen.queryByText("Upload to workspace")).toBeNull();
   fireEvent.drop(screen.getByText("other/"), { dataTransfer: transfer });
   expect(enqueueUploads).toHaveBeenCalledExactlyOnceWith(
@@ -593,9 +600,11 @@ it("shows a single folder ring and upload label, then freezes the DROP row despi
   );
   expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
   expect(assets.closest("[data-upload-hover]")).toBeNull();
+  expect(folder.querySelector("svg.lucide-upload")).toBeNull();
+  expect(assets).not.toHaveAttribute("data-upload-glow");
 });
 
-it("outlines the browsed root while a root-level file row is the drop target", async () => {
+it("shows the dashed root zone while a root-level file row is the drop target", async () => {
   view(
     "src",
     tree({
@@ -608,13 +617,16 @@ it("outlines the browsed root while a root-level file row is the drop target", a
   await screen.findByRole("button", { name: "Upload files" });
   const transfer = { types: ["Files"], files: [new File(["bytes"], "new.txt")] };
   fireEvent.dragOver(screen.getByText("top.txt"), { dataTransfer: transfer });
-  expect(screen.getByText("Upload to src")).toBeVisible();
-  const outline = document.querySelector("[data-upload-root-outline]");
-  expect(outline).toBeTruthy();
-  expect(outline?.parentElement).toBe(document.querySelector("[data-upload-drop-root]"));
+  expect(screen.getByText("Upload to workspace")).toBeVisible();
+  expect(screen.getByText("to src")).toBeVisible();
+  expect(screen.getByRole("status")).toHaveTextContent("Upload to src");
+  expect(document.querySelector("[data-upload-root-outline]")).toBeNull();
   expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(1);
   fireEvent.dragOver(screen.getByText("other/"), { dataTransfer: transfer });
-  expect(screen.getByText("Upload to src/other")).toBeVisible();
+  expect(screen.getByText("other/").closest("[data-drop-folder]")).toHaveAttribute(
+    "data-upload-hover",
+  );
+  expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
   expect(document.querySelector("[data-upload-root-outline]")).toBeNull();
   fireEvent.drop(screen.getByText("top.txt"), { dataTransfer: transfer });
   expect(enqueueUploads).toHaveBeenCalledExactlyOnceWith(
@@ -767,7 +779,8 @@ it("keeps one overlay across tree to header and header-child crossings", async (
   const transfer = { types: ["Files"] };
   fireEvent.dragEnter(row, { dataTransfer: transfer });
   fireEvent.dragOver(row, { dataTransfer: transfer });
-  expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(1);
+  expect(row.closest("[data-drop-folder]")).toHaveAttribute("data-upload-hover");
+  expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
   fireEvent.dragEnter(header, { dataTransfer: transfer });
   fireEvent.dragLeave(row, { dataTransfer: transfer });
   expect(screen.getByText("Upload to workspace")).toBeVisible();
@@ -802,17 +815,41 @@ it("does not commit the expanded tree again for same-row dragover", async () => 
   const row = screen.getByText("dir0/");
   const transfer = { types: ["Files"] };
   fireEvent.dragOver(row, { dataTransfer: transfer });
-  expect(screen.getByText("Upload to src/dir0")).toBeVisible();
+  expect(screen.getByRole("status")).toHaveTextContent("Upload to src/dir0");
   const before = commits.mock.calls.length;
   for (let index = 0; index < 25; index++) fireEvent.dragOver(row, { dataTransfer: transfer });
   expect(commits).toHaveBeenCalledTimes(before);
 });
 
-it("uses a solid background for the floating label over tree rows", async () => {
+it("highlights the parent folder when hovering its file and restores it on drag end", async () => {
   view("src", tree());
   await screen.findByRole("button", { name: "Upload files" });
-  fireEvent.dragOver(screen.getByText("assets/"), { dataTransfer: { types: ["Files"] } });
-  expect(screen.getByText("Upload to src/assets")).toHaveClass("bg-card-solid");
+  const transfer = { types: ["Files"] };
+  const folder = screen.getByText("assets/").closest("[data-drop-folder]") as HTMLElement;
+  fireEvent.dragOver(screen.getByText("existing.txt"), { dataTransfer: transfer });
+  expect(folder).toHaveAttribute("data-upload-hover");
+  expect(folder.querySelector("svg.lucide-upload")).toBeTruthy();
+  expect(screen.getByText("assets/")).toHaveAttribute("data-upload-glow");
+  expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
+  fireEvent.dragEnd(screen.getByText("existing.txt"), { dataTransfer: transfer });
+  expect(folder).not.toHaveAttribute("data-upload-hover");
+  expect(folder.querySelector("svg.lucide-upload")).toBeNull();
+  expect(screen.getByText("assets/")).not.toHaveAttribute("data-upload-glow");
+});
+
+it("names an offscreen parent folder in the dashed fallback zone", async () => {
+  view("src", tree());
+  await screen.findByRole("button", { name: "Upload files" });
+  const folder = screen.getByText("assets/").closest("[data-index]");
+  expect(folder).toBeTruthy();
+  folder?.remove();
+  fireEvent.dragOver(screen.getByText("existing.txt"), {
+    dataTransfer: { types: ["Files"] },
+  });
+  expect(screen.getByText("Upload to workspace")).toBeVisible();
+  expect(screen.getByText("to src/assets")).toBeVisible();
+  expect(screen.getByRole("status")).toHaveTextContent("Upload to src/assets");
+  expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(1);
 });
 
 it.each([429, 503])(
@@ -933,7 +970,7 @@ it.each([500, 502, 504, 429, 503, "transport", "generic JSON"])(
     expect(document.querySelector("[data-upload-drop-root]")).toBeTruthy();
     expect(fireEvent.dragOver(row, { dataTransfer: transfer })).toBe(false);
     expect(document.querySelector("[data-upload-hover]")).toBeTruthy();
-    expect(screen.getByText("Upload to src/assets")).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent("Upload to src/assets");
     expect(fireEvent.drop(row, { dataTransfer: transfer })).toBe(false);
     expect(enqueueUploads).toHaveBeenCalledExactlyOnceWith(
       expect.anything(),
