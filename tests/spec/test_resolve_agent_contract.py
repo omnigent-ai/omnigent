@@ -248,7 +248,10 @@ def test_output_outcomes_include_repro_audit_blockers() -> None:
 
 def test_repro_audit_preserves_non_repro_mode_contracts() -> None:
     instructions = _normalized_resolve_instructions()
-    assert "(Resolve: reproduction handoff recovery, fail-before proof" in instructions
+    assert (
+        "Skip the agent's other entry phases (Resolve: reproduction handoff recovery, "
+        "fail-before proof" in instructions
+    )
     assert (
         "the **selected regression check from 2B.4 supplies the fail→pass proof** "
         "for a behavioral bug" in instructions
@@ -343,37 +346,26 @@ def test_resolve_delegates_review_remediation_to_the_shared_skill() -> None:
     assert not (_RESOLVE_AGENT / "skills" / "resolve-inputs" / "review-remediation.md").exists()
 
 
-def test_resolve_agent_bundle_ships_the_shared_review_remediation(tmp_path: Path) -> None:
-    """The linked review-remediation skill reaches the server as regular files."""
+def test_resolve_agent_bundle_ships_the_shared_skills(tmp_path: Path) -> None:
+    """Linked shared skills reach the server as files, with one copy of the review helper."""
     from omnigent.cli import _bundle
     from omnigent.spec.tar_utils import extract_safe
 
-    shared = _RESOLVE_AGENT.parent / "agent-skills" / "otto-review-remediation"
-    assert (_RESOLVE_AGENT / "skills" / "otto-review-remediation").resolve() == shared.resolve()
-
+    shared = _RESOLVE_AGENT.parent / "agent-skills"
     extracted = tmp_path / "bundle"
     extract_safe(_bundle(_RESOLVE_AGENT), extracted)
+    bundled_skills = {skill.name for skill in load(extracted).skills}
 
-    assert "otto-review-remediation" in {skill.name for skill in load(extracted).skills}
-    bundled = extracted / "skills" / "otto-review-remediation" / "SKILL.md"
-    assert not bundled.is_symlink()
-    assert bundled.read_text(encoding="utf-8") == (shared / "SKILL.md").read_text(encoding="utf-8")
-
-
-def test_resolve_agent_bundle_ships_the_shared_review_loop(tmp_path: Path) -> None:
-    """The linked review-loop skill reaches the server as files, with one copy of the helper."""
-    from omnigent.cli import _bundle
-    from omnigent.spec.tar_utils import extract_safe
-
-    shared = _RESOLVE_AGENT.parent / "agent-skills" / "otto-pr-review-loop"
-    assert (_RESOLVE_AGENT / "skills" / "otto-pr-review-loop").resolve() == shared.resolve()
-
-    extracted = tmp_path / "bundle"
-    extract_safe(_bundle(_RESOLVE_AGENT), extracted)
-
-    assert "otto-pr-review-loop" in {skill.name for skill in load(extracted).skills}
-    helper = (shared / "review_cycle.py").read_text(encoding="utf-8")
-    bundled = extracted / "skills" / "otto-pr-review-loop" / "review_cycle.py"
-    assert not bundled.is_symlink()
-    assert bundled.read_text(encoding="utf-8") == helper
+    for name, path in (
+        ("otto-pr-review-loop", "SKILL.md"),
+        ("otto-pr-review-loop", "review_cycle.py"),
+        ("otto-review-remediation", "SKILL.md"),
+    ):
+        assert (_RESOLVE_AGENT / "skills" / name).resolve() == (shared / name).resolve()
+        assert name in bundled_skills
+        bundled = extracted / "skills" / name / path
+        assert not bundled.is_symlink()
+        assert bundled.read_text(encoding="utf-8") == (shared / name / path).read_text(
+            encoding="utf-8"
+        )
     assert not (extracted / "skills" / "resolve-drive-pr" / "review_cycle.py").exists()
