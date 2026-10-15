@@ -1039,6 +1039,31 @@ async def test_overlimit_cleanup_error_preserves_message(
         assert source_closed.is_set()
 
 
+async def test_overlimit_closes_standard_httpx_async_generator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transport_module, "RUNNER_TUNNEL_MAX_MESSAGE_BYTES", 1024)
+    source_closed = asyncio.Event()
+
+    async def body() -> AsyncGenerator[bytes, None]:
+        try:
+            yield b"x" * 2048
+        finally:
+            source_closed.set()
+
+    async with _tunnel([_CAPABILITY]) as (client, _, _):
+        request = client.build_request(
+            "PATCH",
+            "/upload",
+            content=body(),
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        with pytest.raises(httpx.LocalProtocolError, match=r"binary request.*message limit"):
+            await client.send(request)
+
+        assert source_closed.is_set()
+
+
 async def test_overlimit_closes_public_wrapper_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
