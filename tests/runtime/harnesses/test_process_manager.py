@@ -35,6 +35,7 @@ import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
+import httpx
 import pytest
 
 from omnigent.runtime.harnesses import _HARNESS_MODULES
@@ -1315,6 +1316,81 @@ async def test_orphan_sweep_preserves_live_omnigent_dirs(
         assert (sibling_dir / _AP_PID_FILE).exists()
     finally:
         await fresh.shutdown()
+
+
+def _unshare_pid_namespace_available() -> bool:
+    """Whether this host allows an unprivileged user + PID namespace."""
+    if sys.platform != "linux" or shutil.which("unshare") is None:
+        return False
+    import subprocess
+
+    probe = subprocess.run(
+        ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "true"],
+        capture_output=True,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+@pytest.mark.skipif(
+    not _unshare_pid_namespace_available(),
+    reason="needs Linux with unprivileged user + PID namespaces",
+)
+async def test_orphan_sweep_from_another_pid_namespace_keeps_a_live_harness(
+    manager: HarnessProcessManager,
+) -> None:
+    """A sweep that cannot see our PID must not delete a live session's socket.
+
+    Agent sandboxes (e.g. Codex's Linux sandbox) run commands in their own PID
+    namespace with ``/tmp`` writable. A server or test booted there sweeps the
+    shared harness root, sees every live ``AP_PID`` as dead, and deletes each
+    session's socket while its runner and harness keep running.
+    """
+    import subprocess
+
+    await manager.start()
+    try:
+        conversation_id = "conv-live-in-host-ns"
+        client = await manager.get_client(conversation_id, _TEST_HARNESS_NAME)
+        harness_pid = (await client.get("/pid")).json()["pid"]
+
+        sweep = (
+            "import asyncio, pathlib, sys\n"
+            "from omnigent.runtime.harnesses.process_manager import "
+            "sweep_orphaned_harness_processes\n"
+            "asyncio.run(sweep_orphaned_harness_processes(tmp_parent=pathlib.Path(sys.argv[1])))\n"
+        )
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "unshare",
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--mount-proc",
+                sys.executable,
+                "-c",
+                sweep,
+                str(manager.instance_dir.parent),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+        socket_path = manager.socket_path(conversation_id)
+        assert socket_path.exists()
+        # Fresh connection: the cached client's keepalive could otherwise
+        # reuse a socket opened before the sweep ran.
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=str(socket_path)),
+            base_url="http://harness.local",
+        ) as fresh:
+            assert (await fresh.get("/pid")).json()["pid"] == harness_pid
+    finally:
+        await manager.shutdown()
 
 
 @pytest.mark.posix_only
