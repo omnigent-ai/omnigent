@@ -21,6 +21,19 @@ except ImportError:
 # deliberately replaces ambient state; subprocesses inherit the safe override.
 _TEST_OMNIGENT_DATA_DIR = Path(tempfile.mkdtemp(prefix="omnigent-pytest-")).resolve()
 os.environ["OMNIGENT_DATA_DIR"] = str(_TEST_OMNIGENT_DATA_DIR)
+# The user config path is fixed from Path.home() at import, so a test that only
+# redirects $HOME still writes the developer's real ~/.omnigent/config.yaml
+# (an accounts-login test once left `server: http://localhost:8000` there).
+os.environ["OMNIGENT_CONFIG_HOME"] = str(_TEST_OMNIGENT_DATA_DIR / "config-home")
+# A suite started from inside an Omnigent session inherits its runner's
+# identity: tests would log into the live runner's log file and dial its tunnel.
+for _name in list(os.environ):
+    if _name.startswith(("OMNIGENT_RUNNER_", "OMNIGENT_TERMINAL_")) or _name in (
+        "OMNIGENT_PROCESS_LOG_FILE",
+        "OMNIGENT_HARNESS_TMP_PARENT",
+        "OMNIGENT_USER_ID",
+    ):
+        del os.environ[_name]
 
 # Skip the synchronous api.litellm.ai/model_catalog HTTP fallback during
 # tests. Hardened CI runners can't reach the public internet, so every
