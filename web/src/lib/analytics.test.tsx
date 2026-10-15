@@ -262,4 +262,21 @@ describe("useOmnigentPageView", () => {
     expect(analytics).toHaveBeenCalledTimes(2);
     expect(analytics).toHaveBeenLastCalledWith({ type: "page_view", pageId: "chat" });
   });
+
+  it("reports nothing while pageId is null and fires once it is set", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    // A page on a URL that is about to be replaced with its canonical form passes
+    // null first, so the redirect hop doesn't count as a page view of its own.
+    const { rerender } = renderHook(
+      ({ pageId }: { pageId: string | null }) => useOmnigentPageView(pageId),
+      { wrapper: atPath("/settings"), initialProps: { pageId: null as string | null } },
+    );
+    expect(analytics).not.toHaveBeenCalled();
+    rerender({ pageId: "settings.general" });
+    expect(analytics).toHaveBeenCalledExactlyOnceWith({
+      type: "page_view",
+      pageId: "settings.general",
+    });
+  });
 });

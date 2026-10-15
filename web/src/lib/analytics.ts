@@ -43,11 +43,16 @@ import { emitOmnigentAnalytics } from "@/lib/analyticsEmit";
  * `/c/a` → `/c/b`) is still a distinct page view. So a component that stays
  * mounted across such a navigation (ChatPage does) still emits one page view per
  * destination, all under the same `pageId`.
+ *
+ * Pass `null` while there is nothing to report yet — e.g. a URL about to be
+ * replaced with its canonical form — so the view is counted once, at the final
+ * URL, rather than once per hop.
  */
-export function useOmnigentPageView(pageId: string): void {
+export function useOmnigentPageView(pageId: string | null): void {
   const { pathname } = useLocation();
   const lastFired = useRef<string | null>(null);
   useEffect(() => {
+    if (pageId === null) return;
     // Key on pageId + pathname so a mounted page re-emits on a param change but
     // not on unrelated re-renders.
     const key = `${pageId} ${pathname}`;
