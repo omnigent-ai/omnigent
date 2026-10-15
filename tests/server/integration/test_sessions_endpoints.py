@@ -5674,9 +5674,9 @@ _CODEX_MODEL_CARD = {
     "title": "Model unavailable with ChatGPT login",
     "cause": _CODEX_MODEL_DETAIL,
     "remediation": (
-        "Choose a model available to your ChatGPT account using /model in the Codex terminal. "
-        "For a Databricks model, run `omnigent setup` on the host to select a "
-        "Databricks provider for Codex, then start a new session."
+        "Choose a model supported by your ChatGPT account using /model in the Codex terminal. "
+        "To use another provider, configure it for Codex with `omnigent setup` "
+        "on the host, then start a new session."
     ),
 }
 

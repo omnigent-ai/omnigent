@@ -418,7 +418,9 @@ def test_client_update_diagnosis_ignores_unrelated_errors() -> None:
     assert diagnose_client_update_required("") is None
 
 
-@pytest.mark.parametrize("model", ["system.ai.gpt-6-1-sol", "future-model-id"])
+@pytest.mark.parametrize(
+    "model", ["system.ai.gpt-6-1-sol", "openai/example-model", "future-model-id"]
+)
 def test_codex_model_rejection_explains_how_to_fix_configuration(model: str) -> None:
     message = f"The '{model}' model is not supported when using Codex with a ChatGPT account."
     diagnosis = diagnose_codex_model_rejection(message)
@@ -428,7 +430,7 @@ def test_codex_model_rejection_explains_how_to_fix_configuration(model: str) -> 
     assert diagnosis.cause == message
     assert diagnosis.remediation is not None
     assert "/model in the Codex terminal" in diagnosis.remediation
-    assert "Databricks provider for Codex" in diagnosis.remediation
+    assert "another provider, configure it for Codex" in diagnosis.remediation
     assert "start a new session" in diagnosis.remediation
     assert diagnosis.category is ErrorCategory.CONFIG
     assert classify_native_turn_error("codex_turn_error", message) == "codex_turn_error"
