@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -433,7 +434,11 @@ def test_distinct_messages_with_identical_usage_are_not_collapsed(
     _run_extension_script(node, extension_path, script)
 
 
-def test_usage_baseline_survives_native_restart() -> None:
+@pytest.mark.parametrize(
+    "baseline_source",
+    ["local", "server", "matching-local", "stale-local", "corrupt-local", "unreported-local"],
+)
+def test_usage_baseline_survives_native_restart(baseline_source: str) -> None:
     """A relaunched Pi process restarts its cumulative counters at 0, so its first
     flush falls below the server peak and is clamped; assert the baseline advances.
     """
@@ -474,6 +479,7 @@ fs.writeFileSync(
 );
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
+const baselineSource = __BASELINE_SOURCE__;
 const postedEvents = [];
 global.fetch = async (_url, request) => {
   postedEvents.push(JSON.parse(request.body));
@@ -527,8 +533,24 @@ function launchExtension() {
   assert.equal(beforeRestart[0].data.cumulative_input_tokens, 150000);
   assert.equal(beforeRestart[0].data.cumulative_output_tokens, 30000);
 
-  // Relaunch: a brand-new process restores and re-asserts the baseline on
-  // session_start, then reports one short post-restart turn.
+  const statePath = path.join(bridgeDir, "cumulative_usage.json");
+  if (baselineSource !== "local") {
+    const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    cfg.usageBaseline = { ...beforeRestart[0].data };
+    delete cfg.usageBaseline.model;
+    if (baselineSource === "unreported-local") {
+      cfg.usageBaseline.cumulative_input_tokens = 100000;
+      cfg.usageBaseline.cumulative_output_tokens = 20000;
+    }
+    fs.writeFileSync(configPath, JSON.stringify(cfg));
+    if (baselineSource === "server") fs.unlinkSync(statePath);
+    if (baselineSource === "corrupt-local") fs.writeFileSync(statePath, "{bad-json");
+    if (baselineSource === "stale-local") {
+      fs.writeFileSync(statePath, JSON.stringify({cumulative_input_tokens: 100000}));
+    }
+  }
+
+  // A fresh extension must combine server and local state without re-billing either.
   postedEvents.length = 0;
   const second = launchExtension();
   await second.session_start({}, ctx);
@@ -545,12 +567,12 @@ function launchExtension() {
   );
 
   const afterRestart = usageEvents();
-  // session_start re-asserts the restored baseline (so an idle resume or a
-  // failed pre-exit flush still reaches the server), then the new turn advances
-  // it: two posts, the first re-asserting 150000/30000.
-  assert.equal(afterRestart.length, 2, JSON.stringify(postedEvents));
-  assert.equal(afterRestart[0].data.cumulative_input_tokens, 150000, JSON.stringify(postedEvents));
-  assert.equal(afterRestart[0].data.cumulative_output_tokens, 30000, JSON.stringify(postedEvents));
+  const reasserts = baselineSource === "local" || baselineSource === "unreported-local";
+  assert.equal(afterRestart.length, reasserts ? 2 : 1, JSON.stringify(postedEvents));
+  if (reasserts) {
+    assert.equal(afterRestart[0].data.cumulative_input_tokens, 150000);
+    assert.equal(afterRestart[0].data.cumulative_output_tokens, 30000);
+  }
   const data = afterRestart[afterRestart.length - 1].data;
   // Totals must advance from the restored baseline: 150000 + 900 / 30000 + 250.
   assert.equal(data.cumulative_input_tokens, 150900, JSON.stringify(data));
@@ -560,7 +582,9 @@ function launchExtension() {
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
 });"""
-    _run_extension_script(node, extension_path, script)
+    _run_extension_script(
+        node, extension_path, script.replace("__BASELINE_SOURCE__", json.dumps(baseline_source))
+    )
 
 
 def test_session_start_readiness_not_blocked_by_hung_usage_post() -> None:

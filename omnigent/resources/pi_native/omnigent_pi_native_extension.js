@@ -1745,15 +1745,7 @@ module.exports = function (pi) {
     }
   }
 
-  function restoreCumulativeUsage() {
-    const statePath = usageStatePath();
-    if (!statePath) return;
-    let saved;
-    try {
-      saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    } catch (_err) {
-      return; // Fresh session or unreadable state: start the counters at 0.
-    }
+  function raiseUsageTotals(saved) {
     if (!saved || typeof saved !== "object") return;
     const input = toInt(saved.cumulative_input_tokens);
     const output = toInt(saved.cumulative_output_tokens);
@@ -1764,9 +1756,26 @@ module.exports = function (pi) {
     if (cacheRead > cumulativeCacheReadTokens) cumulativeCacheReadTokens = cacheRead;
     if (!usageModel && typeof saved.model === "string" && saved.model)
       usageModel = saved.model;
-    // Leave lastPostedUsageKey empty so session_start re-asserts this baseline:
-    // a failed pre-exit flush can leave the server behind, and re-posting an
-    // already-recorded total is a no-op under the server's grow-only clamp.
+  }
+
+  function restoreCumulativeUsage() {
+    const baseline = config && config.usageBaseline;
+    raiseUsageTotals(baseline);
+    const statePath = usageStatePath();
+    if (statePath) {
+      try {
+        raiseUsageTotals(JSON.parse(fs.readFileSync(statePath, "utf8")));
+      } catch (_err) {}
+    }
+    // The server already holds this baseline. Only reassert a newer local total.
+    if (
+      baseline &&
+      cumulativeInputTokens === toInt(baseline.cumulative_input_tokens) &&
+      cumulativeOutputTokens === toInt(baseline.cumulative_output_tokens) &&
+      cumulativeCacheReadTokens === toInt(baseline.cumulative_cache_read_input_tokens)
+    ) {
+      lastPostedUsageKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
+    }
   }
 
   function rememberContext(ctx) {
