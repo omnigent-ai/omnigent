@@ -192,9 +192,11 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`
 - **`model-picker`, `effort-picker`, refused change:** the rollback cases in
   `web/src/store/chatStore.test.ts` and the composer case in
-  `web/src/pages/ChatPage.composer.test.tsx` (`pnpm --dir web test`). Manually,
-  pick another effort in a Codex session right after Start session, while the
-  terminal is still starting: the pill keeps the previous effort.
+  `web/src/pages/ChatPage.composer.test.tsx` (`pnpm --dir web test`). A pick
+  during Codex startup waits for the terminal, then applies. If startup does
+  not become ready within the recovery budget, the pill keeps the previous
+  selection; server/runner coverage is in
+  `tests/server/integration/test_codex_model_change_after_idle_reap.py`.
 - **`effort-terminal-mirror`:**
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_codex_terminal_effort_change_reaches_composer`,
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`

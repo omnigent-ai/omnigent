@@ -38,6 +38,8 @@ the header menu), and each place is a separate entry point.
   it; the state survives a reload.
 - `project`: Add to project (Move session once filed) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
+- `project-rename`: the project menu opens a dialog with the name selected;
+  typing replaces it without losing characters as the menu closes.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
@@ -104,6 +106,9 @@ the header menu), and each place is a separate entry point.
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, add to project (or move
 session), archive or unarchive, and delete.
+
+**Project folder:** right-click its header or open its three-dot menu, then
+choose Rename project. Start typing as soon as the dialog opens.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -313,6 +318,9 @@ plain `uv run pytest`, which starts a private server for the test.
   regroup under that project.
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
+- **`project-rename`, project header right-click and three-dot menus:**
+  `tests/e2e_ui/sessions/test_project_rename_dialog_focus.py::test_rename_dialog_preselects_name_so_typing_replaces`
+  covers typing across the menu's exit animation from both menus.
 - **`fork`, message cutoff:**
   `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_fork_from_middle_truncates_history`,
   plus agent switching (own environment):
