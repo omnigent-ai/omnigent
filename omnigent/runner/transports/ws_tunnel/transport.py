@@ -199,39 +199,31 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                 stream=True,
             )
             if use_binary:
+                stream = request.stream
+                assert isinstance(stream, httpx.AsyncByteStream)
                 try:
-                    stream = request.stream
-                    assert isinstance(stream, httpx.AsyncByteStream)
                     iterator = stream.__aiter__()
-                    # Close HTTPX's wrapped source directly when it is closeable.
-                    source = getattr(stream, "_stream", None)
-                    if source is not None and callable(getattr(source, "aclose", None)):
-                        close_target = source
-                    elif callable(getattr(iterator, "aclose", None)):
-                        close_target = iterator
-                    else:
-                        close_target = stream
+                    wire_buffer = bytearray(encode_binary_request(frame, b""))
+                    body_budget = RUNNER_TUNNEL_MAX_MESSAGE_BYTES - len(wire_buffer)
+                    body_size = 0
+                    async for chunk in iterator:
+                        if body_size + len(chunk) > body_budget:
+                            raise httpx.LocalProtocolError(
+                                "binary request exceeds tunnel message limit",
+                                request=request,
+                            )
+                        wire_buffer.extend(chunk)
+                        body_size += len(chunk)
+                    wire = bytes(wire_buffer)
+                    del wire_buffer
+                except BaseException as error:
                     try:
-                        wire_buffer = bytearray(encode_binary_request(frame, b""))
-                        body_budget = RUNNER_TUNNEL_MAX_MESSAGE_BYTES - len(wire_buffer)
-                        body_size = 0
-                        async for chunk in iterator:
-                            if body_size + len(chunk) > body_budget:
-                                raise ValueError("binary request exceeds tunnel message limit")
-                            wire_buffer.extend(chunk)
-                            body_size += len(chunk)
-                        wire = bytes(wire_buffer)
-                        del wire_buffer
-                    except BaseException as error:
-                        try:
-                            await _aclose_if_available(close_target)
-                        except BaseException as cleanup_error:
-                            raise error from cleanup_error
-                        raise
-                    else:
-                        await _aclose_if_available(close_target)
-                except ValueError as exc:
-                    raise httpx.LocalProtocolError(str(exc), request=request) from exc
+                        await _aclose_if_available(stream)
+                    except BaseException as cleanup_error:
+                        raise error from cleanup_error
+                    raise
+                else:
+                    await _aclose_if_available(stream)
             else:
                 body = await request.aread()
                 content_type = request.headers.get("content-type", "application/json")
