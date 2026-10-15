@@ -1137,3 +1137,221 @@ async def test_invalid_create_key_is_rejected_before_runner(scenario, key: str):
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request"
     assert not any(request.method == "POST" for request in scenario.requests)
+
+
+async def test_pending_create_key_waits_without_another_admission(scenario, monkeypatch):
+    scenario.hard["max_open_uploads"] = 1
+    key = "a" * 32
+    uid = uuid.uuid4().hex
+    entered = asyncio.Event()
+    duplicate_ready = asyncio.Event()
+    release = asyncio.Event()
+    posts = 0
+    capability_calls = 0
+    limits = uploads._limits
+
+    def tracked_limits(*args, **kwargs):
+        nonlocal capability_calls
+        result = limits(*args, **kwargs)
+        capability_calls += 1
+        if capability_calls == 2:
+            duplicate_ready.set()
+        return result
+
+    monkeypatch.setattr(uploads, "_limits", tracked_limits)
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        if request.method == "GET":
+            return await scenario.handle(request)
+        posts += 1
+        entered.set()
+        await release.wait()
+        return httpx.Response(
+            201,
+            json={
+                "upload_id": uid,
+                "offset": 0,
+                "chunk_bytes": 1024**2,
+                "expires_at": time.time() + 3600,
+            },
+        )
+
+    async def create(name: str = "payload.bin") -> httpx.Response:
+        return await scenario.client.post(
+            scenario.base,
+            json={"dir": "", "name": name, "size": 3},
+            headers={"Idempotency-Key": key},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://runner"
+    ) as runner:
+        scenario.routing._clients["binary-test"] = runner
+        first = asyncio.create_task(create())
+        await asyncio.wait_for(entered.wait(), 5)
+        duplicate = asyncio.create_task(create())
+        try:
+            await asyncio.wait_for(duplicate_ready.wait(), 5)
+            changed = await asyncio.wait_for(create("different.bin"), 5)
+            assert changed.status_code == 422
+            assert changed.json()["error"]["code"] == "idempotency_key_conflict"
+            assert not duplicate.done()
+        finally:
+            release.set()
+        first_result, duplicate_result = await asyncio.wait_for(
+            asyncio.gather(first, duplicate), 5
+        )
+        assert first_result.status_code == duplicate_result.status_code == 201
+        assert first_result.json()["upload_id"] == duplicate_result.json()["upload_id"] == uid
+        assert posts == 1
+
+
+async def test_failed_pending_create_key_wakes_waiters_and_clears_reservation(scenario):
+    scenario.hard["max_open_uploads"] = 1
+    key = "a" * 32
+    uid = uuid.uuid4().hex
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    posts = 0
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        if request.method == "GET":
+            return await scenario.handle(request)
+        posts += 1
+        if posts == 1:
+            entered.set()
+            await release.wait()
+            raise httpx.ReadTimeout("runner acknowledgement lost")
+        return httpx.Response(
+            201,
+            json={
+                "upload_id": uid,
+                "offset": 0,
+                "chunk_bytes": 1024**2,
+                "expires_at": time.time() + 3600,
+            },
+        )
+
+    async def create() -> httpx.Response:
+        return await scenario.client.post(
+            scenario.base,
+            json={"dir": "", "name": "payload.bin", "size": 3},
+            headers={"Idempotency-Key": key},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://runner"
+    ) as runner:
+        scenario.routing._clients["binary-test"] = runner
+        first = asyncio.create_task(create())
+        await asyncio.wait_for(entered.wait(), 5)
+        duplicate = asyncio.create_task(create())
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(duplicate), 0.2)
+        finally:
+            release.set()
+        first_result, duplicate_result = await asyncio.wait_for(
+            asyncio.gather(first, duplicate), 5
+        )
+        assert first_result.status_code == 504
+        assert duplicate_result.status_code in {502, 504}
+        assert posts == 1
+        retry = await create()
+        assert retry.status_code == 201
+        assert retry.json()["upload_id"] == uid
+        assert posts == 2
+
+
+async def test_finished_create_key_replay_does_not_reopen_admission(scenario):
+    scenario.hard["max_open_uploads"] = 1
+    ids = {"a" * 32: uuid.uuid4().hex, "b" * 32: uuid.uuid4().hex}
+    creates: dict[str, int] = {}
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return await scenario.handle(request)
+        if request.url.path.endswith("/complete"):
+            return await scenario.handle(request)
+        key = request.headers["Idempotency-Key"]
+        creates[key] = creates.get(key, 0) + 1
+        return httpx.Response(
+            201,
+            json={
+                "upload_id": ids[key],
+                "offset": 3 if creates[key] > 1 else 0,
+                "chunk_bytes": 1024**2,
+                "expires_at": time.time() + 3600,
+            },
+        )
+
+    async def create(key: str) -> httpx.Response:
+        return await scenario.client.post(
+            scenario.base,
+            json={"dir": "", "name": "payload.bin", "size": 3},
+            headers={"Idempotency-Key": key},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://runner"
+    ) as runner:
+        scenario.routing._clients["binary-test"] = runner
+        first = await create("a" * 32)
+        assert first.status_code == 201
+        completed = await scenario.client.post(scenario.base + "/" + ids["a" * 32] + "/complete")
+        assert completed.status_code == 200
+        replay = await create("a" * 32)
+        assert replay.status_code == 201
+        assert replay.json()["upload_id"] == ids["a" * 32]
+        assert replay.json()["offset"] == 3
+        other = await create("b" * 32)
+        assert other.status_code == 201
+        assert other.json()["upload_id"] == ids["b" * 32]
+
+
+async def test_create_key_runner_id_change_retires_stale_admission(scenario):
+    scenario.hard["max_open_uploads"] = 1
+    ids = [uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex]
+    posts = 0
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        if request.method in ("GET", "HEAD", "DELETE"):
+            return await scenario.handle(request)
+        posts += 1
+        return httpx.Response(
+            201,
+            json={
+                "upload_id": ids[posts - 1],
+                "offset": 0,
+                "chunk_bytes": 1024**2,
+                "expires_at": time.time() + 3600,
+            },
+        )
+
+    async def create(key: str) -> httpx.Response:
+        return await scenario.client.post(
+            scenario.base,
+            json={"dir": "", "name": "payload.bin", "size": 3},
+            headers={"Idempotency-Key": key},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://runner"
+    ) as runner:
+        scenario.routing._clients["binary-test"] = runner
+        first = await create("a" * 32)
+        replay = await create("a" * 32)
+        assert first.status_code == replay.status_code == 201
+        assert first.json()["upload_id"] == ids[0]
+        assert replay.json()["upload_id"] == ids[1]
+        old = await scenario.client.head(scenario.base + "/" + ids[0])
+        assert old.status_code == 404
+        current = await scenario.client.head(scenario.base + "/" + ids[1])
+        assert current.status_code == 200
+        assert (await scenario.client.delete(scenario.base + "/" + ids[1])).status_code == 204
+        other = await create("b" * 32)
+        assert other.status_code == 201
+        assert other.json()["upload_id"] == ids[2]
