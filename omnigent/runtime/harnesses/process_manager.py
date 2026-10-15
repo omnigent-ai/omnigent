@@ -43,6 +43,7 @@ from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
+from omnigent.native.owner_claim import owner_is_gone, read_owner_claim, write_owner_claim
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
@@ -53,11 +54,6 @@ from omnigent.runtime.harnesses.paths import (
     HARNESS_TMP_PARENT_ENV_VAR,
     harness_tmp_parent,
 )
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows has no flock.
-    fcntl = None  # type: ignore[assignment]
 
 _logger = logging.getLogger(__name__)
 
@@ -91,11 +87,8 @@ _HARNESS_AUTH_TOKEN_ENV = "OMNIGENT_HARNESS_AUTH_TOKEN"
 # Sentinel file the Omnigent instance writes into its subdir on boot. The
 # orphan sweep uses it to tell whether a sibling subdir belongs to
 # a still-running Omnigent (leave alone) or a crashed one (kill its
-# children, remove the dir).
+# children, remove the dir). Holds an owner claim; older builds wrote a bare PID.
 _AP_PID_FILE = "AP_PID"
-# Lock file a live instance holds an exclusive flock on. Unlike AP_PID, the
-# lock is visible to a sweeper in another PID namespace (e.g. an agent sandbox).
-_AP_LOCK_FILE = "AP_LOCK"
 
 # Mode bits applied to the per-AP subdir and the per-conversation
 # socket. Filesystem permissions + the per-AP-uuid scope are the v1
@@ -617,8 +610,6 @@ class HarnessProcessManager:
         # their per-conv locks).
         self._registry_lock = asyncio.Lock()
         self._reaper_task: asyncio.Task[None] | None = None
-        # Fd holding the instance-dir flock while started (None on Windows).
-        self._instance_lock_fd: int | None = None
         self._started = False
         # Set at the start of ``shutdown`` so an in-flight cold spawn
         # cannot register a live process after teardown begins.
@@ -697,15 +688,10 @@ class HarnessProcessManager:
             # whose dir uuid happens to collide with ours gets cleaned first.
             await sweep_orphaned_harness_processes(tmp_parent=self._tmp_parent)
         self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        # Lock before writing AP_PID so a sweep never sees a new-style
-        # sentinel without the lock that marks this dir live.
-        self._instance_lock_fd = _hold_instance_lock(self._instance_dir)
-        # Write the AP_PID sentinel so other instances' sweeps can
-        # tell our dir is live. Strict ``"x"`` because the dir is
-        # exclusively ours; a pre-existing sentinel would mean the
-        # uuid collided with a still-running instance — fail loud.
-        sentinel = self._instance_dir / _AP_PID_FILE
-        sentinel.write_text(str(os.getpid()), encoding="utf-8")
+        # Write the AP_PID sentinel so other instances' sweeps can tell our
+        # dir is live. The PID-namespace-qualified claim keeps a sweep that
+        # cannot see our PID (e.g. inside an agent sandbox) from deleting it.
+        write_owner_claim(self._instance_dir, filename=_AP_PID_FILE)
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -1210,9 +1196,6 @@ class HarnessProcessManager:
         # rmtree leaves it behind; the next Omnigent boot's orphan
         # sweep handles it.
         shutil.rmtree(self._instance_dir, ignore_errors=True)
-        if self._instance_lock_fd is not None:
-            os.close(self._instance_lock_fd)
-            self._instance_lock_fd = None
         self._started = False
 
     async def _get_spawn_lock(self, conversation_id: str) -> asyncio.Lock:
@@ -1629,72 +1612,32 @@ async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) ->
                 exc,
             )
             continue
-        try:
-            pid = int(sentinel.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError) as exc:
-            _logger.warning(
-                "could not read AP_PID sentinel at %s: %s; skipping",
-                sentinel,
-                exc,
-            )
-            continue
-        lock_held = _instance_lock_held(child)
-        if lock_held:
-            continue
-        # No lock file: an instance from a build that predates the lock.
-        if lock_held is None and _pid_alive(pid):
-            continue
+        claim = read_owner_claim(child, filename=_AP_PID_FILE)
+        if claim is not None:
+            # Only a sweeper in the owner's boot and PID namespace can judge it.
+            if not owner_is_gone(claim, process_alive=_pid_alive):
+                continue
+            pid = claim.pid
+        else:
+            # A bare PID from a build that predates owner claims.
+            try:
+                pid = int(sentinel.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError) as exc:
+                _logger.warning(
+                    "could not read AP_PID sentinel at %s: %s; skipping",
+                    sentinel,
+                    exc,
+                )
+                continue
+            if _pid_alive(pid):
+                continue
         _logger.info(
-            "sweeping orphaned Omnigent instance dir %s (owner pid %d gone)",
+            "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
             child,
             pid,
         )
         await _kill_orphan_runners(child)
         shutil.rmtree(child, ignore_errors=True)
-
-
-def _hold_instance_lock(instance_dir: Path) -> int | None:
-    """Take the instance-dir flock that marks *instance_dir* live.
-
-    The kernel drops the lock when the holder exits, so the sweep can tell a
-    live instance from a dead one even when it cannot see the holder's PID.
-
-    :param instance_dir: This instance's directory.
-    :returns: The fd holding the lock, or ``None`` where flock is unavailable.
-    """
-    if fcntl is None:
-        return None
-    fd = os.open(instance_dir / _AP_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
-        raise
-    return fd
-
-
-def _instance_lock_held(instance_dir: Path) -> bool | None:
-    """Report whether a live instance holds *instance_dir*'s lock.
-
-    :param instance_dir: A sibling instance directory found by the sweep.
-    :returns: ``True`` if held (or unknowable, to stay conservative), ``False``
-        if the owner is gone, ``None`` if the dir has no lock file.
-    """
-    if fcntl is None:
-        return None
-    try:
-        fd = os.open(instance_dir / _AP_LOCK_FILE, os.O_RDWR)
-    except FileNotFoundError:
-        return None
-    except OSError:
-        return True
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return True
-    finally:
-        os.close(fd)
-    return False
 
 
 async def _kill_orphan_runners(instance_dir: Path) -> None:

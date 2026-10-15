@@ -38,10 +38,10 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.native.owner_claim import current_pid_namespace, read_owner_claim, write_owner_claim
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
 from omnigent.runtime.harnesses.process_manager import (
-    _AP_LOCK_FILE,
     _AP_PID_FILE,
     _TMP_PARENT_ENV_VAR,
     HarnessProcessManager,
@@ -160,9 +160,12 @@ async def test_start_creates_instance_dir_with_sentinel(
         assert manager.instance_dir.is_dir()
         sentinel = manager.instance_dir / _AP_PID_FILE
         assert sentinel.exists()
-        # The recorded PID is this process — proves the sweep on
-        # a sibling Omnigent boot would correctly identify us as alive.
-        assert sentinel.read_text(encoding="utf-8").strip() == str(os.getpid())
+        # The recorded owner is this process in this PID namespace — proves the
+        # sweep on a sibling Omnigent boot would correctly identify us as alive.
+        claim = read_owner_claim(manager.instance_dir, filename=_AP_PID_FILE)
+        assert claim is not None
+        assert claim.pid == os.getpid()
+        assert claim.pid_ns == current_pid_namespace()
     finally:
         await manager.shutdown()
 
@@ -1292,20 +1295,25 @@ async def test_orphan_sweep_removes_dead_omnigent_dirs(
         await fresh.shutdown()
 
 
-@pytest.mark.posix_only
-async def test_orphan_sweep_removes_unlocked_dir_even_if_its_pid_was_reused(
+@pytest.mark.parametrize("owner_namespace", ["ours", "foreign"])
+async def test_orphan_sweep_judges_a_dead_looking_owner_only_from_its_namespace(
     short_tmp_parent: Path,
+    owner_namespace: str,
 ) -> None:
-    """An unheld instance lock means the owner is gone, whatever its PID now names."""
-    stale_dir = short_tmp_parent / "ap-reusedpid"
-    stale_dir.mkdir(mode=0o700)
-    (stale_dir / _AP_LOCK_FILE).touch()
-    # The dead owner's PID now belongs to an unrelated live process.
-    (stale_dir / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+    """Only a sweeper in the owner's PID namespace may conclude the owner is gone."""
+    claimed_dir = short_tmp_parent / "ap-claimed"
+    claimed_dir.mkdir(mode=0o700)
+    write_owner_claim(claimed_dir, filename=_AP_PID_FILE)
+    sentinel = claimed_dir / _AP_PID_FILE
+    lines = ["99999999", *sentinel.read_text(encoding="utf-8").splitlines()[1:]]
+    if owner_namespace == "foreign":
+        # How a live owner looks to a sweeper inside an agent sandbox.
+        lines = ["pid_ns=pid:[1]" if line.startswith("pid_ns=") else line for line in lines]
+    sentinel.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     await sweep_orphaned_harness_processes(tmp_parent=short_tmp_parent)
 
-    assert not stale_dir.exists()
+    assert claimed_dir.exists() is (owner_namespace == "foreign")
 
 
 async def test_orphan_sweep_preserves_live_omnigent_dirs(
@@ -1349,10 +1357,6 @@ def _unshare_pid_namespace_available() -> bool:
     return probe.returncode == 0
 
 
-@pytest.mark.skipif(
-    not _unshare_pid_namespace_available(),
-    reason="needs Linux with unprivileged user + PID namespaces",
-)
 async def test_orphan_sweep_from_another_pid_namespace_keeps_a_live_harness(
     manager: HarnessProcessManager,
 ) -> None:
@@ -1365,6 +1369,8 @@ async def test_orphan_sweep_from_another_pid_namespace_keeps_a_live_harness(
     """
     import subprocess
 
+    if not _unshare_pid_namespace_available():
+        pytest.skip("needs Linux with unprivileged user + PID namespaces")
     await manager.start()
     try:
         conversation_id = "conv-live-in-host-ns"
