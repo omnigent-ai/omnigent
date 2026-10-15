@@ -168,6 +168,8 @@ class UploadHelperClient(_HelperProcessClient):
                 credential_proxy=None,
                 egress_relay_port=None,
                 egress_socket_path=None,
+                git_ssh=None,
+                git_ssh_socket_path=None,
             ),
             egress_rules=None,
             egress_allow_private_destinations=False,
