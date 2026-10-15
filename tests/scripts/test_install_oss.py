@@ -15,6 +15,7 @@ package-manager probe is driven by putting fake executables on ``PATH``.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shlex
 import shutil
@@ -336,7 +337,8 @@ def test_check_bubblewrap_missing_no_pkg_manager_warns_generically(
         ("", "omnigent[databricks]"),
         ("--version 1.2.3", "omnigent[databricks]==1.2.3"),
         ("--repo https://github.com/o/r", "omnigent[databricks] @ git+https://github.com/o/r"),
-        ("--extra databricks", "omnigent[databricks,databricks]"),
+        ("--extra databricks", "omnigent[databricks]"),
+        ("--extra foo,databricks", "omnigent[foo,databricks]"),
         ("--extra foo,bar --extra baz", "omnigent[databricks,foo,bar,baz]"),
         ("--no-databricks", "omnigent"),
         ("--no-databricks --extra antigravity", "omnigent[antigravity]"),
@@ -368,7 +370,11 @@ def test_install_target_selects_extras(lib: Path, args: str, target: str) -> Non
 
 _CLI_COMMANDS = """
 uname() { case "$1" in -s) echo Linux;; -m) echo x86_64;; esac; }
-uv() { [ "$1 $2" = 'python find' ]; printf '%s\\n' "$TEST_PYTHON"; }
+uv() { [ "$1 $2" = 'python find' ] || return 1; printf '%s\\n' "$TEST_PYTHON"; }
+DATABRICKS_CLI_SHA256_LINUX_AMD64="$TEST_ARCHIVE_SHA256"
+DATABRICKS_CLI_SHA256_LINUX_ARM64="$TEST_ARCHIVE_SHA256"
+DATABRICKS_CLI_SHA256_DARWIN_AMD64="$TEST_ARCHIVE_SHA256"
+DATABRICKS_CLI_SHA256_DARWIN_ARM64="$TEST_ARCHIVE_SHA256"
 curl() {
     printf '%s\\n' "$@" > "$TEST_CURL_LOG"
     cp "$TEST_ARCHIVE" "$4"
@@ -397,6 +403,8 @@ def databricks_env(tmp_path: Path) -> dict[str, str]:
         "TMPDIR": str(scratch),
         "TEST_PYTHON": sys.executable,
         "TEST_ARCHIVE": str(archive),
+        "TEST_ARCHIVE_SHA256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        "TEST_EXECUTED": str(tmp_path / "executed"),
         "TEST_BIN_DIR": str(bindir),
         "TEST_CURL_LOG": str(tmp_path / "curl.log"),
         "TEST_LEDGER": str(tmp_path / "ledger.log"),
@@ -460,22 +468,30 @@ def test_existing_databricks_cli_is_checked_without_replacement(
     assert (r.returncode == 0) == usable, r.stderr
     if not usable:
         assert "cannot run auth login" in r.stderr
+        assert "--no-databricks" in r.stderr
     assert existing.read_text() == contents
     assert not Path(databricks_env["TEST_CURL_LOG"]).exists()
 
 
-@pytest.mark.parametrize("failure", ["download", "archive", "auth"])
+@pytest.mark.parametrize("failure", ["download", "checksum", "archive", "auth"])
 def test_databricks_install_failure_does_not_publish_binary(
     lib: Path, databricks_env: dict[str, str], failure: str
 ) -> None:
     fault = ""
     if failure == "download":
         fault = "curl() { return 22; }"
+    elif failure == "checksum":
+        with zipfile.ZipFile(databricks_env["TEST_ARCHIVE"], "w") as release:
+            release.writestr("databricks", '#!/bin/sh\nprintf ran > "$TEST_EXECUTED"\n')
     elif failure == "archive":
         Path(databricks_env["TEST_ARCHIVE"]).write_bytes(b"incomplete download")
     else:
         with zipfile.ZipFile(databricks_env["TEST_ARCHIVE"], "w") as release:
             release.writestr("databricks", "#!/bin/sh\nexit 1\n")
+    if failure in {"archive", "auth"}:
+        databricks_env["TEST_ARCHIVE_SHA256"] = hashlib.sha256(
+            Path(databricks_env["TEST_ARCHIVE"]).read_bytes()
+        ).hexdigest()
     r = run(
         lib,
         _CLI_COMMANDS + f'\n{fault}\nensure_databricks_cli "$TEST_BIN_DIR"',
@@ -483,6 +499,9 @@ def test_databricks_install_failure_does_not_publish_binary(
     )
     assert r.returncode != 0
     assert "Databricks CLI installation failed" in r.stderr
+    if failure == "checksum":
+        assert "checksum mismatch" in r.stderr
+        assert not Path(databricks_env["TEST_EXECUTED"]).exists()
     assert not (Path(databricks_env["TEST_BIN_DIR"]) / "databricks").exists()
     assert list(Path(databricks_env["TMPDIR"]).iterdir()) == []
 
