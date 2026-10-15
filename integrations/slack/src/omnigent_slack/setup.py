@@ -6,19 +6,19 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from slack_bolt.async_app import AsyncApp
-
-from omnigent_slack.auth_manager import AuthManager, pack_user_key, slack_client_id
-from omnigent_slack.events import host_id_of
-from omnigent_slack.models import UserConfig
-from omnigent_slack.oauth import DeviceGrantUnavailableError, OAuthError
-from omnigent_slack.omnigent import (
+from omnigent_bot_core.events import host_id_of
+from omnigent_bot_core.oauth import DeviceGrantUnavailableError, OAuthError
+from omnigent_bot_core.omnigent import (
     AuthRequiredError,
     OmnigentClient,
     OmnigentClientPool,
     OmnigentError,
     ValidatedServer,
 )
+from slack_bolt.async_app import AsyncApp
+
+from omnigent_slack.auth_manager import AuthManager, pack_user_key, slack_client_id
+from omnigent_slack.models import UserConfig
 from omnigent_slack.store import SQLiteStore
 from omnigent_slack.text import truncate_option
 
