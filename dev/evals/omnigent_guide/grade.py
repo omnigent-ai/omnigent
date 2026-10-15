@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
@@ -16,6 +17,8 @@ from omnigent.runtime.harnesses._executor_adapter import (
     _strip_mcp_tool_prefix,
 )
 from omnigent.spec.framework_skills import FRAMEWORK_SKILL_NAMES
+
+_JUDGE_ATTEMPTS = 5
 
 # Harnesses without a skill tool (codex, pi) read the SKILL.md file directly.
 _SKILL_FILE_RE = re.compile(r"skills/([A-Za-z0-9][\w.-]*)/SKILL\.md")
@@ -256,7 +259,9 @@ class OpenAIJudge:
         message = (
             f"Question:\n{prompt}\n\nAnswer:\n{answer or '(no answer)'}\n\nCriteria:\n{listed}"
         )
-        for _attempt in range(2):
+        for attempt in range(_JUDGE_ATTEMPTS):
+            if attempt:
+                time.sleep(min(2**attempt, 30))  # gateway rate limits clear within seconds
             try:
                 reply = self._client.chat.completions.create(
                     model=self._model,

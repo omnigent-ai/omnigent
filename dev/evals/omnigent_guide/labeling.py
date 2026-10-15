@@ -97,7 +97,8 @@ def write_blind_sample(
             for line in (run.record.answer or "(no answer)").splitlines()
         ]
         md += ["", "**Criteria:**", ""]
-        for crit in case.criteria:
+        # The run's own criteria: only those that hold for its build's version.
+        for crit in run.criteria:
             md.append(f"- `{crit.id}`: {crit.text}")
             rows.append([item, crit.id, crit.text, ""])
         rows.append(

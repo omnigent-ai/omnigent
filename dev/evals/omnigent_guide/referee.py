@@ -156,6 +156,7 @@ class Surface:
     repo_paths: frozenset[str]
     config_set_keys: frozenset[str] = frozenset()
     spec_root_keys: frozenset[str] = frozenset()
+    string_literals: frozenset[str] = frozenset()
 
     @classmethod
     def probe(cls, python: Path, *, source: Path) -> Surface:
@@ -175,7 +176,8 @@ class Surface:
             tools=frozenset(facts["tools"]),
             spec_builtins=frozenset(facts["spec_builtins"]),
             harnesses=frozenset(facts["harnesses"]),
-            env_vars=frozenset(facts["env_vars"]),
+            env_vars=frozenset(facts["env_vars"]) | _deploy_env_vars(source, files),
+            string_literals=frozenset(facts.get("string_literals", ())),
             repo_paths=frozenset(files),
             config_set_keys=frozenset(facts.get("config_set_keys", ())),
             spec_root_keys=frozenset(facts["spec_root_keys"]),
@@ -190,6 +192,7 @@ class Surface:
             "spec_builtins": sorted(self.spec_builtins),
             "harnesses": sorted(self.harnesses),
             "env_vars": sorted(self.env_vars),
+            "string_literals": sorted(self.string_literals),
             "repo_paths": sorted(self.repo_paths),
             "config_set_keys": sorted(self.config_set_keys),
             "spec_root_keys": sorted(self.spec_root_keys),
@@ -204,6 +207,7 @@ class Surface:
             spec_builtins=frozenset(raw["spec_builtins"]),
             harnesses=frozenset(raw["harnesses"]),
             env_vars=frozenset(raw["env_vars"]),
+            string_literals=frozenset(raw.get("string_literals", ())),
             repo_paths=frozenset(raw["repo_paths"]),
             config_set_keys=frozenset(raw.get("config_set_keys", ())),
             spec_root_keys=frozenset(raw.get("spec_root_keys", ())),
@@ -547,9 +551,20 @@ class Referee:
                 if span.startswith("omnigent."):
                     pyrefs.append((index, span))
                     continue
-                if span.split(".", 1)[0] in USER_CONFIG_ROOTS:
-                    review.config_paths.add(span)
+                root = span.split(".", 1)[0]
+                if root in USER_CONFIG_ROOTS:
+                    missing = self._unread_user_key(span)
+                    if missing:
+                        review.findings.append(
+                            Finding("config_key", span, f"no reader uses {missing!r}", negated)
+                        )
+                    else:
+                        review.config_paths.add(span)
                     continue
+                if root == "sandbox":
+                    span = f"os_env.{span}"  # informal shorthand for the agent's sandbox
+                elif root not in self.surface.spec_root_keys:
+                    continue  # e.g. `os.environ`: not a config key
                 fragment = _nest({span.rsplit(".", 1)[-1]: "probe-value"}, span.split(".")[:-1])
                 for single in (True, False):
                     base = _SINGLE_BASE if single else _BUNDLE_BASE
@@ -569,6 +584,7 @@ class Referee:
                     )
                     continue
                 if not self._is_agent_config(block):
+                    self._check_user_config_block(review, block)
                     continue
                 # Without spec_version the block may be a single-file agent or a
                 # bundle config.yaml shown without its header; accept either.
@@ -636,6 +652,35 @@ class Referee:
                 if f.kind == "config_key"
             ]
         return problems
+
+    def _unread_user_key(self, dotted: str) -> str | None:
+        """The root or leaf of a user-config key that no reader names, if any.
+
+        Middle segments are skipped: they are often user-chosen names, such as
+        a provider name under ``providers``.
+        """
+        if not self.surface.string_literals:
+            return None
+        parts = dotted.split(".")
+        for part in {parts[0], parts[-1]}:
+            if part not in self.surface.string_literals:
+                return part
+        return None
+
+    def _check_user_config_block(self, review: Review, block: Mapping[str, Any]) -> None:
+        """Check the leaf keys of a ``~/.omnigent/config.yaml`` block against reader names."""
+        roots = {str(k) for k in block} & USER_CONFIG_ROOTS
+        if not roots:
+            return
+        for root in sorted(roots):
+            for path in sorted(set(_leaf_paths(block[root], root))):
+                missing = self._unread_user_key(path)
+                if missing:
+                    review.findings.append(
+                        Finding("config_key", path, f"no reader uses {missing!r}")
+                    )
+                else:
+                    review.config_paths.add(path)
 
     def _is_agent_config(self, block: Mapping[str, Any]) -> bool:
         keys = {str(k) for k in block}
@@ -792,8 +837,40 @@ USER_CONFIG_ROOTS = frozenset(
         "session_title_instructions",
         "auto_open_conversation",
         "copilot",
+        "acp",
     }
 )
+
+
+def _leaf_paths(node: Any, prefix: str) -> list[str]:
+    """Dotted paths of the scalar-valued keys under *node*."""
+    if isinstance(node, Mapping):
+        found: list[str] = []
+        for key, value in node.items():
+            found.extend(_leaf_paths(value, f"{prefix}.{key}"))
+        return found
+    if isinstance(node, list):
+        return [path for item in node for path in _leaf_paths(item, prefix)]
+    return [prefix]
+
+
+_DEPLOY_ENV_SUFFIXES = (".py", ".sh", ".yaml", ".yml", ".toml", ".json", ".env")
+
+
+def _deploy_env_vars(source: Path, files: Iterable[str]) -> frozenset[str]:
+    """``OMNIGENT_*`` names read by deploy and install code outside the package."""
+    found: set[str] = set()
+    for name in files:
+        if not name.startswith(("deploy/", "scripts/")):
+            continue
+        if not (name.endswith(_DEPLOY_ENV_SUFFIXES) or Path(name).name.startswith("Dockerfile")):
+            continue
+        try:
+            found.update(_ENV_RE.findall((source / name).read_text(encoding="utf-8")))
+        except (OSError, UnicodeDecodeError):
+            continue
+    return frozenset(found)
+
 
 #: Generated at site build time, so absent from the site repo's tree.
 _SITE_EXTRAS = frozenset({"/docs", "/llms.txt", "/llms-full.txt"})

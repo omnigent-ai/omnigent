@@ -26,6 +26,7 @@ from typing import Any
 import yaml
 
 _ENV_VAR_RE = re.compile(r"\bOMNIGENT_[A-Z0-9_]*[A-Z0-9]\b")
+_LITERAL_RE = re.compile(r"(?<![\w])[\"']([A-Za-z_][A-Za-z0-9_-]{1,60})[\"']")
 
 
 def surface() -> dict[str, Any]:
@@ -69,11 +70,14 @@ def surface() -> dict[str, Any]:
 
     package_dir = Path(omnigent.__file__).resolve().parent
     env_vars: set[str] = set()
+    literals: set[str] = set()
     for source in package_dir.rglob("*.py"):
         try:
-            env_vars.update(_ENV_VAR_RE.findall(source.read_text(encoding="utf-8")))
+            text = source.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+        env_vars.update(_ENV_VAR_RE.findall(text))
+        literals.update(_LITERAL_RE.findall(text))
 
     import omnigent.cli as cli_module
 
@@ -82,6 +86,8 @@ def surface() -> dict[str, Any]:
         "package_dir": str(package_dir),
         "cli": walk(cli, []),
         "env_vars": sorted(env_vars),
+        # Names some reader uses, for config files that have no schema.
+        "string_literals": sorted(literals),
         # Keys `omnigent config set/unset` accepts.
         "config_set_keys": sorted(getattr(cli_module, "_GLOBAL_CONFIG_KEYS", ())),
     }

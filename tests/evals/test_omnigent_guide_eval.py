@@ -137,6 +137,23 @@ def test_referee_checks_names_paths_and_imports(referee: Referee) -> None:
     }
 
 
+def test_referee_checks_user_config_keys_by_reader_names(referee: Referee) -> None:
+    (review,) = referee.review(
+        [
+            "Add the agent under `acp.agents`, set `runner.zz_invented_leaf`, and read "
+            "`os.environ` as usual. The Docker image reads `OMNIGENT_ARTIFACT_URI`.\n"
+            "```yaml\nproviders:\n  my-gateway:\n    kind: gateway\n    zz_invented_field: 1\n```"
+        ]
+    )
+
+    assert "acp.agents" in review.config_paths
+    assert "providers.my-gateway.kind" in review.config_paths
+    assert {(f.kind, f.text) for f in review.fabrications} == {
+        ("config_key", "runner.zz_invented_leaf"),
+        ("config_key", "providers.my-gateway.zz_invented_field"),
+    }
+
+
 class _FakeJudge:
     name = "fake"
 
