@@ -250,14 +250,17 @@ async def test_device_poll_malformed_200_raises_oauth_error() -> None:
         await client.aclose()
 
 
+@pytest.mark.parametrize("status", [400, 403, 410])
 @respx.mock
-async def test_oidc_poll_expired_ticket() -> None:
-    respx.get(_BASE + "/auth/cli-poll").mock(return_value=httpx.Response(410, json={"error": "x"}))
+async def test_oidc_poll_expired_ticket(status: int) -> None:
+    respx.get(_BASE + "/auth/cli-poll").mock(
+        return_value=httpx.Response(status, json={"error": "Login request rejected"})
+    )
     from omnigent_slack import oauth as _oauth
 
     client = httpx.AsyncClient(base_url=_BASE)
     try:
-        with pytest.raises(AuthorizationExpiredError):
+        with pytest.raises(AuthorizationExpiredError, match="Login request rejected"):
             await _oauth._poll_cli_ticket(client, "T1", "v" * 64, interval=0)
     finally:
         await client.aclose()

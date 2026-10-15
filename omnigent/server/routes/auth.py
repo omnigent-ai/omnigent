@@ -929,9 +929,21 @@ def create_auth_router(
             return JSONResponse(status_code=401, content={"error": "unauthorized"})
         form = await request.form()
         ticket_id = (str(form.get("ticket") or "")).strip()
-        ticket = _cli_tickets.get(ticket_id)
-        if ticket is not None:
-            ticket.denied = True
+        ticket = _cli_ticket(ticket_id)
+        if ticket is None or ticket.token is not None or ticket.denied:
+            return HTMLResponse(
+                _cli_consent_html(error="This login request is invalid or has expired."),
+                status_code=200,
+                headers=_CLI_BROWSER_HEADERS,
+            )
+        session_iat = _session_iat(request, ticket_id)
+        if session_iat is None or session_iat < int(ticket.created_at):
+            return HTMLResponse(
+                _cli_consent_html(error="Sign in again to deny this login."),
+                status_code=200,
+                headers=_CLI_BROWSER_HEADERS,
+            )
+        ticket.denied = True
         return HTMLResponse(
             _cli_consent_html(denied=True), status_code=200, headers=_CLI_BROWSER_HEADERS
         )

@@ -12,14 +12,13 @@ from __future__ import annotations
 
 import re
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 import jwt
 import pytest
 
-from omnigent.server.oidc import derive_code_challenge
 from omnigent.server.routes.auth import (
     _CLI_TICKET_TTL_SECONDS,
     _CliTicket,
@@ -27,72 +26,15 @@ from omnigent.server.routes.auth import (
 )
 from tests.server.integration.oidc_fixtures import (
     TEST_SIGNING_KEY,
-    make_oidc_config,
+    _mint_state_cookie,
+    _mock_httpx_client_for_github,
+    _pkce_pair,
 )
 from tests.server.integration.oidc_fixtures import (
     build_oidc_transport as _build_oidc_app,
 )
 
 pytestmark = pytest.mark.asyncio
-
-
-def _pkce_pair() -> tuple[str, str]:
-    verifier = "a" * 64
-    return verifier, derive_code_challenge(verifier)
-
-
-def _mint_state_cookie(
-    state: str,
-    code_verifier: str = "test-verifier",
-    return_to: str = "/",
-    ticket: str | None = None,
-) -> str:
-    """Mint a signed auth-state cookie matching what /auth/login produces."""
-    config = make_oidc_config()
-    payload: dict = {
-        "state": state,
-        "code_verifier": code_verifier,
-        "return_to": return_to,
-        "exp": int(time.time()) + 300,
-    }
-    if ticket:
-        payload["ticket"] = ticket
-    return jwt.encode(payload, config.cookie_secret, algorithm="HS256")
-
-
-def _mock_httpx_client_for_github(
-    token_status: int = 200,
-    token_json: object | None = None,
-    emails_json: list | None = None,
-) -> AsyncMock:
-    """Build a mock httpx.AsyncClient context manager for GitHub endpoints.
-
-    Returns an AsyncMock suitable for use as an async context manager
-    (``async with httpx.AsyncClient() as client``).
-    """
-    if token_json is None:
-        token_json = {"access_token": "gho_test_token", "token_type": "bearer"}
-    if emails_json is None:
-        emails_json = [{"email": "alice@example.com", "primary": True, "verified": True}]
-
-    token_resp = MagicMock()
-    token_resp.status_code = token_status
-    token_resp.json.return_value = token_json
-    token_resp.text = str(token_json)
-
-    emails_resp = MagicMock()
-    emails_resp.status_code = 200
-    emails_resp.json.return_value = emails_json
-
-    mock_client = AsyncMock()
-    mock_client.post = AsyncMock(return_value=token_resp)
-    mock_client.get = AsyncMock(return_value=emails_resp)
-
-    # Make it work as an async context manager.
-    mock_cm = AsyncMock()
-    mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_cm.__aexit__ = AsyncMock(return_value=False)
-    return mock_cm
 
 
 # ── 1. Login redirect ──────────────────────────────────────────────

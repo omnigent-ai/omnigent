@@ -810,6 +810,38 @@ def test_login_oidc_mode_sets_default_server(
     assert challenge == expected
 
 
+@pytest.mark.parametrize("stage,status", [("create", 400), ("poll", 403), ("poll", 410)])
+def test_login_oidc_failure_leaves_default_server_unchanged(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, stage: str, status: int
+) -> None:
+    import time
+    import webbrowser
+
+    server = "http://omni-oidc.internal:6767"
+    cli_mod._save_global_config({"server": "https://existing.example.com"})
+    error = "Login request rejected"
+    responses = [_response(401, body={"login_url": "/auth/login"})]
+    if stage == "poll":
+        responses.append(_response(status, body={"error": error}))
+    fake = _FakeHttpx(responses=responses)
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+    creation = (
+        _response(status, body={"error": error})
+        if stage == "create"
+        else _response(200, body={"ticket": "t", "login_url": "/auth/go"})
+    )
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: creation)
+    monkeypatch.setattr(webbrowser, "open", lambda url: True)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    result = CliRunner().invoke(cli_group, ["login", server])
+
+    assert result.exit_code != 0
+    assert error in result.output
+    assert cli_mod._load_global_config().get("server") == "https://existing.example.com"
+    assert len(fake.requests) == (1 if stage == "create" else 2)
+
+
 def test_login_failure_leaves_default_server_unchanged(
     monkeypatch: pytest.MonkeyPatch, token_dir: Path
 ) -> None:

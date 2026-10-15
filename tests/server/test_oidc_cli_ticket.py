@@ -18,23 +18,16 @@ from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import mint_session_cookie
 from tests.server.integration.oidc_fixtures import (
     TEST_SIGNING_KEY,
+    _mint_state_cookie,
+    _mock_httpx_client_for_github,
+    _pkce_pair,
     make_oidc_config,
 )
 from tests.server.integration.oidc_fixtures import (
     build_oidc_transport as _build_app,
 )
-from tests.server.integration.test_oidc_auth_e2e import (
-    _mint_state_cookie,
-    _mock_httpx_client_for_github,
-    _pkce_pair,
-)
 
 pytestmark = pytest.mark.asyncio
-
-
-@pytest.fixture(autouse=True)
-def _authenticated_origin_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
 
 
 async def _create_ticket(client: httpx.AsyncClient, base_path: str = "") -> tuple[str, str]:
@@ -95,6 +88,10 @@ async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Pa
         assert approved.status_code == 200
         assert "Approved" in approved.text
 
+        denied_after_approval = await client.post(
+            "/auth/cli-deny", data={"ticket": ticket}, headers={"Origin": "http://test"}
+        )
+        assert "invalid or has expired" in denied_after_approval.text
         fulfilled = await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
         assert fulfilled.status_code == 200
         body = fulfilled.json()
@@ -380,7 +377,8 @@ async def test_cli_consent_origin_normalization_remains_strict(origin: str) -> N
         assert pending.status_code == 202
 
 
-async def test_cli_approve_rejects_stale_session() -> None:
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+async def test_cli_decision_rejects_stale_session(decision: str) -> None:
     transport = _build_app()
     async with httpx.AsyncClient(
         transport=transport, base_url="http://test", follow_redirects=False
@@ -393,20 +391,21 @@ async def test_cli_approve_rejects_stale_session() -> None:
             )
         client.cookies.set("ap_session", stale)
         approved = await client.post(
-            "/auth/cli-approve",
+            f"/auth/cli-{decision}",
             data={"ticket": ticket},
             headers={"Origin": "http://test"},
         )
         assert approved.status_code == 200
-        assert "Sign in again to approve this login" in approved.text
+        assert f"Sign in again to {decision} this login" in approved.text
         assert (
             await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
         ).status_code == 202
 
 
 @pytest.mark.parametrize("credential_kind", ["runner", "session"])
-async def test_cli_approve_requires_ticket_login_provenance(
-    credential_kind: str, tmp_path: Path
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+async def test_cli_decision_requires_ticket_login_provenance(
+    credential_kind: str, decision: str, tmp_path: Path
 ) -> None:
     config = make_oidc_config()
     provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
@@ -423,7 +422,7 @@ async def test_cli_approve_requires_ticket_login_provenance(
         client.cookies.set("ap_session", token)
         with patch("omnigent.server.routes.auth.issue_login_grant") as issue_grant:
             approval = await client.post(
-                "/auth/cli-approve", data={"ticket": ticket}, headers={"Origin": "http://test"}
+                f"/auth/cli-{decision}", data={"ticket": ticket}, headers={"Origin": "http://test"}
             )
             assert "<h1>Approved</h1>" not in approval.text
             pending = await client.get(
