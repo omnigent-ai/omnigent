@@ -12,6 +12,7 @@ export function testUploadRow(overrides: Partial<UploadRow> = {}): UploadRow {
   return {
     ...owner,
     key: `${ownerKey(owner)}:id`,
+    createKey: "a".repeat(32),
     id: "id",
     batch: "batch",
     file: new File([new Uint8Array(20)], "a.bin"),

@@ -72,6 +72,7 @@ beforeEach(() => {
     environment: "default",
     id: "id",
     key: "id",
+    createKey: "a".repeat(32),
     batch: crypto.randomUUID(),
     file: new File([new Uint8Array(20)], "a.bin"),
     name: "a.bin",
@@ -262,6 +263,9 @@ it("limits parallel files and prechecks batch and file limits", async () => {
     return server(url, init);
   });
   enqueueUploads(row, [row.file!, row.file!, row.file!], "frozen", "frozen", row.limits, client);
+  const createKeys = Object.values(useUploadStore.getState().rows).map((item) => item.createKey);
+  expect(createKeys.every((key) => /^[0-9a-f]{32}$/.test(key ?? ""))).toBe(true);
+  expect(new Set(createKeys).size).toBe(3);
   expect(pending).toBe(2);
   release.shift()!();
   await vi.waitFor(() => expect(release.length).toBe(2));
@@ -1254,4 +1258,83 @@ it("bounds failed-upload cleanup and refuses retry until reconciliation settles"
   });
   expect(useUploadStore.getState().rows.id).toBeUndefined();
   expect(toast).toHaveBeenCalledWith("0 of 1 uploaded, 1 failed");
+});
+
+it("reuses one create key after a lost browser response", async () => {
+  const ids = new Map<string, string>();
+  const keys: string[] = [];
+  let lost = false;
+  fetchMock.mockImplementation(async (url, init) => {
+    if (init?.method === "POST" && !String(url).endsWith("/complete")) {
+      const key = new Headers(init.headers).get("Idempotency-Key") ?? "";
+      keys.push(key);
+      ids.set(key, ids.get(key) ?? "remote");
+      if (!lost) {
+        lost = true;
+        throw new TypeError("Lost response");
+      }
+      return json({ upload_id: ids.get(key), offset: 0, chunk_bytes: 4 });
+    }
+    return server(url, init);
+  });
+  await transferUpload(row.key, client, wait);
+  expect(keys).toHaveLength(2);
+  expect(keys[0]).toMatch(/^[0-9a-f]{32}$/);
+  expect(keys[1]).toBe(keys[0]);
+  expect(ids.size).toBe(1);
+  expect(useUploadStore.getState().rows.id.status).toBe("done");
+});
+
+it("renews the create key when the conflict choice changes", async () => {
+  fetchMock.mockResolvedValueOnce(errorResponse(409, "file_exists"));
+  await transferUpload(row.key, client, wait);
+  const first = new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get("Idempotency-Key");
+  await retryUpload(row.key, client, "rename");
+  await vi.waitFor(() => expect(useUploadStore.getState().rows.id.status).toBe("done"));
+  const creates = fetchMock.mock.calls.filter(
+    ([url, init]) => init?.method === "POST" && !String(url).endsWith("/complete"),
+  );
+  const second = new Headers(creates[1]?.[1]?.headers).get("Idempotency-Key");
+  expect(first).toMatch(/^[0-9a-f]{32}$/);
+  expect(second).toMatch(/^[0-9a-f]{32}$/);
+  expect(second).not.toBe(first);
+});
+
+it("resumes from a keyed create replay offset", async () => {
+  const keys: string[] = [];
+  fetchMock.mockImplementation(async (url, init) => {
+    if (init?.method === "POST" && !String(url).endsWith("/complete")) {
+      keys.push(new Headers(init.headers).get("Idempotency-Key") ?? "");
+      if (keys.length === 1) throw new TypeError("Lost response");
+      offset = 8;
+      return json({ upload_id: "remote", offset: 8, chunk_bytes: 4 });
+    }
+    return server(url, init);
+  });
+  await transferUpload(row.key, client, wait);
+  expect(keys[0]).toMatch(/^[0-9a-f]{32}$/);
+  expect(keys[1]).toBe(keys[0]);
+  expect(
+    requests.filter((request) => request.method === "PATCH").map((request) => request.offset),
+  ).toEqual([8, 16]);
+});
+
+it("stores a create key for a row without one", async () => {
+  delete row.createKey;
+  let lost = false;
+  fetchMock.mockImplementation(async (url, init) => {
+    const response = await server(url, init);
+    if (init?.method === "POST" && !String(url).endsWith("/complete") && !lost) {
+      lost = true;
+      throw new TypeError("Lost response");
+    }
+    return response;
+  });
+  await transferUpload(row.key, client, wait);
+  const keys = fetchMock.mock.calls
+    .filter(([url, init]) => init?.method === "POST" && !String(url).endsWith("/complete"))
+    .map(([, init]) => new Headers(init?.headers).get("Idempotency-Key"));
+  expect(keys[0]).toMatch(/^[0-9a-f]{32}$/);
+  expect(keys[1]).toBe(keys[0]);
+  expect(useUploadStore.getState().rows.id.createKey).toBe(keys[0]);
 });

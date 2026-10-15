@@ -263,6 +263,7 @@ class ErrorCode:
     INVALID_NAME = "invalid_name"
     INVALID_PATH = "invalid_path"
     INVALID_REQUEST = "invalid_request"
+    IDEMPOTENCY_KEY_CONFLICT = "idempotency_key_conflict"
     INVALID_OFFSET = "invalid_offset"
     FILE_EXISTS = "file_exists"
     IS_DIRECTORY = "is_directory"
@@ -346,6 +347,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.INVALID_NAME: 400,
     ErrorCode.INVALID_PATH: 400,
     ErrorCode.INVALID_REQUEST: 400,
+    ErrorCode.IDEMPOTENCY_KEY_CONFLICT: 422,
     ErrorCode.INVALID_OFFSET: 400,
     ErrorCode.FILE_EXISTS: 409,
     ErrorCode.IS_DIRECTORY: 409,
@@ -413,6 +415,7 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.INVALID_NAME: ErrorCategory.USER,
     ErrorCode.INVALID_PATH: ErrorCategory.USER,
     ErrorCode.INVALID_REQUEST: ErrorCategory.USER,
+    ErrorCode.IDEMPOTENCY_KEY_CONFLICT: ErrorCategory.USER,
     ErrorCode.INVALID_OFFSET: ErrorCategory.USER,
     ErrorCode.FILE_EXISTS: ErrorCategory.USER,
     ErrorCode.IS_DIRECTORY: ErrorCategory.USER,
@@ -482,6 +485,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.INVALID_NAME: ErrorImpact.BENIGN,
     ErrorCode.INVALID_PATH: ErrorImpact.BENIGN,
     ErrorCode.INVALID_REQUEST: ErrorImpact.BENIGN,
+    ErrorCode.IDEMPOTENCY_KEY_CONFLICT: ErrorImpact.BENIGN,
     ErrorCode.INVALID_OFFSET: ErrorImpact.BENIGN,
     ErrorCode.FILE_EXISTS: ErrorImpact.BENIGN,
     ErrorCode.IS_DIRECTORY: ErrorImpact.BENIGN,
@@ -547,6 +551,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.INVALID_NAME: ErrorPhase.REQUEST,
     ErrorCode.INVALID_PATH: ErrorPhase.REQUEST,
     ErrorCode.INVALID_REQUEST: ErrorPhase.REQUEST,
+    ErrorCode.IDEMPOTENCY_KEY_CONFLICT: ErrorPhase.REQUEST,
     ErrorCode.INVALID_OFFSET: ErrorPhase.REQUEST,
     ErrorCode.FILE_EXISTS: ErrorPhase.REQUEST,
     ErrorCode.IS_DIRECTORY: ErrorPhase.REQUEST,
