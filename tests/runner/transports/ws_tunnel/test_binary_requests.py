@@ -505,6 +505,64 @@ async def test_malformed_envelope_is_diagnosed(fault: str, caplog) -> None:
         registry.close_request(_RUNNER, "bad-request")
 
 
+async def test_deeply_nested_binary_header_keeps_runner_receive_loop_alive(caplog) -> None:
+    nested = b"[" * 10_000 + b"0" + b"]" * 10_000
+    header = (
+        b'{"kind":"request","id":"deep-header","method":"PATCH",'
+        b'"path":"/malformed","query_string":"","headers":[],"stream":true,'
+        b'"nested":' + nested + b"}"
+    )
+    wire = b"OTB\x01" + len(header).to_bytes(4, "big") + header
+    malformed_handled = asyncio.Event()
+    dispatch_tasks: dict[str, asyncio.Task[None]] = {}
+
+    async def app(scope, receive, send) -> None:
+        await receive()
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        session = registry.get(_RUNNER)
+        assert session is not None
+
+        async def runner_receive_loop() -> None:
+            while True:
+                raw = await ws.recv()
+                await _handle_tunnel_frame(app, raw, ws.send, dispatch_tasks, {})
+                if raw == wire:
+                    malformed_handled.set()
+
+        receiver = asyncio.create_task(runner_receive_loop())
+        malformed_waiter = asyncio.create_task(malformed_handled.wait())
+        try:
+            registry.open_request(_RUNNER, "deep-header")
+            await registry.send_request(session, wire, request_id="deep-header")
+            done, _ = await asyncio.wait(
+                {receiver, malformed_waiter}, timeout=5, return_when=asyncio.FIRST_COMPLETED
+            )
+            assert malformed_waiter in done and malformed_waiter.result()
+            assert "runner received malformed binary request" in caplog.text
+            registry.close_request(_RUNNER, "deep-header")
+
+            response = await asyncio.wait_for(
+                client.patch(
+                    "/after-malformed",
+                    content=b"next",
+                    extensions={"runner_tunnel_binary_request_body": True},
+                ),
+                5,
+            )
+            assert response.status_code == 204
+            assert not receiver.done()
+        finally:
+            receiver.cancel()
+            malformed_waiter.cancel()
+            await asyncio.gather(receiver, malformed_waiter, return_exceptions=True)
+            for task in dispatch_tasks.values():
+                task.cancel()
+            await asyncio.gather(*dispatch_tasks.values(), return_exceptions=True)
+
+
 def test_encoder_rejects_over_limit() -> None:
     frame = RequestFrame("limit", "PATCH", "/")
     overhead = len(encode_binary_request(frame, b""))
