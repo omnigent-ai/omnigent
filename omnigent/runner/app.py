@@ -3624,8 +3624,12 @@ def create_runner_app(
             server_client=server_client,
             session_id=conv_id,
         )
-        bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
-        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
+        bridge_dir = (
+            bridge_dir_for_bridge_id(bridge_id)
+            if bridge_id
+            else _native_runtime.codex_native_bridge_dir(conv_id)
+        )
         state = read_bridge_state(bridge_dir)
         if state is None:
             _logger.log(
@@ -3660,9 +3664,8 @@ def create_runner_app(
         """
         Bridge directory for a codex-native session.
 
-        Same resolution as :func:`_codex_native_bridge_state_for_session` — the
-        bridge id label when present, else the conversation id — so a request
-        written here lands in the directory the forwarder polls.
+        Use the bridge id label when present, else the conversation id, so a
+        request written here lands in the directory the forwarder polls.
 
         :param conv_id: Conversation id, e.g. ``"conv_abc123"``.
         :returns: The session's bridge directory.

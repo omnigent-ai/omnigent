@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -342,6 +342,95 @@ async def test_connected_codex_model_change_before_idle_reap(
     )
     native_session.assert_applied(response)
     assert native_session.codex.launches == 1
+
+
+@pytest.mark.parametrize(
+    ("lookup", "applies"),
+    [
+        ("unavailable", True),
+        ("missing-label", True),
+        ("explicit-label", True),
+        ("wrong-label", False),
+        ("wrong-session-map", False),
+        ("no-map", False),
+    ],
+)
+async def test_rotated_codex_settings_resolve_the_owned_launch_directory(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    lookup: str,
+    applies: bool,
+) -> None:
+    """A missing label can use the owned launch, but cannot override explicit ownership."""
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+    from tests.runner.helpers import NullServerClient
+
+    session = native_session
+    old_bridge_dir = session.codex.bridge_dir
+    await session.codex.close()
+    rotated_id = "rotated-" + session.session_id
+    rotated_bridge_dir = bridge.bridge_dir_for_bridge_id(rotated_id)
+    rotated_home = bridge.codex_home_for_bridge_dir(rotated_bridge_dir)
+    rotated_home.mkdir(parents=True)
+    (rotated_home / "config.toml").write_text(
+        f'model = "{_PREVIOUS_MODEL}"\nmodel_reasoning_effort = "high"\n'
+    )
+    session.codex.bridge_dir = rotated_bridge_dir
+    await session.codex.start()
+    bridge.clear_bridge_state(old_bridge_dir)
+    mapped_dirs = {session.session_id: rotated_bridge_dir}
+    if lookup == "explicit-label":
+        mapped_dirs[session.session_id] = old_bridge_dir
+    elif lookup == "no-map":
+        mapped_dirs.clear()
+    elif lookup == "wrong-session-map":
+        state = bridge.read_bridge_state(rotated_bridge_dir)
+        assert state is not None
+        bridge.write_bridge_state(rotated_bridge_dir, replace(state, session_id="other-session"))
+    monkeypatch.setattr(native_runtime, "_AUTO_CODEX_BRIDGE_DIRS", mapped_dirs)
+    monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_READY_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_READY_POLL_S", 0.005)
+    get = NullServerClient.get
+    post = NullServerClient.post
+    callbacks = {"labels": 0, "effort": 0}
+
+    async def labels(self: Any, url: str, **kwargs: Any) -> Any:
+        if not url.endswith("/labels"):
+            return await get(self, url, **kwargs)
+        callbacks["labels"] += 1
+        if lookup == "unavailable":
+            raise DatabricksAuthError("Credential service could not supply callback credentials")
+        live_labels = {}
+        if lookup in {"explicit-label", "wrong-label"}:
+            live_labels[bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = (
+                rotated_id if lookup == "explicit-label" else "wrong-" + session.session_id
+            )
+        return httpx.Response(200, json={"labels": live_labels}, request=httpx.Request("GET", url))
+
+    async def effort(self: Any, url: str, **kwargs: Any) -> Any:
+        if lookup == "unavailable" and url.endswith("/events"):
+            callbacks["effort"] += 1
+            raise DatabricksAuthError("Credential service could not supply callback credentials")
+        return await post(self, url, **kwargs)
+
+    monkeypatch.setattr(NullServerClient, "get", labels)
+    monkeypatch.setattr(NullServerClient, "post", effort)
+    response = await asyncio.wait_for(
+        client.patch(
+            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+        ),
+        timeout=2,
+    )
+
+    if applies:
+        session.assert_applied(response)
+    else:
+        _assert_codex_refusal(session, response)
+    assert session.codex.launches == 2
+    assert callbacks["labels"] >= 1
+    assert callbacks["effort"] == int(lookup == "unavailable")
+    assert bridge.read_bridge_state(old_bridge_dir) is None
 
 
 @pytest.mark.parametrize("clear_bridge", [False, True], ids=["stale-bridge", "missing-bridge"])
