@@ -223,7 +223,7 @@ class UploadIndex:
         default_factory=dict
     )
     pending_creates: dict[
-        tuple[str, str, str, str], tuple[str, asyncio.Future[CreatedUpload | UploadError]]
+        tuple[str, str, str, str], tuple[str, Future[CreatedUpload | UploadError]]
     ] = field(default_factory=dict)
     sessions: dict[str, SessionAdmission] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -664,8 +664,8 @@ def register_upload_routes(
         )
         pending = (session_id, environment_id, uuid.uuid4().hex)
         index.prune(session_id)
-        pending_result: asyncio.Future[CreatedUpload | UploadError] | None = None
-        wait_for: asyncio.Future[CreatedUpload | UploadError] | None = None
+        pending_result: Future[CreatedUpload | UploadError] | None = None
+        wait_for: Future[CreatedUpload | UploadError] | None = None
         cached_id: str | None = None
         reserved = False
         with index.lock:
@@ -696,7 +696,7 @@ def register_upload_routes(
                         raise UploadError(ErrorCode.UPLOAD_LIMIT, {"Retry-After": "60"})
                     reserved = True
                 if scope is not None:
-                    pending_result = asyncio.get_running_loop().create_future()
+                    pending_result = Future()
                     index.pending_creates[scope] = (digest, pending_result)
                 if reserved:
                     try:
@@ -706,7 +706,7 @@ def register_upload_routes(
                             index.pending_creates.pop(scope, None)
                         raise
         if wait_for is not None:
-            outcome = await asyncio.shield(wait_for)
+            outcome = await asyncio.shield(asyncio.wrap_future(wait_for))
             if isinstance(outcome, UploadError):
                 raise outcome
             return outcome
