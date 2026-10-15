@@ -145,8 +145,15 @@ def rotating_gateway(
         ("responses", False, True, True),
         ("chat", False, True, False),
     ],
-    ids=["chat-unsandboxed", "chat-sandboxed", "responses", "anthropic",
-         "gateway-chat", "gateway-responses", "gateway-nonreasoning"],
+    ids=[
+        "chat-unsandboxed",
+        "chat-sandboxed",
+        "responses",
+        "anthropic",
+        "gateway-chat",
+        "gateway-responses",
+        "gateway-nonreasoning",
+    ],
 )
 async def test_pi_session_stays_in_sync_after_retry_recovery(
     tmp_path: Path,
