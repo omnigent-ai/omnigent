@@ -3202,6 +3202,71 @@ def test_bundle_resolves_config_env_vars(
     assert parsed["llm"]["model"] == "openai/gpt-4o"
 
 
+def _agent_with_shared_skill(checkout: Path) -> Path:
+    """Create a checkout with one agent and a skill stored outside its ``skills/``."""
+    (checkout / ".git").mkdir(parents=True)
+    shared = checkout / "shared-skills" / "review-loop"
+    shared.mkdir(parents=True)
+    (shared / "SKILL.md").write_text(
+        "---\nname: review-loop\ndescription: Shared loop.\n---\nBody.\n"
+    )
+    (shared / "helper.py").write_text("print('helper')\n")
+    agent = checkout / "agents" / "fixer"
+    (agent / "skills").mkdir(parents=True)
+    _write_config(
+        agent,
+        {
+            "spec_version": 1,
+            "name": "fixer",
+            "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+        },
+    )
+    return agent
+
+
+@pytest.mark.parametrize("link", ["directory", "files"])
+def test_bundle_includes_symlinked_skill_as_regular_files(tmp_path: Path, link: str) -> None:
+    """A skill linked from elsewhere in the checkout survives server-side extraction."""
+    from omnigent.spec import load
+    from omnigent.spec.tar_utils import extract_safe
+
+    agent = _agent_with_shared_skill(tmp_path)
+    linked = agent / "skills" / "review-loop"
+    if link == "directory":
+        linked.symlink_to(Path("../../../shared-skills/review-loop"))
+    else:
+        linked.mkdir()
+        for name in ("SKILL.md", "helper.py"):
+            (linked / name).symlink_to(Path("../../../../shared-skills/review-loop") / name)
+
+    bundle_bytes = _bundle(agent)
+
+    with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode="r:gz") as tf:
+        assert tf.getmember("skills/review-loop/helper.py").isfile()
+    extracted = tmp_path / "extracted"
+    extract_safe(bundle_bytes, extracted)
+    assert [skill.name for skill in load(extracted).skills] == ["review-loop"]
+    assert (extracted / "skills/review-loop/helper.py").read_text() == "print('helper')\n"
+
+
+@pytest.mark.parametrize(
+    ("target", "message"),
+    [
+        ("../../../shared-skills/missing", "dangling symlink"),
+        ("../../../../outside", "outside"),
+        ("..", "symlink loop"),
+    ],
+)
+def test_bundle_rejects_unbundleable_symlinks(tmp_path: Path, target: str, message: str) -> None:
+    """Links that cannot be bundled fail instead of silently dropping the skill."""
+    agent = _agent_with_shared_skill(tmp_path / "checkout")
+    (tmp_path / "outside").mkdir()
+    (agent / "skills" / "review-loop").symlink_to(Path(target))
+
+    with pytest.raises(OmnigentError, match=message):
+        _bundle(agent)
+
+
 def test_bundle_resolves_mcp_header_env_vars(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
