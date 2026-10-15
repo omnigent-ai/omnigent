@@ -10,10 +10,13 @@ drift from ``omnigent server``.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import sys
 from typing import TYPE_CHECKING
 
 import uvicorn.server
+from uvicorn.main import STARTUP_FAILURE
 
 if TYPE_CHECKING:
     import socket
@@ -57,3 +60,15 @@ class ShutdownSignalingServer(uvicorn.server.Server):
         # transport and connections linger past the graceful window.
         await asyncio.sleep(0)
         await super().shutdown(sockets)
+
+
+def serve(config: uvicorn.Config) -> None:
+    """Run ``config`` through :class:`ShutdownSignalingServer` with ``uvicorn.run()``'s
+    exit contract: Ctrl-C exits quietly, and a failed ASGI lifespan startup exits
+    ``STARTUP_FAILURE`` (3) so failure-only restart policies bring the server back.
+    """
+    server = ShutdownSignalingServer(config)
+    with contextlib.suppress(KeyboardInterrupt):
+        server.run()
+    if not server.started:
+        sys.exit(STARTUP_FAILURE)

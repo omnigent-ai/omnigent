@@ -298,12 +298,7 @@ try:
     )
 
     if __name__ == "__main__":
-        import contextlib
-
-        from omnigent.server.graceful_shutdown import (
-            SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
-            ShutdownSignalingServer,
-        )
+        from omnigent.server.graceful_shutdown import SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S, serve
 
         logger.info("Starting omnigent on 0.0.0.0:%d", PORT)
         config = uvicorn.Config(
@@ -319,9 +314,7 @@ try:
             # Matches `omnigent server`.
             timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
         )
-        # uvicorn.run() swallows KeyboardInterrupt; match that behaviour.
-        with contextlib.suppress(KeyboardInterrupt):
-            ShutdownSignalingServer(config).run()
+        serve(config)
 
 except Exception:  # noqa: BLE001 — startup catch-all; we want every failure logged
     logger.error("FATAL: omnigent failed to start:\n%s", traceback.format_exc())

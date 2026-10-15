@@ -2,17 +2,19 @@
 
 ``ShutdownSignalingServer`` is the single launcher behaviour that ``omnigent
 server`` and the deploy entrypoints share. These guard its contract directly
-(fast, no port bind), separate from the slow Docker end-to-end test.
+(fast, no port bind).
 """
 
 from __future__ import annotations
 
 import asyncio
 import importlib
+from typing import Any
 
 import pytest
 import uvicorn
 import uvicorn.server
+from uvicorn.main import STARTUP_FAILURE
 
 from omnigent.runtime import session_stream
 from omnigent.server import graceful_shutdown, shutdown_state
@@ -20,6 +22,7 @@ from omnigent.server.graceful_shutdown import (
     SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
     SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S_DEFAULT,
     ShutdownSignalingServer,
+    serve,
 )
 
 
@@ -56,6 +59,20 @@ def test_shutdown_drains_sse_and_marks_shutdown_before_the_graceful_wait(
 
     assert calls == ["mark", "drain", "super"]
     assert captured["sockets"] is sentinel
+
+
+def test_serve_exits_non_zero_when_lifespan_startup_fails() -> None:
+    """Like ``uvicorn.run()``, a failed startup must not exit 0: failure-only
+    restart policies would leave the server down. ``Server.run()`` alone returns.
+    """
+
+    async def _failing_startup(scope: object, receive: Any, send: Any) -> None:
+        await receive()
+        await send({"type": "lifespan.startup.failed", "message": "boom"})
+
+    with pytest.raises(SystemExit) as exc_info:
+        serve(uvicorn.Config(_failing_startup))
+    assert exc_info.value.code == STARTUP_FAILURE
 
 
 def test_graceful_timeout_defaults_to_five_seconds() -> None:

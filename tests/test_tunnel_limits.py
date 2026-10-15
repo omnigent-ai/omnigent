@@ -133,6 +133,7 @@ def test_docker_entrypoint_hands_the_tunnel_budget_and_graceful_shutdown_to_uvic
     def _capture_run(self: uvicorn.server.Server) -> None:
         captured["config"] = self.config
         captured["server_class"] = type(self).__name__
+        self.started = True  # a real startup sets this; serve() exits 3 without it
 
     monkeypatch.setattr(uvicorn.server.Server, "run", _capture_run)
 
@@ -174,9 +175,10 @@ def test_every_deploy_entrypoint_serves_through_the_shared_graceful_launcher() -
             f"{relative} does not bound uvicorn's graceful shutdown, so a held SSE "
             "stream blocks SIGTERM until the orchestrator SIGKILLs the process"
         )
-        assert "ShutdownSignalingServer(" in code, (
-            f"{relative} does not serve through ShutdownSignalingServer, so open "
-            "SSE session streams are force-cancelled instead of drained on shutdown"
+        assert "serve(config)" in code, (
+            f"{relative} does not serve through graceful_shutdown.serve(), so open SSE "
+            "session streams are force-cancelled instead of drained on shutdown and a "
+            "failed startup exits 0"
         )
         assert "uvicorn.run(" not in code, (
             f"{relative} still calls bare uvicorn.run(), which cannot install the "
