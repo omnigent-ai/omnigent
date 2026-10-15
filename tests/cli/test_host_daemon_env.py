@@ -217,14 +217,23 @@ def test_runner_env_explicit_proxy_passthrough_remains_available() -> None:
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
-@pytest.mark.parametrize("enabled", ["0", "1"])
-def test_host_slice_key_gate_reaches_daemon_and_runner(
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("OMNIGENT_HOST_SLICE_KEY_ENABLED", "0"),
+        ("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1"),
+        ("OMNIGENT_FEATURES", ""),
+        ("OMNIGENT_FEATURES", "usage_page,claude_osc_status"),
+    ],
+)
+def test_release_controls_reach_daemon_and_runner(
     monkeypatch: pytest.MonkeyPatch,
     server_url: str | None,
-    enabled: str,
+    name: str,
+    value: str,
 ) -> None:
-    """The host and its spawned runner make the same slice-key decision."""
-    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", enabled)
+    """Operator controls survive both environment boundaries in either server mode."""
+    monkeypatch.setenv(name, value)
 
     daemon_env = _build_host_daemon_env(server_url=server_url)
     runner_env = _build_runner_env(
@@ -236,8 +245,15 @@ def test_host_slice_key_gate_reaches_daemon_and_runner(
         parent_pid=12345,
     )
 
-    assert daemon_env["OMNIGENT_HOST_SLICE_KEY_ENABLED"] == enabled
-    assert runner_env["OMNIGENT_HOST_SLICE_KEY_ENABLED"] == enabled
+    assert daemon_env[name] == value
+    assert runner_env[name] == value
+    if name == "OMNIGENT_FEATURES":
+        from omnigent.runner.resource_registry import SessionResourceRegistry
+        from omnigent.server.feature_flags import Feature
+
+        with patch.dict(os.environ, runner_env, clear=True):
+            registry = SessionResourceRegistry()
+        assert registry._feature_flags.enabled(Feature.CLAUDE_OSC_STATUS) == bool(value)
 
 
 _CLAUDE_TOOL_SEARCH_ENV: Final = {

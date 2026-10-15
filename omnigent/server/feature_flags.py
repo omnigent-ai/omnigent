@@ -1,8 +1,8 @@
 """Deployment-wide release feature management.
 
 Additional release features are enabled as a comma-separated set in
-``OMNIGENT_FEATURES``. The set is resolved once when an application or route
-factory is built, so every request handled by that process sees one immutable
+``OMNIGENT_FEATURES``. The set is resolved once when an application, route
+factory or runner resource registry is built, giving each one an immutable
 snapshot.
 """
 
@@ -28,6 +28,7 @@ class Feature(StrEnum):
     IMPORT_REVIEW = "import_review"
     CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
+    CLAUDE_OSC_STATUS = "claude_osc_status"
 
 
 @dataclass(frozen=True)
@@ -91,12 +92,19 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="web",
         review_by_release="0.19.0",
     ),
+    FeatureDefinition(
+        feature=Feature.CLAUDE_OSC_STATUS,
+        description="Claude-native working status from OSC 7501 terminal reports",
+        owner="runner",
+        review_by_release="0.20.0",
+        frontend_visible=False,
+    ),
 )
 
 
 @dataclass(frozen=True)
 class FeatureFlags:
-    """Immutable feature values for one server process."""
+    """Immutable feature values for one server or runner process."""
 
     # Older clients still gate Harnesses settings on this value.
     enabled_features: frozenset[Feature] = frozenset({Feature.HARNESS_SETTINGS_UI})

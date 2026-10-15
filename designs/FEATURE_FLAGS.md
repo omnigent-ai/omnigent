@@ -30,10 +30,19 @@ lifecycle metadata.
 | `canvas` | Off | Web | 0.15.0 | Exposes the web Canvas route (`/canvas`) and its sidebar navigation: top-level sessions as draggable cards, one canvas per project. |
 | `custom_agents_settings_ui` | Off | Web | 0.18.0 | Exposes Custom agents settings when the server also advertises `agent_install`. |
 | `sidebar_grouping_ui` | Off | Web | 0.19.0 | Adds Grouping, Ordering and Show options to the sidebar filter menu, moves that menu to the Projects header, splits Shared sessions into their own section, lets a Status or Updated grouping replace the Projects, Shared and Sessions sections, and expands the session tooltip with Repo, PR and Created by. |
+| `claude_osc_status` | Off | Runner | 0.20.0 | Uses Claude OSC 7501 reports for working status, with legacy file/pane fallback. Set on the host/runner; applies to newly launched Claude-native terminals after restart. Not exposed in `/v1/info`. |
 
 At the review release, each flag must be removed by making the feature
 unconditional, removing the feature, or moving a genuinely permanent operator
 policy into normal server configuration.
+
+Runner features use the same enabled set, resolved once at resource-registry
+startup. The host forwards `OMNIGENT_FEATURES` to its runners, including through
+the CLI's background daemon. Changing a remote server's environment alone does
+not change a separate host's runners. Restart the host and affected runners
+after changing their feature set; existing terminals keep their launch
+configuration. See the [Claude status prototype](claude-program-status-prototype.md)
+for activation, rollback and remaining verification requirements.
 
 ## Rollout and rollback
 
