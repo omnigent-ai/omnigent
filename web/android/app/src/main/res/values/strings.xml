@@ -15,6 +15,11 @@
     <string name="connect_action">Connect</string>
     <string name="connect_recents">Recent servers</string>
     <string name="connect_invalid">Enter a valid http(s) server URL</string>
+    <string name="login_pending_title">Signing in…</string>
+    <string name="login_pending_body">Finish signing in with your browser. You\'ll return here automatically.</string>
+    <string name="login_failed_title">Couldn\'t sign in</string>
+    <string name="login_failed_body">Sign-in didn\'t complete. Try again, or switch servers from the button above.</string>
+    <string name="login_retry">Try again</string>
     <string name="menu_reload">Reload</string>
     <string name="menu_connect_new">Connect to New Server</string>
     <!-- Shown to IT admins in their EMM console, not to app users. -->
