@@ -375,6 +375,38 @@ class BwrapSandboxBackend(SandboxBackend):
             git_ssh=sandbox_spec.git_ssh,
         )
 
+    def launch_fingerprint(
+        self,
+        argv: list[str],
+        policy: SandboxPolicy,
+        cwd: Path,
+        chdir: Path | None = None,
+    ) -> object:
+        """Return the dotfile / symlink masks a launch would emit and the inodes it pins.
+
+        A mount stays on the entry it covered, so a masked entry, granted
+        root or default ``/etc`` file replaced on the host must also force a
+        relaunch. Framework scratch roots are per-launch and excluded.
+        """
+        del chdir
+        cwd_resolved = cwd.resolve(strict=False)
+        masks = _dotfile_and_symlink_mask_args(
+            cwd_resolved,
+            policy.cwd_allow_hidden if policy.cwd_allow_hidden is not None else [],
+            policy,
+            argv=argv,
+        )
+        skip = set(policy.mask_scan_skip_roots or [])
+        granted = [
+            cwd_resolved,
+            *(policy.read_roots or []),
+            *(root for root in policy.write_roots if root not in skip),
+            *policy.write_files,
+            *_DEFAULT_ETC_FILES,
+        ]
+        roots = [_path_identity(root, follow_symlinks=True) for root in granted]
+        return masks, _mount_target_identities(masks), roots
+
     def wrap_launcher_argv(
         self,
         argv: list[str],
@@ -1003,6 +1035,35 @@ def _interpreter_chain_binds(argv: Sequence[str], covered_prefixes: list[Path]) 
             current = Path(os.path.normpath(str(current.parent / link)))
 
     return extra
+
+
+_BIND_FLAGS = frozenset(
+    {"--bind", "--bind-try", "--ro-bind", "--ro-bind-try", "--dev-bind", "--dev-bind-try"}
+)
+
+
+def _mount_target_identities(argv: Sequence[str]) -> list[tuple[int, int] | None]:
+    """Return host ``(st_dev, st_ino)`` of mount points and the bind sources they get.
+
+    Destinations are not followed (a mask covers the entry itself); bind
+    sources are, since bwrap mounts what a symlinked source points at.
+    """
+    targets: list[tuple[str, bool]] = []
+    for i, token in enumerate(argv[:-1]):
+        if token == "--tmpfs":
+            targets.append((argv[i + 1], False))
+        elif token in _BIND_FLAGS and i + 2 < len(argv):
+            targets += [(argv[i + 1], True), (argv[i + 2], False)]
+    return [_path_identity(target, follow_symlinks=follow) for target, follow in targets]
+
+
+def _path_identity(path: str | Path, *, follow_symlinks: bool) -> tuple[int, int] | None:
+    """Return the host ``(st_dev, st_ino)`` of *path*, or ``None`` if it is missing."""
+    try:
+        info = os.stat(path, follow_symlinks=follow_symlinks)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
 
 
 def _tmpfs_mask_dirs(mask_args: Sequence[str]) -> list[Path]:
