@@ -15,7 +15,7 @@ import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { prefetchSessionHostChain } from "./hooks/useSession";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { getBasePath, withBasePath } from "./lib/basePath";
-import { isFeatureEnabled, resolveServerInfo, type ServerInfo } from "./lib/capabilities";
+import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
@@ -25,7 +25,10 @@ import { applyMacElectronShellAttribute } from "./lib/nativeBridge";
 import { applyMobileAppTargetAttribute } from "./lib/mobileAppTargets";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
-import { applyWebFontCapability, restoreFontPreferences } from "./lib/restoreFontPreferences";
+import {
+  applyWebFontCapabilityFromServerInfo,
+  restoreFontPreferences,
+} from "./lib/restoreFontPreferences";
 import { migrateLegacyProjectFolderPagination } from "./lib/projectFolderPaginationPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
@@ -130,7 +133,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
     let alive = true;
     void bootServerInfo.settled.then((resolved) => {
       if (!alive) return;
-      applyWebFontCapability(isFeatureEnabled(resolved, "webfonts"));
+      applyWebFontCapabilityFromServerInfo(resolved);
       setInfo(resolved);
     });
     return () => {

@@ -12,6 +12,7 @@ import {
 import { applyFixedWidthFontFamily, readFixedWidthFontFamily } from "./fixedWidthFontPreferences";
 import { loadCodeFontFamily, readCodeFontFamily } from "./codeFontPreferences";
 import { setWebFontsEnabled } from "./webFontLoader";
+import { isFeatureEnabled, type ServerInfo } from "./capabilities";
 
 /**
  * Restore the saved UI + fixed-width + code font preferences on boot.
@@ -34,4 +35,9 @@ export function restoreFontPreferences(): void {
 export function applyWebFontCapability(enabled: boolean): void {
   setWebFontsEnabled(enabled);
   if (enabled) restoreFontPreferences();
+}
+
+/** Apply the settled server capability before restoring downloadable fonts. */
+export function applyWebFontCapabilityFromServerInfo(info: ServerInfo): void {
+  applyWebFontCapability(isFeatureEnabled(info, "webfonts"));
 }

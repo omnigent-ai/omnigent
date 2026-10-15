@@ -2315,13 +2315,8 @@ function UiFontFamilyControl() {
 }
 
 /**
- * Fixed-width (monospace chrome) font family picker. A searchable dropdown over
- * the catalog's `fixedWidth` role; selecting an option loads the webfont and
- * applies it live via the --ui-mono-font-family variable, which the `font-mono`
- * utility reads (see lib/fixedWidthFontPreferences.ts) — file paths, hashes,
- * inline code chips and log rows across the chrome. Distinct from the code
- * editor/terminal font below. "Default" falls back to the --font-mono stack; a
- * custom typed family stays honored.
+ * Fixed-width picker; catalog faces load only when webfonts is enabled.
+ * "Monospace default" uses --font-mono; typed families stay honored.
  */
 function FixedWidthFontFamilyControl() {
   const [family, setFamily] = useState(() => readFixedWidthFontFamily());

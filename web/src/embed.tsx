@@ -35,7 +35,7 @@ import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { CapabilitiesContext } from "./lib/CapabilitiesContext";
 import { createBootServerInfo } from "./lib/bootCapabilities";
-import { isFeatureEnabled, resolveServerInfo, type ServerInfo } from "./lib/capabilities";
+import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { EmbeddedProvider } from "./lib/embedded";
 import {
   type OmnigentHostConfig,
@@ -67,14 +67,13 @@ import "./index.css";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
-import { applyWebFontCapability, restoreFontPreferences } from "./lib/restoreFontPreferences";
+import {
+  applyWebFontCapabilityFromServerInfo,
+  restoreFontPreferences,
+} from "./lib/restoreFontPreferences";
 
-// Restore saved font CSS when the embed module loads. Downloadable fonts wait
-// for the server capability probe. The UI/code font controls stay visible when
-// embedded (per-device readability prefs that don't conflict with host theming),
-// so a chosen font must be applied + fetched here just as standalone does in
-// main.tsx — otherwise the selection would only take effect on the next Settings
-// change. Guarded for SSR by the apply/load helpers.
+// Keep per-device font choices effective in the embed. Catalog downloads wait
+// for the capability probe; saved CSS preferences apply immediately.
 restoreFontPreferences();
 
 export type { HtmlPreviewFrameProps, OmnigentHostConfig } from "./lib/host";
@@ -150,7 +149,7 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
     let alive = true;
     const boot = createBootServerInfo(resolveServerInfo());
     function applyCapabilities(resolved: ServerInfo): void {
-      applyWebFontCapability(isFeatureEnabled(resolved, "webfonts"));
+      applyWebFontCapabilityFromServerInfo(resolved);
       setInfo(resolved);
     }
     void boot.initial.then((resolved) => {
