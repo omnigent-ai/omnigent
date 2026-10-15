@@ -6079,22 +6079,37 @@ def _bundle_files(source: Path) -> Iterator[tuple[Path, str]]:
         the allowed root.
     """
     from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime.filesystem_registry import detect_git_root
+
+    def resolve(path: Path) -> Path:
+        try:
+            return path.resolve()
+        except (OSError, RuntimeError) as exc:
+            # A link to itself (or a pair pointing at each other) cannot resolve.
+            raise OmnigentError(
+                f"{path.relative_to(source)} is a symlink loop; cannot bundle it.",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
 
     root = source.resolve()
-    boundary = next((p for p in (root, *root.parents) if (p / ".git").exists()), root)
+    boundary = detect_git_root(root) or root
+    # Real directories on the walk's path to each visited directory, itself included.
+    lineage: dict[str, tuple[Path, ...]] = {}
     for dirpath, dirnames, filenames in os.walk(source, followlinks=True):
         current = Path(dirpath)
-        rel_dir = current.relative_to(source)
-        real_dir = current.resolve()
-        if any((source / parent).resolve() == real_dir for parent in rel_dir.parents):
+        real_dir = resolve(current)
+        ancestors = lineage.get(os.path.dirname(dirpath), ()) if current != source else ()
+        if real_dir in ancestors:
             raise OmnigentError(
-                f"{rel_dir} is a symlink loop; cannot bundle it.",
+                f"{current.relative_to(source)} is a symlink loop; cannot bundle it.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        lineage[dirpath] = (*ancestors, real_dir)
         dirnames.sort()
-        for name in [*dirnames, *sorted(filenames)]:
+        files = set(filenames)
+        for name in [*dirnames, *sorted(files)]:
             path = current / name
-            real = path.resolve()
+            real = resolve(path)
             rel = path.relative_to(source)
             if not real.exists():
                 raise OmnigentError(
@@ -6107,7 +6122,7 @@ def _bundle_files(source: Path) -> Iterator[tuple[Path, str]]:
                     "only symlinks within the agent's checkout can be bundled.",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            if name in filenames and real.is_file():
+            if name in files and real.is_file():
                 yield real, str(rel)
 
 

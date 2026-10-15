@@ -3202,9 +3202,14 @@ def test_bundle_resolves_config_env_vars(
     assert parsed["llm"]["model"] == "openai/gpt-4o"
 
 
-def _agent_with_shared_skill(checkout: Path) -> Path:
+def _agent_with_shared_skill(checkout: Path, *, git: bool = True) -> Path:
     """Create a checkout with one agent and a skill stored outside its ``skills/``."""
-    (checkout / ".git").mkdir(parents=True)
+    checkout.mkdir(parents=True, exist_ok=True)
+    if git:
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    else:
+        # A stray directory named .git is not a checkout and must not widen the boundary.
+        (checkout / ".git").mkdir()
     shared = checkout / "shared-skills" / "review-loop"
     shared.mkdir(parents=True)
     (shared / "SKILL.md").write_text(
@@ -3250,16 +3255,20 @@ def test_bundle_includes_symlinked_skill_as_regular_files(tmp_path: Path, link: 
 
 
 @pytest.mark.parametrize(
-    ("target", "message"),
+    ("target", "message", "git"),
     [
-        ("../../../shared-skills/missing", "dangling symlink"),
-        ("../../../../outside", "outside"),
-        ("..", "symlink loop"),
+        ("../../../shared-skills/missing", "dangling symlink", True),
+        ("../../../../outside", "outside", True),
+        ("../../../shared-skills/review-loop", "outside", False),
+        ("..", "symlink loop", True),
+        ("review-loop", "symlink loop", True),
     ],
 )
-def test_bundle_rejects_unbundleable_symlinks(tmp_path: Path, target: str, message: str) -> None:
+def test_bundle_rejects_unbundleable_symlinks(
+    tmp_path: Path, target: str, message: str, git: bool
+) -> None:
     """Links that cannot be bundled fail instead of silently dropping the skill."""
-    agent = _agent_with_shared_skill(tmp_path / "checkout")
+    agent = _agent_with_shared_skill(tmp_path / "checkout", git=git)
     (tmp_path / "outside").mkdir()
     (agent / "skills" / "review-loop").symlink_to(Path(target))
 
