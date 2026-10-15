@@ -7175,6 +7175,9 @@ def create_runner_app(
         _begin_turn_slot=_begin_turn_slot,
         _claude_model_options_rows=_claude_model_options_rows,
         _codex_native_bridge_state_for_session=_codex_native_bridge_state_for_session,
+        _codex_native_bridge_state_and_dir_for_session=(
+            _codex_native_bridge_state_and_dir_for_session
+        ),
         _ensure_comment_relay_started=_ensure_comment_relay_started,
         _ensure_native_terminal_for_turn=_ensure_native_terminal_for_turn,
         _fetch_session_model_override=_fetch_session_model_override,
