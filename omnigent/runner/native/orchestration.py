@@ -9750,10 +9750,8 @@ async def _auto_create_claude_terminal(
         launch_model,
         extra={"session_id": session_id},
     )
-    # The per-harness startup command override from config
-    # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) is
-    # the same resolver the local-CLI native launch uses (see cli_native.py), so
-    # both terminal-creation paths honour one config surface.
+    # Resolve the per-harness config override (``harness.claude-native.{command,args}``)
+    # early so the stored-args filter below can compute the real launch cwd.
     from omnigent.config import load_effective_config  # noqa: FlagLocalImports
     from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
         resolve_harness_args,
@@ -9767,30 +9765,27 @@ async def _auto_create_claude_terminal(
         client_surface=resource_registry.client_surface(session_id),
     )
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
-    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
-    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
-    # and ``parent_os_env`` below, launch_terminal falls back to
-    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
-    # ``agent_os_env`` was already resolved above for ``prepare_bridge_dir``,
-    # so the terminal process and the bridge's sys_os_* tools agree.
+    # Inherit the agent's sandbox (and pass ``parent_os_env`` below): otherwise
+    # launch_terminal falls back to _default_sandbox_for_platform, overriding
+    # the YAML config; ``agent_os_env`` matches what prepare_bridge_dir resolved.
     claude_terminal_os_env = OSEnvSpec(
         type="caller_process",
         cwd=workspace,
         sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
     )
+    # Where Claude will run: an ``env --chdir`` launch wrapper can move it away
+    # from the workspace. Stored ``--mcp-config`` paths and trust seeding use it.
+    launch_cwd = _claude_terminal_launch_cwd(
+        TerminalEnvSpec(
+            os_env=claude_terminal_os_env,
+            command=launch_command,
+            args=resolve_harness_args("claude-native", (), cfg=_harness_cfg),
+            env=claude_terminal_env,
+            env_unset=claude_terminal_env_unset,
+        ),
+        agent_os_env,
+    )
     if session_launch_args:
-        # Stored ``--mcp-config`` paths are checked where Claude will run; an
-        # ``env --chdir`` launch wrapper can move that away from the workspace.
-        launch_cwd = _claude_terminal_launch_cwd(
-            TerminalEnvSpec(
-                os_env=claude_terminal_os_env,
-                command=launch_command,
-                args=resolve_harness_args("claude-native", (), cfg=_harness_cfg),
-                env=claude_terminal_env,
-                env_unset=claude_terminal_env_unset,
-            ),
-            agent_os_env,
-        )
         session_launch_args = drop_startup_fatal_claude_args(
             session_launch_args, workspace=launch_cwd
         )
@@ -9935,10 +9930,7 @@ async def _auto_create_claude_terminal(
     )
     # Seed trust and onboarding in the config selected by the terminal's launch environment.
     try:
-        ensure_claude_workspace_trusted(
-            _claude_terminal_launch_cwd(env_spec, agent_os_env),
-            env=_claude_terminal_launch_env(env_spec),
-        )
+        ensure_claude_workspace_trusted(launch_cwd, env=_claude_terminal_launch_env(env_spec))
     except BaseException as seed_error:
         # No forwarder owns the routers yet, so release the ones this launch started.
         # A ``None`` handle would shut down whichever router is registered now.

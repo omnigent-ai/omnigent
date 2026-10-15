@@ -121,9 +121,9 @@ def test_stored_missing_mcp_config_does_not_prevent_terminal_startup(
         metadata={"terminal_launch_args": ["--mcp-config", str(config)]},
     )
     session_id = str(created["session_id"])
-    config.unlink()
-    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
     try:
+        config.unlink()
+        bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
         outcome, status, trail = _await_startup(live_server, session_id)
         assert outcome == "up", (
             "claude-native session whose stored --mcp-config file was deleted "
