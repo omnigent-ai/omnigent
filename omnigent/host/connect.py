@@ -2711,6 +2711,7 @@ class HostProcess:
                     ],
                     title=local.title,
                     source=local.source,
+                    archived=local.archived,
                 ),
                 None,
             )

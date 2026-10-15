@@ -11,6 +11,10 @@ from omnigent.entities.conversation import synthesize_conversation_title
 
 ImportSource = Literal["claude", "codex", "kimi", "kiro", "opencode", "pi", "qwen"]
 
+# Upper bound on items in one imported session. The import API rejects a larger
+# session; the Codex loader may first trim it to its last compaction.
+MAX_IMPORT_ITEMS = 100_000
+
 IMPORT_SOURCE_LABEL_KEY = "omnigent.import.source"
 IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY = "omnigent.import.external_session_id"
 IMPORT_PROVENANCE_LABEL_KEYS = frozenset(
@@ -37,6 +41,9 @@ class LocalSessionImport:
     # title) when the transcript carried one; None to fall back to the first
     # user message.
     native_title: str | None = None
+    # Whether the harness had archived the session (Codex ``threads.archived`` or
+    # an ``archived_sessions/`` rollout); the import lands archived in Omnigent too.
+    archived: bool = False
 
     @property
     def title(self) -> str | None:

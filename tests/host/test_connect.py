@@ -8117,6 +8117,7 @@ async def test_handle_import_local_all_streams_a_frame_per_session(
             items=[item],
             title=f"{source} title",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -8171,6 +8172,7 @@ async def test_handle_import_local_exact_id_does_not_list_sessions(
             items=[item],
             title="Exact session",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -8233,6 +8235,7 @@ async def test_handle_import_local_reports_unreadable_sessions_as_failed(
             items=[item],
             title="ok",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -8306,6 +8309,7 @@ async def test_handle_import_local_unexpected_error_skips_only_that_session(
             items=[item],
             title="ok",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -8375,6 +8379,7 @@ async def test_handle_import_local_send_failure_skips_only_that_session(
             items=[item],
             title="ok",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -8431,6 +8436,7 @@ async def test_handle_import_local_send_connection_closed_aborts_batch(
             items=[item],
             title="ok",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -8487,6 +8493,7 @@ async def test_handle_import_local_slices_oversized_session_into_chunks(
             items=[item],
             title=f"{session_id} title",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -8561,6 +8568,7 @@ async def test_handle_import_local_legacy_server_skips_only_unsafe_session(
             items=[item],
             title=f"{session_id} title",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
