@@ -100,6 +100,7 @@ from omnigent.stores.conversation_store import (
     FORK_SOURCE_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    RUNNER_CREATOR_LABEL_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -3710,6 +3711,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from sqlalchemy import update
 
+        # Labels and bindings may live in separate databases. Revoke bootstrap
+        # access first so a failed binding write cannot restore old authority.
+        self.delete_label(conversation_id, RUNNER_CREATOR_LABEL_KEY)
+
         def write(session: Session) -> bool:
             stmt = (
                 update(SqlConversationMetadata)
@@ -3913,6 +3918,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``conversation_id``.
         """
 
+        self.delete_label(conversation_id, RUNNER_CREATOR_LABEL_KEY)
+
         def write(session: Session) -> SqlConversationMetadata:
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             if meta is None:
@@ -3955,6 +3962,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             exists for ``conversation_id``.
         """
 
+        self.delete_label(conversation_id, RUNNER_CREATOR_LABEL_KEY)
+
         def write(session: Session) -> SqlConversationMetadata:
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             if meta is None:
@@ -3989,6 +3998,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
         """
+
+        self.delete_label(conversation_id, RUNNER_CREATOR_LABEL_KEY)
 
         def write(session: Session) -> SqlConversationMetadata:
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))

@@ -318,13 +318,15 @@ def create_runner_tunnel_router(
 
     @router.post("/runners/{runner_id}/token")
     async def mint_runner_owner_token(request: Request, runner_id: str) -> dict[str, str | int]:
-        """Mint a short-lived owner bearer for a delegated runner.
+        """Mint a short-lived runner-confined bearer for a delegated runner.
 
         A host-launched or managed-sandbox runner does not inherit the host
         user's credential; it presents its server-minted tunnel binding token
         (``X-Omnigent-Runner-Tunnel-Token``) and the server returns a
-        short-lived owner JWT the runner then uses on its HTTP callbacks
-        (which gate on ``require_user``). This is the HTTP analog of the
+        short-lived JWT the runner then uses on its HTTP callbacks (which
+        gate on ``require_user``). The JWT authenticates as the session owner
+        but only on this runner's own routes and sessions (see
+        ``RunnerTokenConfinement``). This is the HTTP analog of the
         runner tunnel's binding-token handshake: the same SHA-256 gate
         (``token_bound_runner_id(token) == runner_id``) and the same
         owner resolution (``resolve_managed_runner_owner``), minting a
@@ -332,8 +334,8 @@ def create_runner_tunnel_router(
 
         The binding-token match is required unconditionally — the
         allow-list shortcut honored on some other runner-token checks is
-        deliberately NOT accepted here, because this endpoint issues a
-        full owner credential and delegated runners are token-bound.
+        deliberately NOT accepted here, because this endpoint issues an
+        owner-identity credential and delegated runners are token-bound.
 
         :param request: The incoming FastAPI request (carries the binding
             token header).
@@ -366,7 +368,9 @@ def create_runner_tunnel_router(
                 owner = await asyncio.to_thread(resolve_managed_runner_owner, runner_id)
             if owner is None:
                 raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
-            bearer = auth_provider.mint_runner_token(owner, _MANAGED_RUNNER_TOKEN_TTL_S)
+            bearer = auth_provider.mint_runner_token(
+                owner, _MANAGED_RUNNER_TOKEN_TTL_S, runner_id=runner_id
+            )
         if bearer is None:
             # oidc/accounts mint; header/proxy mode can't (identity is
             # asserted upstream). Signal clearly rather than 401.

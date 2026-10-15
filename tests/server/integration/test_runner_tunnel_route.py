@@ -1903,9 +1903,9 @@ class _MintingAuthProvider(_CredentialHeaderAuthProvider):
     ``tests/server/test_accounts.py``.
     """
 
-    def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
-        """Return a deterministic sentinel bearer for *user_id*."""
-        return f"minted-owner-token:{user_id}:{ttl_seconds}"
+    def mint_runner_token(self, user_id: str, ttl_seconds: int, *, runner_id: str) -> str | None:
+        """Return a deterministic sentinel bearer for *user_id* and *runner_id*."""
+        return f"minted-owner-token:{user_id}:{ttl_seconds}:{runner_id}"
 
 
 def _mint_route_app(
@@ -1985,7 +1985,8 @@ async def test_mint_token_endpoint_returns_owner_bearer_for_valid_binding_token(
 
     assert response.status_code == 200
     body = response.json()
-    assert body["token"] == "minted-owner-token:owner@example.com:1800"
+    # The endpoint confines the bearer to the path runner.
+    assert body["token"] == f"minted-owner-token:owner@example.com:1800:{runner_id}"
     assert isinstance(body["expires_at"], int)
     assert body["expires_at"] > 0
 

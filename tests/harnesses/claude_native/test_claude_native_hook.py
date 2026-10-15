@@ -409,7 +409,6 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
             "PATCH",
             "http://127.0.0.1:8787/v1/sessions/conv_old",
             {
-                "runner_id": "",
                 "labels": {"omnigent.claude_native.bridge_id": "conv_old-cleared"},
             },
         ),

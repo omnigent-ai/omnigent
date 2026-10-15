@@ -3912,7 +3912,17 @@ def create_app(
     def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
         assert runner_account_store is not None and auth_provider is not None
         return runner_account_store.with_runner_authority(
-            runner_id, lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds)
+            runner_id,
+            lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds, runner_id=runner_id),
+        )
+
+    if isinstance(auth_provider, UnifiedAuthProvider):
+        from omnigent.server.auth import runner_session_in_scope
+
+        auth_provider.set_runner_session_check(
+            lambda runner_id, session_id: runner_session_in_scope(
+                runner_id, session_id, conversation_store.get_conversation
+            )
         )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:

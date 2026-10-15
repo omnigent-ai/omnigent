@@ -634,3 +634,53 @@ Run service.yaml, a Helm chart, an HF Spaces config) plus a README
 that explains how to point that platform at `docker/Dockerfile`.
 
 Update this top-level README with a row in the table above.
+
+
+### Delegated runner credentials
+
+New runner bearer tokens are bound to their runner and its session tree. They
+cannot access account administration, other runners' sessions, host management,
+or scheduled-task APIs. Session creation stays on the creating runner; native
+session rotations and sub-agents retain that binding. Interactive user clients
+continue using their own credentials for account-wide operations. Runner
+credentials still follow account password rotation and deletion.
+
+Runner-created sessions receive temporary bootstrap access until their first
+binding attempt. Binding, transfer, and detach consume that permission before
+changing metadata, so a detached session cannot regain access through its old
+creator label. It may still inherit access from its nearest current runner
+binding, subject to the placement limit below. When separate databases are
+configured, revocation commits first; if
+the subsequent initial binding fails, the owner must retry the binding with
+interactive credentials. A runner may reuse agent definitions uploaded by its
+owner, but that does not grant access to other sessions' transcripts.
+
+Runner tools that require account-wide access are unavailable with these tokens:
+`sys_scheduled_task_create/list/update/delete` and tools listing all sessions.
+Use an interactive user client for those operations. Session-local operations
+and permitted child-session work continue with delegated credentials. Older
+runners may still advertise unavailable tools and receive authentication errors;
+this requires an approved compatibility transition before deployment.
+
+Previously issued unscoped runner bearers remain valid until their original
+expiry. Restart runners after upgrading to obtain scoped credentials; use
+password rotation to revoke earlier account credentials immediately when needed.
+
+Inherited scope is limited to 32 parent edges (33 indexed session lookups,
+including the target). Directly bound sessions and runner-created sessions with
+an active bootstrap label are unaffected by their total nesting depth. Before
+rotating credentials, explicitly bind any active unbound session whose nearest
+runner binding is more than 32 parent edges away. An owner can do this with
+`PATCH /v1/sessions/{id}` and `{"runner_id": "<runner-id>"}`. This also restores
+access after a deep detached subtree reaches the limit. A nearer conflicting
+binding still denies inherited access. This placement limit and the loss of
+account-wide tools require explicit maintainer approval before rollout.
+
+Custom `AuthProvider` implementations must accept the `runner_id` keyword in
+`mint_runner_token` and bind newly minted credentials to that runner. Update
+overrides before deploying the server; the mint route passes this argument.
+
+Claude-native `/clear` transfers the terminal and posts the old conversation's
+idle status, continuation message, and redirect before detaching its runner.
+Child interrupts check the parent runner binding. MCP elicitation requests are
+mirrored only to ancestors within the runner's scope.

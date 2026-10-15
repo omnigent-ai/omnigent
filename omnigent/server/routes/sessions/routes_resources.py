@@ -51,6 +51,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    require_runner_session_scope,
 )
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.permissions import check_session_access
@@ -1523,6 +1524,8 @@ def register_resources_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         await _validate_session(target_session_id, request, LEVEL_EDIT)
+        # The transfer re-points the target at this terminal's host.
+        require_runner_session_scope(request, target_session_id)
 
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer"
         status, payload = await _proxy_post_to_runner(
@@ -2060,6 +2063,7 @@ def register_resources_routes(
                 "Source session is not an ancestor of this session",
                 code=ErrorCode.FORBIDDEN,
             )
+        require_runner_session_scope(request, body.source_session_id)
 
         # Validate every source file WITHOUT reading a blob, enforcing the copy
         # limits before any blob is read. Summing StoredFile.bytes here means

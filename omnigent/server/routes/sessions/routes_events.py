@@ -84,6 +84,8 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    require_runner_session_scope,
+    runner_token_confinement,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -1475,6 +1477,8 @@ def register_events_routes(
                         code=ErrorCode.INVALID_INPUT,
                     )
                 target_session_id = conv.parent_conversation_id
+                # Interrupts are HTTP-only; the tunnel event allowlist excludes them.
+                require_runner_session_scope(cast(Request, request), target_session_id)
                 interrupt_payload.update(
                     codex_side_thread_id=child_thread_id,
                     codex_side_turn_id=response_id.removeprefix("codex_"),
@@ -1704,6 +1708,8 @@ def register_events_routes(
                 conversation_store,
                 session_id,
                 _mcp_elicit_payload,
+                # MCP elicitations are also excluded from the tunnel event allowlist.
+                confinement=runner_token_confinement(cast(Request, request)),
             )
             return {"queued": False, "elicitation_id": elicit_id}
         if body.type == _COMPACT_TYPE:

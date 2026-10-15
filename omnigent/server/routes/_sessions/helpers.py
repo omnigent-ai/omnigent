@@ -114,6 +114,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
+    RunnerTokenConfinement,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
@@ -1533,6 +1534,8 @@ def _targeted_elicitation_event(
 def _ancestor_session_ids(
     conv_store: ConversationStore,
     session_id: str,
+    *,
+    allows_session: Callable[[str], bool] | None = None,
 ) -> list[str]:
     """
     Return ancestor session ids for a session, nearest parent first.
@@ -1540,6 +1543,7 @@ def _ancestor_session_ids(
     :param conv_store: Store used to read conversation parent links.
     :param session_id: Session to walk upward from, e.g.
         ``"conv_child123"``.
+    :param allows_session: Stop before the first ancestor outside the caller's scope.
     :returns: Ancestor ids in parent-to-root order. Empty when the
         session is top-level or missing.
     """
@@ -1549,6 +1553,8 @@ def _ancestor_session_ids(
     while current is not None and current.parent_conversation_id is not None:
         parent_id = current.parent_conversation_id
         if parent_id in seen:
+            break
+        if allows_session is not None and not allows_session(parent_id):
             break
         ancestors.append(parent_id)
         seen.add(parent_id)
@@ -1560,6 +1566,8 @@ def _publish_elicitation_request_to_ancestors(
     conv_store: ConversationStore,
     session_id: str,
     event: dict[str, Any],
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> None:
     """
     Mirror a child elicitation request into each ancestor stream.
@@ -1568,9 +1576,14 @@ def _publish_elicitation_request_to_ancestors(
     :param session_id: Child session that owns the elicitation,
         e.g. ``"conv_child123"``.
     :param event: Original ``response.elicitation_request`` event.
+    :param confinement: Runner scope to apply to each ancestor, when present.
     """
     mirrored = _targeted_elicitation_event(event, target_session_id=session_id)
-    for ancestor_id in _ancestor_session_ids(conv_store, session_id):
+    for ancestor_id in _ancestor_session_ids(
+        conv_store,
+        session_id,
+        allows_session=confinement.allows_session if confinement is not None else None,
+    ):
         session_stream.publish(ancestor_id, mirrored)
 
 
