@@ -483,6 +483,80 @@ check_bubblewrap() {
   fi
 }
 
+# ── Shared-install upgrade safety ────────────────────────────────────────────
+#
+# Several hosts on one machine can run this installer at the same moment (for
+# example when they see a new build on the same auto-upgrade poll), and host,
+# runner, and session processes keep executing from the shared tool env — each
+# fresh process rewrites __pycache__ entries in it. A plain
+# `uv tool install --force` upgrades that env in place: uv's removal of the
+# live directory races those writers, can abort half-deleted (ENOTEMPTY), and
+# leaves an install without a usable bin/. So installer runs serialize on a
+# lock, the previous env is parked aside with an atomic rename (uv then always
+# builds into a fresh directory), and a failed install restores the parked env.
+
+INSTALL_LOCK_DIR=
+
+release_install_lock() {
+  if [ -n "$INSTALL_LOCK_DIR" ]; then
+    rm -rf "$INSTALL_LOCK_DIR"
+    INSTALL_LOCK_DIR=
+  fi
+}
+
+# Take the cross-process installer lock inside the uv tool dir ($1). mkdir is
+# the portable atomic lock; a lock whose recorded owner process is gone is
+# stale (a crashed installer) and is reclaimed.
+acquire_install_lock() {
+  lock_dir="$1/.$PACKAGE_NAME-installer.lock"
+  lock_waiting=false
+  lock_deadline=$(($(date +%s) + 600))
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    lock_owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    if [ -n "$lock_owner" ] && ! kill -0 "$lock_owner" 2>/dev/null \
+      && ! ps -p "$lock_owner" >/dev/null 2>&1; then
+      rm -rf "$lock_dir"
+      continue
+    fi
+    if [ "$lock_waiting" = false ]; then
+      step "Waiting for another omnigent install to finish"
+      lock_waiting=true
+    fi
+    if [ "$(date +%s)" -ge "$lock_deadline" ]; then
+      fail "Another install has held $lock_dir for over 10 minutes. If no omnigent install is running, remove that directory and rerun."
+    fi
+    sleep 1
+  done
+  printf '%s\n' "$$" >"$lock_dir/pid"
+  INSTALL_LOCK_DIR="$lock_dir"
+  trap release_install_lock EXIT
+}
+
+# Best-effort removal of a tool env that is no longer the live install.
+# Processes still executing from it keep recreating __pycache__ entries, so
+# removal can race; retry, then leave the hidden directory for a later
+# installer run to reap.
+remove_parked_env() {
+  for _ in 1 2 3; do
+    rm -rf "$1" 2>/dev/null || true
+    if [ ! -e "$1" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  verbose "Could not fully remove $1; a later install will retry."
+}
+
+# Reap parked envs left behind by earlier installer runs (crashed, or their
+# removal raced live processes). Runs under the installer lock.
+reap_parked_envs() {
+  for parked in "$1/.$PACKAGE_NAME-old."*; do
+    if [ -e "$parked" ]; then
+      remove_parked_env "$parked"
+    fi
+  done
+}
+
 install_omnigent() {
   # Default: the published PyPI wheel (`omnigent`, optionally `omnigent==X`).
   # The wheel ships the prebuilt web UI, so there is no npm/Node step and no
@@ -512,9 +586,43 @@ install_omnigent() {
     target="${PACKAGE_NAME}${extras_suffix}"
     step "Installing Omnigent${extras_suffix:+ $extras_suffix} (Python $PYTHON_VERSION)"
   fi
+  tools_dir="$(uv tool dir)"
+  tool_env="$tools_dir/$PACKAGE_NAME"
+  mkdir -p "$tools_dir"
+  acquire_install_lock "$tools_dir"
+  reap_parked_envs "$tools_dir"
+
+  # Park the previous env with an atomic rename so uv never has to delete a
+  # directory that live processes are still writing into.
+  parked_env=
+  if [ -d "$tool_env" ]; then
+    parked_env="$tools_dir/.$PACKAGE_NAME-old.$$"
+    mv "$tool_env" "$parked_env"
+  fi
+
+  install_status=0
   # --force so re-running upgrades instead of no-op'ing; -q hides uv's
   # "Installed N executables" summary (the package also ships an `omni` alias).
-  run_with_spinner "uv tool install" uv tool install --force -q --python "$PYTHON_VERSION" "$target"
+  run_with_spinner "uv tool install" uv tool install --force -q --python "$PYTHON_VERSION" "$target" || install_status=$?
+
+  if [ "$install_status" -ne 0 ]; then
+    if [ -n "$parked_env" ] && [ -e "$parked_env" ]; then
+      if [ -e "$tool_env" ]; then
+        remove_parked_env "$tool_env"
+      fi
+      if [ ! -e "$tool_env" ]; then
+        mv "$parked_env" "$tool_env"
+        warn "Install failed; the previous omnigent install was restored."
+      fi
+    fi
+    exit "$install_status"
+  fi
+
+  if [ -n "$parked_env" ]; then
+    remove_parked_env "$parked_env"
+  fi
+  # The lock stays held through verify_omnigent (released in main): another
+  # installer starting now would park this fresh env and break the verify run.
 }
 
 uv_tool_bin_dir() {
@@ -681,6 +789,7 @@ main() {
   install_omnigent
   bin_dir="$(uv_tool_bin_dir)"
   verify_omnigent "$bin_dir"
+  release_install_lock
   maybe_add_bin_to_path "$bin_dir"
   write_install_ledger "$bin_dir"
   print_next_steps "$bin_dir"
