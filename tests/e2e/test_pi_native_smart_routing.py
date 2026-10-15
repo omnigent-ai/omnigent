@@ -26,23 +26,22 @@ pexpect + fake ``HOME`` + mock-model-server CLI e2e).
 from __future__ import annotations
 
 import contextlib
-import glob
 import json
 import os
 import re
 import signal
-import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+from tests._helpers.live_server import isolated_process_env
 from tests.e2e._harness_probes import cli_unavailable_reason
+from tests.e2e.conftest import configure_mock_llm, get_mock_requests
 
 pexpect = pytest.importorskip("pexpect")
 
@@ -58,58 +57,42 @@ _DEFAULT_MODEL = "gpt-fake-5-1"
 _TARGET_MODEL = "gpt-fake-5-2"
 _JUDGE_MODEL = "mock-judge"
 _COMPLEX_PROMPT = "Refactor the whole module and add tests; this is a complex, multi-file task."
-_LAUNCH_TIMEOUT = 240
-_TURN_TIMEOUT = 180
-
-
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+_LAUNCH_TIMEOUT = 120
+_TURN_TIMEOUT = 60
 
 
 @pytest.fixture
-def mock_llm() -> Iterator[str]:
-    """Start the shared mock model server (pi gateway + routing judge)."""
-    port = _free_port()
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            str(_REPO_ROOT / "tests/server/integration/mock_llm_server.py"),
-            str(port),
-        ],
-        env={**os.environ, "PYTHONPATH": str(_REPO_ROOT)},
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-    )
-    base = f"http://127.0.0.1:{port}"
-    deadline = time.monotonic() + 20
-    ready = False
-    while time.monotonic() < deadline:
-        with contextlib.suppress(Exception):
-            if httpx.get(f"{base}/stats", timeout=1).status_code == 200:
-                ready = True
-                break
-        time.sleep(0.2)
-    if not ready:
-        proc.kill()
-        pytest.skip("mock model server did not boot")
-    # A plain assistant reply for either model id, so a served turn always
-    # completes regardless of which model the pane ends up on.
+def mock_llm(isolated_mock_llm_server_url: str) -> str:
+    """Script the existing isolated mock for the pane and routing judge."""
     for key, text in (
         (_DEFAULT_MODEL, "PONG-DEFAULT"),
         (_TARGET_MODEL, "PONG-TARGET"),
         ("default", "PONG"),
     ):
-        httpx.post(f"{base}/mock/set_fallback", json={"key": key, "text": text}, timeout=10)
-    try:
-        yield base
-    finally:
-        proc.send_signal(signal.SIGTERM)
-        with contextlib.suppress(Exception):
-            proc.wait(timeout=5)
+        response = httpx.post(
+            f"{isolated_mock_llm_server_url}/mock/set_fallback",
+            json={"key": key, "text": text},
+            timeout=10,
+        )
+        response.raise_for_status()
+    configure_mock_llm(
+        isolated_mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "routing-tool",
+                        "name": "bash",
+                        "arguments": '{"command":"printf PI_ROUTING_TOOL_RESULT"}',
+                    }
+                ]
+            },
+            {"text": "ROUTED_FIRST_ANSWER", "stream": True},
+            {"text": "ROUTED_FOLLOWUP_ANSWER", "stream": True},
+        ],
+        key=_TARGET_MODEL,
+    )
+    return isolated_mock_llm_server_url
 
 
 @pytest.fixture
@@ -141,26 +124,26 @@ def pi_home(tmp_path: Path, mock_llm: str) -> Path:
 
 
 def _env(pi_home: Path) -> dict[str, str]:
-    env = {
-        **os.environ,
-        "HOME": str(pi_home),
-        "OMNIGENT_CONFIG_HOME": str(pi_home / ".omnigent"),
-        "OMNIGENT_SKIP_ONBOARD": "1",
-        "PYTHONPATH": os.pathsep.join(
-            str(p)
-            for p in (
-                _REPO_ROOT,
-                _REPO_ROOT / "sdks" / "python-client",
-                _REPO_ROOT / "sdks" / "ui",
-            )
-        ),
-        "TERM": "xterm-256color",
-        "PROMPT_TOOLKIT_NO_CPR": "1",
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
+    base_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("OMNIGENT_", "RUNNER_", "PI_", "OPENAI_", "ANTHROPIC_"))
+        and key != "TMUX"
     }
-    env.pop("OMNIGENT_CONFIG", None)
-    return env
+    return isolated_process_env(
+        pi_home,
+        {
+            "OMNIGENT_CONFIG_HOME": str(pi_home / ".omnigent"),
+            "OMNIGENT_PI_PATH": os.environ.get("OMNIGENT_PI_PATH"),
+            "OMNIGENT_SKIP_ONBOARD": "1",
+            "OMNIGENT_NO_UPDATE_CHECK": "1",
+            "PI_OFFLINE": "1",
+            "PI_TELEMETRY": "0",
+            "TERM": "xterm-256color",
+            "PROMPT_TOOLKIT_NO_CPR": "1",
+        },
+        base_env,
+    )
 
 
 def _launch_pi(env: dict[str, str]) -> tuple[Any, str, str]:
@@ -176,50 +159,36 @@ def _launch_pi(env: dict[str, str]) -> tuple[Any, str, str]:
         dimensions=(40, 140),
         timeout=_LAUNCH_TIMEOUT,
     )
-    child.expect(r"Web UI:\s*(\S+)", timeout=_LAUNCH_TIMEOUT)
-    web_url = child.match.group(1)
-    match = re.match(r"(https?://[^/]+)/c/(\S+)", web_url)
-    assert match, f"could not parse Web UI url: {web_url!r}"
-    return child, match.group(1), match.group(2)
+    child.logfile_read = (Path(env["HOME"]) / "terminal.txt").open("w")
+    try:
+        child.expect(r"Web UI:\s*(\S+)", timeout=_LAUNCH_TIMEOUT)
+        web_url = child.match.group(1)
+        match = re.match(r"(https?://[^/]+)/c/(\S+)", web_url)
+        assert match, f"could not parse Web UI url: {web_url!r}"
+        return child, match.group(1), match.group(2)
+    except BaseException:
+        _teardown(child, env)
+        raise
 
 
-def _find_pi_pane() -> tuple[str, str] | None:
-    """Locate the runner-owned tmux socket + pane hosting the pi TUI.
-
-    The pi TUI runs in a runner-owned tmux pane; a keystroke typed by the user
-    reaches it through that pane, so ``tmux send-keys`` is how we type - a
-    pexpect stdin write to ``omnigent pi`` never reaches the pane's input box.
-    """
-    socks = set(glob.glob("/tmp/**/omnigent-terminal-*/tmux.sock", recursive=True))
-    with contextlib.suppress(Exception):
-        out = subprocess.run(
-            ["ps", "-eo", "args"], capture_output=True, text=True, timeout=10
-        ).stdout
-        for line in out.splitlines():
-            m = re.search(r"-S\s+(\S+tmux\.sock)", line)
-            if m:
-                socks.add(m.group(1))
-    for sock in sorted(socks):
-        with contextlib.suppress(Exception):
-            panes = subprocess.run(
-                ["tmux", "-S", sock, "list-panes", "-a", "-F", "#{pane_id}"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            ).stdout.split()
-            if panes:
-                return sock, panes[0]
-    return None
+def _find_pi_pane(server: str, conv: str) -> tuple[str, str]:
+    """Use only the terminal registered to this test's session."""
+    response = httpx.get(
+        f"{server}/v1/sessions/{conv}/resources/terminals/terminal_pi_main", timeout=10
+    )
+    response.raise_for_status()
+    metadata = response.json()["metadata"]
+    return metadata["tmux_socket"], metadata["tmux_target"]
 
 
 def _tmux_type(pane: tuple[str, str], text: str) -> None:
     sock, pane_id = pane
     subprocess.run(
-        ["tmux", "-S", sock, "send-keys", "-t", pane_id, "-l", text], check=False, timeout=10
+        ["tmux", "-S", sock, "send-keys", "-t", pane_id, "-l", text], check=True, timeout=10
     )
     time.sleep(0.5)
     subprocess.run(
-        ["tmux", "-S", sock, "send-keys", "-t", pane_id, "Enter"], check=False, timeout=10
+        ["tmux", "-S", sock, "send-keys", "-t", pane_id, "Enter"], check=True, timeout=10
     )
 
 
@@ -258,22 +227,22 @@ def _judge_call_count(mock: str) -> int:
 def _enable_smart_routing(server: str, conv: str) -> None:
     httpx.patch(
         f"{server}/v1/sessions/{conv}", json={"cost_control_mode_override": "on"}, timeout=30
-    )
+    ).raise_for_status()
     if _snapshot(server, conv).get("model_override"):
-        httpx.patch(f"{server}/v1/sessions/{conv}", json={"model_override": None}, timeout=30)
+        httpx.patch(
+            f"{server}/v1/sessions/{conv}", json={"model_override": None}, timeout=30
+        ).raise_for_status()
 
 
 def _configure_judge_from_options(mock: str, server: str, conv: str) -> None:
     """Point the routing judge at a real non-default pushed model option.
 
     The pane pushes its ``external_model_options`` on start; the snapshot
-    serves them. The router clamps an unknown pick to the cheapest candidate,
-    so the judge must return an id that is actually in the menu. Falls back to
-    the bare target id when options are not yet exposed (the buggy build fails
-    either way, having no candidates at all).
+    serves them. Require the target in that menu so an unknown-model fallback
+    cannot mask the routing behavior.
     """
-    pick = _TARGET_MODEL
-    deadline = time.monotonic() + 90
+    pick = None
+    deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
         options = _snapshot(server, conv).get("model_options") or []
         target = next(
@@ -290,6 +259,7 @@ def _configure_judge_from_options(mock: str, server: str, conv: str) -> None:
             pick = target
             break
         time.sleep(3)
+    assert pick is not None, "Pi did not publish the target model in its live options"
     verdict = json.dumps(
         {
             "harness": "pi-native",
@@ -301,17 +271,22 @@ def _configure_judge_from_options(mock: str, server: str, conv: str) -> None:
         f"{mock}/mock/configure",
         json={"key": _JUDGE_MODEL, "responses": [{"text": verdict}] * 12},
         timeout=10,
-    )
+    ).raise_for_status()
 
 
-def _await_served_turn(mock: str, before: int) -> list[str]:
+def _await_answer(child: Any, server: str, conv: str, marker: str) -> list[dict[str, Any]]:
     deadline = time.monotonic() + _TURN_TIMEOUT
+    items: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
-        served = _served_pi_models(mock)
-        if len(served) > before:
-            return served[before:]
-        time.sleep(2)
-    return []
+        with contextlib.suppress(pexpect.TIMEOUT):
+            child.read_nonblocking(65536, timeout=0.1)
+        response = httpx.get(f"{server}/v1/sessions/{conv}/items", timeout=10)
+        response.raise_for_status()
+        items = response.json().get("data", [])
+        if any(item.get("role") == "assistant" and marker in json.dumps(item) for item in items):
+            return items
+        time.sleep(0.2)
+    raise AssertionError(f"Pi did not mirror {marker}: {items[-8:]}")
 
 
 def _diagnostics(mock: str, server: str, conv: str, served: list[str]) -> str:
@@ -323,89 +298,72 @@ def _diagnostics(mock: str, server: str, conv: str, served: list[str]) -> str:
     )
 
 
-def test_pi_native_smart_routing_composer_turn_applies_pick(pi_home: Path, mock_llm: str) -> None:
-    """A composer (web) turn with Smart Routing on runs on the ROUTED model.
-
-    Buggy build: the router finds no pi-native candidates, is never consulted,
-    records no decision, and the turn is served on the default model.
-    """
+@pytest.mark.parametrize("surface", ["composer", "tui"])
+def test_pi_native_smart_routing_applies_pick(pi_home: Path, mock_llm: str, surface: str) -> None:
+    """Route before inference, then preserve the tool result on the next turn."""
     env = _env(pi_home)
     child, server, conv = _launch_pi(env)
     try:
         child.expect(_DEFAULT_MODEL, timeout=_LAUNCH_TIMEOUT)
-        time.sleep(8)  # let the pane's model registry push its options
         _enable_smart_routing(server, conv)
         _configure_judge_from_options(mock_llm, server, conv)
+        pane = _find_pi_pane(server, conv) if surface == "tui" else None
 
-        before = len(_served_pi_models(mock_llm))
-        resp = httpx.post(
-            f"{server}/v1/sessions/{conv}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": _COMPLEX_PROMPT,
-                        }
-                    ],
-                },
-            },
-            timeout=60,
-        )
-        assert resp.status_code in (200, 202), (
-            f"composer POST failed: {resp.status_code} {resp.text[:300]}"
-        )
-
-        served = _await_served_turn(mock_llm, before)
-        diag = _diagnostics(mock_llm, server, conv, served)
-        assert served, (
-            f"composer turn produced no served pi request within {_TURN_TIMEOUT}s. {diag}"
-        )
-        assert _TARGET_MODEL in served, (
-            "Smart Routing pick was not applied to the pi-native composer turn: "
-            f"the turn was served on the default model, not the routed {_TARGET_MODEL!r}. {diag}"
-        )
-    finally:
-        _teardown(child, env)
-
-
-def test_pi_native_smart_routing_tui_prompt_is_routed(pi_home: Path, mock_llm: str) -> None:
-    """A prompt typed into the Pi TUI with Smart Routing on runs on the ROUTED model.
-
-    Buggy build: a TUI-typed prompt bypasses the route gate entirely (no
-    ``UserPromptSubmit`` hook for pi-native), so the judge is never consulted
-    and the turn is served on the default model.
-    """
-    env = _env(pi_home)
-    child, server, conv = _launch_pi(env)
-    try:
-        child.expect(_DEFAULT_MODEL, timeout=_LAUNCH_TIMEOUT)
-        time.sleep(10)  # let the runner-owned pane + extension settle
-        _enable_smart_routing(server, conv)
-        _configure_judge_from_options(mock_llm, server, conv)
-
-        pane = _find_pi_pane()
-        assert pane is not None, "could not locate the runner-owned pi tmux pane to type into"
+        def send(text: str) -> None:
+            if pane is not None:
+                _tmux_type(pane, text)
+            else:
+                response = httpx.post(
+                    f"{server}/v1/sessions/{conv}/events",
+                    json={
+                        "type": "message",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": text}],
+                        },
+                    },
+                    timeout=30,
+                )
+                assert response.status_code in (200, 202), response.text
 
         judge_before = _judge_call_count(mock_llm)
-        before = len(_served_pi_models(mock_llm))
-        _tmux_type(pane, _COMPLEX_PROMPT)
+        send(_COMPLEX_PROMPT)
+        _await_answer(child, server, conv, "ROUTED_FIRST_ANSWER")
+        served = _served_pi_models(mock_llm)
+        assert served == [_TARGET_MODEL, _TARGET_MODEL], _diagnostics(
+            mock_llm, server, conv, served
+        )
+        assert _judge_call_count(mock_llm) > judge_before
+        judge_after = _judge_call_count(mock_llm)
 
-        served = _await_served_turn(mock_llm, before)
-        diag = _diagnostics(mock_llm, server, conv, served)
-        assert served, (
-            f"TUI-typed prompt produced no served pi request within {_TURN_TIMEOUT}s. {diag}"
+        send("What did the command return?")
+        items = _await_answer(child, server, conv, "ROUTED_FOLLOWUP_ANSWER")
+        assert _served_pi_models(mock_llm) == [_TARGET_MODEL] * 3
+        assert _judge_call_count(mock_llm) == judge_after
+        requests = get_mock_requests(mock_llm, key=_TARGET_MODEL)
+        history = requests[-1]["messages"]
+        assert any(
+            message.get("role") == "tool"
+            and message.get("tool_call_id") == "routing-tool"
+            and message.get("content") == "PI_ROUTING_TOOL_RESULT"
+            for message in history
         )
-        assert _judge_call_count(mock_llm) > judge_before, (
-            "the TUI-typed prompt was never routed: the routing judge was not "
-            f"consulted (no UserPromptSubmit route-turn hook for pi-native). {diag}"
+        assert any(
+            message.get("role") == "assistant" and message.get("content") == "ROUTED_FIRST_ANSWER"
+            for message in history
         )
-        assert _TARGET_MODEL in served, (
-            "Smart Routing pick was not applied to the pi-native TUI turn: "
-            f"the turn was served on the default model, not the routed {_TARGET_MODEL!r}. {diag}"
+        (pi_home / "routing-evidence.json").write_text(
+            json.dumps({"surface": surface, "requests": requests, "items": items}, indent=2)
         )
+    except BaseException:
+        with contextlib.suppress(httpx.HTTPError):
+            (pi_home / "routing-failure.json").write_text(
+                json.dumps(
+                    {"requests": get_mock_requests(mock_llm), "session": _snapshot(server, conv)},
+                    indent=2,
+                )
+            )
+        raise
     finally:
         _teardown(child, env)
 
@@ -422,6 +380,9 @@ def _teardown(child: Any, env: dict[str, str]) -> None:
     time.sleep(2)
     with contextlib.suppress(Exception):
         child.kill(signal.SIGKILL)
+    child.close(force=True)
+    if child.logfile_read is not None:
+        child.logfile_read.close()
     omni_bin = Path(sys.executable).parent / "omni"
     if omni_bin.exists():
         with contextlib.suppress(Exception):
