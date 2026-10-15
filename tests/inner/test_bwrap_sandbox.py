@@ -417,6 +417,67 @@ def test_wrap_launcher_argv_starts_with_bwrap_and_ends_with_command(
     ]
 
 
+def test_launch_fingerprint_tracks_new_and_replaced_masked_dotfiles(tmp_path: Path) -> None:
+    """A new dotfile, or one atomically replaced under its mask, changes the fingerprint."""
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    argv = [sys.executable, "-c", "pass"]
+    (tmp_path / ".env").write_text("old")
+    launched = backend.launch_fingerprint(argv, policy, tmp_path)
+    assert backend.launch_fingerprint(argv, policy, tmp_path) == launched
+
+    replacement = tmp_path / "env.new"
+    replacement.write_text("new")
+    os.replace(replacement, tmp_path / ".env")
+    replaced = backend.launch_fingerprint(argv, policy, tmp_path)
+    assert replaced != launched
+
+    (tmp_path / ".npmrc").write_text("token")
+    assert backend.launch_fingerprint(argv, policy, tmp_path) != replaced
+
+
+def test_launch_fingerprint_tracks_granted_roots_but_not_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retargeted roots and replaced default files count; per-launch scratch churn does not."""
+    import dataclasses
+
+    import omnigent.inner.bwrap_sandbox as bwrap_module
+
+    etc_file = tmp_path / "resolv.conf"
+    etc_file.write_text("nameserver 192.0.2.1\n")
+    monkeypatch.setattr(bwrap_module, "_DEFAULT_ETC_FILES", (str(etc_file),))
+    backend = _make_backend()
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    granted = tmp_path / "granted"
+    granted.symlink_to(tmp_path / "a")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    policy = dataclasses.replace(
+        _make_policy(cwd, read_roots=[granted], write_roots=[scratch]),
+        mask_scan_skip_roots=[scratch],
+    )
+    argv = [sys.executable, "-c", "pass"]
+    launched = backend.launch_fingerprint(argv, policy, cwd)
+
+    (scratch / ".cache").mkdir()
+    (scratch / "replaced").mkdir()
+    assert backend.launch_fingerprint(argv, policy, cwd) == launched
+
+    replacement = tmp_path / "resolv.conf.new"
+    replacement.write_text("nameserver 192.0.2.2\n")
+    os.replace(replacement, etc_file)
+    refreshed = backend.launch_fingerprint(argv, policy, cwd)
+    assert refreshed != launched
+
+    granted.unlink()
+    granted.symlink_to(tmp_path / "b")
+    assert backend.launch_fingerprint(argv, policy, cwd) != refreshed
+
+
 def test_wrap_launcher_argv_includes_required_mounts_and_chdir(
     tmp_path: Path,
 ) -> None:
