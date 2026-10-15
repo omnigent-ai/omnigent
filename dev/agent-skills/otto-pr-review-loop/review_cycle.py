@@ -27,7 +27,10 @@ PERMISSIONS = {"admin", "write"}
 
 class GitHubError(RuntimeError):
     def __init__(self, error: subprocess.CalledProcessError):
-        detail = (error.stderr or "").strip() or str(error)
+        stderr = error.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        detail = stderr.strip() or str(error)
         status = re.search(r"\(HTTP (\d{3})\)", detail)
         self.status = int(status[1]) if status else None
         super().__init__(detail)
@@ -129,6 +132,7 @@ def review_attempts(repository, number, head, reviewer, request, default_branch=
                 )
             )
         # Active runs on the first page are returned again by the status pages.
+        # Runs without an id are kept rather than risk dropping an active one.
         seen, unique = set(), []
         for run in runs:
             if run.get("id") not in seen:
@@ -183,7 +187,6 @@ def artifact_zip(repository, artifact_id):
             timeout=120,
         ).stdout
     except subprocess.CalledProcessError as exc:
-        exc.stderr = (exc.stderr or b"").decode(errors="replace")
         raise GitHubError(exc) from exc
 
 
@@ -216,14 +219,14 @@ def completed_zero_findings(repository, number, head, comments, artifacts):
     }
     if not summary_urls:
         return False
-    error = None
+    errors = []
     for artifact_id in artifacts.values():
         if not artifact_id:
             continue
         try:
             receipt = ocr_receipt(repository, artifact_id)
         except (RuntimeError, ValueError) as exc:
-            error = exc
+            errors.append(exc)
             continue
         if (
             receipt.get("pr") == number
@@ -232,9 +235,10 @@ def completed_zero_findings(repository, number, head, comments, artifacts):
             and receipt["summary_url"] in summary_urls
         ):
             return True
-    # Without a valid receipt, report why rather than presenting a quiet gap.
-    if error is not None:
-        raise error
+    # An unreadable artifact may hold the matching receipt, so report why instead
+    # of quietly treating the review as incomplete.
+    if errors:
+        raise RuntimeError("; ".join(str(exc) for exc in errors)) from errors[-1]
     return False
 
 

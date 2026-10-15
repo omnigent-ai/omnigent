@@ -775,7 +775,7 @@ def test_zero_findings_skips_an_unreadable_receipt_artifact(monkeypatch, valid_s
 
     def read(repository, artifact_id):
         if artifact_id == 1 or not valid_second:
-            raise RuntimeError("Invalid OCR completion artifact")
+            raise RuntimeError(f"Invalid OCR completion artifact {artifact_id}")
         return receipt
 
     monkeypatch.setattr(cycle, "ocr_receipt", read)
@@ -784,8 +784,11 @@ def test_zero_findings_skips_an_unreadable_receipt_artifact(monkeypatch, valid_s
         assert cycle.completed_zero_findings("o/r", 7, "a" * 40, comments, artifacts)
     else:
         # No readable receipt: fail closed and say why.
-        with pytest.raises(RuntimeError, match="Invalid OCR completion artifact"):
+        with pytest.raises(RuntimeError) as raised:
             cycle.completed_zero_findings("o/r", 7, "a" * 40, comments, artifacts)
+        assert str(raised.value) == (
+            "Invalid OCR completion artifact 1; Invalid OCR completion artifact 2"
+        )
 
 
 @pytest.mark.parametrize(
@@ -815,8 +818,9 @@ def test_download_ocr_completion_receipt(monkeypatch, payload):
     if payload == "valid":
         assert cycle.ocr_receipt("o/r", 123) == expected
     elif payload == "http_error":
-        with pytest.raises(cycle.GitHubError, match="HTTP 403"):
+        with pytest.raises(cycle.GitHubError, match="HTTP 403") as raised:
             cycle.ocr_receipt("o/r", 123)
+        assert raised.value.__cause__.stderr == b"HTTP 403"
     else:
         with pytest.raises((RuntimeError, ValueError, subprocess.CalledProcessError)):
             cycle.ocr_receipt("o/r", 123)
