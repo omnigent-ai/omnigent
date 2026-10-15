@@ -1701,7 +1701,7 @@ class ClaudeSDKExecutor(Executor):
         # ``--plugin-dir <bundle>`` produces clean
         # ``<agent-name>:<skill-name>`` labels in Claude's skill
         # listing instead of the auto-derived tmpdir basename.
-        if self._bundle_dir is not None:
+        if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
             try:
                 ensure_bundle_plugin_manifest(self._bundle_dir, self._agent_name)
             except OSError as exc:
@@ -2676,7 +2676,7 @@ class ClaudeSDKExecutor(Executor):
         # ``name`` (and thus the skill-listing prefix) comes from
         # the manifest written at construction time.
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
-        if self._bundle_dir is not None:
+        if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
             bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,

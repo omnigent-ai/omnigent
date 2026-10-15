@@ -25,6 +25,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapp
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -981,6 +982,7 @@ _LAUNCH_CONFIG_FETCH_TIMEOUT_S = 20.0
 _LAUNCH_CONFIG_FETCH_ATTEMPTS = 3
 _LAUNCH_CONFIG_FETCH_BACKOFF_BASE_S = 0.5
 _LAUNCH_CONFIG_FETCH_BACKOFF_CAP_S = 4.0
+_LAUNCH_CONFIG_RETRY_MAX_DELAY_S = 10.0
 _LAUNCH_CONFIG_RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
 
 
@@ -1032,7 +1034,8 @@ async def _fetch_native_launch_snapshot(
     Reads ``GET /v1/sessions/<id>`` and returns the parsed snapshot object.
     A transient runner->server condition (a read/connect timeout, or a
     ``429``/``502``/``503``/``504``) is retried with bounded exponential
-    backoff so one blip under load does not tear through native terminal
+    backoff and jitter, honoring bounded ``Retry-After`` hints, so one blip
+    under load does not tear through native terminal
     launch, ensure, and the next turn. A persistent transient failure, a 5xx,
     or a malformed body raises a server-attributed ``OmnigentError`` so
     startup-reliability signals count it as a platform fault.
@@ -1056,6 +1059,7 @@ async def _fetch_native_launch_snapshot(
     resp: httpx.Response | None = None
     for attempt in range(1, _LAUNCH_CONFIG_FETCH_ATTEMPTS + 1):
         last_attempt = attempt == _LAUNCH_CONFIG_FETCH_ATTEMPTS
+        resp = None
         try:
             resp = await server_client.get(
                 path, params=_SESSION_METADATA_PARAMS, timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S
@@ -1073,16 +1077,7 @@ async def _fetch_native_launch_snapshot(
                         phase=ErrorPhase.HARNESS_SETUP,
                     ) from exc
                 raise RuntimeError(message) from exc
-            _logger.warning(
-                "Transient %s launch-config fetch error (attempt %d/%d) for "
-                "session=%s; retrying: %s",
-                runtime_label,
-                attempt,
-                _LAUNCH_CONFIG_FETCH_ATTEMPTS,
-                session_id,
-                type(exc).__name__,
-                extra={"session_id": session_id},
-            )
+            retry_reason = type(exc).__name__
         else:
             if resp.status_code == 200:
                 break
@@ -1099,21 +1094,35 @@ async def _fetch_native_launch_snapshot(
                         phase=ErrorPhase.HARNESS_SETUP,
                     )
                 raise RuntimeError(message)
-            _logger.warning(
-                "Transient %s launch-config fetch status %d (attempt %d/%d) for "
-                "session=%s; retrying",
-                runtime_label,
-                resp.status_code,
-                attempt,
-                _LAUNCH_CONFIG_FETCH_ATTEMPTS,
-                session_id,
-                extra={"session_id": session_id},
-            )
+            retry_reason = f"HTTP {resp.status_code}"
         backoff = min(
             _LAUNCH_CONFIG_FETCH_BACKOFF_BASE_S * (2 ** (attempt - 1)),
             _LAUNCH_CONFIG_FETCH_BACKOFF_CAP_S,
         )
-        await _launch_config_retry_sleep(backoff)
+        delay = jittered_retry_delay(
+            resp, backoff=backoff, max_delay=_LAUNCH_CONFIG_RETRY_MAX_DELAY_S
+        )
+        if delay is None:
+            assert resp is not None
+            raise OmnigentError(
+                f"Could not fetch {runtime_label} launch config for {session_id!r}: "
+                f"GET /v1/sessions returned {resp.status_code}.",
+                category=ErrorCategory.SERVER,
+                impact=ErrorImpact.BLOCKING,
+                phase=ErrorPhase.HARNESS_SETUP,
+            )
+        _logger.warning(
+            "Transient %s launch-config fetch failure: %s (attempt %d/%d) for "
+            "session=%s; retrying in %.2fs",
+            runtime_label,
+            retry_reason,
+            attempt,
+            _LAUNCH_CONFIG_FETCH_ATTEMPTS,
+            session_id,
+            delay,
+            extra={"session_id": session_id},
+        )
+        await _launch_config_retry_sleep(delay)
     assert resp is not None  # loop either broke on 200 or raised
     try:
         snapshot = resp.json()

@@ -10962,6 +10962,65 @@ async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> No
     app.state.active_turns.pop(conv, None)
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("replaced", [False, True])
+@pytest.mark.asyncio
+async def test_interrupt_client_lookup_preserves_turn_ownership(
+    stream: bool, replaced: bool
+) -> None:
+    """A delayed harness lookup must not send the old interrupt to new work."""
+    conv = "conv_interrupt_lookup_owner"
+    original = asyncio.create_task(asyncio.Event().wait())
+    successor = asyncio.create_task(asyncio.Event().wait())
+
+    class InterruptClient(_RecoveryScriptedHarnessClient):
+        async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+            if json.get("type") == "interrupt":
+                task = app.state.active_turns.get(conv)
+                if isinstance(task, asyncio.Task):
+                    task.cancel()
+                else:
+                    app.state.on_proxy_stream_end(conv)
+            return await super().post(url, json=json, timeout=timeout)
+
+    class DelayedProcessManager(_RecoveryFakeProcessManager):
+        async def get_client(
+            self, conversation_id: str, harness: str, env: Any = None
+        ) -> _RecoveryScriptedHarnessClient:
+            if replaced:
+                app.state.on_proxy_stream_end(conv)
+                app.state.begin_turn_slot(conv)
+                app.state.active_turns[conv] = successor
+            return await super().get_client(conversation_id, harness, env)
+
+    harness = InterruptClient([])
+    app = create_runner_app(
+        process_manager=DelayedProcessManager(harness),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.begin_turn_slot(conv)
+    if not stream:
+        app.state.active_turns[conv] = original
+    try:
+        async with _recovery_runner_client(app) as http:
+            response = await http.post(f"/v1/sessions/{conv}/events", json={"type": "interrupt"})
+            assert response.status_code == 204, response.text
+
+        assert successor.cancelling() == 0
+        if replaced:
+            assert app.state.active_turns.get(conv) is successor
+            assert harness.patched_events == []
+        else:
+            assert harness.patched_events == [{"type": "interrupt"}]
+            assert conv not in app.state.active_turns
+    finally:
+        for task in (original, successor):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        app.state.active_turns.pop(conv, None)
+
+
 @pytest.mark.asyncio
 async def test_resync_clears_in_flight_marker_no_buffer() -> None:
     """B1: an accepted no-buffer resync clears the process-manager in-flight marker."""

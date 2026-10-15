@@ -349,13 +349,15 @@ async def test_serve_tunnel_fails_loud_on_protocol_rejection(
 
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
 
-    with pytest.raises(RuntimeError, match="runner tunnel rejected"):
+    with pytest.raises(RuntimeError, match="runner tunnel rejected") as exc_info:
         await serve_tunnel(
             _noop_app,
             server_url="http://127.0.0.1:8000",
             runner_id="runner_bad_protocol",
             runner_version="0.1.0",
         )
+    # A protocol mismatch is not a credential problem.
+    assert not isinstance(exc_info.value, serve_module.RunnerTunnelAuthRejectedError)
 
 
 @pytest.mark.asyncio
@@ -408,7 +410,7 @@ async def test_serve_tunnel_fails_loud_on_http_auth_rejection(
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
 
-    with pytest.raises(RuntimeError, match="HTTP 401"):
+    with pytest.raises(serve_module.RunnerTunnelAuthRejectedError, match="HTTP 401"):
         await serve_tunnel(
             _noop_app,
             server_url="https://example.databricksapps.com",
@@ -460,7 +462,7 @@ async def test_serve_tunnel_no_credential_error_after_streak(
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
 
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(serve_module.RunnerTunnelAuthRejectedError) as exc_info:
         await serve_tunnel(
             _noop_app,
             server_url="https://ws.cloud.databricks.com/api/2.0/omnigent?o=123",
@@ -650,7 +652,8 @@ async def test_serve_tunnel_fails_loud_on_auth_redirect(
     message = str(exc_info.value)
     # The standard rejection prefix is preserved so
     # ``_entry.main`` recognizes the failure as the fatal class
-    # and exits via ``SystemExit(1)`` instead of re-raising.
+    # and exits instead of re-raising; the type marks it as a sign-in problem.
+    assert isinstance(exc_info.value, serve_module.RunnerTunnelAuthRejectedError)
     assert "runner tunnel rejected by server" in message
     # The actual redirect target shows up so the user can see
     # what the server is asking for.
