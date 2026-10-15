@@ -222,6 +222,9 @@ class UploadIndex:
     idempotency_keys: dict[tuple[str, str, str, str], tuple[str, str]] = field(
         default_factory=dict
     )
+    pending_creates: dict[
+        tuple[str, str, str, str], tuple[str, asyncio.Future[CreatedUpload | UploadError]]
+    ] = field(default_factory=dict)
     sessions: dict[str, SessionAdmission] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
     expiry_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -661,25 +664,53 @@ def register_upload_routes(
         )
         pending = (session_id, environment_id, uuid.uuid4().hex)
         index.prune(session_id)
+        pending_result: asyncio.Future[CreatedUpload | UploadError] | None = None
+        wait_for: asyncio.Future[CreatedUpload | UploadError] | None = None
+        cached_id: str | None = None
+        reserved = False
         with index.lock:
-            replay = index.idempotency_keys.get(scope) if scope is not None else None
-            live = (
-                index.records.get((session_id, environment_id, replay[0]))
-                if replay is not None
-                else None
-            )
-            if live is None or live.finished:
+            in_flight = index.pending_creates.get(scope) if scope is not None else None
+            if in_flight is not None:
+                if in_flight[0] != digest:
+                    raise UploadError(ErrorCode.IDEMPOTENCY_KEY_CONFLICT)
+                wait_for = in_flight[1]
+            else:
+                replay = index.idempotency_keys.get(scope) if scope is not None else None
+                live = (
+                    index.records.get((session_id, environment_id, replay[0]))
+                    if replay is not None
+                    else None
+                )
+                if live is not None and not live.finished:
+                    if replay is not None and replay[1] != digest:
+                        raise UploadError(ErrorCode.IDEMPOTENCY_KEY_CONFLICT)
+                    cached_id = replay[0] if replay is not None else None
+                else:
+                    if scope is not None:
+                        index.idempotency_keys.pop(scope, None)
+                    admission = index.sessions.get(session_id, SessionAdmission())
+                    if (
+                        len(admission.keys) >= cap.limits.max_open_uploads
+                        or admission.size + declaration.size > cap.limits.max_open_bytes
+                    ):
+                        raise UploadError(ErrorCode.UPLOAD_LIMIT, {"Retry-After": "60"})
+                    reserved = True
                 if scope is not None:
-                    index.idempotency_keys.pop(scope, None)
-                admission = index.sessions.get(session_id, SessionAdmission())
-                if (
-                    len(admission.keys) >= cap.limits.max_open_uploads
-                    or admission.size + declaration.size > cap.limits.max_open_bytes
-                ):
-                    raise UploadError(ErrorCode.UPLOAD_LIMIT, {"Retry-After": "60"})
-                index.add(pending, record)
-            elif replay is not None and replay[1] != digest:
-                raise UploadError(ErrorCode.IDEMPOTENCY_KEY_CONFLICT)
+                    pending_result = asyncio.get_running_loop().create_future()
+                    index.pending_creates[scope] = (digest, pending_result)
+                if reserved:
+                    try:
+                        index.add(pending, record)
+                    except BaseException:
+                        if scope is not None:
+                            index.pending_creates.pop(scope, None)
+                        raise
+        if wait_for is not None:
+            outcome = await asyncio.shield(wait_for)
+            if isinstance(outcome, UploadError):
+                raise outcome
+            return outcome
+        outcome: CreatedUpload | UploadError = UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
         try:
             response = await _relay(
                 client,
@@ -695,19 +726,43 @@ def register_upload_routes(
             ):
                 raise UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
             with index.lock:
-                index.remove(pending)
-                index.add((session_id, environment_id, result.upload_id), record)
-                if scope is not None:
+                if reserved:
+                    index.remove(pending)
+                if cached_id is not None and cached_id != result.upload_id:
+                    index.remove((session_id, environment_id, cached_id))
+                result_key = (session_id, environment_id, result.upload_id)
+                existing = index.records.get(result_key)
+                if (
+                    idempotency_key is not None
+                    and existing is not None
+                    and existing.owner == owner
+                    and existing.idempotency_key == idempotency_key
+                ):
+                    settled = existing
+                else:
+                    index.add(result_key, record)
+                    settled = record
+                if scope is not None and not settled.finished:
                     index.idempotency_keys[scope] = (result.upload_id, digest)
+            result.chunk_bytes = cap.limits.chunk.initial
+            result.expires_at = min(
+                result.expires_at, time.time() + min(settled.idle_ttl_s, settled.max_age_s)
+            )
+            outcome = result
+            return result
+        except UploadError as exc:
+            outcome = exc
+            raise
         finally:
             # The runner accounts for creates whose acknowledgement was lost.
             with index.lock:
-                index.remove(pending)
-        result.chunk_bytes = cap.limits.chunk.initial
-        result.expires_at = min(
-            result.expires_at, time.time() + min(record.idle_ttl_s, record.max_age_s)
-        )
-        return result
+                if reserved:
+                    index.remove(pending)
+                if scope is not None and pending_result is not None:
+                    in_flight = index.pending_creates.get(scope)
+                    if in_flight is not None and in_flight[1] is pending_result:
+                        index.pending_creates.pop(scope)
+                        pending_result.set_result(outcome)
 
     async def owned(
         request: Request, session_id: str, environment_id: str, upload_id: str
