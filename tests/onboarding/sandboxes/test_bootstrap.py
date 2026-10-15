@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
+import sys
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -40,6 +42,11 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 # ── Fake launcher plumbing ──────────────────────────────────
+
+# The bootstrap probes the sandbox CLI for `login --yes` with a one-line verdict.
+_LOGIN_HELP_COMMAND = bootstrap_mod._LOGIN_HELP_PROBE_COMMAND
+_LOGIN_HELP_WITH_YES = "supports-yes\n"
+_LOGIN_HELP_LEGACY = "legacy\n"
 
 
 class _FakeRemoteProcess(RemoteProcess):
@@ -117,16 +124,22 @@ class _FakeLauncher(SandboxLauncher):
         login_lines: list[str] | None = None,
         login_returncode: int = 0,
         exec_foreground_returncode: int = 0,
+        login_help: str = _LOGIN_HELP_WITH_YES,
+        login_help_returncode: int = 0,
     ) -> None:
         """
         :param login_lines: Lines the fake login process streams.
         :param login_returncode: Exit code of the fake login process.
         :param exec_foreground_returncode: Exit code of
             ``exec_foreground``.
+        :param login_help: The ``--yes`` probe's verdict line.
+        :param login_help_returncode: Exit code of that probe.
         """
         self._login_lines = list(login_lines or [])
         self._login_returncode = login_returncode
         self._exec_foreground_returncode = exec_foreground_returncode
+        self._login_help = login_help
+        self._login_help_returncode = login_help_returncode
         self.log: list[str] = []
         self.run_commands: list[str] = []
         self.puts: list[_PutCall] = []
@@ -156,6 +169,10 @@ class _FakeLauncher(SandboxLauncher):
         """Record the remote command and report success."""
         self.log.append(f"run:{command}")
         self.run_commands.append(command)
+        if command == _LOGIN_HELP_COMMAND:
+            return RemoteCommandResult(
+                returncode=self._login_help_returncode, stdout=self._login_help, stderr=""
+            )
         return RemoteCommandResult(returncode=0, stdout="", stderr="")
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
@@ -322,6 +339,7 @@ def test_login_runs_in_sandbox_and_forwards_callback_port(
         return True
 
     monkeypatch.setattr(bootstrap_mod.webbrowser, "open", _fake_open)
+    _patch_saved_local_pairing(monkeypatch)
 
     # The CLI derives the workspace once per command and threads it
     # down — the login itself performs no derivation (and no HTTP).
@@ -334,10 +352,11 @@ def test_login_runs_in_sandbox_and_forwards_callback_port(
 
     # The login runs INSIDE the sandbox with a forced PTY — and it is
     # `omnigent login <server>` (which infers the fronting workspace
-    # itself), NOT a raw `databricks auth login` with profile flags.
+    # itself), NOT a raw `databricks auth login` with profile flags. The
+    # saved local pairing settled consent, so the login is pre-approved.
     assert launcher.stream_calls == [
         _StreamCall(
-            command="omnigent login https://app.example.com",
+            command="omnigent login --yes https://app.example.com",
             pty=True,
         )
     ]
@@ -364,13 +383,16 @@ def test_login_runs_in_sandbox_and_forwards_callback_port(
         "[DEFAULT]\nhost = https://ws.example.com\n"
         "auth_type = databricks-cli\nworkspace_id = 123456\n"
     )
+    # The --yes probe runs first (a failed probe leaves the sandbox untouched),
+    # then the cfg seed.
     assert launcher.run_commands == [
+        _LOGIN_HELP_COMMAND,
         f"rm -f ~/.databrickscfg && printf '%s' {shlex.quote(expected_cfg_body)} "
-        "> ~/.databrickscfg"
+        "> ~/.databrickscfg",
     ]
     # The seed lands before the login spawn (the login reads the cfg).
-    assert launcher.log.index(f"run:{launcher.run_commands[0]}") < launcher.log.index(
-        "stream:omnigent login https://app.example.com"
+    assert launcher.log.index(f"run:{launcher.run_commands[1]}") < launcher.log.index(
+        "stream:omnigent login --yes https://app.example.com"
     )
 
 
@@ -393,6 +415,7 @@ def test_login_completes_without_browser_when_no_url_printed(
         raise AssertionError(f"browser opened unexpectedly: {url}")
 
     monkeypatch.setattr(bootstrap_mod.webbrowser, "open", _fail_open)
+    _patch_saved_local_pairing(monkeypatch)
     login_app_oauth_in_sandbox(
         launcher,
         "sb-1",
@@ -422,11 +445,15 @@ def test_login_skips_cfg_seed_for_non_databricks_server() -> None:
     )
     # No remote pre-step ran: the cfg was not touched.
     assert launcher.run_commands == []
-    # The in-sandbox login itself still ran.
-    assert len(launcher.stream_calls) == 1
+    # The in-sandbox login itself still ran, with no pairing to pre-approve.
+    assert launcher.stream_calls == [
+        _StreamCall(command="omnigent login https://oss.example.com", pty=True)
+    ]
 
 
-def test_login_seed_omits_workspace_id_line_when_unknown() -> None:
+def test_login_seed_omits_workspace_id_line_when_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     When the workspace didn't reveal its org id (``workspace_id`` is
     ``None``), the cfg seed must omit the ``workspace_id`` line while
@@ -438,20 +465,221 @@ def test_login_seed_omits_workspace_id_line_when_unknown() -> None:
         login_lines=["Logged in.\r\n"],
         login_returncode=0,
     )
+    _patch_saved_local_pairing(monkeypatch)
     login_app_oauth_in_sandbox(
         launcher,
         "sb-1",
         server_url="https://app.example.com",
         workspace=DerivedWorkspace(host="https://ws.example.com", workspace_id=None),
     )
-    # Exactly one remote pre-step ran (the cfg seed) — zero would mean
-    # the missing org id wrongly disabled the seed entirely.
-    assert len(launcher.run_commands) == 1
-    seed_command = launcher.run_commands[0]
+    # The cfg seed still ran (after the --yes probe) — a missing org id must
+    # not disable the seed entirely.
+    assert launcher.run_commands[0] == _LOGIN_HELP_COMMAND
+    assert launcher.run_commands[1].startswith("rm -f ~/.databrickscfg")
+    seed_command = launcher.run_commands[1]
     assert "host = https://ws.example.com" in seed_command
     assert "auth_type = databricks-cli" in seed_command
     # No workspace_id line in any form (the key name itself is absent).
     assert "workspace_id" not in seed_command
+
+
+# ── cross-origin pairing consent ──────────────────────────────
+
+
+def _patch_saved_local_pairing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stage a prior local ``omnigent login`` pairing the server with the workspace."""
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda server: "https://ws.example.com",
+    )
+
+
+def _patch_unpaired_login_consent(
+    monkeypatch: pytest.MonkeyPatch, *, tty: bool, answer: bool | BaseException | None = None
+) -> list[str]:
+    """Stage a first cross-origin pairing: no saved local login, scripted prompt.
+
+    :param tty: What ``sys.stdin.isatty()`` reports.
+    :param answer: The scripted answer, an exception the prompt raises (Ctrl-C/EOF),
+        or ``None`` to fail the test if a prompt is shown.
+    :returns: Capture list of the confirmation prompts shown.
+    """
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda server: None)
+    monkeypatch.setattr(bootstrap_mod.sys.stdin, "isatty", lambda: tty)
+    prompts: list[str] = []
+
+    def _confirm(text: str, **kwargs: object) -> bool:
+        prompts.append(text)
+        assert answer is not None, f"unexpected confirmation prompt: {text}"
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(bootstrap_mod.click, "confirm", _confirm)
+    return prompts
+
+
+def test_login_asks_before_first_cross_origin_pairing_on_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no saved local login, a terminal is asked here and the sandbox login is pre-approved.
+
+    The in-sandbox login cannot take the answer over its PTY.
+    """
+    launcher = _FakeLauncher(login_lines=["Logged in.\r\n"])
+    prompts = _patch_unpaired_login_consent(monkeypatch, tty=True, answer=True)
+
+    login_app_oauth_in_sandbox(
+        launcher,
+        "sb-1",
+        server_url="https://app.example.com",
+        workspace=DerivedWorkspace(host="https://ws.example.com", workspace_id="123456"),
+    )
+
+    # The question names both origins so the user can check them.
+    assert prompts == [
+        "Allow https://app.example.com to receive credentials for workspace https://ws.example.com?"
+    ]
+    assert launcher.stream_calls == [
+        _StreamCall(command="omnigent login --yes https://app.example.com", pty=True)
+    ]
+
+
+@pytest.mark.parametrize("answer", [False, click.Abort()], ids=["no", "aborted"])
+def test_login_declined_cross_origin_pairing_touches_nothing(
+    monkeypatch: pytest.MonkeyPatch, answer: bool | BaseException
+) -> None:
+    """Declining (or aborting) the pairing stops before anything reaches the sandbox."""
+    launcher = _FakeLauncher(login_lines=["Logged in.\r\n"])
+    _patch_unpaired_login_consent(monkeypatch, tty=True, answer=answer)
+
+    with pytest.raises(click.ClickException) as exc:
+        login_app_oauth_in_sandbox(
+            launcher,
+            "sb-1",
+            server_url="https://app.example.com",
+            workspace=DerivedWorkspace(host="https://ws.example.com", workspace_id="123456"),
+        )
+
+    assert "cancelled" in str(exc.value)
+    assert launcher.log == []
+
+
+def test_login_keeps_legacy_command_for_older_sandbox_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sandbox whose installed CLI predates ``login --yes`` gets the legacy command.
+
+    ``omnigent sandbox auth`` reuses that CLI, and its login does not ask.
+    """
+    launcher = _FakeLauncher(login_lines=["Logged in.\r\n"], login_help=_LOGIN_HELP_LEGACY)
+    _patch_saved_local_pairing(monkeypatch)
+
+    login_app_oauth_in_sandbox(
+        launcher,
+        "sb-1",
+        server_url="https://app.example.com",
+        workspace=DerivedWorkspace(host="https://ws.example.com", workspace_id="123456"),
+    )
+
+    assert launcher.stream_calls == [
+        _StreamCall(command="omnigent login https://app.example.com", pty=True)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("verdict", "returncode", "detail"),
+    [("probe-failed:127\n", 0, "probe-failed:127"), ("", 1, "exit 1")],
+    ids=["cli-missing", "launcher-error"],
+)
+def test_login_fails_fast_when_sandbox_cli_probe_fails(
+    monkeypatch: pytest.MonkeyPatch, verdict: str, returncode: int, detail: str
+) -> None:
+    """A broken ``--yes`` probe is reported; guessing "legacy" could hang the login."""
+    launcher = _FakeLauncher(
+        login_lines=["Logged in.\r\n"], login_help=verdict, login_help_returncode=returncode
+    )
+    _patch_saved_local_pairing(monkeypatch)
+
+    with pytest.raises(click.ClickException) as exc:
+        login_app_oauth_in_sandbox(
+            launcher,
+            "sb-1",
+            server_url="https://app.example.com",
+            workspace=DerivedWorkspace(host="https://ws.example.com", workspace_id="123456"),
+        )
+
+    assert "omnigent login --help" in str(exc.value) and detail in str(exc.value)
+    # No login was spawned against an unknown CLI.
+    assert launcher.stream_calls == []
+    # ...and the sandbox was left untouched: no cfg seed ran.
+    assert launcher.run_commands == [_LOGIN_HELP_COMMAND]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="the probe is a POSIX shell line for Linux sandboxes"
+)
+@pytest.mark.parametrize(
+    ("fake_cli", "expected"),
+    [
+        (
+            "printf 'Usage: omnigent login [OPTIONS] SERVER_URL\\n\\nOptions:\\n"
+            "  -y, --yes  Approve sending credentials.\\n  --help  Show this message.\\n'",
+            "supports-yes",
+        ),
+        (
+            "printf 'Usage: omnigent login [OPTIONS] SERVER_URL\\n\\nOptions:\\n"
+            "  --help  Show this message.\\n'",
+            "legacy",
+        ),
+        ("echo 'omnigent: cannot start' >&2; exit 3", "probe-failed:3"),
+    ],
+    ids=["current", "legacy", "failing"],
+)
+def test_login_help_probe_command_classifies_a_real_cli(
+    tmp_path: Path, fake_cli: str, expected: str
+) -> None:
+    """The probe shell line yields one verdict token for a current, legacy or broken CLI."""
+    fake = tmp_path / "omnigent"
+    fake.write_text(f"#!/bin/sh\n{fake_cli}\n")
+    fake.chmod(0o755)
+    env = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+    result = subprocess.run(
+        bootstrap_mod._LOGIN_HELP_PROBE_COMMAND,
+        shell=True,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip().splitlines()[-1] == expected
+
+
+def test_login_requires_prior_local_login_when_unattended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Off a TTY the pairing cannot be approved, so a prior local login is required."""
+    launcher = _FakeLauncher(login_lines=["Logged in.\r\n"])
+    prompts = _patch_unpaired_login_consent(monkeypatch, tty=False)
+
+    with pytest.raises(click.ClickException) as exc:
+        login_app_oauth_in_sandbox(
+            launcher,
+            "sb-1",
+            server_url="https://app.example.com",
+            workspace=DerivedWorkspace(host="https://ws.example.com", workspace_id="123456"),
+        )
+
+    assert "login https://app.example.com" in str(exc.value)
+    # The remedy must work unattended too, and must not name a flag this command lacks.
+    assert "login --yes https://app.example.com" in str(exc.value)
+    assert "--no-auth" not in str(exc.value)
+    assert prompts == []
+    assert launcher.log == []
 
 
 def test_derive_workspace_extracts_workspace_from_apps_redirect(
@@ -837,14 +1065,16 @@ def test_bootstrap_runs_steps_in_order_and_returns_provisioned_id(
         launcher.log.append(f"ship:{sid}")
 
     def _record_login(launcher_arg: Any, sid: str, **kwargs: Any) -> None:
-        """Record the login step, including the threaded workspace pin."""
+        """Record the login step, including the threaded workspace pin and consent."""
         launcher.log.append(
-            f"login:{sid}:{kwargs['server_url']}:{kwargs['workspace'].host}:{kwargs['skip']}"
+            f"login:{sid}:{kwargs['server_url']}:{kwargs['workspace'].host}:"
+            f"{kwargs['skip']}:{kwargs['pairing_approved']}"
         )
 
     monkeypatch.setattr(bootstrap_mod, "build_wheels", _record_build)
     monkeypatch.setattr(bootstrap_mod, "ship_wheels", _record_ship)
     monkeypatch.setattr(bootstrap_mod, "login_app_oauth_in_sandbox", _record_login)
+    _patch_saved_local_pairing(monkeypatch)
 
     sid = bootstrap_sandbox_host(launcher, sandbox_id=None, **_bootstrap_kwargs(tmp_path))
 
@@ -862,8 +1092,47 @@ def test_bootstrap_runs_steps_in_order_and_returns_provisioned_id(
         "keep_alive:sb-new",
         "build:None",
         "ship:sb-new",
-        "login:sb-new:https://app.example.com:https://ws.example.com:False",
+        "login:sb-new:https://app.example.com:https://ws.example.com:False:True",
     ], f"Step order is contract. Got: {launcher.log}"
+
+
+def test_bootstrap_settles_pairing_consent_before_provisioning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no saved pairing, the question comes before any sandbox work.
+
+    Declining must not leave a provisioned sandbox behind; approving is
+    passed down so the login step does not ask a second time.
+    """
+    launcher = _FakeLauncher()
+    monkeypatch.setattr(bootstrap_mod, "build_wheels", lambda repo_root, **kwargs: None)
+    monkeypatch.setattr(bootstrap_mod, "ship_wheels", lambda launcher_arg, sid, **kwargs: None)
+    logins: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        bootstrap_mod,
+        "login_app_oauth_in_sandbox",
+        lambda launcher_arg, sid, **kwargs: logins.append(kwargs),
+    )
+    answers = iter([False, True])
+    prompts = _patch_unpaired_login_consent(monkeypatch, tty=True, answer=None)
+
+    def _confirm(text: str, **kwargs: object) -> bool:
+        prompts.append(text)
+        launcher.log.append("consent")
+        return next(answers)
+
+    monkeypatch.setattr(bootstrap_mod.click, "confirm", _confirm)
+
+    with pytest.raises(click.ClickException):
+        bootstrap_sandbox_host(launcher, sandbox_id=None, **_bootstrap_kwargs(tmp_path))
+    assert launcher.log == ["consent"]
+
+    sid = bootstrap_sandbox_host(launcher, sandbox_id=None, **_bootstrap_kwargs(tmp_path))
+
+    assert sid == "sb-new"
+    assert launcher.log[1:3] == ["consent", "prepare"]
+    assert len(prompts) == 2
+    assert [entry["pairing_approved"] for entry in logins] == [True]
 
 
 def test_bootstrap_fails_fast_without_forward_capability(tmp_path: Path) -> None:

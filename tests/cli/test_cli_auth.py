@@ -232,6 +232,43 @@ def test_store_and_load_databricks_record(token_dir) -> None:
     )
 
 
+def test_databricks_pairing_trusted_normalizes_origin_and_saved_host(token_dir) -> None:
+    """Default ports and trailing slashes do not turn a trusted pairing into a question."""
+    from omnigent.cli_auth import databricks_pairing_trusted, store_databricks_auth
+
+    # Workspace-hosted omnigent is the same origin even with an explicit default port.
+    assert databricks_pairing_trusted(
+        "https://example.databricks.com:443/api/2.0/omnigent", "https://example.databricks.com"
+    )
+    # A different origin with no saved record needs the question.
+    assert not databricks_pairing_trusted(
+        "https://myapp-123.aws.databricksapps.com", "https://example.databricks.com"
+    )
+    store_databricks_auth(
+        server_url="https://myapp-123.aws.databricksapps.com",
+        workspace_host="https://example.databricks.com",
+    )
+    # The record is stored without a trailing slash; a live host with one still matches,
+    # and so does a differently cased hostname.
+    assert databricks_pairing_trusted(
+        "https://myapp-123.aws.databricksapps.com", "https://example.databricks.com/"
+    )
+    assert databricks_pairing_trusted(
+        "https://myapp-123.aws.databricksapps.com", "https://Example.Databricks.com"
+    )
+    # A pairing with one workspace does not authorize another.
+    assert not databricks_pairing_trusted(
+        "https://myapp-123.aws.databricksapps.com", "https://other.databricks.com"
+    )
+    # A redirect naming a malformed port or host is untrusted, not a crash.
+    assert not databricks_pairing_trusted(
+        "https://myapp-123.aws.databricksapps.com", "https://example.databricks.com:bad"
+    )
+    assert not databricks_pairing_trusted(
+        "https://myapp-123.aws.databricksapps.com", "https://[::1"
+    )
+
+
 def test_pointer_record_reads_as_absent_without_expiry_warning(
     token_dir, monkeypatch, caplog
 ) -> None:

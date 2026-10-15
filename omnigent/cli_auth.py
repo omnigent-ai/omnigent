@@ -29,6 +29,7 @@ import os
 import stat
 import tempfile
 import time
+import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -615,6 +616,45 @@ def load_databricks_org_id(server_url: str) -> str | None:
         return None
     org_id = entry.get("org_id")
     return org_id if isinstance(org_id, str) and org_id else None
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None] | None:
+    """``(scheme, lowercased host, port)`` for *url*, or ``None`` when malformed."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.scheme or not parts.hostname:
+        return None
+    return (parts.scheme, parts.hostname, port or {"https": 443, "http": 80}.get(parts.scheme))
+
+
+def databricks_pairing_trusted(server_url: str, workspace_host: str) -> bool:
+    """Whether *server_url* may receive *workspace_host* credentials without asking.
+
+    True when both share an origin (workspace-hosted omnigent) or a saved
+    ``omnigent login`` record already pairs the server with that workspace.
+    A workspace host that does not parse as an origin is never trusted.
+
+    :param server_url: The server URL, e.g.
+        ``"https://myapp-123.aws.databricksapps.com"``.
+    :param workspace_host: The workspace fronting it, e.g.
+        ``"https://example.databricks.com"``.
+    :returns: ``True`` when no consent question is needed before pairing.
+    """
+    workspace = _url_origin(workspace_host)
+    if workspace is None:
+        return False
+    if _url_origin(server_url) == workspace:
+        return True
+    saved = load_databricks_workspace_host(server_url)
+    return saved is not None and _url_origin(saved) == workspace
+
+
+def databricks_pairing_question(server_url: str, workspace_host: str) -> str:
+    """The consent question asked before a first cross-origin pairing."""
+    return f"Allow {server_url} to receive credentials for workspace {workspace_host}?"
 
 
 # Workspace-routing header. When a Databricks host fronts many workspaces

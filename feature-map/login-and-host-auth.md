@@ -15,6 +15,11 @@ be able to write resources without a separate Omnigent account.
 - `login-auto-detect`: `omnigent login <url>` detects the server's sign-in mode.
   States: accounts, OIDC, header mode, Databricks-fronted, and a workspace URL
   with an org selector.
+- `cross-origin-pairing-consent`: the first `omnigent login` to a server on a
+  different origin from its Databricks workspace asks before any workspace
+  credential is resolved or sent; `--yes` pre-approves it, a saved pairing skips
+  the question, and unattended commands or sandbox provisioning without a
+  terminal need a prior login.
 - `databricks-credential-kind`: the host authenticates with a user OAuth login
   made by the Databricks CLI, a personal access token, or a machine-to-machine
   service principal. Each is its own state to reproduce.
@@ -51,7 +56,8 @@ be able to write resources without a separate Omnigent account.
 
 ## How to get to it (user POV)
 
-**CLI sign-in:** `omnigent login <server-url>`.
+**CLI sign-in:** `omnigent login <server-url>` (`--yes` pre-approves a first
+cross-origin workspace pairing in scripts).
 
 **Host:** `omnigent host <server-url>` (or `--server`), `omnigent host ""` for a
 local server, `--background`, `--no-open`, `--non-interactive`, and the
@@ -87,6 +93,17 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
 - **Isolated CLI loop:** use [cli-setup-verify](../.claude/skills/cli-setup-verify/SKILL.md),
   which drives the real `omnigent` binary in a PTY with a throwaway config and
   data directory, for sign-in prompts and host commands.
+- **`cross-origin-pairing-consent`:** inside cli-setup-verify's isolated loop,
+  point `omnigent login <url>` at a loopback stub whose unauthenticated
+  `GET /v1/me` answers `302 Location: https://<ws>/oidc/oauth2/v2.0/authorize?...`
+  and whose `.databrickscfg` holds a PAT for `https://<ws>`. Expect the question
+  `Allow <url> to receive credentials for workspace https://<ws>?` before any
+  `Authorization` header reaches the stub; `n`, Enter and EOF cancel with no
+  `auth_tokens.json` entry, `--yes` logs in without asking, and
+  `omnigent host --server <url> --non-interactive` without a saved pairing fails
+  with the `omnigent login` hint. Component tests:
+  `tests/cli/test_login_databricks.py`, `tests/cli/test_backend.py -k preflight`,
+  `tests/onboarding/sandboxes/test_bootstrap.py -k "pairing or unattended or legacy or probe"`.
 - **`proxy-env`:**
   `tests/e2e/test_login_accounts_proxy_env.py::test_login_detects_accounts_auth_despite_proxy_env`
   (starts its own accounts server; run with plain `uv run pytest`).

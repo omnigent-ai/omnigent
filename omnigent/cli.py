@@ -3693,8 +3693,9 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     response (status=302)" traceback from the session-create call. A
     rejected bearer can hide that signature behind a bare 401/403, so the
     probe falls back to the saved workspace or an unauthenticated retry.
-    It then asks the SDK for a fresh workspace token before prompting a
-    TTY or giving headless invocations the exact login command.
+    When the server is already paired with that workspace (or shares its
+    origin) it then asks the SDK for a fresh workspace token; otherwise it
+    prompts a TTY or gives headless invocations the exact login command.
 
     Non-Databricks postures are deliberately left alone: local accounts
     servers auto-authenticate downstream (magic-link redeem), and
@@ -3715,6 +3716,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
 
     from omnigent.chat import _remote_headers
     from omnigent.cli_auth import (
+        databricks_pairing_trusted,
         load_databricks_org_id,
         load_databricks_workspace_host,
         store_databricks_auth,
@@ -3745,7 +3747,8 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     if workspace_host is None:
         return
     org_id = load_databricks_org_id(server)
-    auth_info = _databricks_workspace_auth_info(workspace_host)
+    trusted = databricks_pairing_trusted(server, workspace_host)
+    auth_info = _databricks_workspace_auth_info(workspace_host) if trusted else None
     if auth_info is not None:
         if org_id is None:
             org_id = _workspace_hosted_profile_org_id(
@@ -3766,9 +3769,17 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         else f"Not signed in to {display}"
     )
     if non_interactive or not sys.stdin.isatty():
+        # A first cross-origin pairing needs consent, which a headless login
+        # cannot give without --yes; say so instead of hinting a command that
+        # would stop at the question.
+        remedy = (
+            f"Run `{login_cmd}` and retry."
+            if trusted
+            else f"Run `{login_cmd}` from a terminal (or `{login_cmd} --yes` to approve the "
+            "pairing unattended) and retry."
+        )
         raise click.ClickException(
-            f"{state} (Databricks-fronted; /v1/me answered "
-            f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
+            f"{state} (Databricks-fronted; /v1/me answered HTTP {probe.status_code}). {remedy}"
         )
     click.echo(f"{state} — running `{login_cmd}` first.")
     # Login selector comes from the URL, not the stored org_id used above: on a
@@ -12880,14 +12891,22 @@ def _databricks_host_needs_org_selector(workspace_host: str) -> bool:
     return not meta.workspace_id and bool(meta.account_id)
 
 
-def _databricks_login(server: str, workspace_host: str, org_id: str | None = None) -> None:
+def _databricks_login(
+    server: str,
+    workspace_host: str,
+    org_id: str | None = None,
+    *,
+    assume_yes: bool = False,
+) -> None:
     """Log in to a Databricks-fronted Omnigent server.
 
     Covers both Databricks Apps deployments and workspace-hosted
-    omnigent (``https://<workspace>/api/2.0/omnigent``). Reuses an
-    existing host-keyed Databricks CLI OAuth grant when one resolves;
-    otherwise runs ``databricks auth login --host <workspace>``
-    (browser flow). The minted token is verified against the server
+    omnigent (``https://<workspace>/api/2.0/omnigent``). A first pairing
+    with a server on another origin is confirmed with the user before any
+    workspace credential is resolved. Reuses an existing host-keyed
+    Databricks CLI OAuth grant when one resolves; otherwise runs
+    ``databricks auth login --host <workspace>`` (browser flow). The
+    minted token is verified against the server
     before anything is stored; a *cached* grant that fails
     verification (e.g. a stale token-cache entry minted for a
     different workspace) triggers one fresh browser login and a
@@ -12903,9 +12922,11 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
         (see :func:`_org_id_from_url`). When set, the login binds the
         grant to this workspace and the verify request routes to it —
         needed where the bare host is the account, not a workspace.
+    :param assume_yes: Skip the confirmation a first cross-origin pairing
+        needs (``omnigent login --yes``); the caller already has consent.
     :raises click.ClickException: When the ``databricks`` extra or CLI
-        binary is missing, the workspace login fails, or the server
-        rejects the workspace token.
+        binary is missing, the pairing is declined, the workspace login
+        fails, or the server rejects the workspace token.
     """
     from omnigent.onboarding.databricks_config import (
         DATABRICKS_EXTRA_INSTALL_HINT,
@@ -12920,8 +12941,40 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
             f"{DATABRICKS_EXTRA_INSTALL_HINT}"
         )
 
-    from omnigent.cli_auth import is_workspace_hosted_url
+    from omnigent.cli_auth import (
+        databricks_pairing_question,
+        databricks_pairing_trusted,
+        is_workspace_hosted_url,
+    )
 
+    if not assume_yes and not databricks_pairing_trusted(server, workspace_host):
+        # First pairing with a server on another origin: ask before any
+        # workspace credential is resolved, let alone sent to it. Only a
+        # terminal can answer; piped input is not consent.
+        if not _stdin_is_tty():
+            raise click.ClickException(
+                f"Login cancelled: {server} is not paired with workspace {workspace_host} "
+                "yet, and approving that needs a terminal. Nothing was sent or stored. "
+                "Pass --yes to pre-approve the pairing in scripted logins."
+            )
+        # Printed as a full line so a PTY driver that only streams output
+        # (an older `omnigent sandbox auth`) still shows why this is waiting.
+        click.echo(
+            f"First pairing: {server} would receive credentials for the Databricks workspace "
+            f"{workspace_host}. Answer below; a script (or an older `omnigent sandbox auth`) "
+            "cannot answer and should pass --yes instead."
+        )
+        try:
+            approved = click.confirm(
+                databricks_pairing_question(server, workspace_host), default=False
+            )
+        except click.Abort:
+            approved = False
+        if not approved:
+            raise click.ClickException(
+                f"Login cancelled: no workspace credentials were sent to {server} and "
+                "nothing was stored. Pass --yes to pre-approve this pairing in scripted logins."
+            )
     auth_info = _databricks_workspace_auth_info(workspace_host)
     if org_id is None and auth_info is not None:
         org_id = _workspace_hosted_profile_org_id(server, workspace_host, auth_info.profile_name)
@@ -13182,7 +13235,18 @@ def _remember_default_server(server: str) -> None:
 
 @cli.command("login")
 @click.argument("server_url")
-def login(server_url: str) -> None:
+@click.option(
+    "--yes",
+    "-y",
+    "assume_yes",
+    is_flag=True,
+    default=False,
+    help=(
+        "Approve sending your Databricks workspace credentials to a server on "
+        "another origin without asking (for scripted logins)."
+    ),
+)
+def login(server_url: str, assume_yes: bool) -> None:
     """Authenticate with a remote Omnigent server.
 
     Probes the server's auth mode and runs the matching flow:
@@ -13200,7 +13264,10 @@ def login(server_url: str) -> None:
       log in to the workspace via ``databricks auth login --host
       <workspace>`` (browser) and store a pointer record so later
       commands mint fresh workspace tokens automatically. Requires
-      the ``databricks`` extra.
+      the ``databricks`` extra. When the server and that workspace are
+      different origins (a Databricks App) and no pairing is saved yet,
+      the login asks before any workspace credential is resolved or
+      sent; ``--yes`` pre-approves it.
 
     Subsequent ``omnigent run --server <url>`` commands then
     use the stored token via the runner / host-tunnel auth chain. A
@@ -13220,6 +13287,8 @@ def login(server_url: str) -> None:
         ``https://`` (``http://`` for loopback hosts), and the workspace
         web-UI URL (``<ws>/omnigent``) is accepted alongside the bare
         workspace root.
+    :param assume_yes: Skip the confirmation a first cross-origin
+        pairing with a Databricks workspace needs.
     """
     import httpx as _httpx
 
@@ -13245,7 +13314,7 @@ def login(server_url: str) -> None:
 
     databricks_workspace = _databricks_workspace_login_target(server, probe)
     if databricks_workspace is not None:
-        _databricks_login(server, databricks_workspace, org_id=org_id)
+        _databricks_login(server, databricks_workspace, org_id=org_id, assume_yes=assume_yes)
         _remember_default_server(server)
         return
 

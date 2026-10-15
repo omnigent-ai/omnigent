@@ -196,16 +196,104 @@ def test_login_apps_redirect_stores_pointer_record(
         ]
     )
     _patch_login_env(monkeypatch, fake_httpx=fake)
+    # A terminal answers the first-pairing question; scripted callers pass --yes.
+    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: True)
 
-    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL], input="y\n")
 
     assert result.exit_code == 0, result.output
+    assert f"Allow {_APPS_URL} to receive credentials for workspace {_WORKSPACE}?" in result.output
     # The pointer record names the workspace parsed from the redirect —
     # a miss means the auth chain would fall back to ambient credentials.
     assert load_databricks_workspace_host(_APPS_URL) == _WORKSPACE
     # The verify call carried the minted workspace bearer to the app.
     assert fake.requests[-1]["authorization"] == "Bearer tok-cached"
     assert "alice@example.com" in result.output
+
+
+@pytest.mark.parametrize(
+    ("tty", "answer"),
+    [(True, "n\n"), (True, "\n"), (True, ""), (False, "y\n")],
+    ids=["terminal-n", "terminal-enter", "terminal-eof", "piped-y"],
+)
+def test_login_cross_origin_workspace_pairing_requires_confirmation(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, tty: bool, answer: str
+) -> None:
+    """Declining, Enter, EOF, or any piped input on a first cross-origin pairing sends nothing.
+
+    Only a terminal can agree before the named workspace's credential is resolved.
+    """
+    from omnigent.cli_auth import load_databricks_workspace_host
+
+    fake = _FakeHttpx(
+        responses=[
+            _response(302, headers={"location": _APPS_REDIRECT}),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+    monkeypatch.setattr(cli_mod, "_stdin_is_tty", lambda: tty)
+    monkeypatch.setattr(
+        cli_mod,
+        "_databricks_workspace_auth_info",
+        lambda workspace_host: pytest.fail("credentials resolved before approval"),
+    )
+
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL], input=answer)
+
+    assert result.exit_code != 0, result.output
+    # Both origins are named so the user can check them; a piped stdin gets the
+    # same explanation (and the --yes hint) instead of a bare abort or a silent yes.
+    assert _APPS_URL in result.output and _WORKSPACE in result.output
+    assert "Login cancelled" in result.output and "--yes" in result.output
+    # Only the credential-less probe reached the app, and nothing was stored.
+    forwarded = [req["authorization"] for req in fake.requests if req["authorization"]]
+    assert forwarded == [], result.output
+    assert len(fake.requests) == 1
+    assert load_databricks_workspace_host(_APPS_URL) is None
+
+
+def test_login_yes_flag_pre_approves_cross_origin_pairing(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """``--yes`` answers the pairing question; an empty stdin would otherwise abort."""
+    from omnigent.cli_auth import load_databricks_workspace_host
+
+    fake = _FakeHttpx(
+        responses=[
+            _response(302, headers={"location": _APPS_REDIRECT}),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+
+    result = CliRunner().invoke(cli_group, ["login", "--yes", _APPS_URL])
+
+    assert result.exit_code == 0, result.output
+    assert load_databricks_workspace_host(_APPS_URL) == _WORKSPACE
+    assert fake.requests[-1]["authorization"] == "Bearer tok-cached"
+
+
+def test_login_reuses_saved_pairing_without_asking(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """A server already paired with this workspace logs in again with no question."""
+    from omnigent.cli_auth import store_databricks_auth
+
+    store_databricks_auth(_APPS_URL, _WORKSPACE)
+    fake = _FakeHttpx(
+        responses=[
+            _response(302, headers={"location": _APPS_REDIRECT}),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+
+    # No stdin answer is supplied: a question here would abort the login.
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+
+    assert result.exit_code == 0, result.output
+    assert fake.requests[-1]["authorization"] == "Bearer tok-cached"
 
 
 def test_login_workspace_hosted_401_uses_url_host(
@@ -411,7 +499,7 @@ def test_login_apps_fails_loud_without_databricks_extra(
     fake = _FakeHttpx(responses=[_response(302, headers={"location": _APPS_REDIRECT})])
     _patch_login_env(monkeypatch, fake_httpx=fake, sdk_installed=False)
 
-    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+    result = CliRunner().invoke(cli_group, ["login", "--yes", _APPS_URL])
 
     assert result.exit_code != 0
     # The error must carry the canonical install hint, not a generic failure.
@@ -445,7 +533,7 @@ def test_login_runs_databricks_auth_login_when_no_cached_grant(
         cached_tokens=[None, "tok-fresh"],
     )
 
-    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+    result = CliRunner().invoke(cli_group, ["login", "--yes", _APPS_URL])
 
     assert result.exit_code == 0, result.output
     # Exactly one browser login, pinned to the per-workspace profile so
@@ -473,7 +561,7 @@ def test_login_fails_loud_when_app_rejects_workspace_token(
     )
     _patch_login_env(monkeypatch, fake_httpx=fake)
 
-    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+    result = CliRunner().invoke(cli_group, ["login", "--yes", _APPS_URL])
 
     assert result.exit_code != 0
     assert "403" in result.output
@@ -530,7 +618,7 @@ def test_login_stale_cached_grant_triggers_fresh_login_and_retry(
         cached_tokens=["tok-stale", "tok-fresh"],
     )
 
-    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+    result = CliRunner().invoke(cli_group, ["login", "--yes", _APPS_URL])
 
     assert result.exit_code == 0, result.output
     # Exactly one forced re-login — a second rejection must fail loud,
@@ -567,7 +655,7 @@ def test_foreign_subprocess_calls_stay_out_of_the_login_recorder(
     # Stands in for a background thread shelling out mid-login.
     probe = cli_mod.subprocess.run(["git", "--version"], capture_output=True)
 
-    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+    result = CliRunner().invoke(cli_group, ["login", "--yes", _APPS_URL])
 
     assert result.exit_code == 0, result.output
     assert login_calls == [f"auth login --host {_WORKSPACE} --profile {_PROFILE}"]
@@ -693,7 +781,7 @@ def test_login_sets_default_server(monkeypatch: pytest.MonkeyPatch, token_dir: P
     )
     _patch_login_env(monkeypatch, fake_httpx=fake)
 
-    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+    result = CliRunner().invoke(cli_group, ["login", "--yes", _APPS_URL])
 
     assert result.exit_code == 0, result.output
     assert cli_mod._load_global_config().get("server") == _APPS_URL
@@ -801,7 +889,7 @@ def test_login_failure_leaves_default_server_unchanged(
     )
     _patch_login_env(monkeypatch, fake_httpx=fake)
 
-    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+    result = CliRunner().invoke(cli_group, ["login", "--yes", _APPS_URL])
 
     assert result.exit_code != 0
     assert cli_mod._load_global_config().get("server") == "https://existing.example.com"
