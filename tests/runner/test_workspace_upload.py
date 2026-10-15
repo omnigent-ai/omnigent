@@ -2888,6 +2888,47 @@ async def test_create_key_waits_for_pending_begin(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_create_key_replay_preserves_original_upload(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runner.workspace_upload import UploadDeclaration
+
+    manager = client._transport.app.state.workspace_uploads
+    headers = {"Idempotency-Key": "a" * 32}
+    first = await create(client, headers=headers)
+    assert first.status_code == 201
+    uid = first.json()["upload_id"]
+    staging = Path(manager.records[uid].staging_path)
+    assert staging.exists()
+    original_create = manager._create
+    replayed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_replay(*args):
+        result = await original_create(*args)
+        replayed.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(manager, "_create", hold_replay)
+    declaration = UploadDeclaration(dir="", name="payload.bin", size=3, created_by="alice")
+    duplicate = asyncio.create_task(
+        manager.create("session", DEFAULT_ENVIRONMENT_ID, declaration, "a" * 32)
+    )
+    await asyncio.wait_for(replayed.wait(), 5)
+    duplicate.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await duplicate
+
+    assert uid in manager.records
+    assert staging.exists()
+    url = BASE + "/" + uid + "?created_by=alice"
+    assert (await client.patch(url, headers=HEADERS, content=b"abc")).status_code == 204
+    assert (await client.post(BASE + "/" + uid + "/complete?created_by=alice")).status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_create_key_survives_index_restore_and_finished_replay(
     client: httpx.AsyncClient,
 ) -> None:

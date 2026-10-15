@@ -702,16 +702,18 @@ class UploadManager:
         )
         self.inflight.add(request)
         try:
-            return await asyncio.shield(task)
+            result, _created = await asyncio.shield(task)
+            return result
         except asyncio.CancelledError:
             try:
-                result = await self._settle(task)
+                result, created = await self._settle(task)
             except (RouteError, OSError):
                 pass
             else:
-                uid = cast(str, result["upload_id"])
-                cleanup = asyncio.create_task(self._abort_creation(uid))
-                await self._settle(cleanup)
+                if created:
+                    uid = cast(str, result["upload_id"])
+                    cleanup = asyncio.create_task(self._abort_creation(uid))
+                    await self._settle(cleanup)
             raise
         finally:
             self.inflight.discard(request)
@@ -790,7 +792,7 @@ class UploadManager:
         environment_id: str,
         declaration: UploadDeclaration,
         idempotency_key: str | None,
-    ) -> dict[str, object]:
+    ) -> tuple[dict[str, object], bool]:
         if not valid_name(declaration.name):
             raise RouteError(400, "invalid_name", "Invalid basename")
         if declaration.dir.startswith("/") or "\\" in declaration.dir or "\0" in declaration.dir:
@@ -811,7 +813,7 @@ class UploadManager:
                 session_id, environment_id, declaration, idempotency_key, directory
             )
             if replay is not None:
-                return replay
+                return replay, False
         async with self._using_helper(session_id, environment_id) as helper:
             binding = self.helpers[(session_id, environment_id)]
             uid = uuid.uuid4().hex
@@ -891,7 +893,7 @@ class UploadManager:
                         session_id, environment_id, declaration, idempotency_key, directory
                     )
                     if replay is not None:
-                        return replay
+                        return replay, False
                 try:
                     result = await self._call(
                         uid,
@@ -916,12 +918,15 @@ class UploadManager:
                     record.staging_ino = cast(int, result["staging_ino"])
                     record.pending = False
                     await self._save_settled()
-                return {
-                    "upload_id": uid,
-                    "offset": 0,
-                    "chunk_bytes": min(1024**2, self.limits.chunk_bytes),
-                    "expires_at": now + min(self.limits.idle_ttl_s, self.limits.max_age_s),
-                }
+                return (
+                    {
+                        "upload_id": uid,
+                        "offset": 0,
+                        "chunk_bytes": min(1024**2, self.limits.chunk_bytes),
+                        "expires_at": now + min(self.limits.idle_ttl_s, self.limits.max_age_s),
+                    },
+                    True,
+                )
 
     async def operate(
         self,
