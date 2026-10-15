@@ -791,6 +791,7 @@ class HarnessProcessManager:
                 and entry is not None
                 and harness != "any"
                 and entry.process.returncode is None
+                and entry.endpoint is not None
                 and entry.endpoint.socket_path is not None
                 and entry.endpoint.socket_path.parent == self._instance_dir
                 and not entry.endpoint.socket_path.exists()
