@@ -361,7 +361,7 @@ def test_resolve_agent_bundle_ships_the_shared_review_remediation(tmp_path: Path
 
 
 def test_resolve_agent_bundle_ships_the_shared_review_loop(tmp_path: Path) -> None:
-    """The linked review-loop skill and the legacy helper path reach the server as files."""
+    """The linked review-loop skill reaches the server as files, with one copy of the helper."""
     from omnigent.cli import _bundle
     from omnigent.spec.tar_utils import extract_safe
 
@@ -373,7 +373,7 @@ def test_resolve_agent_bundle_ships_the_shared_review_loop(tmp_path: Path) -> No
 
     assert "otto-pr-review-loop" in {skill.name for skill in load(extracted).skills}
     helper = (shared / "review_cycle.py").read_text(encoding="utf-8")
-    for path in ("otto-pr-review-loop/review_cycle.py", "resolve-drive-pr/review_cycle.py"):
-        bundled = extracted / "skills" / path
-        assert not bundled.is_symlink()
-        assert bundled.read_text(encoding="utf-8") == helper
+    bundled = extracted / "skills" / "otto-pr-review-loop" / "review_cycle.py"
+    assert not bundled.is_symlink()
+    assert bundled.read_text(encoding="utf-8") == helper
+    assert not (extracted / "skills" / "resolve-drive-pr" / "review_cycle.py").exists()
