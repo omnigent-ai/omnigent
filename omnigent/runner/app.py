@@ -3959,9 +3959,13 @@ def create_runner_app(
             return False
         if expected_task is not None and turn_task is not expected_task:
             return False
+        turn_epoch = _turn_bind_epoch.get(conv_id, 0)
         turn_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await turn_task
+        # A replacement can start and finish while cancellation unwinds.
+        if _turn_bind_epoch.get(conv_id, 0) != turn_epoch:
+            return True
         if _active_turns.get(conv_id) is turn_task:
             _on_proxy_stream_end(conv_id)
             return True
