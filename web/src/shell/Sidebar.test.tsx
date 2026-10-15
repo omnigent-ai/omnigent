@@ -1581,16 +1581,8 @@ describe("Sidebar session list", () => {
       expect(within(section).getByRole("meter", { name: "CPU used" })).toBeInTheDocument();
       expect(within(tooltip).queryByTestId("session-tooltip-location")).toBeNull();
       const details = within(tooltip).getByTestId("session-tooltip-branch").parentElement!;
-      const dividers: Element[] = [];
-      for (
-        let sibling = details.nextElementSibling;
-        sibling;
-        sibling = sibling.nextElementSibling
-      ) {
-        if (sibling.classList.contains("border-t")) dividers.push(sibling);
-        if (sibling === section) break;
-      }
-      expect(dividers).toEqual([section]);
+      const dividers = [...tooltip.children].filter((el) => el.classList.contains("border-t"));
+      expect(dividers).toEqual([details, section]);
       expect(section).toHaveClass("border-border");
       // The section closes the card, after the status line.
       expect(tooltip.lastElementChild).toBe(section);
