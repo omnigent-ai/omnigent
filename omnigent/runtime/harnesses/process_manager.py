@@ -721,9 +721,10 @@ class HarnessProcessManager:
         switching support; changes to ACP startup options also require a restart.
 
         Crash detection: if the previously-spawned subprocess has
-        exited (``returncode is not None``), the entry is dropped
-        and a fresh subprocess is spawned with the ``env``
-        provided on the call that triggered the respawn.
+        exited (``returncode is not None``), or its Unix socket has
+        disappeared, the entry is dropped and a fresh subprocess is
+        spawned with the ``env`` provided on the call that triggered
+        the respawn.
         Per-conversation lock ensures concurrent callers during
         the lazy-init window don't race two subprocesses onto the
         same socket — see §Process management: Spawn lock for the
@@ -785,6 +786,32 @@ class HarnessProcessManager:
                     "while get_client waited"
                 )
             entry = self._entries.get(conversation_id)
+            if (
+                entry is not None
+                and entry.process.returncode is None
+                and entry.endpoint.socket_path is not None
+                and not entry.endpoint.socket_path.exists()
+            ):
+                _logger.warning(
+                    "harness %s for conversation %s lost its socket; respawning",
+                    entry.harness,
+                    conversation_id,
+                    extra={
+                        "session_id": conversation_id,
+                        "event_name": "harness_socket_missing",
+                        "attributes": {
+                            "harness": entry.harness,
+                            "pid": entry.process.pid,
+                            "socket_path": str(entry.endpoint.socket_path),
+                            "tracked_response_id": self._in_flight_response_ids.get(
+                                conversation_id
+                            ),
+                        },
+                    },
+                )
+                await self._close_entry(entry)
+                self._in_flight_response_ids.pop(conversation_id, None)
+                entry = None
             if entry is not None and entry.process.returncode is not None:
                 # Prior subprocess died; drop the stale entry and
                 # respawn below. The dead client is closed on
