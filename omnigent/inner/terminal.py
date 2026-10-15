@@ -31,6 +31,7 @@ from typing import Any, TypeAlias, cast
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native import owner_claim
 from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import strip_runner_auth_secrets
@@ -804,20 +805,40 @@ def _tmux_available() -> bool:
     return shutil.which("tmux") is not None
 
 
+class TmuxUnavailableError(OmnigentError, RuntimeError):
+    """The host has no tmux that managed terminals can use.
+
+    Coded ``HARNESS_NOT_CONFIGURED``: only the person can fix the host's tmux,
+    and the message says how, so a terminal start failure shows it verbatim.
+    Subclasses :class:`RuntimeError` so callers that already catch that keep
+    working.
+    """
+
+    def __init__(self, message: str) -> None:
+        """
+        :param message: Client-safe remedy, e.g. ``"tmux 3.2 is too old; ..."``.
+        """
+        super().__init__(message, code=ErrorCode.HARNESS_NOT_CONFIGURED)
+
+
 def _require_supported_tmux() -> None:
     """Fail before terminal setup when tmux is missing, unknown, or too old."""
     tmux = shutil.which("tmux")
     if tmux is None:
-        raise RuntimeError("tmux is not installed or not on PATH")
+        raise TmuxUnavailableError(
+            "tmux is not installed or not on PATH. Native terminals need tmux "
+            f"{MIN_TMUX_VERSION_HINT} or newer: install it (macOS: `brew install tmux`), "
+            "or restart the Omnigent host from a shell where `tmux -V` works."
+        )
     version = tmux_version(tmux)
     if version is None:
-        raise RuntimeError(
+        raise TmuxUnavailableError(
             "Could not determine the installed tmux version; managed terminals require "
             f"tmux {MIN_TMUX_VERSION_HINT} or newer"
         )
     if version < MIN_TMUX_VERSION:
         detected = f"{version[0]}.{version[1]}"
-        raise RuntimeError(
+        raise TmuxUnavailableError(
             f"tmux {detected} is too old; managed terminals require "
             f"tmux {MIN_TMUX_VERSION_HINT} or newer"
         )

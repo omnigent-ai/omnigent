@@ -685,6 +685,12 @@ console listener is stored on the registry entry
 `close()` detaches it on teardown. Electron-only (needs `executeJavaScript` +
 the native view); no server flag.
 
+All renderer IPC navigation uses the same URL policy, including the URL bar.
+A renderer's `agent: false` flag does not exempt a tab from address checks.
+Main-owned Arca preview eligibility still applies. Other internal sites must be
+opened in a separate browser; this also keeps later redirects in these tabs
+under the same policy.
+
 **JS trust boundary (important):** `omnigent:browser-execute` runs
 arbitrary JS in the child view via `executeJavaScript(js, true)`. It is exposed
 to the SPA **only for the relay's own fixed templates** (the DOM-snapshot walk,

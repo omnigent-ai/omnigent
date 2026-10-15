@@ -52,3 +52,12 @@ def test_repro_agent_loads_the_screen_evidence_caption_rule_as_instructions() ->
     spec = load(_REPRO_AGENT, expand_env=False)
     assert "Caption the screen from screen evidence" in spec.instructions
     assert "Base screen claims on inspected frames" in _normalized(_DEV / "recording-lanes.md")
+
+
+def test_caption_rules_reach_the_agent_without_treating_hidden_labels_as_visible() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+    instructions = " ".join(load(_REPRO_AGENT, expand_env=False).instructions.split())
+    assert "in the recorded viewport and unobstructed" in lanes
+    assert "Quote only text the viewer can see" in lanes
+    assert "quote only visibly rendered text" in instructions
+    assert "hidden accessibility labels and backend logs are not screen evidence" in instructions

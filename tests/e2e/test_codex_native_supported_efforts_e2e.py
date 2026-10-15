@@ -440,6 +440,34 @@ def test_codex_model_switch_clamps_inherited_effort(codex_effort_rig: _Rig) -> N
         _assert_turn(rig, session, _STANDARD_MODEL, "xhigh")
 
 
+def test_codex_model_pick_recreates_closed_terminal(codex_effort_rig: _Rig) -> None:
+    """A model pick restores an exited TUI and keeps the live Codex thread."""
+    rig = codex_effort_rig
+    assert "high" in rig.capabilities("gpt-6-sol")
+    assert "low" in rig.capabilities("gpt-6-astra")
+    with _session(rig, "gpt-6-sol", "high") as session:
+        _assert_turn(rig, session, "gpt-6-sol", "high")
+        original = read_bridge_state(session.bridge)
+        assert original is not None
+        terminal_path = f"/v1/sessions/{session.id}/resources/terminals/{session.terminal['id']}"
+        _json(rig.api.delete(terminal_path))
+        assert rig.api.get(terminal_path).status_code == 404
+
+        _json(
+            rig.api.patch(
+                f"/v1/sessions/{session.id}",
+                json={"model_override": "gpt-6-astra", "reasoning_effort": "low"},
+            )
+        )
+        session.terminal = _json(rig.api.get(terminal_path))
+        recovered = read_bridge_state(session.bridge)
+        assert recovered is not None
+        assert recovered.thread_id == original.thread_id
+        assert recovered.socket_path == original.socket_path
+        _assert_turn(rig, session, "gpt-6-astra", "low", terminal=True)
+        _assert_turn(rig, session, "gpt-6-astra", "low")
+
+
 def test_codex_effort_reset_survives_next_turn(codex_effort_rig: _Rig) -> None:
     """Clearing the picker uses the real model default without restoring the saved effort."""
     rig = codex_effort_rig
