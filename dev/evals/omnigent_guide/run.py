@@ -30,6 +30,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -60,7 +61,21 @@ from tests.harness_bench.driver import TurnResult, infra_failure_reason
 from tests.harness_bench.profile import resolve_profile
 
 _RUNS_PER_DRIVER = 15
-_INFRA_RETRIES = 2
+_INFRA_RETRIES = 4
+# The gateway limits input tokens per minute per workspace, and an agent turn
+# resends its whole context on every tool call, so parallel lanes can exceed it.
+_RATE_LIMIT_MARKERS = ("429", "REQUEST_LIMIT_EXCEEDED", "ReadTimeout")
+_RATE_LIMIT_PAUSE_S = 45.0
+
+
+def _rate_limited(error: str | None) -> bool:
+    return any(marker in str(error) for marker in _RATE_LIMIT_MARKERS)
+
+
+def is_infra_error(error: str | None) -> bool:
+    """Whether a failed run says nothing about the agent: auth, network, or rate limits."""
+    return _rate_limited(error) or bool(infra_failure_reason(TurnResult(failed=True, error=error)))
+
 
 _SHIMS = Path(__file__).with_name("shims")
 
@@ -321,14 +336,17 @@ def _drive(
         kwargs["os_env"] = _sandboxed_os_env(arm, scratch)
     for start in range(0, len(todo), _RUNS_PER_DRIVER):
         # Fresh provisioning per batch mints fresh gateway credentials.
-        with _DRIVERS[harness](**kwargs) as driver:
+        driver_cm = _DRIVERS[harness](**kwargs)
+        if hasattr(driver_cm, "keep_logs_in"):
+            driver_cm.keep_logs_in = scratch / "logs"
+        with driver_cm as driver:
             for case, index in todo[start : start + _RUNS_PER_DRIVER]:
                 record = RunRecord(case_id=case.id, harness=harness, arm=arm.name, run_index=index)
                 driver.run(case.prompt, record)
-                if record.status == "failed" and infra_failure_reason(
-                    TurnResult(failed=True, error=record.error)
-                ):
+                if record.status == "failed" and is_infra_error(record.error):
                     record.status = INFRA_ERROR
+                    if _rate_limited(record.error):
+                        time.sleep(_RATE_LIMIT_PAUSE_S)
                 with path.open("a", encoding="utf-8") as runs_file:
                     runs_file.write(json.dumps(dataclasses.asdict(record)) + "\n")
                 print(

@@ -78,13 +78,14 @@ def test_skill_loads_are_recognized_across_harness_shapes() -> None:
 
 
 def test_referee_checks_commands_and_flags_against_the_cli(referee: Referee) -> None:
-    good, bad, negated, passthrough = referee.review(
+    good, bad, negated, passthrough, positional = referee.review(
         [
             "Run `omnigent upgrade --check`, then `omni upgrade`.",
             "```bash\nomnigent schedule create --cron '0 9 * * 1-5'\n"
             "omnigent upgrade --latest\n```",
             "There is no `omnigent schedule` command.",
             "`omnigent claude --dangerously-skip-permissions` forwards the flag.",
+            'Run `omnigent host https://omni.example.com`, or wrap it: `omnigent "$@"`.',
         ]
     )
 
@@ -95,6 +96,7 @@ def test_referee_checks_commands_and_flags_against_the_cli(referee: Referee) -> 
     }
     assert negated.findings and not negated.fabrications
     assert not passthrough.fabrications
+    assert not positional.fabrications and positional.uses_command(["host"])
 
 
 def test_referee_loads_yaml_through_the_spec_loaders(referee: Referee) -> None:

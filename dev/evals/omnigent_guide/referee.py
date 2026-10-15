@@ -370,7 +370,18 @@ def _segments(line: str) -> Iterable[list[str]]:
 
 
 def _is_placeholder(token: str) -> bool:
-    return bool(_PLACEHOLDER_RE.match(token)) or token.startswith("<") or token.endswith(">")
+    return (
+        bool(_PLACEHOLDER_RE.match(token)) or token.startswith(("<", "$")) or token.endswith(">")
+    )
+
+
+def _url_or_path(token: str) -> bool:
+    """A URL or path, which a group may take as an argument (``omnigent host <url>``)."""
+    return (
+        "://" in token
+        or token.startswith(("/", "./", "~"))
+        or bool(re.match(r"^[\w.-]+\.[a-z]{2,}(:\d+)?(/|$)|^[\w.-]+:\d+(/|$)", token))
+    )
 
 
 def _walk_cli(
@@ -401,6 +412,8 @@ def _walk_cli(
             continue
         if node["commands"]:
             sub = node["commands"].get(token)
+            if sub is None and _url_or_path(token):
+                continue  # a group that takes a URL, e.g. `omnigent host https://...`
             if sub is None:
                 where = " ".join(("omnigent", *path, token))
                 findings.append(Finding("command", where, "no such command"))

@@ -73,8 +73,18 @@ def isolated_claude_env(root: Path) -> dict[str, str]:
 #: on a prompt nobody answers.
 CLAUDE_ALLOWED_TOOLS = (
     "Read,Glob,Grep,WebFetch,WebSearch,Skill,Write,Edit,mcp__omnigent,"
-    "Bash(omnigent:*),Bash(omni:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(grep:*),"
-    "Bash(find:*),Bash(which:*),Bash(curl:*)"
+    "Bash(omnigent:*),Bash(omni:*),Bash(which:*)"
+)
+
+#: The runner machine may hold an Omnigent checkout and the operator's own
+#: Omnigent and Claude data; an installed user has neither. Path rules cover
+#: Read, Grep, and Glob; the relay's shell and file tools would bypass them.
+CLAUDE_DISALLOWED_TOOLS = (
+    "Read(~/Repositories/**),Edit(~/Repositories/**),Read(~/.omnigent/**),"
+    "Edit(~/.omnigent/**),Read(~/.claude/**),Edit(~/.claude/**),"
+    "mcp__omnigent__sys_os_shell,mcp__omnigent__sys_os_read,mcp__omnigent__sys_os_write,"
+    "mcp__omnigent__sys_os_edit,mcp__omnigent__sys_terminal_launch,"
+    "mcp__omnigent__sys_terminal_send,mcp__omnigent__sys_terminal_read"
 )
 
 #: Mirrors the production ``claude-native-ui`` agent, minus the user's own
@@ -194,6 +204,8 @@ class ClaudeNativeEvalDriver(NativeTuiDriver):
             self._model,
             "--allowedTools",
             CLAUDE_ALLOWED_TOOLS,
+            "--disallowedTools",
+            CLAUDE_DISALLOWED_TOOLS,
         ]
         try:
             created = post_session_bundle(
@@ -291,6 +303,9 @@ class SdkEvalDriver:
         self._root = Path(tempfile.mkdtemp(prefix="omni-eval-sdk-"))
         self._workspace = self._root / "workspace"
         self._server: SharedFullServer | None = None
+        #: Where to keep server and runner logs when a run in the batch fails.
+        self.keep_logs_in: Path | None = None
+        self._had_errors = False
 
     def __enter__(self) -> SdkEvalDriver:
         try:
@@ -310,6 +325,13 @@ class SdkEvalDriver:
 
     def __exit__(self, *exc: object) -> None:
         if self._server is not None:
+            # Keep the server and runner logs of a batch that hit errors.
+            if self.keep_logs_in is not None and self._had_errors:
+                target = self.keep_logs_in / f"batch-{uuid.uuid4().hex[:8]}"
+                target.mkdir(parents=True, exist_ok=True)
+                for name in ("server.log", "runner.log"):
+                    with contextlib.suppress(OSError):
+                        shutil.copy2(self._server._tmp / name, target / name)
             self._server.__exit__(*exc)
         shutil.rmtree(self._root, ignore_errors=True)
 
@@ -351,12 +373,14 @@ class SdkEvalDriver:
             session_id = self._server.create_session(self._agent_name)
         except (httpx.HTTPError, IndexError, KeyError) as exc:
             record.status, record.error = INFRA_ERROR, repr(exc)
+            self._had_errors = True
             return record
         try:
             return ask(
                 self._server.client, session_id, prompt, record, timeout=self._timeout, quiet_s=3.0
             )
         finally:
+            self._had_errors |= record.status != "completed"
             _delete_session(self._server.client, session_id)
 
 
