@@ -475,6 +475,139 @@ async def test_serve_tunnel_no_credential_error_after_streak(
     assert "login https://ws.cloud.databricks.com/omnigent?o=123` " in message
 
 
+class _SignInFactory:
+    """Token factory whose credential source reports a pending interactive sign-in."""
+
+    def __init__(self, pending_calls: int, *, token: str | None) -> None:
+        """
+        :param pending_calls: Calls that report the sign-in as still pending.
+        :param token: What later calls return once it is no longer pending.
+        """
+        self._pending_calls = pending_calls
+        self._token = token
+        self.calls = 0
+        self.sign_in_pending = pending_calls > 0
+
+    def __call__(self) -> str | None:
+        self.calls += 1
+        self.sign_in_pending = self.calls <= self._pending_calls
+        return None if self.sign_in_pending else self._token
+
+
+def _clock_advanced_by_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Drive ``serve_tunnel``'s clock from its own sleeps; return the recorded delays."""
+    now = [1000.0]
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(serve_module.time, "monotonic", lambda: now[0])
+    return sleeps
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_waits_for_a_pending_sign_in_then_connects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A never-connected runner polls a pending sign-in instead of upgrading without a token."""
+    factory = _SignInFactory(pending_calls=4, token="tok-after-sign-in")
+    upgrades: list[str | None] = []
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **kwargs: Any) -> None:
+        del app
+        upgrades.append(auth_token)
+        kwargs["on_connected"]()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_sign_in_wait",
+            runner_version="0.1.0",
+            auth_token_factory=factory,
+        )
+
+    # No unauthenticated upgrade while pending: the first one carries the new token.
+    assert upgrades == ["tok-after-sign-in"]
+    assert len(sleeps) == 4
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_fails_once_the_sign_in_is_no_longer_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sign-in that stops being pending without a token fails like any missing credential."""
+    from omnigent.runner.transports.ws_tunnel.serve import _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+    factory = _SignInFactory(pending_calls=2, token=None)
+    attempts = 0
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        del app
+        nonlocal attempts
+        attempts += 1
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_sign_in_required",
+            runner_version="0.1.0",
+            auth_token_factory=factory,
+        )
+
+    assert str(exc_info.value).startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+    assert attempts == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_bounds_the_wait_for_a_pending_sign_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sign-in still pending at the budget fails the launch as before."""
+    from omnigent.runner.transports.ws_tunnel.serve import (
+        _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS,
+        _SIGN_IN_PENDING_POLL_INTERVAL_S,
+        _SIGN_IN_PENDING_WAIT_S,
+    )
+
+    factory = _SignInFactory(pending_calls=10_000, token=None)
+    attempts = 0
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        del app
+        nonlocal attempts
+        attempts += 1
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="no credential available"):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_sign_in_timeout",
+            runner_version="0.1.0",
+            auth_token_factory=factory,
+        )
+
+    polls = [delay for delay in sleeps if delay == _SIGN_IN_PENDING_POLL_INTERVAL_S]
+    assert sum(polls) == _SIGN_IN_PENDING_WAIT_S
+    assert attempts == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+
 @pytest.mark.asyncio
 async def test_serve_tunnel_reauth_hint_uses_wrapper_command(
     monkeypatch: pytest.MonkeyPatch,
