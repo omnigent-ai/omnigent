@@ -2,6 +2,7 @@ import { markdownTokens } from "./SourceMappedMarkdown";
 import { decodeHtmlEntities, type MarkdownToken } from "@tiptap/core";
 import type { MarkdownManager } from "@tiptap/markdown";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
+import { ALERT_MARKER } from "./TipTapGitHubAlert";
 
 interface Source {
   text: string;
@@ -221,7 +222,7 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
         }
         children(token.tokens ?? [], inner);
         const text = pieces.slice(begin).join("");
-        const marker = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](\n|$)/.exec(text);
+        const marker = ALERT_MARKER.exec(text);
         if (marker) {
           pieces.splice(begin, pieces.length - begin, text.slice(marker[0].length));
           starts.splice(charBegin, marker[0].length);
@@ -279,10 +280,15 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
   const positions: number[] = [];
   let cursor = 0;
   doc.descendants((node, pos) => {
-    if (!node.isText || !node.text) return;
-    if (!text.startsWith(node.text, cursor)) valid = false;
+    if (!valid) return false;
+    if (!node.isText || !node.text) return true;
+    if (!text.startsWith(node.text, cursor)) {
+      valid = false;
+      return false;
+    }
     for (let i = 0; i < node.text.length; i++) positions.push(pos + i);
     cursor += node.text.length;
+    return true;
   });
   const monotonic = (values: number[]) =>
     values.every((value, i) => i === 0 || value >= values[i - 1]);
@@ -302,8 +308,10 @@ export function markdownSourceMap(
   let map: SourceMap | null = null;
   try {
     map = buildMap(doc, raw, manager);
-  } catch {
+  } catch (error) {
     // Custom tokenizer failures must preserve the legacy comment path.
+    if (import.meta.env.DEV)
+      console.warn("Markdown source map failed; using legacy anchors", error);
   }
   cache.set(doc, { raw, manager, map });
   return map;
