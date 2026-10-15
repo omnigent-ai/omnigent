@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import socket
 import sys
@@ -11,6 +12,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
+import psutil
 import pytest
 import uvicorn
 from fastapi import FastAPI, Request
@@ -29,8 +31,20 @@ CHUNK = 8 * 1024**2
 MAX_COPIES = 3
 # Headers, frames and other per-request objects are far smaller than one chunk.
 SLACK = 512 * 1024
-# A multi-part read may hold the growing buffer's over-allocation, never a second copy.
+# Multipart reads keep one chunk buffer plus small receive parts.
 MAX_READ_PEAK = 1.2
+
+
+def _multipart_request(payload: bytes, part: int, content_length: int | None) -> Request:
+    offsets = iter(range(0, len(payload), part))
+
+    async def receive() -> dict:
+        start = next(offsets, len(payload))
+        body = payload[start : start + part]
+        return {"type": "http.request", "body": body, "more_body": start + part < len(payload)}
+
+    headers = [] if content_length is None else [(b"content-length", str(content_length).encode())]
+    return Request({"type": "http", "method": "PATCH", "headers": headers}, receive)
 
 
 @pytest.mark.parametrize(
@@ -48,7 +62,14 @@ async def test_multi_part_read_stays_near_one_copy(size: int, part: int) -> None
         body = payload[start : start + part]
         return {"type": "http.request", "body": body, "more_body": start + part < size}
 
-    request = Request({"type": "http", "method": "PATCH", "headers": []}, receive)
+    request = Request(
+        {
+            "type": "http",
+            "method": "PATCH",
+            "headers": [(b"content-length", str(size).encode())],
+        },
+        receive,
+    )
     tracemalloc.start()
     try:
         baseline = tracemalloc.get_traced_memory()[0]
@@ -59,6 +80,122 @@ async def test_multi_part_read_stays_near_one_copy(size: int, part: int) -> None
     assert body == payload
     print(f"{size}B in {part}B parts: read peak={peak} bytes ({peak / size:.2f}x)")
     assert peak <= MAX_READ_PEAK * size, f"read peak {peak / size:.2f}x payload"
+
+
+async def test_declared_length_preallocates_exact_buffer_for_multipart_body(monkeypatch) -> None:
+    payload = os.urandom(CHUNK)
+    offsets = iter(range(0, len(payload), 64 * 1024))
+    preallocated_sizes: list[int] = []
+    original_bytes_io = uploads.io.BytesIO
+
+    class TrackingBytesIO(original_bytes_io):
+        def write(self, data: bytes) -> int:
+            written = super().write(data)
+            if data == b"\0":
+                preallocated_sizes.append(self.tell())
+            return written
+
+    monkeypatch.setattr(uploads.io, "BytesIO", TrackingBytesIO)
+
+    async def receive() -> dict:
+        start = next(offsets, len(payload))
+        body = payload[start : start + 64 * 1024]
+        return {
+            "type": "http.request",
+            "body": body,
+            "more_body": start + 64 * 1024 < len(payload),
+        }
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "PATCH",
+            "headers": [(b"content-length", str(len(payload)).encode())],
+        },
+        receive,
+    )
+    body = await uploads._read_capped(request, len(payload))
+    assert body == payload
+    assert preallocated_sizes == [len(payload)]
+
+
+async def test_declared_body_longer_than_content_length_is_rejected() -> None:
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"four", "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "PATCH",
+            "headers": [(b"content-length", b"3")],
+        },
+        receive,
+    )
+    with pytest.raises(uploads.UploadError) as error:
+        await uploads._read_capped(request, 8)
+    assert error.value.code == uploads.ErrorCode.TOO_LARGE
+
+
+async def test_declared_length_over_cap_is_rejected_before_reading() -> None:
+    calls = 0
+
+    async def receive() -> dict:
+        nonlocal calls
+        calls += 1
+        return {"type": "http.request", "body": b"x", "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "PATCH",
+            "headers": [(b"content-length", b"9")],
+        },
+        receive,
+    )
+    with pytest.raises(uploads.UploadError) as error:
+        await uploads._read_capped(request, 8)
+    assert error.value.code == uploads.ErrorCode.TOO_LARGE
+    assert calls == 0
+
+
+async def test_declared_body_shorter_than_content_length_is_rejected() -> None:
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"four", "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "PATCH",
+            "headers": [(b"content-length", b"5")],
+        },
+        receive,
+    )
+    with pytest.raises(uploads.UploadError) as error:
+        await uploads._read_capped(request, 8)
+    assert error.value.code == uploads.ErrorCode.UPLOAD_RELAY_FAILED
+
+
+async def test_repeated_declared_length_reads_bound_rss_growth() -> None:
+    process = psutil.Process()
+    try:
+        baseline = process.memory_info().rss
+    except (OSError, psutil.Error) as exc:
+        pytest.skip(f"process RSS is unavailable: {exc}")
+
+    payload = os.urandom(CHUNK)
+    for _ in range(25):
+        request = _multipart_request(payload, 64 * 1024, content_length=None)
+        body = await uploads._read_capped(request, len(payload))
+        assert body == payload
+        del body
+        gc.collect()
+
+    try:
+        growth = process.memory_info().rss - baseline
+    except (OSError, psutil.Error) as exc:
+        pytest.skip(f"process RSS is unavailable: {exc}")
+    print(f"25 repeated 8 MiB reads: RSS growth={growth / 1024**2:.2f} MiB")
+    assert growth < 64 * 1024**2, f"RSS grew {growth / 1024**2:.2f} MiB"
 
 
 # The runner lives in a child process so tracemalloc sees only server-side allocations.
