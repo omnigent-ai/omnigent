@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import heapq
 import itertools
 import ntpath
@@ -18,7 +19,7 @@ from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -104,6 +105,7 @@ _MESSAGES = {
     ErrorCode.INVALID_NAME: "Invalid upload basename",
     ErrorCode.INVALID_PATH: "Destination must be inside the workspace",
     ErrorCode.INVALID_REQUEST: "Invalid upload declaration",
+    ErrorCode.IDEMPOTENCY_KEY_CONFLICT: "Upload declaration changed for this key",
     ErrorCode.INVALID_OFFSET: "Upload-Offset must be a nonnegative integer",
     ErrorCode.FILE_EXISTS: "A file already exists at the destination",
     ErrorCode.IS_DIRECTORY: "The destination is a directory",
@@ -196,6 +198,7 @@ class UploadRecord:
     runner_id: str | None
     finished: bool = False
     aborted: bool = False
+    idempotency_key: str | None = None
 
     def expired(self, now: float) -> bool:
         return (
@@ -216,6 +219,9 @@ class SessionAdmission:
 class UploadIndex:
     # The index belongs to one application's router, never another workspace.
     records: dict[UploadKey, UploadRecord] = field(default_factory=dict)
+    idempotency_keys: dict[tuple[str, str, str, str], tuple[str, str]] = field(
+        default_factory=dict
+    )
     sessions: dict[str, SessionAdmission] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
     expiry_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -240,6 +246,10 @@ class UploadIndex:
 
     def remove(self, key: UploadKey) -> None:
         record = self.records.pop(key, None)
+        if record is not None and record.idempotency_key is not None:
+            scope = (*key[:2], record.owner, record.idempotency_key)
+            if self.idempotency_keys.get(scope, (None,))[0] == key[2]:
+                self.idempotency_keys.pop(scope, None)
         if record is not None and not record.finished:
             self.release(key, record)
 
@@ -256,6 +266,8 @@ class UploadIndex:
         if record.finished:
             return False
         self.release(key, record)
+        if record.idempotency_key is not None:
+            self.idempotency_keys.pop((*key[:2], record.owner, record.idempotency_key), None)
         record.finished = True
         record.aborted = aborted
         return True
@@ -376,6 +388,7 @@ async def _relay(
     declaration: dict[str, Any] | None = None,
     body: bytes | None = None,
     offset: int = 0,
+    idempotency_key: str | None = None,
 ) -> httpx.Response:
     try:
         async with asyncio.timeout(timeout):
@@ -390,6 +403,8 @@ async def _relay(
                     "Upload-Offset": str(offset),
                 }
                 if body is not None
+                else {"Idempotency-Key": idempotency_key}
+                if idempotency_key is not None
                 else None,
                 extensions={"runner_tunnel_binary_request_body": True}
                 if body is not None
@@ -571,7 +586,12 @@ def register_upload_routes(
             }
         },
     )
-    async def create(request: Request, session_id: str, environment_id: str) -> CreatedUpload:
+    async def create(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> CreatedUpload:
         conv, owner = await authorize(request, session_id)
         trusted_origin(request)
         if _request_media_type(request) != "application/json":
@@ -582,6 +602,8 @@ def register_upload_routes(
             )
         except ValidationError as exc:
             raise UploadError(ErrorCode.INVALID_REQUEST) from exc
+        if idempotency_key is not None and not re.fullmatch(r"[0-9a-f]{32}", idempotency_key):
+            raise UploadError(ErrorCode.INVALID_REQUEST)
         await validate_session(
             session_id, request, browse_level(declaration.dir, within_workspace=LEVEL_EDIT)
         )
@@ -619,6 +641,12 @@ def register_upload_routes(
             raise UploadError(ErrorCode.RUNNER_CAPABILITY_MISMATCH)
         if declaration.size > cap.limits.max_file_bytes:
             raise UploadError(ErrorCode.TOO_LARGE)
+        digest = hashlib.sha256(declaration.model_dump_json().encode()).hexdigest()
+        scope = (
+            (session_id, environment_id, owner, idempotency_key)
+            if idempotency_key is not None
+            else None
+        )
         now = time.monotonic()
         record = UploadRecord(
             owner,
@@ -629,17 +657,29 @@ def register_upload_routes(
             config.workspace_upload_staging_idle_ttl_s(),
             config.workspace_upload_staging_max_age_s(),
             conv.runner_id,
+            idempotency_key=idempotency_key,
         )
         pending = (session_id, environment_id, uuid.uuid4().hex)
         index.prune(session_id)
         with index.lock:
-            admission = index.sessions.get(session_id, SessionAdmission())
-            if (
-                len(admission.keys) >= cap.limits.max_open_uploads
-                or admission.size + declaration.size > cap.limits.max_open_bytes
-            ):
-                raise UploadError(ErrorCode.UPLOAD_LIMIT, {"Retry-After": "60"})
-            index.add(pending, record)
+            replay = index.idempotency_keys.get(scope) if scope is not None else None
+            live = (
+                index.records.get((session_id, environment_id, replay[0]))
+                if replay is not None
+                else None
+            )
+            if live is None or live.finished:
+                if scope is not None:
+                    index.idempotency_keys.pop(scope, None)
+                admission = index.sessions.get(session_id, SessionAdmission())
+                if (
+                    len(admission.keys) >= cap.limits.max_open_uploads
+                    or admission.size + declaration.size > cap.limits.max_open_bytes
+                ):
+                    raise UploadError(ErrorCode.UPLOAD_LIMIT, {"Retry-After": "60"})
+                index.add(pending, record)
+            elif replay is not None and replay[1] != digest:
+                raise UploadError(ErrorCode.IDEMPOTENCY_KEY_CONFLICT)
         try:
             response = await _relay(
                 client,
@@ -647,13 +687,18 @@ def register_upload_routes(
                 _runner_path(session_id, environment_id),
                 timeout=config.workspace_upload_chunk_timeout_s(),
                 declaration={**declaration.model_dump(), "created_by": owner},
+                idempotency_key=idempotency_key,
             )
             result: CreatedUpload = _json_model(response, CreatedUpload)
-            if not re.fullmatch(r"[0-9a-f]{32}", result.upload_id) or result.offset != 0:
+            if not re.fullmatch(r"[0-9a-f]{32}", result.upload_id) or not (
+                0 <= result.offset <= declaration.size
+            ):
                 raise UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
             with index.lock:
                 index.remove(pending)
                 index.add((session_id, environment_id, result.upload_id), record)
+                if scope is not None:
+                    index.idempotency_keys[scope] = (result.upload_id, digest)
         finally:
             # The runner accounts for creates whose acknowledgement was lost.
             with index.lock:

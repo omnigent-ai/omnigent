@@ -347,6 +347,8 @@ function unconfirmedCancellation(row: UploadRow): void {
 }
 
 function createUpload(row: UploadRow, client: QueryClient) {
+  const createKey = row.createKey ?? crypto.randomUUID().replaceAll("-", "");
+  if (!row.createKey) useUploadStore.getState().update(row.key, { createKey });
   const signal = row.controller.signal;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let deadlineAt: number | undefined;
@@ -379,7 +381,7 @@ function createUpload(row: UploadRow, client: QueryClient) {
   // Keep admission independent of cancellation; late cleanup retains metadata only.
   const created = uploadRequest(row, "", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "Idempotency-Key": createKey },
     body: JSON.stringify({
       dir: row.directory,
       name: row.name,
@@ -562,6 +564,7 @@ export function enqueueUploads(
       ...owner,
       id,
       key: `${ownerKey(owner)}:${id}`,
+      createKey: crypto.randomUUID().replaceAll("-", ""),
       batch,
       file,
       name: file.name,
@@ -613,7 +616,14 @@ export async function retryUpload(
       status: "queued",
       error: undefined,
       controller: new AbortController(),
-      ...(conflict ? { conflict, uploadId: undefined, offset: 0 } : {}),
+      ...(conflict
+        ? {
+            conflict,
+            createKey: crypto.randomUUID().replaceAll("-", ""),
+            uploadId: undefined,
+            offset: 0,
+          }
+        : {}),
     });
     reportedBatches.delete(row.batch);
     pumpUploads(row, client);

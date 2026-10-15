@@ -14,6 +14,7 @@ export type ConflictChoice = "fail" | "replace" | "rename";
 
 export interface UploadRow extends UploadOwner {
   key: string;
+  createKey?: string;
   id: string;
   batch: string;
   file?: File;
