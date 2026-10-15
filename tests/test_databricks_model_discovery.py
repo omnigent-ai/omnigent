@@ -312,7 +312,7 @@ def test_family_shim_warns_and_delegates_to_the_catalog() -> None:
     assert families == {"opus": "system.ai.claude-opus-5"}
 
 
-def _discover_codex(model_services: list[dict[str, str]]) -> tuple[str, ...]:
+def _discover_codex(model_services: list[dict[str, object]]) -> tuple[str, ...]:
     """Run codex discovery against a canned ``system.ai`` model-services page."""
     from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
 
@@ -361,6 +361,49 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> No
 def test_discover_codex_models_empty_listing_is_authoritative() -> None:
     """A listing that serves no codex model returns an empty tuple, not an error."""
     assert _discover_codex([{"name": "model-services/system.ai.claude-opus-5"}]) == ()
+
+
+def test_discover_codex_models_matches_the_advertised_gateway_route() -> None:
+    models = _discover_codex(
+        [
+            {
+                "name": "model-services/system.ai.gpt-99-chat-only",
+                "supported_api_types": ["mlflow/v1/chat/completions", "mlflow/v1/responses"],
+            },
+            {
+                "name": "model-services/system.ai.gpt-99-openai-only",
+                "supported_api_types": ["openai/v1/responses"],
+            },
+            {
+                "name": "model-services/system.ai.glm-99",
+                "supported_api_types": ["codex/v1/responses"],
+            },
+            {
+                "name": "model-services/system.ai.kimi-k99",
+                "supported_api_types": ["CODEX/v1/RESPONSES"],
+            },
+        ]
+    )
+
+    assert set(models) == {"system.ai.glm-99", "system.ai.kimi-k99"}
+
+
+@pytest.mark.parametrize(
+    ("metadata", "included"),
+    [
+        ({}, True),
+        ({"supported_api_types": None}, True),
+        ({"supported_api_types": "codex/v1/responses"}, True),
+        ({"supported_api_types": [None]}, True),
+        ({"supported_api_types": []}, False),
+    ],
+)
+def test_discover_codex_models_distinguishes_unknown_and_empty_route_metadata(
+    metadata: dict[str, object], included: bool
+) -> None:
+    models = _discover_codex([{"name": "model-services/system.ai.gpt-99", **metadata}])
+
+    assert ("system.ai.gpt-99" in models) is included
 
 
 def test_select_servable_model_matches_legacy_spelling() -> None:

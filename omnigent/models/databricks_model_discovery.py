@@ -16,6 +16,7 @@ CLAUDE_MODEL_FAMILIES: tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
 
 _MODEL_SERVICES_PATH = "/api/2.1/unity-catalog/model-services"
 _ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"
+_CODEX_RESPONSES_API_TYPE = "codex/v1/responses"
 _MODEL_SERVICE_PREFIX = "model-services/"
 _SYSTEM_MODEL_PREFIX = "system.ai."
 _MODEL_SERVICES_MAX_RESULTS = 1000
@@ -154,6 +155,8 @@ def _list_model_service_ids(
     client: httpx.Client,
     workspace_url: str,
     headers: dict[str, str],
+    *,
+    required_api_type: str | None = None,
 ) -> list[str]:
     """List Databricks-managed ``system.ai`` model-service identifiers."""
     model_ids: list[str] = []
@@ -185,6 +188,15 @@ def _list_model_service_ids(
                 if model_id.startswith(_MODEL_SERVICE_PREFIX):
                     model_id = model_id[len(_MODEL_SERVICE_PREFIX) :]
                 if model_id.startswith(_SYSTEM_MODEL_PREFIX):
+                    api_types = service.get("supported_api_types")
+                    # Unknown metadata keeps legacy discovery; a valid list is authoritative.
+                    if (
+                        required_api_type is not None
+                        and isinstance(api_types, list)
+                        and all(isinstance(api_type, str) for api_type in api_types)
+                        and required_api_type not in {api_type.lower() for api_type in api_types}
+                    ):
+                        continue
                     model_ids.append(model_id)
         raw_next = payload.get("next_page_token")
         if not isinstance(raw_next, str) or not raw_next:
@@ -360,10 +372,10 @@ def discover_databricks_codex_models(
 ) -> tuple[str, ...]:
     """Discover every codex-compatible model a Databricks workspace serves.
 
-    Unity Catalog model services is the only listing that reports what the
-    codex Responses route will serve, so ids are ``system.ai.`` by
-    construction — unlike the Claude catalog above, which also has a legacy
-    gateway listing to merge in.
+    Model services lists availability across several gateway routes. Its
+    advertised API types select the Codex Responses route; missing or malformed
+    metadata retains the legacy family fallback. Unlike Claude discovery, no
+    legacy gateway listing is merged into these ``system.ai.`` ids.
 
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
@@ -378,7 +390,9 @@ def discover_databricks_codex_models(
 
     headers = {"Authorization": f"Bearer {token}"}
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        model_ids = _list_model_service_ids(client, workspace_url, headers)
+        model_ids = _list_model_service_ids(
+            client, workspace_url, headers, required_api_type=_CODEX_RESPONSES_API_TYPE
+        )
     codex_ids = [model_id for model_id in model_ids if is_codex_compatible_model(model_id)]
     return tuple(sorted(codex_ids, key=_codex_preference_rank, reverse=True))
 

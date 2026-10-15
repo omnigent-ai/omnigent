@@ -3311,6 +3311,7 @@ def _resolve_databricks_codex_model(
                     return model.strip()
 
     servable: tuple[str, ...] = ()
+    discovery_succeeded = False
     try:
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
@@ -3323,6 +3324,7 @@ def _resolve_databricks_codex_model(
         # simply fails the listing and drops to the ucode-state fallback below,
         # which is already keyed by ``host``.
         servable = discover_databricks_codex_models(host, creds.token)
+        discovery_succeeded = True
     except Exception as exc:  # noqa: BLE001 — cached ucode state is the launch fallback
         # Recoverable fallback; frames are debug-only so a TTY-mirrored
         # host console stays concise.
@@ -3348,6 +3350,11 @@ def _resolve_databricks_codex_model(
         return select_servable_model(requested, servable) or requested
     if servable:
         return servable[0]
+    if discovery_succeeded:
+        raise ValueError(
+            "Databricks workspace advertises no models for the Codex Responses route. "
+            "Check model access or configure another provider."
+        )
     return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
 
 

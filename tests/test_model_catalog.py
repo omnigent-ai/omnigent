@@ -18,6 +18,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -1069,6 +1070,40 @@ def test_openai_compatible_listing_maps_ids_and_context_window(
         ("openai/gpt-5.4", 400000),
         ("moonshotai/kimi-k2.6", 262144),
     ]
+
+
+def test_custom_codex_provider_keeps_its_glm_and_kimi_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  custom:\n"
+        "    kind: gateway\n"
+        "    default: true\n"
+        "    openai:\n"
+        "      base_url: https://custom.example/v1\n"
+        "      api_key: test-token\n"
+        "      wire_api: responses\n",
+    )
+    monkeypatch.setattr(
+        "omnigent.models.databricks_model_discovery.discover_databricks_codex_models",
+        Mock(side_effect=AssertionError("custom providers must not use Databricks discovery")),
+    )
+    requests_seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        return httpx.Response(200, json={"data": [{"id": "glm-99"}, {"id": "kimi-k99"}]})
+
+    listing = list_models_for_worker(
+        _worker_spec("codex-native"), "codex-native", transport=httpx.MockTransport(handler)
+    )
+
+    assert {model.id for model in listing.models} == {"glm-99", "kimi-k99"}
+    assert [str(request.url) for request in requests_seen] == ["https://custom.example/v1/models"]
+    assert requests_seen[0].headers["authorization"] == "Bearer test-token"
 
 
 def test_anthropic_api_listing_uses_api_key_headers(

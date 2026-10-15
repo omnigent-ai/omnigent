@@ -269,3 +269,58 @@ def test_resolve_databricks_codex_model_discovery_failure_warns_without_tracebac
         "host logging mirrors it to the user's terminal"
     )
     assert "databricks auth login --profile prof" in warning.getMessage()
+
+
+def test_empty_databricks_discovery_does_not_guess_an_implicit_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "databrickscfg"))
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        lambda profile: SimpleNamespace(token="tok"),
+    )
+    monkeypatch.setattr(
+        "omnigent.models.databricks_model_discovery.discover_databricks_codex_models",
+        lambda host, token: (),
+    )
+    fallback = Mock(return_value=SimpleNamespace(model_id="unadvertised-default"))
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.model_catalog.resolve_catalog_model", fallback
+    )
+
+    with pytest.raises(ValueError, match=r"no models.*Codex Responses"):
+        _resolve_databricks_codex_model("https://h.example.com", "prof", None)
+
+    fallback.assert_not_called()
+    assert (
+        _resolve_databricks_codex_model("https://h.example.com", "prof", "explicit-model")
+        == "explicit-model"
+    )
+
+
+def test_failed_databricks_discovery_keeps_the_implicit_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "databrickscfg"))
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        Mock(side_effect=OSError("listing unavailable")),
+    )
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", lambda host: None)
+    fallback = Mock(return_value=SimpleNamespace(model_id="cached-default"))
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.model_catalog.resolve_catalog_model", fallback
+    )
+
+    assert (
+        _resolve_databricks_codex_model("https://h.example.com", "prof", None) == "cached-default"
+    )
+    fallback.assert_called_once_with("databricks", family="openai")
