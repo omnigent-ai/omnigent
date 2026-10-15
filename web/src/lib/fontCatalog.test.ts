@@ -116,9 +116,6 @@ describe("fontCatalog — integrity", () => {
       "Mulish",
       "Source Sans 3",
       "Barlow",
-      "Poppins",
-      "Kanit",
-      "Archivo",
       "Geist",
     ]);
 
