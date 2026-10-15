@@ -203,8 +203,14 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                     stream = request.stream
                     assert isinstance(stream, httpx.AsyncByteStream)
                     iterator = stream.__aiter__()
-                    # httpx's async-iterator wrapper doesn't close its wrapped source.
+                    # Close HTTPX's wrapped source directly when it is closeable.
                     source = getattr(stream, "_stream", None)
+                    if source is not None and callable(getattr(source, "aclose", None)):
+                        close_target = source
+                    elif callable(getattr(iterator, "aclose", None)):
+                        close_target = iterator
+                    else:
+                        close_target = stream
                     try:
                         wire_buffer = bytearray(encode_binary_request(frame, b""))
                         body_budget = RUNNER_TUNNEL_MAX_MESSAGE_BYTES - len(wire_buffer)
@@ -216,16 +222,14 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                             body_size += len(chunk)
                         wire = bytes(wire_buffer)
                         del wire_buffer
-                    finally:
+                    except BaseException as error:
                         try:
-                            if iterator is not stream and iterator is not source:
-                                await _aclose_if_available(iterator)
-                        finally:
-                            try:
-                                if source is not None and source is not stream:
-                                    await _aclose_if_available(source)
-                            finally:
-                                await _aclose_if_available(stream)
+                            await _aclose_if_available(close_target)
+                        except BaseException as cleanup_error:
+                            raise error from cleanup_error
+                        raise
+                    else:
+                        await _aclose_if_available(close_target)
                 except ValueError as exc:
                     raise httpx.LocalProtocolError(str(exc), request=request) from exc
             else:
