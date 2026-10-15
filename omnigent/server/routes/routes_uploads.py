@@ -15,6 +15,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from concurrent.futures import Future
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import quote
@@ -265,6 +266,17 @@ class UploadIndex:
         admission.size -= record.size
         if not admission.keys:
             del self.sessions[key[0]]
+
+    def has_capacity(
+        self, session_id: str, size: int, limits: PublicLimits, replacing: UploadKey | None = None
+    ) -> bool:
+        admission = self.sessions.get(session_id, SessionAdmission())
+        count = len(admission.keys)
+        used = admission.size
+        if replacing is not None and replacing in admission.keys:
+            count -= 1
+            used -= self.records[replacing].size
+        return count < limits.max_open_uploads and used + size <= limits.max_open_bytes
 
     def finish(self, key: UploadKey, record: UploadRecord, *, aborted: bool = False) -> bool:
         if record.finished:
@@ -703,11 +715,7 @@ def register_upload_routes(
                 else:
                     if scope is not None:
                         index.idempotency_keys.pop(scope, None)
-                    admission = index.sessions.get(session_id, SessionAdmission())
-                    if (
-                        len(admission.keys) >= cap.limits.max_open_uploads
-                        or admission.size + declaration.size > cap.limits.max_open_bytes
-                    ):
+                    if not index.has_capacity(session_id, declaration.size, cap.limits):
                         raise UploadError(ErrorCode.UPLOAD_LIMIT, {"Retry-After": "60"})
                     reserved = True
                 if scope is not None:
@@ -740,11 +748,17 @@ def register_upload_routes(
                 0 <= result.offset <= declaration.size
             ):
                 raise UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
+            rejected = False
+            abort_new = False
+            settled = record
             with index.lock:
                 if reserved:
                     index.remove(pending)
-                if cached_id is not None and cached_id != result.upload_id:
-                    index.remove((session_id, environment_id, cached_id))
+                replaced_key = (
+                    (session_id, environment_id, cached_id)
+                    if cached_id is not None and cached_id != result.upload_id
+                    else None
+                )
                 result_key = (session_id, environment_id, result.upload_id)
                 existing = index.records.get(result_key)
                 if (
@@ -753,12 +767,31 @@ def register_upload_routes(
                     and existing.owner == owner
                     and existing.idempotency_key == idempotency_key
                 ):
+                    if replaced_key is not None:
+                        index.remove(replaced_key)
                     settled = existing
+                elif not reserved and not index.has_capacity(
+                    session_id, declaration.size, cap.limits, replacing=replaced_key
+                ):
+                    rejected = True
+                    abort_new = existing is None
                 else:
+                    if replaced_key is not None:
+                        index.remove(replaced_key)
                     index.add(result_key, record)
-                    settled = record
-                if scope is not None and not settled.finished:
+                if not rejected and scope is not None and not settled.finished:
                     index.idempotency_keys[scope] = (result.upload_id, digest)
+            if rejected:
+                if abort_new:
+                    with suppress(UploadError):
+                        await _relay(
+                            client,
+                            "DELETE",
+                            _runner_path(session_id, environment_id, "/" + result.upload_id),
+                            timeout=config.workspace_upload_chunk_timeout_s(),
+                            owner=owner,
+                        )
+                raise UploadError(ErrorCode.UPLOAD_LIMIT, {"Retry-After": "60"})
             result.chunk_bytes = cap.limits.chunk.initial
             result.expires_at = min(
                 result.expires_at, time.time() + min(settled.idle_ttl_s, settled.max_age_s)
