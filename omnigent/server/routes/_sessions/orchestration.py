@@ -130,7 +130,6 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_READ,
-    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -11488,14 +11487,10 @@ def _create_session_from_bundle(
         any non-integrity reason.
     """
     if spec is None:
-        # Enforce the policy-handler allowlist only on a shared /
-        # multi-user server. On a trusted single-user/local server,
-        # ``omnigent run`` uploads the operator's own bundle through this same
-        # path, so custom handlers must keep working (the operator already has
-        # code execution — the restriction would add no security there).
+        # Loopback requests can originate from agents as well as the operator.
         spec = validate_agent_bundle(
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
     assert spec.name is not None
 

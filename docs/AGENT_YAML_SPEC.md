@@ -631,9 +631,15 @@ To migrate an existing uploaded agent:
 3. Make subsequent MCP configuration changes on the migrated agent. Removing an
    MCP server from an old agent does not bypass bundle validation.
 
-Operator-authored bundles on trusted single-user/local servers retain their
-Python and TypeScript tool support. Changing a tool's declared runtime alone is
-not a migration: client tools require a client-provided implementation.
+HTTP uploads apply these restrictions on local single-user servers too, together
+with the registered-policy-handler and relative `os_env.cwd` checks: a loopback
+request cannot distinguish the operator from code running in a session. Editing
+the MCP servers of an agent uploaded before this change re-validates its stored
+bundle, so migrate and re-upload such agents first. For trusted in-process tools
+or custom policy handlers, register the agent with `omnigent server --agent
+<path>`; use MCP/client tools for uploaded agents. Changing a tool's declared
+runtime alone is not a migration: client tools require a client-provided
+implementation.
 
 ### MCP server
 

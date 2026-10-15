@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import io
 import tarfile
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 import yaml
+from fastapi import FastAPI
 
 from omnigent.server.routes import session_mcp_servers as mcp_routes
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from tests.server.helpers import create_test_session
+from tests.server.test_bundles import _MIN_CONFIG, _make_bundle_bytes
 
 pytestmark = pytest.mark.asyncio
 
@@ -282,6 +286,34 @@ async def test_update_mcp_server_clears_headers_when_empty_dict_sent(
     bundle = await _agent_bundle(client, session_id)
     mcp_file = _mcp_file_from_bundle(bundle, "secure.yaml")
     assert "headers" not in mcp_file
+
+
+async def test_mcp_mutation_revalidates_stored_bundle(
+    client: httpx.AsyncClient, app: FastAPI, tmp_path: Path
+) -> None:
+    """Editing MCP servers re-validates the stored bundle like a fresh upload."""
+    session = await create_test_session(client, name="legacy-agent")
+    session_id = session["id"]
+    agent = app.state.agent_store.get(session["agent_id"])
+    assert agent is not None
+    # The ``app`` fixture stores bundles under this directory.
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    legacy = _make_bundle_bytes(
+        {
+            "config.yaml": _MIN_CONFIG.format(name="legacy-agent"),
+            "tools/python/echo.py": "def echo(text: str) -> str:\n    return text\n",
+        }
+    )
+    artifact_store.put(agent.bundle_location, legacy)
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers",
+        json={"name": "github", "transport": "http", "url": "https://example.com/sse"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "may not ship a server-side Python/TS tool file" in resp.text
+    assert artifact_store.get(agent.bundle_location) == legacy
 
 
 async def _agent_bundle(client: httpx.AsyncClient, session_id: str) -> bytes:

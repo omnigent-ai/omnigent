@@ -31,7 +31,7 @@ from omnigent.db.utils import builtin_agent_id, installed_agent_id
 from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.auth import AuthProvider, local_single_user_enabled
+from omnigent.server.auth import AuthProvider
 from omnigent.server.bundles import content_bundle_location, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._origin import require_trusted_origin
@@ -363,7 +363,7 @@ def create_builtin_agents_router(
         spec = await asyncio.to_thread(
             validate_agent_bundle,
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
         if spec.name is None:  # validate_agent_bundle rejects this; narrows the type
             raise OmnigentError("agent spec has no name", code=ErrorCode.INVALID_INPUT)

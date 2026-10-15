@@ -36,7 +36,6 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
-    local_single_user_enabled,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry
@@ -347,14 +346,11 @@ def register_agent_routes(
         # Run bundle validation (tar extraction + spec parse, both
         # blocking) off the event loop -- mirrors the POST
         # /sessions/bundled path. A malicious bundle that blocks here
-        # must not hang the entire server loop. The
-        # policy-handler allowlist is enforced only on a
-        # shared / multi-user server; a trusted single-user/local server
-        # keeps supporting custom handlers (see _create_session_from_bundle).
+        # must not hang the entire server loop.
         spec = await asyncio.to_thread(
             validate_agent_bundle,
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
         if spec.name is None:
             raise OmnigentError("spec missing name", code=ErrorCode.INVALID_INPUT)

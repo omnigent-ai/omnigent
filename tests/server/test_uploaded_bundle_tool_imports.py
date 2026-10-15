@@ -149,10 +149,10 @@ def upload_app(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    trusted_local: bool,
+    single_user: bool,
 ) -> FastAPI:
     """Use the real deployment-mode flag and header auth with isolated stores."""
-    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1" if trusted_local else "0")
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1" if single_user else "0")
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
@@ -192,19 +192,19 @@ def import_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tu
         sys.modules.pop(module_name, None)
 
 
-@pytest.mark.parametrize("trusted_local", [False, True], ids=["multi-user", "trusted-local"])
+@pytest.mark.parametrize("single_user", [False, True], ids=["multi-user", "single-user"])
 @pytest.mark.parametrize("operation", ["create", "replace"])
 @pytest.mark.parametrize("depth", [0, 3])
 @pytest.mark.parametrize("tool_type,target_field", _TOOL_TARGETS)
 async def test_upload_routes_guard_imports(
     upload_client: httpx.AsyncClient,
     import_probe: tuple[str, Path],
-    trusted_local: bool,
     operation: str,
     depth: int,
     tool_type: str | None,
     target_field: str,
 ) -> None:
+    """Every auth posture rejects the upload before importing its tool target."""
     target, marker = import_probe
     tool: dict[str, object] = {target_field: target}
     if tool_type is not None:
@@ -213,7 +213,6 @@ async def test_upload_routes_guard_imports(
     files = {"bundle": ("agent.tar.gz", bundle, "application/gzip")}
     if operation == "create":
         response = await upload_client.post("/v1/sessions", data={"metadata": "{}"}, files=files)
-        success_status = 201
     else:
         clean = _agent_with_tool({}, 0)
         clean["tools"] = {}
@@ -225,17 +224,7 @@ async def test_upload_routes_guard_imports(
         assert created.status_code == 201, created.text
         session_id = created.json()["session_id"]
         response = await upload_client.put(f"/v1/sessions/{session_id}/agent", files=files)
-        success_status = 200
 
-    if trusted_local:
-        assert marker.exists(), "trusted uploads must retain dynamic tool loading"
-        if tool_type == "cancellable_function":
-            # The loader supports these, but spec translation has retired them.
-            assert response.status_code == 400, response.text
-            assert "was retired" in response.text
-        else:
-            assert response.status_code == success_status, response.text
-    else:
-        assert not marker.exists(), "untrusted validation imported the tool's module"
-        assert response.status_code == 400, response.text
-        assert _REJECTION in response.text
+    assert not marker.exists(), "upload validation imported the tool's module"
+    assert response.status_code == 400, response.text
+    assert _REJECTION in response.text
