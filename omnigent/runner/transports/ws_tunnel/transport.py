@@ -56,9 +56,9 @@ async def _aclose_if_available(stream: object) -> None:
 
 async def _aclose_request_stream(stream: httpx.AsyncByteStream) -> None:
     try:
-        if type(stream) is AsyncIteratorByteStream:
+        if type(stream).aclose is AsyncIteratorByteStream.aclose:
             # HTTPX's wrapper does not close the async iterator it wraps.
-            await _aclose_if_available(stream._stream)
+            await _aclose_if_available(cast(AsyncIteratorByteStream, stream)._stream)
     finally:
         await _aclose_if_available(stream)
 
