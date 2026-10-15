@@ -13,16 +13,19 @@ developer's real ``~/.omnigent``.
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import os
 import re
 import sys
+import sysconfig
 from pathlib import Path
 
 import pytest
 
 from omnigent import crash_handler as ch
 from omnigent import crash_ui
+from omnigent._interpreter_health import broken_stdlib_module, exit_if_stdlib_broken
 from omnigent.version import VERSION
 
 
@@ -446,3 +449,300 @@ def test_issue_url_keeps_short_body_intact(data_dir: Path) -> None:
     body = up.parse_qs(up.urlparse(url).query).get("description", [""])[0]
     assert "truncated" not in body
     assert "ValueError: boom" in body
+
+
+# --------------------------------------------------------------------------- #
+# Broken Python installation (a standard-library module fails to import)
+# --------------------------------------------------------------------------- #
+def _fail_in_module_body(
+    name: str, filename: Path, code: str, *, materialize: bool = True
+) -> Exception:
+    """Run ``code`` as the body of module ``name`` loaded from ``filename``; return the error."""
+    if materialize:
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        filename.write_text(code, encoding="utf-8")
+    try:
+        exec(compile(code, str(filename), "exec"), {"__name__": name})
+    except Exception as e:
+        return e
+    raise AssertionError("module body did not raise")
+
+
+def test_stdlib_import_failure_is_explained_not_reported(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stdlib module that cannot import means a broken interpreter, not an Omnigent crash."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    opened: list[str] = []
+
+    def fake_open(url: str) -> bool:
+        opened.append(url)
+        return True
+
+    monkeypatch.setattr(ch, "_open_browser", fake_open)
+    monkeypatch.setattr(ch, "_copy_to_clipboard", lambda text: True)
+    stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("y\n"))  # would file an issue if asked
+    exc = _fail_in_module_body(
+        "asyncio.runners",
+        tmp_path / "python3.12" / "asyncio" / "runners.py",
+        "import aiohttp_is_not_installed\n",
+    )
+
+    ch.handle_crash(exc, interactive=True, source="test")
+
+    out = _strip_ansi(stream.getvalue())
+    assert "Python installation" in out
+    assert "asyncio.runners" in out
+    assert "runners.py" in out and "import aiohttp_is_not_installed" in out
+    assert "No module named 'aiohttp_is_not_installed'" in out
+    assert "PYTHONPATH" in out  # the copy under tmp_path shadows the interpreter's own
+    assert "ran into an issue" not in out
+    assert "file a GitHub issue" not in out
+    assert opened == []
+    assert not list((data_dir / "crashes").glob("crash-*.md"))
+
+
+def test_failure_inside_the_installed_stdlib_advises_reinstalling_python(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A module under the interpreter's own stdlib directory means the installation is damaged."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
+    runners = Path(sysconfig.get_paths()["stdlib"]) / "asyncio" / "runners.py"
+    exc = _fail_in_module_body(
+        "asyncio.runners", runners, "import aiohttp_is_not_installed\n", materialize=False
+    )
+
+    ch.handle_crash(exc, interactive=False, source="test")
+
+    out = _strip_ansi(stream.getvalue())
+    assert "Python installation" in out
+    assert "Repair or reinstall Python" in out
+    assert "PYTHONPATH" not in out
+
+
+def _run_crash_flow(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> str:
+    """Run the interactive crash flow for ``exc`` (browser stubbed); return the screen text."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(ch, "_open_browser", lambda url: True)
+    monkeypatch.setattr(ch, "_copy_to_clipboard", lambda text: True)
+    stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("n\n"))
+    ch.handle_crash(exc, interactive=True, source="test")
+    return _strip_ansi(stream.getvalue())
+
+
+def test_missing_module_in_own_code_is_still_reported(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Omnigent importing a module this platform lacks is our bug and keeps the crash flow."""
+    exc = _fail_in_module_body(
+        "omnigent.cli_native",
+        tmp_path / "omnigent" / "cli_native.py",
+        'raise ModuleNotFoundError("No module named \'termios\'", name="termios")\n',
+    )
+
+    out = _run_crash_flow(monkeypatch, exc)
+
+    assert "ran into an issue" in out
+    assert "Report saved here:" in out
+    assert "Python installation" not in out
+
+
+def _import_tty_with_termios_failing(error: BaseException) -> BaseException:
+    """Import CPython's own ``tty.py`` while a meta-path finder fails ``import termios``."""
+
+    class _NoTermios:
+        def find_spec(self, fullname: str, path: object = None, target: object = None) -> None:
+            if fullname == "termios":
+                raise error
+
+    spec = importlib.util.spec_from_file_location(
+        "tty", Path(sysconfig.get_paths()["stdlib"]) / "tty.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    finder = _NoTermios()
+    sys.meta_path.insert(0, finder)
+    saved = sys.modules.pop("termios", None)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as e:
+        return e
+    finally:
+        sys.meta_path.remove(finder)
+        if saved is not None:
+            sys.modules["termios"] = saved
+    raise AssertionError("tty imported although termios was unavailable")
+
+
+def test_stdlib_wrapper_missing_a_platform_module_is_still_reported(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``tty`` without ``termios`` is a platform gap in the caller, not a damaged Python."""
+    exc = _import_tty_with_termios_failing(
+        ModuleNotFoundError("No module named 'termios'", name="termios")
+    )
+    assert exc.__traceback__ is not None
+    assert broken_stdlib_module(exc) is None
+
+    out = _run_crash_flow(monkeypatch, exc)
+
+    assert "ran into an issue" in out
+    assert "Report saved here:" in out
+    assert "Python installation" not in out
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("external dependency finder failed"),
+        ModuleNotFoundError("No module named 'finder_dependency'", name="finder_dependency"),
+    ],
+    ids=["runtime-error", "finder-own-dependency-missing"],
+)
+def test_dependency_import_hook_failure_inside_stdlib_import_is_reported(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """A third-party finder failing while the stdlib imports ``termios`` is that finder's bug."""
+    exc = _import_tty_with_termios_failing(error)
+    assert exc is error
+    assert broken_stdlib_module(exc) is None
+
+    out = _run_crash_flow(monkeypatch, exc)
+
+    assert "ran into an issue" in out
+    assert "Report saved here:" in out
+    assert "Python installation" not in out
+
+
+def test_foreign_import_in_stdlib_body_is_damage_even_when_a_finder_raises_it(
+    tmp_path: Path,
+) -> None:
+    """A stdlib body importing a non-stdlib module is damage no matter which finder failed."""
+
+    class _Missing:
+        def find_spec(self, fullname: str, path: object = None, target: object = None) -> None:
+            if fullname == "aiohttp_is_not_installed":
+                raise ModuleNotFoundError(
+                    "No module named 'aiohttp_is_not_installed'", name="aiohttp_is_not_installed"
+                )
+
+    finder = _Missing()
+    sys.meta_path.insert(0, finder)
+    try:
+        exc = _fail_in_module_body(
+            "asyncio.runners",
+            tmp_path / "asyncio" / "runners.py",
+            "import aiohttp_is_not_installed\n",
+        )
+    finally:
+        sys.meta_path.remove(finder)
+    frames = [tb.tb_frame.f_code.co_name for tb in _walk(exc.__traceback__)]
+    assert frames[-1] == "find_spec"  # the finder's frame is innermost, as in the e2e shim
+    module = broken_stdlib_module(exc)
+    assert module is not None and module.name == "asyncio.runners"
+
+
+def _walk(tb: object) -> list:
+    out: list = []
+    while tb is not None:
+        out.append(tb)
+        tb = tb.tb_next  # type: ignore[attr-defined]
+    return out
+
+
+def test_error_raised_through_stdlib_frames_only_is_damage(tmp_path: Path) -> None:
+    """A stdlib body failing inside other stdlib code, with no foreign frame, is damage."""
+    exc = _fail_in_module_body(
+        "asyncio.runners", tmp_path / "asyncio" / "runners.py", "import json\njson.loads('{')\n"
+    )
+    assert not isinstance(exc, ImportError)
+    deeper = [tb.tb_frame.f_globals["__name__"] for tb in _walk(exc.__traceback__)][2:]
+    assert deeper and all(name.partition(".")[0] == "json" for name in deeper)
+
+    module = broken_stdlib_module(exc)
+
+    assert module is not None and module.name == "asyncio.runners"
+
+
+def test_shadow_installed_in_site_packages_is_not_the_stdlib(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A venv's ``lib/pythonX.Y/site-packages`` is not the interpreter's standard library."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
+    shadow = Path(sysconfig.get_paths()["platstdlib"]) / "site-packages" / "asyncio" / "runners.py"
+    exc = _fail_in_module_body(
+        "asyncio.runners", shadow, "import aiohttp_is_not_installed\n", materialize=False
+    )
+
+    ch.handle_crash(exc, interactive=False, source="test")
+
+    out = _strip_ansi(stream.getvalue())
+    assert "PYTHONPATH" in out
+    assert "Repair or reinstall Python" not in out
+
+
+def test_crash_through_entry_script_module_frame_is_still_reported(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real uncaught crash passes through the ``__main__`` module frame; that is not stdlib."""
+    exc = _fail_in_module_body(
+        "__main__",
+        tmp_path / "bin" / "omnigent",
+        "def main():\n    raise ValueError('boom')\n\n\nmain()\n",
+    )
+    assert broken_stdlib_module(exc) is None
+
+    out = _run_crash_flow(monkeypatch, exc)
+
+    assert "ran into an issue" in out
+    assert "Report saved here:" in out
+    assert "Python installation" not in out
+
+
+def test_stdlib_failure_passed_as_explicit_traceback_is_explained(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The threading hook passes ``handle_crash`` the traceback separately; detect from it."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
+    exc = _fail_in_module_body(
+        "asyncio.runners", tmp_path / "asyncio" / "runners.py", "import aiohttp_is_not_installed\n"
+    )
+    tb = exc.__traceback__
+    exc.with_traceback(None)
+
+    ch.handle_crash(exc, tb=tb, interactive=False, source="thread:worker")
+
+    out = _strip_ansi(stream.getvalue())
+    assert "Python installation" in out
+    assert "asyncio.runners" in out
+    assert "A crash report was saved to" not in out
+
+
+def test_cli_import_guard_exits_only_for_stdlib_failures(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI's import-time guard returns on ordinary errors (the caller re-raises) and exits 1
+    for a broken stdlib."""
+    assert exit_if_stdlib_broken(_make_exc("ordinary")) is None
+    assert capsys.readouterr().err == ""
+
+    exc = _fail_in_module_body(
+        "asyncio.runners", tmp_path / "asyncio" / "runners.py", "import aiohttp_is_not_installed\n"
+    )
+    with pytest.raises(SystemExit) as info:
+        exit_if_stdlib_broken(exc)
+
+    assert info.value.code == 1
+    err = capsys.readouterr().err
+    assert "Python installation" in err
+    assert "No module named 'aiohttp_is_not_installed'" in err
