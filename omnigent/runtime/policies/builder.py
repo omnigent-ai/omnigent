@@ -875,6 +875,7 @@ def build_policy_engine(
             else (guardrails.ask_timeout if guardrails else DEFAULT_ASK_TIMEOUT)
         ),
         conversation_id=conversation_id,
+        conversation_title=conv.title if conv is not None else None,
         initial_labels=initial_labels,
         initial_session_state=initial_session_state,
         initial_usage=initial_usage,

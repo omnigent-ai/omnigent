@@ -15,6 +15,11 @@ be able to write resources without a separate Omnigent account.
 - `login-auto-detect`: `omnigent login <url>` detects the server's sign-in mode.
   States: accounts, OIDC, header mode, Databricks-fronted, and a workspace URL
   with an org selector.
+- `cli-browser-ticket-consent`: an OIDC sign-in opens a ticket-specific browser
+  login and then an **Authorize sign-in** page. Compare its code with the CLI,
+  choose **Approve** to complete sign-in, or **Deny** to stop it. Signing in
+  without approving leaves the CLI waiting. Older clients open an upgrade page
+  and cannot start a new session until updated.
 - `databricks-credential-kind`: the host authenticates with a user OAuth login
   made by the Databricks CLI, a personal access token, or a machine-to-machine
   service principal. Each is its own state to reproduce.
@@ -87,6 +92,13 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
 - **Isolated CLI loop:** use [cli-setup-verify](../.claude/skills/cli-setup-verify/SKILL.md),
   which drives the real `omnigent` binary in a PTY with a throwaway config and
   data directory, for sign-in prompts and host commands.
+- **`cli-browser-ticket-consent`:** run
+  `tests/e2e_ui/auth/test_oidc_login_flow.py::test_oidc_cli_ticket_completes_through_browser`
+  against its isolated OIDC test server. Start `omnigent login <server-url>`
+  with throwaway configuration, sign in in the browser, compare the code, and
+  approve to complete the waiting CLI. Start a separate login and deny it to
+  confirm polling stops; closing the page without deciding must leave it pending.
+  Older clients should see upgrade instructions and stop polling.
 - **`proxy-env`:**
   `tests/e2e/test_login_accounts_proxy_env.py::test_login_detects_accounts_auth_despite_proxy_env`
   (starts its own accounts server; run with plain `uv run pytest`).

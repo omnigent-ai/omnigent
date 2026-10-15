@@ -4308,6 +4308,9 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message."
         )
     delivery_diagnostics.set_stage("pasting")
+    # Space returns focus to the input box if the footer (shells item or agent
+    # list) holds it. Either way it types a space, which the clear removes.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     # Clear stale text first: raw controls can otherwise become pasted text.
     # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
@@ -4713,7 +4716,9 @@ def inject_slash_command(
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
+    # not interrupt an in-flight generation. Space first refocuses the input
+    # box from the footer, as in :func:`_paste_and_submit`; C-u clears its space.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)

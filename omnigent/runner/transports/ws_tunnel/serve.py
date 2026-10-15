@@ -1101,15 +1101,9 @@ async def _serve_tunnel_once(
         )
         if event_dispatcher is not None:
             event_dispatcher.connected(send_text)
-        # Reconnect work can itself await event delivery; start receiving the
-        # new generation's ready frame before that work waits for an ACK.
-        reconnect_task = (
-            asyncio.ensure_future(on_ready())
-            if on_ready is not None and event_dispatcher is not None
-            else None
-        )
-        if on_ready is not None and reconnect_task is None:
-            await on_ready()
+        # Recovery can await work sent through this tunnel, including when
+        # events use HTTP. Keep receiving requests and pings while it runs.
+        reconnect_task = asyncio.ensure_future(on_ready()) if on_ready is not None else None
         _logger.info(
             "runner %s connected to %s",
             runner_id,
