@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
+import { Markdown } from "@tiptap/markdown";
 import { SourceMappedMarkdown } from "./SourceMappedMarkdown";
 import { StarterKit } from "@tiptap/starter-kit";
 import { Image } from "@tiptap/extension-image";
@@ -175,6 +176,41 @@ describe("validated Markdown source positions", () => {
     expect(findPmRangeForComment(doc, comment, raw, editor.markdown)).toEqual(
       findPmRangeForComment(doc, comment, raw),
     );
+  });
+
+  it("preserves parsing and serialization while keeping editor token caches separate", () => {
+    const raw = "# Title\n\n[Details](word) word wo**rd**\n\n- item\n";
+    const doc = parse(raw);
+    const plain = new Editor({
+      element: null,
+      extensions: [StarterKit, Markdown],
+      content: raw,
+      contentType: "markdown",
+    });
+    const other = new Editor({
+      element: null,
+      extensions: [StarterKit, SourceMappedMarkdown],
+      content: "Other word",
+      contentType: "markdown",
+    });
+    const lexer = vi.spyOn(editor.markdown!.instance.Lexer.prototype, "lex");
+    try {
+      expect(editor.getJSON()).toEqual(plain.getJSON());
+      expect(editor.getMarkdown()).toBe(plain.getMarkdown());
+      expect(editor.markdown!.instance).not.toBe(other.markdown!.instance);
+      expect(markdownSourceMap(other.state.doc, "Other word", other.markdown)).not.toBeNull();
+      expect(markdownSourceMap(doc, raw, editor.markdown)).not.toBeNull();
+      expect(lexer).toHaveBeenCalledTimes(0);
+      const replacement = "word **word**";
+      editor.commands.setContent(replacement, { contentType: "markdown" });
+      expect(lexer).toHaveBeenCalledTimes(1);
+      expect(markdownSourceMap(editor.state.doc, replacement, editor.markdown)).not.toBeNull();
+      expect(lexer).toHaveBeenCalledTimes(1);
+    } finally {
+      lexer.mockRestore();
+      plain.destroy();
+      other.destroy();
+    }
   });
 
   it("leaves multiword selections on the existing path", () => {
