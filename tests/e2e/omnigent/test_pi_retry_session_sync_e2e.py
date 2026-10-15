@@ -201,7 +201,10 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     try:
         assert executor._sandboxed is sandboxed
         first = await _run_turn(executor, _FIRST_PROMPT)
-        assert _errors(first) == []
+        assert _errors(first) == [], (
+            "the first turn was reported as a failure instead of completing with pi's "
+            f"recovered answer: {_errors(first)}"
+        )
         rpc = executor._session_states[_SESSION_ID].rpc
         assert rpc is not None and rpc.process is not None and rpc._tmp_dir is not None
         pid, agent_dir = rpc.process.pid, Path(rpc._tmp_dir)
@@ -231,10 +234,6 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     assert _streamed_text(third) == "THIRD_ANSWER"
     assert any(isinstance(e, ToolCallComplete) for e in first)
     assert accepted == [True] * 7
-    assert _errors(first) == [], (
-        "the first turn was reported as a failure instead of completing with pi's "
-        f"recovered answer: {_errors(first)}"
-    )
     first_complete = [e for e in first if isinstance(e, TurnComplete)]
     assert [_FIRST_ANSWER in (t.response or "") for t in first_complete] == [True], (
         f"the first turn did not complete with {_FIRST_ANSWER!r}: {first}"

@@ -2104,6 +2104,7 @@ async def test_gateway_refresh_reuses_process_and_fails_closed(
     private_dir = tmp_path / "Pi's config"
     private_dir.mkdir()
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", tmp_path / "pi-agent")
     monkeypatch.setattr(tempfile, "tempdir", str(private_dir))
     current_token = "initial-token"
 
