@@ -1043,6 +1043,26 @@ describe("Sidebar session list", () => {
     expect(badge).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it("hides Forums navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/forums");
+
+    expect(screen.queryByTestId("forum-nav")).toBeNull();
+  });
+
+  it("shows Forums navigation and its experimental label when enabled", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/forums", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { forums: true },
+    });
+
+    const forums = screen.getByTestId("forum-nav");
+    expect(forums).toHaveAttribute("href", "/forums");
+    expect(forums).toHaveTextContent("experimental");
+    expect(forums).toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
   it("hides Usage navigation while the release feature is off", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();

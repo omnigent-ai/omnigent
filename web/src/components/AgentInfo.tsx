@@ -2,6 +2,8 @@ import { McpRegistryPicker } from "@/components/McpRegistry";
 // Agent info surface: the MCP-server and policy badges, and the
 // header info-icon popover that displays them.
 
+import { useQuery } from "@tanstack/react-query";
+import { getSessionUsage } from "@/lib/sessionsApi";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckIcon,
@@ -1341,12 +1343,22 @@ export function AgentInfoContent({
   // Cumulative session spend, live from the store (seeded on bind, updated
   // by SSE ``session_usage``). ``null`` when the session is unpriced (no
   // turn priced yet) — omit the row rather than show "$0.00" / "—".
-  const sessionCostUsd = useChatStore((s) => s.sessionCostUsd);
+  const storeCostUsd = useChatStore((s) => s.sessionCostUsd);
   // Per-model usage breakdown, live from the store (seeded on bind, updated
   // by SSE ``session_usage``). ``null`` until usage is first recorded. The
   // popover renders it directly — the frontend derives any aggregate view
   // from this map rather than receiving flat token fields.
-  const usageByModel = useChatStore((s) => s.sessionUsageByModel);
+  const storeUsage = useChatStore((s) => s.sessionUsageByModel);
+  const boundSessionId = useChatStore((s) => s.conversationId);
+  const useSnapshot = !!sessionId && boundSessionId !== sessionId;
+  const usage = useQuery({
+    queryKey: ["session-info-usage", sessionId],
+    queryFn: ({ signal }) => getSessionUsage(sessionId!, { signal }),
+    enabled: useSnapshot,
+    refetchInterval: 5000,
+  });
+  const sessionCostUsd = useSnapshot ? usage.data?.totalCostUsd : storeCostUsd;
+  const usageByModel = useSnapshot ? usage.data?.usageByModel : storeUsage;
   // Version footer: the server version (global, from the boot capabilities
   // probe) and the bound host's version (per-session, from the health poll).
   // Either may be absent — the footer renders whatever is known and hides

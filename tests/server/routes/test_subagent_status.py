@@ -500,6 +500,38 @@ async def test_external_child_activity_uses_confirmed_outcome(
         assert items[0].data.resource["status"] == expected
 
 
+@pytest.mark.parametrize(
+    ("outcome", "completed", "expected"),
+    [
+        (None, None, None),
+        (None, True, "idle"),
+        ("cancelled", None, "cancelled"),
+        ("failed", None, "failed"),
+    ],
+)
+async def test_forum_native_completion_requires_confirmed_outcome(
+    status_route: _StatusRoute, outcome: str | None, completed: bool | None, expected: str | None
+) -> None:
+    route = status_route
+    route.store.set_labels(route.child_id, {"omnigent.forum.parent": route.parent_id})
+    data: dict[str, Any] = {"status": "idle"}
+    if outcome is not None:
+        data["turn_outcome"] = outcome
+    if completed is not None:
+        data["turn_completed"] = completed
+    response = await route.client.post(
+        f"/v1/sessions/{route.child_id}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+    assert response.status_code == 202, response.text
+    terminal = [
+        call.args[1]
+        for call in route.published.call_args_list
+        if call.args[1].get("type") == "forum.turn.finished"
+    ]
+    assert [event["status"] for event in terminal] == ([] if expected is None else [expected])
+
+
 @pytest.mark.parametrize("harness", ["claude-native", "auto"])
 async def test_claude_child_idle_observations_do_not_complete_new_response_ids(
     status_route: _StatusRoute, harness: str

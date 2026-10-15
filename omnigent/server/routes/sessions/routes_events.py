@@ -2029,7 +2029,16 @@ def register_events_routes(
                     turn_outcome=data.get("turn_outcome"),
                     turn_completed=data.get("turn_completed"),
                 )
-                if outcome is not None:
+                if outcome is not None and conv.labels.get("omnigent.forum.parent"):
+                    session_stream.publish(
+                        session_id,
+                        {
+                            "type": "forum.turn.finished",
+                            "status": "idle" if outcome == "completed" else outcome,
+                            "response_id": response_id,
+                        },
+                    )
+                elif outcome is not None:
                     await record_subagent_activity(
                         session_id,
                         "returned",

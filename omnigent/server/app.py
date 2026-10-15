@@ -1818,6 +1818,7 @@ def create_app(
         try:
             yield
         finally:
+            await app_inst.state.forum_service.shutdown()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
@@ -3298,6 +3299,21 @@ def create_app(
         prefix="/v1",
         tags=["imports"],
     )
+    from omnigent.server.routes.forums import create_forums_router
+
+    forum_router, forum_service = create_forums_router(
+        conversation_store,
+        agent_store,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
+        agent_cache=agent_cache,
+        host_store=host_store,
+        host_registry=host_registry,
+        feature_flags=resolved_feature_flags,
+    )
+    app.state.forum_service = forum_service
+    app.include_router(forum_router, prefix="/v1", tags=["forums"])
+
     # Per-user LLM cost report (omni usage). User-scoped, not session-scoped,
     # so it gets its own router rather than living under /sessions.
     app.include_router(

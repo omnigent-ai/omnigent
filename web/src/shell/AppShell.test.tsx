@@ -569,6 +569,7 @@ function renderShell(
           </>
         }
       />
+      <Route path="forums/:forumId" element={<div>Forum discussion</div>} />
       <Route path="extensions/:extensionId/*" element={<div>extension page</div>} />
     </>,
     <AppShellWithRerenderProbe enabled={options.rerenderable === true} />,
@@ -5361,4 +5362,15 @@ describe("AppShell design-mode submission", () => {
       undefined,
     );
   });
+});
+
+it("uses the Forum parent session for shell panels on a Forum route", async () => {
+  mockConversations([]);
+  const switchTo = vi.spyOn(useChatStore.getState(), "switchTo").mockResolvedValue();
+  renderShell("/forums/forum-parent", serverInfo({ features: { forums: true } }));
+  expect(await screen.findByText("Forum discussion")).toBeInTheDocument();
+  expect(useSessionMock).toHaveBeenCalledWith("forum-parent");
+  expect(useSessionAgent).toHaveBeenCalledWith("forum-parent");
+  expect(switchTo).toHaveBeenCalledWith("forum-parent");
+  switchTo.mockRestore();
 });

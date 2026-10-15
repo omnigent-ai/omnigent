@@ -24,6 +24,7 @@ def test_only_harness_settings_defaults_on(environ: dict[str, str]) -> None:
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
+        "forums": False,
         "arca_shutdown_warnings": False,
         "harness_settings_ui": True,
         "import_review": False,
@@ -107,3 +108,9 @@ def test_release_flags_have_lifecycle_metadata_and_expected_defaults() -> None:
         assert FeatureFlags().enabled(definition.feature) == (
             definition.feature is Feature.HARNESS_SETTINGS_UI
         )
+
+
+def test_forums_opt_in():
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "forums"})
+    assert flags.enabled(Feature.FORUMS)
+    assert flags.frontend_dict()["forums"] is True

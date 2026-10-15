@@ -1,3 +1,4 @@
+vi.mock("@/pages/ForumsPage", () => ({ ForumsPage: () => <div>forums page</div> }));
 import { cleanup, render, screen } from "@testing-library/react";
 import { Outlet, MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -245,5 +246,20 @@ describe("Settings routes", () => {
     expect(await screen.findByTestId("settings-location")).toHaveTextContent(
       "/settings/appearance",
     );
+  });
+});
+
+describe("Forum release flag", () => {
+  it.each(["/forums", "/forums/new", "/forums/example"])(
+    "blocks disabled route %s",
+    async (path) => {
+      renderRoute(path);
+      expect(await screen.findByText("not found")).toBeInTheDocument();
+      expect(screen.queryByText("forums page")).toBeNull();
+    },
+  );
+  it.each(["/forums", "/forums/new", "/forums/example"])("opens enabled route %s", async (path) => {
+    renderRoute(path, { forums: true });
+    expect(await screen.findByText("forums page")).toBeInTheDocument();
   });
 });

@@ -1662,3 +1662,18 @@ class SqlScheduledTaskRun(OmnigentBase):
             "conversation_id",
         ),
     )
+
+
+class SqlForum(OmnigentBase):
+    """Durable coordinator state keyed by the forum's permission-bearing session."""
+
+    __tablename__ = "forums"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    state: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_until: Mapped[float] = mapped_column(Float, default=0, server_default="0")
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)

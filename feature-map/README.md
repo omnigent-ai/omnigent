@@ -103,6 +103,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Sessions](./sessions.md) covers the sidebar, whole-session and message forks,
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 
+- [Forums](./forums.md) covers setup, ordered multi-agent discussion, stop,
+  restart, sharing, and outage states in desktop and mobile web navigation.
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.
 

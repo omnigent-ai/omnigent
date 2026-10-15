@@ -1,3 +1,4 @@
+import { useForumSessionIds, isForumSession } from "@/hooks/useForumSessionIds";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
@@ -48,6 +49,7 @@ import {
   GitPullRequestDraftIcon,
   GitPullRequestIcon,
   InboxIcon,
+  MessagesSquareIcon,
   ListChecksIcon,
   ListFilterIcon,
   LaptopIcon,
@@ -487,6 +489,7 @@ function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
   isCanvasPage: boolean;
+  isForumPage: boolean;
   isTasksPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
@@ -499,6 +502,7 @@ function useActiveNavItem(): {
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
+  const isForumPage = !isExtensionRoute && /\/forums(?:\/|$)/.test(location.pathname);
   const isCanvasPage =
     !isExtensionRoute && isCanvasPathname(location.pathname, rebasePath("/canvas"));
   const isTasksPage = !isExtensionRoute && leaf === "tasks";
@@ -509,6 +513,7 @@ function useActiveNavItem(): {
     activeConversationId == null &&
     !isInboxPage &&
     !isCanvasPage &&
+    !isForumPage &&
     !isTasksPage &&
     !isUsagePage &&
     !isExtensionRoute;
@@ -524,6 +529,7 @@ function useActiveNavItem(): {
     isNewChatPage,
     isInboxPage,
     isCanvasPage,
+    isForumPage,
     isTasksPage,
     isUsagePage,
     activeExtensionPageId,
@@ -802,6 +808,7 @@ function SidebarImpl({
     isNewChatPage,
     isInboxPage,
     isCanvasPage,
+    isForumPage,
     isTasksPage,
     isUsagePage,
     activeExtensionPageId,
@@ -1223,6 +1230,22 @@ function SidebarImpl({
                   Automations
                 </Link>
               </Button>
+              {isFeatureEnabled(serverInfo, "forums") && (
+                <PrimaryNavLink
+                  to="/forums"
+                  label="Forums"
+                  icon={MessagesSquareIcon}
+                  active={isForumPage}
+                  onClick={onNavClick}
+                  componentId="sidebar.forum"
+                  testId="forum-nav"
+                  trailing={
+                    <span className="ml-auto rounded border border-border px-1.5 py-0.5 text-10 font-medium text-muted-foreground">
+                      experimental
+                    </span>
+                  }
+                />
+              )}
               <Button
                 asChild
                 variant="ghost"
@@ -1485,6 +1508,7 @@ function ProjectFolder({
     if (expanded) registerFolder(name, watchedRows);
   }, [expanded, name, watchedRows, registerFolder]);
   useEffect(() => () => registerFolder(name, null), [expanded, name, registerFolder]);
+  const forumSessionIds = useForumSessionIds();
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const conversations = useMemo(() => {
     // Union the folder's own pages with its members from the globally-loaded
@@ -1496,12 +1520,20 @@ function ProjectFolder({
     for (const c of windowConversations) byId.set(c.id, c);
     // Pinned sessions live in the global Pinned section, not their folder.
     return sortConversations(
-      [...byId.values()].filter((c) => !pinnedSet.has(c.id)),
+      [...byId.values()].filter((c) => !pinnedSet.has(c.id) && !isForumSession(c, forumSessionIds)),
       activeOverride,
       frozenSortKeys,
       sortBy,
     );
-  }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys, sortBy]);
+  }, [
+    query.data,
+    windowConversations,
+    pinnedSet,
+    activeOverride,
+    frozenSortKeys,
+    sortBy,
+    forumSessionIds,
+  ]);
   const errors = useSessionErrorStates(conversations);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
@@ -1883,12 +1915,16 @@ function ConversationList({
   // the viewer's own sessions (Chats) and ones shared with them. Archived
   // sessions render in their own group at the bottom (below "Shared with
   // me"); a pinned-then-archived session shows under Archived, not Pinned.
+  const forumSessionIds = useForumSessionIds();
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const loadedSections = useMemo(() => {
     // Merge the server pinned set in, so a pinned session outside the loaded
     // paginated window still renders. Dedupe by id: a pinned session is usually
     // also present in the paginated list, and merging both would render it twice.
-    const allWithPinned = dedupeConversationsById([...allConversations, ...pinnedConversations]);
+    const allWithPinned = dedupeConversationsById([
+      ...allConversations,
+      ...pinnedConversations,
+    ]).filter((c) => !isForumSession(c, forumSessionIds));
     const notArchived = allWithPinned.filter((c) => c.archived !== true);
     // The filter picks the slice; the Pinned / Projects / Sessions structure is
     // then built from it, so every filter reuses the same layout.
@@ -2000,6 +2036,7 @@ function ConversationList({
     // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
+    forumSessionIds,
     allConversations,
     pinnedConversations,
     pinnedSet,

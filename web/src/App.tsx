@@ -52,6 +52,10 @@ const InboxPage = withPageView(
   "inbox",
   lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
 );
+const ForumsPage = withPageView(
+  "forums",
+  lazy(() => import("@/pages/ForumsPage").then((m) => ({ default: m.ForumsPage }))),
+);
 // The shell owns the board so selecting a conversation never unmounts it.
 const CanvasLandingPage = withPageView("canvas", () => null);
 const TasksPage = withPageView(
@@ -169,6 +173,30 @@ function AppRoutes({ basename }: AppProps) {
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+          <Route
+            path={`${prefix}/forums`}
+            element={
+              <FeatureGatedPage feature="forums">
+                <ForumsPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/forums/new`}
+            element={
+              <FeatureGatedPage feature="forums">
+                <ForumsPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/forums/:forumId`}
+            element={
+              <FeatureGatedPage feature="forums">
+                <ForumsPage />
+              </FeatureGatedPage>
+            }
+          />
           <Route
             path={`${prefix}/canvas`}
             element={

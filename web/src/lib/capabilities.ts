@@ -58,6 +58,7 @@ export interface Branding {
 
 /** Release features understood by this frontend build. */
 export type FeatureKey =
+  | "forums"
   | "usage_page"
   | "harness_install"
   | "canvas"

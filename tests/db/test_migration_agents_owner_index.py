@@ -92,6 +92,7 @@ def test_postgres_retry_rebuilds_only_its_own_invalid_index() -> None:
         conn.execute(sa.text(f'DROP DATABASE IF EXISTS "{name}"'))
         conn.execute(sa.text(f'CREATE DATABASE "{name}"'))
     setup = sa.create_engine(uri, isolation_level="AUTOCOMMIT")
+    migration_engine = sa.create_engine(uri)
     invalidate = "UPDATE pg_index SET indisvalid = false WHERE indexrelid = CAST(:i AS regclass)"
     try:
         with setup.connect() as conn:
@@ -99,15 +100,20 @@ def test_postgres_retry_rebuilds_only_its_own_invalid_index() -> None:
             conn.execute(sa.text("CREATE TABLE other.t (x int)"))
             conn.execute(sa.text(f"CREATE INDEX {_INDEX} ON other.t (x)"))
             conn.execute(sa.text(invalidate), {"i": f"other.{_INDEX}"})
-        _run_migrations(sa.create_engine(uri), uri)
+        # Build only this revision so rewinding it cannot replay later migrations.
+        cfg = _build_alembic_config(uri)
+        with migration_engine.connect() as conn:
+            cfg.attributes["connection"] = conn
+            command.upgrade(cfg, "mm1a2b3c4d5e")
         with setup.connect() as conn:
             conn.execute(sa.text(invalidate), {"i": f"public.{_INDEX}"})
             conn.execute(sa.text("UPDATE alembic_version SET version_num = 'll1a2b3c4d5e'"))
-        _run_migrations(sa.create_engine(uri), uri)
+        _run_migrations(migration_engine, uri)
         with setup.connect() as conn:
             assert _pg_index_valid(conn, "public") is True
             assert _pg_index_valid(conn, "other") is False, "another schema's index was touched"
     finally:
+        migration_engine.dispose()
         setup.dispose()
         clear_engine_cache()
         with admin.connect() as conn:

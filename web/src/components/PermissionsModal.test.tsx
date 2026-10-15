@@ -426,6 +426,32 @@ describe("PermissionsModal", () => {
     }
   });
 
+  it("copies and encodes the forum route while sharing its parent session permissions", async () => {
+    listMock.mockResolvedValue([]);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    transformLinkMock.mockReturnValue((path: string) => `https://host.example.com${path}`);
+    render(
+      <PermissionsModal
+        sessionId="forum_parent"
+        sharePath="/forums/forum_parent"
+        open
+        onOpenChange={() => {}}
+      />,
+      { wrapper: createWrapper() },
+    );
+    await waitFor(() => expect(listMock).toHaveBeenCalledWith("forum_parent"));
+    fireEvent.click(screen.getByRole("button", { name: /copy link/i }));
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith("https://host.example.com/forums/forum_parent"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /open in mobile app/i }));
+    expect(screen.getByTestId("share-qr-code")).toHaveAttribute(
+      "data-value",
+      "https://host.example.com/forums/forum_parent",
+    );
+  });
+
   it("uses the host transformShareLink when one is installed", () => {
     // WHY: in the embed the host returns the full absolute URL; the modal must
     // defer to that transform instead of prepending window.location.origin.

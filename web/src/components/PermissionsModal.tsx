@@ -66,6 +66,7 @@ const LEVEL_LABELS: Record<number, string> = {
 interface PermissionsModalProps {
   sessionId: string;
   workspace?: string | null;
+  sharePath?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
@@ -73,6 +74,7 @@ interface PermissionsModalProps {
 export function PermissionsModal({
   sessionId,
   workspace,
+  sharePath,
   open,
   onOpenChange,
 }: PermissionsModalProps) {
@@ -374,7 +376,7 @@ export function PermissionsModal({
             Done overflows a phone-width dialog and widens the whole grid. */}
         <DialogFooter className="sm:justify-between">
           <div className="flex items-center gap-2">
-            <CopyLinkButton sessionId={sessionId} />
+            <CopyLinkButton sessionId={sessionId} sharePath={sharePath} />
             <Button
               variant="ghost"
               onClick={() => setShowQr(true)}
@@ -391,7 +393,12 @@ export function PermissionsModal({
       </DialogContent>
 
       {/* Separate modal for the QR code so the share dialog stays compact. */}
-      <QrCodeDialog sessionId={sessionId} open={showQr} onOpenChange={setShowQr} />
+      <QrCodeDialog
+        sessionId={sessionId}
+        sharePath={sharePath}
+        open={showQr}
+        onOpenChange={setShowQr}
+      />
     </Dialog>
   );
 }
@@ -579,8 +586,12 @@ function AddUserCombobox({ value, onChange, disabled }: AddUserFieldProps) {
  * the host transform returns the full URL (origin included); standalone has no
  * transform, so we prepend the origin ourselves.
  */
-function getShareableLink(sessionId: string, rebasePath: (path: string) => string): string {
-  const path = rebasePath(`/c/${sessionId}`);
+function getShareableLink(
+  sessionId: string,
+  rebasePath: (path: string) => string,
+  sharePath?: string,
+): string {
+  const path = rebasePath(sharePath ?? `/c/${sessionId}`);
   const transform = getOmnigentTransformShareLink();
   // Standalone: `rebasePath` is identity, so apply the deployment base path
   // (e.g. `/proxy/6767`) before prepending the origin. The embed supplies its
@@ -607,7 +618,7 @@ function getDeepLink(sessionId: string, rebasePath: (path: string) => string): s
   }
 }
 
-function CopyLinkButton({ sessionId }: { sessionId: string }) {
+function CopyLinkButton({ sessionId, sharePath }: { sessionId: string; sharePath?: string }) {
   const [copied, setCopied] = useState(false);
   const rebasePath = useRebasePath();
 
@@ -618,14 +629,14 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   }, [copied]);
 
   const handleCopy = useCallback(() => {
-    const url = getShareableLink(sessionId, rebasePath);
+    const url = getShareableLink(sessionId, rebasePath, sharePath);
     navigator.clipboard.writeText(url).then(
       () => setCopied(true),
       (err) => {
         console.warn("Failed to copy link to clipboard", err);
       },
     );
-  }, [sessionId, rebasePath]);
+  }, [sessionId, rebasePath, sharePath]);
 
   return (
     <Button
@@ -650,15 +661,19 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
  */
 function QrCodeDialog({
   sessionId,
+  sharePath,
   open,
   onOpenChange,
 }: {
   sessionId: string;
+  sharePath?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
   const rebasePath = useRebasePath();
-  const deepLink = getDeepLink(sessionId, rebasePath);
+  const deepLink = sharePath
+    ? getShareableLink(sessionId, rebasePath, sharePath)
+    : getDeepLink(sessionId, rebasePath);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

@@ -90,6 +90,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
+        "forums": False,
         "arca_shutdown_warnings": False,
         "harness_settings_ui": True,
         "import_review": False,

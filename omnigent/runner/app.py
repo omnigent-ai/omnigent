@@ -2008,6 +2008,9 @@ def create_runner_app(
                     if isinstance(raw_sub_agent, str) and raw_sub_agent:
                         sub_agent_name = raw_sub_agent
                     raw_parent = body.get("parent_session_id")
+                    # Forum parents grant access; their server coordinator owns turn delivery.
+                    if (body.get("labels") or {}).get("omnigent.forum.parent"):
+                        raw_parent = None
                     if isinstance(raw_parent, str) and raw_parent:
                         parent_session_id = raw_parent
                     raw_agent_name = body.get("agent_name")

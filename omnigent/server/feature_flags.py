@@ -23,6 +23,7 @@ class Feature(StrEnum):
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
+    FORUMS = "forums"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     HARNESS_SETTINGS_UI = "harness_settings_ui"
     IMPORT_REVIEW = "import_review"
@@ -42,6 +43,12 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.FORUMS,
+        description="Experimental multi-agent Forum discussions",
+        owner="web",
+        review_by_release="0.19.0",
+    ),
     FeatureDefinition(
         feature=Feature.USAGE_PAGE,
         description="Web Usage page with cost timeline and breakdowns",
