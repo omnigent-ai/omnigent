@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import io
 import itertools
 import ntpath
 import random
@@ -333,12 +334,26 @@ def _limits(runner: dict[str, Any] | None = None) -> PublicLimits:
 
 
 async def _read_capped(request: Request, maximum: int) -> bytes:
-    body = bytearray()
+    first = b""
+    buffer: io.BytesIO | None = None
+    size = 0
     async for chunk in request.stream():
-        body.extend(chunk[: max(0, maximum + 1 - len(body))])
-        if len(body) > maximum:
+        size += len(chunk)
+        if size > maximum:
             raise UploadError(ErrorCode.TOO_LARGE)
-    return bytes(body)
+        if not chunk:
+            continue
+        if buffer is None and not first:
+            first = chunk
+            continue
+        if buffer is None:
+            # Later parts go into one buffer so no per-part objects outlive their message.
+            buffer = io.BytesIO()
+            buffer.write(first)
+            first = b""
+        buffer.write(chunk)
+    # A single received part is returned as-is, without a copy.
+    return buffer.getvalue() if buffer is not None else first
 
 
 def _response_error(response: httpx.Response) -> UploadError:
