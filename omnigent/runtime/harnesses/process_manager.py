@@ -787,9 +787,11 @@ class HarnessProcessManager:
                 )
             entry = self._entries.get(conversation_id)
             if (
-                entry is not None
+                not IS_WINDOWS
+                and entry is not None
                 and entry.process.returncode is None
                 and entry.endpoint.socket_path is not None
+                and entry.endpoint.socket_path.parent == self._instance_dir
                 and not entry.endpoint.socket_path.exists()
             ):
                 _logger.warning(
