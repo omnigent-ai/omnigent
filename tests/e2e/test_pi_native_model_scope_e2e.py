@@ -79,20 +79,6 @@ def _managed_pi(
     settings_path = global_dir / "settings.json"
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
     monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_dir)
-    config = {
-        "providers": {
-            "demo": {
-                "kind": "gateway",
-                "default": True,
-                "anthropic" if wire_api == "anthropic" else "openai": {
-                    "base_url": base_url,
-                    "api_key": "synthetic-model-scope-key",
-                    **({"wire_api": wire_api} if wire_api != "anthropic" else {}),
-                    "models": models,
-                },
-            }
-        }
-    }
     if databricks:
         config = {
             "providers": {"demo": {"kind": "databricks", "default": True, "profile": "PI_TEST"}}
@@ -108,6 +94,21 @@ def _managed_pi(
             "omnigent.harnesses.pi_native.credentials.resolve_databricks_workspace",
             lambda _: SimpleNamespace(host=base_url, token="synthetic-model-scope-key"),
         )
+    else:
+        config = {
+            "providers": {
+                "demo": {
+                    "kind": "gateway",
+                    "default": True,
+                    "anthropic" if wire_api == "anthropic" else "openai": {
+                        "base_url": base_url,
+                        "api_key": "synthetic-model-scope-key",
+                        **({"wire_api": wire_api} if wire_api != "anthropic" else {}),
+                        "models": models,
+                    },
+                }
+            }
+        }
     provider = resolve_pi_native_provider(model=models["default"], config_loader=lambda: config)
     assert provider is not None
     launch = pi_native_provider_launch(
