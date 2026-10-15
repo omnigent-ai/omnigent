@@ -336,6 +336,18 @@ outcome in the caption. Check each claimed moment, especially claims that text
 or controls are absent. If the frames contradict the caption, correct it or
 re-record.
 
+Inspect the frames for each state named in the caption. To extract the final
+frame, use `ffmpeg -i <clip> -update 1 last-frame.png`; this decodes the whole
+clip, including WebM files without a duration. If inspection fails, disclose
+that in the caption and limit claims to visible states the driver verified.
+Record the inspection failure and supporting assertions in `evidence`.
+
+For a missing element or silent stall, first establish that the reported user
+flow reached the relevant state, then check for unrelated errors. An empty
+page during loading or a session that failed differently does not establish
+the reported absence. If the clip shows another failure, investigate it and
+correct the setup or describe that actual outcome.
+
 ### Timed captions inside the video
 
 For every newly captured clip, **burn in step-by-step captions before declaring

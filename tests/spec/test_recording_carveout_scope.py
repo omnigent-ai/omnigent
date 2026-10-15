@@ -32,6 +32,14 @@ def test_lane_recording_blockers_are_explicit_and_do_not_block_delivery() -> Non
     assert "Do not block the verdict, fix, or PR" in lanes
 
 
+def test_finishing_a_clip_checks_observed_states_and_discloses_limits() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+    assert "ffmpeg -i <clip> -update 1 last-frame.png" in lanes
+    assert "If inspection fails, disclose that in the caption" in lanes
+    assert "first establish that the reported user flow reached the relevant state" in lanes
+    assert "then check for unrelated errors" in lanes
+
+
 def test_repro_recording_rules_match_the_shared_guide() -> None:
     instructions = _normalized(_REPRO_AGENT / "AGENTS.md")
 
