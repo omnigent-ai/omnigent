@@ -334,26 +334,80 @@ def _limits(runner: dict[str, Any] | None = None) -> PublicLimits:
 
 
 async def _read_capped(request: Request, maximum: int) -> bytes:
-    first = b""
-    buffer: io.BytesIO | None = None
-    size = 0
-    async for chunk in request.stream():
-        size += len(chunk)
-        if size > maximum:
+    raw_length = request.headers.get("content-length", "")
+    content_length: int | None = None
+    if re.fullmatch(r"[0-9]+", raw_length):
+        normalized_length = raw_length.lstrip("0") or "0"
+        maximum_text = str(maximum)
+        if len(normalized_length) > len(maximum_text) or (
+            len(normalized_length) == len(maximum_text) and normalized_length > maximum_text
+        ):
             raise UploadError(ErrorCode.TOO_LARGE)
-        if not chunk:
-            continue
-        if buffer is None and not first:
-            first = chunk
-            continue
-        if buffer is None:
-            # Later parts go into one buffer so no per-part objects outlive their message.
-            buffer = io.BytesIO()
-            buffer.write(first)
-            first = b""
-        buffer.write(chunk)
-    # A single received part is returned as-is, without a copy.
-    return buffer.getvalue() if buffer is not None else first
+        content_length = int(normalized_length)
+
+    if content_length is not None:
+        first: bytes | None = None
+        buffer: io.BytesIO | None = None
+        size = 0
+        async for chunk in request.stream():
+            next_size = size + len(chunk)
+            if next_size > maximum or next_size > content_length:
+                raise UploadError(ErrorCode.TOO_LARGE)
+            if not chunk:
+                continue
+            if buffer is None and first is None:
+                first = chunk
+                size = next_size
+                continue
+            if buffer is None:
+                buffer = io.BytesIO()
+                if content_length:
+                    buffer.seek(content_length - 1)
+                    buffer.write(b"\0")
+                    buffer.seek(0)
+                assert first is not None
+                buffer.write(first)
+                first = None
+            buffer.write(chunk)
+            size = next_size
+        if size != content_length:
+            raise UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
+        return buffer.getvalue() if buffer is not None else first or b""
+
+    segments: list[bytes] = []
+    segment: bytearray | None = None
+    segment_used = 0
+    segment_size = 0
+    buffered = 0
+    size = 0
+    segment_view: memoryview | None = None
+    async for chunk in request.stream():
+        next_size = size + len(chunk)
+        if next_size > maximum:
+            raise UploadError(ErrorCode.TOO_LARGE)
+        size = next_size
+        source = memoryview(chunk)
+        offset = 0
+        while offset < len(source):
+            if segment is None:
+                segment_size = min(64 * 1024, maximum - buffered)
+                segment = bytearray(segment_size)
+                segment_view = memoryview(segment)
+            amount = min(len(source) - offset, segment_size - segment_used)
+            end = segment_used + amount
+            assert segment_view is not None
+            segment_view[segment_used:end] = source[offset : offset + amount]
+            offset += amount
+            segment_used = end
+            if end == segment_size:
+                segments.append(bytes(segment))
+                buffered += segment_size
+                segment = None
+                segment_view = None
+                segment_used = 0
+    if segment_view is not None and segment_used:
+        segments.append(bytes(segment_view[:segment_used]))
+    return b"".join(segments)
 
 
 def _response_error(response: httpx.Response) -> UploadError:
