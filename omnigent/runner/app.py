@@ -440,6 +440,24 @@ def _encode_sse_event(event: Mapping[str, object]) -> bytes:
     return f"data: {_json.dumps(event)}\n\n".encode()
 
 
+_INPUT_LIFECYCLE_EVENT_TYPES = frozenset(
+    {
+        "response.in_progress",
+        "response.completed",
+        "response.failed",
+        "response.cancelled",
+        "response.incomplete",
+    }
+)
+
+
+def _input_stable_id(source: Mapping[str, object]) -> str | None:
+    """Return one validated web input id from a runner or harness body."""
+    value = source.get("input_stable_id") or source.get("stable_id")
+    validated = input_attributes({"input_stable_id": value}).get("input_stable_id")
+    return validated if isinstance(validated, str) else None
+
+
 def _response_body_preview(resp: object, *, limit: int = 500) -> str:
     """
     Return a short response-body preview for diagnostics.
@@ -768,20 +786,27 @@ def _is_context_overflow_error(
 def _response_failed_payload(
     error: Mapping[str, object],
     source: str = "execution",
+    *,
+    input_stable_id: str | None = None,
 ) -> _JsonObject:
     """Build a failure envelope with required error fields and a legacy mirror."""
     failure_error = {**_normalize_turn_error(error), **error}
-    return {
+    payload: _JsonObject = {
         "type": "response.failed",
         "source": source,
         "response": {"status": "failed", "error": failure_error},
         "error": failure_error,
     }
+    if input_stable_id is not None:
+        payload["input_stable_id"] = input_stable_id
+    return payload
 
 
 def _response_failed_event(
     error: Mapping[str, object],
     source: str = "execution",
+    *,
+    input_stable_id: str | None = None,
 ) -> bytes:
     """
     Encode one ``response.failed`` SSE frame.
@@ -798,7 +823,13 @@ def _response_failed_event(
         so it can persist the right ``ErrorData.source``.
     :returns: UTF-8 encoded SSE frame bytes.
     """
-    payload = json.dumps(_response_failed_payload(error, source=source))
+    payload = json.dumps(
+        _response_failed_payload(
+            error,
+            source=source,
+            input_stable_id=input_stable_id,
+        )
+    )
     return f"event: response.failed\ndata: {payload}\n\n".encode()
 
 
@@ -3928,9 +3959,13 @@ def create_runner_app(
             return False
         if expected_task is not None and turn_task is not expected_task:
             return False
+        turn_epoch = _turn_bind_epoch.get(conv_id, 0)
         turn_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await turn_task
+        # A replacement can start and finish while cancellation unwinds.
+        if _turn_bind_epoch.get(conv_id, 0) != turn_epoch:
+            return True
         if _active_turns.get(conv_id) is turn_task:
             _on_proxy_stream_end(conv_id)
             return True
@@ -3954,7 +3989,7 @@ def create_runner_app(
                 )
         return True
 
-    async def _forward_harness_interrupt(conv_id: str) -> None:
+    async def _forward_harness_interrupt(conv_id: str, *, turn_epoch: int) -> None:
         """Best-effort POST ``{"type":"interrupt"}`` to a conversation's harness.
 
         Releases the harness's parked policy/tool future so its ``run_turn``
@@ -3962,11 +3997,14 @@ def create_runner_app(
         runner-side floor does not depend on this succeeding.
 
         :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param turn_epoch: Turn generation captured before resolving its harness.
         """
         if process_manager is None:
             return
         try:
             harness_client = await process_manager.get_client(conv_id, "any")
+            if _turn_bind_epoch.get(conv_id, 0) != turn_epoch:
+                return
             await harness_client.post(
                 f"/v1/sessions/{conv_id}/events",
                 json={"type": "interrupt"},
@@ -3996,6 +4034,7 @@ def create_runner_app(
         if conv_id not in _active_turns:
             return
         target = _active_turns.get(conv_id)
+        turn_epoch = _turn_bind_epoch.get(conv_id, 0)
         if isinstance(target, asyncio.Task) and target.done():
             # A done Task is a corpse, not a live turn. Leaving it wedges every
             # ``conv in _active_turns`` liveness check (the buffer gate would strand
@@ -4003,7 +4042,7 @@ def create_runner_app(
             _sweep_dead_turn_slot(conv_id, target)
             return
         _interrupted_sessions.add(conv_id)
-        await _forward_harness_interrupt(conv_id)
+        await _forward_harness_interrupt(conv_id, turn_epoch=turn_epoch)
         # Floor: force-cancel the runner Task when we own one. In stream mode
         # there is no Task here — ``_resync_turn_state`` owns the sentinel pop,
         # and direct interrupt/stop callers rely on the forwarded interrupt
@@ -4068,7 +4107,7 @@ def create_runner_app(
         )
         if stream_sentinel:
             _active_turns.pop(conv_id, None)
-            await _forward_harness_interrupt(conv_id)
+            await _forward_harness_interrupt(conv_id, turn_epoch=_entry_epoch)
         else:
             await _cancel_inprocess_turn(conv_id)
         # Epoch advanced → a replacement ran (covers live-slot and empty-slot after teardown).
@@ -4825,11 +4864,12 @@ def create_runner_app(
         # can't suppress this turn's legitimate terminal publish.
         _desynced_sessions.discard(conv)
         _desync_terminalized.pop(conv, None)
+        handed_off = [False]
         # Locate any uncoded exception logged below in the turn phase (this task's
         # context carries it for its lifetime). Coded errors keep their own phase.
         with phase_scope(ErrorPhase.TURN):
             try:
-                await _run_turn_bg_setup_and_stream(msg_body, conv)
+                await _run_turn_bg_setup_and_stream(msg_body, conv, handed_off)
             except _ContextWindowOverflow:
                 # Re-raise so the streaming-phase handler (which publishes the
                 # error event) is never shadowed by the generic except below.
@@ -4852,7 +4892,18 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": conv},
                 )
-                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                error: dict[str, object] = {"message": f"turn setup failed: {exc}"}
+                if not handed_off[0]:
+                    stable_id = _input_stable_id(msg_body)
+                    if stable_id is not None:
+                        _publish_event(
+                            conv,
+                            _response_failed_payload(
+                                {**error, "undelivered": True},
+                                input_stable_id=stable_id,
+                            ),
+                        )
+                _on_proxy_stream_end(conv, error=error)
             finally:
                 # Permanent-wedge floor: guarantee _active_turns is never left stale,
                 # however the body exits — including a BaseException that escapes
@@ -4892,6 +4943,7 @@ def create_runner_app(
     async def _run_turn_bg_setup_and_stream(
         msg_body: _JsonObject,
         conv: str,
+        handed_off: list[bool],
     ) -> None:
         _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
         await _sync_session_agent(
@@ -5283,6 +5335,7 @@ def create_runner_app(
         finally:
             _session_init_envelopes.pop(conv, None)
         if isinstance(response, StreamingResponse):
+            handed_off[0] = True
             await _drain_streaming_response(response, conv)
         else:
             error = _harness_error_response_error(response)
@@ -5292,6 +5345,16 @@ def create_runner_app(
                 error["message"],
                 extra={"session_id": conv},
             )
+            stable_id = _input_stable_id(harness_body)
+            if stable_id is not None:
+                _publish_event(
+                    conv,
+                    _response_failed_payload(
+                        {**error, "undelivered": True},
+                        source="harness",
+                        input_stable_id=stable_id,
+                    ),
+                )
             _on_proxy_stream_end(conv, error=error)
 
     async def _drain_streaming_response(
@@ -5620,15 +5683,28 @@ def create_runner_app(
                 should_dispatch_locally,
             )
 
+            turn_input_stable_id = _input_stable_id(body)
+
             if _eager_spec_error is not None:
                 _err_type, _err_msg = _eager_spec_error
-                _fail = _response_failed_payload({"message": _err_msg, "type": _err_type})
+                _error = {
+                    "message": _err_msg,
+                    "type": _err_type,
+                    "undelivered": True,
+                }
+                _fail = _response_failed_payload(
+                    _error,
+                    input_stable_id=turn_input_stable_id,
+                )
                 _publish_event(conv_id, _fail)
                 _on_proxy_stream_end(
                     conv_id,
-                    error={"message": _err_msg, "type": _err_type},
+                    error=_error,
                 )
-                yield _response_failed_event({"message": _err_msg, "type": _err_type})
+                yield _response_failed_event(
+                    _error,
+                    input_stable_id=turn_input_stable_id,
+                )
                 return
 
             # Compose instructions for direct-stream turns (dispatch is None;
@@ -5715,8 +5791,14 @@ def create_runner_app(
                                 },
                             },
                         )
+                        _rejection = {
+                            "status": harness_resp.status_code,
+                            "undelivered": True,
+                        }
                         _fail_status = _response_failed_payload(
-                            {"status": harness_resp.status_code}, source="harness"
+                            _rejection,
+                            source="harness",
+                            input_stable_id=turn_input_stable_id,
                         )
                         _publish_event(
                             conv_id,
@@ -5724,10 +5806,12 @@ def create_runner_app(
                         )
                         _on_proxy_stream_end(
                             conv_id,
-                            error={"status": harness_resp.status_code},
+                            error=_rejection,
                         )
                         yield _response_failed_event(
-                            {"status": harness_resp.status_code}, source="harness"
+                            _rejection,
+                            source="harness",
+                            input_stable_id=turn_input_stable_id,
                         )
                         return
 
@@ -5752,10 +5836,16 @@ def create_runner_app(
                             frame, _, _buffer = _buffer.partition("\n\n")
                             raw_sse_bytes = (frame + "\n\n").encode("utf-8")
 
-                            data_line = next(
-                                (line for line in frame.splitlines() if line.startswith("data:")),
+                            frame_lines = frame.split("\n")
+                            data_index = next(
+                                (
+                                    i
+                                    for i, line in enumerate(frame_lines)
+                                    if line.startswith("data:")
+                                ),
                                 None,
                             )
+                            data_line = frame_lines[data_index] if data_index is not None else None
                             if data_line is not None:
                                 try:
                                     event = _json.loads(data_line[5:].strip())
@@ -5914,7 +6004,8 @@ def create_runner_app(
                                         if _lazy_err is not None:
                                             _err_type, _err_msg = _lazy_err
                                             _fail = _response_failed_payload(
-                                                {"message": _err_msg, "type": _err_type}
+                                                {"message": _err_msg, "type": _err_type},
+                                                input_stable_id=turn_input_stable_id,
                                             )
                                             _publish_event(conv_id, _fail)
                                             _on_proxy_stream_end(
@@ -5926,7 +6017,8 @@ def create_runner_app(
                                                 owner_response_id=_response_id,
                                             )
                                             yield _response_failed_event(
-                                                {"message": _err_msg, "type": _err_type}
+                                                {"message": _err_msg, "type": _err_type},
+                                                input_stable_id=turn_input_stable_id,
                                             )
                                             return
                                         _local_tool_workdir = _resolved_workdir_for_spec(
@@ -6097,10 +6189,14 @@ def create_runner_app(
                             if event is None:
                                 yield raw_sse_bytes
                                 continue
-                            if event.get("type") == "response.failed":
-                                _input_stable_id = body.get("input_stable_id")
-                                if isinstance(_input_stable_id, str):
-                                    event["input_stable_id"] = _input_stable_id
+                            if (
+                                event.get("type") in _INPUT_LIFECYCLE_EVENT_TYPES
+                                and turn_input_stable_id is not None
+                            ):
+                                event["input_stable_id"] = turn_input_stable_id
+                                if data_index is not None:
+                                    frame_lines[data_index] = f"data: {_json.dumps(event)}"
+                                    raw_sse_bytes = ("\n".join(frame_lines) + "\n\n").encode()
                             if not _defer_publish and event.get("type") != "response.created":
                                 _publish_event(conv_id, event)
                             if dispatch is not None and event.get(_RUNNER_DISPATCHED_FIELD):
@@ -6128,10 +6224,18 @@ def create_runner_app(
                     ),
                     "type": "_ContextWindowOverflow",
                 }
-                _overflow_fail = _response_failed_payload(_error, source="llm")
+                _overflow_fail = _response_failed_payload(
+                    _error,
+                    source="llm",
+                    input_stable_id=turn_input_stable_id,
+                )
                 _publish_event(conv_id, _overflow_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
-                yield _response_failed_event(_error, source="llm")
+                yield _response_failed_event(
+                    _error,
+                    source="llm",
+                    input_stable_id=turn_input_stable_id,
+                )
 
             except (httpx.HTTPError, RuntimeError) as exc:
                 _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
@@ -6181,10 +6285,18 @@ def create_runner_app(
                         "message": _harness_stream_failure_message(conv_id, exc),
                         "type": type(exc).__name__,
                     }
-                _http_fail = _response_failed_payload(_error, source="harness")
+                _http_fail = _response_failed_payload(
+                    _error,
+                    source="harness",
+                    input_stable_id=turn_input_stable_id,
+                )
                 _publish_event(conv_id, _http_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
-                yield _response_failed_event(_error, source="harness")
+                yield _response_failed_event(
+                    _error,
+                    source="harness",
+                    input_stable_id=turn_input_stable_id,
+                )
 
         return StreamingResponse(
             proxy_stream(),
@@ -7175,6 +7287,10 @@ def create_runner_app(
         _begin_turn_slot=_begin_turn_slot,
         _claude_model_options_rows=_claude_model_options_rows,
         _codex_native_bridge_state_for_session=_codex_native_bridge_state_for_session,
+        _codex_native_bridge_state_and_dir_for_session=(
+            _codex_native_bridge_state_and_dir_for_session
+        ),
+        _codex_terminal_ensure_locks=_codex_terminal_ensure_locks,
         _ensure_comment_relay_started=_ensure_comment_relay_started,
         _ensure_native_terminal_for_turn=_ensure_native_terminal_for_turn,
         _fetch_session_model_override=_fetch_session_model_override,

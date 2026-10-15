@@ -191,6 +191,7 @@ Cross-harness journeys:
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_preserves_supported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_switch_clamps_inherited_effort`,
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_pick_recreates_closed_terminal`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_combined_model_and_reset_uses_target_default`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_effort_reset_survives_next_turn`.
   These own their environment: run with plain `uv run pytest`. They drive a
@@ -248,9 +249,17 @@ Cross-harness journeys:
   An older server resets the previous model first, even with an updated runner;
   its default is then inherited if the target supports it. On older servers,
   switch models first and select Default as a separate action afterward.
-  While a connected runner is still starting Codex and has no loaded bridge,
-  live settings return a retryable 503 and retain the previous selection.
-  Retry once the terminal is ready; fully offline and silent saves remain deferred.
+  On a connected runner, live settings recreate an idle-reaped Codex pane and
+  wait up to 15 seconds for startup to publish its bridge. An unloaded saved
+  thread is resumed once before retrying a rejected update. Overlapping picks
+  retain their apply order, including while recovery is in progress
+  (`tests/server/integration/test_codex_model_change_after_idle_reap.py`).
+  A refused connection to an owned backend whose process has exited replaces
+  that exact launch once within the same readiness budget, then confirms the
+  settings RPC. A replacement backend, live process, authentication refusal,
+  or failure after sending settings is not replayed.
+  Failed startup or resume returns a retryable 503 and retains the previous
+  selection; fully offline and silent saves remain deferred.
   An older server keeps such a refused change, so the updated runner applies it
   on the next turn; an older runner keeps it itself, so the updated server keeps
   it too. A hung connect fails after five seconds; a hung update is unconfirmed,

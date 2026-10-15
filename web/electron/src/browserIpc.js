@@ -301,10 +301,11 @@ function registerBrowserIpc({
     const navigate = (registry) =>
       registry.openOrNavigate(conversationId, url, bounds, {
         force: !!opts?.force,
-        agent: !!opts?.agent,
+        // Renderer flags do not establish user intent.
+        agent: true,
         // The first-party renderer supplies the source-session host; main owns
         // the target and eligibility. Caller exception flags never establish identity.
-        agentContext: opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null,
+        agentContext: getAgentContextForEvent(event, opts?.sourceHostId),
       });
     let r = navigate(g.registry);
     let recovered = false;

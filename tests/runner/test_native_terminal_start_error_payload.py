@@ -21,6 +21,7 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.codex_native.launch_args import CodexTransportArgsError
 from omnigent.inner.terminal import TerminalInstance, TmuxUnavailableError
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
@@ -103,6 +104,7 @@ def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> Non
             "user",
         ),
         (TmuxUnavailableError("tmux is not installed or not on PATH."), "config"),
+        (CodexTransportArgsError("app-server"), "config"),
     ],
 )
 def test_start_failure_log_row_is_blocking_with_derived_category(
@@ -270,15 +272,24 @@ def test_outdated_pi_cli_surfaces_its_actionable_message() -> None:
     assert _ERROR_ID_RE.search(payload["message"]) is not None
 
 
-def test_host_setup_error_surfaces_its_remedy() -> None:
-    """A host without usable tmux shows how to fix it, not the log pointer."""
-    remedy = "tmux 3.2 is too old; managed terminals require tmux 3.3 or newer"
-    payload = _native_terminal_start_error_payload(
-        TmuxUnavailableError(remedy), "Claude", session_id="conv_1"
-    )
+@pytest.mark.parametrize(
+    ("exc", "runtime_name"),
+    [
+        (
+            TmuxUnavailableError(
+                "tmux 3.2 is too old; managed terminals require tmux 3.3 or newer"
+            ),
+            "Claude",
+        ),
+        (CodexTransportArgsError("app-server"), "Codex"),
+    ],
+)
+def test_host_setup_error_surfaces_its_remedy(exc: Exception, runtime_name: str) -> None:
+    """A known setup error shows how to fix it in the session."""
+    payload = _native_terminal_start_error_payload(exc, runtime_name, session_id="conv_1")
 
     assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
-    assert remedy in payload["message"]
+    assert str(exc) in payload["message"]
     assert "see the runner log" not in payload["message"]
     assert _ERROR_ID_RE.search(payload["message"]) is not None
 

@@ -20,6 +20,7 @@ const path = require("node:path");
 
 const {
   desktopDepsAvailable,
+  openBrowserFixture,
   spawnServer,
   launchDesktop,
   saveRecording,
@@ -30,16 +31,7 @@ const deps = desktopDepsAvailable();
 // Drive the preload-exposed browser APIs from the shell renderer. Each helper
 // runs in the SPA window's context, where window.omnigentDesktop exists.
 async function openView(window, conversationId, url) {
-  return window.evaluate(
-    ([cid, u]) =>
-      window.omnigentDesktop.browserOpenOrNavigate(cid, u, {
-        x: 40,
-        y: 80,
-        width: 900,
-        height: 520,
-      }),
-    [conversationId, url],
-  );
+  return openBrowserFixture(window, conversationId, url);
 }
 
 async function execInView(window, conversationId, js) {
@@ -174,10 +166,18 @@ describe(
           assert.match(String(signIn.result), /agent_identity=alice/);
           await window.waitForTimeout(2_500); // hold A's state on film
 
+          const blocked = await window.evaluate(
+            (url) =>
+              window.omnigentDesktop.browserOpenOrNavigate("restricted-fixture", url, undefined, {
+                agent: false,
+              }),
+            server.serverUrl,
+          );
+          assert.equal(blocked.ok, false, "renderer navigation must enforce the URL policy");
           const firstTab = "browser-tab:conv_A:first";
           const secondTab = "browser-tab:conv_A:second";
           for (const tab of [firstTab, secondTab]) {
-            // oxlint-disable-next-line no-await-in-loop -- Drive each native tab sequentially.
+            // oxlint-disable-next-line no-await-in-loop -- Open each fixture before observing its cookies.
             const opened = await openView(window, tab, site);
             assert.equal(opened.ok, true, `${tab} open failed: ${opened.error}`);
             // oxlint-disable-next-line no-await-in-loop -- Wait for this tab's navigation.
