@@ -498,9 +498,11 @@ def create_host_tunnel_router(
                         )
                         # If the host already reconnected, this handler's connection
                         # was replaced; only the current one may mark it offline.
-                        if host_registry.deregister(host_id, conn=conn):
-                            await asyncio.to_thread(host_store.set_offline, host_id)
-                        await diagnostics_cleanup.aclose()
+                        try:
+                            if host_registry.deregister(host_id, conn=conn):
+                                await asyncio.to_thread(host_store.set_offline, host_id)
+                        finally:
+                            await diagnostics_cleanup.aclose()
                     if on_host_disconnect is not None:
                         try:
                             await on_host_disconnect(host_id, tunnel_owner)

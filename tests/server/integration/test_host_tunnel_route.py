@@ -589,13 +589,40 @@ async def test_host_replacement_names_retirement_without_inventing_close_code(
 
 
 @pytest.mark.parametrize("cancellation", ["task", "scope"])
+@pytest.mark.parametrize("offline_fails", [False, True])
 async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
-    db_uri: str, cancellation: str
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cancellation: str,
+    offline_fails: bool,
 ) -> None:
     registry = HostRegistry()
     store = HostStore(db_uri)
     app = FastAPI()
     entered = asyncio.Event()
+    cleanup_completed = asyncio.Event()
+    real_monitoring = TunnelDiagnostics.monitoring
+
+    @contextlib.asynccontextmanager
+    async def observed_monitoring(*args, **kwargs):
+        try:
+            async with real_monitoring(*args, **kwargs):
+                yield
+        finally:
+            # Observe finalization at a cancellation checkpoint, retaining the real monitor.
+            await anyio.lowlevel.checkpoint()
+            cleanup_completed.set()
+
+    monkeypatch.setattr(TunnelDiagnostics, "monitoring", observed_monitoring)
+    if offline_fails:
+
+        def fail_offline(host_id: str) -> None:
+            assert host_id == _HOST_ID
+            raise RuntimeError("test offline persistence failure")
+
+        # Inject only the failed persistence boundary; registration and reads remain real.
+        monkeypatch.setattr(store, "set_offline", fail_offline)
 
     async def on_connect(_host_id: str, _owner: str | None) -> None:
         entered.set()
@@ -631,16 +658,24 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
     try:
         if cancellation == "task":
             comm.future.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await comm.future
         else:
             # ASGI middleware can keep cancelling at every await during teardown.
             cancel_scopes[0].cancel()
-            await comm.wait(timeout=budget(2.0))
+        done, _ = await asyncio.wait({comm.future}, timeout=budget(2.0))
+        assert done
+        if cancellation == "task" and not offline_fails:
+            with pytest.raises(asyncio.CancelledError):
+                comm.future.result()
+        else:
+            comm.future.result()
+        assert cleanup_completed.is_set()
         assert all(task.done() for task in helpers)
         assert registry.get(_HOST_ID) is None
         persisted = HostStore(db_uri).get_host(_HOST_ID)
-        assert persisted is not None and persisted.status == "offline"
+        assert persisted is not None
+        assert persisted.status == ("online" if offline_fails else "offline")
+        if offline_fails:
+            assert "test offline persistence failure" in caplog.text
     finally:
         comm.stop(exceptions=False)
         await asyncio.gather(comm.future, return_exceptions=True)

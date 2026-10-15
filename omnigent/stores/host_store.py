@@ -426,7 +426,12 @@ class HostStore:
             session.add(row)
             return _row_to_host(row)
 
-        return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
+        try:
+            return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
+        except IntegrityError:
+            # A concurrent reservation or connection can win the first insert.
+            # Retry in a fresh transaction, rechecking ownership and deletion.
+            return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
 
     @staticmethod
     def _rotate_host_id(
