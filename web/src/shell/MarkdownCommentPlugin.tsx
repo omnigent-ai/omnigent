@@ -212,7 +212,13 @@ export function MarkdownCommentPlugin({
     const { selection } = state;
     if (selection.empty) return;
 
-    const data = computeSelectionData(selection.from, selection.to, state.doc, contentRef.current);
+    const data = computeSelectionData(
+      selection.from,
+      selection.to,
+      state.doc,
+      contentRef.current,
+      editor.markdown,
+    );
     if (!data) return;
 
     const newRange = { from: selection.from, to: selection.to };

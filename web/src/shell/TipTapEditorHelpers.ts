@@ -1,18 +1,8 @@
-// Text-content position helpers for TipTap / ProseMirror comment anchoring.
-//
-// Comments are anchored by (start_index, end_index) in the raw file and by
-// anchor_content (the verbatim selected text).  These helpers bridge the gap
-// between raw file offsets and ProseMirror integer positions.
-//
-// Strategy (both directions):
-//   1. Build the PM text content with "\n" between blocks as a proxy for the
-//      raw file content.
-//   2. Use anchor_content as the primary match key; start_index as a ±500
-//      window hint so duplicate text resolves to the right occurrence.
-//   3. Map between text-content offset and PM position via binary search on
-//      doc.textBetween(0, mid, "\n").length — O(log n · n) for typical docs.
+// Map raw-file comment offsets to and from ProseMirror positions.
 
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
+import type { MarkdownManager } from "@tiptap/markdown";
+import { exactIndex, markdownSourceMap } from "./markdownSourceMap";
 import type { Comment } from "@/hooks/useComments";
 
 const SEP = "\n";
@@ -69,9 +59,8 @@ function textOffsetToPmPos(doc: ProseMirrorNode, offset: number): number {
 /**
  * Finds the PM [from, to) range for a saved comment.
  *
- * Uses anchor_content as the text to locate; start_index (a raw-file byte
- * offset) is scaled by the textContent/rawContent ratio to produce a hint
- * for where in the text content to search first.
+ * Single words use validated source positions from the editor’s Markdown tokens.
+ * Otherwise, scale the raw-file character offset to a rendered-text hint.
  *
  * Returns null when anchor_content is absent or not found in the document.
  */
@@ -79,10 +68,22 @@ export function findPmRangeForComment(
   doc: ProseMirrorNode,
   comment: Comment,
   rawContent: string,
+  manager?: MarkdownManager,
 ): { from: number; to: number } | null {
-  const { anchor_content, start_index } = comment;
+  const { anchor_content, start_index, end_index } = comment;
   if (!anchor_content?.trim()) return null;
 
+  if (!/\s/u.test(anchor_content) && rawContent.slice(start_index, end_index) === anchor_content) {
+    const map = markdownSourceMap(doc, rawContent, manager);
+    if (map) {
+      const first = exactIndex(map.starts, start_index);
+      const last = exactIndex(map.ends, end_index);
+      if (first !== -1 && last >= first) {
+        const range = { from: map.positions[first], to: map.positions[last] + 1 };
+        if (doc.textBetween(range.from, range.to, SEP) === anchor_content) return range;
+      }
+    }
+  }
   const textContent = doc.textBetween(0, doc.content.size, SEP);
   if (!textContent) return null;
 
@@ -103,8 +104,8 @@ export function findPmRangeForComment(
 /**
  * Computes raw-file comment anchor data for a PM selection range.
  *
- * Extracts the selected text as anchor_content, then searches for it in
- * rawContent using the scaled text-content offset as a hint.
+ * Single words use validated source positions from the editor’s Markdown tokens.
+ * Otherwise, search rawContent using the scaled text-content offset as a hint.
  *
  * When the text cannot be found verbatim in the raw file (e.g. multi-line
  * selections, table cells, or code blocks whose markdown syntax the parser
@@ -119,10 +120,25 @@ export function computeSelectionData(
   to: number,
   doc: ProseMirrorNode,
   rawContent: string,
+  manager?: MarkdownManager,
 ): { start_index: number; end_index: number; anchor_content: string } | null {
   const anchor_content = doc.textBetween(from, to, SEP);
   if (!anchor_content.trim()) return null;
 
+  if (!/\s/u.test(anchor_content)) {
+    const map = markdownSourceMap(doc, rawContent, manager);
+    if (map) {
+      const first = exactIndex(map.positions, from);
+      const last = exactIndex(map.positions, to - 1);
+      if (first !== -1 && last >= first) {
+        const start_index = map.starts[first];
+        const end_index = map.ends[last];
+        if (rawContent.slice(start_index, end_index) === anchor_content) {
+          return { start_index, end_index, anchor_content };
+        }
+      }
+    }
+  }
   const textContent = doc.textBetween(0, doc.content.size, SEP);
   const textFrom = doc.textBetween(0, from, SEP).length;
 

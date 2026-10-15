@@ -24,7 +24,7 @@ import type { Node } from "@tiptap/pm/model";
 import { StarterKit } from "@tiptap/starter-kit";
 import { TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
 import { ListItem, TaskItem } from "@tiptap/extension-list";
-import { Markdown } from "@tiptap/markdown";
+import { SourceMappedMarkdown } from "./SourceMappedMarkdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { useCanEdit } from "@/hooks/usePermissions";
@@ -402,7 +402,7 @@ function MarkdownRichTextViewerInner({
       // Soft line breaks in hard-wrapped source render as spaces so Edit mode
       // reflows prose to the viewer width like Preview; see TipTapSoftBreak.ts.
       SoftBreak,
-      Markdown,
+      SourceMappedMarkdown,
       createWorkspaceImageExtension(conversationId, path),
       createCommentDecorationExtension(commentStateRef),
       createSearchDecorationExtension(searchStateRef),

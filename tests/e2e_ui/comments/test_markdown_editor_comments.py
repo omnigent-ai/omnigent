@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -323,3 +324,99 @@ def test_heading_text_anchor_content_excludes_prefix(
         f"stored start_index={stored_idx} is more than 200 chars from "
         f"raw markdown position {raw_idx} for anchor {anchor!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("fixture", "phrase", "occurrence", "expected_start"),
+    [
+        ("repeated-word.md", "Repeated", 1, 30),
+        ("hidden-word.md", "word", 0, 16),
+        ("hidden-url.md", "word", 1, 242),
+    ],
+    ids=["repeated-word", "hidden-url-and-split-word", "hidden-url"],
+)
+def test_repeated_word_keeps_selected_occurrence_after_reopen(
+    page: Page,
+    seeded_session: tuple[str, str],
+    fixture: str,
+    phrase: str,
+    occurrence: int,
+    expected_start: int,
+) -> None:
+    """Keep the selected word's raw offset and highlight through save/reopen."""
+    base_url, session_id = seeded_session
+    path = fixture
+    content = (Path(__file__).parent / "fixtures" / fixture).read_text()
+    response = httpx.put(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
+        json={"content": content, "encoding": "utf-8"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    file_button = page.get_by_role("button", name=path, exact=True)
+    expect(file_button).to_be_visible(timeout=30_000)
+    file_button.click()
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    editor = viewer.locator("[contenteditable='true']")
+    paragraph = editor.locator("p").first
+    expect(paragraph).to_contain_text(phrase)
+    paragraph.evaluate(
+        """(element, {phrase, occurrence}) => {
+            element.closest('[contenteditable]').focus();
+            const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+            const positions = [];
+            let text = '', node;
+            while ((node = walker.nextNode())) {
+                for (let i = 0; i < node.length; i++) positions.push([node, i]);
+                text += node.textContent;
+            }
+            let start = -1;
+            for (let i = 0; i <= occurrence; i++) start = text.indexOf(phrase, start + 1);
+            if (start < 0) throw new Error('Selected occurrence not found');
+            const range = document.createRange();
+            range.setStart(...positions[start]);
+            const [endNode, endOffset] = positions[start + phrase.length - 1];
+            range.setEnd(endNode, endOffset + 1);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }""",
+        {"phrase": phrase, "occurrence": occurrence},
+    )
+    page.get_by_role("button", name="Add comment", exact=True).click()
+    viewer.locator("textarea[placeholder='Add a comment…']").fill("Only the selected occurrence")
+    viewer.get_by_role("button", name="Add Comment", exact=True).click()
+    expect(viewer).to_contain_text("Only the selected occurrence")
+
+    def check_highlight() -> None:
+        """The decoration covers exactly the selected visible occurrence."""
+        highlight = editor.locator("[data-comment-id]")
+        expect(highlight).to_have_count(1)
+        expect(highlight).to_have_text(phrase)
+        before = highlight.evaluate(
+            """element => {
+                const range = document.createRange();
+                range.selectNodeContents(element.closest('p'));
+                range.setEndBefore(element);
+                return range.toString();
+            }"""
+        )
+        assert before.count(phrase) == occurrence
+
+    check_highlight()
+    response = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/comments", params={"path": path}, timeout=10
+    )
+    response.raise_for_status()
+    saved = response.json()
+    assert len(saved) == 1
+    assert saved[0]["start_index"] == expected_start
+    assert saved[0]["end_index"] == expected_start + len(phrase)
+    assert saved[0]["anchor_content"] == phrase
+
+    page.get_by_role("button", name=f"Close {path}", exact=True).first.click()
+    file_button.click()
+    expect(editor).to_be_visible()
+    check_highlight()
