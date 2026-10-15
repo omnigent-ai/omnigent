@@ -2,6 +2,7 @@ import { queryOptions, useQuery } from "@tanstack/react-query";
 import { useRef } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { ApiError } from "@/lib/sessionsApi";
 
 /**
  * One worktree of a repository, as returned by
@@ -113,10 +114,17 @@ export async function fetchHostWorktrees(
     if (/not a git (?:repo|repository)/i.test(text)) return [];
   }
   if (!res.ok) {
-    throw new Error(`host worktrees fetch failed: HTTP ${res.status}`);
+    throw new ApiError(`host worktrees fetch failed: HTTP ${res.status}`, res.status, null);
   }
   const body = (await res.json()) as HostWorktreesResponse;
   return body.data;
+}
+
+// A 400 is the host's answer for this path (git failed or timed out there), so
+// retrying only multiplies that timeout. Other failures keep the default retries.
+function shouldRetryHostWorktrees(failureCount: number, error: Error): boolean {
+  if (error instanceof ApiError && error.status === 400) return false;
+  return failureCount < 3;
 }
 
 /** Shared query options for single-path and batched recent-workspace reads. */
@@ -125,6 +133,7 @@ export function hostWorktreesQueryOptions(hostId: string, repoPath: string) {
     queryKey: ["host-worktrees", hostId, repoPath] as const,
     queryFn: () => fetchHostWorktrees(hostId, repoPath),
     staleTime: 5_000,
+    retry: shouldRetryHostWorktrees,
   });
 }
 

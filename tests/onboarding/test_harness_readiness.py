@@ -12,9 +12,10 @@ import yaml
 
 import omnigent.onboarding.harness_install as hi
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.harness_availability import HARNESS_VERSION_TOO_LOW
+from omnigent.harness_availability import HARNESS_BINARY_MISSING, HARNESS_VERSION_TOO_LOW
 from omnigent.onboarding.harness_readiness import (
     _READINESS_PROBE_MAX_WORKERS,
+    _binary_availability_reason,
     configured_harness_map,
     harness_is_configured,
 )
@@ -57,6 +58,12 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
         monkeypatch.delenv(var, raising=False)
         monkeypatch.delenv(f"OMNIGENT_{var}", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))  # ~/.databrickscfg, gcloud ADC, …
+    # OpenCode readiness keys off its provider env vars, including the AWS
+    # credential-chain variables that autoload Bedrock.
+    import omnigent.onboarding.opencode_auth as _oc
+
+    for _provider_id, _label, var in _oc._ENV_PROVIDER_VARS:
+        monkeypatch.delenv(var, raising=False)
     import omnigent.onboarding.databricks_config as _dbc
     from omnigent.onboarding import ambient as _ambient
 
@@ -89,6 +96,8 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     import omnigent._platform as platform
 
     monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
     monkeypatch.setattr(platform, "_cli_fallback_dirs", lambda: ())
 
 
@@ -217,6 +226,50 @@ def test_cli_harness_configured_only_when_binary_installed(
     assert harness_is_configured(harness) is False
 
 
+@pytest.mark.parametrize("path_env", ["OMNIGENT_PI_PATH", "HARNESS_PI_PATH"])
+@pytest.mark.parametrize(
+    ("path_version", "selected_version", "expected"),
+    [
+        (None, "0.85.1", True),
+        ("0.84.1", "0.85.1", True),
+        ("0.85.1", "0.84.1", HARNESS_VERSION_TOO_LOW),
+        ("0.85.1", None, HARNESS_BINARY_MISSING),
+        ("0.85.1", "unparseable", HARNESS_VERSION_TOO_LOW),
+    ],
+)
+def test_pi_readiness_uses_selected_executable(
+    monkeypatch: pytest.MonkeyPatch,
+    path_env: str,
+    path_version: str | None,
+    selected_version: str | None,
+    expected: bool | str,
+) -> None:
+    """Readiness, inference-bound launches and setup inspect the selected Pi."""
+    versions = {"/test/path/pi": path_version, "/test/selected/pi": selected_version}
+    monkeypatch.setenv("HARNESS_PI_PATH", "/test/missing/legacy-pi")
+    monkeypatch.setenv(path_env, "/test/selected/pi")
+
+    def resolve_binary(name: str) -> str | None:
+        binary = "/test/path/pi" if name == "pi" else name
+        return binary if versions.get(binary) is not None else None
+
+    monkeypatch.setattr(hi.shutil, "which", resolve_binary)
+
+    def version_probe(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert argv == ["/test/selected/pi", "--version"]
+        return subprocess.CompletedProcess(argv, 0, stdout=selected_version or "", stderr="")
+
+    monkeypatch.setattr(hi.subprocess, "run", version_probe)
+    assert _binary_availability_reason("pi") == expected
+    assert hi.harness_cli_version_satisfies("pi") is (expected is True)
+    version, _range = hi.harness_cli_version("pi")
+    assert version == (None if selected_version == "unparseable" else selected_version)
+    for harness in ("pi", "pi-native", "native-pi"):
+        assert harness_is_configured(harness) is (expected is True)
+    for harness in ("pi", "pi-native"):
+        assert (hi.missing_harness_cli(harness) is None) is (expected is True)
+
+
 def test_auth_aware_native_harness_reports_binary_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -259,6 +312,40 @@ def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
     result = configured_harness_map()
     assert result["claude-native"] == "needs-auth"
     assert result["opencode-native"] == "needs-auth"
+
+
+def test_opencode_ready_via_bedrock_profile_without_stored_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "share"))
+    config_dir = tmp_path / "config" / "opencode"
+    config_dir.mkdir(parents=True)
+    (config_dir / "opencode.json").write_text(
+        '{"provider": {"amazon-bedrock": {"options": {"profile": "work"}}}}',
+        encoding="utf-8",
+    )
+
+    result = configured_harness_map()
+    for harness in ("opencode", "opencode-native", "native-opencode"):
+        assert result[harness] is True
+
+
+def test_opencode_ready_via_aws_credential_env_without_stored_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``AWS_PROFILE`` alone readies OpenCode: it autoloads Bedrock from the AWS
+    credential chain, so no ``auth.json``, provider key, or ``opencode.json``
+    block is needed and the picker map must not warn ``needs-auth``."""
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "share"))
+    monkeypatch.setenv("AWS_PROFILE", "work")
+
+    result = configured_harness_map()
+    for harness in ("opencode", "opencode-native", "native-opencode"):
+        assert result[harness] is True
 
 
 def test_claude_ready_via_configured_provider_without_cli_login(
@@ -771,7 +858,7 @@ def test_claude_ready_via_managed_gateway_without_provider_or_cli_login(
 
     The enterprise state (`isaac configure claude`): nothing in omnigent's
     config, no subscription login the probe can see, but Claude Code's managed
-    settings pin an AI Gateway + apiKeyHelper and the CLI applies them itself.
+    settings pin a Unity Gateway + apiKeyHelper and the CLI applies them itself.
     This is the exact "Claude Code isn't configured on <host>" dead end — the
     structural check must go green WITHOUT the `claude auth status` subprocess.
     """
@@ -1165,7 +1252,7 @@ def test_codex_cli_config_provider_does_not_ready_sdk_harnesses(
                 family="openai",
                 source="~/.codex/config.toml",
                 model_provider="Databricks",
-                display_name="Databricks AI Gateway",
+                display_name="Databricks Unity Gateway",
             )
         ],
     )

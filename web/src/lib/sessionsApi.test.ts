@@ -25,7 +25,7 @@ import {
   listRunners,
   openSessionStream,
   postEvent,
-  retryRateLimitedTurn,
+  continueFailedTurn,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -73,6 +73,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   localStorage.clear();
 });
 
@@ -151,6 +152,7 @@ describe("createSession", () => {
       queuedItems: undefined,
       contextWindow: undefined,
       labels: undefined,
+      projectId: null,
       lastTaskError: undefined,
       lastTotalTokens: undefined,
       usageIncluded: true,
@@ -555,33 +557,47 @@ describe("createSideChat", () => {
     agent_id: "agent_fork",
     status: "idle",
     created_at: 1704067200,
+    labels: { "omnigent.side_chat": "1", "omnigent.side_chat.source_id": source.id },
   };
 
   it.each(["worktree-from-another-machine", "main", null])(
-    "uses the current workspace without requiring saved branch %s",
+    "relaunches a stopped parent and reuses its runner without requiring saved branch %s",
     async (gitBranch) => {
+      const relaunchedRunnerId = "runner_relaunched";
       fetchMock
-        .mockResolvedValueOnce(mockJsonResponse({ ...source, git_branch: gitBranch }))
+        .mockResolvedValueOnce(
+          mockJsonResponse({ ...source, runner_online: false, git_branch: gitBranch }),
+        )
+        .mockResolvedValueOnce(mockJsonResponse({ recovered: true, recovery: "runner_relaunched" }))
+        .mockResolvedValueOnce(
+          mockJsonResponse({
+            ...source,
+            runner_id: relaunchedRunnerId,
+            runner_online: true,
+            git_branch: gitBranch,
+          }),
+        )
         .mockResolvedValueOnce(mockJsonResponse(fork))
-        .mockResolvedValueOnce(mockJsonResponse({ runner_id: "runner_side" }));
+        .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: relaunchedRunnerId }));
 
       await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
 
-      const [forkUrl, forkInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      const [retryUrl, retryInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      expect(retryUrl).toBe(`/v1/sessions/${source.id}/events`);
+      expect(JSON.parse(retryInit.body as string)).toEqual({ type: "retry_session", data: {} });
+      const [forkUrl, forkInit] = fetchMock.mock.calls[3] as [string, RequestInit];
       expect(forkUrl).toBe(`/v1/sessions/${source.id}/fork`);
       expect(JSON.parse(forkInit.body as string)).toEqual({ title: "Side chat", side_chat: true });
-      const [launchUrl, launchInit] = fetchMock.mock.calls[2] as [string, RequestInit];
-      expect(launchUrl).toBe("/v1/hosts/host_mac/runners");
-      expect(JSON.parse(launchInit.body as string)).toEqual({
-        session_id: fork.id,
-        workspace: source.workspace,
-      });
-      expect(fetchMock).toHaveBeenCalledTimes(3);
+      const [bindUrl, bindInit] = fetchMock.mock.calls[4] as [string, RequestInit];
+      expect(bindUrl).toBe(`/v1/sessions/${fork.id}`);
+      expect(bindInit.method).toBe("PATCH");
+      expect(JSON.parse(bindInit.body as string)).toEqual({ runner_id: relaunchedRunnerId });
+      expect(fetchMock).toHaveBeenCalledTimes(5);
     },
   );
 
-  it.each([{ host_id: null, workspace: null }, { host_online: false }])(
-    "uses the parent's online runner when its host cannot launch (%j)",
+  it.each([{}, { host_id: null, workspace: null }, { host_online: false }])(
+    "reuses the parent's online runner regardless of host availability (%j)",
     async (placement) => {
       fetchMock
         .mockResolvedValueOnce(mockJsonResponse({ ...source, ...placement }))
@@ -609,6 +625,33 @@ describe("createSideChat", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["omnigent.side_chat.source_id", "omnigent.fork.source_id"])(
+    "routes the initial runner bind using %s without making the fork a sub-agent",
+    async (sourceLabel) => {
+      vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
+      const side = {
+        ...fork,
+        labels: { "omnigent.side_chat": "1", [sourceLabel]: source.id },
+      };
+      fetchMock
+        .mockResolvedValueOnce(mockJsonResponse(source))
+        .mockResolvedValueOnce(mockJsonResponse(side))
+        .mockResolvedValueOnce(mockJsonResponse({ ...side, runner_id: source.runner_id }));
+
+      await createSideChat(source.id);
+
+      const init = fetchMock.mock.calls[2][1] as RequestInit;
+      expect(new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")).toBe(source.host_id);
+      expect(getSessionHost(side.id)).toBe(source.host_id);
+      fetchMock.mockResolvedValueOnce(mockJsonResponse(side));
+      expect(await getSession(side.id)).toMatchObject({
+        hostId: null,
+        parentSessionId: null,
+        kind: "default",
+      });
+    },
+  );
+
   it("wakes a resumable host and refreshes its placement before starting a side chat", async () => {
     fetchMock
       .mockResolvedValueOnce(
@@ -621,22 +664,25 @@ describe("createSideChat", () => {
       )
       .mockResolvedValueOnce(mockJsonResponse({ recovered: true, recovery: "runner_relaunched" }))
       .mockResolvedValueOnce(
-        mockJsonResponse({ ...source, host_id: "host_awake", workspace: "/resumed/workspace" }),
+        mockJsonResponse({
+          ...source,
+          host_id: "host_awake",
+          workspace: "/resumed/workspace",
+          runner_id: "runner_awake",
+        }),
       )
       .mockResolvedValueOnce(mockJsonResponse(fork))
-      .mockResolvedValueOnce(mockJsonResponse({ runner_id: "runner_side" }));
+      .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: "runner_awake" }));
 
     await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
 
     const [retryUrl, retryInit] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(retryUrl).toBe(`/v1/sessions/${source.id}/events`);
     expect(JSON.parse(retryInit.body as string)).toMatchObject({ type: "retry_session" });
-    const [launchUrl, launchInit] = fetchMock.mock.calls[4] as [string, RequestInit];
-    expect(launchUrl).toBe("/v1/hosts/host_awake/runners");
-    expect(JSON.parse(launchInit.body as string)).toEqual({
-      session_id: fork.id,
-      workspace: "/resumed/workspace",
-    });
+    const [bindUrl, bindInit] = fetchMock.mock.calls[4] as [string, RequestInit];
+    expect(bindUrl).toBe(`/v1/sessions/${fork.id}`);
+    expect(bindInit.method).toBe("PATCH");
+    expect(JSON.parse(bindInit.body as string)).toEqual({ runner_id: "runner_awake" });
   });
 
   it("does not create an orphan fork when neither the host nor runner is available", async () => {
@@ -1528,14 +1574,14 @@ describe("stopSession", () => {
   });
 });
 
-describe("retryRateLimitedTurn", () => {
+describe("continueFailedTurn", () => {
   it.each([
     { queued: true, item_id: "ci_retry" },
     { queued: true, pending_id: "pending_retry" },
   ])("submits a continuation for an accepted retry: %o", async (response) => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse(response));
 
-    await retryRateLimitedTurn("conv_retry");
+    await continueFailedTurn("conv_retry");
 
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -1548,7 +1594,7 @@ describe("retryRateLimitedTurn", () => {
         content: [
           {
             type: "input_text",
-            text: "Please continue from where you left off before the rate limit error.",
+            text: "Please continue from where you left off.",
           },
         ],
       },
@@ -1564,8 +1610,8 @@ describe("retryRateLimitedTurn", () => {
         }),
     );
 
-    const first = retryRateLimitedTurn("conv_retry");
-    const second = retryRateLimitedTurn("conv_retry");
+    const first = continueFailedTurn("conv_retry");
+    const second = continueFailedTurn("conv_retry");
 
     expect(second).toBe(first);
     expect(fetchMock).toHaveBeenCalledOnce();
@@ -1573,7 +1619,7 @@ describe("retryRateLimitedTurn", () => {
     await Promise.all([first, second]);
 
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
-    await retryRateLimitedTurn("conv_retry");
+    await continueFailedTurn("conv_retry");
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -1586,8 +1632,8 @@ describe("retryRateLimitedTurn", () => {
         }),
     );
 
-    const first = retryRateLimitedTurn("conv_retry");
-    const second = retryRateLimitedTurn("conv_retry");
+    const first = continueFailedTurn("conv_retry");
+    const second = continueFailedTurn("conv_retry");
     const outcomes = Promise.allSettled([first, second]);
     finishRetry?.(mockJsonResponse({ queued: false, denied: true }));
 
@@ -1598,7 +1644,7 @@ describe("retryRateLimitedTurn", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
 
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
-    await retryRateLimitedTurn("conv_retry");
+    await continueFailedTurn("conv_retry");
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -1612,8 +1658,8 @@ describe("retryRateLimitedTurn", () => {
     );
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true }));
 
-    const first = retryRateLimitedTurn("conv_first");
-    await retryRateLimitedTurn("conv_second");
+    const first = continueFailedTurn("conv_first");
+    await continueFailedTurn("conv_second");
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
@@ -1627,7 +1673,7 @@ describe("retryRateLimitedTurn", () => {
   it("rejects policy denials so the error card remains actionable", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, denied: true }));
 
-    await expect(retryRateLimitedTurn("conv_retry")).rejects.toThrow(
+    await expect(continueFailedTurn("conv_retry")).rejects.toThrow(
       "The retry was blocked by a policy",
     );
   });
@@ -1635,7 +1681,7 @@ describe("retryRateLimitedTurn", () => {
   it("rejects a response that did not queue a continuation", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false }));
 
-    await expect(retryRateLimitedTurn("conv_retry")).rejects.toThrow("The retry was not accepted");
+    await expect(continueFailedTurn("conv_retry")).rejects.toThrow("The retry was not accepted");
   });
 
   it("propagates the server's dispatch error", async () => {
@@ -1646,7 +1692,7 @@ describe("retryRateLimitedTurn", () => {
       ),
     );
 
-    await expect(retryRateLimitedTurn("conv_retry")).rejects.toMatchObject({
+    await expect(continueFailedTurn("conv_retry")).rejects.toMatchObject({
       code: "runner_unavailable",
       message: "The host is offline",
       status: 503,

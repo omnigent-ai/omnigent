@@ -5,13 +5,11 @@ Use empty CODEX_HOME and OMNIGENT_CONFIG_HOME.
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import shutil
 import signal
 import subprocess
-import tarfile
 import time
 import uuid
 from collections.abc import Callable
@@ -30,6 +28,7 @@ from omnigent._wrapper_labels import (
 )
 from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id, read_bridge_state
 from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
+from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e.conftest import configure_mock_llm, release_mock_gate
 from tests.e2e.test_host_codex_native_e2e import _poll_for_assistant_marker, _send_user_text
 
@@ -115,28 +114,19 @@ def test_codex_terminal_recovery_preserves_inflight_turn(
     }
     spec["spawn"] = False
     spec["os_env"]["cwd"] = str(tmp_path)
-    with io.BytesIO() as buffer:
-        with tarfile.open(fileobj=buffer, mode="w:gz") as bundle:
-            data = yaml.safe_dump(spec).encode()
-            entry = tarfile.TarInfo("codex-native-ui.yaml")
-            entry.size = len(data)
-            bundle.addfile(entry, io.BytesIO(data))
-        payload = buffer.getvalue()
+    payload = bundle_files({"codex-native-ui.yaml": yaml.safe_dump(spec).encode()})
 
-    create = http_client.post(
+    create = post_session_bundle(
+        http_client.post,
         "/v1/sessions",
-        data={
-            "metadata": json.dumps(
-                {
-                    "workspace": str(tmp_path),
-                    "labels": {
-                        WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
-                        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-                    },
-                }
-            )
+        payload,
+        metadata={
+            "workspace": str(tmp_path),
+            "labels": {
+                WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
+                UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+            },
         },
-        files={"bundle": ("agent.tar.gz", payload, "application/gzip")},
     )
     assert create.is_success, create.text
     session_id = create.json()["session_id"]

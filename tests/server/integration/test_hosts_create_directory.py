@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 import pytest
@@ -33,6 +34,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 # Same liveness-race flake guard as test_hosts_filesystem.py: the mock
 # WS host can be starved + deregistered under parallel CI load. Tests
@@ -44,26 +46,6 @@ pytestmark = [
 
 _HOST_ID = "f28abbfd54a8b22204184b69d9bfd49f"
 _HOST_NAME = "mkdir-test-laptop"
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build a minimal ASGI WebSocket scope.
-
-    :param path: WebSocket path, e.g. ``"/v1/hosts/X/tunnel"``.
-    :returns: ASGI scope dict.
-    """
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
 
 
 def _hello_text(name: str = _HOST_NAME) -> str:
@@ -144,19 +126,11 @@ async def mkdir_setup(
     conn = registry.get(_HOST_ID)
     assert conn is not None
     replies: dict[str, dict[str, Any]] = {}
-    stop_drain = asyncio.Event()
 
     async def _drain() -> None:
-        """Drain outbound WS frames and reply to create_dir frames.
-
-        :returns: None when ``stop_drain`` is set or no events arrive
-            within the per-iteration timeout.
-        """
-        while not stop_drain.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        """Reply to create-dir frames until fixture teardown cancels the drain."""
+        while True:
+            output = await comm.receive_output(timeout=None)
             if output.get("type") != "websocket.send":
                 continue
             text = output.get("text")
@@ -192,14 +166,38 @@ async def mkdir_setup(
     try:
         yield app, registry, comm, replies, drain_task
     finally:
-        stop_drain.set()
+        drain_task.cancel()
         try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
+        finally:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=5.0)
 
 
 # ── Happy path ──────────────────────────────────────────
+
+
+async def test_create_directory_survives_idle_mock_host(
+    mkdir_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """The mock host remains connected while no requests are in flight."""
+    app, registry, comm, _replies, _drain = mkdir_setup
+    await asyncio.sleep(0.75)
+    assert not comm.future.done()
+    assert registry.get(_HOST_ID) is not None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/hosts/{_HOST_ID}/directories", json={"path": "/projects/new-app"}
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["path"] == "/projects/new-app"
 
 
 async def test_create_directory_returns_created_path(

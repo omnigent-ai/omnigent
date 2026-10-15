@@ -295,6 +295,10 @@ def test_templates_load_before_mine_and_discovery_reuses_its_request(
             route.fulfill(json={"data": [], "has_more": False})
 
     def agents(route: Route) -> None:
+        if parse_qs(urlparse(route.request.url).query).get("scope") == ["user"]:
+            # The caller's own agents: a separate list, not the catalog.
+            route.fulfill(json={"data": [], "has_more": False})
+            return
         agent_requests.append(route.request.url)
         route.fulfill(
             json={

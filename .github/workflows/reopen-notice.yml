@@ -8,7 +8,7 @@ name: Reopen notice on PR close
 # matter what `permissions:` asks for -- commenting would 403 on exactly the fork
 # PRs this notice exists for. `_target` runs in the base-repo context with a
 # grantable token; safe here since the job reads only event metadata and the
-# comment list, checks out the default branch's `.github`, and runs no PR code.
+# discussion/reviews and timeline, checks out the default branch's `.github`, and runs no PR code.
 
 on:
   pull_request_target:
@@ -42,7 +42,7 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: .github
           persist-credentials: false
-      - name: Comment with the reopen instructions
+      - name: Comment with reopen instructions and missing Otto closure feedback
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           retries: 3

@@ -11,14 +11,33 @@ is covered without paying the server-boot cost.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
 import httpx
+import psutil
 import pytest
 
+from dev.benchmarks.omnigent import journeys as bench_journeys
 from dev.benchmarks.omnigent import run as bench_run
-from dev.benchmarks.omnigent.environment import BenchEnvironment, _sse_session_status
+from dev.benchmarks.omnigent.environment import (
+    BenchEnvironment,
+    GatedTurn,
+    _close_reader,
+    _sse_session_status,
+    _stop_process_group,
+    bench_child_environ,
+)
 from dev.benchmarks.omnigent.journeys import ALL_JOURNEYS, Journey, run_latency, run_throughput
 from dev.benchmarks.omnigent.measure import RunResult, aggregate, check_thresholds
 from dev.benchmarks.omnigent.schema import SCHEMA_VERSION, build_report
@@ -347,6 +366,287 @@ async def test_latency_prepare_runs_before_warmup_and_timed_operations() -> None
         "measure",
         "teardown",
     ]
+
+
+@pytest.mark.asyncio
+async def test_latency_max_warmup_clamps_requested_warmup() -> None:
+    """``max_warmup`` lowers ``--warmup`` for journeys where repeats warm nothing."""
+    calls: list[str] = []
+
+    async def _measure(_env: BenchEnvironment, _ctx: object) -> None:
+        calls.append("measure")
+
+    journey = Journey(name="cold", kind="latency", measure=_measure, max_warmup=1)
+    result = await run_latency(journey, cast(BenchEnvironment, object()), iterations=3, warmup=10)
+
+    assert result.n_success == 3
+    assert len(calls) == 4  # 1 warmup + 3 timed
+
+
+@pytest.mark.asyncio
+async def test_latency_validate_runs_off_the_clock() -> None:
+    """Slow per-sample cleanup in ``validate`` (e.g. killing a CLI) is not timed."""
+
+    async def _measure(_env: BenchEnvironment, _ctx: object) -> None:
+        return None
+
+    async def _validate(_env: BenchEnvironment, _ctx: object) -> None:
+        await asyncio.sleep(0.5)
+
+    journey = Journey(name="cleanup", kind="latency", measure=_measure, validate=_validate)
+    result = await run_latency(journey, cast(BenchEnvironment, object()), iterations=2, warmup=0)
+
+    assert result.n_success == 2
+    assert max(result.latencies_ms) < 250  # timing validate's 0.5s sleep would exceed this
+
+
+@pytest.mark.asyncio
+async def test_turn_session_rotates_every_n_samples() -> None:
+    """Turn journeys move to a fresh warmed session so history stays bounded."""
+    created: list[str] = []
+    warmed: list[str] = []
+
+    class _Env:
+        async def create_bound_session(self, agent_id: str) -> str:
+            created.append(agent_id)
+            return f"s{len(created)}"
+
+        async def drive_turn(self, session_id: str, _text: str) -> None:
+            warmed.append(session_id)
+
+    ctx = bench_journeys._TurnSession(agent_id="a", session_id="s0")
+    every = bench_journeys._TURN_SESSION_SAMPLES
+    for _ in range(2 * every + 1):
+        await bench_journeys._rotate_turn_session(cast(BenchEnvironment, _Env()), ctx)
+
+    assert created == ["a", "a"]
+    assert warmed == ["s1", "s2"]  # each fresh session gets its warm-up turn
+    assert ctx.session_id == "s2"
+    assert ctx.samples == 1
+
+
+@pytest.mark.asyncio
+async def test_interrupt_moves_to_a_fresh_session_after_a_failed_sample() -> None:
+    """A parked turn left by a failed op could land its marker on the next sample."""
+    calls: list[str] = []
+
+    class _Env:
+        async def finish_gated_turn(self, _turn: object) -> None:
+            calls.append("finish")
+
+        async def create_bound_session(self, _agent_id: str) -> str:
+            calls.append("create")
+            return "fresh"
+
+        async def drive_turn(self, _session_id: str, _text: str) -> None:
+            calls.append("warm")
+
+        async def cancellation_markers(self, session_id: str) -> int:
+            calls.append(f"markers:{session_id}")
+            return 0
+
+        async def start_gated_turn(self, session_id: str) -> str:
+            calls.append(f"gate:{session_id}")
+            return "turn"
+
+    ctx = bench_journeys._TurnSession(agent_id="a", session_id="old", samples=3)
+    ctx.gated = cast(GatedTurn, object())
+    await bench_journeys._prepare_interrupt(cast(BenchEnvironment, _Env()), ctx)
+
+    assert calls == ["finish", "create", "warm", "markers:fresh", "gate:fresh"]
+
+
+def _status_line(status: str) -> bytes:
+    return f'data: {{"type": "session.status", "status": "{status}"}}\n\n'.encode()
+
+
+def _gated_env(statuses: list[str], end_stream: asyncio.Event) -> BenchEnvironment:
+    """A runner-mode env whose SSE stream emits *statuses*, then ends on *end_stream*."""
+
+    async def _stream():
+        for status in statuses:
+            yield _status_line(status)
+        await end_stream.wait()
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, content=_stream())
+        return httpx.Response(202)
+
+    env = BenchEnvironment(with_runner=True)
+    env.client = httpx.AsyncClient(
+        base_url="http://bench", transport=httpx.MockTransport(_handler)
+    )
+
+    async def _no_mock(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    env.configure_mock = _no_mock  # type: ignore[method-assign]
+    env._wait_gate_pending = _no_mock  # type: ignore[method-assign]
+    return env
+
+
+@pytest.mark.asyncio
+async def test_interrupt_fails_when_the_stream_ends_without_idle() -> None:
+    """A stream closing after the interrupt is not a cancel: the sample must fail."""
+    end_stream = asyncio.Event()
+    env = _gated_env(["running"], end_stream)
+    assert env.client is not None
+    try:
+        turn = await env.start_gated_turn("s1", timeout=5)
+        end_stream.set()  # EOF with no idle status
+        with pytest.raises(RuntimeError, match="did not settle cleanly"):
+            await env.interrupt_gated_turn(turn, timeout=5)
+        await env.finish_gated_turn(turn)
+    finally:
+        await env.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_gated_turn_fails_promptly_when_the_turn_settles_before_the_gate() -> None:
+    """A turn that fails before calling the LLM must not wait out the gate timeout."""
+    env = _gated_env(["running", "failed"], asyncio.Event())
+    assert env.client is not None
+
+    async def _never_pending(*, timeout: float) -> None:
+        await asyncio.Event().wait()
+
+    env._wait_gate_pending = _never_pending  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="settled before it was interrupted"):
+            await asyncio.wait_for(env.start_gated_turn("s1", timeout=60), timeout=5)
+    finally:
+        await env.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_sample_ends_at_idle_not_after_stream_cleanup() -> None:
+    """Closing the session stream after ``idle`` must not count toward the sample."""
+    interrupted, release = asyncio.Event(), asyncio.Event()
+
+    class _SlowCloseStream(httpx.AsyncByteStream):
+        async def __aiter__(self):  # type: ignore[override]
+            yield _status_line("running")
+            await interrupted.wait()
+            yield _status_line("idle")
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            await release.wait()  # response cleanup blocks until released
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, stream=_SlowCloseStream())
+        if b'"interrupt"' in request.content:
+            interrupted.set()
+        return httpx.Response(202)
+
+    env = _gated_env([], asyncio.Event())
+    assert env.client is not None
+    await env.client.aclose()
+    env.client = httpx.AsyncClient(
+        base_url="http://bench", transport=httpx.MockTransport(_handler)
+    )
+    try:
+        turn = await env.start_gated_turn("s1", timeout=5)
+        await asyncio.wait_for(env.interrupt_gated_turn(turn, timeout=5), timeout=2)
+        release.set()
+        await env.finish_gated_turn(turn)
+    finally:
+        release.set()
+        await env.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_close_cli_startup_terminates_the_stashed_child_once() -> None:
+    terminated: list[bool] = []
+
+    class _Child:
+        def terminate(self, force: bool) -> None:
+            terminated.append(force)
+
+    ctx: dict[str, object] = {"child": _Child()}
+    env = cast(BenchEnvironment, object())
+    await bench_journeys._close_cli_startup(env, ctx)
+    await bench_journeys._close_cli_startup(env, ctx)  # a second cleanup is harmless
+
+    assert terminated == [True]
+
+
+@pytest.mark.asyncio
+async def test_interrupt_refuses_a_turn_that_already_settled() -> None:
+    """Timing an interrupt on a settled turn would measure nothing; it must fail."""
+    posted: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        posted.append(request.url.path)
+        return httpx.Response(202)
+
+    env = BenchEnvironment(with_runner=True)
+    env.client = httpx.AsyncClient(
+        base_url="http://bench", transport=httpx.MockTransport(_handler)
+    )
+    idle = asyncio.Event()
+    idle.set()
+    turn = GatedTurn("s1", asyncio.create_task(asyncio.sleep(0)), idle, {})
+    try:
+        with pytest.raises(RuntimeError, match="settled before the interrupt"):
+            await env.interrupt_gated_turn(turn)
+    finally:
+        await env.client.aclose()
+        await turn.reader
+
+    assert posted == []
+
+
+@pytest.mark.asyncio
+async def test_interrupt_returns_when_the_gated_turn_settles() -> None:
+    idle = asyncio.Event()
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/s1/events"
+        idle.set()  # the stream reader would see the turn go idle
+        return httpx.Response(202)
+
+    env = BenchEnvironment(with_runner=True)
+    env.client = httpx.AsyncClient(
+        base_url="http://bench", transport=httpx.MockTransport(_handler)
+    )
+    turn = GatedTurn("s1", asyncio.create_task(asyncio.sleep(0)), idle, {})
+    try:
+        await env.interrupt_gated_turn(turn, timeout=5)
+    finally:
+        await env.client.aclose()
+        await turn.reader
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finished", [True, False])
+async def test_close_reader_lets_a_finished_reader_close_its_stream(finished: bool) -> None:
+    """Cancelling a reader mid-close leaked a pooled connection per turn."""
+    saw_terminal = asyncio.Event()
+    closed: list[bool] = []
+
+    async def _reader() -> None:
+        try:
+            if not finished:
+                await asyncio.Event().wait()  # still waiting on the stream
+            saw_terminal.set()
+            await asyncio.sleep(0.01)  # stands in for ``response.aclose()``
+            closed.append(True)
+        except asyncio.CancelledError:
+            closed.append(False)
+            raise
+
+    reader = asyncio.create_task(_reader())
+    if finished:
+        await saw_terminal.wait()
+    else:
+        await asyncio.sleep(0)
+    await _close_reader(reader, finished=finished)
+
+    assert reader.done()
+    assert closed == [finished]
 
 
 def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
@@ -726,3 +1026,396 @@ def test_report_markdown_cross_report_matrix() -> None:
     # Per-report sections still follow the cross matrix.
     assert "### sqlite" in md
     assert "### postgresql" in md
+
+
+# ── harness hygiene (process groups, caller env, terminals) ──
+
+
+def test_bench_child_environ_drops_caller_session_vars() -> None:
+    """Bench processes must not inherit the enclosing Omnigent session's identity."""
+    caller = {
+        "PATH": "/usr/bin",
+        "OMNIGENT_SKIP_WEB_UI": "true",
+        "OMNIGENT_RUNNER_ZYGOTE": "0",  # a tuning knob, kept
+        "OMNIGENT_RUNNER_ID": "runner_caller",
+        "OMNIGENT_RUNNER_DELEGATED_AUTH": "token",
+        "RUNNER_SERVER_URL": "http://caller:6767",
+        "OMNIGENT_PROCESS_LOG_FILE": "/home/u/.omnigent/logs/runner/runner-caller.log",
+        "OMNIGENT_TERMINAL_LAUNCH_ID": "launch_caller",
+        "OMNIGENT_REMOTE_AUTH_TOKEN": "caller-bearer",
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"X-Routing": "caller"}',
+        "OMNIGENT_HARNESS_AUTH_TOKEN": "caller-harness-token",
+        "OMNIGENT_SESSION_ID": "conv_caller",
+        "OMNIGENT_POLICY_URL": "http://caller:6767",
+    }
+
+    assert bench_child_environ(caller) == {
+        "PATH": "/usr/bin",
+        "OMNIGENT_SKIP_WEB_UI": "true",
+        "OMNIGENT_RUNNER_ZYGOTE": "0",
+    }
+
+
+def test_caller_session_env_literals_match_the_runtime() -> None:
+    """Names kept as literals (no cheap public constant) must track the runtime."""
+    from dev.benchmarks.omnigent.environment import _CALLER_SESSION_ENV_VARS
+    from omnigent.chat import _REMOTE_AUTH_TOKEN_ENV
+    from omnigent.runner.native import orchestration
+    from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
+    from omnigent.runtime.harnesses.process_manager import _HARNESS_AUTH_TOKEN_ENV
+
+    assert {
+        _REMOTE_AUTH_TOKEN_ENV,
+        HARNESS_TMP_PARENT_ENV_VAR,
+        _HARNESS_AUTH_TOKEN_ENV,
+    } <= _CALLER_SESSION_ENV_VARS
+    # The native policy hooks' env is built from literals in orchestration.
+    source = Path(orchestration.__file__).read_text()
+    for name in ("OMNIGENT_SESSION_ID", "OMNIGENT_POLICY_URL"):
+        assert f'policy_env["{name}"]' in source
+        assert name in _CALLER_SESSION_ENV_VARS
+
+
+def _wait_gone(proc: psutil.Process, timeout: float = 5.0) -> bool:
+    """Wait for *proc* to exit; a recycled pid doesn't count as it running."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+                return True
+        except psutil.NoSuchProcess:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX-only")
+def test_stop_process_group_kills_descendants_that_ignore_sigterm(tmp_path: Path) -> None:
+    """Stopping a bench child also kills what it forked, even past SIGTERM.
+
+    That includes a child its SIGTERM handler forks just before it exits.
+    """
+    late_pid_file = tmp_path / "late.pid"
+    ignore_term = '(trap "" TERM; exec sleep 60) &'
+    script = (
+        f"trap '{ignore_term} echo $! > \"$1\"; exit 0' TERM; "
+        f"{ignore_term} echo $!; "
+        "while :; do sleep 0.1; done"
+    )
+    proc = subprocess.Popen(
+        ["sh", "-c", script, "sh", str(late_pid_file)],
+        stdout=subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    descendants = [psutil.Process(int(proc.stdout.readline()))]
+    try:
+        _stop_process_group(proc)
+
+        assert proc.poll() is not None
+        with contextlib.suppress(psutil.NoSuchProcess):  # already killed and reaped
+            descendants.append(psutil.Process(int(late_pid_file.read_text())))
+        for descendant in descendants:
+            assert _wait_gone(descendant)
+    finally:
+        for descendant in descendants:
+            with contextlib.suppress(psutil.Error):
+                descendant.kill()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux")
+def test_teardown_kills_terminals_under_the_bench_tmpdir() -> None:
+    """A runner's leftover REPL tmux server under the bench TMPDIR is killed."""
+    env = BenchEnvironment()
+    terminal_dir = env._child_tmp / "omnigent-terminal-test"
+    terminal_dir.mkdir(parents=True)
+    socket_path = terminal_dir / "tmux.sock"
+    subprocess.run(["tmux", "-S", str(socket_path), "new-session", "-d", "sleep 60"], check=True)
+    # Teardown deletes the socket, so only the server's pid can show it exited.
+    server = psutil.Process(
+        int(
+            subprocess.run(
+                ["tmux", "-S", str(socket_path), "display-message", "-p", "#{pid}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        )
+    )
+    try:
+        env._stop()
+
+        assert _wait_gone(server)
+    finally:
+        with contextlib.suppress(psutil.Error):
+            server.kill()
+        shutil.rmtree(env._tmp, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_start_stops_what_it_started() -> None:
+    """``__aexit__`` never runs when ``__aenter__`` raises, so it must clean up itself."""
+    env = BenchEnvironment()
+    stopped: list[bool] = []
+
+    def _start() -> None:
+        raise RuntimeError("server never became healthy")
+
+    env._start = _start  # type: ignore[method-assign]
+    env._stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="never became healthy"):
+        await env.__aenter__()
+    assert stopped == [True]
+
+
+@pytest.mark.asyncio
+async def test_failure_after_start_still_tears_down() -> None:
+    """A failure later in ``__aenter__`` (here the mock call) stops what started."""
+    env = BenchEnvironment(with_runner=True)
+    stopped: list[bool] = []
+
+    async def _mock_post(_path: str, _body: dict[str, object]) -> None:
+        raise httpx.ConnectError("mock LLM crashed")
+
+    env._start = lambda: None  # type: ignore[method-assign]
+    env._stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+    env._mock_post = _mock_post  # type: ignore[method-assign]
+
+    with pytest.raises(httpx.ConnectError):
+        await env.__aenter__()
+    assert stopped == [True]
+    assert env.client is not None and env.client.is_closed
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX-only")
+@pytest.mark.asyncio
+async def test_cancelled_start_cannot_leave_a_child_behind() -> None:
+    """Cancelling startup mid-spawn: teardown stops what started, refuses the rest."""
+    env = BenchEnvironment()
+    spawned = threading.Event()
+    release = threading.Event()
+    later_spawn: list[str] = []
+
+    def _start() -> None:
+        env._spawn(["sleep", "60"])
+        spawned.set()
+        release.wait(timeout=30)
+        try:
+            env._spawn(["sleep", "60"])
+            later_spawn.append("spawned")
+        except RuntimeError:
+            later_spawn.append("refused")
+
+    env._start = _start  # type: ignore[method-assign]
+    task = asyncio.create_task(env.__aenter__())
+    try:
+        await asyncio.to_thread(spawned.wait, 30)
+        first_child = env._children[0]
+        task.cancel()
+        await _wait_until(lambda: env._stopping)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The thread running _start outlives the cancelled await; let it finish.
+        await _wait_until(lambda: bool(later_spawn))
+
+        assert later_spawn == ["refused"]
+        assert len(env._children) == 1
+        assert first_child.poll() is not None
+    finally:
+        release.set()
+        for child in env._children:
+            # An unreaped leader keeps its group id from being recycled.
+            if child.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_start_cancelled_before_it_begins_creates_nothing() -> None:
+    """Teardown that runs first must not leave a temp dir for the late start to fill."""
+    env = BenchEnvironment()
+    entered = threading.Event()
+    release = threading.Event()
+    outcome: list[str] = []
+    real_start = env._start
+
+    def _paused_start() -> None:
+        entered.set()
+        release.wait(timeout=30)
+        try:
+            real_start()
+        except RuntimeError as exc:
+            outcome.append(str(exc))
+            raise
+
+    env._start = _paused_start  # type: ignore[method-assign]
+    task = asyncio.create_task(env.__aenter__())
+    try:
+        await asyncio.to_thread(entered.wait, 30)
+        task.cancel()
+        await _wait_until(lambda: env._stopping)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _wait_until(lambda: bool(outcome))
+
+        assert outcome == ["benchmark environment is stopping"]
+        assert not env._tmp.exists()
+    finally:
+        release.set()
+        shutil.rmtree(env._tmp, ignore_errors=True)
+
+
+async def _wait_until(condition: Callable[[], bool], timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX-only")
+@pytest.mark.timeout(180)
+def test_sigterm_mid_run_leaves_no_processes(tmp_path: Path) -> None:
+    """``timeout``/``kill`` on run.py still tears down the server it booted."""
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(bench_run.__file__)),
+            "--journeys",
+            "list_sessions",
+            "--iterations",
+            "100000",
+            "--runs",
+            "1",
+        ],
+        env={**bench_child_environ(), "HOME": str(tmp_path)},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert proc.stdout is not None
+    descendants: list[psutil.Process] = []
+    try:
+        for line in proc.stdout:
+            if "Benchmarking" in line:
+                break
+        descendants = psutil.Process(proc.pid).children(recursive=True)
+        assert descendants, "run.py booted no server"
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=60)
+        assert proc.returncode == 128 + signal.SIGTERM
+        assert all(_wait_gone(child) for child in descendants)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+        for child in descendants:
+            with contextlib.suppress(psutil.Error):
+                child.kill()
+
+
+class _CliStubEnv:
+    """The slice of BenchEnvironment the cli_startup journey uses."""
+
+    base_url = "http://127.0.0.1:9"
+
+    def __init__(self, tmp: Path) -> None:
+        self._tmp = tmp
+
+    def child_env(self) -> dict[str, str]:
+        return {"PATH": os.environ.get("PATH", ""), "TMPDIR": str(self._tmp)}
+
+
+# What the REPL paints once ready: the toolbar, or the prompt where it's suppressed.
+_TOOLBAR_READY = " polly \\302\\267  ready \\n"
+_PROMPT_READY = "\\342\\235\\257 "
+
+
+def _fake_cli(
+    tmp_path: Path, calls: Path, *, drain: str = "exit 0", ready: str = _TOOLBAR_READY
+) -> Path:
+    """A stand-in `omnigent`: logs each call, and prints a slow REPL for `polly`.
+
+    :param drain: Shell run for a draining `host stop --all` (no `--daemon-only`).
+    :param ready: What `polly` prints once its REPL is ready.
+    """
+    fake = tmp_path / "omnigent"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f'echo "$* | $OMNIGENT_DATA_DIR | $OMNIGENT_CONFIG_HOME" >> {calls}\n'
+        f'if [ "$*" = "host stop --all" ]; then {drain}; fi\n'
+        'if [ "$1" = polly ]; then\n'
+        "  printf 'Launching your agent\\n'; sleep 0.5\n"
+        f"  printf '{ready}'; sleep 30\n"
+        "fi\n"
+    )
+    fake.chmod(0o755)
+    return fake
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="fake CLI is a POSIX shell script")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drain", "falls_back"),
+    [
+        pytest.param("exit 0", False, id="drained"),
+        pytest.param("exit 1", True, id="drain-failed"),
+        pytest.param("exec sleep 5", True, id="drain-timed-out"),
+    ],
+)
+async def test_cli_startup_stops_only_its_own_daemons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drain: str, falls_back: bool
+) -> None:
+    """cli_startup must never run `omnigent stop`, which kills any local server.
+
+    Teardown drains the last session first; if that fails or hangs, it still
+    stops the journey's daemons.
+    """
+    calls = tmp_path / "calls.txt"
+    monkeypatch.setenv("OMNIGENT_BIN", str(_fake_cli(tmp_path, calls, drain=drain)))
+    monkeypatch.setattr(bench_journeys, "_CLI_DRAIN_TIMEOUT_S", 0.5)
+    env = cast(BenchEnvironment, _CliStubEnv(tmp_path))
+    journey = ALL_JOURNEYS["cli_startup"]
+
+    ctx = await journey.run_setup(env)
+    cli_env = cast(dict[str, dict[str, str]], ctx)["env"]
+    await journey.run_prepare(env, ctx)
+    await journey.run_teardown(env, ctx)
+
+    scoped = f"{cli_env['OMNIGENT_DATA_DIR']} | {cli_env['OMNIGENT_CONFIG_HOME']}"
+    assert calls.read_text().splitlines() == [
+        f"host stop --all --daemon-only | {scoped}",  # prepare: daemons only, fast
+        f"host stop --all | {scoped}",  # teardown: drain the last session first
+        *([f"host stop --all --daemon-only | {scoped}"] if falls_back else []),
+    ]
+    assert Path(cli_env["OMNIGENT_DATA_DIR"]).is_relative_to(tmp_path)
+    # Pre-set theme, so the first-run picker doesn't stand in for the REPL.
+    assert "theme: light" in (Path(cli_env["OMNIGENT_CONFIG_HOME"]) / "config.yaml").read_text()
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="fake CLI is a POSIX shell script")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ready", [pytest.param(_TOOLBAR_READY, id="toolbar"), pytest.param(_PROMPT_READY, id="prompt")]
+)
+async def test_cli_startup_times_until_the_repl_is_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ready: str
+) -> None:
+    """The spinner line is not readiness; the timed CLI runs in the scoped dirs."""
+    calls = tmp_path / "calls.txt"
+    monkeypatch.setenv("OMNIGENT_BIN", str(_fake_cli(tmp_path, calls, ready=ready)))
+    env = cast(BenchEnvironment, _CliStubEnv(tmp_path))
+    journey = ALL_JOURNEYS["cli_startup"]
+
+    result = await run_latency(journey, env, iterations=1, warmup=0)
+
+    assert result.n_success == 1, result.failures
+    assert result.latencies_ms[0] >= 500  # waited past "Launching your agent"
+    polly = [line for line in calls.read_text().splitlines() if line.startswith("polly")]
+    assert len(polly) == 1
+    assert str(tmp_path) in polly[0].split(" | ")[1]

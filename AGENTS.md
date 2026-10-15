@@ -3,6 +3,17 @@
 Guidance for AI agents (Claude Code, Copilot, Cursor, etc.) working in this
 repository. See `CONTRIBUTING.md` for the full contributor workflow.
 
+## Test changes
+
+Before adding test setup, read [the test guide](tests/README.md) and
+[primitive catalog](tests/_helpers/README.md), then inspect the nearest scenario.
+Reuse sufficient coverage unchanged or extend a compatible scenario. Keep input
+matrices at the lowest reliable layer; retain E2E for distinct process, transport
+or browser boundaries. Reuse primitives with explicit caller inputs and keep
+faults and assertions in the test. Explain new setup or a separate E2E in the
+PR's Test Plan (Repro uses `evidence`; Resolve uses `test_audit`). Count helper changes in
+test LOC; fewer lines alone do not establish adequate coverage.
+
 ## Committing
 
 Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
@@ -24,7 +35,8 @@ Use `just` for common tasks; run `just --list` for grouped recipes.
 
 When you open a pull request, fill in the repo's PR template at
 `.github/pull_request_template.md` (case-sensitive on Linux — note the lowercase
-filename). Keep every section and checkbox row so reviewers can skim them.
+filename). Keep every section and checkbox row so reviewers can skim them,
+except the optional Changelog section as described below.
 
 - **Summary** — what changed and why.
 - **Test Plan** — how you verified it.
@@ -36,6 +48,16 @@ filename). Keep every section and checkbox row so reviewers can skim them.
   each).
 - **Coverage notes** — required if you checked "Manual verification completed"
   or "Not applicable".
+- **Release notes** — choose exactly one Yes/No checkbox and keep both rows.
+  Choose Yes only for outstanding user-facing features, bug fixes, UX changes,
+  and breaking changes. Breaking changes must choose Yes. Features behind a
+  feature flag are eligible only once the flag is enabled for users. Choose No
+  for small fixes or improvements, features behind disabled flags, and internal
+  changes with no user impact. This is the author's recommendation for
+  maintainers curating the release notes.
+- **Changelog** — if Release notes is Yes, write one line describing the change
+  for users, including compatibility impact for breaking changes. If No, delete
+  this section; the complete changelog still credits the PR using its title.
 
 Generate the description from the actual diff and this session's context — lead
 with the motivation, then the change. Don't pass a `--body` that skips these

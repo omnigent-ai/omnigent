@@ -29,13 +29,20 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import type { ConnectResult, ServerCheckResult } from "@/pages/onboarding/ServerSelectorV2";
+import type {
+  ConnectProgress,
+  ConnectResult,
+  ServerCheckResult,
+} from "@/pages/onboarding/ServerSelectorV2";
 import {
+  ConnectStatus,
   InstallActionIcon,
   installActionLabel,
   OnboardingHeading,
 } from "@/pages/onboarding/primitives";
 import { cn } from "@/lib/utils";
+import { ownServerName } from "@/lib/serverNames";
+import "../../../electron/src/url.js";
 
 const DEFAULT_LOCAL = "http://localhost:6767";
 const CREATE_SERVER_URL = "https://omnigent.ai/";
@@ -64,34 +71,19 @@ export function isLocalInstall(url: string): boolean {
   return u.protocol === "http:" && u.port === LOCAL_SERVER_PORT && u.pathname === "/";
 }
 
-/** Card title: local servers read as "Local installation (host)". */
-function serverTitle(url: string): string {
-  return isLocal(url) ? `Local installation (${displayName(url)})` : displayName(url);
+/** Card title: the organization's name for a managed server; local servers
+ *  read as "Local installation (host)"; else the server's own name beside its
+ *  host (display only), else the host. */
+function serverTitle(url: string, managedName?: string | null, ownName?: string | null): string {
+  if (managedName) return managedName;
+  if (isLocal(url)) return `Local installation (${displayName(url)})`;
+  return ownName ? `${ownName} (${displayName(url)})` : displayName(url);
 }
 
-/**
- * Normalize a typed server URL to an absolute http(s) origin, or null if it
- * isn't a usable URL. A bare host ("localhost:6767", "example.com") gets an
- * http:// scheme; a non-http scheme (javascript:, file:) or garbage is
- * rejected — the shell still probes reachability on navigate, this just stops
- * obviously-wrong input from being connected. Mirrors electron/src/url.js;
- * the main process re-normalizes on connect, so this is only a client-side
- * pre-filter. Exported for its test (ServerSelectStep.test.ts).
- */
+/** Use the shell's URL rules for typed URLs on both onboarding screens. */
 export function normalizeServerUrl(raw: string): string | null {
-  const trimmed = raw.trim();
-  if (trimmed === "") return null;
-  // A scheme is anything before "://". If present it must be http(s); if absent
-  // (bare host), default to http. This rejects file:, javascript:, ftp: etc.,
-  // and "file:///x" (scheme "file") rather than mangling it into a fake host.
-  const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed);
-  if (hasScheme && !/^https?:\/\//i.test(trimmed)) return null;
-  const withScheme = hasScheme ? trimmed : `http://${trimmed}`;
   try {
-    const url = new URL(withScheme);
-    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-    if (url.hostname === "") return null;
-    return url.toString();
+    return globalThis.omnigentUrl.normalizeUrl(raw);
   } catch {
     return null;
   }
@@ -139,9 +131,13 @@ export function ServerSelectStep({
   error,
   recentServers,
   managedServers,
+  managedServerNames,
+  serverNames,
   installed,
   onBack,
   onConnect,
+  connection = null,
+  onCancelConnect,
   onRemove,
   onCopy,
   onCheckServer,
@@ -151,7 +147,11 @@ export function ServerSelectStep({
   error?: string;
   recentServers: string[];
   managedServers: string[];
-  /** CLI installed → "Open"/"Start Omnigent"; missing → "Install Omnigent". */
+  /** Display names for managed servers, server URL → name (from MDM). */
+  managedServerNames?: Record<string, string>;
+  /** Names servers gave themselves, origin → name. */
+  serverNames?: Record<string, string>;
+  /** CLI status for local setup; remote servers always offer "Open Omnigent". */
   installed?: boolean;
   /** Reports whether the URL-input ("add") view is showing, so the parent can
    *  swap the panel band (hero icons) for it. */
@@ -159,6 +159,9 @@ export function ServerSelectStep({
   onBack: () => void;
   /** Connect to a URL; resolves `{error}` to show, else navigation is underway. */
   onConnect: (url: string) => Promise<ConnectResult>;
+  /** Progress of the in-flight onConnect (null when idle). */
+  connection?: ConnectProgress | null;
+  onCancelConnect?: () => void;
   /** Remove a recent server from the list, if the shell supports it. */
   onRemove?: (url: string) => void;
   /** Copy text to the clipboard (native shell bridge — file:// blocks navigator.clipboard). */
@@ -277,6 +280,13 @@ export function ServerSelectStep({
   // Joining the local install while it's down boots it → "Start", not "Open".
   const startsLocal =
     selected !== null && isLocalInstall(selected) && checks[selected] === "unreachable";
+  const actionInstalled = installed || (selected !== null && !isLocalInstall(selected));
+
+  const managedName = (url: string): string | null =>
+    managedServers.includes(url) && managedServerNames && Object.hasOwn(managedServerNames, url)
+      ? managedServerNames[url]
+      : null;
+  const ownName = (url: string): string | null => ownServerName(serverNames, url);
 
   const renderRow = (url: string) => {
     const isSelected = selected === url;
@@ -316,7 +326,9 @@ export function ServerSelectStep({
               )}
             </span>
             <span className="flex min-w-0 flex-1 flex-col">
-              <span className="truncate text-base text-foreground">{serverTitle(url)}</span>
+              <span className="truncate text-base text-foreground">
+                {serverTitle(url, managedName(url), ownName(url))}
+              </span>
               <span className="flex items-center gap-1.5 text-base text-muted-foreground">
                 {isFirstRecent && (
                   <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] leading-none">
@@ -468,6 +480,8 @@ export function ServerSelectStep({
         </div>
       )}
 
+      <ConnectStatus connection={connection} onCancel={onCancelConnect} />
+
       <div className="mt-3 flex justify-between gap-2">
         {mode === "add" ? (
           <>
@@ -490,13 +504,18 @@ export function ServerSelectStep({
           </>
         ) : (
           <>
-            <Button variant="ghost" onClick={onBack} size="lg">
+            <Button variant="ghost" onClick={onBack} size="lg" disabled={connection !== null}>
               <ArrowLeft className="size-4" />
               Back
             </Button>
-            <Button disabled={selected === null} onClick={join} size="lg">
-              <InstallActionIcon installed={installed} startsLocal={startsLocal} />
-              {installActionLabel(installed, startsLocal)}
+            <Button
+              disabled={selected === null}
+              loading={connection !== null}
+              onClick={join}
+              size="lg"
+            >
+              <InstallActionIcon installed={actionInstalled} startsLocal={startsLocal} />
+              {installActionLabel(actionInstalled, startsLocal)}
             </Button>
           </>
         )}

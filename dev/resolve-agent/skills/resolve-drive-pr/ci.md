@@ -64,5 +64,6 @@ settles:
     someone else's red.
 
 Re-poll after each push (or, if you took over a fork PR, on your own PR's checks).
-Stay in this loop (within the round cap) until the checks you're responsible for
-are green.
+Every push here also requires fresh Polly and OCR reviews (4.3). Continue until
+the required checks pass, or record a concrete blocker and an incomplete handoff.
+An unrelated failing required check still prevents a ready-to-merge claim.

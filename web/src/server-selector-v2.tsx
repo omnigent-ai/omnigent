@@ -1,12 +1,13 @@
-// Standalone entry for the gated server selector v2 (Electron shell).
+// Standalone entry for the Electron server selector V2.
 //
-// Loaded from a file:// window when OMNIGENT_SERVER_SELECTOR_V2=1 (see
-// electron/src/main.js `setupPagePath`). Renders the ServerSelectorV2, wiring it
+// Loaded from a file:// window (see electron/src/main.js `setupPagePath`).
+// Renders the ServerSelectorV2, wiring it
 // to the shell's `omnigentSetup` preload bridge (server URL, recent / managed
 // servers, connect, start-local). Theme follows the OS via index.css.
 
-import { type CSSProperties, useEffect, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { Spinner } from "./components/ui/spinner";
 import type { Runner } from "./pages/onboarding/RunnerStep";
 import { ServerSelectorV2, type ServerSelectorV2Setup } from "./pages/onboarding/ServerSelectorV2";
 import { maybeMockSetup } from "./pages/onboarding/mockSetup";
@@ -18,9 +19,12 @@ const CLOUD_DOCS_URL = "https://omnigent.ai/docs/deploy/overview";
 /** The `omnigentSetup` preload bridge (see electron/src/preload.js). */
 interface OmnigentSetup {
   getServerUrl: () => Promise<string | null>;
-  setServerUrl: (url: string) => Promise<unknown>;
+  setServerUrl: (url: string, opts?: { requestId?: string }) => Promise<{ cancelled?: boolean }>;
+  cancelServerConnection?: (requestId: string) => Promise<boolean>;
+  onConnectionProgress?: (cb: (p: { requestId?: string; phase?: string }) => void) => () => void;
   getManagedServers: () => Promise<string[]>;
   getManagedServerNames?: () => Promise<Record<string, string>>;
+  getServerNames?: () => Promise<Record<string, string>>;
   getRecentServers: () => Promise<string[]>;
   forgetRecentServer?: (url: string) => Promise<string[]>;
   getRunnerOptions?: (url: string) => Promise<{ remote?: boolean; bundledCli?: boolean } | null>;
@@ -59,7 +63,7 @@ function SetupApp() {
   return <BridgeSetupApp />;
 }
 
-function BridgeSetupApp() {
+export function BridgeSetupApp() {
   const params = new URLSearchParams(window.location.search);
   const failedUrl = params.get("url");
   const error = params.get("error") ?? undefined;
@@ -75,6 +79,7 @@ function BridgeSetupApp() {
   const [recentServers, setRecentServers] = useState<string[]>([]);
   const [managedServers, setManagedServers] = useState<string[]>([]);
   const [managedServerNames, setManagedServerNames] = useState<Record<string, string>>({});
+  const [serverNames, setServerNames] = useState<Record<string, string>>({});
   // Whether the `omnigent` CLI is installed — decides "Install" vs "Start"/"Open".
   // Undefined until the probe resolves.
   const [installed, setInstalled] = useState<boolean | undefined>(undefined);
@@ -95,6 +100,15 @@ function BridgeSetupApp() {
   // Hold the initial paint until the CLI probe resolves, so the wizard opens on
   // the correct step (welcome vs server list) instead of flashing the wrong one.
   const [ready, setReady] = useState(false);
+  // The in-flight connect's request ID; cleared by Cancel so its late result reads as cancelled.
+  const activeConnect = useRef<string | null>(null);
+  const refreshCliStatus = useCallback(async () => {
+    const status = await setupBridge()?.getCliStatus();
+    setInstalled(status?.installed === true);
+    setInstallSupported(status?.installSupported === true);
+    setLocalServerRunning(status?.localServerRunning === true);
+    return status?.installed === true;
+  }, []);
 
   useEffect(() => {
     const bridge = setupBridge();
@@ -119,11 +133,11 @@ function BridgeSetupApp() {
       (names) => setManagedServerNames(names ?? {}),
       () => {},
     );
-    const cli = bridge.getCliStatus().then((status) => {
-      setInstalled(status?.installed === true);
-      setInstallSupported(status?.installSupported === true);
-      setLocalServerRunning(status?.localServerRunning === true);
-    });
+    void bridge.getServerNames?.().then(
+      (names) => setServerNames(names ?? {}),
+      () => {},
+    );
+    const cli = refreshCliStatus();
     // Older shells omit getSetupCapabilities → leave the item enabled. Gate on
     // it too, so the legacy item isn't shown enabled before v2Forced resolves.
     const caps = bridge.getSetupCapabilities
@@ -146,7 +160,7 @@ function BridgeSetupApp() {
       setInstalled((prev) => prev ?? false);
       setReady(true);
     });
-  }, [failedUrl, isEphemeral]);
+  }, [failedUrl, isEphemeral, refreshCliStatus]);
 
   // Sync the wizard's `.dark` class with the shell's effective theme: the dark
   // styles key off the class (index.css), not the OS media query. The shell
@@ -164,10 +178,13 @@ function BridgeSetupApp() {
     recentServers,
     managedServers,
     managedServerNames,
+    serverNames,
     installed,
+    installSupported,
+    onRecheckCli: refreshCliStatus,
     connectedBefore,
     localServerRunning,
-    onConnect: async (url) => {
+    onConnect: async (url, onPhase) => {
       // setServerUrl persists the URL and navigates the window to it; on success
       // the server's SPA takes over and this page goes away. A rejection (e.g.
       // main-side normalizeUrl rejects an input the renderer accepted) is
@@ -175,13 +192,35 @@ function BridgeSetupApp() {
       // silently does nothing.
       const bridge = setupBridge();
       if (!bridge) return { error: "The desktop shell is unavailable." };
+      // The request ID opts into the shell's connecting/authenticating phases and Cancel.
+      const requestId = crypto.randomUUID();
+      activeConnect.current = requestId;
+      const unsubscribe = bridge.onConnectionProgress?.((p) => {
+        if (p?.requestId !== requestId) return;
+        if (p.phase === "connecting" || p.phase === "authenticating") onPhase?.(p.phase);
+      });
       try {
-        await bridge.setServerUrl(url);
-        return {};
+        const result = await bridge.setServerUrl(url, { requestId });
+        return result?.cancelled || activeConnect.current !== requestId ? { cancelled: true } : {};
       } catch (e) {
+        if (activeConnect.current !== requestId) return { cancelled: true };
         return { error: e instanceof Error ? e.message : "Could not connect to that server." };
+      } finally {
+        unsubscribe?.();
+        if (activeConnect.current === requestId) activeConnect.current = null;
       }
     },
+    onCancelConnect: setupBridge()?.cancelServerConnection
+      ? async () => {
+          const requestId = activeConnect.current;
+          if (requestId === null) return false;
+          // Only a confirmed cancel drops the request: an unconfirmed one keeps
+          // the connect's real outcome (navigation or its error).
+          const cancelled = (await setupBridge()?.cancelServerConnection?.(requestId)) === true;
+          if (cancelled && activeConnect.current === requestId) activeConnect.current = null;
+          return cancelled;
+        }
+      : undefined,
     onStartLocal: async () => {
       // Start (or reuse) the local server, then navigate to it. Resolves the
       // outcome so the terminal step can show ready/failed. On success the
@@ -303,10 +342,7 @@ function BridgeSetupApp() {
 
   return (
     <>
-      {/* Window drag surface: with the native title bar hidden (titleBarStyle
-          "hiddenInset" / frame:false, see electron/src/main.js) this strip is
-          the only place the user can grab to move the window. Matches the
-          static setup page's 36px .drag-strip. */}
+      {/* Match the main shell and static setup page's 48px window drag band. */}
       <div
         style={
           {
@@ -314,7 +350,7 @@ function BridgeSetupApp() {
             top: 0,
             left: 0,
             right: 0,
-            height: 36,
+            height: 48,
             WebkitAppRegion: "drag",
           } as CSSProperties
         }
@@ -323,11 +359,14 @@ function BridgeSetupApp() {
         <ServerSelectorV2 setup={setup} />
       ) : (
         // Hold on the wizard background until the CLI probe resolves, so the
-        // flow opens on the correct step rather than flashing the wrong one.
+        // flow opens on the correct step rather than flashing the wrong one. The
+        // spinner fades in late, so a fast probe shows nothing.
         <div
-          className="min-h-screen"
+          className="grid min-h-screen place-items-center"
           style={{ background: "var(--onboarding-wizard-background)" }}
-        />
+        >
+          <Spinner className="size-6 text-muted-foreground animate-in fade-in delay-300 fill-mode-backwards" />
+        </div>
       )}
     </>
   );

@@ -42,8 +42,13 @@ from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
     HostHelloFrame,
     HostMcpServersResultFrame,
+    HostMcpToolsResultFrame,
+    HostPluginsResultFrame,
+    HostSkillContentResultFrame,
     HostSkillsResultFrame,
 )
+from omnigent.host.harness_startup import HarnessStartup
+from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 
 _logger = logging.getLogger(__name__)
 
@@ -87,6 +92,14 @@ def _canonical_host_id(host_id: str) -> str:
         return host_id
 
 
+def _fail_pending_harness_startup(conn: HostConnection) -> None:
+    """Settle launch settings requests when their tunnel can no longer reply."""
+    while conn.pending_harness_startup:
+        _, future = conn.pending_harness_startup.popitem()
+        if not future.done():
+            future.set_result(None)
+
+
 def _fail_pending_imports(conn: HostConnection) -> None:
     """Fail the connection's in-flight import streams immediately.
 
@@ -105,6 +118,72 @@ def _fail_pending_imports(conn: HostConnection) -> None:
                 },
             )
         )
+
+
+def _fail_pending_plugins(conn: HostConnection) -> None:
+    """Fail plugin requests as soon as their tunnel disconnects or is replaced."""
+    while conn.pending_plugins:
+        _request_id, future = conn.pending_plugins.popitem()
+        if not future.done():
+            future.set_exception(ConnectionError(f"host '{conn.host_id}' disconnected"))
+
+
+def _fail_pending_skill_content(conn: HostConnection) -> None:
+    """Settle lookups immediately when their host connection disappears."""
+    while conn.pending_skill_content:
+        _request_id, future = conn.pending_skill_content.popitem()
+        if not future.done():
+            future.set_exception(ConnectionError("host disconnected"))
+
+
+def _fail_pending_mcp_tools(conn: HostConnection) -> None:
+    """Settle probes immediately when their host connection disappears."""
+    while conn.pending_mcp_tools:
+        _request_id, future = conn.pending_mcp_tools.popitem()
+        if not future.done():
+            future.set_exception(ConnectionError("host disconnected"))
+
+
+def _fail_pending_inventory(pending: dict[str, asyncio.Future[Any]], host_id: str) -> None:
+    """Fail inventory waiters on their owner loops and clear the retired map."""
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+    while True:
+        try:
+            _request_id, future = pending.popitem()
+        except KeyError:
+            break
+        if future.done():
+            continue
+        try:
+            owner_loop = future.get_loop()
+            if owner_loop.is_closed():
+                continue
+
+            def settle(future: asyncio.Future[Any] = future, host_id: str = host_id) -> None:
+                if not future.done():
+                    future.set_exception(ConnectionError(f"host '{host_id}' disconnected"))
+
+            if owner_loop is current_loop:
+                settle()
+            else:
+                owner_loop.call_soon_threadsafe(settle)
+        except RuntimeError:
+            # The owner loop can close between the check and scheduling. The
+            # pending map is already retired, so there is nothing to wake.
+            continue
+
+
+def _fail_pending_skills(conn: HostConnection) -> None:
+    """Fail skill-discovery requests as soon as their host disappears."""
+    _fail_pending_inventory(conn.pending_skills, conn.host_id)
+
+
+def _fail_pending_mcp_servers(conn: HostConnection) -> None:
+    """Fail MCP inventory requests as soon as their host disappears."""
+    _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
 
 
 # How long a runner exit report stays answerable, and how many are kept.
@@ -127,10 +206,13 @@ class RunnerExitReport:
         e.g. ``"alice@example.com"``. ``None`` when auth is disabled.
         Gates visibility: only the owner may read the report (the log
         tail can contain agent output).
+    :param had_connected: Host evidence that the runner connected at least once,
+        or ``None`` when unavailable.
     """
 
     error: str
     owner: str | None
+    had_connected: bool | None = None
 
 
 class RunnerExitReports:
@@ -152,16 +234,31 @@ class RunnerExitReports:
             ttl=_EXIT_REPORT_TTL_S,
         )
 
-    def record(self, runner_id: str, error: str, owner: str | None) -> None:
+    def record(
+        self, runner_id: str, error: str, owner: str | None, *, had_connected: bool | None = None
+    ) -> None:
         """Store a runner exit report.
 
         :param runner_id: The dead runner, e.g. ``"runner_abc123"``.
         :param error: Human-readable cause from the host daemon.
         :param owner: Owner of the reporting host tunnel, or ``None``
             when auth is disabled.
+        :param had_connected: First-connect evidence supplied by the host.
         """
         with self._lock:
-            self._reports[runner_id] = RunnerExitReport(error=error, owner=owner)
+            self._reports[runner_id] = RunnerExitReport(
+                error=error, owner=owner, had_connected=had_connected
+            )
+
+    def was_connected(self, runner_id: str) -> bool:
+        """Return whether the host's exit report proves this runner had connected.
+
+        :param runner_id: Runner whose lifetime evidence is needed.
+        :returns: ``True`` only for a report with affirmative connection evidence.
+        """
+        with self._lock:
+            report = self._reports.get(runner_id)
+        return report is not None and report.had_connected is True
 
     def get(self, runner_id: str) -> str | None:
         """Look up a report's error without owner scoping.
@@ -308,6 +405,8 @@ class HostConnection:
         model catalogs resolved by the selected host.
     :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
     :param pending_mcp_servers: Per-``request_id`` futures for MCP inventory requests.
+    :param pending_skill_content: Per-request futures for transient SKILL.md reads.
+    :param pending_mcp_tools: Per-request futures for lazy MCP discovery.
     """
 
     workspace_id: int
@@ -315,9 +414,14 @@ class HostConnection:
     ws: WebSocketLike
     hello: HostHelloFrame
     owner: str | None
-    outbound_queue: asyncio.Queue[str | None]
+    outbound_queue: asyncio.Queue[OutboundFrame | None]
     connected_at: float
     last_frame_at: float
+    diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
+    retirement_reason: str | None = None
+    sender_end_reason: str | None = None
+    close_requested_code: int | None = None
+    close_requested_reason: str | None = None
     account_generation: str | None = None
     # True when this tunnel authenticated with a valid managed-sandbox launch
     # token, i.e. a server-provisioned sandbox proving itself on connect — not a
@@ -373,6 +477,18 @@ class HostConnection:
     pending_skills: dict[str, asyncio.Future[HostSkillsResultFrame]] = field(
         default_factory=dict,
     )
+    pending_harness_startup: dict[str, asyncio.Future[HarnessStartup | None]] = field(
+        default_factory=dict
+    )
+    pending_plugins: dict[str, asyncio.Future[HostPluginsResultFrame]] = field(
+        default_factory=dict
+    )
+    pending_skill_content: dict[str, asyncio.Future[HostSkillContentResultFrame]] = field(
+        default_factory=dict
+    )
+    pending_mcp_tools: dict[str, asyncio.Future[HostMcpToolsResultFrame]] = field(
+        default_factory=dict
+    )
     pending_mcp_servers: dict[str, asyncio.Future[HostMcpServersResultFrame]] = field(
         default_factory=dict,
     )
@@ -382,6 +498,16 @@ class HostConnection:
     pending_import_local: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]] = field(
         default_factory=dict,
     )
+
+    def enqueue(self, data: str, *, app_ping_ts: int | None = None) -> None:
+        """Queue a frame on the socket loop, retaining local timing metadata."""
+        queued_at = self.diagnostics.timestamp()
+        frame = OutboundFrame(data, queued_at=queued_at, app_ping_ts=app_ping_ts)
+        self.outbound_queue.put_nowait(frame)
+        try:
+            self.diagnostics.enqueued(frame, self.outbound_queue.qsize(), queued_at)
+        except Exception:
+            _logger.exception("Host %s outbound queue diagnostics failed", self.host_id)
 
 
 class HostRegistry:
@@ -471,8 +597,15 @@ class HostRegistry:
                     ws_id,
                     host_id,
                 )
+                old.retirement_reason = "replaced"
                 old.outbound_queue.put_nowait(None)
                 _fail_pending_imports(old)
+                _fail_pending_harness_startup(old)
+                _fail_pending_plugins(old)
+                _fail_pending_skill_content(old)
+                _fail_pending_mcp_tools(old)
+                _fail_pending_skills(old)
+                _fail_pending_mcp_servers(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -513,8 +646,15 @@ class HostRegistry:
             removed = self._hosts.pop(key)
         # Without this the route handler's loops keep running and its ping loop
         # keeps the host row online, even though the host is now unreachable.
+        removed.retirement_reason = "deregistered"
         removed.outbound_queue.put_nowait(None)
         _fail_pending_imports(removed)
+        _fail_pending_harness_startup(removed)
+        _fail_pending_plugins(removed)
+        _fail_pending_skill_content(removed)
+        _fail_pending_mcp_tools(removed)
+        _fail_pending_skills(removed)
+        _fail_pending_mcp_servers(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:
@@ -677,7 +817,7 @@ class HostRegistry:
         without a lock. Every current caller (REST handlers, the WS
         receive loop, the ping loop) runs on the uvicorn event loop,
         so the call below is safe. A caller on another thread must use
-        ``loop.call_soon_threadsafe(queue.put_nowait, data)`` instead.
+        ``loop.call_soon_threadsafe(conn.enqueue, data)`` instead.
 
         :param conn: The target host connection.
         :param data: JSON-encoded frame text.
@@ -704,4 +844,4 @@ class HostRegistry:
             if current is not conn:
                 raise ConnectionError(f"host {conn.host_id!r} connection was replaced")
 
-        conn.outbound_queue.put_nowait(data)
+        conn.enqueue(data)

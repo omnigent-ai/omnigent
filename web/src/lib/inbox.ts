@@ -1,7 +1,7 @@
-// Pure helpers for the Inbox page (`/inbox`): turn session rows +
-// their snapshot `pending_elicitations` payloads into render-ready
-// items. Kept free of React/store imports so the assembly logic is
-// unit-testable in isolation.
+// Pure helpers for the Inbox page (`/inbox`): turn session rows,
+// their snapshot `pending_elicitations` payloads, and their read-state
+// into render-ready items. Kept free of React/store imports so the
+// assembly logic is unit-testable in isolation.
 
 import type { Comment } from "@/hooks/useComments";
 import type { Conversation } from "@/hooks/useConversations";
@@ -61,6 +61,36 @@ export function collectInboxItems(sources: InboxSource[]): InboxItem[] {
     }
   }
   return items;
+}
+
+/** A session whose agent output the viewer hasn't opened yet (the sidebar's unread dot). */
+export interface UnreadInboxItem {
+  row: Conversation;
+  /** `"error"` when the unseen turn failed, otherwise `"done"`. */
+  kind: "done" | "error";
+}
+
+/**
+ * Collect sessions with unseen agent output, newest first.
+ *
+ * `isUnseen` is the sidebar dot's predicate (injected to keep this module
+ * free of the read-state store), so both surfaces agree on what's unread.
+ * Rows with pending approvals are skipped — they're already listed as
+ * approval items, and one session shouldn't appear twice.
+ */
+export function collectUnreadInboxItems(
+  rows: Conversation[],
+  isUnseen: (id: string, updatedAt: number, status: string | undefined) => boolean,
+): UnreadInboxItem[] {
+  return rows
+    .filter(
+      (row) =>
+        !row.archived &&
+        (row.pending_elicitations_count ?? 0) === 0 &&
+        isUnseen(row.id, row.updated_at, row.status),
+    )
+    .sort((a, b) => b.updated_at - a.updated_at)
+    .map((row) => ({ row, kind: row.status === "failed" ? "error" : "done" }));
 }
 
 /** One unseen file comment, paired with the session that owns it. */
@@ -131,4 +161,46 @@ export function sumPendingApprovals(rows: Conversation[]): number {
     total += row.pending_elicitations_count ?? 0;
   }
   return total;
+}
+
+/** Recency bucket the Inbox lists an item under. */
+export type InboxTimeGroup = "Just now" | "Earlier today" | "Yesterday" | "This week" | "Older";
+
+const JUST_NOW_MS = 5 * 60_000;
+
+/**
+ * Bucket an item's timestamp by recency. Day boundaries are local calendar
+ * days, so "Yesterday" means the previous date, not "24–48 hours ago".
+ *
+ * :param atSeconds: Item timestamp in epoch seconds.
+ * :param now: Reference time (defaults to the current time).
+ */
+export function inboxTimeGroup(atSeconds: number, now: Date = new Date()): InboxTimeGroup {
+  const atMs = atSeconds * 1000;
+  if (now.getTime() - atMs < JUST_NOW_MS) return "Just now";
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const d = now.getDate();
+  if (atMs >= new Date(y, m, d).getTime()) return "Earlier today";
+  if (atMs >= new Date(y, m, d - 1).getTime()) return "Yesterday";
+  if (atMs >= new Date(y, m, d - 6).getTime()) return "This week";
+  return "Older";
+}
+
+/**
+ * Sort entries newest first and split them into recency groups, in order.
+ * The sort is stable, so equal timestamps keep their input order.
+ */
+export function groupInboxEntries<T extends { at: number }>(
+  entries: T[],
+  now: Date = new Date(),
+): { label: InboxTimeGroup; entries: T[] }[] {
+  const groups: { label: InboxTimeGroup; entries: T[] }[] = [];
+  for (const entry of [...entries].sort((a, b) => b.at - a.at)) {
+    const label = inboxTimeGroup(entry.at, now);
+    const last = groups.at(-1);
+    if (last?.label === label) last.entries.push(entry);
+    else groups.push({ label, entries: [entry] });
+  }
+  return groups;
 }

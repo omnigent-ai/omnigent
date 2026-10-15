@@ -26,6 +26,7 @@ from omnigent.runner.resource_registry import (
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
+    _build_app_for_spec,
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
@@ -901,12 +902,6 @@ async def test_create_session_repl_terminal_dispatch(
         name="dispatch-agent",
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
     )
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the parametrized spec for any agent id."""
-        del agent_id, session_id
-        return spec
 
     created_sessions: list[str] = []
 
@@ -939,14 +934,7 @@ async def test_create_session_repl_terminal_dispatch(
         "omnigent.runner.app._codex_session_needs_runner_terminal", _fake_codex_needs
     )
 
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-        # A real (empty) registry: the dispatch gate requires one, and
-        # ``get()`` on it reports no existing REPL terminal.
-        terminal_registry=TerminalRegistry(),
-    )
+    app, _ = await _build_app_for_spec(spec, terminal_registry=TerminalRegistry())
 
     body: dict[str, Any] = {
         "session_id": "5eef02d60f39cba3fbd0ae188348643f",

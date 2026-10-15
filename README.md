@@ -519,6 +519,9 @@ and they're in. Signup is invite-only.
 
 - **Share a live session.** Hit **Share** in the web UI and send the link;
   teammates watch your agent work and chat with it in real time.
+- **Share with everyone who can sign in.** Admins can allow public Edit in
+  **Settings > Sharing > Maximum public permission**. Owners then choose
+  **Share > General access > Edit**. The default stays Read.
 - **Leave a shared session.** Done with a session someone shared with you?
   Pick **Leave session** from its sidebar row menu to drop it from your
   sidebar. Nothing is deleted — the owner keeps it and can share it again.
@@ -585,6 +588,14 @@ See the [policy guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/PO
 ---
 
 ## Write your own agent
+
+For centrally managed remote tools, reusable account connections, and a gateway
+with session policies around built-in or external backends, see the
+[MCP registry and gateway prototype](examples/mcp-registry/README.md).
+Direct MCP requests use the caller's connected account. A shared session's runner
+uses its authenticated account (normally the owner), while policies evaluate the
+turn's initiating user. Databricks connections ask for a workspace URL before
+OAuth. KMS limits serialized grants to 4096 bytes; use Vault for larger grants.
 
 An agent is a short YAML file: your prompt, your tools — local Python
 functions, MCP servers, and sub-agents a supervisor can delegate to. You don't

@@ -26,13 +26,9 @@ real. No credentials or live model calls are required::
 from __future__ import annotations
 
 import contextlib
-import io
 import json
 import os
 import shutil
-import subprocess
-import sys
-import tarfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -44,8 +40,9 @@ import pytest
 import yaml
 
 from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
-from tests.e2e.conftest import find_free_port
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.server_runner import server_runner
+from tests._helpers.session import bundle_files, post_session_bundle
 
 pytestmark = pytest.mark.timeout(360, method="signal")
 _REPO = Path(__file__).resolve().parents[2]
@@ -111,48 +108,46 @@ def rig(
         ),
         encoding="utf-8",
     )
-    token = uuid.uuid4().hex
-    runner_id = token_bound_runner_id(token)
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
+    base_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        in {
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "SYSTEMROOT",
+            "WINDIR",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "REQUESTS_CA_BUNDLE",
+            "NODE_EXTRA_CA_CERTS",
+        }
+    }
     env = {
-        **{
-            key: value
-            for key, value in os.environ.items()
-            if key
-            in {
-                "PATH",
-                "LANG",
-                "LC_ALL",
-                "SYSTEMROOT",
-                "WINDIR",
-                "TMPDIR",
-                "TMP",
-                "TEMP",
-                "SSL_CERT_FILE",
-                "SSL_CERT_DIR",
-                "REQUESTS_CA_BUNDLE",
-                "NODE_EXTRA_CA_CERTS",
-            }
-        },
-        "HOME": str(native_home),
         "OMNIGENT_CONFIG_HOME": str(config_dir),
-        "OMNIGENT_DATA_DIR": str(tmp_path / "data"),
         "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
         "OMNIGENT_SKIP_ONBOARD": "1",
         "OMNIGENT_NO_UPDATE_CHECK": "1",
         "OMNIGENT_SKIP_WEB_UI": "true",
         "OMNIGENT_CLAUDE_PATH": str(shutil.which("claude")),
-        "PYTHONPATH": str(_REPO),
     }
-    for key in ("NO_PROXY", "no_proxy"):
-        env[key] = "127.0.0.1,localhost"
-    processes: list[subprocess.Popen[bytes]] = []
     with (
-        (tmp_path / "server.log").open("w") as server_log,
-        (tmp_path / "runner.log").open("w") as runner_log,
+        server_runner(
+            tmp_path,
+            workspace=workspace,
+            server_cwd=_REPO,
+            base_env=base_env,
+            server_env=env,
+            health_timeout=60,
+            poll_interval=0.5,
+            wait_ready=False,
+        ) as stack,
         httpx.Client(
-            base_url=base_url,
+            base_url=stack.base_url,
             timeout=30,
             trust_env=False,
             headers={
@@ -161,64 +156,9 @@ def rig(
             },
         ) as client,
     ):
-        try:
-            processes.append(
-                subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-m",
-                        "omnigent.cli",
-                        "server",
-                        "--host",
-                        "127.0.0.1",
-                        "--port",
-                        str(port),
-                        "--database-uri",
-                        f"sqlite:///{tmp_path / 'test.db'}",
-                        "--artifact-location",
-                        str(tmp_path / "artifacts"),
-                    ],
-                    cwd=_REPO,
-                    env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": token},
-                    stdout=server_log,
-                    stderr=subprocess.STDOUT,
-                )
-            )
-            processes.append(
-                subprocess.Popen(
-                    [sys.executable, "-m", "omnigent.runner._entry"],
-                    cwd=_REPO,
-                    env={
-                        **env,
-                        "OMNIGENT_RUNNER_ID": runner_id,
-                        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": token,
-                        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                        "RUNNER_SERVER_URL": base_url,
-                    },
-                    stdout=runner_log,
-                    stderr=subprocess.STDOUT,
-                )
-            )
-            deadline = time.monotonic() + 60
-            while time.monotonic() < deadline:
-                assert all(proc.poll() is None for proc in processes), "server/runner exited"
-                with contextlib.suppress(httpx.HTTPError):
-                    response = client.get(f"/v1/runners/{runner_id}/status", timeout=2)
-                    if response.status_code == 200 and response.json().get("online"):
-                        break
-                time.sleep(0.5)
-            else:
-                pytest.fail("server/runner did not become ready")
-            yield client, runner_id, mock_url
-        finally:
-            for proc in reversed(processes):
-                if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=5)
+        assert stack.runner_home == native_home, "native configuration must match runner HOME"
+        stack.start_runner(cwd=_REPO, env=env)
+        yield client, stack.runner_id, mock_url
 
 
 def _configure_mock(mock_url: str) -> None:
@@ -299,17 +239,9 @@ def _register_parent(client: httpx.Client, mock_url: str) -> str:
             }
         },
     }
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml.safe_dump(spec).encode()
-        info = tarfile.TarInfo(f"{name}.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-    )
+    data = yaml.safe_dump(spec).encode()
+    bundle_bytes = bundle_files({f"{name}.yaml": data})
+    resp = post_session_bundle(client.post, "/v1/sessions", bundle_bytes)
     assert resp.status_code in (200, 201, 409), f"{resp.status_code} {resp.text[:400]}"
     listing = client.get(
         "/v1/sessions", params={"visibility": "all", "agent_name": name, "limit": 1}

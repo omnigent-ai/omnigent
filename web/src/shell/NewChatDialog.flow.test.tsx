@@ -39,6 +39,13 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
+import { readLastMcpServices, writeLastMcpServices } from "@/lib/mcpPreferences";
+
+vi.mock("@/lib/mcpRegistry", () => ({
+  authorizeRegistryService: vi.fn(),
+  registryRequest: vi.fn(),
+}));
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
@@ -48,6 +55,7 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { writeLastHostChoice } from "@/lib/hostPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -402,6 +410,8 @@ beforeEach(() => {
   pushMatchers.length = 0;
   announcePushedSession = null;
   vi.mocked(authenticatedFetch).mockReset();
+  vi.mocked(registryRequest).mockReset();
+  vi.mocked(authorizeRegistryService).mockReset();
   // Clear the module-level landing draft so a base branch (or other field)
   // left behind by an unmounting test doesn't seed the next one.
   resetLandingDraft();
@@ -431,6 +441,289 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen create flow", () => {
+  it.each([
+    { query: "canvas=main", canvasId: "main", project: undefined },
+    {
+      query: "canvas=proj_alpha&project=Alpha",
+      canvasId: "proj_alpha",
+      project: { id: "proj_alpha", name: "Alpha" },
+    },
+  ])(
+    "keeps a Canvas create on its board through temporary and real routes ($canvasId)",
+    async ({ query, canvasId, project }) => {
+      searchParams = new URLSearchParams(query);
+      projects = project ? [project] : [];
+      const tempConvId = "temp:1234567890abcdef1234567890abcdef";
+      beginLocalConversationMock.mockReturnValue({
+        tempConvId,
+        pendingMsgTempId: "pend_canvas",
+        createToken: "1234567890abcdef1234567890abcdef",
+      });
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      renderLanding([], { features: { canvas: true } });
+      await waitForWorkspaceSeed();
+      typeMessage("Create a session from Canvas");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+      const search = canvasId === "main" ? "" : `?canvas=${canvasId}`;
+      await waitFor(() =>
+        expect(navigateMock).toHaveBeenCalledWith({
+          pathname: `/canvas/c/${encodeURIComponent(tempConvId)}`,
+          search,
+        }),
+      );
+      await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalledOnce());
+      const hydrateNavigate = hydrateLocalConversationMock.mock.calls[0][7];
+      hydrateNavigate("/c/conv_new", { replace: true });
+      expect(navigateMock).toHaveBeenLastCalledWith(
+        { pathname: "/canvas/c/conv_new", search },
+        { replace: true },
+      );
+      const stillViewing = hydrateLocalConversationMock.mock.calls[0][8];
+      const previousUrl = window.location.href;
+      try {
+        window.history.replaceState({}, "", `/canvas/c/${encodeURIComponent(tempConvId)}${search}`);
+        expect(stillViewing()).toBe(true);
+        window.history.replaceState({}, "", "/canvas");
+        expect(stillViewing()).toBe(false);
+      } finally {
+        window.history.replaceState({}, "", previousUrl);
+      }
+    },
+  );
+
+  it("returns a server-first Canvas create to its project", async () => {
+    searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding([], { features: { canvas: true } });
+    await waitForWorkspaceSeed();
+    typeMessage("Create from the project board");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith({
+        pathname: "/canvas/c/conv_new",
+        search: "?canvas=proj_alpha",
+      }),
+    );
+  });
+
+  it("ignores a Canvas return parameter when the feature is off", async () => {
+    searchParams = new URLSearchParams("canvas=main");
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("Create a regular session");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("keeps the Canvas project and draft when a temporary create fails", async () => {
+    searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
+    projects = [{ id: "proj_alpha", name: "Alpha" }];
+    const previousUrl = window.location.href;
+    navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
+      window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
+    });
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:1234567890abcdef1234567890abcdef",
+      pendingMsgTempId: "pend_canvas",
+      createToken: "1234567890abcdef1234567890abcdef",
+    });
+    removeLocalConversationMock.mockReturnValue(true);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "Host unavailable" }), { status: 503 }),
+    );
+    try {
+      renderLanding([], { features: { canvas: true } });
+      await waitForWorkspaceSeed();
+      typeMessage("Keep this Canvas draft");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() =>
+        expect(navigateMock).toHaveBeenLastCalledWith({
+          pathname: "/",
+          search: "?canvas=proj_alpha&project=Alpha",
+        }),
+      );
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this Canvas draft");
+      expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+    } finally {
+      window.history.replaceState({}, "", previousUrl);
+    }
+  });
+
+  it("includes selected registry services in the sandbox creation request", async () => {
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [{ id: "tracker", title: "Tracker", auth: "none", connected: true }],
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_managed" }),
+    } as Response);
+    renderLanding([], { managed_sandboxes_enabled: true, enabled_connections: ["mcp"] });
+    fireEvent.click(screen.getByRole("button", { name: "MCP services: 0 selected" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Tracker" }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Tracker" })).toBeChecked());
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    typeMessage("use the tracker");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [url, init] = vi.mocked(authenticatedFetch).mock.calls[0];
+    expect(url).toBe("/v1/sessions");
+    expect(JSON.parse(init!.body as string)).toMatchObject({
+      host_type: "managed",
+      mcp_registry_services: ["tracker"],
+    });
+  });
+
+  it("waits for MCP OAuth before allowing launch and preserves the draft selection", async () => {
+    const service = { id: "tracker", title: "Tracker", auth: "oauth", connected: false };
+    vi.mocked(registryRequest).mockResolvedValue({ data: [service] });
+    let finish!: () => void;
+    vi.mocked(authorizeRegistryService).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    writeLastHostChoice("host_1");
+    renderLanding([], { managed_sandboxes_enabled: true, enabled_connections: ["mcp"] });
+    await waitForWorkspaceSeed();
+    typeMessage("use the tracker");
+    fireEvent.click(screen.getByRole("button", { name: "MCP services: 0 selected" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Tracker" }));
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    const signInSignal = vi.mocked(authorizeRegistryService).mock.calls[0][1];
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    expect(signInSignal.aborted).toBe(false);
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, connected: true }] });
+    await act(async () => finish());
+    await waitFor(() => expect(readLastMcpServices()).toEqual(["tracker"]));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByTestId("new-chat-landing-submit")).not.toBeDisabled();
+    cleanup();
+    writeLastMcpServices([]);
+    renderLanding([], { managed_sandboxes_enabled: true, enabled_connections: ["mcp"] });
+    expect(await screen.findByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("use the tracker");
+  });
+
+  it.each([false, true])(
+    "ignores remembered MCPs without the admin opt-in (hosted: %s)",
+    async (managed) => {
+      writeLastMcpServices(["system.ai.github"]);
+      vi.mocked(authenticatedFetch).mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderLanding([], { managed_sandboxes_enabled: managed });
+      if (!managed) await waitForWorkspaceSeed();
+      expect(screen.queryByTestId("new-chat-landing-mcp-registry-chip")).toBeNull();
+      expect(registryRequest).not.toHaveBeenCalled();
+      typeMessage("Start without managed registry");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+      expect(
+        JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
+      ).not.toHaveProperty("mcp_registry_services");
+      expect(readLastMcpServices()).toEqual(["system.ai.github"]);
+    },
+  );
+
+  it("restores remembered MCPs on a fresh draft and launches only available services without opening the picker", async () => {
+    writeLastMcpServices(["tracker", "removed"]);
+    let finish!: (value: unknown) => void;
+    vi.mocked(registryRequest).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    vi.mocked(authenticatedFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderLanding([], { enabled_connections: ["mcp"] });
+    await waitForWorkspaceSeed();
+    typeMessage("Use my remembered tools");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "MCP services: 2 selected" })).toBeVisible();
+    expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
+    await act(async () => finish({ data: [{ id: "tracker", title: "Tracker", connected: true }] }));
+    expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+    expect(
+      JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
+    ).toMatchObject({ mcp_registry_services: ["tracker"] });
+    expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
+  });
+
+  it.each(["retry", "opt out"])(
+    "keeps preferences on a catalog failure and allows %s",
+    async (recovery) => {
+      writeLastMcpServices(["tracker"]);
+      vi.mocked(registryRequest).mockRejectedValue(new Error("Catalog unavailable"));
+      renderLanding([], { enabled_connections: ["mcp"] });
+      await waitForWorkspaceSeed();
+      typeMessage("Use my tools");
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.click(screen.getByTestId("new-chat-landing-mcp-registry-chip"));
+      expect(await screen.findByRole("alert")).toHaveTextContent("Catalog unavailable");
+      expect(readLastMcpServices()).toEqual(["tracker"]);
+      expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+      expect(screen.queryByText(/No longer available/)).toBeNull();
+      if (recovery === "opt out") {
+        fireEvent.click(screen.getByRole("switch", { name: "tracker" }));
+        expect(readLastMcpServices()).toEqual([]);
+        fireEvent.keyDown(document, { key: "Escape" });
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+        vi.mocked(authenticatedFetch).mockResolvedValue({
+          ok: true,
+          json: async () => ({ id: "conv_without_mcp" }),
+        } as Response);
+        fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+        await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+        expect(
+          JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
+        ).not.toHaveProperty("mcp_registry_services");
+        expect(authorizeRegistryService).not.toHaveBeenCalled();
+        return;
+      }
+      const service = { id: "tracker", title: "Tracker", auth: "oauth", connected: false };
+      vi.mocked(registryRequest).mockResolvedValue({ data: [service] });
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(await screen.findByRole("switch", { name: "Tracker" })).toBeChecked();
+      expect(
+        screen.getByRole("button", { name: "MCP services: 1 selected, 1 needs sign-in" }),
+      ).toBeVisible();
+      vi.mocked(authorizeRegistryService).mockResolvedValue();
+      vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, connected: true }] });
+      fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+      await screen.findByText("Connected");
+      expect(readLastMcpServices()).toEqual(["tracker"]);
+      fireEvent.click(screen.getByRole("switch", { name: "Tracker" }));
+      expect(readLastMcpServices()).toEqual([]);
+      cleanup();
+      resetLandingDraft();
+      renderLanding([], { enabled_connections: ["mcp"] });
+      fireEvent.click(screen.getByTestId("new-chat-landing-mcp-registry-chip"));
+      expect(await screen.findByRole("switch", { name: "Tracker" })).not.toBeChecked();
+    },
+  );
+
   it("keeps project placement on the provisional and rekeyed conversation", async () => {
     searchParams = new URLSearchParams("project=Alpha");
     projects = [{ id: "proj_alpha", name: "Alpha" }];
@@ -1076,7 +1369,7 @@ describe("NewChatLandingScreen create flow", () => {
     await waitForWorkspaceSeed();
     // Surrounding whitespace + an embedded control char (\x07 bell) prove the
     // screen sanitizes the message before handing it off.
-    typeMessage("  read the README\x07 and refactor  ");
+    typeMessage("  - read the README\x07\n  - refactor  ");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
@@ -1094,11 +1387,10 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.initial_items).toBeUndefined();
 
     // It's stashed in the chatStore (keyed by the new conversation id),
-    // trimmed + control-char-stripped, for ChatPage to auto-send. Plain
-    // text (no leading "/") carries no skill invocation.
+    // control-char-stripped with list indentation intact, for ChatPage to send.
     await waitFor(() =>
       expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
-        text: "read the README and refactor",
+        text: "  - read the README\n  - refactor",
         skill: null,
         files: [],
       }),
@@ -1278,7 +1570,7 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     // Same sanitization vehicle as the chatStore handoff test — the history
-    // entry must be the SENT prompt (control-char stripped, trimmed), so a
+    // entry must be the SENT prompt (control-char stripped), so a
     // recall + resend reproduces exactly what was sent.
     typeMessage("  read the README\x07 and refactor  ");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -1289,10 +1581,10 @@ describe("NewChatLandingScreen create flow", () => {
     const history = JSON.parse(localStorage.getItem(PROMPT_HISTORY_KEY) ?? "[]");
     // The stored entry is the SANITIZED prompt: the \x07 bell is gone (proving
     // sanitizeInitialPrompt ran — a bare trim would have kept it) and the
-    // surrounding whitespace is trimmed. So a recall + resend reproduces
+    // indentation is preserved. So a recall + resend reproduces
     // exactly what was sent, not the raw keystrokes.
     expect(history[0]).not.toContain("\x07");
-    expect(history).toEqual(["read the README and refactor"]);
+    expect(history).toEqual(["  read the README and refactor"]);
   });
 
   it("attaches terminal-wrapper labels when the claude-native agent is chosen", async () => {
@@ -1816,7 +2108,8 @@ describe("NewChatLandingScreen create flow", () => {
       '[data-testid="new-chat-landing-agent-model-omnigent-openai/system.ai.gpt-5-6-sol"]',
     );
     expect(fullNameRow).not.toBeNull();
-    expect(fullNameRow).toHaveAttribute("title", "GPT 5.6 Sol");
+    expect(fullNameRow).toHaveTextContent("GPT 5.6 Sol");
+    expect(fullNameRow).toHaveAttribute("title", "omnigent-openai/system.ai.gpt-5-6-sol");
     fireEvent.change(screen.getByTestId("new-chat-landing-agent-model-search"), {
       target: { value: "gpt sol" },
     });
@@ -2417,7 +2710,8 @@ describe("NewChatLandingScreen create flow", () => {
 
 describe("sanitizeInitialPrompt", () => {
   it.each([
-    ["trims surrounding whitespace", "  hello  ", "hello"],
+    ["trims trailing whitespace and preserves indentation", "  hello  ", "  hello"],
+    ["still trims native slash commands", "  /side explain this  ", "/side explain this"],
     // \n and \t must survive — multi-line prompts depend on it.
     ["preserves newlines and tabs", "line1\n\tline2", "line1\n\tline2"],
     // C0/C1 controls (bell \x07, NUL \x00, DEL \x7f) corrupt tmux

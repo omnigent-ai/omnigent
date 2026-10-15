@@ -13,7 +13,7 @@ Mirrors the codex / pi wraps' env-var config flow.
 Unlike the gateway-backed harnesses, cursor has NO gateway /
 Databricks-profile env vars: the SDK talks only to Cursor's own backend and has
 no custom API base-URL override, so there is nothing for the workflow layer to
-route through the Databricks AI gateway.
+route through the Databricks Unity Gateway.
 
 Env vars read at startup:
 

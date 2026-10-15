@@ -45,7 +45,8 @@ window.omnigentDesktop = {{
 @pytest.fixture(autouse=True)
 def _drop_routes(page: Page) -> Iterator[None]:
     yield
-    page.unroute_all(behavior="ignoreErrors")
+    if not page.is_closed():
+        page.unroute_all(behavior="ignoreErrors")
 
 
 @pytest.fixture

@@ -1,4 +1,11 @@
-import { forwardRef, useRef, type ComponentPropsWithoutRef, type ReactNode } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+} from "react";
 import {
   ChevronDownIcon,
   FolderIcon,
@@ -16,6 +23,7 @@ import {
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { permissionModeConcept } from "@/lib/nativeHarnessModes";
 import {
@@ -33,20 +41,28 @@ import {
  * content inset line via the shared content inset; a chip's box starts there, and its
  * own px-1 keeps the glyph off the edge.
  */
-export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWithoutRef<"div">) {
+export function ComposerWorkspaceBar({
+  className,
+  children,
+  trailingContent,
+  ...props
+}: ComponentPropsWithoutRef<"div"> & { trailingContent?: ReactNode }) {
   const barRef = useRef<HTMLDivElement>(null);
   useCollapsedWorkspaceLabels(barRef);
   return (
     <div
       ref={barRef}
       className={cn(
-        "composer-workspace-surface group/composer-workspace relative z-0 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-1.5 md:gap-2",
+        "composer-workspace-surface group/composer-workspace relative z-0 -mb-px flex h-7 min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-0.5 md:h-[37px] md:gap-2 md:py-1.5",
         COMPOSER_CONTENT_INSET_CLASS,
         COMPOSER_TRAY_INSET_CLASS,
         className,
       )}
       {...props}
-    />
+    >
+      {children}
+      {trailingContent}
+    </div>
   );
 }
 
@@ -56,8 +72,13 @@ export const ComposerWorkspaceTrigger = forwardRef<
     kind: "directory" | "worktree";
     label: string;
     icon?: ReactNode;
+    /** Hide the visible label; it stays the accessible name. */
+    iconOnly?: boolean;
   }
->(function ComposerWorkspaceTrigger({ kind, label, icon, className, ...props }, ref) {
+>(function ComposerWorkspaceTrigger(
+  { kind, label, icon, iconOnly = false, className, ...props },
+  ref,
+) {
   const Icon = kind === "directory" ? FolderIcon : GitForkIcon;
   return (
     <button
@@ -72,12 +93,14 @@ export const ComposerWorkspaceTrigger = forwardRef<
       {...props}
     >
       {icon ?? <Icon className="size-3.5 shrink-0" />}
-      <span
-        data-workspace-collapse-label=""
-        className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
-      >
-        {label}
-      </span>
+      {!iconOnly && (
+        <span
+          data-workspace-collapse-label=""
+          className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}
+        >
+          {label}
+        </span>
+      )}
       <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
     </button>
   );
@@ -101,7 +124,6 @@ export const ComposerHostTrigger = forwardRef<
       ref={ref}
       type="button"
       aria-label={label}
-      title={label}
       className={cn(
         "flex h-8 w-11 shrink-0 cursor-pointer items-center justify-center gap-0.5 rounded-lg bg-transparent pl-1 pr-2 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground dark:hover:bg-muted/50 disabled:cursor-default md:h-7",
         className,
@@ -132,6 +154,7 @@ export function ComposerPermissionPicker({
   selectedValue,
   options,
   disabled = false,
+  iconOnly = false,
   loading = false,
   interactiveWhileLoading = false,
   onSelect,
@@ -143,6 +166,8 @@ export function ComposerPermissionPicker({
   selectedValue?: string | null;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
+  /** Hide the visible value; it stays in the accessible name. */
+  iconOnly?: boolean;
   loading?: boolean;
   interactiveWhileLoading?: boolean;
   onSelect: (value: string) => void;
@@ -165,11 +190,13 @@ export function ComposerPermissionPicker({
           data-permission-concept={permissionModeConcept(harness, selectedValue)}
         >
           <HandIcon className="size-3 shrink-0" />
-          <span
-            className={cn("min-w-0 truncate text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
-          >
-            {value}
-          </span>
+          {!iconOnly && (
+            <span
+              className={cn("min-w-0 truncate text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
+            >
+              {value}
+            </span>
+          )}
           <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </button>
       </DropdownMenuTrigger>
@@ -220,6 +247,83 @@ export function ComposerConfigTooltipRows({
         </span>
       ))}
     </>
+  );
+}
+
+const MENU_CLOSE_TOOLTIP_GUARD_MS = 600;
+
+function useMenuGuardedTooltip(menuOpen: boolean) {
+  const [wantsOpen, setWantsOpen] = useState(false);
+  // Epoch millis until which open requests are ignored; Infinity while the
+  // menu is open. A ref, not state: it is only read when Radix requests an
+  // open, so changing it never needs a re-render.
+  const suppressedUntil = useRef(0);
+  useEffect(() => {
+    if (menuOpen) {
+      setWantsOpen(false);
+      suppressedUntil.current = Number.POSITIVE_INFINITY;
+    } else if (suppressedUntil.current === Number.POSITIVE_INFINITY) {
+      suppressedUntil.current = Date.now() + MENU_CLOSE_TOOLTIP_GUARD_MS;
+    }
+  }, [menuOpen]);
+  return {
+    open: wantsOpen && !menuOpen,
+    onOpenChange: (next: boolean) =>
+      setWantsOpen(next && !menuOpen && Date.now() >= suppressedUntil.current),
+    triggerProps: {
+      onPointerEnter: () => {
+        if (!menuOpen) suppressedUntil.current = 0;
+      },
+    },
+  } as const;
+}
+
+/**
+ * Hover tooltip for a composer control that opens a menu. It stays hidden
+ * while the menu is open and doesn't reopen as focus returns on close.
+ */
+export function ComposerMenuTooltip({
+  menuOpen,
+  content,
+  variant = "default",
+  testId,
+  className,
+  contentClassName,
+  children,
+}: {
+  menuOpen: boolean;
+  content: ReactNode;
+  variant?: "default" | "session-info";
+  testId?: string;
+  /** Classes for the wrapper that receives the hover. */
+  className?: string;
+  /** Classes for the tooltip surface. */
+  contentClassName?: string;
+  children: ReactNode;
+}) {
+  const guardedTooltip = useMenuGuardedTooltip(menuOpen);
+  return (
+    <TooltipProvider>
+      <Tooltip open={guardedTooltip.open} onOpenChange={guardedTooltip.onOpenChange}>
+        <TooltipTrigger asChild>
+          <span className={cn("flex min-w-0", className)} {...guardedTooltip.triggerProps}>
+            {children}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent
+          side="top"
+          className={cn(
+            "max-w-80 flex-col items-start gap-0.5 px-3 py-2",
+            variant === "session-info" &&
+              "w-64 max-w-[calc(100vw-2rem)] items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10",
+            contentClassName,
+          )}
+          data-testid={testId}
+        >
+          {content}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 

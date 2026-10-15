@@ -9,12 +9,12 @@ each of those rebuilds the React Flow nodes from the fresh session list.
 
 from __future__ import annotations
 
-import json
 import re
 
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
 
@@ -24,11 +24,8 @@ SELECTED_CARD_CLASS = re.compile(r"(?:^|\s)border-brand-accent(?:\s|$)")
 
 def _create_session(live_server: str, title: str) -> str:
     """Create a real top-level session and give it a stable title."""
-    create = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-        timeout=30.0,
+    create = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", _build_hello_world_bundle(), timeout=30.0
     )
     create.raise_for_status()
     session_id = create.json()["session_id"]
@@ -60,6 +57,9 @@ def test_clicked_card_keeps_selected_highlight_across_live_updates(
     expect(page.get_by_role("status", name="Loading sessions")).to_have_count(0)
 
     target_card.click()
+    # Opening the session narrows the canvas and keeps the viewport, so with a
+    # long session list cards can fall off-screen (and stop rendering). Refit.
+    page.get_by_role("button", name="Fit view").click()
     target_node = page.locator(".react-flow__node").filter(has_text="Canvas highlight target")
     expect(target_node).to_have_class(SELECTED_NODE_CLASS)
     expect(target_card).to_have_class(SELECTED_CARD_CLASS)

@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  HTML_PREVIEW_HEAD,
   HTML_PREVIEW_SANDBOX,
   detectLang,
   getSelectionOffsets,
@@ -406,39 +407,41 @@ describe("indexToLine", () => {
 });
 
 // ---------------------------------------------------------------------------
-// prepareHtmlPreviewDoc — force links to open in a new tab
+// prepareHtmlPreviewDoc — new-tab links; same-page anchors stay in the frame
 // ---------------------------------------------------------------------------
 
 describe("prepareHtmlPreviewDoc", () => {
+  const HEAD = HTML_PREVIEW_HEAD;
   const BASE = '<base target="_blank">';
 
-  it("injects the base tag inside an existing <head>", () => {
+  it("injects the head markup, base target first, inside an existing <head>", () => {
     const html = "<!DOCTYPE html><html><head><title>x</title></head><body>hi</body></html>";
     const out = prepareHtmlPreviewDoc(html);
-    expect(out).toContain(`<head>${BASE}<title>x</title>`);
+    expect(HEAD.startsWith(BASE)).toBe(true);
+    expect(out).toContain(`<head>${HEAD}<title>x</title>`);
     // Doctype stays first so the document keeps standards mode.
     expect(out.indexOf("<!DOCTYPE html>")).toBe(0);
   });
 
   it("matches <head> with attributes", () => {
     const out = prepareHtmlPreviewDoc('<head lang="en"><meta></head>');
-    expect(out).toContain(`<head lang="en">${BASE}<meta>`);
+    expect(out).toContain(`<head lang="en">${HEAD}<meta>`);
   });
 
   it("creates a <head> after <html> when none exists", () => {
     const out = prepareHtmlPreviewDoc("<!DOCTYPE html><html><body>hi</body></html>");
-    expect(out).toContain(`<html><head>${BASE}</head><body>`);
+    expect(out).toContain(`<html><head>${HEAD}</head><body>`);
     expect(out.indexOf("<!DOCTYPE html>")).toBe(0);
   });
 
-  it("prepends the base tag for a bare fragment (no doctype to displace)", () => {
+  it("prepends the head markup for a bare fragment (no doctype to displace)", () => {
     const out = prepareHtmlPreviewDoc('<a href="https://example.com">link</a>');
-    expect(out).toBe(`${BASE}<a href="https://example.com">link</a>`);
+    expect(out).toBe(`${HEAD}<a href="https://example.com">link</a>`);
   });
 
   it("is case-insensitive on the HEAD tag", () => {
     const out = prepareHtmlPreviewDoc("<HEAD></HEAD>");
-    expect(out).toContain(`<HEAD>${BASE}`);
+    expect(out).toContain(`<HEAD>${HEAD}`);
   });
 
   it("preserves an existing <base href>; the injected target tag wins by order", () => {
@@ -447,20 +450,15 @@ describe("prepareHtmlPreviewDoc", () => {
     // forcing links to a new tab.
     const html = '<head><base href="https://cdn.example.com/"></head>';
     const out = prepareHtmlPreviewDoc(html);
-    expect(out).toBe(`<head>${BASE}<base href="https://cdn.example.com/"></head>`);
+    expect(out).toBe(`<head>${HEAD}<base href="https://cdn.example.com/"></head>`);
     expect(out.indexOf(BASE)).toBeLessThan(out.indexOf("<base href"));
   });
 
-  it("injects exactly one base tag per call (no duplicates)", () => {
-    const out = prepareHtmlPreviewDoc("<head></head>");
-    expect(out.match(/<base target="_blank">/g)).toHaveLength(1);
-  });
-
-  it("is idempotent: re-preparing already-prepared content adds no second base tag", () => {
+  it("injects one base tag and one anchor script, and re-preparing adds no second copy", () => {
     const once = prepareHtmlPreviewDoc("<head></head>");
-    const twice = prepareHtmlPreviewDoc(once);
-    expect(twice).toBe(once);
-    expect(twice.match(/<base target="_blank">/g)).toHaveLength(1);
+    expect(once.match(/<base target="_blank">/g)).toHaveLength(1);
+    expect(once.split("<script>")).toHaveLength(2);
+    expect(prepareHtmlPreviewDoc(once)).toBe(once);
   });
 
   it("still injects a real base when the literal base string only appears in content", () => {
@@ -470,15 +468,350 @@ describe("prepareHtmlPreviewDoc", () => {
     // instead of opening a new tab. The base must still land in <head>.
     const html = '<html><head></head><body><!-- <base target="_blank"> --></body></html>';
     const out = prepareHtmlPreviewDoc(html);
-    expect(out).toContain(`<head>${BASE}</head>`);
+    expect(out).toContain(`<head>${HEAD}</head>`);
   });
 
-  it("documents the matcher limitation: a <head> literal in earlier markup is matched textually", () => {
-    // A simple regex (not a full parser) matches the first <head> string, even
-    // inside a comment. This only mis-places the harmless base tag inside the
-    // sandboxed preview — never a security issue — so we lock in the behavior.
+  it("skips a <head> literal inside a comment and injects into the real head", () => {
     const out = prepareHtmlPreviewDoc("<!-- <head> --><html><head></head></html>");
-    expect(out).toBe(`<!-- <head>${BASE} --><html><head></head></html>`);
+    expect(out).toBe(`<!-- <head> --><html><head>${HEAD}</head></html>`);
+  });
+
+  it("keeps an artifact script intact when it only mentions <head>/<html> (bare fragment)", () => {
+    // The injected markup carries its own </script>; landing inside this string
+    // would end the artifact's script early.
+    const script = "<script>var t = '<html><head><title>Example</title></head></html>';</script>";
+    const out = prepareHtmlPreviewDoc(`${script}<p>hi</p>`);
+    expect(out).toBe(`${HEAD}${script}<p>hi</p>`);
+  });
+
+  it("recognizes unusual script end tags and comment terminators while scanning", () => {
+    const script = "<script>var t = '<head>';</script\t\n bar>";
+    expect(prepareHtmlPreviewDoc(`${script}<html><head></head></html>`)).toBe(
+      `${script}<html><head>${HEAD}</head></html>`,
+    );
+    expect(prepareHtmlPreviewDoc("<!-- <head> --!><html><head></head></html>")).toBe(
+      `<!-- <head> --!><html><head>${HEAD}</head></html>`,
+    );
+    // An abruptly closed empty comment ends at once rather than swallowing the document.
+    expect(prepareHtmlPreviewDoc("<!--><html><head></head></html>")).toBe(
+      `<!--><html><head>${HEAD}</head></html>`,
+    );
+    expect(prepareHtmlPreviewDoc("<!---><html><head></head></html>")).toBe(
+      `<!---><html><head>${HEAD}</head></html>`,
+    );
+    // A hyphen continues a tag name, so this is script text, not an end tag.
+    const fake = "<script>const sample = '</script-not-real><html><head>';</script><p>hi</p>";
+    expect(prepareHtmlPreviewDoc(fake)).toBe(`${HEAD}${fake}`);
+    const quoted = "<script data-x=\"a>b\">var t = '<head>';</script><p>hi</p>";
+    expect(prepareHtmlPreviewDoc(quoted)).toBe(`${HEAD}${quoted}`);
+    expect(prepareHtmlPreviewDoc('<html><head data-x="a>b"></head></html>')).toBe(
+      `<html><head data-x="a>b">${HEAD}</head></html>`,
+    );
+  });
+
+  it("scans unterminated and repeated incomplete tags in linear time", () => {
+    // An incomplete tag must not cause excessive backtracking, nor be rescanned once the
+    // scan has moved past it; each case stays near-instant when progress is linear.
+    const cases = [
+      `<p>ok</p><script ${'"'.repeat(36)}`,
+      '<script "'.repeat(8000),
+      "<head '".repeat(8000),
+      `<script>${"</script ".repeat(8000)}`,
+      `<p>ok</p>${"<script a>".repeat(8000)}`,
+    ];
+    for (const hostile of cases) {
+      const started = performance.now();
+      expect(prepareHtmlPreviewDoc(hostile)).toBe(`${HEAD}${hostile}`);
+      expect(performance.now() - started).toBeLessThan(500);
+    }
+  });
+
+  it("does not treat a start tag still open at end of input as the head", () => {
+    // The parser drops such a tag, so markup placed after it would vanish; the <html>
+    // fallback supplies a real head instead, and a bare open tag gets the prepend.
+    expect(prepareHtmlPreviewDoc('<html><head data-x="a>b')).toBe(
+      `<html><head>${HEAD}</head><head data-x="a>b`,
+    );
+    expect(prepareHtmlPreviewDoc("<head ")).toBe(`${HEAD}<head `);
+  });
+
+  it("keeps scanning through a double-escaped </script> inside an artifact script", () => {
+    // After `<!--<script`, the tokenizer is double-escaped: `</script>` only steps back to the
+    // escaped state, so the element (and its `<head>` literal) runs on to the later `</script>`.
+    const script = "<script><!--<script></script><head>-->\nwindow.artifactRan = 1;\n</script>";
+    const rest = '\n<p id="after">ok</p>';
+    expect(prepareHtmlPreviewDoc(`${script}${rest}`)).toBe(`${HEAD}${script}${rest}`);
+    // `-->` leaves the escaped states, so the next `</script>` closes the element for real.
+    const closed = "<script><!--<script>--></script><html><head></head></html>";
+    expect(prepareHtmlPreviewDoc(closed)).toBe(
+      `<script><!--<script>--></script><html><head>${HEAD}</head></html>`,
+    );
+    // In the escaped state alone, `</script>` still closes the element.
+    const escapedOnly = "<script><!--</script><html><head></head></html>";
+    expect(prepareHtmlPreviewDoc(escapedOnly)).toBe(
+      `<script><!--</script><html><head>${HEAD}</head></html>`,
+    );
+  });
+
+  it("treats a quote as an attribute value delimiter only after =, like the tokenizer", () => {
+    // `"a` is an attribute name here, so the tag ends at the first `>` and the markup lands
+    // where the parser's head begins.
+    expect(prepareHtmlPreviewDoc('<html><head "a>b"></head></html>')).toBe(
+      `<html><head "a>${HEAD}b"></head></html>`,
+    );
+    // Inside an unquoted value, `=` and quotes are plain text too: the tag ends at the first `>`,
+    // so the markup stays out of the artifact's script.
+    const unquoted = '<head data=x="y><script>window.before="foo>";window.after=1;</script>';
+    expect(prepareHtmlPreviewDoc(unquoted)).toBe(
+      `<head data=x="y>${HEAD}<script>window.before="foo>";window.after=1;</script>`,
+    );
+  });
+
+  it("treats an unterminated <script> or comment as swallowing the rest of the document", () => {
+    const script = "<script>var t = '<head>';";
+    expect(prepareHtmlPreviewDoc(`${script}<html><head></head></html>`)).toBe(
+      `${HEAD}${script}<html><head></head></html>`,
+    );
+    expect(prepareHtmlPreviewDoc("<!-- <head><html>")).toBe(`${HEAD}<!-- <head><html>`);
+  });
+
+  it("does not mistake <header> for <head>", () => {
+    const out = prepareHtmlPreviewDoc("<header>Title</header><p>hi</p>");
+    expect(out).toBe(`${HEAD}<header>Title</header><p>hi</p>`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Same-page anchor script — the in-frame click handler prepareHtmlPreviewDoc injects
+// ---------------------------------------------------------------------------
+
+describe("prepareHtmlPreviewDoc same-page anchor script", () => {
+  const SCRIPT_BODY = HTML_PREVIEW_HEAD.slice(
+    HTML_PREVIEW_HEAD.indexOf("<script>") + "<script>".length,
+    HTML_PREVIEW_HEAD.lastIndexOf("</script>"),
+  );
+
+  /** The capture-phase window listeners the script registers; removed again in afterAll. */
+  let registered: [string, EventListener][] = [];
+
+  beforeAll(() => {
+    expect(SCRIPT_BODY).not.toBe("");
+    const register = vi.spyOn(window, "addEventListener");
+    // The handler body is a compile-time constant, so the Function constructor is safe here;
+    // vitest's jsdom does not execute inserted <script> elements.
+    new Function(SCRIPT_BODY)();
+    registered = register.mock.calls
+      .filter(([type, , options]) => (type === "click" || type === "auxclick") && options === true)
+      .map(([type, listener]) => [type, listener as EventListener]);
+    register.mockRestore();
+    expect(registered.map(([type]) => type)).toEqual(["click", "auxclick"]);
+  });
+
+  afterAll(() => {
+    for (const [type, listener] of registered) window.removeEventListener(type, listener, true);
+    document.head.innerHTML = "";
+  });
+
+  beforeEach(() => {
+    // Drop the previous test's base before touching history, which resolves against it.
+    document.head.innerHTML = "";
+    history.replaceState(null, "", "/preview");
+    // Like a srcdoc frame, whose base URL is its embedder's: a bare "#x" resolves to another
+    // document, so only the handler navigating this document keeps the click on the page.
+    document.head.innerHTML = '<base target="_blank"><base href="https://host.example/app/">';
+    document.body.innerHTML = "";
+  });
+
+  /** What the injected handler did with an activation. */
+  type Outcome = "handled" | "prevented" | "untouched";
+
+  /** Let jsdom's asynchronous navigation and the handler's cleanup task run. */
+  const settle = () =>
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+
+  /** Rough stand-in for URL parsing's whitespace handling, enough to tell fragment links apart. */
+  const isFragment = (href: string | null): boolean =>
+    Array.from(href ?? "")
+      .filter((c) => c > " ")
+      .join("")
+      .startsWith("#");
+
+  /**
+   * Dispatch an activation on `target` and report what the handler did. A probe registered
+   * before the dispatch runs after every artifact-style listener but before the handler's
+   * finisher, which joins window's list during the dispatch: it records whether the page had
+   * already cancelled, and cancels non-fragment links itself so jsdom never attempts a real
+   * navigation. "handled" means the finisher cancelled the click and navigated the document.
+   */
+  async function click(
+    target: string | Element,
+    init: MouseEventInit = {},
+    type = "click",
+  ): Promise<Outcome> {
+    let beforeFinish = false;
+    let probeCancelled = false;
+    window.addEventListener(
+      type,
+      (event) => {
+        beforeFinish = event.defaultPrevented;
+        const anchor = event
+          .composedPath()
+          .find((node) => node instanceof Element && node.matches("a[href],area[href]"));
+        if (
+          !beforeFinish &&
+          !isFragment((anchor as Element | undefined)?.getAttribute("href") ?? null)
+        ) {
+          event.preventDefault();
+          probeCancelled = true;
+        }
+      },
+      { once: true },
+    );
+    const element = typeof target === "string" ? document.querySelector(target) : target;
+    expect(element).not.toBeNull();
+    const event = new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      ...init,
+    });
+    element?.dispatchEvent(event);
+    await settle();
+    if (beforeFinish) return "prevented";
+    if (probeCancelled || !event.defaultPrevented) return "untouched";
+    return "handled";
+  }
+
+  it("keeps a fragment-only link in the frame by navigating this document", async () => {
+    document.body.innerHTML = '<a id="link" href="#section-3">Jump</a><h2 id="section-3">S3</h2>';
+    expect(await click("#link")).toBe("handled");
+    expect(location.hash).toBe("#section-3");
+    expect(location.pathname).toBe("/preview");
+    // Nothing in the artifact is modified on the way; the injected base is untouched.
+    expect(document.querySelector("base")?.hasAttribute("href")).toBe(false);
+  });
+
+  it("keeps modifier clicks in the frame too (a new tab could only show a blank page)", async () => {
+    document.body.innerHTML = '<a id="a" href="#one">1</a><a id="b" href="#two">2</a>';
+    expect(await click("#a", { ctrlKey: true })).toBe("handled");
+    expect(location.hash).toBe("#one");
+    expect(await click("#b", { metaKey: true, shiftKey: true })).toBe("handled");
+    expect(location.hash).toBe("#two");
+  });
+
+  it("handles middle clicks (auxclick) the same way and leaves right clicks alone", async () => {
+    document.body.innerHTML = '<a id="link" href="#mid">m</a>';
+    expect(await click("#link", { button: 2 }, "auxclick")).toBe("untouched");
+    expect(location.hash).toBe("");
+    expect(await click("#link", { button: 1 }, "auxclick")).toBe("handled");
+    expect(location.hash).toBe("#mid");
+  });
+
+  it("keeps a link with its own target in the frame", async () => {
+    document.body.innerHTML = '<a id="blank" href="#x" target="_blank">x</a>';
+    expect(await click("#blank")).toBe("handled");
+    expect(location.hash).toBe("#x");
+  });
+
+  it("finds links inside an open shadow root through composedPath", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = host.attachShadow({ mode: "open" });
+    root.innerHTML = '<a href="#shadow">s</a>';
+    const link = root.querySelector("a");
+    expect(link).not.toBeNull();
+    expect(await click(link as Element)).toBe("handled");
+    expect(location.hash).toBe("#shadow");
+    // A light-DOM anchor wrapping a shadow host is found along the composed path too.
+    document.body.innerHTML = '<a href="#wrap"><span id="wrapped"></span></a>';
+    const inner = (document.getElementById("wrapped") as HTMLElement).attachShadow({
+      mode: "open",
+    });
+    inner.innerHTML = "<b>inside</b>";
+    expect(await click(inner.querySelector("b") as Element)).toBe("handled");
+    expect(location.hash).toBe("#wrap");
+  });
+
+  it("handles clicks on elements nested in the anchor and on <area> hotspots", async () => {
+    document.body.innerHTML =
+      '<a href="#a"><span id="inner">in</span></a><map><area id="hot" href="#b" shape="default"></map>';
+    expect(await click("#inner")).toBe("handled");
+    expect(location.hash).toBe("#a");
+    expect(await click("#hot")).toBe("handled");
+    expect(location.hash).toBe("#b");
+  });
+
+  it("lets a document-level handler the page registers later cancel the click first", async () => {
+    document.body.innerHTML = '<a id="route" href="#settings">settings</a>';
+    const router = (event: Event) => event.preventDefault();
+    document.addEventListener("click", router);
+    try {
+      expect(await click("#route")).toBe("prevented");
+      expect(location.hash).toBe("");
+    } finally {
+      document.removeEventListener("click", router);
+    }
+  });
+
+  it("runs after listeners the page registers later on window, so they still cancel or route", async () => {
+    // The finisher joins window's bubble list during the dispatch and therefore runs last. Until
+    // then the event and the document are untouched: `defaultPrevented` is false, relative URLs
+    // still resolve against the artifact's own base, and every way of cancelling counts.
+    document.body.innerHTML = '<a id="route" href="#settings">settings</a>';
+    async function cancelsVia(router: EventListener): Promise<void> {
+      window.addEventListener("click", router);
+      try {
+        expect(await click("#route")).toBe("prevented");
+        expect(location.hash).toBe("");
+      } finally {
+        window.removeEventListener("click", router);
+      }
+    }
+    await cancelsVia((event) => event.preventDefault());
+    await cancelsVia((event) => {
+      event.returnValue = false;
+    });
+    let routed = 0;
+    await cancelsVia((event) => {
+      if (event.defaultPrevented) return;
+      routed++;
+      event.preventDefault();
+    });
+    expect(routed).toBe(1);
+    let resolved = "";
+    await cancelsVia((event) => {
+      resolved = new URL("child.js", document.baseURI).href;
+      event.preventDefault();
+    });
+    expect(resolved).toBe("https://host.example/app/child.js");
+    // `window.onclick = () => false` cancels through the browser's own handler machinery; vitest's
+    // `window` global does not forward that accessor to jsdom, so the Playwright scenario in
+    // tests/e2e_ui/files/test_html_preview.py covers it in a real browser.
+  });
+
+  it("leaves clicks the page handled itself and non-fragment links alone", async () => {
+    document.body.innerHTML =
+      '<a id="own" href="#section-3">own</a><a id="ext" href="https://example.com/x">ext</a>' +
+      '<a id="rel" href="other.html#frag">rel</a><a id="nbsp" href="&#160;#frag">nb</a>' +
+      '<h2 id="section-3">S3</h2>';
+    document.getElementById("own")?.addEventListener("click", (event) => event.preventDefault());
+    expect(await click("#own")).toBe("prevented");
+    expect(location.hash).toBe("");
+    expect(await click("#ext")).toBe("untouched");
+    expect(await click("#rel")).toBe("untouched");
+    // A non-breaking space survives URL parsing, so this is a relative path, not a fragment.
+    expect(await click("#nbsp")).toBe("untouched");
+    expect(location.hash).toBe("");
+  });
+
+  it("drops only the ASCII whitespace URL parsing drops before classifying the href", async () => {
+    // Tab and newline go anywhere; spaces and other C0 controls only at the ends.
+    document.body.innerHTML =
+      '<a id="spaced-link" href=" \t#spa\nced ">s</a><h2 id="spaced">S</h2>';
+    expect(await click("#spaced-link")).toBe("handled");
+    expect(location.hash).toBe("#spaced");
   });
 });
 

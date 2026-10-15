@@ -50,7 +50,6 @@ import asyncio
 import contextlib
 import errno
 import hashlib
-import io
 import json
 import logging
 import os
@@ -59,7 +58,6 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import traceback
@@ -69,6 +67,8 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
+
+from tests._helpers.session import bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -114,12 +114,7 @@ def _build_minimal_agent_bundle() -> bytes:
             },
         }
     ).encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(config)
-        tf.addfile(info, io.BytesIO(config))
-    return buf.getvalue()
+    return bundle_files({"config.yaml": config})
 
 
 def _make_wal_store(path: Path, rows: list[tuple[str, object]]) -> sqlite3.Connection:
@@ -297,11 +292,7 @@ def emfile_session_id(emfile_server: str) -> str:
     """Create a real session on the test server and return its id."""
     bundle = _build_minimal_agent_bundle()
     with httpx.Client(base_url=emfile_server, timeout=30.0) as client:
-        resp = client.post(
-            "/v1/sessions",
-            data={"metadata": json.dumps({})},
-            files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        )
+        resp = post_session_bundle(client.post, "/v1/sessions", bundle)
     assert resp.status_code in (200, 201), (
         f"Session create failed {resp.status_code}: {resp.text[:400]}"
     )

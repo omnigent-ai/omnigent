@@ -55,9 +55,10 @@ and fall back rather than assuming a fixed structure:
 2. Only when the artifact checkpoint is absent or invalid, inspect `run.log` from
    the downloaded bundle, then fall back to `gh run view <ci_link> --log`. The
    final repro message is echoed in the job log **untruncated**, so its last
-   ```json block can recover the handoff. The log may also carry the complete
-   verbatim source of the reproduction test as a path-labelled code block; use that only
-   when the artifact's `files/` tree did not preserve the test.
+   ```json block can recover the handoff. New reports cite test files rather
+   than embedding their source. Older logs may carry complete, path-labelled
+   source blocks; use those only when the artifact's `files/` tree did not
+   preserve the test. A path or hash alone cannot recover a missing file.
 
    **This run's handoff is authoritative.** The `ci_link` you were given names
    exactly one repro run, and its `bug_url` is the bug you resolve — no other.

@@ -24,7 +24,6 @@ same harness as ``test_sidebar_ownership_gating.py``.
 
 from __future__ import annotations
 
-import json
 import uuid
 from collections.abc import Iterator
 
@@ -32,12 +31,13 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
+from tests._helpers.browser import user_page
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
+    create_user_session,
     spawn_multi_user_server,
 )
-from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 # Edit access (2): enough to share a session with a non-owner. Mirrors
 # LEVEL_EDIT in omnigent/server/auth.py.
@@ -63,24 +63,10 @@ def multi_user_server(
 
 
 def _create_session(server: MultiUserServer, *, owner_email: str, title: str) -> str:
-    """Create a session owned by *owner_email* and give it a unique *title*.
-
-    A multi-user header-auth server 401s headerless writes, so both the create
-    and the title PATCH carry the owner's ``X-Forwarded-Email``. The title makes
-    the row easy to spot among other tests' sessions on the shared server.
-    """
-    headers = {"X-Forwarded-Email": owner_email}
-    create = httpx.post(
-        f"{server.base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-        headers=headers,
-        timeout=30.0,
+    """Seed a titled session owned by the explicit header identity."""
+    return create_user_session(
+        server.base_url, headers={"X-Forwarded-Email": owner_email}, metadata={"title": title}
     )
-    create.raise_for_status()
-    session_id = create.json()["session_id"]
-    _patch(server, session_id, owner_email, {"title": title})
-    return session_id
 
 
 def _patch(server: MultiUserServer, session_id: str, actor_email: str, body: dict) -> None:
@@ -166,9 +152,7 @@ def test_pinned_section_ignores_the_session_filter(
     shared = _create_session(server, owner_email=ADMIN_EMAIL, title=f"e2e-pin-shared-{uniq}")
     _grant(server, shared, viewer_email, _LEVEL_EDIT)
 
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{owned}")
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
 
@@ -197,8 +181,6 @@ def test_pinned_section_ignores_the_session_filter(
         _set_filter(page, "archived")
         _pinned_has(page, owned)
         _pinned_has(page, shared)
-    finally:
-        ctx.close()
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
@@ -224,9 +206,7 @@ def test_projects_section_ignores_the_session_filter(
     filed = _create_session(server, owner_email=viewer_email, title=f"e2e-proj-filed-{uniq}")
     _patch(server, filed, viewer_email, {"labels": {_PROJECT_LABEL_KEY: project}})
 
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{filed}")
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
 
@@ -247,8 +227,6 @@ def test_projects_section_ignores_the_session_filter(
         _set_filter(page, "archived")
         expect(page.get_by_role("button", name="Projects", exact=True)).to_be_visible()
         expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
-    finally:
-        ctx.close()
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
@@ -278,9 +256,7 @@ def test_shared_session_stays_in_flat_list_on_project_name_collision(
     _patch(server, shared, ADMIN_EMAIL, {"labels": {_PROJECT_LABEL_KEY: project}})
     _grant(server, shared, viewer_email, _LEVEL_EDIT)
 
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{owned}")
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
         # The shared row is hidden under the default "My sessions"; switch to
@@ -292,5 +268,3 @@ def test_shared_session_stays_in_flat_list_on_project_name_collision(
         expect(page.get_by_role("button", name=project, exact=True)).to_be_visible(timeout=30_000)
         expect(_section(page, "Sessions").locator(f'a[href="/c/{shared}"]')).to_be_visible()
         expect(_row(page, shared)).to_be_visible()
-    finally:
-        ctx.close()

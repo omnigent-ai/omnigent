@@ -69,7 +69,8 @@ async def test_reposted_item_with_source_id_persists_once(
     session_id = await _create_session(client, "idem-repost")
     first = await _post_item(client, session_id, text="hello once", source_id="rec-1:0:message")
     second = await _post_item(client, session_id, text="hello once", source_id="rec-1:0:message")
-    assert first["item_id"] == second["item_id"]
+    third = await _post_item(client, session_id, text="hello once", source_id="rec-1:0:message")
+    assert first["item_id"] == second["item_id"] == third["item_id"]
     assert await _message_texts(client, session_id) == ["hello once"]
 
 

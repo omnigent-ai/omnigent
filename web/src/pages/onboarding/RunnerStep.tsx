@@ -4,14 +4,11 @@
 
 import { useState } from "react";
 import { Cloud, Laptop } from "lucide-react";
+import { Card } from "@/components/ui/card";
+import { cn } from "@/lib/utils";
+import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
+  ConnectStatus,
   InstallActionButton,
   OnboardingBackButton,
   OnboardingHeading,
@@ -24,6 +21,8 @@ export function RunnerStep({
   remoteAvailable,
   installed,
   error,
+  connection = null,
+  onCancelConnect,
   onBack,
   onInstall,
 }: {
@@ -33,6 +32,9 @@ export function RunnerStep({
   installed?: boolean;
   /** A connect error to show above the actions. */
   error?: string;
+  /** Progress of an in-flight direct connect (null when idle). */
+  connection?: ConnectProgress | null;
+  onCancelConnect?: () => void;
   onBack: () => void;
   onInstall: (runner: Runner) => void;
 }) {
@@ -42,29 +44,57 @@ export function RunnerStep({
     <div className="flex h-full flex-col px-2 pb-1 pt-3">
       <OnboardingHeading>Where do you work today?</OnboardingHeading>
 
-      <Select value={runner} onValueChange={(v) => setRunner(v as Runner)}>
-        <SelectTrigger aria-label="Runner" className="w-full">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {remoteAvailable && (
-            <SelectItem value="remote">
+      {remoteAvailable && (
+        <label htmlFor="runner-remote">
+          <Card
+            className={cn(
+              "cursor-pointer flex-row pl-4 border-transparent items-center",
+              runner === "remote" ? "shadow-sm" : "shadow-none",
+            )}
+          >
+            <input
+              id="runner-remote"
+              type="radio"
+              name="runner"
+              checked={runner === "remote"}
+              onChange={() => setRunner("remote")}
+              className="size-[13px] shrink-0 appearance-none rounded-full border border-foreground text-foreground checked:bg-[radial-gradient(circle_at_center,currentColor_0_3px,transparent_3.5px)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            />
+            <span className="flex items-center justify-center gap-1">
               <Cloud className="size-4" aria-hidden />
               Arca
-            </SelectItem>
-          )}
-          <SelectItem value="local">
-            <Laptop className="size-4" aria-hidden />
-            My laptop
-          </SelectItem>
-        </SelectContent>
-      </Select>
-      {runner === "local" && (
-        // Onboarding connects this laptop without the host-enrollment prompt, so say what it grants.
-        <p className="mt-2 text-center text-sm text-muted-foreground">
-          The server will be able to run agents on this laptop.
-        </p>
+            </span>
+          </Card>
+        </label>
       )}
+      <div className="mt-2" />
+      <label htmlFor="runner-local">
+        <Card
+          className={cn(
+            "cursor-pointer flex-row pl-4 items-center",
+            runner === "local" ? "shadow-sm" : "shadow-none",
+          )}
+        >
+          <input
+            id="runner-local"
+            type="radio"
+            name="runner"
+            checked={runner === "local"}
+            onChange={() => setRunner("local")}
+            className="size-[13px] shrink-0 appearance-none rounded-full border border-foreground text-foreground checked:bg-[radial-gradient(circle_at_center,currentColor_0_3px,transparent_3.5px)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+          />
+          <div className="flex flex-col">
+            <span className="flex items-center justify-start gap-1">
+              <Laptop className="size-4" aria-hidden />
+              My laptop
+            </span>
+
+            <span className="text-center text-sm text-muted-foreground">
+              The server will be able to run agents on this laptop.
+            </span>
+          </div>
+        </Card>
+      </label>
 
       <p className="mx-auto mt-4 max-w-sm flex-1 text-center text-base text-muted-foreground">
         Automatically carry over your existing setup. Share sessions with your teammates. Use from
@@ -78,9 +108,15 @@ export function RunnerStep({
         </div>
       )}
 
+      <ConnectStatus connection={connection} onCancel={onCancelConnect} />
+
       <OnboardingRail>
-        <OnboardingBackButton onClick={onBack} />
-        <InstallActionButton installed={installed} onClick={() => onInstall(runner)} />
+        <OnboardingBackButton onClick={onBack} disabled={connection !== null} />
+        <InstallActionButton
+          installed={installed}
+          loading={connection !== null}
+          onClick={() => onInstall(runner)}
+        />
       </OnboardingRail>
     </div>
   );

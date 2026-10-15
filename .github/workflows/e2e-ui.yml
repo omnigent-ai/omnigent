@@ -316,12 +316,12 @@ jobs:
       # native render-parity tests boot a real Claude Code / Codex CLI. The
       # rest of the e2e-ui suite (openai-agents) ignores them.
       - name: Install Claude Code CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@4f403d71435055cf820984e829cb630cbc73da53
         with:
           harness: claude
 
       - name: Install Codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@4f403d71435055cf820984e829cb630cbc73da53
         with:
           harness: codex
 
@@ -404,6 +404,8 @@ jobs:
           path: |
             test-results/
             playwright-report/
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/trace.zip
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/*.png
           retention-days: 3
           if-no-files-found: ignore
 
@@ -443,6 +445,9 @@ jobs:
             /tmp/pytest-of-runner/**/e2e_ui_mocked_codex_server*/runner.log
             /tmp/pytest-of-runner/**/test_antigravity_survives_prob*/server.log
             /tmp/pytest-of-runner/**/test_antigravity_survives_prob*/runner.log
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/*.log
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/network.json
+            /tmp/pytest-of-runner/**/test_managed_first_message_reb*/first-response.json
             /tmp/omnigent-*/claude-native/**
             /tmp/claude-home-dump/**
             /tmp/codex-home-dump/**

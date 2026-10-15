@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
@@ -273,9 +275,40 @@ describe("ErrorBanner", () => {
     ["databricks_sign_in_pending", "The agent is waiting for a Databricks sign-in."],
     ["agent_startup_pending", "The agent is still starting in the session terminal."],
     ["codex_thread_not_started", "Codex stopped before it could start, so this turn never ran."],
+    [
+      "transient_upstream_error",
+      "The model service hit a temporary error mid-response; retrying usually continues the turn.",
+    ],
+    [
+      "client_update_required",
+      "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+    ],
   ])("describes a %s failure in plain English", (code, sentence) => {
     render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
     expect(screen.getByText(sentence)).toBeInTheDocument();
+  });
+
+  it("names both versions and the update command on a client_update_required card", () => {
+    render(
+      <ErrorBanner
+        message={`API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; version 2.1.280 or newer is required."}`}
+        source="execution"
+        code="client_update_required"
+        title="Claude Code needs an update"
+        cause="Claude Code 2.1.217 on the host doesn't support this model; version 2.1.280 or newer is required."
+        remediation="Run `claude update` on the host, then start a new session."
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Claude Code needs an update")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Claude Code needs an update/i }));
+    const content = screen.getByTestId("error-message-content");
+    expect(content).toHaveTextContent("Claude Code 2.1.217 on the host");
+    expect(content).toHaveTextContent("version 2.1.280 or newer is required");
+    expect(content).toHaveTextContent("Try this: Run `claude update` on the host");
+    // The running CLI keeps its old version, so neither turn retry nor resume applies.
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
   });
 
   const SIGN_IN_REMEDIATION =
@@ -690,6 +723,26 @@ describe("ErrorBanner", () => {
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
+  it("offers turn retry for a transient upstream failure", async () => {
+    const onRetry = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ErrorBanner
+        message="API Error: Server error mid-response. The response above may be incomplete."
+        source="llm"
+        code="transient_upstream_error"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The model service hit a temporary error mid-response; retrying usually continues the turn.",
+    );
+    // Turn retry, not a runner resume — the session itself is healthy.
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(onRetry).toHaveBeenCalledTimes(1));
+  });
+
   it.each(["native_turn_error", "codex_turn_error", "codex_reauth_required", "unauthorized"])(
     "does not infer rate-limit retry from the message for code %s",
     (code) => {
@@ -706,9 +759,29 @@ describe("ErrorBanner", () => {
       render(
         <ErrorBanner message="The turn failed." source="execution" code={code} onRetry={vi.fn()} />,
       );
-      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
     },
   );
+
+  it("offers Retry (not Resume session) for a connection_error", async () => {
+    const onRetry = vi.fn(async () => {});
+    render(
+      <ErrorBanner
+        itemId="conn-err-1"
+        message="peer closed connection without sending complete message body (incomplete chunked read)"
+        source="harness"
+        code="connection_error"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    const retryButton = screen.getByRole("button", { name: "Retry" });
+    fireEvent.click(retryButton);
+    await waitFor(() =>
+      expect(onRetry).toHaveBeenCalledWith(expect.objectContaining({ code: "connection_error" })),
+    );
+  });
 
   it("suppresses the runner's unavailable last-output diagnostics tab", () => {
     render(
@@ -747,6 +820,124 @@ describe("ErrorBanner", () => {
     );
     expect(screen.getByTestId("error-diagnostics-content")).toHaveTextContent("pid: 99");
   });
+});
+
+describe("missing workspace recovery", () => {
+  beforeEach(() => useChatStore.setState({ conversationId: "conv_parent" }));
+  afterEach(() => useChatStore.setState({ conversationId: null }));
+
+  it.each([null, "conv_side_chat"])("continues the displayed conversation (%s)", (scope) => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ConversationScopeContext.Provider value={scope}>
+          <ErrorBanner
+            message="workspace path does not exist: /missing"
+            source="execution"
+            code="workspace_missing"
+          />
+        </ConversationScopeContext.Provider>
+      </ForkDialogContextProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({
+      sourceSessionId: scope ?? "conv_parent",
+      workspaceRecovery: true,
+    });
+    expect(screen.queryByText("Message")).not.toBeInTheDocument();
+    expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+  });
+
+  it("offers directory recovery for grouped workspace errors instead of retrying the missing path", () => {
+    const onRetry = vi.fn();
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ErrorBanner
+          message="The runner disconnected"
+          source="execution"
+          code="runner_disconnected"
+          onRetry={onRetry}
+          relatedErrors={[
+            {
+              itemId: "workspace-error",
+              code: "workspace_missing",
+              source: "execution",
+              message: "Missing directory",
+            },
+          ]}
+        />
+      </ForkDialogContextProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Resume session" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
+    expect(openForkDialog).toHaveBeenCalledOnce();
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { canFork: false, code: "workspace_missing" },
+    { canFork: true, code: "runner_error" },
+  ])("does not offer directory recovery for $code with canFork=$canFork", ({ canFork, code }) => {
+    render(
+      <ForkDialogContextProvider value={{ canFork, openForkDialog: vi.fn() }}>
+        <ErrorBanner message="Error details" source="execution" code={code} />
+      </ForkDialogContextProvider>,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Continue in another directory…" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the action disabled when forking is unavailable", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider
+        value={{
+          currentSessionId: "conv_parent",
+          canFork: true,
+          disabledReason: "Forking is unavailable",
+          openForkDialog,
+        }}
+      >
+        <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+      </ForkDialogContextProvider>,
+    );
+    const button = screen.getByRole("button", { name: "Continue in another directory…" });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(openForkDialog).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "lets a scoped child resolve its capabilities independently of root canFork=%s",
+    (canFork) => {
+      const openForkDialog = vi.fn();
+      render(
+        <ForkDialogContextProvider
+          value={{
+            currentSessionId: "conv_parent",
+            canFork,
+            disabledReason: "Forking this sandbox session is not supported yet.",
+            openForkDialog,
+          }}
+        >
+          <ConversationScopeContext.Provider value="conv_side_chat">
+            <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+          </ConversationScopeContext.Provider>
+        </ForkDialogContextProvider>,
+      );
+
+      const button = screen.getByRole("button", { name: "Continue in another directory…" });
+      expect(button).toBeEnabled();
+      fireEvent.click(button);
+      expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({
+        sourceSessionId: "conv_side_chat",
+        workspaceRecovery: true,
+      });
+    },
+  );
 });
 
 describe("RoutingDecisionCard — session-level auto-routing", () => {
@@ -989,9 +1180,9 @@ describe("routing decision — harness / scope / raw pick", () => {
   // Only an AI-Gateway-routed decision is marked: the built-in judge is the
   // plain case, and a legacy row predates the field entirely.
   const AIGW_MARK = "routing-decision-source-databricks";
-  const AIGW_NAME = "Routed by the Databricks AI Gateway";
+  const AIGW_NAME = "Routed by the Databricks Unity Gateway";
 
-  it("card: marks a decision the Databricks AI Gateway answered", () => {
+  it("card: marks a decision the Databricks Unity Gateway answered", () => {
     render(
       <RoutingDecisionCard
         model="databricks-claude-sonnet-5"

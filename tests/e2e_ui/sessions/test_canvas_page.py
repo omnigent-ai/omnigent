@@ -9,10 +9,11 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import Page, Route, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 
-def _stub_server_info(page: Page, *, canvas: bool) -> None:
+def _stub_server_info(page: Page, *, canvas: bool, usage: bool = False) -> None:
     """Advertise one deterministic ``canvas`` release-feature value."""
     body = json.dumps(
         {
@@ -20,7 +21,7 @@ def _stub_server_info(page: Page, *, canvas: bool) -> None:
             "single_user": True,
             "login_url": None,
             "needs_setup": False,
-            "features": {"canvas": canvas, "usage_page": False, "harness_install": False},
+            "features": {"canvas": canvas, "usage_page": usage, "harness_install": False},
             "harness_install_enabled": False,
             "installable_harnesses": [],
         }
@@ -75,6 +76,10 @@ def test_canvas_page_is_absent_while_the_feature_is_off(page: Page, live_server:
 
     expect(page.get_by_role("heading", name="Page not found")).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("canvas-nav")).to_have_count(0)
+
+    page.goto(f"{live_server}/canvas/c/any-session")
+    expect(page.get_by_role("heading", name="Page not found")).to_be_visible()
+    expect(page.get_by_test_id("canvas-workspace")).to_have_count(0)
 
 
 def test_canvas_page_groups_sessions_by_project_and_opens_them(
@@ -133,8 +138,10 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
     )
     expect(cards).to_have_count(1)
 
-    cards.dblclick()
-    expect(page).to_have_url(re.compile(r"/c/project-session$"))
+    cards.click()
+    expect(page).to_have_url(re.compile(r"/canvas/c/project-session\?canvas=project-release$"))
+    expect(page.get_by_role("region", name="Canvas pane", exact=True)).to_be_visible()
+    expect(page.get_by_role("tab", name="Release", exact=True)).to_be_visible()
 
 
 def test_canvas_page_remembers_a_dragged_card_across_reloads(
@@ -171,6 +178,7 @@ def test_canvas_page_remembers_a_dragged_card_across_reloads(
     page.mouse.down()
     page.mouse.move(before["x"] + 140, before["y"] + 300, steps=8)
     page.mouse.up()
+    expect(page).to_have_url(re.compile(r"/canvas$"))
     page.wait_for_function(
         f"() => JSON.stringify((({read_layout})() ?? {{}}).positions?.only) !== '[0,0]'"
     )
@@ -206,11 +214,8 @@ def test_canvas_page_remembers_a_dragged_card_across_reloads(
 
 def test_canvas_cards_follow_live_session_updates(page: Page, live_server: str) -> None:
     """A change pushed over the sessions stream reaches the card without a list re-fetch."""
-    create = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-        timeout=30.0,
+    create = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", _build_hello_world_bundle(), timeout=30.0
     )
     create.raise_for_status()
     session_id = create.json()["session_id"]

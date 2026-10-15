@@ -44,6 +44,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.messages import all_message_text as _extract_all_text
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import (
     create_runner_bound_session,
@@ -66,24 +67,6 @@ pytestmark = pytest.mark.skipif(
 # model's response, Pi genuinely surfaced them.
 _GREET_NAME = "pi-e2e-xyz-greet-c4a8d5"
 _COUNT_NAME = "pi-e2e-xyz-count-d2f6e1"
-
-
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """
-    Concatenate all message text blocks from a response body.
-
-    :param body: The terminal response body returned by
-        :func:`tests.e2e.conftest.poll_session_until_terminal`.
-    :returns: All assistant text joined by newlines.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
 
 
 def _enumerate_skills_with_retry(

@@ -5,13 +5,11 @@ const assert = require("node:assert/strict");
 const {
   DATABRICKS_INTERNAL_FEATURES_KEY,
   MAX_SERVER_URLS,
-  SERVER_NAMES_KEY,
   SERVER_URLS_KEY,
   excludingManagedServers,
   getDatabricksInternalFeaturesEnabled,
   getManagedServerNames,
   getManagedServerUrls,
-  parseManagedServerNames,
   parseManagedServerUrls,
 } = require("../src/managed_preferences");
 
@@ -132,54 +130,45 @@ describe("managed server preferences", () => {
     );
   });
 
-  it("reads display names for the managed servers from the serverNames dictionary", () => {
+  it("reads display names from an omnigentServerName query parameter", () => {
     const calls = [];
-    const names = getManagedServerNames({
-      platform: "darwin",
-      getUserDefault: (key, type) => {
-        calls.push([key, type]);
-        return key === SERVER_URLS_KEY ? ["team.example.com"] : { "team.example.com": " Team " };
-      },
+    const getUserDefault = (...args) => {
+      calls.push(args);
+      return [
+        "https://workspace.example.com/?o=123&omnigentServerName=%20Team%20A%20",
+        "https://other.example.com/ml?omnigentServerName=",
+        "plain.example.com",
+      ];
+    };
+    // The parameter never reaches the server URL.
+    assert.deepEqual(getManagedServerUrls({ platform: "darwin", getUserDefault }), [
+      "https://workspace.example.com/?o=123",
+      "https://other.example.com/ml",
+      "https://plain.example.com/",
+    ]);
+    assert.deepEqual(getManagedServerNames({ platform: "darwin", getUserDefault }), {
+      "https://workspace.example.com/?o=123": "Team A",
     });
     assert.deepEqual(calls, [
       [SERVER_URLS_KEY, "array"],
-      [SERVER_NAMES_KEY, "dictionary"],
+      [SERVER_URLS_KEY, "array"],
     ]);
-    // Keyed by the managed URL as the list normalizes it.
-    assert.deepEqual(names, { "https://team.example.com/": "Team" });
   });
 
-  it("keeps only names for listed servers, skipping bad entries", () => {
-    const urls = ["https://team.example.com/"];
-    assert.deepEqual(
-      parseManagedServerNames(
-        {
-          "https://team.example.com/": "Team",
-          "https://other.example.com/": "Other", // not a managed server
-          "not a url": "Nope",
-        },
-        urls,
-      ),
-      { "https://team.example.com/": "Team" },
-    );
-    assert.deepEqual(parseManagedServerNames({ "https://team.example.com/": "  " }, urls), {});
-    assert.deepEqual(parseManagedServerNames({ "https://team.example.com/": 42 }, urls), {});
-    assert.deepEqual(parseManagedServerNames(["Team"], urls), {});
-    assert.deepEqual(parseManagedServerNames(undefined, urls), {});
-  });
-
-  it("reads no names without managed servers, or when the read fails", () => {
-    assert.deepEqual(getManagedServerNames({ platform: "linux", getUserDefault: () => ({}) }), {});
+  it("names only the servers the list keeps", () => {
+    const getUserDefault = () => [
+      "https://team.example.com/",
+      "https://team.example.com/other?omnigentServerName=Dropped",
+    ];
+    assert.deepEqual(getManagedServerNames({ platform: "darwin", getUserDefault }), {});
     assert.deepEqual(
       getManagedServerNames({
         platform: "darwin",
-        getUserDefault: (key) => {
-          if (key === SERVER_URLS_KEY) return ["team.example.com"];
-          throw new Error("unreadable");
-        },
+        getUserDefault: () => ["https://team.example.com/?omnigentServerName=Team", "http://bad"],
       }),
       {},
     );
+    assert.deepEqual(getManagedServerNames({ platform: "linux", getUserDefault }), {});
   });
 
   it("filters recents already represented by a managed origin", () => {

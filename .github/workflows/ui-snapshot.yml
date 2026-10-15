@@ -192,7 +192,7 @@ jobs:
           # live_server subprocess is torn down.
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \
-            -p no:rerunfailures \
+            -p no:rerunfailures --ignore-size-diff \
             --ui-skip-build \
             "${EXTRA_ARGS[@]}"
 

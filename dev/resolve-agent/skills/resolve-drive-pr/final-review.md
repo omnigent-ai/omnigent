@@ -1,16 +1,26 @@
 ### 4.5 — Submit the final review verdict, then tag the maintainer
 
 When the branch is **mergeable** (4.2 — re-check `mergeable` now; `main` may have
-moved again since your last push), CI is green (4.2), **and** the automated review
-is clean (4.3), you're done iterating — now record your verdict and hand off to a
-human. A `CONFLICTING`/`DIRTY` branch is **not** `fixed`: rebase and resolve
-(4.2) before you submit a verdict, or, if you truly can't, downgrade the outcome
+moved again since your last push), CI is green (4.2), **and** both Polly and OCR
+reviews are complete with all findings settled for the current head (4.3), record
+your verdict and hand off to a human. A `CONFLICTING`/`DIRTY` branch is **not**
+`fixed`: rebase and resolve (4.2) before you submit a verdict, or, if you truly can't, downgrade the outcome
 and say the PR needs a conflict resolution the maintainer must do.
+
+**Gate: the live review receipt is current.** Run `review_cycle.py check` from
+Step 4.3 immediately before this verdict. If either reviewer is incomplete or
+feedback has changed, return to the review loop; do not approve or report ready.
 
 **Gate: the shared impact assessment covers the current candidate.** Confirm
 its base/head and tested contents still match, all required checks passed, and
 `uncovered_boundaries` is empty. Otherwise follow its blocked/partial verdict
 rules; do not approve or call the PR fully verified.
+
+Check the final test diff against the coverage selection in `test_audit` and the product
+checkout's `tests/_helpers/README.md` (or nearby fixtures if absent). Settle
+avoidable copied setup; use `test_audit` to explain a helper mismatch or distinct
+E2E boundary. Preserve necessary coverage and the original reproduction evidence;
+do not request a second test layer merely because the first is small.
 
 **Gate: the after-fix clip is present, or its absence is named — no silent skip.**
 Before you tag anyone, confirm the deliverable carries the before/after proof

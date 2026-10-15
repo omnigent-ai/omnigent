@@ -3,6 +3,7 @@ import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
@@ -57,6 +58,9 @@ const mobileMenu = {
   onOpenSubagents: () => {},
   githubPanelOpen: false,
   onOpenGithub: () => {},
+  sideChatsPanelOpen: false,
+  showSideChats: false,
+  onOpenSideChats: () => {},
   onOpenMainExecutionLog: () => {},
 };
 
@@ -73,16 +77,19 @@ function renderHeader(props: {
   wrapperLabel?: string | null;
   canShare?: boolean;
   canFork?: boolean;
+  forkDisabledReason?: string;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   hasHeaderMenu?: boolean;
   hasAgentInfo?: boolean;
   hasRailContent?: boolean;
+  rightPanelOpen?: boolean;
   showFilesPanel?: boolean;
   pending?: boolean;
   mobileMenu?: typeof mobileMenu;
   onOpenSidebar?: (peek?: boolean) => void;
   onFork?: () => void;
+  settingsMode?: boolean;
 }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -92,6 +99,7 @@ function renderHeader(props: {
           <ChatHeader
             sidebarOpen={props.sidebarOpen}
             onOpenSidebar={props.onOpenSidebar ?? (() => {})}
+            settingsMode={props.settingsMode}
             isChildSession={props.isChildSession ?? false}
             subAgentName={props.subAgentName ?? null}
             // Defaults to no active session: PresenceAvatars / AgentInfoButton /
@@ -106,6 +114,7 @@ function renderHeader(props: {
             wrapperLabel={props.wrapperLabel ?? null}
             canShare={props.canShare ?? false}
             canFork={props.canFork ?? false}
+            forkDisabledReason={props.forkDisabledReason}
             shareDisabled={props.shareDisabled}
             shareDisabledReason={props.shareDisabledReason}
             onShare={() => {}}
@@ -115,7 +124,7 @@ function renderHeader(props: {
             hasHeaderMenu={props.hasHeaderMenu ?? false}
             showFilesPanel={props.showFilesPanel ?? false}
             hasRailContent={props.hasRailContent ?? true}
-            rightPanelOpen={false}
+            rightPanelOpen={props.rightPanelOpen ?? false}
             onToggleRightPanel={() => {}}
             pending={props.pending}
             mobileMenu={props.mobileMenu ?? mobileMenu}
@@ -217,6 +226,35 @@ describe("ChatHeader — workspace pane alignment", () => {
   });
 });
 
+describe("ChatHeader — workspace pane shortcut", () => {
+  it.each([
+    { rightPanelOpen: false, label: "Expand right panel" },
+    { rightPanelOpen: true, label: "Collapse right panel" },
+  ])("shows the shortcut when the action is '$label'", ({ rightPanelOpen, label }) => {
+    vi.useFakeTimers();
+    try {
+      renderHeader({
+        sidebarOpen: true,
+        conversationId: "conv_workspace_shortcut",
+        rightPanelOpen,
+      });
+      const trigger = screen.getByRole("button", { name: label });
+
+      expect(trigger).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+]`);
+      fireEvent.focus(trigger);
+      act(() => vi.advanceTimersByTime(1000));
+
+      const tooltip = screen.getByRole("tooltip");
+      expect(tooltip).toHaveTextContent(label);
+      expect(
+        Array.from(tooltip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
+      ).toEqual([MOD_KEY, ALT_KEY, "]"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("ChatHeader — open-sidebar toggle visibility", () => {
   it("hides the toggle entirely when the sidebar is open", () => {
     renderHeader({ sidebarOpen: true });
@@ -230,7 +268,26 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
     // Closed: the toggle is the only sidebar affordance, so it must be
     // present. A regression here would hide the only way to reopen the
     // sidebar via pointer.
-    expect(screen.getByRole("button", { name: "Open sidebar" })).toBeInTheDocument();
+    const toggle = screen.getByRole("button", { name: "Open sidebar" });
+    expect(toggle).toBeInTheDocument();
+    expect(toggle.querySelector("svg")).toHaveClass("lucide-panel-left");
+  });
+
+  it("uses the menu icon for the mobile sidebar toggle", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({ sidebarOpen: false });
+
+    expect(screen.getByRole("button", { name: "Open sidebar" }).querySelector("svg")).toHaveClass(
+      "lucide-menu",
+    );
+  });
+
+  it("uses a back arrow and faded header surface for the mobile settings menu", () => {
+    const { container } = renderHeader({ sidebarOpen: false, settingsMode: true });
+
+    const button = screen.getByRole("button", { name: "Back to settings menu" });
+    expect(button.querySelector("svg")).toHaveClass("lucide-arrow-left");
+    expect(container.querySelector("header")).toHaveClass("settings-mobile-header");
   });
 
   it("cancels the pending peek as soon as the toggle is pressed", () => {
@@ -562,29 +619,26 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
 });
 
 describe("ChatHeader — floating mobile controls", () => {
-  it("gives the mobile control clusters the same glass surface", () => {
-    // The bar paints no background and chat scrolls under it, so each cluster
-    // needs its own blurred pill to stay legible over moving content.
+  it("keeps the mobile control clusters free of circular glass containers", () => {
     isMobileMock.mockReturnValue(true);
     renderHeader({ sidebarOpen: false, conversationId: "conv-1", canShare: true });
 
     const toggle = screen.getByRole("button", { name: "Open sidebar" });
     const cluster = screen.getByRole("button", { name: "Share session" }).parentElement;
     for (const surface of [toggle, cluster]) {
-      expect(surface).toHaveClass(
+      expect(surface).not.toHaveClass(
         "max-md:rounded-full",
         "max-md:bg-background/70",
+        "max-md:shadow-[0_6px_20px_-4px_rgb(0_0_0/0.18)]",
         "max-md:backdrop-blur-xl",
-        "max-md:backdrop-saturate-150",
       );
     }
-    // Nothing to show on the landing composer — the pill must not paint empty.
+    // Nothing to show on the landing composer, so the empty cluster stays hidden.
     expect(cluster).toHaveClass("max-md:empty:hidden");
   });
 
   it("keeps the two clusters the same size around a lone control", () => {
-    // The right pill read visibly larger than the left toggle while it padded
-    // its child; with no padding a lone size-10 kebab is the same 40px circle.
+    // Removing the visible containers must not shrink either touch target.
     isMobileMock.mockReturnValue(true);
     renderHeader({
       sidebarOpen: false,
@@ -627,9 +681,7 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(screen.getByTestId("view-mode-menu-terminal")).toBeInTheDocument();
   });
 
-  it("rounds the kebab's own background so no square shows inside the pill", () => {
-    // The ghost button paints `aria-expanded:bg-muted` at its rounded-lg
-    // radius, which showed as a square behind the round pill once open.
+  it("does not add a circular container to the mobile kebab", () => {
     isMobileMock.mockReturnValue(true);
     renderHeader({
       sidebarOpen: true,
@@ -638,10 +690,10 @@ describe("ChatHeader — floating mobile controls", () => {
       hasHeaderMenu: true,
     });
 
-    expect(screen.getByTestId("session-actions-menu")).toHaveClass("max-md:rounded-full");
+    expect(screen.getByTestId("session-actions-menu")).not.toHaveClass("max-md:rounded-full");
   });
 
-  it("gives the fallback menu the same glass as the controls", () => {
+  it("keeps the fallback menu legible over scrolling content", () => {
     isMobileMock.mockReturnValue(true);
     renderHeader({
       sidebarOpen: true,
@@ -811,6 +863,28 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(onFork).toHaveBeenCalledOnce();
   });
 
+  it.each([false, true])("disables the fallback Fork menu (mobile=%s)", (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    const onFork = vi.fn();
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      actionConversation: null,
+      canFork: true,
+      forkDisabledReason: "Forking this sandbox session is not supported yet.",
+      onFork,
+    });
+    fireEvent.pointerDown(
+      screen.getByTestId(mobile ? "session-actions-menu" : "desktop-fork-actions-menu"),
+      { button: 0 },
+    );
+    const fork = screen.getByRole("menuitem", { name: "Fork" });
+    expect(fork).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork, { key: "Enter" });
+    expect(onFork).not.toHaveBeenCalled();
+  });
+
   it("folds the workspace-rail entries into the one mobile kebab", () => {
     // Previously a second `PanelRight` trigger sat beside the kebab; the rail
     // entries now ride in the same menu, so a phone has a single trigger.
@@ -829,15 +903,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       button: 0,
     });
 
-    // Strip SVG <title> text (e.g. "Github" from GithubMono) before comparing —
-    // textContent includes it but it's invisible; the labels are what matters.
-    const svgTitleText = (el: Element) =>
-      [...el.querySelectorAll("title")].map((t) => t.textContent ?? "").join("");
-    expect(
-      screen
-        .getAllByRole("menuitem")
-        .map((item) => (item.textContent ?? "").replace(svgTitleText(item), "").trim()),
-    ).toEqual([
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Export",
       "Rename",
@@ -845,7 +911,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       "Add to project",
       "Files",
       "Changes",
-      "GitHub",
+      "Pull Requests",
       "Agents1",
       "Archive",
       "Delete",
@@ -870,6 +936,42 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Files" }));
     expect(onOpenFiles).toHaveBeenCalled();
+  });
+
+  it("opens the side-chats drawer from the kebab when the harness supports it", () => {
+    const onOpenSideChats = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      mobileMenu: { ...mobileMenu, showSideChats: true, onOpenSideChats },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
+    expect(onOpenSideChats).toHaveBeenCalled();
+  });
+
+  it("hides the side-chats entry for a harness without side chat", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      mobileMenu: { ...mobileMenu, showSideChats: false },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    expect(screen.queryByRole("menuitem", { name: "Side chats" })).toBeNull();
   });
 
   it("keeps the rail entries reachable when the session isn't owner-managed", () => {

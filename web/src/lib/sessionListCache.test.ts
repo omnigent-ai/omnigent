@@ -357,6 +357,12 @@ describe("filtersFromConversationQueryKey", () => {
     });
   });
 
+  it("accepts creation-order caches for live updates and optimistic mutations", () => {
+    expect(
+      filtersFromConversationQueryKey(["conversations", "", false, null, "mine", "created_at"]),
+    ).toEqual({ searchQuery: "", includeArchived: false, project: undefined, visibility: "mine" });
+  });
+
   it("rejects non-canonical conversation query keys", () => {
     expect(() => filtersFromConversationQueryKey(["conversations", ""])).toThrow(
       "Invalid conversations query key",

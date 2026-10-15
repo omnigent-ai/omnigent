@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import re
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 STORAGE_KEY = "omnigent:default-workspace-tab"
@@ -44,9 +44,9 @@ def test_default_workspace_tab_setting_opens_session_on_chosen_tab(
 @pytest.mark.parametrize(
     ("default_tab", "default_label", "tab_order"),
     [
-        ("changes", "Changes", ["Changes", "Files", "GitHub", "Agents"]),
-        ("github", "GitHub", ["GitHub", "Files", "Changes", "Agents"]),
-        ("subagents", "Agents", ["Agents", "Files", "Changes", "GitHub"]),
+        ("changes", "Changes", ["Changes", "Files", "Pull Requests", "Agents"]),
+        ("github", "Pull Requests", ["Pull Requests", "Files", "Changes", "Agents"]),
+        ("subagents", "Agents", ["Agents", "Files", "Changes", "Pull Requests"]),
     ],
 )
 def test_changed_default_applies_to_visited_session_after_reload(
@@ -67,7 +67,7 @@ def test_changed_default_applies_to_visited_session_after_reload(
     group = page.get_by_role("radiogroup", name="Default Workspace tab")
     options = group.get_by_role("radio")
     expect(options).to_have_count(4)
-    for index, label in enumerate(["Files", "Changes", "GitHub", "Agents"]):
+    for index, label in enumerate(["Files", "Changes", "Pull Requests", "Agents"]):
         expect(options.nth(index)).to_have_accessible_name(label)
     preference = page.get_by_test_id(f"workspace-tab-default-{default_tab}")
     preference.click()
@@ -98,10 +98,11 @@ def test_agents_tab_survives_return_to_unvisited_root(
 ) -> None:
     """A main-agent click keeps Agents selected when the root has no saved tab."""
     base_url, root_id = seeded_session
-    child_response = httpx.post(
+    child_response = post_session_bundle(
+        httpx.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"parent_session_id": root_id})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
+        _build_hello_world_bundle(),
+        metadata={"parent_session_id": root_id},
         timeout=30.0,
     )
     child_response.raise_for_status()

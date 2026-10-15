@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.resource_registry import (
     _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
+    _TERMINAL_EXIT_OUTPUT_MAX_LINES,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
@@ -887,30 +889,47 @@ async def test_required_terminal_exit_while_running_is_failure(
     assert record.attributes["session_status_before_exit"] == "running"
 
 
-def test_trim_terminal_output_drops_whole_leading_lines() -> None:
-    # Over the char budget: the first surviving line must be a WHOLE line, never
-    # a mid-word fragment (the "rity reasons" cut). The final line — the one that
-    # matters — stays intact.
-    filler = "\n".join(f"line {i} " + "x" * 80 for i in range(200))
+def test_trim_terminal_output_keeps_character_tail() -> None:
+    # Over the char budget: keep the last N characters, marked as truncated.
+    filler = "\n".join(f"line {i} " + "x" * 150 for i in range(30))
     text = filler + "\n--dangerously-skip-permissions cannot be run for security reasons"
     trimmed = trim_terminal_output(text)
     assert trimmed is not None
-    assert len(trimmed) <= _TERMINAL_EXIT_OUTPUT_MAX_CHARS + 60  # + the omitted-lines marker
-    assert trimmed.startswith("... omitted ")
-    # The last line survived whole (not clipped mid-word).
-    assert trimmed.endswith("for security reasons")
-    # The first content line after the marker is a complete line.
-    first_content = trimmed.splitlines()[1]
-    assert first_content.startswith("line ")
+    marker, body = trimmed.split("\n", 1)
+    assert marker.startswith("... omitted ") and marker.endswith(" earlier character(s) ...")
+    assert len(body) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
+    assert body.endswith("for security reasons")
+
+
+def test_trim_terminal_output_keeps_long_line_before_final_line() -> None:
+    # A long error line followed by tmux's short "pane is dead" line must not be
+    # dropped wholesale, leaving only the pane-dead line.
+    usage = "Usage: codex [OPTIONS] " + "z" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 1000)
+    trimmed = trim_terminal_output(f"a\nb\n{usage}\npane is dead (status 2)")
+    assert trimmed is not None
+    assert trimmed.endswith("z\npane is dead (status 2)")
+    assert len(trimmed.split("\n", 1)[1]) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
+
+
+def test_trim_terminal_output_skips_blank_pane_rows() -> None:
+    # A dead pane's capture has its output at the top, then blank rows down to
+    # tmux's "Pane is dead" line; the blank rows must not use up the line budget.
+    blank_rows = "\n" * (_TERMINAL_EXIT_OUTPUT_MAX_LINES + 10)
+    text = f"Error: failed to get token\n{blank_rows}Pane is dead (status 1)"
+    assert trim_terminal_output(text) == "Error: failed to get token\nPane is dead (status 1)"
 
 
 def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:
-    # A single line longer than the budget has no line boundary to snap to, so
-    # it's clipped from the tail as a last resort.
     line = "y" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 500)
     trimmed = trim_terminal_output(line)
-    assert trimmed is not None
-    assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
+    assert (
+        trimmed
+        == f"... omitted 500 earlier character(s) ...\n{'y' * _TERMINAL_EXIT_OUTPUT_MAX_CHARS}"
+    )
+
+
+def test_trim_terminal_output_leaves_short_output_untouched() -> None:
+    assert trim_terminal_output("  boom\r\nexit 1\n") == "boom\nexit 1"
 
 
 def test_terminal_exit_diagnostics_reads_exit_status(tmp_path: Path) -> None:
@@ -1247,6 +1266,68 @@ async def test_cleanup_session_closes_primary_env(
         assert not reg.has_primary_env("conv_1")
     finally:
         os.environ.pop("OMNIGENT_RUNNER_OS_ENV_ROOT", None)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe() -> None:
+    """Primary environment cleanup finishes after repeated cancellation."""
+    reg = SessionResourceRegistry()
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    heartbeat_ran_while_blocked = asyncio.Event()
+
+    class _BlockingEnvironment(_FakeOSEnvironment):
+        def close(self) -> None:
+            started.set()
+            assert release.wait(timeout=2.0)
+            self._closed = True
+            finished.set()
+
+    environment = _BlockingEnvironment(
+        spec=OSEnvSpec(type="caller_process", cwd="/tmp", sandbox=OSEnvSandboxSpec(type="none")),
+        cwd=Path("/tmp"),
+    )
+    reg._primary_envs["conv_blocked_cleanup"] = environment
+
+    async def heartbeat() -> None:
+        while not finished.is_set():
+            if started.is_set():
+                heartbeat_ran_while_blocked.set()
+                return
+            await asyncio.sleep(0.01)
+
+    heartbeat_task: asyncio.Task[None] | None = None
+    cleanup_task: asyncio.Task[None] | None = None
+    watchdog = threading.Thread(
+        target=lambda: (release.wait(timeout=2.0), release.set()),
+        name="test-resource-cleanup-watchdog",
+        daemon=True,
+    )
+    watchdog.start()
+    try:
+        heartbeat_task = asyncio.create_task(heartbeat())
+        cleanup_task = asyncio.create_task(reg.cleanup_session("conv_blocked_cleanup"))
+        await asyncio.wait_for(heartbeat_ran_while_blocked.wait(), timeout=1.0)
+        cleanup_task.cancel()
+        await asyncio.sleep(0)
+        cleanup_task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup_task
+    finally:
+        release.set()
+        if cleanup_task is not None and not cleanup_task.done():
+            cleanup_task.cancel()
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+        await asyncio.gather(cleanup_task, heartbeat_task, return_exceptions=True)
+        watchdog.join(timeout=1.0)
+
+    assert finished.is_set()
+    assert environment._closed
+    assert not reg.has_primary_env("conv_blocked_cleanup")
+    assert heartbeat_ran_while_blocked.is_set()
 
 
 # ── Phase 4: cleanup endpoint tests ─────────────────────────────

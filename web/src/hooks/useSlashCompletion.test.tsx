@@ -508,6 +508,22 @@ describe("inline skill completion", () => {
     expect(view.result.current.open).toBe(false);
   });
 
+  it("preserves adjacent text that is not a command continuation", () => {
+    const text = "please /revthis change";
+    const { view } = setup({ text });
+    const element = document.createElement("textarea");
+    element.value = text;
+    element.setSelectionRange(11, 11);
+    act(() => view.result.current.onSelectionChange(element));
+
+    act(() => {
+      expect(view.result.current.complete("/review-pr")).toEqual({
+        text: "please /review-pr this change",
+        caret: 18,
+      });
+    });
+  });
+
   it.each(["please /rev", "please $rev"])("uses the native skill prefix in %j", (text) => {
     const { view } = setup({
       text,
@@ -518,6 +534,27 @@ describe("inline skill completion", () => {
     expect(view.result.current.matches).toEqual(["$review"]);
     act(() => {
       expect(view.result.current.complete("$review").text).toBe("please $review ");
+    });
+  });
+
+  it("compares command bodies case-insensitively across native prefix conversion", () => {
+    const text = "please /rEvIeW this change";
+    const { view } = setup({
+      text,
+      prefix: "$",
+      commands: { $Review: "Review" },
+      skills: { $Review: "Review" },
+    });
+    const element = document.createElement("textarea");
+    element.value = text;
+    element.setSelectionRange(11, 11);
+    act(() => view.result.current.onSelectionChange(element));
+
+    act(() => {
+      expect(view.result.current.complete("$Review")).toEqual({
+        text: "please $Review this change",
+        caret: 15,
+      });
     });
   });
 

@@ -27,7 +27,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -68,8 +68,8 @@ class _Rig:
         self.child_id = uuid.uuid4().hex
         self.inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.app = _native_app(harness)
-        runner_app._session_inboxes_ref[self.parent_id] = self.inbox
-        runner_app.register_subagent_work(
+        subagent_work._session_inboxes_ref[self.parent_id] = self.inbox
+        subagent_work.register_subagent_work(
             parent_session_id=self.parent_id,
             child_session_id=self.child_id,
             agent="researcher",
@@ -77,8 +77,8 @@ class _Rig:
         )
 
     def close(self) -> None:
-        self.runner_app.unregister_subagent_work(self.child_id)
-        self.runner_app._session_inboxes_ref.pop(self.parent_id, None)
+        subagent_work.unregister_subagent_work(self.child_id)
+        subagent_work._session_inboxes_ref.pop(self.parent_id, None)
         self.runner_app._session_event_queues_ref.pop(self.parent_id, None)
         self.runner_app._session_event_queues_ref.pop(self.child_id, None)
 
@@ -119,7 +119,7 @@ async def test_quiescence_idle_for_outcome_confirming_harness_delivers_nothing()
                 resp = await rig.post_status(client, data)
                 assert resp.status_code == 204, resp.text
         assert rig.drained() == [], "a bare quiescence idle must not deliver a terminal status"
-        entry = rig.runner_app.get_subagent_work(rig.child_id)
+        entry = subagent_work.get_subagent_work(rig.child_id)
         assert entry is not None and entry.status not in ("completed", "cancelled", "failed")
     finally:
         rig.close()
@@ -239,12 +239,12 @@ async def test_settled_outcome_is_redelivered_on_retried_quiescence_idle(
 
             # First settling idle lands while the parent inbox is gone: the
             # outcome is recorded but delivery cannot be confirmed.
-            rig.runner_app._session_inboxes_ref.pop(rig.parent_id, None)
+            subagent_work._session_inboxes_ref.pop(rig.parent_id, None)
             resp = await rig.post_status(client, {"status": "idle", "output": "partial work"})
             assert resp.status_code == 503, resp.text
 
             # The forwarder retries the same bare idle after the inbox exists.
-            rig.runner_app._session_inboxes_ref[rig.parent_id] = rig.inbox
+            subagent_work._session_inboxes_ref[rig.parent_id] = rig.inbox
             resp = await rig.post_status(client, {"status": "idle", "output": "partial work"})
             assert resp.status_code == 204, resp.text
         delivered = rig.drained()
@@ -263,14 +263,13 @@ async def test_grace_timer_cancel_does_not_settle_reused_dispatch() -> None:
     (``only_if_work_id`` = A) must be dropped as superseded, leaving B live so
     it can still complete.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    runner_app._session_inboxes_ref[parent_id] = inbox
+    subagent_work._session_inboxes_ref[parent_id] = inbox
     try:
-        entry_a = runner_app.register_subagent_work(
+        entry_a = subagent_work.register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=child_id,
             agent="researcher",
@@ -279,7 +278,7 @@ async def test_grace_timer_cancel_does_not_settle_reused_dispatch() -> None:
         work_id_a = entry_a.work_id
 
         # The reused child session starts turn B (a fresh dispatch).
-        entry_b = runner_app.register_subagent_work(
+        entry_b = subagent_work.register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=child_id,
             agent="researcher",
@@ -288,14 +287,14 @@ async def test_grace_timer_cancel_does_not_settle_reused_dispatch() -> None:
         assert entry_b.work_id != work_id_a
 
         # A's delayed grace-timer cancel fires, still bound to A's work_id.
-        superseded = runner_app.mark_subagent_work_terminal(
+        superseded = subagent_work.mark_subagent_work_terminal(
             child_id, status="cancelled", output=None, only_if_work_id=work_id_a
         )
         assert not superseded.delivered_now
-        assert runner_app.get_subagent_work(child_id).status == "launching"
+        assert subagent_work.get_subagent_work(child_id).status == "launching"
 
         # B completes normally and reaches the parent.
-        done = runner_app.mark_subagent_work_terminal(
+        done = subagent_work.mark_subagent_work_terminal(
             child_id, status="completed", output="B result"
         )
         assert done.delivered_now
@@ -305,8 +304,8 @@ async def test_grace_timer_cancel_does_not_settle_reused_dispatch() -> None:
             statuses.append(inbox.get_nowait()["status"])
         assert statuses == ["completed"]
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 def test_cancelled_inbox_line_surfaces_output_before_cancellation() -> None:

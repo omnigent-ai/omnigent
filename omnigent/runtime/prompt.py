@@ -23,7 +23,7 @@ from omnigent.runtime.tool_result_replay import (
 from omnigent.spec import AgentSpec
 
 # Shape of the wake notice the runner posts into a parent session when a
-# dispatched sub-agent finishes (``omnigent.runner.app._format_subagent_wake_notice``).
+# dispatched sub-agent finishes (``omnigent.runner.subagent_work._format_subagent_wake_notice``).
 # Quoted verbatim wherever the model is told what to expect, so the notice
 # reads as a known runtime signal rather than a user-typed instruction.
 SUBAGENT_WAKE_NOTICE_SHAPE = (

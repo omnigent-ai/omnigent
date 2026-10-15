@@ -302,6 +302,9 @@ class MessageData(BaseModel):
     :param stream_message_id: Native live-preview stream finalized by
         this assistant message. Persisted so reconnect snapshots can
         suppress delayed preview chunks after the authoritative item.
+    :param user_authored: Confirmed or conservatively preserved user input;
+        prevents legacy content cleanup from hiding literal agent markup.
+    :param subagent_return_id: Native task id of an explicitly completed child.
     """
 
     role: Literal["user", "assistant"]
@@ -309,6 +312,8 @@ class MessageData(BaseModel):
     content: list[dict[str, Any]]
     agent: str | None = Field(default=None, serialization_alias="model")
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
+    user_authored: bool = Field(default=False, exclude_if=lambda value: value is False)
+    subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
 
@@ -380,12 +385,16 @@ class FunctionCallData(BaseModel):
     :param arguments: JSON-encoded arguments string.
     :param call_id: Unique call identifier from the LLM,
         e.g. ``"call_abc123"``.
+    :param namespace: Tool namespace the model emitted the call under,
+        e.g. ``"container"``. ``None`` for the default namespace. Harnesses
+        that replay history must round-trip it with the call.
     """
 
     agent: str = Field(serialization_alias="model")
     name: str
     arguments: str
     call_id: str
+    namespace: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class FunctionCallOutputData(BaseModel):
@@ -395,10 +404,12 @@ class FunctionCallOutputData(BaseModel):
     :param call_id: The call_id this output corresponds to,
         e.g. ``"call_abc123"``.
     :param output: The tool's string result.
+    :param subagent_return_id: Native task id of an explicitly completed child.
     """
 
     call_id: str
     output: str
+    subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ErrorData(BaseModel):

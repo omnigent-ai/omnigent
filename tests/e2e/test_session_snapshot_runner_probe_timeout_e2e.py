@@ -42,35 +42,19 @@ Run::
 
 from __future__ import annotations
 
-import io
-import json
-import os
-import secrets
-import signal
-import socket
-import subprocess
-import sys
-import tarfile
 import time
 from pathlib import Path
 
 import httpx
 import yaml
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests._helpers.server_runner import server_runner
+from tests._helpers.session import bundle_files, post_session_bundle
 
 # CI shells can carry an egress proxy in the environment; every HTTP call in
 # this test targets 127.0.0.1, so bypass proxy autodetection entirely.
 _http = httpx.Client(trust_env=False)
 
-_PYTHONPATH = os.pathsep.join(
-    [
-        str(_REPO_ROOT),
-        str(_REPO_ROOT / "sdks" / "python-client"),
-        str(_REPO_ROOT / "sdks" / "ui"),
-        os.environ.get("PYTHONPATH", ""),
-    ]
-)
 
 # How long the runner takes to answer GET /v1/sessions/{id} once armed. Chosen
 # well above any reasonable probe deadline, so a build with no effective
@@ -81,8 +65,6 @@ _RUNNER_SLEEP_S = 12.0
 # generous. On the buggy build each load takes ~_RUNNER_SLEEP_S and trips this.
 _BOUND_S = 8.0
 
-_HEALTH_TIMEOUT_S = 120.0
-_POLL_S = 1.0
 
 # Runner bootstrap: wrap ``dispatch_via_asgi`` so that once armed (the arm file
 # exists), the runner answers the exact snapshot path GET /v1/sessions/{id} by
@@ -136,53 +118,6 @@ main()
 """
 
 
-def _find_free_port() -> int:
-    """Grab an ephemeral port for the spawned server."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
-    """Subprocess env with worktree imports and no proxy in the way."""
-    env = {
-        **os.environ,
-        "PYTHONPATH": _PYTHONPATH,
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
-    }
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        env.pop(name, None)
-    env.update(extra)
-    return env
-
-
-def _terminate(proc: subprocess.Popen[bytes] | None) -> None:
-    """Best-effort SIGTERM -> SIGKILL teardown for a spawned process."""
-    if proc is None or proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
-def _wait_http_ok(url: str, deadline: float) -> None:
-    """Poll *url* until it returns 200 or *deadline* (monotonic) passes."""
-    last = "not polled"
-    while time.monotonic() < deadline:
-        try:
-            if _http.get(url, timeout=2.0).status_code == 200:
-                return
-            last = "non-200"
-        except httpx.HTTPError as exc:
-            last = f"{type(exc).__name__}: {exc}"
-        time.sleep(_POLL_S)
-    raise AssertionError(f"{url} never became healthy: {last}")
-
-
 def _create_agent_session(base_url: str) -> str:
     """Create a minimal single-model agent session via multipart POST /v1/sessions."""
     config = {
@@ -194,19 +129,8 @@ def _create_agent_session(base_url: str) -> str:
             "profile": "test",
         },
     }
-    with io.BytesIO() as buf:
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            data = yaml.dump(config).encode()
-            info = tarfile.TarInfo("slow-probe-agent.yaml")
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
-        bundle = buf.getvalue()
-    resp = _http.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
-    )
+    bundle = bundle_files({"slow-probe-agent.yaml": yaml.dump(config).encode()})
+    resp = post_session_bundle(_http.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
     resp.raise_for_status()
     return str(resp.json()["session_id"])
 
@@ -224,86 +148,17 @@ def test_session_snapshot_probe_is_bounded_and_not_repeated(tmp_path: Path) -> N
 
     :param tmp_path: Per-test temp dir (server DB, runner HOME, workspace).
     """
-    port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    database_uri = f"sqlite:///{tmp_path / 'chat.db'}"
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    runner_home = tmp_path / "home"
-    runner_home.mkdir()
-    runner_log_file = tmp_path / "runner-process.log"
     arm_file = tmp_path / "arm-slow-probe"
-
-    binding_token = secrets.token_urlsafe(32)
-    from omnigent.runner.identity import token_bound_runner_id
-
-    runner_id = token_bound_runner_id(binding_token)
-
-    server_log = (tmp_path / "server.log").open("w")
-    runner_stdout = (tmp_path / "runner.stdout.log").open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
-    runner_proc: subprocess.Popen[bytes] | None = None
-
-    def _runner_log() -> str:
-        return runner_log_file.read_text() if runner_log_file.exists() else ""
-
-    def _spawn_server() -> subprocess.Popen[bytes]:
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                database_uri,
-                "--artifact-location",
-                str(tmp_path / "artifacts"),
-            ],
-            env=_localhost_env({"OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}),
-            stdout=server_log,
-            stderr=subprocess.STDOUT,
+    with server_runner(tmp_path) as stack:
+        base_url, runner_id = stack.base_url, stack.runner_id
+        stack.start_runner(
+            bootstrap=_RUNNER_BOOTSTRAP,
+            env={
+                "OMNIGENT_PROCESS_LOG_FILE": str(tmp_path / "runner-process.log"),
+                "OMNIGENT_LOG_LEVEL": "INFO",
+                "OMNIGENT_TEST_SLOW_PROBE_ARM_FILE": str(arm_file),
+            },
         )
-        _wait_http_ok(f"{base_url}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
-        return proc
-
-    def _wait_runner_online() -> bool:
-        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        while time.monotonic() < deadline:
-            try:
-                status = _http.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2.0)
-                if status.status_code == 200 and status.json().get("online") is True:
-                    return True
-            except httpx.HTTPError:
-                pass
-            time.sleep(_POLL_S)
-        return False
-
-    try:
-        server_proc = _spawn_server()
-
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-c", _RUNNER_BOOTSTRAP],
-            env=_localhost_env(
-                {
-                    "OMNIGENT_RUNNER_ID": runner_id,
-                    "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-                    "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                    "RUNNER_SERVER_URL": base_url,
-                    "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
-                    "HOME": str(runner_home),
-                    "OMNIGENT_PROCESS_LOG_FILE": str(runner_log_file),
-                    "OMNIGENT_LOG_LEVEL": "INFO",
-                    "OMNIGENT_TEST_SLOW_PROBE_ARM_FILE": str(arm_file),
-                }
-            ),
-            stdout=runner_stdout,
-            stderr=subprocess.STDOUT,
-        )
-        assert _wait_runner_online(), f"runner never came online; log:\n{_runner_log()[-3000:]}"
 
         session_id = _create_agent_session(base_url)
 
@@ -323,11 +178,7 @@ def test_session_snapshot_probe_is_bounded_and_not_repeated(tmp_path: Path) -> N
         # restarting the server. conversations.runner_id survives in the DB, so
         # the next snapshot takes the empty-cache live-status probe branch. The
         # runner reconnects the tunnel to the fresh server process.
-        _terminate(server_proc)
-        server_proc = _spawn_server()
-        assert _wait_runner_online(), (
-            f"runner never reconnected after restart; log:\n{_runner_log()[-3000:]}"
-        )
+        stack.restart_server()
         time.sleep(1.0)
 
         # First session load: on an empty cache the snapshot probes the runner.
@@ -361,8 +212,3 @@ def test_session_snapshot_probe_is_bounded_and_not_repeated(tmp_path: Path) -> N
             f"{_RUNNER_SLEEP_S:.0f}s delay), so the failed probe was not remembered / "
             "skipped for a window."
         )
-    finally:
-        _terminate(runner_proc)
-        _terminate(server_proc)
-        server_log.close()
-        runner_stdout.close()
