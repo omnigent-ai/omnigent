@@ -56,11 +56,10 @@ def _await_startup(base_url: str, session_id: str) -> tuple[str, str, list[str]]
     """Settle the session's terminal launch.
 
     :returns: ``(outcome, status, trail)`` where outcome is ``"up"`` when a
-        terminal stays live and the session is usable, ``"failed"`` when the
-        runner tore the terminal down, or ``"timeout"``.
+        terminal stays live for ``_SETTLE_S`` with a usable session status,
+        ``"failed"`` when the session failed, or ``"timeout"``.
     """
     deadline = time.time() + _STARTUP_BUDGET_S
-    saw_terminal = False
     up_since: float | None = None
     trail: list[str] = []
     status = "unknown"
@@ -70,18 +69,16 @@ def _await_startup(base_url: str, session_id: str) -> tuple[str, str, list[str]]
         trail.append(f"{status}/{int(has_terminal)}")
         if status == "failed":
             return "failed", status, trail
-        if has_terminal:
-            saw_terminal = True
-        elif saw_terminal:
-            return "failed", status, trail  # terminal came up then was torn down
         if has_terminal and status in {"idle", "running", "working"}:
             up_since = up_since or time.time()
             if time.time() - up_since >= _SETTLE_S:
                 return "up", status, trail
         else:
+            # A terminal that vanishes restarts the settle window; a startup
+            # exit also flips the session to ``failed`` above.
             up_since = None
         time.sleep(1.0)
-    return ("up" if up_since is not None else "timeout"), status, trail
+    return "timeout", status, trail
 
 
 def test_stored_print_arg_does_not_prevent_terminal_startup(

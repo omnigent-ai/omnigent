@@ -3189,6 +3189,10 @@ def drop_startup_fatal_claude_args(args: Sequence[str], *, workspace: Path) -> l
             index += 1
         if values:
             kept.extend(("--mcp-config", *values))
+        else:
+            _logger.warning(
+                "Dropped --mcp-config with no usable values from the Claude launch args"
+            )
     return kept
 
 
