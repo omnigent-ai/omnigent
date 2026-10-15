@@ -777,7 +777,6 @@ def _build_models_json(
         "supportsDeveloperRole": False,
         "supportsStore": False,
         "supportsStrictMode": False,
-        **({} if is_generic_provider else {"supportsReasoningEffort": False}),
     }
     provider_models: dict[str, list[_JsonObject]] = {
         "databricks-openai": [],
@@ -844,7 +843,6 @@ def _build_models_json(
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
                     "supportsStrictMode": False,
-                    "supportsReasoningEffort": False,
                     "supportsUsageInStreaming": False,
                 },
                 "models": provider_models["databricks-mlflow"],
@@ -860,7 +858,6 @@ def _build_models_json(
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
                     "supportsStrictMode": False,
-                    **({} if is_generic_provider else {"supportsReasoningEffort": False}),
                     # Gemini/Qwen/Llama/inkling models reject stream_options
                     # (which carries include_usage) with 400 "unknown field".
                     "supportsUsageInStreaming": False,

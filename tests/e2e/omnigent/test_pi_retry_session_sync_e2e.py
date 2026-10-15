@@ -11,6 +11,8 @@ import pytest
 
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TextChunk, TurnComplete
 from omnigent.inner.pi_harness import _build_pi_executor
+from omnigent.models.model_catalog import ModelEntry
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
 from omnigent.onboarding.providers import ModelInfo
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, reset_mock_llm
@@ -67,17 +69,56 @@ def _errors(events: list) -> list[str]:
 
 
 @pytest.mark.timeout(300)
-@pytest.mark.parametrize("wire_api", ["chat", "responses", "anthropic"])
+@pytest.mark.parametrize(
+    ("wire_api", "databricks", "reasoning"),
+    [
+        ("chat", False, True),
+        ("responses", False, True),
+        ("anthropic", False, True),
+        ("chat", True, True),
+        ("responses", True, True),
+        ("chat", True, False),
+    ],
+)
 async def test_pi_session_stays_in_sync_after_retry_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mock_llm_server_url: str,
     wire_api: str,
+    databricks: bool,
+    reasoning: bool,
 ) -> None:
     """The prompt after a retry-recovered turn gets only its own answer."""
     skip_if_harness_cli_missing("pi")
 
     mock_model = "mock-pi-retry-session-sync"
+    if databricks:
+        mock_model = f"system.ai.{mock_model}"
+        entry = ModelEntry(
+            id=mock_model,
+            family="other",
+            metadata=ModelMetadata(
+                supported_capabilities=frozenset({ModelCapability.REASONING})
+                if reasoning
+                else frozenset(),
+                wire_apis=frozenset(
+                    {
+                        ModelWireAPI.OPENAI_CHAT
+                        if wire_api == "chat"
+                        else ModelWireAPI.OPENAI_RESPONSES
+                    }
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
+            lambda *_: [entry],
+        )
+        monkeypatch.setattr("omnigent.models.model_catalog.catalog_model_entries", lambda *_: [])
+        monkeypatch.setattr(
+            "omnigent.inner.pi_executor._databricks_workspace_url_for_gateway",
+            lambda *_args, **_kwargs: mock_llm_server_url,
+        )
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -106,7 +147,11 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
         json.dumps(
             {"claude": mock_llm_server_url}
             if wire_api == "anthropic"
-            else {"openai": f"{mock_llm_server_url}/v1"}
+            else {
+                "openai": f"{mock_llm_server_url}/ai-gateway/codex/v1"
+                if databricks
+                else f"{mock_llm_server_url}/v1"
+            }
         ),
     )
     monkeypatch.setenv("HARNESS_PI_GATEWAY_HOST", mock_llm_server_url)
@@ -177,6 +222,6 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
             else r.get("reasoning", {}).get("effort")
             for r in requests
         ]
-        assert efforts == ["high", "high", "high", "low"]
+        assert efforts == (["high", "high", "high", "low"] if reasoning else [None] * 4)
     history = json.dumps(requests[-1].get("messages", requests[-1].get("input")))
     assert "REMEMBERED_PI_VALUE" in history and _FIRST_ANSWER in history

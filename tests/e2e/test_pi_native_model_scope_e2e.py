@@ -13,6 +13,7 @@ import shutil
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pexpect
 import pyte
@@ -22,6 +23,8 @@ from omnigent.harnesses.pi_native.credentials import (
     pi_native_provider_launch,
     resolve_pi_native_provider,
 )
+from omnigent.models.model_catalog import ModelEntry
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
 from omnigent.onboarding.providers import ModelInfo
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, reset_mock_llm
 
@@ -68,6 +71,7 @@ def _managed_pi(
     base_url: str = "http://127.0.0.1:9/v1",
     wire_api: str = "chat",
     reasoning_effort: str | None = None,
+    databricks: bool = False,
 ) -> Iterator[_PiTui]:
     global_dir = tmp_path / "global-agent"
     global_dir.mkdir()
@@ -75,21 +79,37 @@ def _managed_pi(
     settings_path = global_dir / "settings.json"
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
     monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_dir)
-    config = {
-        "providers": {
-            "demo": {
-                "kind": "gateway",
-                "default": True,
-                "anthropic" if wire_api == "anthropic" else "openai": {
-                    "base_url": base_url,
-                    "api_key": "synthetic-model-scope-key",
-                    **({"wire_api": wire_api} if wire_api != "anthropic" else {}),
-                    "models": models,
-                },
+    if databricks:
+        config = {
+            "providers": {"demo": {"kind": "databricks", "default": True, "profile": "PI_TEST"}}
+        }
+        monkeypatch.setattr(
+            "omnigent.inner.databricks_executor._read_databrickscfg_host", lambda _: base_url
+        )
+        monkeypatch.setattr(
+            "omnigent.inner.codex_executor._databricks_codex_auth_command",
+            lambda *_: "printf %s synthetic-model-scope-key",
+        )
+        monkeypatch.setattr(
+            "omnigent.harnesses.pi_native.credentials.resolve_databricks_workspace",
+            lambda _: SimpleNamespace(host=base_url, token="synthetic-model-scope-key"),
+        )
+    else:
+        config = {
+            "providers": {
+                "demo": {
+                    "kind": "gateway",
+                    "default": True,
+                    "anthropic" if wire_api == "anthropic" else "openai": {
+                        "base_url": base_url,
+                        "api_key": "synthetic-model-scope-key",
+                        **({"wire_api": wire_api} if wire_api != "anthropic" else {}),
+                        "models": models,
+                    },
+                }
             }
         }
-    }
-    provider = resolve_pi_native_provider(config_loader=lambda: config)
+    provider = resolve_pi_native_provider(model=models["default"], config_loader=lambda: config)
     assert provider is not None
     launch = pi_native_provider_launch(
         tmp_path / "managed-agent", provider, reasoning_effort=reasoning_effort
@@ -169,12 +189,50 @@ def test_default_only_provider_preserves_existing_pi_scope(
         assert "demo-fast [omnigent]" in picker
 
 
-@pytest.mark.parametrize("wire_api", ["chat", "responses", "anthropic"])
+@pytest.mark.parametrize(
+    ("wire_api", "databricks", "reasoning"),
+    [
+        ("chat", False, True),
+        ("responses", False, True),
+        ("anthropic", False, True),
+        ("chat", True, True),
+        ("responses", True, True),
+        ("chat", True, False),
+    ],
+)
 def test_generic_provider_delivers_effort_through_native_tool_turn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_llm_server_url: str, wire_api: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_llm_server_url: str,
+    wire_api: str,
+    databricks: bool,
+    reasoning: bool,
 ) -> None:
     """Generated model capability and selected effort reach the actual API."""
     model = f"demo-fast-{wire_api}"
+    if databricks:
+        model = f"system.ai.{model}"
+        entry = ModelEntry(
+            id=model,
+            family="other",
+            metadata=ModelMetadata(
+                supported_capabilities=frozenset({ModelCapability.REASONING})
+                if reasoning
+                else frozenset(),
+                wire_apis=frozenset(
+                    {
+                        ModelWireAPI.OPENAI_CHAT
+                        if wire_api == "chat"
+                        else ModelWireAPI.OPENAI_RESPONSES
+                    }
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
+            lambda *_: [entry],
+        )
+        monkeypatch.setattr("omnigent.models.model_catalog.catalog_model_entries", lambda *_: [])
     monkeypatch.setattr(
         "omnigent.onboarding.providers.find_catalog_models",
         lambda _: [ModelInfo(name=model, provider="openai", supports_reasoning=True)],
@@ -201,9 +259,12 @@ def test_generic_provider_delivers_effort_through_native_tool_turn(
         tmp_path,
         monkeypatch,
         models={"default": model},
-        base_url=mock_llm_server_url if wire_api == "anthropic" else f"{mock_llm_server_url}/v1",
+        base_url=mock_llm_server_url
+        if databricks or wire_api == "anthropic"
+        else f"{mock_llm_server_url}/v1",
         wire_api=wire_api,
         reasoning_effort="high",
+        databricks=databricks,
     ) as tui:
         tui.send("Run the tool, then answer.\r")
         tui.wait_for(lambda text: "NATIVE_EFFORT_FIRST_ANSWER" in text)
@@ -217,6 +278,6 @@ def test_generic_provider_delivers_effort_through_native_tool_turn(
         else r.get("output_config" if wire_api == "anthropic" else "reasoning", {}).get("effort")
         for r in requests
     ]
-    assert efforts == ["high"] * 3
+    assert efforts == (["high"] * 3 if reasoning else [None] * 3)
     history = json.dumps(requests[-1].get("messages", requests[-1].get("input")))
     assert "PI_EFFORT_TOOL_RESULT" in history and "NATIVE_EFFORT_FIRST_ANSWER" in history

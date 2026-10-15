@@ -882,26 +882,29 @@ def test_provider_launch_effort_edge_values(
     assert warning is None
 
 
-def test_provider_launch_gateway_routed_model_keeps_thinking_off(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("effort", "expected"),
+    [
+        ("high", ["--thinking", "high"]),
+        ("none", ["--thinking", "off"]),
+        ("default", []),
+        (None, []),
+    ],
+)
+def test_provider_launch_gateway_routed_model_preserves_effort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, effort: str | None, expected: list[str]
 ) -> None:
-    """The gateway-routed pin wins over the user's effort, with a warning.
-
-    Those models' ``reasoning_tokens`` break pi's completions handler so text
-    never surfaces; honouring the effort would reintroduce that.
-    """
+    """Secondary providers use the same effort mapping as the primary."""
     provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
     monkeypatch.setattr(
         "omnigent.inner.pi_settings.prepare_managed_pi_agent_dir",
         lambda *_args, **_kwargs: None,
     )
 
-    _env, args, warning = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider, "high")
+    _env, args, warning = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider, effort)
 
-    assert args.count("--thinking") == 1
-    assert args[-2:] == ["--thinking", "off"]
-    assert warning is not None
-    assert "databricks-glm-5-2" in warning
+    assert args[4:] == expected
+    assert warning is None
 
 
 def test_pi_native_provider_launch_namespaced_model_uses_qualified_arg(
@@ -961,8 +964,6 @@ def test_provider_launch_accepts_provider_qualified_selection(tmp_path: Path) ->
         "omnigent-openai",
         "--model",
         "gpt-5.6-sol",
-        "--thinking",
-        "off",
     ]
 
 
@@ -1008,15 +1009,10 @@ def test_inline_databricks_gateway_selection_follows_the_model_across_discovery(
     assert args[:4] == ["--provider", expected_provider, "--model", "system.ai.gpt-5"]
 
 
-def test_inline_databricks_gateway_default_launches_with_thinking_off(
+def test_inline_databricks_gateway_default_preserves_requested_thinking(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """After enumeration the GPT default is gateway-routed, so effort is dropped with a notice.
-
-    The default now lives in the generated OpenAI provider rather than the
-    primary, so the launch takes the same gateway-routed branch as the
-    databricks-kind path: thinking off, and a warning when an effort was set.
-    """
+    """A GPT default retains its effort after routing to a secondary provider."""
     monkeypatch.setattr(
         creds,
         "_fetch_pi_model_lists",
@@ -1040,10 +1036,9 @@ def test_inline_databricks_gateway_default_launches_with_thinking_off(
         "--model",
         "system.ai.gpt-5",
         "--thinking",
-        "off",
+        "high",
     ]
-    assert effort_warning is not None
-    assert "system.ai.gpt-5" in effort_warning
+    assert effort_warning is None
 
 
 def test_provider_launch_rejects_unavailable_qualified_selection(tmp_path: Path) -> None:
@@ -2265,11 +2260,7 @@ def test_local_kind_override_passes_through_verbatim() -> None:
 
 
 def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A Databricks profile provider includes an OpenAI Completions provider for GPT models.
-
-    The ``omnigent-openai`` provider targets ``/serving-endpoints`` so Pi's
-    /model command exposes GPT models returned by the live serving-endpoints API.
-    """
+    """A Databricks profile exposes cataloged GPT models on their declared protocols."""
     from omnigent.inner import databricks_executor
 
     monkeypatch.setattr(
@@ -2305,10 +2296,12 @@ def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPat
     )
     assert openai_entry["baseUrl"] == "https://wkspc.example.com/ai-gateway/codex/v1"
     assert openai_entry["api"] == "openai-responses"
+    assert "supportsReasoningEffort" not in openai_entry["compat"]
     assert any(m["id"] == "databricks-gpt-5-5" for m in openai_entry["models"])
     completions_entry = cfg["providers"].get("omnigent-completions")
     assert completions_entry is not None, "omnigent-completions provider missing from models.json"
     assert completions_entry["api"] == "openai-completions"
+    assert "supportsReasoningEffort" not in completions_entry["compat"]
     assert any(m["id"] == "databricks-gpt-5-4" for m in completions_entry["models"])
 
 
@@ -2915,8 +2908,7 @@ def test_uncataloged_model_launch_arg_matches_rendered_provider(
     """``--provider`` must name the provider models.json registered the model on.
 
     The launch resolves the provider from the rendered config, so a model placed
-    by the family fallback is selectable — and gets ``--thinking off``, without
-    which the gateway 400s on ``reasoning_effort``.
+    by the family fallback is selectable without forcing a thinking level.
     """
     provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
     monkeypatch.setattr(
@@ -2931,8 +2923,6 @@ def test_uncataloged_model_launch_arg_matches_rendered_provider(
         "omnigent-completions",
         "--model",
         "databricks-glm-5-2",
-        "--thinking",
-        "off",
     ]
     cfg = json.loads((tmp_path / "pi-agent" / "models.json").read_text())
     registered = cfg["providers"]["omnigent-completions"]["models"]
