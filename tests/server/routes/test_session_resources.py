@@ -7728,6 +7728,118 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
 
 
 @pytest.mark.asyncio
+async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirror(
+    tmp_path: Path,
+) -> None:
+    """A pre-delivery refusal must not be reported again as a missing message.
+
+    Claude refuses web ``/login`` before touching the terminal. If that failure
+    is not marked undelivered, the input stays pending. The next successful
+    message's transcript mirror skips it and persists a second error with code
+    ``native_prompt_not_recorded``.
+    """
+    from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
+    from omnigent.runtime import pending_inputs
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+    )
+    from omnigent.server.schemas import CreateResponseRequest
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    conversation = store.get_conversation(session_id)
+    assert conversation is not None
+    first_stable_id = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+    later_stable_id = "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b"
+    auth_content = [{"type": "input_text", "text": "/login"}]
+    later_content = [{"type": "input_text", "text": "continue after login"}]
+    first_pending = pending_inputs.record(
+        session_id,
+        auth_content,
+        created_by="alice@example.com",
+        stable_id=first_stable_id,
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: ClaudeNativeExecutor(tmp_path))
+    context = TurnContext(
+        response_id="resp_login_refused",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(
+                CreateResponseRequest(model="claude", input=auth_content),
+                context,
+            )
+        refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
+        failed_turn = _ScriptedStreamingRunnerClient(
+            [
+                _sse_frame(
+                    {
+                        "type": "response.in_progress",
+                        "response": {"id": "resp_login_refused", "model": "claude"},
+                    }
+                ),
+                _sse_frame(
+                    {
+                        "type": "response.failed",
+                        "input_stable_id": first_stable_id,
+                        "response": {
+                            "id": "resp_login_refused",
+                            "model": "claude",
+                            "error": refusal,
+                        },
+                    }
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+        await _relay_runner_stream(session_id, failed_turn, store)  # type: ignore[arg-type]
+
+        later_pending = pending_inputs.record(
+            session_id,
+            later_content,
+            created_by="alice@example.com",
+            stable_id=later_stable_id,
+        )
+        await _persist_external_conversation_item(
+            session_id,
+            conversation,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": later_content},
+                    "response_id": "native_later_turn",
+                    "source_id": "claude:later:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+
+        missing_errors = [
+            (item.data.code, item.data.message)
+            for item in store.appended_items
+            if item.type == "error" and item.data.code == "native_prompt_not_recorded"
+        ]
+        assert missing_errors == [], (
+            "generated 'Web message missing from native transcript': the refused input "
+            f"{first_pending} stayed pending and was reported missing when the later mirror "
+            f"settled {later_pending}; persisted={missing_errors}"
+        )
+        assert refusal.get("undelivered") is True
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == []
+        assert later_pending not in pending_inputs.pending_ids(session_id)
+    finally:
+        await adapter.on_shutdown()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_relay_leaves_the_queue_alone_when_the_harness_may_have_the_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
