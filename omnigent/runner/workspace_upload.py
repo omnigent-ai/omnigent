@@ -33,7 +33,7 @@ from functools import partial
 from pathlib import Path
 from typing import TypeVar, cast
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
 
@@ -111,6 +111,7 @@ class UploadRecord(BaseModel):
     publication: dict[str, object] | None = None
     result: dict[str, object] | None = None
     snapshot: str | None = None
+    idempotency_key: str | None = None
 
 
 class UploadDeclaration(BaseModel):
@@ -373,7 +374,9 @@ class UploadManager:
                         {
                             "op": "resume",
                             "id": uid,
-                            **record.model_dump(exclude={"snapshot", "staging_path"}),
+                            **record.model_dump(
+                                exclude={"snapshot", "staging_path", "idempotency_key"}
+                            ),
                         },
                     )
                 )
@@ -501,7 +504,7 @@ class UploadManager:
                     uid,
                     record,
                     "cleanup",
-                    **record.model_dump(exclude={"snapshot", "staging_path"}),
+                    **record.model_dump(exclude={"snapshot", "staging_path", "idempotency_key"}),
                 )
         except RouteError as exc:
             if exc.code not in ("parent_gone", "staging_gone"):
@@ -513,7 +516,10 @@ class UploadManager:
     async def _recover(self, uid: str, record: UploadRecord) -> None:
         try:
             record.result = await self._call(
-                uid, record, "recover", **record.model_dump(exclude={"snapshot", "staging_path"})
+                uid,
+                record,
+                "recover",
+                **record.model_dump(exclude={"snapshot", "staging_path", "idempotency_key"}),
             )
         except RouteError as exc:
             if exc.code in ("parent_gone", "staging_gone"):
@@ -679,13 +685,21 @@ class UploadManager:
                     raise
 
     async def create(
-        self, session_id: str, environment_id: str, declaration: UploadDeclaration
+        self,
+        session_id: str,
+        environment_id: str,
+        declaration: UploadDeclaration,
+        idempotency_key: str | None = None,
     ) -> dict[str, object]:
         if self.stopping:
             raise RouteError(503, "runner_stopping", "Runner is shutting down")
+        if idempotency_key is not None and not re.fullmatch(r"[0-9a-f]{32}", idempotency_key):
+            raise RouteError(400, "invalid_request", "Invalid idempotency key")
         request = asyncio.current_task()
         assert request is not None
-        task = asyncio.create_task(self._create(session_id, environment_id, declaration))
+        task = asyncio.create_task(
+            self._create(session_id, environment_id, declaration, idempotency_key)
+        )
         self.inflight.add(request)
         try:
             return await asyncio.shield(task)
@@ -708,8 +722,74 @@ class UploadManager:
             if record is not None:
                 await self._remove(uid, record)
 
+    def _keyed_record(
+        self, session_id: str, environment_id: str, declaration: UploadDeclaration, key: str
+    ) -> tuple[str, UploadRecord] | None:
+        return next(
+            (
+                (uid, record)
+                for uid, record in self.records.items()
+                if record.session_id == session_id
+                and record.environment_id == environment_id
+                and record.created_by == declaration.created_by
+                and record.idempotency_key == key
+                and not self._expired(record, _now())
+            ),
+            None,
+        )
+
+    async def _replay_create(
+        self,
+        session_id: str,
+        environment_id: str,
+        declaration: UploadDeclaration,
+        key: str,
+        directory: str,
+    ) -> dict[str, object] | None:
+        while True:
+            async with self.lock:
+                match = self._keyed_record(session_id, environment_id, declaration, key)
+                if match is None:
+                    return None
+                uid, record = match
+                if not record.pending:
+                    if (
+                        record.dir,
+                        record.name,
+                        record.size,
+                        record.on_conflict,
+                        record.sha256,
+                    ) != (
+                        directory,
+                        declaration.name,
+                        declaration.size,
+                        declaration.on_conflict,
+                        declaration.sha256,
+                    ):
+                        raise RouteError(
+                            422, "idempotency_key_conflict", "Upload declaration changed"
+                        )
+                    return {
+                        "upload_id": uid,
+                        "offset": record.size if record.result is not None else record.offset,
+                        "chunk_bytes": min(1024**2, self.limits.chunk_bytes),
+                        "expires_at": min(
+                            record.last_activity + self.limits.idle_ttl_s,
+                            record.created_at + self.limits.max_age_s,
+                        ),
+                    }
+                wait = self.upload_locks[uid]
+                if not wait.locked():
+                    raise RouteError(504, "timeout", "Upload begin is unresolved")
+            async with wait:
+                pass
+
     async def _create(
-        self, session_id: str, environment_id: str, declaration: UploadDeclaration
+        self,
+        session_id: str,
+        environment_id: str,
+        declaration: UploadDeclaration,
+        idempotency_key: str | None,
     ) -> dict[str, object]:
         if not valid_name(declaration.name):
             raise RouteError(400, "invalid_name", "Invalid basename")
@@ -726,6 +806,12 @@ class UploadManager:
             raise RouteError(400, "invalid_request", "Invalid upload declaration")
         if declaration.size > self.limits.max_file_bytes:
             raise RouteError(413, "too_large", "File exceeds runner limit")
+        if idempotency_key is not None:
+            replay = await self._replay_create(
+                session_id, environment_id, declaration, idempotency_key, directory
+            )
+            if replay is not None:
+                return replay
         async with self._using_helper(session_id, environment_id) as helper:
             binding = self.helpers[(session_id, environment_id)]
             uid = uuid.uuid4().hex
@@ -754,39 +840,58 @@ class UploadManager:
                     "created_at": now,
                     "last_activity": now,
                     "pending": True,
+                    "idempotency_key": idempotency_key,
                 }
             )
             creation_lock = asyncio.Lock()
             async with creation_lock:
-                async with self.lock:
-                    opened = [
-                        r
-                        for r in self.records.values()
-                        if r.session_id == session_id and r.result is None
-                    ]
-                    if (
-                        len(opened) >= self.limits.max_open_uploads
-                        or sum(r.size for r in opened) + declaration.size
-                        > self.limits.max_open_bytes
-                    ):
-                        raise RouteError(429, "upload_limit", "Session upload limit reached")
-                    self.upload_locks[uid] = creation_lock
-                    self.records[uid] = record
-                    try:
-                        await self._save_settled()
-                    except OSError as exc:
-                        logger.exception("Unable to save new upload intent")
-                        # Begin has not run, so there is no allocation to preserve.
-                        del self.records[uid]
-                        del self.upload_locks[uid]
-                        try:
-                            await self._save_settled()
-                        except OSError:
-                            logger.exception("Unable to persist upload intent rollback")
-                        message = "Upload index could not be saved"
-                        if exc.errno in (errno.ENOSPC, errno.EDQUOT):
-                            raise RouteError(507, "no_space", message) from exc
-                        raise RouteError(500, "io_error", message) from exc
+                while True:
+                    async with self.lock:
+                        match = (
+                            self._keyed_record(
+                                session_id, environment_id, declaration, idempotency_key
+                            )
+                            if idempotency_key is not None
+                            else None
+                        )
+                        if match is None:
+                            opened = [
+                                r
+                                for r in self.records.values()
+                                if r.session_id == session_id and r.result is None
+                            ]
+                            if (
+                                len(opened) >= self.limits.max_open_uploads
+                                or sum(r.size for r in opened) + declaration.size
+                                > self.limits.max_open_bytes
+                            ):
+                                raise RouteError(
+                                    429, "upload_limit", "Session upload limit reached"
+                                )
+                            self.upload_locks[uid] = creation_lock
+                            self.records[uid] = record
+                            try:
+                                await self._save_settled()
+                            except OSError as exc:
+                                logger.exception("Unable to save new upload intent")
+                                # Begin has not run, so there is no allocation to preserve.
+                                del self.records[uid]
+                                del self.upload_locks[uid]
+                                try:
+                                    await self._save_settled()
+                                except OSError:
+                                    logger.exception("Unable to persist upload intent rollback")
+                                message = "Upload index could not be saved"
+                                if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+                                    raise RouteError(507, "no_space", message) from exc
+                                raise RouteError(500, "io_error", message) from exc
+                            break
+                    assert idempotency_key is not None
+                    replay = await self._replay_create(
+                        session_id, environment_id, declaration, idempotency_key, directory
+                    )
+                    if replay is not None:
+                        return replay
                 try:
                     result = await self._call(
                         uid,
@@ -980,10 +1085,20 @@ def register_upload_routes(
         )
 
     @app.post(base)
-    async def create(session_id: str, environment_id: str, request: Request) -> JSONResponse:
+    async def create(
+        session_id: str,
+        environment_id: str,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> JSONResponse:
         try:
             declaration = UploadDeclaration.model_validate(await request.json())
-            result = await manager.create(session_id, environment_id, declaration)
+            result = await manager.create(
+                session_id,
+                environment_id,
+                declaration,
+                idempotency_key,
+            )
             return JSONResponse(status_code=201, content=result)
         except (ValidationError, ValueError):
             return RouteError(400, "invalid_request", "Invalid upload declaration").response()

@@ -65,9 +65,12 @@ async def client(tmp_path: Path) -> AsyncIterator[httpx.AsyncClient]:
     env.close()
 
 
-async def create(client: httpx.AsyncClient, **fields: object) -> httpx.Response:
+async def create(
+    client: httpx.AsyncClient, *, headers: dict[str, str] | None = None, **fields: object
+) -> httpx.Response:
     return await client.post(
         BASE,
+        headers=headers,
         json={
             "dir": "",
             "name": "payload.bin",
@@ -2823,3 +2826,126 @@ async def test_upload_resolver_errors_match_filesystem(
             assert not manager.state_path.exists()
         finally:
             await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_create_key_replays_offset_without_charging_limit(client: httpx.AsyncClient) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    manager.limits = UploadLimits(max_open_uploads=1)
+    headers = {"Idempotency-Key": "a" * 32}
+    first = await create(client, headers=headers, dir=".")
+    assert first.status_code == 201
+    uid = first.json()["upload_id"]
+    assert (
+        await client.patch(BASE + "/" + uid + "?created_by=alice", headers=HEADERS, content=b"ab")
+    ).status_code == 204
+    replay = await create(client, headers=headers, dir=".")
+    assert replay.status_code == 201
+    assert replay.json()["upload_id"] == uid
+    assert replay.json()["offset"] == 2
+    assert len(manager.records) == 1
+    assert (await create(client, headers={"Idempotency-Key": "b" * 32})).status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_create_key_rejects_changed_declaration(client: httpx.AsyncClient) -> None:
+    headers = {"Idempotency-Key": "a" * 32}
+    assert (await create(client, headers=headers)).status_code == 201
+    changed = await create(client, headers=headers, name="different.bin")
+    assert changed.status_code == 422
+    assert changed.json()["error"]["code"] == "idempotency_key_conflict"
+
+
+@pytest.mark.asyncio
+async def test_create_key_waits_for_pending_begin(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = manager._call
+
+    async def hold_begin(uid, record, op, **kwargs):
+        if op == "begin":
+            entered.set()
+            await release.wait()
+        return await original(uid, record, op, **kwargs)
+
+    monkeypatch.setattr(manager, "_call", hold_begin)
+    headers = {"Idempotency-Key": "a" * 32}
+    first = asyncio.create_task(create(client, headers=headers))
+    await asyncio.wait_for(entered.wait(), 5)
+    duplicate = asyncio.create_task(create(client, headers=headers))
+    try:
+        await asyncio.sleep(0)
+        assert not duplicate.done()
+    finally:
+        release.set()
+    first_response, duplicate_response = await asyncio.gather(first, duplicate)
+    assert first_response.status_code == duplicate_response.status_code == 201
+    assert first_response.json()["upload_id"] == duplicate_response.json()["upload_id"]
+    assert len(manager.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_key_survives_index_restore_and_finished_replay(
+    client: httpx.AsyncClient,
+) -> None:
+    from omnigent.runner.workspace_upload import UploadDeclaration
+
+    manager = client._transport.app.state.workspace_uploads
+    headers = {"Idempotency-Key": "a" * 32}
+    first = await create(client, headers=headers)
+    uid = first.json()["upload_id"]
+    url = BASE + "/" + uid + "?created_by=alice"
+    assert (await client.patch(url, headers=HEADERS, content=b"abc")).status_code == 204
+    completed = await client.post(BASE + "/" + uid + "/complete?created_by=alice")
+    assert completed.status_code == 200
+    replay = await create(client, headers=headers)
+    assert replay.status_code == 201
+    assert replay.json()["upload_id"] == uid
+    assert replay.json()["offset"] == 3
+    fresh = restart(manager)
+    try:
+        assert fresh.records[uid].idempotency_key == "a" * 32
+        restored = await fresh.create(
+            "session",
+            DEFAULT_ENVIRONMENT_ID,
+            UploadDeclaration(dir="", name="payload.bin", size=3, created_by="alice"),
+            "a" * 32,
+        )
+        assert restored["upload_id"] == uid
+        assert restored["offset"] == 3
+    finally:
+        await fresh.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["A" * 32, "a" * 31, "g" * 32, "a" * 33])
+async def test_invalid_create_key_is_bad_request(client: httpx.AsyncClient, key: str) -> None:
+    response = await create(client, headers={"Idempotency-Key": key})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_create_key_reports_unresolved_begin_without_spinning(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runner.workspace_upload import RouteError
+
+    manager = client._transport.app.state.workspace_uploads
+    original = manager._call
+
+    async def fail_begin(uid, record, op, **kwargs):
+        if op == "begin":
+            raise RouteError(504, "timeout", "Upload begin timed out")
+        return await original(uid, record, op, **kwargs)
+
+    monkeypatch.setattr(manager, "_call", fail_begin)
+    headers = {"Idempotency-Key": "a" * 32}
+    first = await create(client, headers=headers)
+    assert first.status_code == 504
+    replay = await asyncio.wait_for(create(client, headers=headers), 0.5)
+    assert replay.status_code == 504
+    assert len(manager.records) == 1

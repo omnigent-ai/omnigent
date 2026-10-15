@@ -1036,3 +1036,104 @@ def test_index_work_is_bounded_across_sessions(expired):
         assert index.finish(key, record)
         assert not index.finish(key, record)
         assert not index.sessions
+
+
+@pytest.mark.parametrize("lost_leg", ["browser", "runner"])
+async def test_create_key_recovers_lost_response_without_double_admission(scenario, lost_leg: str):
+    scenario.hard["max_open_uploads"] = 1
+    key = "a" * 32
+    ids: dict[str, str] = {}
+    calls = 0
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.method == "GET":
+            return await scenario.handle(request)
+        scenario.requests.append(request)
+        assert request.headers.get("Idempotency-Key") == key
+        calls += 1
+        uid = ids.setdefault(key, uuid.uuid4().hex)
+        if lost_leg == "runner" and calls == 1:
+            raise httpx.ReadTimeout("runner acknowledgement lost")
+        return httpx.Response(
+            201,
+            json={
+                "upload_id": uid,
+                "offset": 2 if calls == 2 else 0,
+                "chunk_bytes": 1024**2,
+                "expires_at": time.time() + 3600,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://runner"
+    ) as runner:
+        scenario.routing._clients["binary-test"] = runner
+        first = await scenario.client.post(
+            scenario.base,
+            json={"dir": "", "name": "payload.bin", "size": 3},
+            headers={"Idempotency-Key": key},
+        )
+        assert first.status_code == (504 if lost_leg == "runner" else 201)
+        replay = await scenario.client.post(
+            scenario.base,
+            json={"dir": "", "name": "payload.bin", "size": 3},
+            headers={"Idempotency-Key": key},
+        )
+        assert replay.status_code == 201, replay.text
+        assert replay.json()["upload_id"] == ids[key]
+        assert replay.json()["offset"] == 2
+        assert len(ids) == 1
+        assert calls == 2
+        assert (
+            await scenario.client.post(
+                scenario.base,
+                json={"dir": "", "name": "other.bin", "size": 3},
+                headers={"Idempotency-Key": "b" * 32},
+            )
+        ).status_code == 429
+        assert calls == 2
+
+
+async def test_create_key_mismatch_is_typed_and_stops_before_runner(scenario):
+    key = "a" * 32
+    first = await scenario.client.post(
+        scenario.base,
+        json={"dir": "", "name": "payload.bin", "size": 3},
+        headers={"Idempotency-Key": key},
+    )
+    assert first.status_code == 201
+    sent = len(scenario.requests)
+    changed = await scenario.client.post(
+        scenario.base,
+        json={"dir": "", "name": "different.bin", "size": 3},
+        headers={"Idempotency-Key": key},
+    )
+    assert changed.status_code == 422
+    assert changed.json()["error"]["code"] == "idempotency_key_conflict"
+    assert len(scenario.requests) == sent
+
+
+async def test_runner_create_key_conflict_passes_through_typed(scenario):
+    scenario.failure = httpx.Response(
+        422, json={"error": {"code": "idempotency_key_conflict", "message": "Key changed"}}
+    )
+    response = await scenario.client.post(
+        scenario.base,
+        json={"dir": "", "name": "payload.bin", "size": 3},
+        headers={"Idempotency-Key": "a" * 32},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "idempotency_key_conflict"
+
+
+@pytest.mark.parametrize("key", ["A" * 32, "a" * 31, "g" * 32])
+async def test_invalid_create_key_is_rejected_before_runner(scenario, key: str):
+    response = await scenario.client.post(
+        scenario.base,
+        json={"dir": "", "name": "payload.bin", "size": 3},
+        headers={"Idempotency-Key": key},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert not any(request.method == "POST" for request in scenario.requests)
