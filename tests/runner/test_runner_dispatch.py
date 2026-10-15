@@ -9749,17 +9749,19 @@ async def test_approval_event_flattened_for_harness_scaffold() -> None:
 
 
 @pytest.mark.asyncio
-async def test_approval_event_without_content_flattened() -> None:
-    """A decline verdict with no form content flattens without a ``content`` key."""
+@pytest.mark.parametrize("owner", ["harness", "runner", "settled"])
+async def test_approval_event_without_content_flattened(owner: str) -> None:
+    """Only a live runner-owned policy decline interrupts before forwarding."""
+    from omnigent.runner import pending_approvals
     from omnigent.runtime.harnesses._scaffold import ApprovalEvent
 
-    captured: dict[str, Any] = {}
+    captured: list[dict[str, Any]] = []
 
     class _CapturingHarnessClient:
         async def post(
             self, url: str, *, json: dict[str, Any], timeout: float | None = None
         ) -> httpx.Response:
-            captured["body"] = json
+            captured.append(json)
             return httpx.Response(204)
 
     mgr = _FakeProcessManager(harness_client=cast(Any, _CapturingHarnessClient()))
@@ -9767,15 +9769,24 @@ async def test_approval_event_without_content_flattened() -> None:
         process_manager=cast(HarnessProcessManager, mgr),
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    async with _runner_test_client(app) as http:
-        resp = await http.post(
-            "/v1/sessions/conv_y/events",
-            json={"type": "approval", "data": {"elicitation_id": "e2", "action": "decline"}},
-        )
-
-    assert resp.status_code == 204
-    assert captured["body"] == {"type": "approval", "elicitation_id": "e2", "action": "decline"}
-    ApprovalEvent.model_validate(captured["body"])
+    pending = pending_approvals.register("e2") if owner != "harness" else None
+    if owner == "settled":
+        pending_approvals.resolve("e2", False)
+    try:
+        async with _runner_test_client(app) as http:
+            resp = await http.post(
+                "/v1/sessions/conv_y/events",
+                json={"type": "approval", "data": {"elicitation_id": "e2", "action": "decline"}},
+            )
+        assert resp.status_code == 204
+        approval = {"type": "approval", "elicitation_id": "e2", "action": "decline"}
+        expected = [{"type": "interrupt"}, approval] if owner == "runner" else [approval]
+        assert captured == expected
+        ApprovalEvent.model_validate(captured[-1])
+        if pending is not None:
+            assert pending.done() and pending.result().approved is False
+    finally:
+        pending_approvals.cleanup("e2")
 
 
 @pytest.mark.asyncio

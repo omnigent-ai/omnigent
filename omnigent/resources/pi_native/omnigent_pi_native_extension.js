@@ -2,6 +2,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { setTimeout: delay } = require("node:timers/promises");
 
 // Tuning for the TOOL_CALL policy long-poll (see evalNativePolicyHttp).
 //
@@ -156,20 +157,45 @@ async function parkPiExtensionUiHttp(config, request, opts) {
     !config ||
     !config.serverUrl ||
     !config.sessionId ||
-    typeof fetch !== "function"
+    typeof fetch !== "function" ||
+    opts?.signal?.aborted
   ) {
     return null;
   }
-  if (opts && opts.signal && opts.signal.aborted) return null;
   const timeoutMs =
-    opts && typeof opts.timeout === "number" && opts.timeout > 0
+    Number.isFinite(opts?.timeout) && opts.timeout > 0
       ? opts.timeout
-      : null;
+      : _PARK_TOTAL_BUDGET_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const signal = opts?.signal
+    ? AbortSignal.any([controller.signal, opts.signal])
+    : controller.signal;
+  const elicitationId = mintPiUiElicitationId();
+  let verdict = null;
+  try {
+    verdict = await waitPiExtensionUiHttp(config, request, elicitationId, signal);
+    return verdict;
+  } catch (_err) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+    if (!verdict) {
+      // A cancelled dialog will not reattach; settle its card by the same id.
+      void postEventChecked(
+        config,
+        { type: "external_elicitation_resolved", data: { elicitation_id: elicitationId } },
+        AbortSignal.timeout(5_000),
+      ).catch(() => {});
+    }
+  }
+}
+
+async function waitPiExtensionUiHttp(config, request, elicitationId, signal) {
   const relay = relayCredentials();
   const url = relay
     ? `${relay.url}/hook/pi/extension-ui`
     : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/hooks/pi-extension-ui`;
-  const elicitationId = mintPiUiElicitationId();
   const body = JSON.stringify({ elicitation_id: elicitationId, request });
   const reqHeaders = relay
     ? {
@@ -180,61 +206,50 @@ async function parkPiExtensionUiHttp(config, request, opts) {
         "content-type": "application/json",
         ...freshAuthHeaders(config.authHeaders),
       };
-
-  const parkDeadline =
-    Date.now() + (timeoutMs != null ? timeoutMs : _PARK_TOTAL_BUDGET_MS);
   let transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
   let transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
 
   while (true) {
-    if (opts && opts.signal && opts.signal.aborted) return null;
-    if (Date.now() >= parkDeadline) return null;
-    const controller =
-      typeof AbortController === "function" ? new AbortController() : null;
-    const remaining = parkDeadline - Date.now();
-    const attemptMs = Math.min(_PARK_ATTEMPT_TIMEOUT_MS, Math.max(remaining, 1));
-    const timer = controller
-      ? setTimeout(() => controller.abort(), attemptMs)
-      : null;
+    signal.throwIfAborted();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), _PARK_ATTEMPT_TIMEOUT_MS);
+    const attemptSignal = AbortSignal.any([signal, controller.signal]);
     const attemptStart = Date.now();
     let resp;
+    let text;
     try {
       resp = await fetch(url, {
         method: "POST",
         headers: reqHeaders,
         body,
-        ...(controller ? { signal: controller.signal } : {}),
+        signal: attemptSignal,
       });
+      text = await resp.text();
     } catch (_err) {
-      if (timer) clearTimeout(timer);
-      const aborted = !!(controller && controller.signal.aborted);
-      const elapsed = Date.now() - attemptStart;
-      const reattachFloor = Math.min(
-        _PARK_REATTACH_MIN_ELAPSED_MS,
-        Math.max(attemptMs - 5_000, attemptMs * 0.8),
-      );
-      const isLongPollReattach = aborted && elapsed >= reattachFloor;
+      signal.throwIfAborted();
+      const isLongPollReattach =
+        controller.signal.aborted &&
+        Date.now() - attemptStart >= _PARK_REATTACH_MIN_ELAPSED_MS;
       if (isLongPollReattach) {
-        if (Date.now() >= parkDeadline) return null;
         transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
         transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
         continue;
       }
       if (Date.now() + transientBackoff >= transientDeadline) return null;
-      await sleep(transientBackoff);
+      await delay(transientBackoff, undefined, { signal });
       transientBackoff = Math.min(
         transientBackoff * 2,
         _TRANSIENT_RETRY_MAX_BACKOFF_MS,
       );
       continue;
     } finally {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
     }
-
+    signal.throwIfAborted();
     if (!resp.ok) {
       if (resp.status >= 500) {
         if (Date.now() + transientBackoff >= transientDeadline) return null;
-        await sleep(transientBackoff);
+        await delay(transientBackoff, undefined, { signal });
         transientBackoff = Math.min(
           transientBackoff * 2,
           _TRANSIENT_RETRY_MAX_BACKOFF_MS,
@@ -243,31 +258,15 @@ async function parkPiExtensionUiHttp(config, request, opts) {
       }
       return null;
     }
-
-    let text;
-    try {
-      text = await resp.text();
-    } catch (_err) {
-      return null;
-    }
     if (!text) {
-      // Empty 200: timeout/disconnect. Re-attach with the same id.
-      if (Date.now() >= parkDeadline) return null;
+      // Reattach to the same prompt after an empty long-poll response.
       transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
       transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
-      // A server that answers immediately (consumed tombstone, a proxy that
-      // ends the long poll) would otherwise spin here with no delay.
-      await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS);
+      await delay(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS, undefined, { signal });
       continue;
     }
-    let json;
-    try {
-      json = JSON.parse(text);
-    } catch (_err) {
-      return null;
-    }
-    if (json && typeof json.action === "string") return json;
-    return null;
+    const json = JSON.parse(text);
+    return json && typeof json.action === "string" ? json : null;
   }
 }
 

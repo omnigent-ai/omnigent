@@ -623,6 +623,68 @@ async function testEditorHonoursOpts() {
   assert("aborted editor posted no park", hookCalls.length === 0, JSON.stringify(hookCalls));
 }
 
+async function testPendingDialogCancellation() {
+  for (const phase of ["headers", "body", "backoff"]) {
+    for (const cause of ["abort", "timeout"]) {
+      const h = makeHarness({ captureEvents: true });
+      const captureFetch = global.fetch;
+      let started;
+      const ready = new Promise((resolve) => { started = resolve; });
+      let release = () => {};
+      let requestId;
+      let calls = 0;
+      const waitForAbort = (signal) => new Promise((resolve, reject) => {
+        release = () => resolve("");
+        signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        started();
+      });
+      global.fetch = async (url, opts) => {
+        if (!String(url).endsWith("/hooks/pi-extension-ui")) return captureFetch(url, opts);
+        requestId = JSON.parse(opts.body).elicitation_id;
+        calls += 1;
+        if (phase === "backoff") started();
+        if (phase === "headers") await waitForAbort(opts.signal);
+        return {
+          ok: phase !== "backoff", status: phase === "backoff" ? 503 : 200,
+          text: async () => {
+            if (phase === "body") await waitForAbort(opts.signal);
+            started();
+            return "";
+          },
+        };
+      };
+      const { ui } = mockUi();
+      const ctx = { mode: "tui", ui };
+      await h.handlers.session_start({}, ctx);
+      const controller = new AbortController();
+      const pending = ctx.ui.confirm("Proceed?", "Pending question", {
+        signal: controller.signal, timeout: cause === "timeout" ? 100 : 5000,
+      });
+      let watchdog;
+      try {
+        await ready;
+        if (cause === "abort") controller.abort();
+        const result = await Promise.race([
+          pending,
+          new Promise((resolve) => { watchdog = setTimeout(() => resolve("still pending"), 1000); }),
+        ]);
+        const resolved = h.postedEvents.filter((event) => event.type === "external_elicitation_resolved");
+        assert(`${cause} during ${phase} settles the dialog`, result === false, String(result));
+        assert(`${cause} during ${phase} clears its exact card`,
+          resolved.length === 1 && resolved[0].data.elicitation_id === requestId,
+          JSON.stringify(resolved));
+        assert(`${cause} during ${phase} does not repark`, calls === 1, String(calls));
+      } finally {
+        clearTimeout(watchdog);
+        release();
+        controller.abort();
+        await pending;
+        global.fetch = captureFetch;
+      }
+    }
+  }
+}
+
 async function testRpcModeDoesNotWrapUi() {
   const h = makeHarness({ captureEvents: true });
   global.fetch = async () => ({ ok: true, status: 204, text: async () => "" });
@@ -752,6 +814,7 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
     await testTuiWrapReparksSameElicitationId();
     await testEmptyReparkBacksOff();
     await testEditorHonoursOpts();
+    await testPendingDialogCancellation();
     await testRpcModeDoesNotWrapUi();
     await testNotifyAndSetStatusStayUnwrapped();
   } finally {
