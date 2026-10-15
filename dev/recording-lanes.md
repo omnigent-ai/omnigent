@@ -56,6 +56,17 @@ Recording is **best-effort**:
   that cannot start.
 - Text-only CLI output is not a reason to skip recording. A missing recording
   from an earlier run is not a reason either.
+- A clip that stops short of the full journey is still footage. If a re-record
+  fails, is cut off, or leaves only a truncated file, declare the best complete
+  clip you still have with a caption that states its limits (for example
+  `… → stops before the Subagents panel opens`). Reserve `recordings: []` for a
+  facet with no usable clip at all.
+- Name the blocker you observed — the command you ran, the limit you requested,
+  and the error it returned — not an inferred platform ceiling. `sys_os_shell`
+  takes `timeout` (seconds; default 120). If a run ends at a limit you did not
+  request, verify the `timeout` argument you passed and inspect the returned
+  error before attributing the stop to a platform ceiling; when the argument was
+  wrong, fix the call and rerun.
 - Do not block the verdict, fix, or PR because footage is missing or rejected.
   Explain the gap and continue with the available evidence.
 
@@ -335,6 +346,14 @@ already displayed. Keep backend findings in `evidence`; describe the visible
 outcome in the caption. Check each claimed moment, especially claims that text
 or controls are absent. If the frames contradict the caption, correct it or
 re-record.
+
+**Keep the last complete clip until its replacement is finalized.** Point the
+re-record at a fresh raw directory (for example `recordings/<slug>/raw-2/`) and
+leave the stable `<kind>-<facet>.<ext>` in place while it runs. Swap the stable
+path only after the new take has finished and its last frame checks out, then
+delete the superseded clip. Never delete the earlier clip as part of the re-run
+command: if the re-run is killed, times out, or produces a truncated file, the
+earlier clip is the footage you attach, with a caption that states its limits.
 
 ### Timed captions inside the video
 
