@@ -1,0 +1,139 @@
+# Claude program status prototype
+
+OMNI-12244 proposes using Claude Code's OSC 7501 reports to drive the working
+indicator. This prototype is disabled by default. It does not replace completion
+hooks or enable the protocol for other harnesses.
+
+## What determines working status today
+
+| Harness path | Source of status |
+| --- | --- |
+| Claude native | `sessions/<pid>.json` under Claude's config directory, polled every 200 ms; pane activity when that file is unavailable. Busy/waiting mean running; idle/shell mean idle. `waitingFor` supplies the blocked reason. |
+| Pi, Cursor, Kiro, Goose, Qwen, Kimi, Hermes native terminals | Shared pane watcher: changing screen means running; one second of quiet means idle. Harness forwarders can also publish status. |
+| Codex native, OpenCode | Structured app-server events already supply lifecycle state. |
+| SDK harnesses | Their runtime turn lifecycle supplies status; this terminal prototype does not apply. |
+
+The UI considers running/waiting active and also accounts for background shells.
+Claude's Stop/StopFailure hooks still deliver task outcomes and wake parents.
+A display status report cannot replace those messages.
+
+The file API is undocumented. Screen inference can mistake a quiet model/tool
+operation for idle, or a prompt repaint for work. OSC 7501 explicitly distinguishes
+idle, working, done, blocked and error, with optional reasons and child records.
+Claude Code 2.1.295 introduced support; the standard CI pin is still 2.1.266
+(the separate billing-notice lane uses 2.1.278).
+
+## Transport decision
+
+A first prototype observed raw tmux control-mode output and injected capability
+replies. A synthetic peer passed, but actual Claude 2.1.295 rejected it: tmux
+answered the following primary device-attributes query before the observer could
+reply to OSC 7501. Claude treats that ordering as “unsupported.” `capture-pane`
+loses OSC sequences altogether.
+
+The revised prototype places a small PTY relay before tmux's output parser:
+
+```mermaid
+flowchart LR
+    CLI[Claude inside existing sandbox] <-->|inner PTY| Relay[Program status relay]
+    Relay <-->|input, output, resize| Tmux[Managed tmux pane]
+    Tmux <--> Viewer[Terminal viewers]
+    Relay --> Snapshot[Private atomic root snapshot]
+    Snapshot --> Watcher[Runner status watcher]
+    Watcher --> UI[Existing session status publisher]
+```
+
+The relay runs outside the existing sandbox launcher, inside the managed tmux
+pane. It answers and consumes only OSC 7501 capability queries before forwarding
+remaining bytes to tmux. Other output passes through unchanged, including status
+reports for capable viewers. It forwards stdin, terminal dimensions and signals,
+reaps the command, and preserves its numeric exit code. It uses the runner's
+Python interpreter and a standard-library-only script.
+
+This adds a process and a PTY to an opted-in terminal. The tradeoff is reliable
+negotiation with unmodified tmux and no dependency on browser attachment. A
+future tmux implementation of OSC 7501 could remove that need.
+
+## Ownership and fallback
+
+Set `OMNIGENT_CLAUDE_OSC_STATUS=1` in the **runner process environment**, then
+create a new Claude-native session. The flag applies only to the Claude terminal
+role; it is not serialized in portable agent specs. Existing sessions retain
+their launch configuration. Unset the flag and restart the runner to disable it.
+
+| Claude root report | Published status |
+| --- | --- |
+| working | running |
+| blocked | running with a safe message or permission/question/auth reason |
+| idle, done | idle |
+| error | failed |
+| clear or full reset | Relinquish OSC ownership; try the existing file, then pane inference |
+
+Only root reports identifying `app=claude-code` own the session indicator.
+Child records and other applications cannot overwrite it. This is a Claude
+status consumer, not a complete general-purpose terminal record implementation:
+child-record display, progress and durable done/error notifications are deferred.
+
+A valid root snapshot persists through silence; no heartbeat or freshness timeout
+is imposed. Tunnel resync republishes it. OSC 133 A clears working/blocked/idle;
+RIS clears all state. Relay/process exit releases observation to the existing
+terminal-exit handling. The legacy file lookup uses the inner command PID instead
+of the relay's pane PID, retaining the existing Claude session-ID scan fallback.
+Snapshot write failure must not terminate the command.
+
+Parsing is incremental, bounded to 4096 bytes, and handles BEL/ST terminators,
+fragmentation, cancellation, oversized strings and nested control strings. It
+validates per-field limits, base64 and single-line text before applying a report.
+Report text is display data, never an instruction or input to the terminal.
+Invisible formatting characters are removed from the displayed blocked reason.
+
+## Verification and acceptance
+
+Run the focused suite with retries disabled:
+
+```sh
+uv run --no-sync pytest \
+  tests/terminals/test_program_status.py \
+  tests/runner/test_resource_registry.py \
+  tests/inner/test_terminal.py \
+  tests/terminals/test_launch_failure_cleanup.py \
+  tests/harnesses/claude_native/test_claude_native_status_file.py \
+  --reruns 0 -n 4 --dist loadfile -q
+```
+
+The runner scenario launches a protocol peer through the real registries, tmux
+and relay, both unsandboxed and in the available native sandbox. It sends the
+capability query and device-attributes query together and requires the OSC reply
+first. It covers a non-emitting peer, conflicting legacy state, elapsed-time
+silence, blocked input, resize/input forwarding, root/child isolation, clear,
+error, resync and process exit. Existing terminal scenarios cover final output,
+exit codes and cancellation with and without the relay. Parser matrices stay at
+the byte-stream layer. These peers do not substitute for a real Claude canary.
+
+Before activation, verify with Claude 2.1.295 or later in an isolated dev runner:
+
+1. Enable the flag for that runner and start a new Claude-native session.
+2. Submit a task with a long quiet tool operation. The indicator should stay
+   working while the operation runs, including after closing and reopening the
+   terminal viewer.
+3. Trigger a permission or question prompt. Confirm the blocked reason appears;
+   answer it and confirm work resumes. Cancel another turn and confirm idle.
+4. Complete a turn and verify both idle display and the normal final message.
+   Reconnect the runner tunnel and verify the state is restored.
+5. Repeat without the flag and with an older/non-emitting Claude version to check
+   the existing fallback. Do not set `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` when
+   testing OSC: Claude also disables program status with that setting.
+
+The draft PR records the exact candidate, actual CLI checks and remaining gaps.
+Production acceptance requires Linux/bwrap, managed credential/proxy settings,
+real-provider turns, and web/desktop/mobile viewer checks. This prototype does
+not claim those paths from local parser or tmux results. A separate change should
+upgrade CI's Claude pin and decide activation after that evidence is available.
+
+## Sources
+
+- [OSC 7501 specification](https://www.superlogical.com/rex/docs/build/program-status)
+- [Program status rationale](https://mitchellh.com/writing/program-status-osc7501)
+- [Claude Code 2.1.295 release notes](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md#21295)
+- [Legacy Claude status reader](../omnigent/harnesses/claude_native/status_file.py)
+- [Runner status arbitration](../omnigent/runner/resource_registry.py)
