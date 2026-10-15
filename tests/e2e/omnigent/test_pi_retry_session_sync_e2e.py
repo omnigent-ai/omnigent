@@ -127,17 +127,34 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
         "omnigent.onboarding.providers.find_catalog_models",
         lambda _: [ModelInfo(name=mock_model, provider="openai", supports_reasoning=True)],
     )
+    gateway_chat = databricks and wire_api == "chat"
+    # The gateway deliberately repeats the tool name as its call ID across turns.
+    tool = {
+        "call_id": "remember" if gateway_chat else "remember-1",
+        "name": "remember",
+        "arguments": "{}",
+        **({"thoughtSignature": "first-tool-signature"} if gateway_chat else {}),
+    }
+    responses = [
+        {"error": _RETRYABLE_ERROR, "status_code": 503},
+        {"tool_calls": [tool]},
+        {"text": _FIRST_ANSWER, "stream": True},
+        *(
+            [{"tool_calls": [{**tool, "thoughtSignature": "second-tool-signature"}]}]
+            if gateway_chat
+            else []
+        ),
+        {"text": _SECOND_ANSWER, "stream": True},
+    ]
+    if gateway_chat:
+        for response in responses:
+            if "text" in response:
+                response["chat_content"] = [
+                    {"type": "reasoning", "text": "PRIVATE_GATEWAY_REASONING"},
+                    {"type": "text", "text": response["text"]},
+                ]
     reset_mock_llm(mock_llm_server_url)
-    configure_mock_llm(
-        mock_llm_server_url,
-        [
-            {"error": _RETRYABLE_ERROR, "status_code": 503},
-            {"tool_calls": [{"call_id": "remember-1", "name": "remember", "arguments": "{}"}]},
-            {"text": _FIRST_ANSWER, "stream": True},
-            {"text": _SECOND_ANSWER, "stream": True},
-        ],
-        key=mock_model,
-    )
+    configure_mock_llm(mock_llm_server_url, responses, key=mock_model)
 
     # The harness env the runtime emits for an OpenAI-compatible provider.
     monkeypatch.setenv("HARNESS_PI_MODEL", mock_model)
@@ -205,12 +222,9 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     )
 
     requests = get_mock_requests(mock_llm_server_url)
-    assert len(requests) == 4, (
-        f"expected the retry, tool continuation and second prompt; got {len(requests)} "
-        "provider call(s)"
-    )
+    assert len(requests) == (5 if gateway_chat else 4), requests
 
-    assert calls == ["remember"]
+    assert calls == (["remember"] * 2 if gateway_chat else ["remember"])
     if wire_api == "anthropic":
         budgets = [r.get("thinking", {}).get("budget_tokens") for r in requests]
         assert all(isinstance(budget, int) for budget in budgets), budgets
@@ -222,6 +236,26 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
             else r.get("reasoning", {}).get("effort")
             for r in requests
         ]
-        assert efforts == (["high", "high", "high", "low"] if reasoning else [None] * 4)
+        assert efforts == (
+            ["high"] * 3 + ["low"] * (len(requests) - 3) if reasoning else [None] * len(requests)
+        )
     history = json.dumps(requests[-1].get("messages", requests[-1].get("input")))
     assert "REMEMBERED_PI_VALUE" in history and _FIRST_ANSWER in history
+
+    if gateway_chat:
+        wire_calls = [
+            call for message in requests[-1]["messages"] for call in message.get("tool_calls", [])
+        ]
+        assert [call.get("thoughtSignature") for call in wire_calls] == [
+            "first-tool-signature",
+            "second-tool-signature",
+        ]
+        ids = [call["id"] for call in wire_calls]
+        assert len(set(ids)) == 2 and "remember" not in ids
+        result_ids = [
+            message["tool_call_id"]
+            for message in requests[-1]["messages"]
+            if message["role"] == "tool"
+        ]
+        assert result_ids == ids
+        assert "PRIVATE_GATEWAY_REASONING" not in history and "[object Object]" not in history
