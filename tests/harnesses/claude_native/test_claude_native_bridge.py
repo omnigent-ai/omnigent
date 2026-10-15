@@ -10553,6 +10553,21 @@ _SETTINGS_PANEL_PANE = """\
    Type to filter · Enter/↓ to select · ↑ to tabs · Esc to clear
 """
 
+# The details panel of a background shell, opened from the task indicator
+# below the input box. It replaces the input box, and its footer joins the
+# keys that close it into one hint: "Esc/Enter/Space to close".
+_TASK_DETAILS_PANE = """\
+⏺ Started the build in the background.
+──────────────────────────────
+  Shell details
+  Status:   running
+  Runtime:  4m 12s
+  Command:  make test
+  Output:
+  No output available
+  ← to go back · Esc/Enter/Space to close · x to stop
+"""
+
 # A sliver-height pane holding a multi-line draft: Claude Code renders the
 # box's opening rule and the draft's first row, then runs out of screen —
 # the closing rule never makes it on. The composer is live, so requiring
@@ -11172,6 +11187,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         _SHELL_MODE_PANE,
         _REWIND_PANE,
         _SETTINGS_PANEL_PANE,
+        _TASK_DETAILS_PANE,
     ],
     ids=[
         "reverse-search",
@@ -11180,6 +11196,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         "shell-mode",
         "rewind",
         "settings-panel",
+        "task-details-panel",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
