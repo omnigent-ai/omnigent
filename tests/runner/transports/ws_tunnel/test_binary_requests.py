@@ -8,7 +8,7 @@ import json
 import logging
 import socket
 import tracemalloc
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
 import httpx
@@ -813,7 +813,7 @@ async def test_oversized_streaming_binary_body_stops_at_envelope_limit() -> None
     consumed = 0
     source_closed = asyncio.Event()
 
-    async def body() -> AsyncIterator[bytes]:
+    async def body() -> AsyncGenerator[bytes, None]:
         nonlocal consumed
         try:
             for _ in range(RUNNER_TUNNEL_MAX_MESSAGE_BYTES // chunk_size + 2):
@@ -823,11 +823,21 @@ async def test_oversized_streaming_binary_body_stops_at_envelope_limit() -> None
         finally:
             source_closed.set()
 
+    class BodyStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.source = body()
+
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            return self.source
+
+        async def aclose(self) -> None:
+            await self.source.aclose()
+
     async with _tunnel([_CAPABILITY]) as (client, ws, registry):
-        request = client.build_request(
+        request = httpx.Request(
             "PATCH",
-            "/upload",
-            content=body(),
+            "http://runner/upload",
+            stream=BodyStream(),
             extensions={"runner_tunnel_binary_request_body": True},
         )
         header = RequestFrame(
@@ -994,19 +1004,31 @@ async def test_overlimit_cleanup_error_preserves_message(
 ) -> None:
     monkeypatch.setattr(transport_module, "RUNNER_TUNNEL_MAX_MESSAGE_BYTES", 1024 * 1024)
     chunk_size = 64 * 1024
+    source_closed = asyncio.Event()
 
-    async def body() -> AsyncIterator[bytes]:
+    async def body() -> AsyncGenerator[bytes, None]:
         try:
             for _ in range(1024 * 1024 // chunk_size + 2):
                 yield b"x" * chunk_size
         finally:
+            source_closed.set()
             raise ValueError("cleanup failed")
 
+    class BodyStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.source = body()
+
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            return self.source
+
+        async def aclose(self) -> None:
+            await self.source.aclose()
+
     async with _tunnel([_CAPABILITY]) as (client, _, _):
-        request = client.build_request(
+        request = httpx.Request(
             "PATCH",
-            "/upload",
-            content=body(),
+            "http://runner/upload",
+            stream=BodyStream(),
             extensions={"runner_tunnel_binary_request_body": True},
         )
         with pytest.raises(
@@ -1014,6 +1036,84 @@ async def test_overlimit_cleanup_error_preserves_message(
         ) as error:
             await client.send(request)
         assert error.value.request is request
+        assert source_closed.is_set()
+
+
+async def test_overlimit_closes_public_wrapper_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transport_module, "RUNNER_TUNNEL_MAX_MESSAGE_BYTES", 1024)
+
+    class InnerStream:
+        def __init__(self) -> None:
+            self.closed = 0
+            self.sent = False
+
+        def __aiter__(self) -> InnerStream:
+            return self
+
+        async def __anext__(self) -> bytes:
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return b"x" * 2048
+
+        async def aclose(self) -> None:
+            self.closed += 1
+
+    class WrapperStream(httpx.AsyncByteStream):
+        def __init__(self, inner: InnerStream) -> None:
+            self.inner = inner
+            self._stream = inner
+            self.close_calls = 0
+
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            return self.inner
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            await self.inner.aclose()
+
+    async with _tunnel([_CAPABILITY]) as (client, _, registry):
+        inner = InnerStream()
+        stream = WrapperStream(inner)
+        request = httpx.Request(
+            "PATCH",
+            "http://runner/upload",
+            stream=stream,
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        with pytest.raises(httpx.LocalProtocolError, match=r"binary request.*message limit"):
+            await client.send(request)
+
+        assert stream.close_calls == 1
+        assert inner.closed == 1
+        session = registry.get(_RUNNER)
+        assert session is not None
+        assert not session.binary_requests
+
+
+async def test_body_value_error_propagates_and_releases_slot() -> None:
+    failure = ValueError("upstream body read failed")
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"partial"
+        raise failure
+
+    async with _tunnel([_CAPABILITY]) as (client, _, registry):
+        request = client.build_request(
+            "PATCH",
+            "/upload",
+            content=body(),
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        with pytest.raises(ValueError) as error:
+            await client.send(request)
+
+        assert error.value is failure
+        session = registry.get(_RUNNER)
+        assert session is not None
+        assert not session.binary_requests
 
 
 async def test_binary_request_across_consumer_loop() -> None:
