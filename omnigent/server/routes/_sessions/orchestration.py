@@ -373,6 +373,7 @@ from omnigent.server.schemas import (
     ElicitationResult,
     ErrorDetail,
     NativeModelOption,
+    NativeUsageBaseline,
     SessionCreateInput,
     SessionCreateMetadata,
     SessionEventInput,
@@ -1450,8 +1451,6 @@ def _build_session_response(
     harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
     native_usage_baseline = None
     if harness == "pi-native":
-        from omnigent.server.schemas import NativeUsageBaseline
-
         own_usage = conv.session_usage or {}
         cached = int(own_usage.get("cache_read_input_tokens", 0) or 0)
         native_usage_baseline = NativeUsageBaseline(
