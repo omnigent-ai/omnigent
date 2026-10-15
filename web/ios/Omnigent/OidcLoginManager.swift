@@ -103,7 +103,7 @@ final class OidcLoginManager {
       .replacingOccurrences(of: "=", with: "")
   }
 
-  private static func requestTicket(origin: URL, codeChallenge: String) async throws -> Ticket {
+  static func requestTicket(origin: URL, codeChallenge: String) async throws -> Ticket {
     var request = URLRequest(url: endpoint("/auth/cli-login", origin: origin))
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -119,7 +119,7 @@ final class OidcLoginManager {
     return try ticket(from: data, origin: origin)
   }
 
-  private static func pollForToken(
+  static func pollForToken(
     origin: URL, ticket: String, codeVerifier: String
   ) async throws -> String? {
     let clock = ContinuousClock()
