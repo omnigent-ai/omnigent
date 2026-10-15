@@ -131,14 +131,19 @@ def review_attempts(repository, number, head, reviewer, request, default_branch=
                     "workflow_runs",
                 )
             )
-        # Active runs on the first page are returned again by the status pages.
+        # Active runs on the first page are returned again by the status pages,
+        # which are read later, so the later copy (e.g. a rerun) is current.
         # Runs without an id are kept rather than risk dropping an active one.
-        seen, unique = set(), []
+        latest, unique = {}, []
         for run in runs:
-            if run.get("id") not in seen:
+            run_id = run.get("id")
+            if run_id is None:
                 unique.append(run)
-            if run.get("id") is not None:
-                seen.add(run["id"])
+            elif run_id in latest:
+                unique[latest[run_id]] = run
+            else:
+                latest[run_id] = len(unique)
+                unique.append(run)
         runs = unique
     label = {"polly": "Polly", "ocr": "OCR"}[reviewer]
     return [

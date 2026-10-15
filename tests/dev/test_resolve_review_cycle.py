@@ -932,25 +932,30 @@ def test_pull_request_target_run_without_linked_pulls_is_not_this_review():
     assert cycle.active_review_runs("o/r", 7, "a" * 40, "polly", api) == []
 
 
-def test_active_review_on_the_first_page_is_not_reported_twice():
+@pytest.mark.parametrize("first_page_status", ["in_progress", "completed"])
+def test_active_review_on_the_first_page_is_not_reported_twice(first_page_status):
     api = Github()
     ours = {
         "id": 5,
         "event": "workflow_dispatch",
         "head_branch": "main",
-        "status": "in_progress",
+        "status": first_page_status,
+        "run_attempt": 1,
         "display_title": f"Polly #7 @{'a' * 40}",
     }
     api.active_runs["polly-review.yml"] = [ours, *[{"status": "completed"}] * 99]
+    # The status page is read later; for a completed run it shows the rerun.
+    current = {**ours, "status": "queued" if first_page_status == "completed" else "in_progress"}
+    current["run_attempt"] = 2 if first_page_status == "completed" else 1
 
     def request(args):
-        if "/runs?status=in_progress" in args[1]:
-            return {"workflow_runs": [dict(ours)]}
+        if f"/runs?status={current['status']}" in args[1]:
+            return {"workflow_runs": [dict(current)]}
         if "/runs?status=" in args[1]:
             return {"workflow_runs": []}
         return api(args)
 
-    assert cycle.active_review_runs("o/r", 7, "a" * 40, "polly", request) == [ours]
+    assert cycle.active_review_runs("o/r", 7, "a" * 40, "polly", request) == [current]
 
 
 def test_active_review_beyond_recent_hundred_runs_is_still_found():
