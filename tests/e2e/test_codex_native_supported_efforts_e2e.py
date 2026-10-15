@@ -509,7 +509,7 @@ def test_codex_new_preserves_session_settings(codex_effort_rig: _Rig) -> None:
     ) as session:
         try:
             before = _json(rig.api.get(f"/v1/sessions/{session.id}"))
-            assert {key: before[key] for key in settings} == settings
+            assert {key: before.get(key) for key in settings} == settings
             _assert_turn(rig, session, _STANDARD_MODEL, "high", terminal=True)
             original = read_bridge_state(session.bridge)
             assert original is not None
@@ -521,6 +521,8 @@ def test_codex_new_preserves_session_settings(codex_effort_rig: _Rig) -> None:
                 rotated = read_bridge_state(session.bridge)
                 if rotated is not None and rotated.session_id != session.id:
                     break
+                # A slow TUI can drop the first Enter while absorbing the paste.
+                session.tmux("send-keys", "Enter")
                 time.sleep(0.2)
             else:
                 pytest.fail(
