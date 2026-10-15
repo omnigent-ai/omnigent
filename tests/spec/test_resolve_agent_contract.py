@@ -306,6 +306,10 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
 
 def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None:
     instructions = _normalized_resolve_instructions()
+    drive_pr = (_RESOLVE_AGENT / "skills" / "resolve-drive-pr" / "SKILL.md").read_text()
+    assert (
+        "| 4.3, independent Polly and OCR reviews | the shared `otto-pr-review-loop`" in drive_pr
+    )
     review = " ".join(
         {skill.name: skill.content for skill in load(_RESOLVE_AGENT).skills}[
             "otto-pr-review-loop"
