@@ -932,6 +932,90 @@ async def test_binary_envelope_releases_buffer_while_waiting_for_response(
             tracemalloc.stop()
 
 
+async def test_binary_request_closes_custom_stream_once_after_consumption() -> None:
+    class NonIdempotentStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            stream = self
+
+            class Iterator:
+                def __init__(self) -> None:
+                    self.sent = False
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self) -> bytes:
+                    if self.sent:
+                        raise StopAsyncIteration
+                    self.sent = True
+                    return b"payload"
+
+                async def aclose(self) -> None:
+                    await stream.aclose()
+
+            return Iterator()
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            if self.close_calls > 1:
+                raise RuntimeError("stream closed twice")
+
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        stream = NonIdempotentStream()
+        request = httpx.Request(
+            "PATCH",
+            "http://runner/upload",
+            stream=stream,
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        task = asyncio.create_task(client.send(request, stream=True))
+        try:
+            raw = await asyncio.wait_for(ws.recv(), 2)
+            assert isinstance(raw, bytes)
+            request_id = _envelope_header(raw)["id"]
+            assert stream.close_calls == 1
+            await _reply(ws, request_id)
+            response = await asyncio.wait_for(task, 2)
+            assert response.status_code == 204
+            await response.aclose()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        session = registry.get(_RUNNER)
+        assert session is not None
+        assert not session.binary_requests
+
+
+async def test_overlimit_cleanup_error_preserves_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transport_module, "RUNNER_TUNNEL_MAX_MESSAGE_BYTES", 1024 * 1024)
+    chunk_size = 64 * 1024
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            for _ in range(1024 * 1024 // chunk_size + 2):
+                yield b"x" * chunk_size
+        finally:
+            raise ValueError("cleanup failed")
+
+    async with _tunnel([_CAPABILITY]) as (client, _, _):
+        request = client.build_request(
+            "PATCH",
+            "/upload",
+            content=body(),
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        with pytest.raises(
+            httpx.LocalProtocolError, match=r"binary request.*message limit"
+        ) as error:
+            await client.send(request)
+        assert error.value.request is request
+
+
 async def test_binary_request_across_consumer_loop() -> None:
     def consume() -> int:
         async def send() -> int:
