@@ -15,7 +15,8 @@ in the Files drawer.
 - `upload-picker`: multi-select to the browsed folder; keyboard focus returns to
   Upload after selection or cancellation.
 - `upload-tree`: folder drops, file drops to their parent, spring-loaded folders,
-  root drops and Changed-view root drops; clear upload feedback in both themes.
+  root drops and Changed-view root drops; a folder target swaps its icon to Upload
+  and glows, while root targets show a dashed zone in both themes.
 - `upload-tray`: committed progress, cancel, retry, conflict decisions, completion
   and announcements; survives a viewer swap, drawer close and session switch.
 - `upload-gates`: flag off and viewers see no controls; pending permission waits;
@@ -33,7 +34,10 @@ surfaces; Reveal in file manager is available only on a host with that support.
 
 **Uploads in the rail:** choose Upload in the Files header, or drag local files
 onto a folder, a file, the tree's empty space or the header. Rest over a collapsed
-folder to expand it, then drop inside. Changed and search results target the browsed root. Select
+folder for 1000 ms to expand it, then drop inside. File rows inside a folder highlight
+their parent folder; top-level files, empty space, the header and Changed view show
+the dashed workspace drop zone. Search results target the browsed root; Changed
+view targets the workspace root. Select
 Cancel or Retry in Uploads, choose Replace / Keep both / Skip for duplicates,
 open a file or switch sessions while the transfer runs, or close the rail to see
 its persistent progress notification.
@@ -77,11 +81,12 @@ checkout revisions. The feature stays disabled by default.
   `tests/e2e_ui/files/test_workspace_upload_tree.py::test_workspace_upload_tree_large_binary_byte_exact`.
   The separate `test_workspace_upload_tree_isolated_rss` gates server RSS on one
   process: the 200 MiB peak stays at or below baseline + 3 × chunk × in-flight +
-  64 MiB, at most a fixed 32 MiB above a small upload's peak, and RSS settles to
-  baseline + 64 MiB or less within 30 s. Set `WORKSPACE_UPLOAD_TREE_EVIDENCE` to an
+  64 MiB, at most a fixed 32 MiB above a small upload's peak. Within 30 s, Linux
+  RSS or macOS malloc in-use bytes (`heap -s` on the same server pid) settle to a
+  baseline taken the same way + 64 MiB. Set `WORKSPACE_UPLOAD_TREE_EVIDENCE` to an
   external JSON path to retain source and disk SHA-256, and
   `WORKSPACE_UPLOAD_TREE_RSS_EVIDENCE` to retain baseline, small and large peaks,
-  settled RSS, and chunk and concurrency limits.
+  settled RSS and malloc in-use bytes, and chunk and concurrency limits.
 - **Sleeping host-bound runner (own environment):**
   `tests/e2e_ui/files/test_workspace_upload.py::test_workspace_upload_asleep_runner_wakes_without_a_message`.
 - **Desktop shell, Android and iOS:** repeat the picker from the respective Files
@@ -93,11 +98,11 @@ checkout revisions. The feature stays disabled by default.
   drop multiple files into a nested folder plus a binary of at least 50 MiB and
   compare SHA-256 on disk. Record server baseline, small-upload and large-upload
   peak and settled RSS; the large peak must stay at or below baseline + 3 × chunk ×
-  in-flight + 64 MiB and within 32 MiB of the small peak, and RSS must return to
-  baseline + 64 MiB or less within 30 s. Stop for missing credentials, login,
-  new resources or excessive memory. Unavailable
-  lanes and ingress binary-frame checks remain manual gates before enabling
-  the feature by default.
+  in-flight + 64 MiB and within 32 MiB of the small peak. Within 30 s, Linux RSS
+  or macOS malloc in-use bytes must return to baseline + 64 MiB or less. Stop
+  for missing credentials, login, new resources or excessive memory. Unavailable
+  lanes and ingress binary-frame checks remain manual gates before enabling the
+  feature by default.
 
 ## Gotchas
 

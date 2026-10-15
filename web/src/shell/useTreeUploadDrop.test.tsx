@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useRef, useState } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { resolveUploadTarget } from "./WorkspaceUploads";
@@ -34,6 +34,9 @@ function Harness({ enabled = true, onFiles = vi.fn(), onExpand = vi.fn() }) {
         <div data-drop-dir="assets" data-testid="file">
           <span>existing.txt</span>
         </div>
+        <div data-drop-dir="" data-testid="root-file">
+          top.txt
+        </div>
         <span data-testid="space" />
       </div>
       <button type="button" onClick={() => setMounted(!mounted)}>
@@ -42,6 +45,7 @@ function Harness({ enabled = true, onFiles = vi.fn(), onExpand = vi.fn() }) {
       <span data-testid="feedback">
         {active && hover ? `Upload to ${hover.directory}` : "idle"}
       </span>
+      <span data-testid="target-folder">{active && hover?.folderRow?.dataset.dropDir}</span>
       <div data-testid="outside" />
     </>
   );
@@ -63,12 +67,12 @@ it("delegates to newly mounted rows and never uses stale hover to resolve a drop
   expect(screen.getByTestId("feedback")).toHaveTextContent("idle");
 });
 
-it("spring-loads a collapsed folder after 600ms without restarting on repeated dragover", () => {
+it("spring-loads a collapsed folder after 1000ms without restarting on repeated dragover", () => {
   vi.useFakeTimers();
   const onExpand = vi.fn();
   render(<Harness onExpand={onExpand} />);
   fireEvent.dragOver(screen.getByTestId("folder-label"), { dataTransfer: transfer });
-  act(() => vi.advanceTimersByTime(599));
+  act(() => vi.advanceTimersByTime(999));
   expect(onExpand).not.toHaveBeenCalled();
   fireEvent.dragOver(screen.getByTestId("folder-label"), { dataTransfer: transfer });
   act(() => vi.advanceTimersByTime(1));
@@ -93,7 +97,7 @@ it.each(["leave", "scroll", "unmount", "outside", "removed-row", "drop", "end"])
     if (action === "removed-row") fireEvent.click(screen.getByText("Slide window"));
     if (action === "drop") fireEvent.drop(row, { dataTransfer: transfer });
     if (action === "end") fireEvent.dragEnd(row, { dataTransfer: transfer });
-    act(() => vi.advanceTimersByTime(700));
+    act(() => vi.advanceTimersByTime(1000));
     expect(onExpand).not.toHaveBeenCalled();
     if (action !== "unmount") expect(screen.getByTestId("feedback")).toHaveTextContent("idle");
   },
@@ -111,7 +115,7 @@ it.each([false, true])("accepts drops and hover only with the tree gate enabled=
   );
   fireEvent.drop(row, { dataTransfer: transfer });
   expect(onFiles).toHaveBeenCalledTimes(enabled ? 1 : 0);
-  act(() => vi.advanceTimersByTime(700));
+  act(() => vi.advanceTimersByTime(1000));
   expect(onExpand).not.toHaveBeenCalled();
 });
 
@@ -122,7 +126,8 @@ it("file rows target their parent without spring-loading; text drags do nothing"
   render(<Harness onFiles={onFiles} onExpand={onExpand} />);
   fireEvent.dragOver(screen.getByTestId("file"), { dataTransfer: transfer });
   expect(screen.getByTestId("feedback")).toHaveTextContent("Upload to src/assets");
-  act(() => vi.advanceTimersByTime(700));
+  expect(screen.getByTestId("target-folder")).toHaveTextContent("assets");
+  act(() => vi.advanceTimersByTime(1000));
   expect(onExpand).not.toHaveBeenCalled();
   fireEvent.dragEnd(screen.getByTestId("file"), { dataTransfer: transfer });
   const text = { types: ["text/plain"], files: [] };
@@ -130,6 +135,24 @@ it("file rows target their parent without spring-loading; text drags do nothing"
   fireEvent.drop(screen.getByTestId("folder"), { dataTransfer: text });
   expect(onFiles).not.toHaveBeenCalled();
   expect(screen.getByTestId("feedback")).toHaveTextContent("idle");
+});
+
+it("keeps the root drop zone for top-level file rows and empty space", () => {
+  render(<Harness />);
+  for (const target of ["root-file", "space"]) {
+    fireEvent.dragOver(screen.getByTestId(target), { dataTransfer: transfer });
+    expect(screen.getByTestId("target-folder")).toBeEmptyDOMElement();
+    expect(screen.getByTestId("feedback")).toHaveTextContent("Upload to src");
+  }
+});
+
+it("falls back to the named destination when virtualization removes the parent row", async () => {
+  render(<Harness />);
+  fireEvent.dragOver(screen.getByTestId("file"), { dataTransfer: transfer });
+  expect(screen.getByTestId("target-folder")).toHaveTextContent("assets");
+  fireEvent.click(screen.getByText("Slide window"));
+  await waitFor(() => expect(screen.getByTestId("target-folder")).toBeEmptyDOMElement());
+  expect(screen.getByTestId("feedback")).toHaveTextContent("Upload to src/assets");
 });
 
 it("preserves depth after scroll so crossing rows does not clear hover or restart spring-load", () => {
@@ -144,7 +167,7 @@ it("preserves depth after scroll so crossing rows does not clear hover or restar
   fireEvent.dragEnter(folder, { dataTransfer: transfer });
   fireEvent.dragLeave(file, { dataTransfer: transfer });
   expect(screen.getByTestId("feedback")).toHaveTextContent("Upload to src/assets");
-  act(() => vi.advanceTimersByTime(599));
+  act(() => vi.advanceTimersByTime(999));
   fireEvent.dragEnter(screen.getByTestId("folder-label"), { dataTransfer: transfer });
   fireEvent.dragLeave(folder, { dataTransfer: transfer });
   act(() => vi.advanceTimersByTime(1));

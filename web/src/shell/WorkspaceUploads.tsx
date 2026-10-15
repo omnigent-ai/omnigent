@@ -378,13 +378,18 @@ export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
     >
       {children}
       {active && target && context && (
-        <FileDropOverlay
-          container={target}
-          variant="upload"
-          label="Upload to workspace"
-          destination={context.dropDestination}
-          subtext="Saved to this session's files"
-        />
+        <>
+          <span className="sr-only" role="status" aria-live="polite">
+            Upload to {context.dropDestination}
+          </span>
+          <FileDropOverlay
+            container={target}
+            variant="upload"
+            label="Upload to workspace"
+            destination={context.dropDestination}
+            subtext="Saved to this session's files"
+          />
+        </>
       )}
     </div>
   );

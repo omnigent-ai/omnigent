@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -24,25 +26,57 @@ from tests.e2e_ui.files.test_workspace_upload import upload_server_pids as uploa
 from tests.e2e_ui.files.test_workspace_upload import upload_session as upload_session
 
 
-def _assert_label_inside_rail(page: Page) -> None:
-    label = page.get_by_text("Upload to src/assets", exact=True).bounding_box()
-    rail = page.get_by_role("complementary", name="Workspace").bounding_box()
-    assert label is not None and rail is not None
-    assert rail["x"] <= label["x"]
-    assert label["x"] + label["width"] <= rail["x"] + rail["width"] + 1
-    assert rail["y"] <= label["y"]
-    assert label["y"] + label["height"] <= rail["y"] + rail["height"] + 1
+def _assert_folder_cue(page: Page, path: str) -> None:
+    row = page.locator(f'[data-drop-dir="{path}"][data-drop-folder]')
+    expect(row).to_have_attribute("data-upload-hover", "")
+    expect(row.locator("svg.lucide-upload")).to_have_count(1)
+    expect(row.locator("svg.lucide-folder, svg.lucide-folder-open")).to_have_count(0)
+    expect(row.locator("[data-upload-glow]")).to_have_count(1)
+    expect(row).not_to_have_class(re.compile(r"\bring-2\b"))
+    expect(page.locator('[role="status"]').filter(has_text=f"Upload to {path}")).to_have_count(1)
+    expect(page.locator('[data-drop-variant="upload"]')).to_have_count(0)
+
+
+def _folder_name_contrast(page: Page, path: str) -> float:
+    return page.locator(f'[data-drop-dir="{path}"][data-drop-folder] [data-upload-glow]').evaluate(
+        """name => {
+          const canvas = document.createElement('canvas');
+          const context = canvas.getContext('2d');
+          const root = getComputedStyle(document.documentElement);
+          const base = root.getPropertyValue('--background');
+          const pixel = color => {
+            context.clearRect(0, 0, 1, 1);
+            context.fillStyle = base;
+            context.fillRect(0, 0, 1, 1);
+            context.fillStyle = color;
+            context.fillRect(0, 0, 1, 1);
+            return [...context.getImageData(0, 0, 1, 1).data].slice(0, 3);
+          };
+          const luminance = rgb => rgb.map(value => {
+            const linear = value / 255;
+            return linear <= 0.04045 ? linear / 12.92 : ((linear + 0.055) / 1.055) ** 2.4;
+          }).reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index], 0);
+          const foreground = luminance(pixel(getComputedStyle(name).color));
+          const ratio = background => (Math.max(foreground, background) + 0.05) /
+            (Math.min(foreground, background) + 0.05);
+          return Math.min(
+            ratio(luminance(pixel(base))),
+            ratio(luminance(pixel(root.getPropertyValue('--muted'))))
+          );
+        }"""
+    )
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
-def test_workspace_upload_tree_narrow_label(
+def test_workspace_upload_tree_narrow_cue(
     page: Page, upload_session: tuple[str, str, Path], theme: str
 ) -> None:
-    """The floating label stays visible in the smallest rail in either theme."""
+    """The folder cue stays legible in the smallest rail in either theme."""
     _, sid, workspace = upload_session
     nested = workspace / "src" / "assets"
     nested.mkdir(parents=True)
     (nested / "existing.txt").write_text("original")
+    (workspace / "top.txt").write_text("root")
     state = json.dumps(
         [{"id": sid, "state": {"open": True, "widthPx": 240, "rightRailTab": "files"}}]
     )
@@ -56,13 +90,19 @@ def test_workspace_upload_tree_narrow_label(
     rail.get_by_role("button", name="src/", exact=True).click()
     assets = rail.get_by_role("button", name="assets/", exact=True)
     _drag(page, '[data-drop-dir="src/assets"][data-drop-folder]', "dragover")
-    expect(page.get_by_text("Upload to src/assets", exact=True)).to_be_visible()
-    _assert_label_inside_rail(page)
+    _assert_folder_cue(page, "src/assets")
+    assert _folder_name_contrast(page, "src/assets") >= 4.5
     bounds = rail.bounding_box()
     assert bounds is not None and bounds["width"] <= 242
     assert page.locator("html").evaluate("e => e.classList.contains('dark')") == (theme == "dark")
     assert page.evaluate("matchMedia('(prefers-reduced-motion: reduce)').matches")
     expect(assets).to_have_attribute("aria-expanded", "true", timeout=5000)
+    _drag(page, '[data-drop-dir="src/assets"]:not([data-drop-folder])', "dragover")
+    _assert_folder_cue(page, "src/assets")
+    _drag(page, '[data-drop-dir=""]:not([data-drop-folder])', "dragover")
+    expect(page.get_by_text("Upload to workspace", exact=True)).to_be_visible()
+    expect(page.locator('[data-drop-variant="upload"]')).to_have_count(1)
+    expect(page.locator("[data-upload-hover]")).to_have_count(0)
 
 
 def test_workspace_upload_tree_folder_file_and_spring_load(
@@ -82,10 +122,9 @@ def test_workspace_upload_tree_folder_file_and_spring_load(
     assets = rail.get_by_role("button", name="assets/", exact=True)
     expect(assets).to_have_attribute("aria-expanded", "false")
     _drag(page, '[data-drop-dir="src/assets"][data-drop-folder]', "dragover")
-    expect(page.get_by_text("Upload to src/assets", exact=True)).to_be_visible()
-    _assert_label_inside_rail(page)
+    _assert_folder_cue(page, "src/assets")
     expect(page.locator('[data-upload-hover][data-drop-dir="src/assets"]')).to_have_count(1)
-    expect(page.locator('[data-drop-variant="upload"]')).to_have_count(1)
+    expect(page.locator('[data-drop-variant="upload"]')).to_have_count(0)
     expect(assets).to_have_attribute("aria-expanded", "true", timeout=5000)
     _drag(page, '[data-drop-dir="src/assets"][data-drop-folder]', "drop", name="folder-drop.txt")
     tray = rail.get_by_role("region", name="Uploads")
@@ -96,6 +135,8 @@ def test_workspace_upload_tree_folder_file_and_spring_load(
     assert (nested / "folder-drop.txt").read_bytes() == b"rail bytes"
     expect(src).to_have_attribute("aria-expanded", "true")
     expect(assets).to_have_attribute("aria-expanded", "true")
+    _drag(page, '[data-drop-dir="src/assets"]:not([data-drop-folder])', "dragover")
+    _assert_folder_cue(page, "src/assets")
     _drag(
         page,
         '[data-drop-dir="src/assets"]:not([data-drop-folder])',
@@ -110,7 +151,7 @@ def test_workspace_upload_tree_folder_file_and_spring_load(
     section.evaluate("element => { element.scrollTop = 300; }")
     expect(section).to_have_js_property("scrollTop", 300)
     _drag(page, '[data-drop-dir="src/assets"]:not([data-drop-folder])', "dragover")
-    expect(page.get_by_text("Upload to src/assets", exact=True)).to_be_visible()
+    _assert_folder_cue(page, "src/assets")
     _drag(
         page,
         '[data-drop-dir="src/assets"]:not([data-drop-folder])',
@@ -187,7 +228,7 @@ def _drop_tree_files(page: Page, paths: list[Path], done: int, *, progress: str 
                 event,
             )
             if event == "dragover":
-                expect(page.get_by_text("Upload to src/assets", exact=True)).to_be_visible()
+                _assert_folder_cue(page, "src/assets")
         tray = rail.get_by_role("region", name="Uploads")
         if progress:
             expect(tray.get_by_role("progressbar", name=progress)).to_be_visible()
@@ -220,6 +261,21 @@ def _peak_rss(process: psutil.Process, action: Callable[[], None]) -> int:
         stop.set()
         monitor.join(timeout=5)
     return max(samples)
+
+
+def _malloc_in_use(pid: int) -> int:
+    try:
+        result = subprocess.run(
+            ["heap", "-s", str(pid)], capture_output=True, text=True, timeout=10, check=False
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise AssertionError(f"macOS heap -s failed for server pid {pid}: {exc}") from exc
+    if result.returncode != 0:
+        raise AssertionError(f"macOS heap -s failed for server pid {pid}: {result.stderr.strip()}")
+    match = re.search(r"^All zones:\s+\d+ nodes \((\d+) bytes\)\s*$", result.stdout, re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"macOS heap -s omitted All zones in-use bytes for server pid {pid}")
+    return int(match.group(1))
 
 
 def _upload_limits(page: Page, upload_session: tuple[str, str, Path]) -> tuple[int, int]:
@@ -288,15 +344,22 @@ def test_workspace_upload_tree_isolated_rss(
     paths = _tree_sources(tmp_path)
     process = psutil.Process(upload_server_pids[upload_session[0]])
     baseline = process.memory_info().rss
+    darwin = sys.platform == "darwin"
+    baseline_settle = _malloc_in_use(process.pid) if darwin else baseline
     small_peak = _peak_rss(process, lambda: _drop_tree_files(page, [small], 1))
     large_peak = _peak_rss(
         process,
         lambda: _drop_tree_files(page, paths, 4, progress="large.bin upload progress"),
     )
-    settled, started = process.memory_info().rss, time.monotonic()
-    while settled > baseline + _ALLOCATOR_SLACK and time.monotonic() - started < _SETTLE_TIMEOUT_S:
+    settled_rss, started = process.memory_info().rss, time.monotonic()
+    settled = _malloc_in_use(process.pid) if darwin else settled_rss
+    while (
+        settled > baseline_settle + _ALLOCATOR_SLACK
+        and time.monotonic() - started < _SETTLE_TIMEOUT_S
+    ):
         time.sleep(0.25)
-        settled = process.memory_info().rss
+        settled_rss = process.memory_info().rss
+        settled = _malloc_in_use(process.pid) if darwin else settled_rss
     evidence = {
         "lane": "local caller_process, sandbox none",
         "chunk_bytes": chunk,
@@ -306,15 +369,18 @@ def test_workspace_upload_tree_isolated_rss(
         "server_baseline_rss": baseline,
         "server_small_peak_rss": small_peak,
         "server_large_peak_rss": large_peak,
-        "server_settled_rss": settled,
+        "server_settled_rss": settled_rss,
+        "settle_metric": "malloc_in_use" if darwin else "rss",
+        "server_baseline_malloc_in_use": baseline_settle if darwin else None,
+        "server_settled_malloc_in_use": settled if darwin else None,
         "settle_wait_s": round(time.monotonic() - started, 2),
         "plateau_margin": _PLATEAU_MARGIN,
         "rss_ceiling": baseline + 3 * chunk * in_flight + _ALLOCATOR_SLACK,
-        "settle_ceiling": baseline + _ALLOCATOR_SLACK,
+        "settle_ceiling": baseline_settle + _ALLOCATOR_SLACK,
     }
     output = os.environ.get("WORKSPACE_UPLOAD_TREE_RSS_EVIDENCE")
     if output:
         Path(output).write_text(json.dumps(evidence, indent=2))
+    assert settled <= evidence["settle_ceiling"], evidence
     assert large_peak <= evidence["rss_ceiling"], evidence
     assert large_peak - small_peak <= _PLATEAU_MARGIN, evidence
-    assert settled <= evidence["settle_ceiling"], evidence
