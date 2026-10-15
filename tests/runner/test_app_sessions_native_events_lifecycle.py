@@ -4650,6 +4650,58 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_required_terminal_exit_while_idle_logs_its_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An idle exit fails no turn, so its log line is the only record of the cause."""
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
+
+    conv_id = uuid.uuid4().hex
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    publish_exit = app.state.session_resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            publish_exit(
+                TerminalExitEvent(
+                    session_id=conv_id,
+                    terminal_id="terminal_claude_main",
+                    terminal_name="claude",
+                    session_key="main",
+                    lifecycle=TerminalLifecycle.REQUIRED,
+                    command="claude",
+                    last_output="Error: launcher config is unreadable",
+                    exit_status=1,
+                    session_was_idle=True,
+                )
+            )
+        await asyncio.sleep(0)
+        events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "required_terminal_exited_idle"
+    ]
+    assert record.levelno == logging.WARNING
+    assert "Error: launcher config is unreadable" in record.getMessage()
+    assert record.attributes["terminal_exit_status"] == 1
+    assert record.attributes["error_code"] == "required_terminal_exited"
+    assert not [
+        event
+        for event in events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_auxiliary_codex_tui_exit_preserves_app_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
