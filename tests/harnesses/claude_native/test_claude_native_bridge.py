@@ -5458,7 +5458,11 @@ def test_tmux_injections_are_serialized_per_bridge(
         return {"socket_path": "/tmp/tmux.sock", "tmux_target": "claude:0.0"}
 
     monkeypatch.setattr(claude_native_bridge, "_wait_for_tmux_info", wait_for_tmux_info)
-    monkeypatch.setattr(claude_native_bridge, "_restore_occupied_input", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_restore_occupied_input",
+        lambda *_a, **_k: claude_native_bridge._InputBoxReclaim(None, ""),
+    )
     monkeypatch.setattr(
         claude_native_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None
     )
@@ -10246,6 +10250,16 @@ _MODEL_PICKER_PANE = """\
   Enter to set as default · s to use this session only · Esc to cancel
 """
 
+# The same picker over a two-model catalog: short enough that a transcript row
+# sits within a few rows of its footer.
+_COMPACT_MODEL_PICKER_PANE = """\
+  Select model
+  Switch between Claude models. Your pick becomes the default for new sessions.
+  ❯ 1. Default (recommended)         Use the default model (currently Opus 4.8) · $5/$25 per Mtok
+    2. Haiku                         Haiku 4.5 · Fastest for quick answers · $1/$5 per Mtok
+  Enter to set as default · s to use this session only · Esc to cancel
+"""
+
 # The ``/effort`` confirmation, as Claude Code 2.1.222 renders it: the same
 # component as "Switch model?", titled for what is being switched.
 _EFFORT_DIALOG_PANE = """\
@@ -11003,6 +11017,8 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         _SHELL_MODE_PANE,
         _REWIND_PANE,
         _SETTINGS_PANEL_PANE,
+        "❯ No, exit\n" + _MODEL_PICKER_PANE,
+        "  1. No, exit\n" + _REWIND_PANE,
     ],
     ids=[
         "reverse-search",
@@ -11011,6 +11027,8 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         "shell-mode",
         "rewind",
         "settings-panel",
+        "exit-echo-above-picker",
+        "exit-echo-above-rewind",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
@@ -11027,7 +11045,9 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     checkpoint restore, a settings panel changes a setting, and shell mode
     hands the message to bash. The injection must Escape the surface first
     (its own documented dismissal), restoring the empty input box, then
-    deliver the message normally.
+    deliver the message normally. A transcript row that merely reads
+    "No, exit" above the surface is not the trust dialog's option and must
+    not keep the surface from being dismissed.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(
@@ -11220,6 +11240,178 @@ def test_terminal_dialog_headline_ignores_other_panes(pane: str) -> None:
     stays on its own PermissionRequest path.
     """
     assert claude_native_bridge._terminal_dialog_headline(pane) is None
+
+
+@pytest.mark.parametrize("entry", ["message", "slash_command"])
+def test_delivery_never_escapes_the_workspace_trust_dialog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    """
+    The trust dialog's "Esc to cancel" is refused, not pressed.
+
+    Cancelling the dialog quits Claude Code (it exits with status 0), so the
+    reclaim's Escape ended the session it was trying to deliver to. The web
+    message or command is refused with the dialog named instead.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_TRUST_DIALOG_PANE])
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_args: claude_native_bridge._ClaudePaneState(alive=True),
+    )
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog) as excinfo:
+        if entry == "message":
+            inject_user_message(bridge_dir, content="hello from the web")
+        else:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert sends == [], f"Nothing may be typed into the trust dialog; got {sends}."
+    assert str(excinfo.value).startswith(
+        "Claude Code is waiting for an answer in its terminal (Accessing workspace:)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("pane", "offers_exit"),
+    [
+        (_TRUST_DIALOG_PANE, True),
+        (
+            _TRUST_DIALOG_PANE.replace(
+                " Enter to confirm", " Use arrow keys to choose\n Enter to confirm"
+            ),
+            True,
+        ),
+        (
+            _TRUST_DIALOG_PANE.replace(" ❯ No, exit", "│ ❯ No, exit               │").replace(
+                "   Yes, I trust this folder", "│   Yes, I trust this folder │"
+            ),
+            True,
+        ),
+        ("❯ No, exit\n" + _MODEL_PICKER_PANE, False),
+        ("❯ No, exit\n" + _COMPACT_MODEL_PICKER_PANE, False),
+        ("❯ No, exit\n  Yes, I trust this folder\n" + _COMPACT_MODEL_PICKER_PANE, False),
+        ("  1. No, exit\n" + _REWIND_PANE, False),
+        (_MCP_APPROVAL_DIALOG_PANE, False),
+        (_API_KEY_DIALOG_PANE, False),
+        (_PERMISSION_PROMPT_PANE, False),
+        (_SETTINGS_PANEL_PANE, False),
+    ],
+    ids=[
+        "folder-trust",
+        "folder-trust-with-hint-row",
+        "folder-trust-framed-rows",
+        "exit-echo-above-picker",
+        "exit-echo-above-compact-picker",
+        "paired-echo-above-compact-picker",
+        "exit-echo-above-rewind",
+        "mcp-single",
+        "api-key",
+        "permission-prompt",
+        "settings-panel",
+    ],
+)
+def test_exit_option_is_read_from_the_dialog_option_rows(pane: str, offers_exit: bool) -> None:
+    """
+    Only the dialog's own paired "No, exit" / "Yes, …" rows count as a quit option.
+
+    Transcript rows reading "No, exit" (even paired with a "Yes" echo) above a
+    picker or rewind dialog sit above that overlay's own rows, outside the rows
+    read directly under the footer, so those overlays stay dismissible; a hint
+    row between the options and the footer, or box borders around the rows,
+    still leave the pair recognised; dialogs without a quit option are not
+    mistaken for one.
+    """
+    assert claude_native_bridge._exit_option_in_dialog(pane) is offers_exit
+
+
+@pytest.mark.parametrize(
+    "occupied_pane",
+    [
+        "❯ No, exit\n" + _MODEL_PICKER_PANE,
+        "❯ No, exit\n" + _COMPACT_MODEL_PICKER_PANE,
+        "❯ No, exit\n  Yes, I trust this folder\n" + _COMPACT_MODEL_PICKER_PANE,
+    ],
+    ids=[
+        "exit-echo-above-picker",
+        "exit-echo-above-compact-picker",
+        "paired-echo-above-compact-picker",
+    ],
+)
+def test_inject_slash_command_dismisses_an_overlay_below_an_exit_echo(
+    occupied_pane: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A "No, exit" transcript echo above a picker does not block a slash command.
+
+    The picker is still Escaped and the command typed, even when a short picker
+    puts the echo within the rows read under the footer; the refusal that names
+    a quitting dialog is reserved for the dialog's own paired option rows.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [occupied_pane, occupied_pane, _IDLE_PANE, _composer_pane("/effort high"), _IDLE_PANE],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert [args[-1] for args in sends] == ["Escape", "C-u", "/effort high", "Enter"]
+
+
+def test_inject_slash_command_names_the_quitting_dialog_from_the_frame_it_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The refusal describes the frame the reclaim classified, not a later capture.
+
+    A torn (empty) capture right after the reclaim must not downgrade the trust
+    dialog's refusal to the generic "dismiss it" wording, whose advice would
+    quit Claude Code.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_TRUST_DIALOG_PANE, _TRUST_DIALOG_PANE, ""])
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog) as excinfo:
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert sends == []
+    assert str(excinfo.value).startswith(
+        "Claude Code is waiting for an answer in its terminal (Accessing workspace:)"
+    )
+
+
+def test_inject_slash_command_refuses_a_numbered_quitting_dialog_without_a_headline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A quitting dialog is refused by its option pair even without a selector row.
+
+    The headline reader needs the ❯ selector, but the pair alone decides that
+    Escape would quit Claude Code, so the refusal still asks for an answer
+    rather than advising a dismissal.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    numbered = _TRUST_DIALOG_PANE.replace(" ❯ No, exit", " 1. No, exit").replace(
+        "   Yes, I trust this folder", " 2. Yes, I trust this folder"
+    )
+    assert claude_native_bridge._terminal_dialog_headline(numbered) is None
+    sends = _fake_tmux(monkeypatch, [numbered])
+
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog) as excinfo:
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert sends == []
+    assert str(excinfo.value).startswith(
+        "Claude Code is waiting for an answer in its terminal (a startup prompt)"
+    )
 
 
 def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(

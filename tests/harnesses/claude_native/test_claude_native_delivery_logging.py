@@ -97,7 +97,9 @@ def test_delivery_diagnostics(
         "_wait_for_tmux_info",
         lambda *_a, **_k: {"socket_path": "/unused/socket", "tmux_target": "main"},
     )
-    monkeypatch.setattr(bridge, "_restore_occupied_input", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        bridge, "_restore_occupied_input", lambda *_a, **_k: bridge._InputBoxReclaim(None, "")
+    )
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", ready)
     monkeypatch.setattr(bridge, "_run_tmux", run_tmux)
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)

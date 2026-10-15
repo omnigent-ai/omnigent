@@ -404,6 +404,11 @@ _OVERLAY_SURFACE = "an overlay"
 # lacks it is not such a surface — e.g. a launch wrapper's output before
 # Claude Code has drawn its input box — and an Escape cannot clear it.
 _ESCAPE_DISMISS_HINT = re.compile(r"\bEsc to \w", re.IGNORECASE)
+# Workspace-trust choices whose Escape quits Claude Code (see _exit_option_in_dialog).
+_EXIT_OPTION_ROW = re.compile(r"\s*(?:❯\s*)?(?:\d+\.\s*)?No, exit\s*")
+_AFFIRMATIVE_OPTION_ROW = re.compile(r"\s*(?:❯\s*)?(?:\d+\.\s*)?Yes\b.*")
+# Two option rows plus one optional hint row before the footer.
+_DIALOG_OPTION_ROWS = 3
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -4201,7 +4206,7 @@ def inject_user_message(
     # reclaim the input box before waiting on it.
     surface = _restore_occupied_input(
         info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir
-    )
+    ).surface
     if surface is not None and surface != _OVERLAY_SURFACE:
         # An overlay may be launcher output the readiness gate waits through; a
         # box held in another mode never frees itself, and timing out reaps the pane.
@@ -4699,11 +4704,19 @@ def inject_slash_command(
     tmux_target = info["tmux_target"]
     # Same reclaim as inject_user_message: a surface left occupying the
     # composer would swallow the C-u and the typed command.
-    surface = _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
-    if surface is not None:
-        # No readiness gate follows; a blind Enter would answer the dialog.
+    reclaim = _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+    if reclaim.surface is not None:
+        # No readiness gate follows; a blind Enter would answer the dialog. Read
+        # the frame the reclaim classified, not a fresh one that may have torn.
+        if _exit_option_in_dialog(reclaim.pane):
+            # Dismissing this dialog quits Claude Code, so name it instead.
+            headline = _terminal_dialog_headline(reclaim.pane) or "a startup prompt"
+            raise ClaudeTerminalDialog(
+                f"Claude Code is waiting for an answer in its terminal ({headline}), so the "
+                "command was not sent. Open the terminal, answer the prompt, then retry."
+            )
         raise ClaudeTerminalDialog(
-            f"Claude Code's input box is occupied by {surface}, so the command was "
+            f"Claude Code's input box is occupied by {reclaim.surface}, so the command was "
             "not sent. Open the terminal, dismiss it, then retry."
         )
     if has_pending_user_prompt(bridge_dir):
@@ -5741,9 +5754,16 @@ def acknowledge_auto_mode_billing_notice(
         lock.release()
 
 
+class _InputBoxReclaim(NamedTuple):
+    """What :func:`_restore_occupied_input` left on screen, and the frame it read."""
+
+    surface: str | None
+    pane: str
+
+
 def _restore_occupied_input(
     socket_path: str, tmux_target: str, *, bridge_dir: Path | None = None
-) -> str | None:
+) -> _InputBoxReclaim:
     """
     Dismiss a terminal-opened surface occupying Claude's input box.
 
@@ -5761,7 +5781,9 @@ def _restore_occupied_input(
     the web-UI message wins the pane.
 
     Questions and permission prompts are protected by their hook wait markers
-    and visible decision controls; they require an explicit answer.
+    and visible decision controls; they require an explicit answer. So does
+    a startup prompt that offers "No, exit", such as the workspace trust
+    dialog: cancelling it quits Claude Code.
 
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
@@ -5784,9 +5806,11 @@ def _restore_occupied_input(
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
-    :returns: ``None`` once the input box is free (or the capture is torn);
-        otherwise the :func:`_occupying_surface` description of what is
-        still on screen, for the caller to refuse to type into.
+    :returns: ``surface`` is ``None`` once the input box is free (or the
+        capture is torn); otherwise the :func:`_occupying_surface` description
+        of what is still on screen, for the caller to refuse to type into.
+        ``pane`` is the capture that verdict was read from, so a refusal can
+        describe the same frame instead of a fresh, possibly torn, one.
     """
     deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
     last_escape: float | None = None
@@ -5804,10 +5828,10 @@ def _restore_occupied_input(
         )
         if auto_mode_billing_notice_visible(pane):
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
-            return None
+            return _InputBoxReclaim(None, pane)
         surface = _occupying_surface(pane)
         if surface is None:
-            return None
+            return _InputBoxReclaim(None, pane)
         now = time.monotonic()
         if now >= deadline:
             _logger.warning(
@@ -5815,10 +5839,13 @@ def _restore_occupied_input(
                 surface,
                 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S,
             )
-            return surface
+            return _InputBoxReclaim(surface, pane)
         # Nothing an Escape can clear: launcher output before the input box
-        # mounts, or a dialog that offers no dismissal.
-        unclearable = surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane)
+        # mounts, a dialog that offers no dismissal, or a startup prompt whose
+        # cancel quits Claude Code.
+        unclearable = surface == _OVERLAY_SURFACE and (
+            not _ESCAPE_DISMISS_HINT.search(pane) or _exit_option_in_dialog(pane)
+        )
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
             # composer Escape interrupts the running turn, and a single frame
@@ -5830,7 +5857,7 @@ def _restore_occupied_input(
             # torn frame mid-redraw of a dismissible surface does not hand a
             # transient back to a caller that will refuse to type into it.
             if unclearable_seen:
-                return surface
+                return _InputBoxReclaim(surface, pane)
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
             _logger.info("claude-native: dismissing %s covering the input box", surface)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
@@ -6128,9 +6155,7 @@ def _terminal_dialog_headline(pane: str) -> str | None:
     """
     if not pane.strip() or _composer_row(pane) is not None:
         return None
-    lines = [line for line in pane.splitlines() if line.strip()]
-    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
-    region = lines[last_rule + 1 :] if last_rule is not None else lines[-_DIALOG_SCAN_TAIL_LINES:]
+    region = _dialog_region(pane)
     footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
     if footer is None:
         return None
@@ -6140,6 +6165,48 @@ def _terminal_dialog_headline(pane: str) -> str | None:
     if not has_selector and "press enter" not in footer.lower():
         return None
     return " ".join(region[0].strip().strip("│").split())[:120]
+
+
+def _dialog_region(pane: str) -> list[str]:
+    """Non-empty rows below the last box rule, or the pane tail when none is drawn."""
+    lines = [line for line in pane.splitlines() if line.strip()]
+    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
+    return lines[last_rule + 1 :] if last_rule is not None else lines[-_DIALOG_SCAN_TAIL_LINES:]
+
+
+def _exit_option_in_dialog(pane: str) -> bool:
+    """
+    Whether the dialog holding the pane offers to quit Claude Code.
+
+    Its option pair sits directly above the "Enter to … · Esc to …" footer, so
+    only the :data:`_DIALOG_OPTION_ROWS` rows before that footer are read, with
+    any box border stripped as for the headline, and "No, exit" counts only next
+    to its affirmative counterpart ("Yes, I trust this folder", "Yes, I accept").
+    Transcript rows above a ``/model`` picker or the rewind dialog — even a pair
+    echoing both choices — are separated from the footer by that overlay's own
+    rows, so those overlays keep their Escape.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the dialog's option rows pair "No, exit" with a "Yes".
+    """
+    region = _dialog_region(pane)
+    footer = next(
+        (i for i in range(len(region) - 1, -1, -1) if _DIALOG_FOOTER_RE.search(region[i])),
+        None,
+    )
+    if footer is None:
+        return False
+    options = region[max(0, footer - _DIALOG_OPTION_ROWS) : footer]
+    rows = [line.strip().strip("│") for line in options]
+    return any(
+        _EXIT_OPTION_ROW.fullmatch(row)
+        and any(
+            _AFFIRMATIVE_OPTION_ROW.fullmatch(rows[j])
+            for j in (i - 1, i + 1)
+            if 0 <= j < len(rows)
+        )
+        for i, row in enumerate(rows)
+    )
 
 
 def _wait_for_claude_prompt_ready(

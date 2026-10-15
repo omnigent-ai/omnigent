@@ -1775,7 +1775,11 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
             "_wait_for_tmux_info",
             lambda *_a, **_k: {"socket_path": "/unused/socket", "tmux_target": "main"},
         )
-    monkeypatch.setattr(claude_bridge, "_restore_occupied_input", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        claude_bridge,
+        "_restore_occupied_input",
+        lambda *_a, **_k: claude_bridge._InputBoxReclaim(None, ""),
+    )
     monkeypatch.setattr(claude_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_bridge, "_run_tmux", run_tmux)
     monkeypatch.setattr(claude_bridge, "_capture_pane", lambda *_a: pane)
