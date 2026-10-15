@@ -8,11 +8,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from sqlalchemy import event, insert, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import SqlHost, SqlUser, current_workspace_id, workspace_scope
-from omnigent.db.utils import get_or_create_engine, now_epoch
+from omnigent.db.utils import get_or_create_engine, now_epoch, run_write_transaction
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import (
@@ -760,7 +761,7 @@ def test_reservation_is_durable_offline_and_tokenless(host_store: HostStore, db_
     assert reserved.sandbox_provider == "modal"
     assert reserved.sandbox_id is None
     assert not host_store.is_online(_RESERVED_HOST_ID)
-    with host_store._session("test_reservation_credentials") as session:
+    with Session(get_or_create_engine(db_uri)) as session:
         row = session.get(SqlHost, (current_workspace_id(), _RESERVED_HOST_ID))
         assert row is not None
         assert row.token_hash is None
@@ -852,9 +853,10 @@ def test_stale_request_cannot_reserve_host(host_store: HostStore) -> None:
 
 @pytest.mark.parametrize("operation", ["reserve", "bind"])
 def test_sandbox_metadata_cannot_cross_account_generation(
-    host_store: HostStore, operation: str
+    host_store: HostStore, db_uri: str, operation: str
 ) -> None:
-    with host_store._engine.begin() as connection:
+    engine = get_or_create_engine(db_uri)
+    with engine.begin() as connection:
         connection.execute(
             insert(SqlUser).values(
                 workspace_id=current_workspace_id(),
@@ -863,7 +865,7 @@ def test_sandbox_metadata_cannot_cross_account_generation(
             )
         )
     reserved = _reserve(host_store)
-    with host_store._engine.begin() as connection:
+    with engine.begin() as connection:
         connection.execute(
             update(SqlUser)
             .where(
@@ -908,6 +910,52 @@ def test_connection_racing_reservation_keeps_managed_classification(host_store: 
     assert host.sandbox_provider == "modal"
     assert host.configured_harnesses == {"codex": True}
     assert host_store.is_online(_RESERVED_HOST_ID)
+
+
+@pytest.mark.parametrize("loser", ["reservation", "connection"])
+def test_insert_conflict_retry_adopts_the_competing_row(
+    host_store: HostStore, monkeypatch: pytest.MonkeyPatch, loser: str
+) -> None:
+    """
+    Reservation and connect both insert when the host row is missing. SQLite
+    serializes writers, so the lost race is injected: the loser's first
+    transaction fails after the other side committed, and its retry must adopt
+    that row rather than raise or insert a duplicate.
+    """
+    operation = "reserve_sandbox_host" if loser == "reservation" else "upsert_host_on_connect"
+    attempts: list[str] = []
+
+    def connect() -> Host:
+        return host_store.upsert_on_connect(
+            _RESERVED_HOST_ID,
+            "managed-host",
+            "alice@example.test",
+            configured_harnesses={"codex": True},
+        )
+
+    def lose_first_attempt(session_maker, operation_name, callback, **kwargs):
+        if operation_name == operation:
+            attempts.append(operation_name)
+            if len(attempts) == 1:
+                if loser == "reservation":
+                    connect()
+                else:
+                    assert _reserve(host_store) is not None
+                raise IntegrityError(
+                    "UNIQUE constraint failed: hosts.workspace_id, hosts.host_id",
+                    params={"host_id": _RESERVED_HOST_ID},
+                    orig=Exception("duplicate primary key"),
+                )
+        return run_write_transaction(session_maker, operation_name, callback, **kwargs)
+
+    monkeypatch.setattr("omnigent.stores.host_store.run_write_transaction", lose_first_attempt)
+    host = _reserve(host_store) if loser == "reservation" else connect()
+    assert attempts == [operation, operation]
+    assert host is not None
+    assert host.status == "online"
+    assert host.sandbox_provider == "modal"
+    assert host.configured_harnesses == {"codex": True}
+    assert host_store.get_host(_RESERVED_HOST_ID) == host
 
 
 @pytest.mark.parametrize("connect_first", [False, True])
