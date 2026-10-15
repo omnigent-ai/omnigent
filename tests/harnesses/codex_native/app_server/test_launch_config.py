@@ -16,10 +16,13 @@ try:
     import tomllib
 except ImportError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
+from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.codex_native.app_server import (
+    CodexDatabricksProfileMissingError,
     build_codex_native_server,
     codex_terminal_env,
 )
+from omnigent.runner.native.orchestration import _native_terminal_start_error_payload
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
     _test_app_server,
@@ -48,7 +51,7 @@ def test_build_codex_native_server_profile_error_names_profile(
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing-databrickscfg"))
 
-    with pytest.raises(OSError, match="profile 'oss'"):
+    with pytest.raises(OSError, match="profile 'oss'") as caught:
         build_codex_native_server(
             socket_path=tmp_path / "codex.sock",
             codex_home=tmp_path / "codex-home",
@@ -59,6 +62,15 @@ def test_build_codex_native_server_profile_error_names_profile(
             ap_server_url=None,
             ap_auth_headers={},
         )
+
+    # The person must fix the profile, so the failure is attributed to config
+    # and its message names the fix.
+    assert isinstance(caught.value, CodexDatabricksProfileMissingError)
+    assert classify_exception(caught.value) == (ErrorCategory.CONFIG, ErrorImpact.BLOCKING)
+    assert "databricks auth login --profile oss" in str(caught.value)
+    payload = _native_terminal_start_error_payload(caught.value, "Codex", session_id="conv_1")
+    assert str(caught.value) in payload["message"]
+    assert "see the runner log" not in payload["message"]
 
 
 def test_build_codex_native_server_uses_profile_host_without_static_token(
