@@ -181,6 +181,11 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
     return _materialize_bytes(raw_bytes, filename, bridge_dir)
 
 
+def attachment_content_digest(raw_bytes: bytes) -> str:
+    """Return the content digest carried by native cache filenames."""
+    return hashlib.sha256(raw_bytes).hexdigest()[:12]
+
+
 def materialize_text(text: str, bridge_dir: Path) -> Path | None:
     """
     Write *text* into the session's attachment cache as a UTF-8 ``.txt`` file.
@@ -197,7 +202,7 @@ def materialize_text(text: str, bridge_dir: Path) -> Path | None:
     """
     # Lone surrogates can't be encoded; replace them rather than lose the text.
     raw_bytes = text.encode("utf-8", errors="replace")
-    digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
+    digest = attachment_content_digest(raw_bytes)
     return _materialize_bytes(raw_bytes, f"pasted_text_{digest}.txt", bridge_dir)
 
 
@@ -232,7 +237,7 @@ def _materialize_bytes(raw_bytes: bytes, filename: str, bridge_dir: Path) -> Pat
         return None
     try:
         stem, suffix = os.path.splitext(filename)
-        digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
+        digest = attachment_content_digest(raw_bytes)
         for name in (filename, f"{stem}_{digest}{suffix}"):
             outcome = _place_no_follow(dir_fd, name, raw_bytes)
             if outcome == "symlink":
@@ -389,6 +394,12 @@ UNRESOLVED_ATTACHMENT_MARKER_PATTERN = r"\[Attachment [^\]]+ could not be loaded
 # Codex's binary file inputs also use the "[Attached file: ...]" shape.
 ATTACHMENT_MARKER_STRIP_PATTERN = (
     rf"\[Attached(?: file)?:[^\]]*\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}"
+)
+
+# A spilled paste replaces one whole text block with this cache reference.
+SPILLED_TEXT_MARKER_PATTERN = (
+    r"(?m)^[ \t]*\[Attached file: /(?:[^\]\r\n]*/)?attachments/[0-9a-f]{32}/"
+    r"pasted_text_(?P<digest>[0-9a-f]{12})(?:_(?P=digest))?\.txt\][ \t]*(?=\r?$)"
 )
 
 

@@ -116,7 +116,11 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
+from omnigent.inner.native_attachments import (
+    ATTACHMENT_MARKER_STRIP_PATTERN,
+    SPILLED_TEXT_MARKER_PATTERN,
+    attachment_content_digest,
+)
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
 
 # A pending entry is evicted this many seconds after it was recorded
@@ -139,6 +143,7 @@ _MAX_ENTRIES_PER_CONVERSATION = 64
 # many of these as the queued message has file blocks, so a marker-like phrase
 # the person typed is never mistaken for a generated one.
 _ONE_LEADING_ATTACHMENT_MARKER_RE = re.compile(rf"^\s*(?:{ATTACHMENT_MARKER_STRIP_PATTERN})\s*")
+_SPILLED_TEXT_MARKER_RE = re.compile(SPILLED_TEXT_MARKER_PATTERN)
 _ATTACHMENT_BLOCK_TYPES = frozenset({"input_image", "input_file"})
 
 NativeInputCauseClass = Literal[
@@ -837,16 +842,13 @@ def resolve_matching_text(
             else _collapse_whitespace(_content_text(entry.content))
             for _pid, entry in ordered
         ]
-        # Two passes. An exact (whitespace-collapsed) match first, so two
-        # messages that differ only in a marker-like phrase the person typed
-        # at the front stay distinct. Then, for entries carrying attachments:
-        # the executor pastes one generated marker line per file block ahead
-        # of the text, so drop exactly that many from the mirror and compare
-        # with the entry's own text — typed marker-like text still counts.
+        # Exact text wins over typed marker-like phrases. Ordinary upload
+        # prefixes can be stripped; spilled pastes require their content digest.
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
-        if match_index is None:
+        spilled = not shell_command and contains_spilled_text_marker(text)
+        if match_index is None and not spilled:
             match_method = "attachment_normalized_text"
             marker_matches: list[int] = []
             for index, (_pid, entry) in enumerate(ordered):
@@ -859,6 +861,26 @@ def resolve_matching_text(
                 ):
                     marker_matches.append(index)
             match_index = _prefer_live(marker_matches, interrupted)
+        if match_index is None and spilled:
+            match_method = "spilled_text_digest"
+            spill_matches: list[int] = []
+            payloads: set[tuple[str, ...]] = set()
+            for index, (_pid, entry) in enumerate(ordered):
+                restored = _restore_spilled_text(text, entry.content)
+                if restored is None:
+                    continue
+                restored_text, payload = restored
+                if (
+                    _collapse_whitespace(
+                        _strip_generated_markers(restored_text, _attachment_count(entry.content))
+                    )
+                    == texts[index]
+                ):
+                    spill_matches.append(index)
+                    payloads.add(payload)
+            # A short digest collision cannot establish which full paste was accepted.
+            if len(payloads) == 1:
+                match_index = _prefer_live(spill_matches, interrupted)
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
         # Bound one drain's work: report at most a cap's worth of skipped
@@ -985,6 +1007,38 @@ def _content_text(content: list[dict[str, Any]]) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "\n".join(parts)
+
+
+def contains_spilled_text_marker(text: str) -> bool:
+    """Recognize a generated paste reference, even if its pending input is gone."""
+    return _SPILLED_TEXT_MARKER_RE.search(text) is not None
+
+
+def _restore_spilled_text(
+    text: str, content: list[dict[str, Any]]
+) -> tuple[str, tuple[str, ...]] | None:
+    """Reconstruct a mirror only from whole text blocks carrying its exact digests."""
+    originals: dict[str, set[str]] = {}
+    for block in content:
+        if (
+            isinstance(block, dict)
+            and block.get("type") in {"input_text", "text"}
+            and isinstance(value := block.get("text"), str)
+        ):
+            digest = attachment_content_digest(value.encode("utf-8", errors="replace"))
+            originals.setdefault(digest, set()).add(value)
+    payload: list[str] = []
+
+    def restore(match: re.Match[str]) -> str:
+        candidates = originals.get(match.group("digest"), set())
+        if len(candidates) != 1:
+            return match.group(0)
+        value = next(iter(candidates))
+        payload.append(value)
+        return value
+
+    restored, count = _SPILLED_TEXT_MARKER_RE.subn(restore, text)
+    return (restored, tuple(payload)) if count == len(payload) and count else None
 
 
 def _first_match(texts: list[str], needle: str, interrupted: list[bool]) -> int | None:

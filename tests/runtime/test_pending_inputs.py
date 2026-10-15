@@ -25,6 +25,7 @@ route tests; this file tests the module in isolation.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -32,6 +33,85 @@ from types import SimpleNamespace
 import pytest
 
 from omnigent.runtime import pending_inputs
+
+
+@pytest.mark.parametrize("shape", ["partial", "multiple", "collision_name", "upload_prefix"])
+def test_spilled_text_matches_original_blocks_before_fifo(shape: str) -> None:
+    first = "résumé\nfirst pasted block"
+    second = "second pasted block"
+
+    def marker(text: str) -> str:
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+        suffix = f"_{digest}" if shape == "collision_name" else ""
+        return f"[Attached file: /runner/attachments/{'a' * 32}/pasted_text_{digest}{suffix}.txt]"
+
+    content = [_text_block(first), _text_block(second)]
+    mirror = f"{marker(first)}\n{marker(second) if shape == 'multiple' else second}"
+    if shape == "upload_prefix":
+        content.insert(0, {"type": "input_file", "filename": "data.bin"})
+        mirror = f"[Attached file: /runner/data.bin]\n{mirror}"
+    earlier = pending_inputs.record(
+        "conv_a", [{"type": "input_file", "filename": "earlier.bin"}, _text_block(second)]
+    )
+    own = pending_inputs.record("conv_a", content)
+
+    matched = pending_inputs.resolve_matching_text("conv_a", mirror, hold=True)
+
+    assert matched.matched is not None and matched.matched.pending_id == own
+    assert matched.match_method == "spilled_text_digest"
+    assert [entry.pending_id for entry in matched.skipped] == [earlier]
+    for entry in [*matched.skipped, matched.matched]:
+        pending_inputs.restore("conv_a", entry)
+    assert pending_inputs.pending_ids("conv_a") == [earlier, own]
+
+
+def test_exact_typed_spill_marker_takes_precedence_over_digest_matching() -> None:
+    text = "pasted text"
+    digest = hashlib.sha256(text.encode()).hexdigest()[:12]
+    mirror = f"[Attached file: /runner/attachments/{'a' * 32}/pasted_text_{digest}.txt]"
+    spilled = pending_inputs.record("conv_a", [_text_block(text)])
+    typed = pending_inputs.record("conv_a", [_text_block(mirror)])
+
+    matched = pending_inputs.resolve_matching_text("conv_a", mirror)
+
+    assert matched.matched is not None and matched.matched.pending_id == typed
+    assert matched.match_method == "normalized_text"
+    assert [entry.pending_id for entry in matched.skipped] == [spilled]
+
+
+@pytest.mark.parametrize(
+    "change", ["wrong_digest", "surrounding_text", "not_a_cache_path", "not_a_line"]
+)
+def test_spill_matching_requires_a_complete_generated_reference_and_original_text(
+    change: str,
+) -> None:
+    text = "pasted text"
+    digest = hashlib.sha256(text.encode()).hexdigest()[:12]
+    marker = f"[Attached file: /runner/attachments/{'a' * 32}/pasted_text_{digest}.txt]"
+    if change == "wrong_digest":
+        marker = marker.replace(digest, "0" * 12)
+    elif change == "surrounding_text":
+        marker += "\nextra words"
+    elif change == "not_a_cache_path":
+        marker = marker.replace(f"attachments/{'a' * 32}/", "uploads/")
+    else:
+        marker = f"explain {marker}"
+    own = pending_inputs.record("conv_a", [_text_block(text)])
+
+    assert pending_inputs.resolve_matching_text("conv_a", marker).matched is None
+    assert pending_inputs.pending_ids("conv_a") == [own]
+
+
+def test_spill_digest_collision_leaves_distinct_pending_pastes_queued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pending_inputs, "attachment_content_digest", lambda _raw: "c" * 12)
+    first = pending_inputs.record("conv_a", [_text_block("first paste")])
+    second = pending_inputs.record("conv_a", [_text_block("second paste")])
+    mirror = f"[Attached file: /runner/attachments/{'a' * 32}/pasted_text_{'c' * 12}.txt]"
+
+    assert pending_inputs.resolve_matching_text("conv_a", mirror).matched is None
+    assert pending_inputs.pending_ids("conv_a") == [first, second]
 
 
 def test_unknown_delivery_stage_is_observable_without_overwriting_state(
