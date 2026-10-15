@@ -697,20 +697,21 @@ class UploadManager:
             raise RouteError(400, "invalid_request", "Invalid idempotency key")
         request = asyncio.current_task()
         assert request is not None
+        cancelled = asyncio.Event()
         task = asyncio.create_task(
-            self._create(session_id, environment_id, declaration, idempotency_key)
+            self._create(session_id, environment_id, declaration, idempotency_key, cancelled)
         )
         self.inflight.add(request)
         try:
-            result, _created = await asyncio.shield(task)
-            return result
+            return await asyncio.shield(task)
         except asyncio.CancelledError:
+            cancelled.set()
             try:
-                result, created = await self._settle(task)
+                result = await self._settle(task)
             except (RouteError, OSError):
                 pass
             else:
-                if created:
+                if idempotency_key is None:
                     uid = cast(str, result["upload_id"])
                     cleanup = asyncio.create_task(self._abort_creation(uid))
                     await self._settle(cleanup)
@@ -785,6 +786,8 @@ class UploadManager:
                     raise RouteError(504, "timeout", "Upload begin is unresolved")
             async with wait:
                 pass
+            if uid not in self.records:
+                raise RouteError(503, "runner_unavailable", "Upload creation did not complete")
 
     async def _create(
         self,
@@ -792,7 +795,8 @@ class UploadManager:
         environment_id: str,
         declaration: UploadDeclaration,
         idempotency_key: str | None,
-    ) -> tuple[dict[str, object], bool]:
+        cancelled: asyncio.Event,
+    ) -> dict[str, object]:
         if not valid_name(declaration.name):
             raise RouteError(400, "invalid_name", "Invalid basename")
         if declaration.dir.startswith("/") or "\\" in declaration.dir or "\0" in declaration.dir:
@@ -813,7 +817,7 @@ class UploadManager:
                 session_id, environment_id, declaration, idempotency_key, directory
             )
             if replay is not None:
-                return replay, False
+                return replay
         async with self._using_helper(session_id, environment_id) as helper:
             binding = self.helpers[(session_id, environment_id)]
             uid = uuid.uuid4().hex
@@ -831,6 +835,8 @@ class UploadManager:
                 raise
             if declaration.size > free.free:
                 raise RouteError(507, "no_space", "Insufficient free disk space")
+            if cancelled.is_set():
+                raise RouteError(503, "runner_unavailable", "Upload creation cancelled")
             now = _now()
             record = UploadRecord.model_validate(
                 {
@@ -893,7 +899,7 @@ class UploadManager:
                         session_id, environment_id, declaration, idempotency_key, directory
                     )
                     if replay is not None:
-                        return replay, False
+                        return replay
                 try:
                     result = await self._call(
                         uid,
@@ -913,20 +919,22 @@ class UploadManager:
                             self._drop(uid, record)
                             await self._save_settled()
                     raise
+                if cancelled.is_set():
+                    record.staging_dev = cast(int, result["staging_dev"])
+                    record.staging_ino = cast(int, result["staging_ino"])
+                    await self._remove(uid, record)
+                    raise RouteError(503, "runner_unavailable", "Upload creation cancelled")
                 async with self.lock:
                     record.staging_dev = cast(int, result["staging_dev"])
                     record.staging_ino = cast(int, result["staging_ino"])
                     record.pending = False
                     await self._save_settled()
-                return (
-                    {
-                        "upload_id": uid,
-                        "offset": 0,
-                        "chunk_bytes": min(1024**2, self.limits.chunk_bytes),
-                        "expires_at": now + min(self.limits.idle_ttl_s, self.limits.max_age_s),
-                    },
-                    True,
-                )
+                return {
+                    "upload_id": uid,
+                    "offset": 0,
+                    "chunk_bytes": min(1024**2, self.limits.chunk_bytes),
+                    "expires_at": now + min(self.limits.idle_ttl_s, self.limits.max_age_s),
+                }
 
     async def operate(
         self,
