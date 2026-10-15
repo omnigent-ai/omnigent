@@ -4879,7 +4879,7 @@ def create_runner_app(
                 raise
             except Exception as exc:
                 if _active_turns.get(conv) is not _own_task:
-                    _logger.debug(
+                    _logger.warning(
                         "Ignoring failure from a superseded background turn for %s",
                         conv,
                         exc_info=True,

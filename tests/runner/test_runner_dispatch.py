@@ -10804,6 +10804,7 @@ async def test_run_turn_bg_finalizer_identity_guard_spares_foreign_slot(
 ) -> None:
     """A delayed setup exit must preserve a replacement turn's state."""
     conv = "conv_finalizer_identity"
+    stable_id = "5c2e8a1f7b3d4e6a9c0f1b2d3e4a5f6c"
     pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
 
     foreign_task = asyncio.create_task(asyncio.Event().wait())
@@ -10830,6 +10831,8 @@ async def test_run_turn_bg_finalizer_identity_guard_spares_foreign_slot(
                     "agent_id": "ag",
                     "model": "x",
                     "content": [{"role": "user", "content": "turn A"}],
+                    "stable_id": stable_id,
+                    "input_stable_id": stable_id,
                 },
             )
             assert resp.status_code == 202, resp.text
@@ -10846,6 +10849,7 @@ async def test_run_turn_bg_finalizer_identity_guard_spares_foreign_slot(
         queue = app.state.session_event_queues.get(conv)
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
+            assert event.get("type") != "response.failed", event
             assert not (
                 event.get("type") == "session.status" and event.get("status") == "failed"
             ), event
