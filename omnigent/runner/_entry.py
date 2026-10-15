@@ -1282,6 +1282,11 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     return dest
 
 
+# The server waits 10s for session init, so throttled spec fetches retry well inside that.
+_SPEC_FETCH_429_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
+_SPEC_FETCH_MAX_RETRY_AFTER_S = 2.0
+
+
 async def _resolve_agent_spec_from_server(
     server_client: httpx.AsyncClient,
     spec_cache_root: Path,
@@ -1305,9 +1310,10 @@ async def _resolve_agent_spec_from_server(
         directory, or ``None`` when the server returns 404 for the
         requested agent.
     :raises RuntimeError: If the server returns a non-200 status
-        other than 404.
+        other than 404, including a 429 that outlasts the retries.
     """
     from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
+    from omnigent.native.native_terminal import request_with_429_retry
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
 
@@ -1319,7 +1325,13 @@ async def _resolve_agent_spec_from_server(
         )
         return None
     path = f"/v1/sessions/{session_id}/agent/contents"
-    resp = await server_client.get(path, headers={MCP_SELECTION_HEADER: "1"})
+    # Every runner re-initializes its sessions when the server restarts, and the
+    # resulting burst gets throttled; a failed fetch here fails the session's init.
+    resp = await request_with_429_retry(
+        lambda: server_client.get(path, headers={MCP_SELECTION_HEADER: "1"}),
+        delays_s=_SPEC_FETCH_429_RETRY_DELAYS_S,
+        max_retry_after_s=_SPEC_FETCH_MAX_RETRY_AFTER_S,
+    )
     if resp.status_code == 404:
         _logger.info(
             "spec_resolver: GET %s returned 404 for missing agent",
