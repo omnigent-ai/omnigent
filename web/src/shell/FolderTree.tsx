@@ -1,8 +1,12 @@
 import { ChevronRightIcon, FolderIcon, FolderOpenIcon, UploadIcon } from "lucide-react";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
-import { FileDropOverlay } from "@/components/FileDropOverlay";
-import { droppedUploadFiles, resolveUploadTarget, useWorkspaceUpload } from "./WorkspaceUploads";
+import {
+  droppedUploadFiles,
+  resolveUploadTarget,
+  useWorkspaceUpload,
+  WorkspaceUploadRootIndicator,
+} from "./WorkspaceUploads";
 import { useTreeUploadDrop } from "./useTreeUploadDrop";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -766,12 +770,9 @@ function FolderTreeInner({
           Upload to {dropHover.directory || upload.destination}
         </span>
         {!dropHover.folderRow && (
-          <FileDropOverlay
+          <WorkspaceUploadRootIndicator
             container={dropRoot}
-            variant="upload"
-            label="Upload to workspace"
             destination={dropHover.directory || upload.destination}
-            subtext="Saved to this session's files"
           />
         )}
       </>
@@ -1275,7 +1276,8 @@ const TreeNodeRow = memo(function TreeNodeRow({
       data-drop-folder=""
       data-upload-hover={dropHighlighted ? "" : undefined}
       className={cn(
-        "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1 hover:bg-muted",
+        "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1",
+        dropHighlighted ? "bg-info/10" : "hover:bg-muted",
         // Reveal flash: reuse the chat nav-jump ring pulse so a folder opened
         // from search catches the eye briefly, then settles.
         highlighted && "animate-user-msg-flash",

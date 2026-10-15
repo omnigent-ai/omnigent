@@ -9,6 +9,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronUp, Upload } from "lucide-react";
 import * as Progress from "radix-ui/progress";
@@ -40,7 +41,6 @@ import {
   type UploadRow,
 } from "@/store/uploadStore";
 import { useChatStore } from "@/store/chatStore";
-import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatBytes } from "./fileStatusUtils";
@@ -350,6 +350,31 @@ export function droppedUploadFiles(event: DragEvent, files: File[]): File[] {
   return files.filter((file) => !directoryFiles.has(file));
 }
 
+export function WorkspaceUploadRootIndicator({
+  container,
+  destination,
+}: {
+  container: HTMLElement;
+  destination: string;
+}) {
+  return createPortal(
+    <div
+      aria-hidden="true"
+      data-drop-variant="upload"
+      className="pointer-events-none absolute inset-0 z-40 m-2 rounded-md border-2 border-dashed border-info bg-transparent"
+    >
+      <div
+        data-upload-root-label=""
+        className="absolute top-0 left-1/2 flex max-w-[calc(100%-1rem)] -translate-x-1/2 flex-col items-center rounded-b-md border-x border-b border-info bg-card-solid px-2 py-0.5 text-center text-ui text-foreground shadow-composer"
+      >
+        <span className="whitespace-nowrap font-medium">Upload to workspace</span>
+        <span className="max-w-full truncate text-muted-foreground">to {destination}</span>
+      </div>
+    </div>,
+    container,
+  );
+}
+
 export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
   const context = useContext(UploadContext);
   const [target, setTarget] = useState<HTMLDivElement | null>(null);
@@ -382,13 +407,7 @@ export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
           <span className="sr-only" role="status" aria-live="polite">
             Upload to {context.dropDestination}
           </span>
-          <FileDropOverlay
-            container={target}
-            variant="upload"
-            label="Upload to workspace"
-            destination={context.dropDestination}
-            subtext="Saved to this session's files"
-          />
+          <WorkspaceUploadRootIndicator container={target} destination={context.dropDestination} />
         </>
       )}
     </div>

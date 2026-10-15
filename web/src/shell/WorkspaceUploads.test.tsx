@@ -600,6 +600,7 @@ it("swaps the folder icon and glows its name, then freezes the DROP row despite 
   );
   expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
   expect(assets.closest("[data-upload-hover]")).toBeNull();
+  expect(folder).not.toHaveClass("bg-info/10");
   expect(folder.querySelector("svg.lucide-upload")).toBeNull();
   expect(assets).not.toHaveAttribute("data-upload-glow");
 });
@@ -620,12 +621,16 @@ it("shows the dashed root zone while a root-level file row is the drop target", 
   expect(screen.getByText("Upload to workspace")).toBeVisible();
   expect(screen.getByText("to src")).toBeVisible();
   expect(screen.getByRole("status")).toHaveTextContent("Upload to src");
+  const rootCue = document.querySelector('[data-drop-variant="upload"]') as HTMLElement;
+  expect(rootCue).toHaveClass("pointer-events-none", "border-dashed", "bg-transparent");
+  expect(rootCue).not.toHaveClass("bg-background/90");
+  expect(screen.getByText("other/").closest("[data-drop-folder]")).toBeInTheDocument();
   expect(document.querySelector("[data-upload-root-outline]")).toBeNull();
   expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(1);
   fireEvent.dragOver(screen.getByText("other/"), { dataTransfer: transfer });
-  expect(screen.getByText("other/").closest("[data-drop-folder]")).toHaveAttribute(
-    "data-upload-hover",
-  );
+  const folder = screen.getByText("other/").closest("[data-drop-folder]");
+  expect(folder).toHaveAttribute("data-upload-hover");
+  expect(folder).toHaveClass("w-full", "bg-info/10");
   expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
   expect(document.querySelector("[data-upload-root-outline]")).toBeNull();
   fireEvent.drop(screen.getByText("top.txt"), { dataTransfer: transfer });
@@ -779,11 +784,14 @@ it("keeps one overlay across tree to header and header-child crossings", async (
   const transfer = { types: ["Files"] };
   fireEvent.dragEnter(row, { dataTransfer: transfer });
   fireEvent.dragOver(row, { dataTransfer: transfer });
-  expect(row.closest("[data-drop-folder]")).toHaveAttribute("data-upload-hover");
+  const folder = row.closest("[data-drop-folder]");
+  expect(folder).toHaveAttribute("data-upload-hover");
+  expect(folder).toHaveClass("bg-info/10");
   expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
   fireEvent.dragEnter(header, { dataTransfer: transfer });
   fireEvent.dragLeave(row, { dataTransfer: transfer });
   expect(screen.getByText("Upload to workspace")).toBeVisible();
+  expect(folder).not.toHaveClass("bg-info/10");
   expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(1);
   fireEvent.dragEnter(child, { dataTransfer: transfer });
   fireEvent.dragLeave(header, { dataTransfer: transfer });
@@ -828,11 +836,13 @@ it("highlights the parent folder when hovering its file and restores it on drag 
   const folder = screen.getByText("assets/").closest("[data-drop-folder]") as HTMLElement;
   fireEvent.dragOver(screen.getByText("existing.txt"), { dataTransfer: transfer });
   expect(folder).toHaveAttribute("data-upload-hover");
+  expect(folder).toHaveClass("w-full", "bg-info/10");
   expect(folder.querySelector("svg.lucide-upload")).toBeTruthy();
   expect(screen.getByText("assets/")).toHaveAttribute("data-upload-glow");
   expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
   fireEvent.dragEnd(screen.getByText("existing.txt"), { dataTransfer: transfer });
   expect(folder).not.toHaveAttribute("data-upload-hover");
+  expect(folder).not.toHaveClass("bg-info/10");
   expect(folder.querySelector("svg.lucide-upload")).toBeNull();
   expect(screen.getByText("assets/")).not.toHaveAttribute("data-upload-glow");
 });
