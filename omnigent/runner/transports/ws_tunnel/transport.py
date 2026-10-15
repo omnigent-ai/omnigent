@@ -29,6 +29,7 @@ from collections.abc import AsyncIterator, Awaitable
 from typing import cast
 
 import httpx
+from httpx._content import AsyncIteratorByteStream
 
 from omnigent.runner.transports.ws_tunnel.binary_requests import (
     BINARY_REQUEST_BODY_CAPABILITY,
@@ -51,6 +52,15 @@ async def _aclose_if_available(stream: object) -> None:
     aclose = getattr(stream, "aclose", None)
     if callable(aclose):
         await cast(Awaitable[None], aclose())
+
+
+async def _aclose_request_stream(stream: httpx.AsyncByteStream) -> None:
+    try:
+        if isinstance(stream, AsyncIteratorByteStream):
+            # HTTPX's wrapper does not close the async iterator it wraps.
+            await _aclose_if_available(stream._stream)
+    finally:
+        await _aclose_if_available(stream)
 
 
 class _TunneledByteStream(httpx.AsyncByteStream):
@@ -218,12 +228,12 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                     del wire_buffer
                 except BaseException as error:
                     try:
-                        await _aclose_if_available(stream)
+                        await _aclose_request_stream(stream)
                     except BaseException as cleanup_error:
                         raise error from cleanup_error
                     raise
                 else:
-                    await _aclose_if_available(stream)
+                    await _aclose_request_stream(stream)
             else:
                 body = await request.aread()
                 content_type = request.headers.get("content-type", "application/json")
