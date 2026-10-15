@@ -135,13 +135,14 @@ function PullRequestEmptyState({
   );
 }
 
-/** Keep the provider name accessible without taking space from the PR picker. */
-function PanelTitle({ copy }: { copy: GitProviderCopy }) {
+/** The provider icon with the panel title, or icon-only (provider named for screen
+ *  readers) where the PR picker needs the room. */
+function PanelTitle({ copy, showTitle = false }: { copy: GitProviderCopy; showTitle?: boolean }) {
   const Icon = copy.Icon;
   return (
-    <h2 className="shrink-0" title={copy.label}>
+    <h2 className="flex shrink-0 items-center gap-2 font-medium text-ui" title={copy.label}>
       <Icon size={14} className="shrink-0" aria-hidden />
-      <span className="sr-only">{copy.label}</span>
+      {showTitle ? "Pull Requests" : <span className="sr-only">{copy.label}</span>}
     </h2>
   );
 }
@@ -574,7 +575,7 @@ function CheckPill({
   );
 }
 
-// ── Summary tab ──────────────────────────────────────────────────────────
+// ── Summary and Comments tabs ────────────────────────────────────────────
 // The PR's description and its conversation comments (from `gh pr view`), both
 // rendered as GitHub-flavored markdown via the shared MessageResponse.
 
@@ -625,29 +626,22 @@ function PullRequestCommentCard({
   );
 }
 
-/** The Summary tab body: CI checks, the PR description, then its comments. When
- *  the token can't read check runs, the Checks area says so instead of counts. */
+/** The Summary tab body: CI checks, then the PR description. When the token
+ *  can't read check runs, the Checks area says so instead of counts. */
 function PullRequestSummaryTab({
   checks,
   checksSupported,
   checksUnavailableHint,
   body,
-  comments,
-  commentsPartial,
-  providerLabel,
 }: {
   checks: PullRequestChecks;
   checksSupported: boolean;
   checksUnavailableHint?: string;
   body: string | null | undefined;
-  comments: PullRequestComment[];
-  commentsPartial?: boolean;
-  providerLabel: string;
 }) {
-  const commentKeys = listKeys(comments, (c) => [c.url, c.created_at, c.author_id ?? c.author]);
   return (
-    // Extra bottom padding so the last comment can scroll clear of the very
-    // bottom edge, where it's awkward to read.
+    // Extra bottom padding so the end of a long description can scroll clear
+    // of the very bottom edge, where it's awkward to read.
     <div className="space-y-4 p-3 pb-16">
       {/* CI status checks (from the PR's statusCheckRollup) as pills; hover a
           pill to see the job names in that bucket. */}
@@ -704,31 +698,44 @@ function PullRequestSummaryTab({
           <p className="text-ui text-muted-foreground italic">No description provided.</p>
         )}
       </section>
-      <section className="space-y-2">
-        <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          {comments.length > 0
-            ? `Comments (${comments.length}${commentsPartial ? "+" : ""})`
-            : "Comments"}
-        </h3>
-        {commentsPartial && (
-          <p role="status" className="text-ui text-muted-foreground">
-            Some comments are unavailable.
-          </p>
-        )}
-        {comments.length === 0 ? (
-          !commentsPartial && <p className="text-ui text-muted-foreground">No comments yet.</p>
-        ) : (
-          <ul className="space-y-2">
-            {comments.map((c, i) => (
-              <PullRequestCommentCard
-                key={commentKeys[i]}
-                comment={c}
-                providerLabel={providerLabel}
-              />
-            ))}
-          </ul>
-        )}
-      </section>
+    </div>
+  );
+}
+
+/** The Comments tab body: the PR's conversation comments in order. A partial
+ *  list keeps what loaded and says the rest is missing rather than empty. */
+function PullRequestCommentsTab({
+  comments,
+  commentsPartial,
+  providerLabel,
+}: {
+  comments: PullRequestComment[];
+  commentsPartial?: boolean;
+  providerLabel: string;
+}) {
+  const commentKeys = listKeys(comments, (c) => [c.url, c.created_at, c.author_id ?? c.author]);
+  return (
+    // Extra bottom padding so the last comment can scroll clear of the very
+    // bottom edge, where it's awkward to read.
+    <div className="space-y-2 p-3 pb-16">
+      {commentsPartial && (
+        <p role="status" className="text-ui text-muted-foreground">
+          Some comments are unavailable.
+        </p>
+      )}
+      {comments.length === 0 ? (
+        !commentsPartial && <p className="text-ui text-muted-foreground">No comments yet.</p>
+      ) : (
+        <ul className="space-y-2">
+          {comments.map((c, i) => (
+            <PullRequestCommentCard
+              key={commentKeys[i]}
+              comment={c}
+              providerLabel={providerLabel}
+            />
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -1021,7 +1028,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
     <div className="flex h-full min-h-0 flex-col">
       {showTrackingControls ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} />
+          <PanelTitle copy={copy} showTitle={prs.length === 0} />
           <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
             {prs.length > 0 && (
               <TooltipProvider>
@@ -1117,7 +1124,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
         </div>
       ) : panelState.kind !== "ready" ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} />
+          <PanelTitle copy={copy} showTitle />
         </div>
       ) : null}
       {showTrackingControls && (linking || update.isError) && (
@@ -1173,9 +1180,10 @@ function PullRequestPanelDetails({
   const changes = usePullRequestChangedFiles(conversationId, hasPr, prUrl, revision);
   const prDiff = usePullRequestDiff(conversationId, hasPr, prUrl, revision);
 
-  // Summary (PR body + comments) vs Changes (the stacked diff). Summary is the
-  // landing tab — like GitHub's PR page opening on the Conversation view.
-  const [activeTab, setActiveTab] = useState<"summary" | "changes">("summary");
+  // Summary (checks + PR body), Comments, and Changes (the stacked diff).
+  // Summary is the landing tab — like GitHub's PR page opening on the
+  // Conversation view.
+  const [activeTab, setActiveTab] = useState<"summary" | "comments" | "changes">("summary");
 
   const themeType = useResolvedThemeMode();
   // Diff layout is the app-global FileViewer preference (unified/split); seed
@@ -1485,11 +1493,11 @@ function PullRequestPanelDetails({
     <TooltipProvider delayDuration={0}>
       <Tabs
         value={activeTab}
-        onValueChange={(v) => setActiveTab(v === "changes" ? "changes" : "summary")}
+        onValueChange={(v) => setActiveTab(v === "comments" || v === "changes" ? v : "summary")}
         componentId="github.panel.tabs"
         className="flex h-full min-h-0 flex-col gap-0"
       >
-        {/* Header: repo + PR metadata + the Summary/Changes tabs. Refreshes on
+        {/* Header: repo + PR metadata + the Summary/Comments/Changes tabs. Refreshes on
             its own — via the git-activity SSE signal and the panel's CI poll.
             Padding lives on the title block (not the outer container) so the
             tabs align to the gutter and the underline row spans full width. */}
@@ -1525,13 +1533,21 @@ function PullRequestPanelDetails({
               <PullRequestStatus state={pr.state} />
             </div>
           </div>
-          {/* Tab bar (Summary | Changes); the diff controls live inside the
-            Changes tab on their own line, so they don't crowd the tabs. gap-0 +
-            flex-none keep the two labels close and content-sized (the default
-            flex-1 equalizes and spreads them). */}
+          {/* Tab bar (Summary | Comments | Changes); the diff controls live inside
+            the Changes tab, and the Comments label carries the count. gap-0 +
+            flex-none keep the labels content-sized (default flex-1 spreads them). */}
           <TabsList variant="line" aria-label="Pull request" className="h-auto gap-0 p-0">
             <TabsTrigger value="summary" className="flex-none border-0 px-3 leading-none">
               Summary
+            </TabsTrigger>
+            <TabsTrigger value="comments" className="flex-none border-0 px-3 leading-none">
+              Comments{" "}
+              {comments.length > 0 && (
+                <span className="text-muted-foreground/70 tabular-nums">
+                  {comments.length}
+                  {pr.comments_partial ? "+" : ""}
+                </span>
+              )}
             </TabsTrigger>
             <TabsTrigger value="changes" className="flex-none border-0 px-3 leading-none">
               Changes
@@ -1539,13 +1555,18 @@ function PullRequestPanelDetails({
           </TabsList>
         </div>
 
-        {/* Summary: CI checks + the PR description + its conversation comments. */}
+        {/* Summary: CI checks + the PR description. */}
         <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
           <PullRequestSummaryTab
             checks={checks}
             checksSupported={pr.checks_supported !== false}
             checksUnavailableHint={copy.checksUnavailableHint}
             body={pr.body}
+          />
+        </TabsContent>
+
+        <TabsContent value="comments" className="min-h-0 flex-1 overflow-y-auto">
+          <PullRequestCommentsTab
             comments={comments}
             commentsPartial={pr.comments_partial}
             providerLabel={copy.label}

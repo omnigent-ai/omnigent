@@ -361,6 +361,55 @@ async def test_remote_resume_add_dir_preserves_configured_roots(
     ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-test"]
 
 
+def test_fresh_remote_tui_leaves_add_dir_to_the_app_server(tmp_path: Path) -> None:
+    """Codex exits on ``--add-dir`` with ``--remote``, so only the server sees the roots."""
+    args = (
+        "summarize the attached notes",
+        "--add-dir=notes",
+        "--cd",
+        "app",
+        "--add-dir",
+        "/shared",
+        "-sworkspace-write",
+        "-c",
+        'model="--add-dir"',
+    )
+
+    assert launch_args.codex_workspace_roots(args, tmp_path) == (
+        tmp_path / "app",
+        [str(tmp_path / "app" / "notes"), "/shared"],
+    )
+    assert app_server.build_codex_remote_args(
+        codex_args=args, thread_id=None, remote_url="ws://127.0.0.1:9876"
+    ) == [
+        "summarize the attached notes",
+        "--cd",
+        "app",
+        "-s",
+        "workspace-write",
+        "-c",
+        'model="--add-dir"',
+        "--remote",
+        "ws://127.0.0.1:9876",
+    ]
+
+
+def test_add_dir_parsing_stops_at_the_prompt_separator(tmp_path: Path) -> None:
+    args = ("--add-dir", "notes", "--", "--add-dir", "prompt text")
+
+    assert launch_args.codex_workspace_roots(args, tmp_path) == (
+        tmp_path,
+        [str(tmp_path / "notes")],
+    )
+    assert launch_args.without_codex_add_dirs(args) == ["--", "--add-dir", "prompt text"]
+
+
+@pytest.mark.parametrize("args", [("--add-dir",), ("--add-dir", "--model", "gpt"), ("-C",)])
+def test_add_dir_without_a_directory_is_rejected(args: tuple[str, ...], tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires a directory"):
+        launch_args.codex_workspace_roots(args, tmp_path)
+
+
 def test_profile_legacy_selection_overrides_base_named_selection(tmp_path: Path) -> None:
     private = tmp_path / "private"
     source = tmp_path / "source"
@@ -562,6 +611,7 @@ def test_reject_reserved_codex_transport_args_rejects(reserved_args: list[str]) 
     These compose an incoherent argv (``codex app-server … --remote``) that clap
     exits 2 on, so the thread never starts; reject them at build time instead.
     """
+    assert launch_args.reserved_codex_transport_arg(reserved_args) == reserved_args[0]
     with pytest.raises(ValueError, match="runner-owned Codex transport"):
         launch_args.reject_reserved_codex_transport_args(reserved_args)
     with pytest.raises(ValueError, match="runner-owned Codex transport"):
@@ -589,6 +639,7 @@ def test_reject_reserved_codex_transport_args_rejects(reserved_args: list[str]) 
 )
 def test_reject_reserved_codex_transport_args_allows(allowed_args: list[str]) -> None:
     """Legitimate pass-through args — including ``app-server`` as a value — pass."""
+    assert launch_args.reserved_codex_transport_arg(allowed_args) is None
     launch_args.reject_reserved_codex_transport_args(allowed_args)  # does not raise
     result = app_server.build_codex_remote_args(
         codex_args=tuple(allowed_args),

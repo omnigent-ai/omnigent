@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import errno
 import json
 import logging
 import os
@@ -6051,20 +6052,96 @@ def _bundle(source: Path) -> bytes:
     resolved = _resolve_bundle_env_vars(source)
 
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for file_path in source.rglob("*"):
-            if file_path.is_file():
-                arcname = str(file_path.relative_to(source))
-                if arcname in resolved:
-                    # Write the resolved YAML instead of the
-                    # original file (which has ${VAR} refs).
-                    data = resolved[arcname].encode("utf-8")
-                    info = tarfile.TarInfo(name=arcname)
-                    info.size = len(data)
-                    tf.addfile(info, io.BytesIO(data))
-                else:
-                    tf.add(str(file_path), arcname=arcname)
+    # dereference: linked paths can share an inode, and the server refuses hardlink members.
+    with tarfile.open(fileobj=buf, mode="w:gz", dereference=True) as tf:
+        for file_path, arcname in _bundle_files(source):
+            if arcname in resolved:
+                # Write the resolved YAML instead of the
+                # original file (which has ${VAR} refs).
+                data = resolved[arcname].encode("utf-8")
+                info = tarfile.TarInfo(name=arcname)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+            else:
+                tf.add(str(file_path), arcname=arcname)
     return buf.getvalue()
+
+
+def _bundle_files(source: Path) -> Iterator[tuple[Path, str]]:
+    """
+    Yield ``(real_path, arcname)`` for every file in an agent directory.
+
+    Symlinks are followed and bundled as regular files, since the server
+    refuses links, so shared skills can be linked into ``skills/``. A link must
+    resolve inside the enclosing Git checkout (or *source* outside one); dangling,
+    escaping and looping links fail instead of silently dropping content, as do
+    links into the repository's ``.git`` directory and unreadable directories.
+    Entries that are not regular files (FIFOs, sockets, devices) are skipped as before.
+
+    :param source: The agent image directory.
+    :raises OmnigentError: If a symlink is dangling, loops, or resolves outside
+        the allowed root.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime.filesystem_registry import detect_git_root
+
+    def resolve(path: Path) -> Path:
+        rel = path.relative_to(source)
+        try:
+            return path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            # Python 3.12 reports loops as RuntimeError; 3.13+ as OSError(ELOOP).
+            if isinstance(exc, RuntimeError) or exc.errno == errno.ELOOP:
+                reason = "is a symlink loop"
+            elif exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                reason = "is a dangling symlink"
+            else:
+                reason = f"cannot be resolved ({exc.strerror})"
+            raise OmnigentError(
+                f"{rel} {reason}; cannot bundle it.", code=ErrorCode.INVALID_INPUT
+            ) from exc
+
+    def unreadable(exc: OSError) -> None:
+        raise OmnigentError(
+            f"{exc.filename} cannot be read ({exc.strerror}); cannot bundle it.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+    root = source.resolve()
+    boundary = detect_git_root(root) or root
+    # Links must not pull in repository metadata such as remote URLs with credentials.
+    git_dir = boundary / ".git"
+    # Real directories on the walk's path to each visited directory, itself included.
+    lineage: dict[str, tuple[Path, ...]] = {}
+    for dirpath, dirnames, filenames in os.walk(source, followlinks=True, onerror=unreadable):
+        current = Path(dirpath)
+        real_dir = resolve(current)
+        ancestors = lineage.get(os.path.dirname(dirpath), ()) if current != source else ()
+        if real_dir in ancestors:
+            raise OmnigentError(
+                f"{current.relative_to(source)} is a symlink loop; cannot bundle it.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        lineage[dirpath] = (*ancestors, real_dir)
+        dirnames.sort()
+        files = set(filenames)
+        for name in [*dirnames, *sorted(files)]:
+            path = current / name
+            real = resolve(path)
+            rel = path.relative_to(source)
+            if real != root / rel and not real.is_relative_to(boundary):
+                raise OmnigentError(
+                    f"{rel} resolves to {real}, outside {boundary}; "
+                    "only symlinks within the agent's checkout can be bundled.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if real != root / rel and real.is_relative_to(git_dir):
+                raise OmnigentError(
+                    f"{rel} resolves into the repository's .git directory; cannot bundle it.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if name in files and real.is_file():
+                yield real, str(rel)
 
 
 def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
@@ -13921,6 +13998,24 @@ def _reject_reserved_kiro_resume_args(kiro_args: tuple[str, ...]) -> None:
         raise click.UsageError(
             "Kiro resume flags are reserved for Omnigent resume handling; use "
             f"`{cli_invocation()} kiro --resume [CONVERSATION]` instead."
+        )
+
+
+def _reject_reserved_codex_transport_args(codex_args: tuple[str, ...]) -> None:
+    """Reject Codex transport args that the runner owns in passthrough args.
+
+    The runner starts Codex's app-server and attaches the TUI itself, so a
+    session created with ``app-server``/``--listen``/``--remote`` could only
+    fail at terminal start.
+    """
+    from omnigent.harnesses.codex_native.launch_args import reserved_codex_transport_arg
+
+    reserved = reserved_codex_transport_arg(codex_args)
+    if reserved is not None:
+        raise click.UsageError(
+            f"{reserved!r} is reserved for Omnigent, which starts Codex's app-server "
+            f"and attaches the TUI itself. Drop it from `{cli_invocation()} codex`, "
+            "or run `codex app-server` directly for a standalone app-server."
         )
 
 

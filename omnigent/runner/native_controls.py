@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse, Response
 
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.runner.app_support import (
     _client_safe_error_detail,
     _SpecEntry,
@@ -102,6 +103,11 @@ _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 # (Read Only appears only with a read-only permission profile), so the digit is
 # read from the live popup when possible rather than hardcoded.
 _CODEX_PERMISSION_MENU_BUDGET_S = 5.0
+# Runtime recovery and bridge publication precede any settings RPC. Keep this
+# below the server's Codex settings forward budget, including confirmation.
+_CODEX_SETTINGS_READY_TIMEOUT_S = 15.0
+_CODEX_SETTINGS_READY_POLL_S = 0.1
+_CODEX_SETTINGS_CLOSE_TIMEOUT_S = 1.0
 # Older servers read any reply as a confirmed result, so outlast their
 # 20-second forward instead of reporting an unconfirmed timeout.
 _LEGACY_SERVER_UPDATE_TIMEOUT_S = 30.0
@@ -111,6 +117,12 @@ class _CodexNativeBridgeStateForSessionFn(Protocol):
     async def __call__(
         self, conv_id: str, *, action: str, missing_state_log_level: int = logging.WARNING
     ) -> CodexNativeBridgeState | None: ...
+
+
+class _CodexNativeBridgeStateAndDirForSessionFn(Protocol):
+    async def __call__(
+        self, conv_id: str, *, action: str, missing_state_log_level: int = logging.WARNING
+    ) -> tuple[CodexNativeBridgeState | None, Path]: ...
 
 
 class _EnsureCommentRelayStartedFn(Protocol):
@@ -227,6 +239,7 @@ def build_native_controls(
     _begin_turn_slot: Callable[[str], None],
     _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]],
     _codex_native_bridge_state_for_session: _CodexNativeBridgeStateForSessionFn,
+    _codex_native_bridge_state_and_dir_for_session: _CodexNativeBridgeStateAndDirForSessionFn,
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
     _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]],
     _fetch_session_model_override: Callable[[str], Coroutine[Any, Any, str | None]],
@@ -305,6 +318,29 @@ def build_native_controls(
                 _logger.warning("Could not mirror pending Codex %s in %s", key, bridge_dir)
         return pending
 
+    async def _ready_codex_bridge_for_settings(conv_id: str) -> CodexNativeBridgeState | None:
+        """Recover a reaped pane and wait for startup to publish its owned bridge."""
+        from omnigent.harnesses.codex_native.bridge import read_bridge_state
+
+        terminal_registry = resource_registry.terminal_registry
+        if terminal_registry is not None:
+            await _ensure_native_terminal_for_turn(conv_id, "codex-native")
+            if terminal_registry.get(conv_id, "codex", "main") is None:
+                return None
+        state, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+            conv_id, action="settings update", missing_state_log_level=logging.DEBUG
+        )
+        if state is not None or terminal_registry is None:
+            return state
+        # Fresh launches publish asynchronously. Poll the resolved directory so
+        # waiting never repeats the server label lookup or starts another pane.
+        while terminal_registry.get(conv_id, "codex", "main") is not None:
+            state = read_bridge_state(bridge_dir)
+            if state is not None:
+                return state if state.session_id == conv_id else None
+            await asyncio.sleep(_CODEX_SETTINGS_READY_POLL_S)
+        return None
+
     async def _apply_codex_native_settings_update(
         conv_id: str,
         settings: _JsonObject,
@@ -313,6 +349,7 @@ def build_native_controls(
     ) -> tuple[Response, _JsonObject]:
         """Apply *settings* and return the response with the settings as resolved."""
         from omnigent.harnesses.codex_native.app_server import (
+            CodexAppServerResponseError,
             client_for_transport,
             resolve_codex_effort_for_model,
         )
@@ -325,7 +362,18 @@ def build_native_controls(
         from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
         from omnigent.util.reasoning_effort import effort_for_model_switch
 
-        state = await _codex_native_bridge_state_for_session(conv_id, action="settings update")
+        try:
+            state = await asyncio.wait_for(
+                _ready_codex_bridge_for_settings(conv_id),
+                timeout=_CODEX_SETTINGS_READY_TIMEOUT_S,
+            )
+        except TimeoutError:
+            _logger.warning(
+                "Codex-native runtime was not ready for settings update for session=%s",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            state = None
         if state is None:
             # No loaded Codex bridge means nothing applied the settings; a
             # silent 204 here would let the caller claim a switch the
@@ -395,22 +443,32 @@ def build_native_controls(
                         codex_client, effort, model, transport=state.socket_path
                     )
                     settings["effort"] = resolved
+            update_pending = False
             try:
-                await asyncio.wait_for(
-                    codex_client.request(
-                        "thread/settings/update",
-                        {
-                            "threadId": state.thread_id,
-                            **settings,
-                        },
-                    ),
-                    timeout=(
-                        _LEGACY_SERVER_UPDATE_TIMEOUT_S
-                        if legacy_server
-                        else SETTINGS_UPDATE_TIMEOUT_S
-                    ),
-                )
+                async with asyncio.timeout(
+                    _LEGACY_SERVER_UPDATE_TIMEOUT_S if legacy_server else SETTINGS_UPDATE_TIMEOUT_S
+                ):
+                    params = {"threadId": state.thread_id, **settings}
+                    update_pending = True
+                    try:
+                        await codex_client.request("thread/settings/update", params)
+                    except CodexAppServerResponseError as exc:
+                        if (
+                            exc.code != -32600
+                            or exc.message != f"thread not found: {state.thread_id}"
+                        ):
+                            raise
+                        # This rejection confirms nothing applied. Resume the
+                        # saved thread and retry once within the same budget.
+                        update_pending = False
+                        await codex_client.request(
+                            "thread/resume", {"threadId": state.thread_id, "excludeTurns": True}
+                        )
+                        update_pending = True
+                        await codex_client.request("thread/settings/update", params)
             except TimeoutError:
+                if not update_pending:
+                    raise
                 # Codex may still apply the update, so this is not a refusal.
                 _logger.warning(
                     "Codex-native thread/settings/update timed out for session=%s",
@@ -444,7 +502,9 @@ def build_native_controls(
             ), settings
         finally:
             with contextlib.suppress(Exception):
-                await codex_client.close()
+                await asyncio.wait_for(
+                    codex_client.close(), timeout=_CODEX_SETTINGS_CLOSE_TIMEOUT_S
+                )
         applied: dict[str, str] = {}
         model = settings.get("model")
         if isinstance(model, str):
@@ -476,7 +536,7 @@ def build_native_controls(
                             conv_id,
                             mirrored.status_code,
                         )
-                except (httpx.HTTPError, ConnectionError):
+                except (httpx.HTTPError, ConnectionError, DatabricksAuthError):
                     _logger.warning(
                         "Could not mirror applied Codex effort for session=%s",
                         conv_id,

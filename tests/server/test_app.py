@@ -967,6 +967,60 @@ async def test_health_unbound_imported_session_reads_offline(
     assert sessions[plain.id]["runner_online"] is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_sharded", "status", "code"),
+    [(True, 400, "wrong_replica"), (None, 409, "conflict")],
+)
+async def test_host_route_for_live_host_on_another_replica(
+    db_uri: str,
+    tmp_path: Path,
+    host_sharded: bool | None,
+    status: int,
+    code: str,
+) -> None:
+    """
+    A live host absent from this replica is re-addressable only when sharded.
+
+    The web client retries a host-keyed request without its routing key only
+    on 400 ``wrong_replica``. A 409 on a sharded deployment leaves the new-chat
+    model picker loading for a host that is online on another replica.
+    ``None`` omits ``host_sharded`` to cover the constructor default.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.server.routes._host_launch import configure_host_sharding
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    host_id = "host_0123456789abcdef0123456789abcdef"
+    host_store = HostStore(db_uri)
+    # Online and freshly seen, but its tunnel never registered on this replica.
+    host_store.upsert_on_connect(host_id, "laptop", "local")
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    sharding = {} if host_sharded is None else {"host_sharded": host_sharded}
+    try:
+        app = create_app(
+            agent_store=SqlAlchemyAgentStore(db_uri),
+            file_store=SqlAlchemyFileStore(db_uri),
+            conversation_store=SqlAlchemyConversationStore(db_uri),
+            artifact_store=artifact_store,
+            host_store=host_store,
+            agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+            **sharding,
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            resp = await c.get(f"/v1/hosts/{host_id}/harnesses/claude-native/model-options")
+    finally:
+        configure_host_sharding(False)
+
+    assert resp.status_code == status, resp.text
+    assert resp.json()["error"]["code"] == code
+
+
 @dataclass(frozen=True)
 class _SeedStores:
     """
