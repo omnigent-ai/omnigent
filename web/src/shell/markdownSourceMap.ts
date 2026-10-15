@@ -288,7 +288,12 @@ export function markdownSourceMap(
   if (!manager) return null;
   const previous = cache.get(doc);
   if (previous?.raw === raw && previous.manager === manager) return previous.map;
-  const map = buildMap(doc, raw, manager);
+  let map: SourceMap | null = null;
+  try {
+    map = buildMap(doc, raw, manager);
+  } catch {
+    // Custom tokenizer failures must preserve the legacy comment path.
+  }
   cache.set(doc, { raw, manager, map });
   return map;
 }

@@ -41,6 +41,9 @@ const cases: [string, string, number, string?][] = [
   ["heading marker", "# ⟦#⟧ hello\n\n#", 0, "#"],
   ["ordered list marker", "1. ⟦1⟧\n2. 1", 0, "1"],
   ["single-tilde strikethrough", `~word~ **⟦word⟧** word\n\n${link}`, 1],
+  ["escaped quote", "\\> word ⟦word⟧", 1],
+  ["escaped angle", "\\< word ⟦word⟧", 1],
+  ["escaped ampersand", "\\& word ⟦word⟧", 1],
   ["original repro", `# Anchors\n\n**word** and **⟦word⟧**\n\n**word**\n\n${link}`, 1],
   ["hidden URL and split bold", "[Details](word) ⟦word⟧ wo**rd**", 0],
   ["hidden URL and split HTML", "[Details](word) ⟦word⟧ wo<em>rd</em>", 0],
@@ -211,6 +214,28 @@ describe("validated Markdown source positions", () => {
       lexer.mockRestore();
       plain.destroy();
       other.destroy();
+    }
+  });
+
+  it("caches failed tokenization and falls back without crashing comment restoration", () => {
+    const raw = "word word";
+    const doc = parse(raw);
+    const changedSource = "\n" + raw;
+    const comment = { start_index: 6, end_index: 10, anchor_content: "word" } as Comment;
+    const lexer = vi
+      .spyOn(editor.markdown!.instance.Lexer.prototype, "lex")
+      .mockImplementation(() => {
+        throw new Error("Custom tokenizer failure");
+      });
+    try {
+      for (let i = 0; i < 2; i++) {
+        expect(findPmRangeForComment(doc, comment, changedSource, editor.markdown)).toEqual(
+          findPmRangeForComment(doc, comment, changedSource),
+        );
+      }
+      expect(lexer).toHaveBeenCalledTimes(1);
+    } finally {
+      lexer.mockRestore();
     }
   });
 

@@ -75,14 +75,14 @@ export function createCommentDecorationExtension(
     name: "commentDecoration",
 
     addProseMirrorPlugins() {
-      const manager = this.editor.markdown;
+      const editor = this.editor;
       return [
         new Plugin({
           key: commentDecorationKey,
           state: {
             init(_, { doc }) {
               return stateRef.current
-                ? buildDecorations(doc, stateRef.current, manager)
+                ? buildDecorations(doc, stateRef.current, editor.markdown)
                 : DecorationSet.empty;
             },
             apply(tr, decorations, _, newState) {
@@ -95,7 +95,7 @@ export function createCommentDecorationExtension(
                 if (typeof meta === "object" && "pendingRange" in meta) {
                   stateRef.current.pendingRange = meta.pendingRange;
                 }
-                return buildDecorations(newState.doc, stateRef.current, manager);
+                return buildDecorations(newState.doc, stateRef.current, editor.markdown);
               }
               // Remap existing decorations through the transaction automatically.
               return decorations.map(tr.mapping, newState.doc);

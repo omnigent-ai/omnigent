@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Editor } from "@tiptap/core";
-import { Markdown } from "@tiptap/markdown";
+import { SourceMappedMarkdown } from "./SourceMappedMarkdown";
+import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
 import { StarterKit } from "@tiptap/starter-kit";
 import { TableKit } from "@tiptap/extension-table";
 import { TaskItem, TaskList } from "@tiptap/extension-list";
@@ -8,6 +9,8 @@ import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { findPmRangeForComment, computeSelectionData } from "./TipTapEditorHelpers";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import type { Comment } from "@/hooks/useComments";
+
+installMarkdownParserPatch();
 
 describe("repeated words in Markdown", () => {
   let editor: Editor | undefined;
@@ -37,7 +40,7 @@ describe("repeated words in Markdown", () => {
         TableKit,
         TaskList,
         TaskItem,
-        Markdown,
+        SourceMappedMarkdown,
       ],
       content: raw,
       contentType: "markdown",
