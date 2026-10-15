@@ -352,6 +352,31 @@ def _isolate_claude_native_state(
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(state_dir))
 
 
+# Suites that drive real processes build each child's environment explicitly, and the
+# prepared repro environment relies on the exported selector reaching respawned runners.
+_PROCESS_SUITES = ("tests/e2e/", "tests/e2e_ui/", "tests/integration/", "tests/browser_ui/")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_claude_config_dir(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep a developer's ``CLAUDE_CONFIG_DIR`` out of in-process tests.
+
+    Omnigent resolves Claude's home from it, which would bypass the tmp ``$HOME``
+    tests use to redirect ``~/.claude``. Tests that need a profile set it themselves;
+    process-driving suites keep the exported value.
+
+    :param request: Pytest request; its node path selects the suite.
+    :param monkeypatch: Pytest monkeypatch fixture; restores the env at teardown.
+    :returns: None.
+    """
+    relative = request.node.path.relative_to(request.config.rootpath).as_posix()
+    if relative.startswith(_PROCESS_SUITES):
+        return
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_codex_native_state(
     tmp_path_factory: pytest.TempPathFactory,

@@ -444,6 +444,27 @@ def test_load_claude_session_prefers_custom_title_over_ai_title(tmp_path: Path) 
     assert imported.title == "My renamed thread"
 
 
+def test_load_claude_session_follows_claude_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ambient loading reads the selected profile's transcript, not the default profile's."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    home = tmp_path / "home"
+    profile = tmp_path / "profiles" / "work"
+    _write_claude_transcript_with_titles(
+        home / ".claude", session_id, ai_title=None, custom_title="Default profile"
+    )
+    _write_claude_transcript_with_titles(
+        profile, session_id, ai_title=None, custom_title="Selected profile"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+
+    imported = load_claude_session(session_id)
+
+    assert imported.title == "Selected profile"
+
+
 def test_load_claude_session_falls_back_to_ai_title(tmp_path: Path) -> None:
     """With no rename, the generated ai-title is used over the first message."""
     session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
