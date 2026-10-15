@@ -110,7 +110,8 @@ function googleFont(
   };
 }
 
-// 25 eligible Sans Serif families in ascending Google popularity; base catalog families not in the ranked list follow.
+// 25 eligible Sans Serif families in ascending Google popularity;
+// base catalog families not in the ranked list follow.
 const SANS_GOOGLE_FONTS: readonly [string, string, readonly number[]][] = [
   ["open-sans", "Open Sans", [400, 500, 600, 700]],
   ["roboto", "Roboto", [400, 500, 600, 700]],
