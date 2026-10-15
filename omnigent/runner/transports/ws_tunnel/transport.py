@@ -44,6 +44,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
 from omnigent.server.server_config import runner_tunnel_binary_request_body
+from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
 # A session event sent to the runner: a user message, approval, or other input
 # that can start work there.
@@ -187,7 +188,6 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                 raise httpx.ConnectError(str(exc), request=request) from exc
             raise
         try:
-            body = await request.aread()
             frame = RequestFrame(
                 id=req_id,
                 method=request.method,
@@ -198,10 +198,21 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             )
             if use_binary:
                 try:
-                    wire: str | bytes = encode_binary_request(frame, body)
+                    wire_buffer = bytearray(encode_binary_request(frame, b""))
+                    body_budget = RUNNER_TUNNEL_MAX_MESSAGE_BYTES - len(wire_buffer)
+                    body_size = 0
+                    stream = request.stream
+                    assert isinstance(stream, httpx.AsyncByteStream)
+                    async for chunk in stream:
+                        if body_size + len(chunk) > body_budget:
+                            raise ValueError("binary request exceeds tunnel message limit")
+                        wire_buffer.extend(chunk)
+                        body_size += len(chunk)
+                    wire: str | bytes = bytes(wire_buffer)
                 except ValueError as exc:
                     raise httpx.LocalProtocolError(str(exc), request=request) from exc
             else:
+                body = await request.aread()
                 content_type = request.headers.get("content-type", "application/json")
                 frame.body, frame.encoding = (
                     encode_body(body, content_type) if body else (None, "utf-8")

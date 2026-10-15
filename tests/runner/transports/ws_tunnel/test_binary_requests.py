@@ -805,6 +805,66 @@ async def test_transport_reports_oversized_binary_request() -> None:
         assert not session.binary_requests
 
 
+async def test_oversized_streaming_binary_body_stops_at_envelope_limit() -> None:
+    chunk_size = 64 * 1024
+    consumed = 0
+
+    async def body() -> AsyncIterator[bytes]:
+        nonlocal consumed
+        for _ in range(RUNNER_TUNNEL_MAX_MESSAGE_BYTES // chunk_size + 2):
+            chunk = b"x" * chunk_size
+            consumed += len(chunk)
+            yield chunk
+
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        request = client.build_request(
+            "PATCH",
+            "/upload",
+            content=body(),
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        header = RequestFrame(
+            "0" * 32,
+            request.method,
+            request.url.path,
+            query_string=request.url.query.decode("utf-8"),
+            headers=[[key, value] for key, value in request.headers.items()],
+            stream=True,
+        )
+        body_budget = RUNNER_TUNNEL_MAX_MESSAGE_BYTES - len(encode_binary_request(header, b""))
+        with pytest.raises(
+            httpx.LocalProtocolError, match=r"binary request.*message limit"
+        ) as error:
+            await client.send(request)
+        assert error.value.request is request
+        assert body_budget < consumed <= body_budget + chunk_size
+
+        session = registry.get(_RUNNER)
+        assert session is not None
+        assert not session.binary_requests
+        assert not session.in_flight
+        assert session.outbound_queue.empty()
+
+        retry = asyncio.create_task(
+            client.patch(
+                "/upload",
+                content=b"retry",
+                extensions={"runner_tunnel_binary_request_body": True},
+            )
+        )
+        try:
+            raw = await asyncio.wait_for(ws.recv(), 2)
+            assert isinstance(raw, bytes)
+            retry_id = _envelope_header(raw)["id"]
+            assert session.binary_requests == {retry_id}
+            await _reply(ws, retry_id)
+            assert (await asyncio.wait_for(retry, 2)).status_code == 204
+            assert not session.binary_requests
+        finally:
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+
+
 async def test_binary_request_across_consumer_loop() -> None:
     def consume() -> int:
         async def send() -> int:
