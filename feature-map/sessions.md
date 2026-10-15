@@ -18,7 +18,10 @@ the header menu), and each place is a separate entry point.
 - `rename`: from the row, the header menu, or the header title; long titles are
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
-  view, which can be filtered by project and paged.
+  view, which can be filtered by project and paged. On a server with worktree
+  cleanup, archiving a session that has a git worktree first asks whether to
+  also delete the worktree (the branch is kept); Remember my choice saves the
+  answer, which Settings → Git can change later.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
@@ -35,6 +38,8 @@ the header menu), and each place is a separate entry point.
   it; the state survives a reload.
 - `project`: Add to project (Move session once filed) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
+- `project-rename`: the project menu opens a dialog with the name selected;
+  typing replaces it without losing characters as the menu closes.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
@@ -79,12 +84,20 @@ the header menu), and each place is a separate entry point.
 - `canvas-session-health`: an opened Canvas session receives host health and
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
-  (Default / Status / Updated), Display (All / My / Shared / Archived), Ordering
-  (Updated / Status) and Show (Updated / Environment / Repo / Branch) submenus,
-  saved per device. Shared sessions get their own section above Sessions. A
-  Status or Updated grouping replaces Projects, Shared and Sessions with titled
-  groups; the first group's header takes the Projects header's place. Select
-  sessions sits beside the filter and selects every list below it at once. Behind
+  (Default / Created / Updated), Display (All / My / Shared / Archived), Ordering
+  (Updated / Created) and Show (Updated / Environment / Repo / Branch) submenus,
+  saved per device. Created ordering keeps sessions newest-created first as messages
+  arrive;
+  requests, pagination, and project folders use that order too. Switching order
+  clears the cached rows and shows loading while session timestamps refresh,
+  including project folders, pins, and Archived. With the flag off,
+  sessions always use Updated regardless of the saved preference. Shared sessions
+  get their own section above Sessions. Status grouping is hidden until
+  working/idle detection is reliable; saved Status selections fall back to Default.
+  Created and Updated group by their respective date, independently of ordering,
+  with headings such as “Created today” and “Updated yesterday”. Both replace
+  Projects, Shared and Sessions with titled groups; the first group's header takes
+  the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
   the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
   a flat Display filter and the tooltip keeps its plain layout.
 
@@ -93,6 +106,9 @@ the header menu), and each place is a separate entry point.
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, add to project (or move
 session), archive or unarchive, and delete.
+
+**Project folder:** right-click its header or open its three-dot menu, then
+choose Rename project. Start typing as soon as the dialog opens.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -116,12 +132,18 @@ agents (installed with `omnigent agent add`, imported in the Create custom agent
 dialog, or uploaded by running a session with their spec) stay available until
 you remove them.
 
+**Archive worktree prompt:** archive a worktree session from the row menu,
+bulk selection, or header menu; the "Also delete the worktree?" dialog offers
+"No, archive only" and "Yes, delete worktree", plus Remember my choice.
+Dismissing it cancels the archive. Settings → Git → Worktrees holds the saved
+choice only when the server supports cleanup.
+
 **Archived view:** choose Display → Archived sessions in the sidebar filter
 menu, then filter by project.
 
 **Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
-Projects header holds Grouping, Display, Ordering and Show. In a Status or
-Updated grouping, Projects is hidden and the funnel sits in the same spot on the
+Projects header holds Grouping, Display, Ordering and Show. In
+Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
 first group's header. The Select sessions button sits beside it and selects
 project, Shared and Sessions rows together; the Sessions header keeps only New
 session. Hovering a row opens
@@ -258,6 +280,17 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_load_more_pages_through`
+- **`archive`, worktree prompt:**
+  `tests/server/integration/test_sessions_archive.py::test_archive_stop_removes_worktree_when_requested`
+  and
+  `tests/server/integration/test_sessions_archive.py::test_delete_worktree_requires_archive`
+  (plain `uv run pytest`) cover the opt-in teardown that keeps the branch and
+  the rejected request without archive. The prompt, remembered choice, and the
+  archive-only fallback on a server without cleanup have component coverage in
+  `web/src/shell/Sidebar.archive.test.tsx` and
+  `web/src/shell/HeaderConversationMenu.test.tsx`. Manually: archive a
+  worktree session from the row menu, bulk selection, and header menu, and
+  expect the dialog each time; a session without a worktree archives silently.
 - **`unarchive`, header menu:**
   `tests/e2e_ui/sessions/test_archived_session_header_menu.py::test_archived_session_header_menu_offers_unarchive`.
   The sidebar row and bulk unarchive have web unit coverage only: archive a
@@ -285,6 +318,9 @@ plain `uv run pytest`, which starts a private server for the test.
   regroup under that project.
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
+- **`project-rename`, project header right-click and three-dot menus:**
+  `tests/e2e_ui/sessions/test_project_rename_dialog_focus.py::test_rename_dialog_preselects_name_so_typing_replaces`
+  covers typing across the menu's exit animation from both menus.
 - **`fork`, message cutoff:**
   `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_fork_from_middle_truncates_history`,
   plus agent switching (own environment):
@@ -294,7 +330,7 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`workspace-recovery`, desktop and mobile conversation, Canvas, and side-chat cards:**
   `tests/browser_ui/chat/test_workspace_missing_recovery.py::test_continue_missing_workspace_in_another_directory`
   runs without a repro instance using `uv run pytest <test>
-  --browser-ui-skip-build --video=on --output=<evidence-directory>`.
+--browser-ui-skip-build --video=on --output=<evidence-directory>`.
   The browser contract covers the error action, visible explanation, blank
   destination, rejected missing directory, directory browser, preflight before
   fork and launch, and navigation to copied history while the original remains
@@ -534,9 +570,10 @@ plain `uv run pytest`, which starts a private server for the test.
   ordinary sessions still return to the new-session page in
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
 - **`view-options`:**
-  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_status_grouping_and_show_toggles_persist_across_reload`,
-  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`
-  (both enable the flag by patching `GET /v1/info`). Unit tests in
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_date_grouping_and_show_toggles_persist_across_reload`,
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
+  (enable the flag by patching `GET /v1/info`). Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
   that the flag-off sidebar ignores stored view options.
 
@@ -567,6 +604,9 @@ plain `uv run pytest`, which starts a private server for the test.
   that the undo toast restores the session.
 - The header menu of an archived session must offer Unarchive, not Archive.
   Open an archived session directly to see it.
+- The worktree prompt appears only when the server advertises worktree cleanup
+  and the session has a worktree. A remembered answer skips it on every later
+  archive; reset the choice in Settings → Git before re-testing.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.

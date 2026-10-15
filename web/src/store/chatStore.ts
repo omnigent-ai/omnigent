@@ -542,6 +542,13 @@ export interface PendingUserMessage {
    * receipt names. Snapshot-replayed entries carry that id as `tempId`.
    */
   pendingId?: string;
+  /**
+   * Sent to a native-terminal session while its turn was running. The vendor
+   * agent reads such a message only after its current step (e.g. a running
+   * tool call), so the bubble says so until `session.input.consumed` promotes
+   * it. Unset on snapshot-replayed entries.
+   */
+  sentMidTurn?: boolean;
 }
 
 /**
@@ -2325,6 +2332,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               (targetState.sessionModelSeeded && targetState.sessionHarness === null))
           ? { text, files: files ?? [] }
           : undefined;
+    // Non-native sends persist at POST time, so only a native session leaves
+    // the bubble pending until the agent actually reads it.
+    const sentMidTurn =
+      targetState?.isNativeTerminalSession === true && targetState.sessionStatus === "running";
     const alreadyStreaming =
       opts?.reusePendingTempId != null
         ? false
@@ -2383,6 +2394,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+                ...(sentMidTurn ? { sentMidTurn } : {}),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells

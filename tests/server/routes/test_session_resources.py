@@ -7616,6 +7616,89 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         assert attrs["item_id"] == consumed[0]["data"]["item_id"]
         assert attrs["response_id"] == message.response_id == "resp_fail"
         assert attrs["match_method"] == "input_stable_id"
+        assert attrs["cause_class"] == "rejected_before_handoff"
+        assert attrs["reason_code"] == "databricks_sign_in_pending"
+        assert attrs["lifecycle_response_id"] == "resp_fail"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    pending_id = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "set up the worktree"}],
+        created_by="alice@example.com",
+        stable_id=stable_id,
+    )
+    next_pending = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "then run the tests"}],
+        stable_id="8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e",
+    )
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _session_id, event: published.append(event)
+    )
+    store = _ConversationStore()
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": stable_id,
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "code": "runner_error",
+                            "message": "turn setup failed",
+                            "undelivered": True,
+                        },
+                    },
+                    "error": {
+                        "code": "runner_error",
+                        "message": "turn setup failed",
+                        "undelivered": True,
+                    },
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": {"code": "runner_error", "message": "turn setup failed"},
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    try:
+        await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
+            next_pending
+        ]
+        consumed = [event for event in published if event.get("type") == "session.input.consumed"]
+        assert [event["data"]["cleared_pending_id"] for event in consumed] == [pending_id]
+        assert not [event for event in published if event.get("type") == "response.failed"]
+        failed = [
+            event
+            for event in published
+            if event.get("type") == "session.status" and event.get("status") == "failed"
+        ]
+        assert [(event["error"]["code"], event.get("response_id")) for event in failed] == [
+            ("runner_error", None)
+        ]
     finally:
         pending_inputs.reset_for_tests()
 
@@ -7728,24 +7811,19 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
 
 
 @pytest.mark.asyncio
-async def test_relay_settles_a_message_codex_refused_and_the_next_mirror_is_clean(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirror(
     tmp_path: Path,
 ) -> None:
-    """
-    A turn Codex refused settles its queued message once, with no false "not recorded".
+    """A pre-delivery refusal must not be reported again as a missing message.
 
-    Codex answers an over-long ``turn/start`` with a JSON-RPC error, which proves
-    the turn never started. The real executor and adapter report that as a coded,
-    undelivered failure; the relay commits the message (so it survives a reload)
-    and drains its queue entry. When the forwarder then mirrors the user's NEXT
-    message, nothing is left queued ahead of it to be reported as never recorded.
+    Claude refuses web ``/login`` before touching the terminal. If that failure
+    is not marked undelivered, the input stays pending. The next successful
+    message's transcript mirror skips it and persists a second error with code
+    ``native_prompt_not_recorded``.
     """
-    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
-    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState, write_bridge_state
-    from omnigent.inner.codex_native_executor import CodexNativeExecutor
+    from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
     from omnigent.runtime import pending_inputs
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.routes.sessions import (
         _persist_external_conversation_item,
@@ -7753,136 +7831,94 @@ async def test_relay_settles_a_message_codex_refused_and_the_next_mirror_is_clea
     )
     from omnigent.server.schemas import CreateResponseRequest
 
-    class _RefusingCodexClient:
-        """App-server client that refuses every turn as over-long."""
-
-        def __init__(self, *_args: object, **_kwargs: object) -> None:
-            pass
-
-        async def connect(self) -> None:
-            pass
-
-        async def close(self) -> None:
-            pass
-
-        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-            raise CodexAppServerResponseError(
-                {
-                    "code": -32602,
-                    "data": {
-                        "input_error_code": "input_too_large",
-                        "max_chars": 1048576,
-                        "actual_chars": 1309439,
-                    },
-                    "message": "Input exceeds the maximum length of 1048576 characters.",
-                }
-            )
-
-    monkeypatch.setattr(
-        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _RefusingCodexClient
-    )
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_codex",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_codex",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id=None,
-        ),
-    )
-    adapter = ExecutorAdapter(executor_factory=lambda: CodexNativeExecutor(bridge_dir=tmp_path))
-    ctx = TurnContext(
-        response_id="resp_refused", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
-    )
-    with pytest.raises(InnerExecutorError) as raised:
-        await adapter.run_turn(CreateResponseRequest(model="test-agent", input="huge paste"), ctx)
-    await adapter.on_shutdown()
-    refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
-
     pending_inputs.reset_for_tests()
-    sid = "2f7e1c0a9d3b4e5f8a6b7c8d9e0f1a2b"
+    session_id = "64a784c3aa907d1774f44313546947c6"
     store = _ConversationStore()
-    conv = Conversation(
-        id=sid,
-        created_at=1,
-        updated_at=1,
-        root_conversation_id=sid,
-        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
-        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
-    )
-    store._conversations[sid] = conv
-    refused_stable = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
-    pending_inputs.record(
-        sid,
-        [{"type": "input_text", "text": "huge paste"}],
+    conversation = store.get_conversation(session_id)
+    assert conversation is not None
+    first_stable_id = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+    later_stable_id = "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b"
+    auth_content = [{"type": "input_text", "text": "/login"}]
+    later_content = [{"type": "input_text", "text": "continue after login"}]
+    first_pending = pending_inputs.record(
+        session_id,
+        auth_content,
         created_by="alice@example.com",
-        stable_id=refused_stable,
+        stable_id=first_stable_id,
     )
-    client = _ScriptedStreamingRunnerClient(
-        [
-            _sse_frame(
-                {"type": "response.in_progress", "response": {"id": "resp_refused", "model": "x"}}
-            ),
-            _sse_frame(
-                {
-                    "type": "response.failed",
-                    "input_stable_id": refused_stable,
-                    "response": {"id": "resp_refused", "model": "x", "error": refusal},
-                }
-            ),
-            "data: [DONE]\n\n",
-        ]
+    adapter = ExecutorAdapter(executor_factory=lambda: ClaudeNativeExecutor(tmp_path))
+    context = TurnContext(
+        response_id="resp_login_refused",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
     )
-
     try:
-        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(
+                CreateResponseRequest(model="claude", input=auth_content),
+                context,
+            )
+        refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
+        failed_turn = _ScriptedStreamingRunnerClient(
+            [
+                _sse_frame(
+                    {
+                        "type": "response.in_progress",
+                        "response": {"id": "resp_login_refused", "model": "claude"},
+                    }
+                ),
+                _sse_frame(
+                    {
+                        "type": "response.failed",
+                        "input_stable_id": first_stable_id,
+                        "response": {
+                            "id": "resp_login_refused",
+                            "model": "claude",
+                            "error": refusal,
+                        },
+                    }
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+        await _relay_runner_stream(session_id, failed_turn, store)  # type: ignore[arg-type]
 
-        # The refused message is committed ahead of its error, and nothing stays queued.
-        assert [i.type for i in store.appended_items] == ["message", "error"]
-        message, error = store.appended_items
-        assert message.data.content == [{"type": "input_text", "text": "huge paste"}]
-        assert message.data.user_authored is True
-        assert message.created_by == "alice@example.com"
-        assert error.data.code == "input_too_large"
-        assert pending_inputs.snapshot_for(sid) == []
-
-        # The user's next message: queued, sent, then mirrored back by the forwarder.
-        pending_inputs.record(
-            sid,
-            [{"type": "input_text", "text": "summarize the readme instead"}],
+        later_pending = pending_inputs.record(
+            session_id,
+            later_content,
             created_by="alice@example.com",
-            stable_id="8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e",
+            stable_id=later_stable_id,
         )
         await _persist_external_conversation_item(
-            sid,
-            conv,
+            session_id,
+            conversation,
             SessionEventInput(
                 type="external_conversation_item",
                 data={
                     "item_type": "message",
-                    "item_data": {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "summarize the readme instead"}
-                        ],
-                    },
-                    "response_id": "resp_next",
-                    "source_id": "codex:next:0",
+                    "item_data": {"role": "user", "content": later_content},
+                    "response_id": "native_later_turn",
+                    "source_id": "claude:later:0",
                 },
             ),
             store,  # type: ignore[arg-type]
         )
 
-        # Only the next message itself was added: no "not recorded" pair for the refused one.
-        assert [i.type for i in store.appended_items[2:]] == ["message"]
-        assert not [
-            i
-            for i in store.appended_items
-            if i.type == "error" and i.data.code == "native_prompt_not_recorded"
+        missing_errors = [
+            (item.data.code, item.data.message)
+            for item in store.appended_items
+            if item.type == "error" and item.data.code == "native_prompt_not_recorded"
         ]
-        assert pending_inputs.snapshot_for(sid) == []
+        assert missing_errors == [], (
+            "generated 'Web message missing from native transcript': the refused input "
+            f"{first_pending} stayed pending and was reported missing when the later mirror "
+            f"settled {later_pending}; persisted={missing_errors}"
+        )
+        assert refusal.get("undelivered") is True
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == []
+        assert later_pending not in pending_inputs.pending_ids(session_id)
     finally:
+        await adapter.on_shutdown()
         pending_inputs.reset_for_tests()
 
 
@@ -9660,5 +9696,164 @@ async def test_native_message_that_is_not_a_claude_btw_is_still_queued(
         assert result.pending_id is not None
         assert [entry["content"] for entry in pending_inputs.snapshot_for(sid)] == [content]
         assert client.post_json_calls[-1][0] == f"/v1/sessions/{sid}/events"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_relay_settles_a_message_codex_refused_and_the_next_mirror_is_clean(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A turn Codex refused settles its queued message once, with no false "not recorded".
+
+    Codex answers an over-long ``turn/start`` with a JSON-RPC error, which proves
+    the turn never started. The real executor and adapter report that as a coded,
+    undelivered failure; the relay commits the message (so it survives a reload)
+    and drains its queue entry. When the forwarder then mirrors the user's NEXT
+    message, nothing is left queued ahead of it to be reported as never recorded.
+    """
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState, write_bridge_state
+    from omnigent.inner.codex_native_executor import CodexNativeExecutor
+    from omnigent.runtime import pending_inputs
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+    )
+    from omnigent.server.schemas import CreateResponseRequest
+
+    class _RefusingCodexClient:
+        """App-server client that refuses every turn as over-long."""
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def connect(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            raise CodexAppServerResponseError(
+                {
+                    "code": -32602,
+                    "data": {
+                        "input_error_code": "input_too_large",
+                        "max_chars": 1048576,
+                        "actual_chars": 1309439,
+                    },
+                    "message": "Input exceeds the maximum length of 1048576 characters.",
+                }
+            )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _RefusingCodexClient
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_codex",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_codex",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: CodexNativeExecutor(bridge_dir=tmp_path))
+    ctx = TurnContext(
+        response_id="resp_refused", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    with pytest.raises(InnerExecutorError) as raised:
+        await adapter.run_turn(CreateResponseRequest(model="test-agent", input="huge paste"), ctx)
+    await adapter.on_shutdown()
+    refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
+
+    pending_inputs.reset_for_tests()
+    sid = "2f7e1c0a9d3b4e5f8a6b7c8d9e0f1a2b"
+    store = _ConversationStore()
+    conv = Conversation(
+        id=sid,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=sid,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
+    )
+    store._conversations[sid] = conv
+    refused_stable = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "huge paste"}],
+        created_by="alice@example.com",
+        stable_id=refused_stable,
+    )
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {"type": "response.in_progress", "response": {"id": "resp_refused", "model": "x"}}
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": refused_stable,
+                    "response": {"id": "resp_refused", "model": "x", "error": refusal},
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+
+        # The refused message is committed ahead of its error, and nothing stays queued.
+        assert [i.type for i in store.appended_items] == ["message", "error"]
+        message, error = store.appended_items
+        assert message.data.content == [{"type": "input_text", "text": "huge paste"}]
+        assert message.data.user_authored is True
+        assert message.created_by == "alice@example.com"
+        assert error.data.code == "input_too_large"
+        assert pending_inputs.snapshot_for(sid) == []
+
+        # The user's next message: queued, sent, then mirrored back by the forwarder.
+        pending_inputs.record(
+            sid,
+            [{"type": "input_text", "text": "summarize the readme instead"}],
+            created_by="alice@example.com",
+            stable_id="8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e",
+        )
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "summarize the readme instead"}
+                        ],
+                    },
+                    "response_id": "resp_next",
+                    "source_id": "codex:next:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+
+        # Only the next message itself was added: no "not recorded" pair for the refused one.
+        assert [i.type for i in store.appended_items[2:]] == ["message"]
+        assert not [
+            i
+            for i in store.appended_items
+            if i.type == "error" and i.data.code == "native_prompt_not_recorded"
+        ]
+        assert pending_inputs.snapshot_for(sid) == []
     finally:
         pending_inputs.reset_for_tests()

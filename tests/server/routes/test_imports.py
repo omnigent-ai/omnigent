@@ -1103,8 +1103,8 @@ async def test_import_local_live_host_off_replica_is_wrong_replica(
     signal the client re-addresses on — the import failed permanently.
 
     Only a sharded (multi-replica) deployment has an "other replica" to
-    re-address to, so force the sharded signal on — the test host stack has no
-    lakebox module, which auto-detects as single-replica.
+    re-address to, so force the sharded signal on — the test host stack is
+    single-replica by default.
     """
     from omnigent.server.routes import _host_launch
 
