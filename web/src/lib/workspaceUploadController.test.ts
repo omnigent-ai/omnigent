@@ -1,4 +1,4 @@
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "./identity";
 import { uploadTotals, useUploadStore, type UploadRow } from "@/store/uploadStore";
@@ -344,6 +344,129 @@ it("debounces refresh by directory, actively refetches the target and replaced f
   expect(
     invalidate.mock.calls.filter(([arg]) => arg?.queryKey?.[0] === "workspace-dir"),
   ).toHaveLength(4);
+});
+
+it("coalesces session-wide refetches across folders and refreshes each folder listing once", async () => {
+  vi.useFakeTimers();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  const result = {
+    path: "a.bin",
+    final_name: "a.bin",
+    size: 20,
+    sha256: "hash",
+    outcome: "created" as const,
+  };
+  for (const directory of ["one", "two", "three"])
+    refreshUploadedFiles(client, { ...row, directory }, result);
+  await vi.advanceTimersByTimeAsync(300);
+  const count = (queryKey: unknown[]) =>
+    invalidate.mock.calls.filter(
+      ([arg]) => JSON.stringify(arg?.queryKey) === JSON.stringify(queryKey),
+    ).length;
+  for (const queryKey of [
+    ["workspace-all-files", "s"],
+    ["workspace-changed-files", "s"],
+    ["workspace-file-search", "s"],
+    ["workspace-dir-listing", "s"],
+    ["workspace-dir", "s", "one"],
+    ["workspace-dir", "s", "two"],
+    ["workspace-dir", "s", "three"],
+  ])
+    expect(count(queryKey)).toBe(1);
+});
+
+it("flushes session-wide refetches during a sustained completion stream", async () => {
+  discardUploads(row.origin, row.identity);
+  vi.useFakeTimers();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  const result = {
+    path: "a.bin",
+    final_name: "a.bin",
+    size: 20,
+    sha256: "hash",
+    outcome: "created" as const,
+  };
+  const sessionKeys = [
+    ["workspace-all-files", "s"],
+    ["workspace-changed-files", "s"],
+    ["workspace-file-search", "s"],
+    ["workspace-dir-listing", "s"],
+  ];
+  const counts = () =>
+    sessionKeys.map(
+      (queryKey) =>
+        invalidate.mock.calls.filter(
+          ([arg]) => JSON.stringify(arg?.queryKey) === JSON.stringify(queryKey),
+        ).length,
+    );
+  // Completions 200 ms apart for 4 s never let the 300 ms trailing debounce settle.
+  for (let i = 0; i < 20; i++)
+    setTimeout(
+      () => refreshUploadedFiles(client, { ...row, directory: `d${i % 3}` }, result),
+      i * 200,
+    );
+  await vi.advanceTimersByTimeAsync(4000);
+  const during = counts();
+  for (const count of during) {
+    expect(count).toBeGreaterThanOrEqual(1);
+    expect(count).toBeLessThanOrEqual(3);
+  }
+  await vi.advanceTimersByTimeAsync(100);
+  expect(counts()).toEqual(during.map((count) => count + 1));
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(counts()).toEqual(during.map((count) => count + 1));
+
+  refreshUploadedFiles(client, row, result);
+  discardUploads(row.origin, row.identity);
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(counts()).toEqual(during.map((count) => count + 1));
+});
+
+it("refreshes an active folder and its replaced files during a sustained same-folder stream", async () => {
+  discardUploads(row.origin, row.identity);
+  vi.useFakeTimers();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  let fetches = 0;
+  const observer = new QueryObserver(client, {
+    queryKey: ["workspace-dir", "s", "src"],
+    queryFn: async () => ++fetches,
+  });
+  const unsubscribe = observer.subscribe(() => {});
+  await vi.advanceTimersByTimeAsync(0);
+  expect(fetches).toBe(1);
+  const path = (i: number) => `src/f${i}.bin`;
+  const refreshed = (i: number) =>
+    ["file-content", "file-diff"].map(
+      (kind) =>
+        invalidate.mock.calls.filter(
+          ([arg]) => JSON.stringify(arg?.queryKey) === JSON.stringify([kind, "s", path(i)]),
+        ).length,
+    );
+  // Replaced files land in one folder 200 ms apart for 4 s, so the 300 ms debounce never settles.
+  for (let i = 0; i < 20; i++)
+    setTimeout(
+      () =>
+        refreshUploadedFiles(client, row, {
+          path: path(i),
+          final_name: `f${i}.bin`,
+          size: 20,
+          sha256: "hash",
+          outcome: "replaced",
+        }),
+      i * 200,
+    );
+  await vi.advanceTimersByTimeAsync(4000);
+  const during = fetches - 1;
+  expect(during).toBeGreaterThanOrEqual(1);
+  expect(during).toBeLessThanOrEqual(3);
+  for (let i = 0; i < 16; i++) expect(refreshed(i)).toEqual([1, 1]);
+  for (let i = 16; i < 20; i++) expect(refreshed(i)).toEqual([0, 0]);
+  await vi.advanceTimersByTimeAsync(100);
+  expect(fetches).toBe(during + 2);
+  for (let i = 0; i < 20; i++) expect(refreshed(i)).toEqual([1, 1]);
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(fetches).toBe(during + 2);
+  unsubscribe();
 });
 
 it("cancels retry waits and distinguishes long upload-limit backoff from busy", async () => {
