@@ -26,7 +26,8 @@ import asyncio
 import contextlib
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
+from typing import cast
 
 import httpx
 
@@ -44,10 +45,17 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.runner.transports.ws_tunnel.registry import RequestState, TunnelRegistry
 from omnigent.server.server_config import runner_tunnel_binary_request_body
+from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
 # A session event sent to the runner: a user message, approval, or other input
 # that can start work there.
 _SESSION_EVENTS_PATH = re.compile(r"^/v1/sessions/[^/]+/events$")
+
+
+async def _aclose_if_available(stream: object) -> None:
+    aclose = getattr(stream, "aclose", None)
+    if callable(aclose):
+        await cast(Awaitable[None], aclose())
 
 
 class _TunneledByteStream(httpx.AsyncByteStream):
@@ -187,7 +195,6 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                 raise httpx.ConnectError(str(exc), request=request) from exc
             raise
         try:
-            body = await request.aread()
             frame = RequestFrame(
                 id=req_id,
                 method=request.method,
@@ -197,11 +204,33 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                 stream=True,
             )
             if use_binary:
+                stream = request.stream
+                assert isinstance(stream, httpx.AsyncByteStream)
                 try:
-                    wire: str | bytes = encode_binary_request(frame, body)
-                except ValueError as exc:
-                    raise httpx.LocalProtocolError(str(exc), request=request) from exc
+                    iterator = stream.__aiter__()
+                    wire_buffer = bytearray(encode_binary_request(frame, b""))
+                    body_budget = RUNNER_TUNNEL_MAX_MESSAGE_BYTES - len(wire_buffer)
+                    body_size = 0
+                    async for chunk in iterator:
+                        if body_size + len(chunk) > body_budget:
+                            raise httpx.LocalProtocolError(
+                                "binary request exceeds tunnel message limit",
+                                request=request,
+                            )
+                        wire_buffer.extend(chunk)
+                        body_size += len(chunk)
+                    wire = bytes(wire_buffer)
+                    del wire_buffer
+                except BaseException as error:
+                    try:
+                        await _aclose_if_available(stream)
+                    except BaseException as cleanup_error:
+                        raise error from cleanup_error
+                    raise
+                else:
+                    await _aclose_if_available(stream)
             else:
+                body = await request.aread()
                 content_type = request.headers.get("content-type", "application/json")
                 frame.body, frame.encoding = (
                     encode_body(body, content_type) if body else (None, "utf-8")
