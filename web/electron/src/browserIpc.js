@@ -298,15 +298,21 @@ function registerBrowserIpc({
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const navigate = (registry) =>
-      registry.openOrNavigate(conversationId, url, bounds, {
+    const navigate = async (registry) => {
+      // The first-party renderer supplies the source-session host; main owns
+      // the target and eligibility. Caller exception flags never establish identity.
+      const agentContext = opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null;
+      if (opts?.agent && url) {
+        const verdict = await registry.checkAgentNavigation(conversationId, url, agentContext);
+        if (!verdict.ok) return verdict;
+      }
+      return registry.openOrNavigate(conversationId, url, bounds, {
         force: !!opts?.force,
         agent: !!opts?.agent,
-        // The first-party renderer supplies the source-session host; main owns
-        // the target and eligibility. Caller exception flags never establish identity.
-        agentContext: opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null,
+        agentContext,
       });
-    let r = navigate(g.registry);
+    };
+    let r = await navigate(g.registry);
     let recovered = false;
     if (!r.ok && opts?.agent) {
       try {
@@ -325,7 +331,7 @@ function registerBrowserIpc({
       // Recovery updates main-owned identity, so rebuild the context and ask
       // the registry to evaluate the same navigation once more.
       const refreshed = gateRegistry(event);
-      if (!refreshed.error) r = navigate(refreshed.registry);
+      if (!refreshed.error) r = await navigate(refreshed.registry);
     }
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.

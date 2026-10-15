@@ -42,6 +42,8 @@ function makeIpcMain() {
   };
 }
 
+const allowAgentNavigation = async () => ({ ok: true });
+
 describe("browser IPC Arca context", () => {
   it("adds a main-owned recovery hint only to a denied agent navigation", async () => {
     const ipcMain = makeIpcMain();
@@ -51,6 +53,7 @@ describe("browser IPC Arca context", () => {
       ipcMain,
       isPinnedOriginSender: () => true,
       getRegistryForEvent: () => ({
+        checkAgentNavigation: allowAgentNavigation,
         openOrNavigate: () => ({ ok: allowed, error: allowed ? undefined : "blocked" }),
       }),
       getAgentNavigationHintForEvent: () => {
@@ -80,6 +83,7 @@ describe("browser IPC Arca context", () => {
       ipcMain,
       isPinnedOriginSender: () => true,
       getRegistryForEvent: () => ({
+        checkAgentNavigation: allowAgentNavigation,
         openOrNavigate: () => ({
           ok: allowed,
           error: allowed ? undefined : "blocked",
@@ -132,6 +136,7 @@ describe("browser IPC Arca context", () => {
       ipcMain,
       isPinnedOriginSender: () => true,
       getRegistryForEvent: () => ({
+        checkAgentNavigation: allowAgentNavigation,
         openOrNavigate: () => {
           navigations++;
           return { ok: false, error: "blocked", created: false };
@@ -163,6 +168,7 @@ describe("browser IPC Arca context", () => {
       ipcMain,
       isPinnedOriginSender: () => true,
       getRegistryForEvent: () => ({
+        checkAgentNavigation: allowAgentNavigation,
         openOrNavigate: () => ({ ok: false, error: "blocked", created: false }),
       }),
       recoverAgentNavigationForEvent: async () => {
@@ -185,8 +191,14 @@ describe("browser IPC Arca context", () => {
   it("re-gates the sender registry after awaited recovery", async () => {
     const ipcMain = makeIpcMain();
     let registryCalls = 0;
-    const first = { openOrNavigate: () => ({ ok: false, error: "blocked" }) };
-    const second = { openOrNavigate: () => ({ ok: true, created: false }) };
+    const first = {
+      checkAgentNavigation: allowAgentNavigation,
+      openOrNavigate: () => ({ ok: false, error: "blocked" }),
+    };
+    const second = {
+      checkAgentNavigation: allowAgentNavigation,
+      openOrNavigate: () => ({ ok: true, created: false }),
+    };
     registerBrowserIpc({
       ipcMain,
       isPinnedOriginSender: () => true,
@@ -207,14 +219,19 @@ describe("browser IPC Arca context", () => {
     assert.equal(registryCalls, 2);
   });
 
-  it("pairs the renderer's source host with main's context and ignores caller exception flags", () => {
+  it("pairs the renderer's source host with main's context and ignores caller exception flags", async () => {
     const ipcMain = makeIpcMain();
     const calls = [];
+    const checks = [];
     const context = { serverTarget: "current", sourceHostId: "actual-host" };
     registerBrowserIpc({
       ipcMain,
       isPinnedOriginSender: () => true,
       getRegistryForEvent: () => ({
+        checkAgentNavigation: async (...args) => {
+          checks.push(args);
+          return { ok: true };
+        },
         openOrNavigate: (...args) => {
           calls.push(args);
           return { ok: true };
@@ -225,7 +242,7 @@ describe("browser IPC Arca context", () => {
         return context;
       },
     });
-    ipcMain.invoke(
+    await ipcMain.invoke(
       "omnigent:browser-open-or-navigate",
       {},
       {
@@ -241,7 +258,42 @@ describe("browser IPC Arca context", () => {
         },
       },
     );
+    assert.deepEqual(checks, [["source", "http://localhost", context]]);
     assert.deepEqual(calls[0][3], { force: true, agent: true, agentContext: context });
+  });
+
+  it("refuses an agent navigation whose host does not resolve publicly before creating a view", async () => {
+    const ipcMain = makeIpcMain();
+    let navigations = 0;
+    const checked = [];
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        checkAgentNavigation: async (_id, url) => {
+          checked.push(url);
+          return url.includes("lvh.me")
+            ? { ok: false, error: "navigation blocked: resolves internally" }
+            : { ok: true };
+        },
+        openOrNavigate: () => {
+          navigations++;
+          return { ok: true, created: false };
+        },
+      }),
+    });
+    const invoke = (url, opts) =>
+      ipcMain.invoke("omnigent:browser-open-or-navigate", {}, { conversationId: "c", url, opts });
+
+    assert.deepEqual(await invoke("http://lvh.me:8899/", { agent: true }), {
+      ok: false,
+      created: false,
+      error: "navigation blocked: resolves internally",
+    });
+    assert.equal(navigations, 0, "no view is created or navigated");
+    // User URL-bar navigation skips the agent check entirely.
+    assert.equal((await invoke("http://lvh.me:8899/", { force: true })).ok, true);
+    assert.deepEqual(checked, ["http://lvh.me:8899/"]);
   });
 });
 
