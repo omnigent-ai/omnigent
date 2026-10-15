@@ -7616,6 +7616,89 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         assert attrs["item_id"] == consumed[0]["data"]["item_id"]
         assert attrs["response_id"] == message.response_id == "resp_fail"
         assert attrs["match_method"] == "input_stable_id"
+        assert attrs["cause_class"] == "rejected_before_handoff"
+        assert attrs["reason_code"] == "databricks_sign_in_pending"
+        assert attrs["lifecycle_response_id"] == "resp_fail"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    pending_id = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "set up the worktree"}],
+        created_by="alice@example.com",
+        stable_id=stable_id,
+    )
+    next_pending = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "then run the tests"}],
+        stable_id="8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e",
+    )
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _session_id, event: published.append(event)
+    )
+    store = _ConversationStore()
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": stable_id,
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "code": "runner_error",
+                            "message": "turn setup failed",
+                            "undelivered": True,
+                        },
+                    },
+                    "error": {
+                        "code": "runner_error",
+                        "message": "turn setup failed",
+                        "undelivered": True,
+                    },
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": {"code": "runner_error", "message": "turn setup failed"},
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    try:
+        await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
+            next_pending
+        ]
+        consumed = [event for event in published if event.get("type") == "session.input.consumed"]
+        assert [event["data"]["cleared_pending_id"] for event in consumed] == [pending_id]
+        assert not [event for event in published if event.get("type") == "response.failed"]
+        failed = [
+            event
+            for event in published
+            if event.get("type") == "session.status" and event.get("status") == "failed"
+        ]
+        assert [(event["error"]["code"], event.get("response_id")) for event in failed] == [
+            ("runner_error", None)
+        ]
     finally:
         pending_inputs.reset_for_tests()
 
