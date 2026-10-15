@@ -8873,7 +8873,9 @@ async def _auto_create_claude_terminal(
 
         try:
             # If a background Claude job still holds this session, resume a copy under a fresh id.
-            resume_session_id = _claude_resume_session_id(session_external_id, session_id=session_id)
+            resume_session_id = _claude_resume_session_id(
+                session_external_id, session_id=session_id
+            )
             _transcript = await _ensure_local_claude_resume_transcript(
                 server_client,
                 session_id=session_id,
