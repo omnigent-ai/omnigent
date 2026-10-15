@@ -24,6 +24,10 @@ scaffold, not every test whose name contains "harness". A filename containing
 
 ## Shared setup
 
+The repository-root `conftest.py` isolates snapshot-failure output by xdist
+worker for every test tree, including `integrations/`. Serial runs keep the
+existing output location.
+
 Read the [primitive catalog](_helpers/README.md) before writing new setup. It
 maps session, server, runner, host and browser operations to existing APIs and
 examples, including ownership and configuration limits.
