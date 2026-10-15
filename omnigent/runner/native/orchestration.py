@@ -352,6 +352,8 @@ _COST_POPUP_REPOP_TASKS: set[asyncio.Task[object]] = set()
 # references keep the tasks alive after session creation returns.
 _TERMINAL_INTERACTIVE_TASKS: set[asyncio.Task[None]] = set()
 _TERMINAL_INTERACTIVE_TIMEOUT_S = 180.0
+# Past p99 startup; a runner lost before the deadline still leaves the pane on record.
+_TERMINAL_INTERACTIVE_SLOW_S = 60.0
 _TERMINAL_INTERACTIVE_POLL_INTERVAL_S = 0.15
 # Sign-in may stay open indefinitely; limit its liveness subprocess rate.
 _CODEX_LOGIN_EXIT_POLL_INTERVAL_S = 1.0
@@ -381,11 +383,14 @@ async def _observe_terminal_interactive(
     instance: TerminalInstance,
     is_interactive: Callable[[str], bool],
     timeout_s: float = _TERMINAL_INTERACTIVE_TIMEOUT_S,
+    slow_after_s: float = _TERMINAL_INTERACTIVE_SLOW_S,
     poll_interval_s: float = _TERMINAL_INTERACTIVE_POLL_INTERVAL_S,
 ) -> None:
     """Emit one semantic event when a native TUI can accept a message."""
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
+    started_at = loop.time()
+    deadline = started_at + timeout_s
+    slow_logged = False
     try:
         while True:
             result = await instance.read()
@@ -410,10 +415,37 @@ async def _observe_terminal_interactive(
                 raise RuntimeError("terminal stopped before becoming interactive")
             if loop.time() >= deadline:
                 raise TimeoutError(f"terminal did not become interactive within {timeout_s:g}s")
+            if not slow_logged and loop.time() >= started_at + slow_after_s:
+                slow_logged = True
+                tail, sign_in_prompt = await _stalled_pane_diagnostics(instance)
+                _logger.warning(
+                    "Native terminal is not interactive yet: session=%s harness=%s "
+                    "terminal_id=%s waited_s=%.0f",
+                    session_id,
+                    harness,
+                    terminal_id,
+                    loop.time() - started_at,
+                    extra=debug_event(
+                        "terminal_interactive_slow",
+                        session_id=session_id,
+                        harness=harness,
+                        terminal_id=terminal_id,
+                        terminal_instance_id=instance.diagnostic_id,
+                        readiness_signal=readiness_signal,
+                        sign_in_prompt_detected=sign_in_prompt,
+                        terminal_last_output=tail,
+                    ),
+                )
             await asyncio.sleep(poll_interval_s)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — observer failure must not fail session creation
+        # A stopped pane reports its final screen with the exit; a live one is read here.
+        tail, sign_in_prompt = (
+            await _stalled_pane_diagnostics(instance)
+            if isinstance(exc, TimeoutError)
+            else (None, None)
+        )
         _logger.warning(
             "Native terminal interactivity was not observed: session=%s harness=%s "
             "terminal_id=%s reason=%s",
@@ -429,6 +461,8 @@ async def _observe_terminal_interactive(
                 terminal_instance_id=instance.diagnostic_id,
                 readiness_signal=readiness_signal,
                 reason=type(exc).__name__,
+                sign_in_prompt_detected=sign_in_prompt,
+                terminal_last_output=tail,
             ),
         )
 
@@ -5612,6 +5646,17 @@ def _terminal_exit_summary(
     return f"{runtime_name} terminal exited{status_text} {stage}."
 
 
+def _redacted_terminal_text(text: str) -> str | None:
+    """Redact and bound pane text for a diagnostic, or ``None`` when capture is off."""
+    from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+    from omnigent.process_logging import harness_stderr_capture_enabled
+    from omnigent.runner.resource_registry import trim_terminal_output
+
+    if not harness_stderr_capture_enabled():
+        return None
+    return trim_terminal_output(sanitize_diagnostic_text(text))
+
+
 def _startup_terminal_output(instance: TerminalInstance) -> str | None:
     """Apply the same capture gate and bounds to both startup-error paths."""
     from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
@@ -5621,6 +5666,19 @@ def _startup_terminal_output(instance: TerminalInstance) -> str | None:
     if not harness_stderr_capture_enabled():
         return None
     return trim_terminal_output(sanitize_diagnostic_text(instance.last_exit_text() or ""))
+
+
+async def _stalled_pane_diagnostics(instance: TerminalInstance) -> tuple[str | None, bool]:
+    """Return a live pane's redacted tail and whether it shows a sign-in prompt.
+
+    A sign-in prompt is reported only as the flag, keeping its one-time code out of logs.
+    """
+    from omnigent.harnesses.diagnostics import detect_sign_in_prompt
+
+    screen = await _read_pane_screen(instance)
+    if detect_sign_in_prompt(screen) is not None:
+        return None, True
+    return _redacted_terminal_text(screen), False
 
 
 class _CodexTerminalExited(RuntimeError):
@@ -5639,16 +5697,14 @@ class _CodexSignInPromptSeen(RuntimeError):
         super().__init__("Codex pane is parked on a sign-in prompt")
 
 
-async def _codex_pane_screen(instance: TerminalInstance) -> str:
+async def _read_pane_screen(instance: TerminalInstance) -> str:
     """Return the pane's screen with wrapped rows joined, or ``""`` when it cannot be read."""
     try:
         # A sign-in address is far wider than the 80-column pane the runner
         # creates, so read wrapped rows joined back into their original lines.
         result = await instance.read(join_wrapped=True)
     except Exception:  # noqa: BLE001 — an unreadable pane simply shows nothing yet
-        _logger.debug(
-            "Codex startup pane read failed for %s", instance.diagnostic_id, exc_info=True
-        )
+        _logger.debug("Startup pane read failed for %s", instance.diagnostic_id, exc_info=True)
         return ""
     raw_screen = result.get("screen") if isinstance(result, dict) else None
     return raw_screen if isinstance(raw_screen, str) else ""
@@ -5679,7 +5735,7 @@ async def _wait_for_codex_thread_or_terminal_exit(
         previous_url: str | None = None
         while True:
             await asyncio.sleep(_CODEX_SIGN_IN_POLL_INTERVAL_S)
-            prompt = detect_sign_in_prompt(await _codex_pane_screen(instance))
+            prompt = detect_sign_in_prompt(await _read_pane_screen(instance))
             if prompt is not None and prompt.url == previous_url:
                 return
             previous_url = prompt.url if prompt is not None else None
@@ -5739,7 +5795,8 @@ async def _record_agent_startup_pending(
     from omnigent.harnesses.codex_native.bridge import write_bridge_startup_error
     from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
 
-    prompt = detect_sign_in_prompt(await _codex_pane_screen(terminal_instance))
+    screen = await _read_pane_screen(terminal_instance)
+    prompt = detect_sign_in_prompt(screen)
     if prompt is not None:
         code = "databricks_sign_in_pending"
         title = "Codex can't start until you sign in to Databricks"
@@ -5763,13 +5820,17 @@ async def _record_agent_startup_pending(
         remediation=remediation,
     )
     pending_event = debug_event("agent_startup_pending", session_id=session_id)
-    pending_event["attributes"] = {
+    attributes: dict[str, object] = {
         "harness": "codex-native",
         "phase": "thread_discovery",
         "waited_s": round(waited_seconds, 1),
         "sign_in_prompt_detected": prompt is not None,
         "code": code,
     }
+    # Without a sign-in prompt, the pane is the only record of what is holding startup.
+    if prompt is None and (tail := _redacted_terminal_text(screen)):
+        attributes["terminal_last_output"] = tail
+    pending_event["attributes"] = attributes
     _logger.warning(
         "Codex TUI for %s has not started a thread after %.0fs but its pane is alive; "
         "recorded %s and waiting without a deadline%s",
