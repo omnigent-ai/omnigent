@@ -111,6 +111,8 @@ the header menu), and each place is a separate entry point.
 sessions** on the empty landing. Choose a machine, harness, and recent count
 or session ID. After starting, go Back to the session list; its heading shows
 progress and links back to Settings. Imported sessions appear in the normal list.
+On phones, the progress link opens the Import panel directly; its header arrow
+returns to the Settings menu.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, add to project (or move
@@ -509,7 +511,9 @@ plain `uv run pytest`, which starts a private server for the test.
   exact-ID imports, and the empty-landing entry point (mocked import responses).
   Run `tests/e2e_ui/sessions/test_import_progress_in_session_list.py` for a real
   isolated host reading transcripts, streaming to the server, leaving Settings,
-  progress beside the sidebar heading, and clearing it on completion.
+  progress beside the sidebar heading, and clearing it on completion. Desktop
+  and mobile cases follow the indicator back to the panel and verify that the
+  content can receive clicks, including behind the mobile drawer boundary.
   `tests/e2e_ui/sessions/test_import_oversized_session.py` verifies recent and
   exact-ID imports through a real host when a transcript exceeds the tunnel's
   message cap; the batch summary links to all three sessions in the sidebar.

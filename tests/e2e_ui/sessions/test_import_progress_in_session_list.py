@@ -91,15 +91,40 @@ def _imported_count(live_server: str, title_prefix: str) -> int:
 
 
 @pytest.mark.timeout(600)
+@pytest.mark.parametrize(
+    "mobile",
+    [
+        pytest.param(False, id="desktop"),
+        pytest.param(
+            True,
+            id="mobile",
+            marks=pytest.mark.browser_context_args(
+                viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True
+            ),
+        ),
+    ],
+)
 def test_session_list_shows_import_in_progress(
     request: pytest.FixtureRequest,
     live_server: str,
     import_host: _ImportHost,
+    mobile: bool,
 ) -> None:
     """Going Back to the session list mid-import shows that sessions are being imported."""
     page: Page = request.getfixturevalue("page")
+    aside = page.locator("aside[aria-label='Conversations']")
+
+    def leave_settings() -> None:
+        if mobile:
+            page.get_by_role("button", name="Back to settings menu", exact=True).click()
+        page.get_by_role("link", name="Back", exact=True).click()
+        if mobile and aside.get_attribute("aria-hidden") == "true":
+            page.get_by_role("button", name="Open sidebar", exact=True).click()
+
     page.goto(f"{live_server}/")
-    page.get_by_test_id("settings-button").click()
+    if mobile:
+        page.get_by_role("button", name="Open sidebar", exact=True).click()
+    page.get_by_role("link", name="Settings", exact=True).click()
     page.get_by_test_id("settings-nav-import").click()
     expect(page.get_by_test_id("import-sessions-panel")).to_be_visible(timeout=30_000)
     page.get_by_test_id("import-host-select").click()
@@ -113,10 +138,9 @@ def test_session_list_shows_import_in_progress(
     page.get_by_test_id("import-submit").click()
     expect(page.get_by_test_id("import-progress")).to_be_visible(timeout=30_000)
 
-    page.get_by_role("link", name="Back", exact=True).click()
+    leave_settings()
     session_list = page.get_by_test_id("sidebar-conversation-list")
     expect(session_list).to_be_visible(timeout=30_000)
-    aside = page.locator("aside[aria-label='Conversations']")
     indicator = aside.get_by_test_id("sidebar-import-progress")
 
     indicator_seen_in_flight = False
@@ -145,11 +169,20 @@ def test_session_list_shows_import_in_progress(
             f"import finished in {elapsed:.1f}s, too fast to observe the list"
         )
 
-    expect(aside.get_by_text(import_host.title_prefix).first).to_be_visible(timeout=60_000)
     assert indicator_seen_in_flight, (
         f"session list showed no in-progress indicator during the {elapsed:.0f}s import "
         f"({checks_in_flight} checks); imported sessions simply appeared"
     )
+
+    indicator.get_by_role("link").click()
+    if mobile:
+        expect(aside).to_have_attribute("aria-hidden", "true")
+    # A panel behind the mobile Settings menu is visible to DOM assertions but
+    # cannot receive a tap. Check that navigation really exposes the content.
+    page.get_by_test_id("import-progress").click(trial=True)
+    expect(page.get_by_test_id("import-limit-select")).to_have_text(_LIMIT_OPTION)
+    leave_settings()
+    expect(aside.get_by_text(import_host.title_prefix).first).to_be_visible(timeout=60_000)
 
     # The indicator is transient: once every session has landed the list goes
     # back to plain rows.
