@@ -2990,3 +2990,129 @@ async def test_create_key_reports_unresolved_begin_without_spinning(
     replay = await asyncio.wait_for(create(client, headers=headers), 0.5)
     assert replay.status_code == 504
     assert len(manager.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_key_creator_keeps_upload_for_waiting_replay(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runner.workspace_upload import UploadDeclaration
+
+    manager = client._transport.app.state.workspace_uploads
+    declaration = UploadDeclaration(dir="", name="payload.bin", size=3, created_by="alice")
+    original_call = manager._call
+    begin_entered, release_begin = asyncio.Event(), asyncio.Event()
+    creator_committed, release_creator = asyncio.Event(), asyncio.Event()
+    replay_ready, release_replay = asyncio.Event(), asyncio.Event()
+    original_create = manager._create
+    calls = 0
+
+    async def hold_begin(uid, record, op, *args, **kwargs):
+        if op == "begin":
+            begin_entered.set()
+            await release_begin.wait()
+        return await original_call(uid, record, op, *args, **kwargs)
+
+    async def hold_result(*args):
+        nonlocal calls
+        calls += 1
+        number = calls
+        result = await original_create(*args)
+        if number == 1:
+            creator_committed.set()
+            await release_creator.wait()
+        else:
+            replay_ready.set()
+            await release_replay.wait()
+        return result
+
+    monkeypatch.setattr(manager, "_call", hold_begin)
+    monkeypatch.setattr(manager, "_create", hold_result)
+    creator = asyncio.create_task(
+        manager.create("session", DEFAULT_ENVIRONMENT_ID, declaration, "a" * 32)
+    )
+    duplicate = None
+    try:
+        await asyncio.wait_for(begin_entered.wait(), 5)
+        duplicate = asyncio.create_task(
+            manager.create("session", DEFAULT_ENVIRONMENT_ID, declaration, "a" * 32)
+        )
+        await asyncio.sleep(0)
+        assert not duplicate.done()
+        release_begin.set()
+        await asyncio.wait_for(creator_committed.wait(), 5)
+        await asyncio.wait_for(replay_ready.wait(), 5)
+        creator.cancel()
+        release_creator.set()
+        with pytest.raises(asyncio.CancelledError):
+            await creator
+        release_replay.set()
+        replay = await duplicate
+        uid = replay["upload_id"]
+        assert uid in manager.records
+        assert Path(manager.records[uid].staging_path).exists()
+        url = BASE + "/" + uid + "?created_by=alice"
+        assert (await client.patch(url, headers=HEADERS, content=b"abc")).status_code == 204
+        assert (
+            await client.post(BASE + "/" + uid + "/complete?created_by=alice")
+        ).status_code == 200
+    finally:
+        release_begin.set()
+        release_creator.set()
+        release_replay.set()
+        await asyncio.gather(
+            creator, *([duplicate] if duplicate is not None else []), return_exceptions=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_key_creator_before_commit_wakes_waiter(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runner.workspace_upload import RouteError, UploadDeclaration
+
+    manager = client._transport.app.state.workspace_uploads
+    declaration = UploadDeclaration(dir="", name="payload.bin", size=3, created_by="alice")
+    original_call = manager._call
+    original_replay = manager._replay_create
+    begin_entered, release_begin, replay_joined = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def hold_begin(uid, record, op, *args, **kwargs):
+        if op == "begin":
+            begin_entered.set()
+            await release_begin.wait()
+        return await original_call(uid, record, op, *args, **kwargs)
+
+    async def joined_replay(*args):
+        if any(record.pending for record in manager.records.values()):
+            replay_joined.set()
+        return await original_replay(*args)
+
+    monkeypatch.setattr(manager, "_call", hold_begin)
+    monkeypatch.setattr(manager, "_replay_create", joined_replay)
+    creator = asyncio.create_task(
+        manager.create("session", DEFAULT_ENVIRONMENT_ID, declaration, "a" * 32)
+    )
+    duplicate = None
+    try:
+        await asyncio.wait_for(begin_entered.wait(), 5)
+        duplicate = asyncio.create_task(
+            manager.create("session", DEFAULT_ENVIRONMENT_ID, declaration, "a" * 32)
+        )
+        await asyncio.wait_for(replay_joined.wait(), 5)
+        await asyncio.sleep(0)
+        creator.cancel()
+        await asyncio.sleep(0)
+        release_begin.set()
+        with pytest.raises(asyncio.CancelledError):
+            await creator
+        with pytest.raises(RouteError) as exc:
+            await duplicate
+        assert exc.value.status == 503
+        assert not manager.records
+        assert not json.loads(manager.state_path.read_text())
+    finally:
+        release_begin.set()
+        await asyncio.gather(
+            creator, *([duplicate] if duplicate is not None else []), return_exceptions=True
+        )
