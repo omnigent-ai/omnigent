@@ -461,6 +461,29 @@ class SandboxBackend(ABC):
         """Resolve host-local policy immediately before launcher construction."""
         return policy
 
+    def launch_fingerprint(
+        self,
+        argv: list[str],
+        policy: SandboxPolicy,
+        cwd: Path,
+        chdir: Path | None = None,
+    ) -> object:
+        """
+        Return what :meth:`wrap_launcher_argv` derives from the host filesystem.
+
+        Launch-time masks (e.g. dotfiles found by the cwd scan) are fixed
+        for a helper's lifetime, so a long-lived helper is relaunched once
+        this value changes. The default ``None`` means nothing is derived.
+
+        :param argv: The unwrapped argv the helper was launched with.
+        :param policy: The policy the helper was launched with.
+        :param cwd: Workspace directory the helper was launched from.
+        :param chdir: Optional separate start directory.
+        :returns: A comparable value, or ``None``.
+        """
+        del argv, policy, cwd, chdir
+        return None
+
     def post_spawn(self, policy: SandboxPolicy, pid: int) -> ContainmentHandle | None:
         """
         Apply post-spawn containment to a just-launched helper process.
