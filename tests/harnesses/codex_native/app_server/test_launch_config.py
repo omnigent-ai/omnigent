@@ -286,6 +286,8 @@ def test_build_codex_native_server_pins_profile_resolved_model(
         # Subscription: an explicit pick and a catalog-resolved Default.
         ("gpt-5.5", None, ['model_provider="openai"']),
         ("gpt-5.6-terra", None, ['model_provider="openai"']),
+        ("system.ai.gpt-6-1-sol", None, ['model_provider="openai"']),
+        ("databricks-gpt-5-6-sol", None, None),
         # cli-config: the user's own provider table rides the config copy.
         ("gpt-5.5", None, ['model_provider="Databricks"']),
         # Databricks profile: Default and an explicit pick.
@@ -354,6 +356,7 @@ def test_launch_argv_and_config_pin_name_the_same_model(
     assert comparable_model_id(argv_model) == comparable_model_id(pinned)
     if profile is None:
         assert argv_model == pinned
+        assert pinned == model
 
 
 async def test_start_pins_reasoning_effort_in_config(

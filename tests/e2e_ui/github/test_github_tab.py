@@ -54,6 +54,10 @@ _INFO = {
         "url": "https://example.com/pr/4242",
         "is_draft": False,
         "author": "octocat",
+        "reviewers": [
+            {"login": "alice", "kind": "user", "state": "APPROVED"},
+            {"login": "platform", "kind": "team", "state": "PENDING"},
+        ],
         "base_ref": "main",
         "head_ref": "feature/github-tab",
         "checks": {
@@ -180,6 +184,8 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
     expect(rail.get_by_text(f"#{_PR_NUMBER}")).to_be_visible()
     expect(rail.get_by_label("Pull request status: Open")).to_be_visible()
+    expect(rail.get_by_role("listitem", name="alice: Approved")).to_be_visible()
+    expect(rail.get_by_role("listitem", name="Team platform: Pending")).to_be_visible()
 
     # A host without tracking controls puts the provider beside the repo.
     icon = rail.get_by_role("heading", name="GitHub", exact=True).bounding_box()
@@ -208,6 +214,9 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     pr_tabs.get_by_role("tab", name="Changes").click()
     expect(rail.get_by_role("button", name="src/app", exact=True)).to_be_visible()
     expect(rail.get_by_role("button", name=re.compile(r"main\.py")).first).to_be_visible()
+
+    rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Summary").click()
+    expect(rail.get_by_role("listitem", name="alice: Approved")).to_be_visible()
 
 
 @pytest.mark.parametrize(

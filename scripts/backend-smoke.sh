@@ -75,6 +75,7 @@ env_vars=(
   "OMNIGENT_CONFIG_HOME=$runtime_config/omnigent"
   "OMNIGENT_DATA_DIR=$runtime_data/omnigent"
   "OMNIGENT_DATABASE_URI=sqlite:///$runtime_db"
+  "OMNIGENT_HARNESS_TMP_PARENT=$runtime_root/h"
   "OMNIGENT_SKIP_WEB_UI=true"
 )
 

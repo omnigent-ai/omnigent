@@ -171,6 +171,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
+import { useSessionImportStore } from "@/store/sessionImport";
 import * as identity from "@/lib/identity";
 
 const useConvMock = vi.mocked(useConversations);
@@ -3768,3 +3769,32 @@ describe("sidebar_grouping_ui release flag", () => {
     expect(screen.queryByText("conv_owned")).toBeNull(); // in the collapsed Alpha folder
   });
 });
+
+it.each(["default", "updated", "shared"])(
+  "keeps import status on the first list heading in the %s view",
+  (view) => {
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({ grouping: view === "updated" ? "updated" : "default" }),
+    );
+    mockConversations([
+      conv("owned", "Claude Code", { updated_at: Date.now() / 1000 }),
+      conv("shared", "Claude Code", { owner: "other@example.com", status: "idle" }),
+    ]);
+    useSessionImportStore.setState({ importing: true, importedCount: 35 });
+    try {
+      renderGroupingSidebar();
+      if (view === "shared") showSharedTab();
+      const title =
+        view === "updated" ? "Updated today" : view === "shared" ? "Shared" : "Sessions";
+      const status = screen.getByTestId("sidebar-import-progress");
+      expect(screen.getByRole("heading", { name: new RegExp(title) })).toContainElement(status);
+      expect(status).toHaveTextContent("Importing (35)");
+      fireEvent.click(screen.getByRole("button", { name: title }));
+      expect(status).toBeVisible();
+      expect(status.closest("button")).toBeNull();
+    } finally {
+      useSessionImportStore.setState({ importing: false, importedCount: 0 });
+    }
+  },
+);

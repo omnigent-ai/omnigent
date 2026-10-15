@@ -355,7 +355,20 @@ def ask_on_add_policy(event: PolicyEvent) -> PolicyResponse:
     }
 
 
+def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
+    """Require approval before an agent persists or changes unattended work."""
+    if event.get("type") != "tool_call":
+        return _ALLOW
+    if event.get("target") not in {"sys_scheduled_task_create", "sys_scheduled_task_update"}:
+        return _ALLOW
+    return {
+        "result": "ASK",
+        "reason": "Approve these scheduled task settings for future unattended runs?",
+    }
+
+
 # ── Skill blocking ──────────────────────────────────────────────────────────
+
 
 # Omnigent runner tools that load skills in non-native (SDK) harnesses.
 _SKILL_TOOLS = frozenset({"load_skill", "read_skill_file"})
