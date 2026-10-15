@@ -1576,13 +1576,18 @@ def _try_sandbox_pi(
         sandbox = resolve_sandbox(os_env, resolved_cwd)
         if not sandbox.active:
             return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
-        # Pi needs to read its own installation + node_modules.
-        pi_dir = pathlib.Path(pi_path).resolve().parent.parent
+        # Bundled and legacy CLIs both need their sibling npm dependencies.
+        executable = pathlib.Path(pi_path).resolve()
+        pi_dir = next(
+            (parent for parent in executable.parents if parent.name == "node_modules"),
+            executable.parent,
+        )
         sandbox = with_additional_read_roots(sandbox, [pi_dir])
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
         sandbox = with_additional_write_roots(sandbox, [home_pi])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-        launcher = create_exec_launcher(pi_path, sandbox)
+        # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
+        launcher = create_exec_launcher(str(executable), sandbox)
         return SandboxedPiCli(launch_path=launcher, sandboxed=True)
     except (OSError, ImportError, NotImplementedError) as exc:
         logger.warning("Could not apply sandbox for Pi: %s", exc)

@@ -38,6 +38,8 @@ the header menu), and each place is a separate entry point.
   it; the state survives a reload.
 - `project`: Add to project (Move session once filed) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
+- `project-rename`: the project menu opens a dialog with the name selected;
+  typing replaces it without losing characters as the menu closes.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
@@ -62,6 +64,10 @@ the header menu), and each place is a separate entry point.
 - `message-recovery`: a message racing initial runner binding or replacement
   reaches the available runner without a false failed turn. Native sessions
   initialize before delivery; SDK sub-agents reuse their loaded session state.
+- `import-progress`: import recent sessions or one session by ID from an online
+  machine. Settings shows a spinner and count; the sidebar heading retains
+  progress after leaving Settings. Results stay compact, with expandable failure
+  details and retry of the original selection.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
 - `recent-switcher`: the desktop app opens the five most recent sessions with
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
@@ -101,9 +107,19 @@ the header menu), and each place is a separate entry point.
 
 ## How to get to it (user POV)
 
+**Import:** open Settings → Import sessions, or choose **Import your recent
+sessions** on the empty landing. Choose a machine, harness, and recent count
+or session ID. After starting, go Back to the session list; its heading shows
+progress and links back to Settings. Imported sessions appear in the normal list.
+On phones, the progress link opens the Import panel directly; its header arrow
+returns to the Settings menu.
+
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, add to project (or move
 session), archive or unarchive, and delete.
+
+**Project folder:** right-click its header or open its three-dot menu, then
+choose Rename project. Start typing as soon as the dialog opens.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -313,6 +329,9 @@ plain `uv run pytest`, which starts a private server for the test.
   regroup under that project.
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
+- **`project-rename`, project header right-click and three-dot menus:**
+  `tests/e2e_ui/sessions/test_project_rename_dialog_focus.py::test_rename_dialog_preselects_name_so_typing_replaces`
+  covers typing across the menu's exit animation from both menus.
 - **`fork`, message cutoff:**
   `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_fork_from_middle_truncates_history`,
   plus agent switching (own environment):
@@ -487,6 +506,20 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/server/integration/test_sessions_child_sessions.py::test_sdk_subagent_recovery_skips_session_init`
   covers recovery during ancestor healing and during the final binding refresh,
   without initializing the SDK child's already-loaded session again.
+- **`import-progress`:** run
+  `tests/e2e_ui/sessions/test_import_sessions.py` for Settings recent imports,
+  exact-ID imports, and the empty-landing entry point (mocked import responses).
+  Run `tests/e2e_ui/sessions/test_import_progress_in_session_list.py` for a real
+  isolated host reading transcripts, streaming to the server, leaving Settings,
+  progress beside the sidebar heading, and clearing it on completion. Desktop
+  and mobile cases follow the indicator back to the panel and verify that the
+  content can receive clicks, including behind the mobile drawer boundary.
+  `tests/e2e_ui/sessions/test_import_oversized_session.py` verifies recent and
+  exact-ID imports through a real host when a transcript exceeds the tunnel's
+  message cap; the batch summary links to all three sessions in the sidebar.
+  Component coverage checks compact large batches, failure expansion, retry
+  after navigation, and collapsed headings.
+
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`
 - **`recent-switcher` (manual Electron):** open at least six sessions, hold

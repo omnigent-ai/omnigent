@@ -537,12 +537,15 @@ def test_facet2_spec_pinned_model_reaches_the_launched_pi(
             f"tail:\n{host.daemon_log.read_text()[-2000:]}"
         )
         pi_argv = [str(token) for token in observation.get("argv") or []]
-        # npm exposes the package bin as .bin/pi (a shim or symlink); resolve
-        # through it so both entry styles verify the real package identity.
+        # npm's .bin/pi resolves to a modular or bundled CLI entry point.
         resolved_entry = os.path.realpath(pi_argv[1]) if len(pi_argv) > 1 else ""
-        assert resolved_entry.endswith(os.path.join("pi-coding-agent", "dist", "cli.js")), (
-            "the observed process is not the real Pi CLI -- expected its node "
-            "entry point to resolve to .../pi-coding-agent/dist/cli.js, got "
+        entry_paths = (
+            os.path.join("pi-coding-agent", "dist", "cli.js"),
+            os.path.join("pi-coding-agent", "dist", "bundle", "cli.js"),
+        )
+        assert resolved_entry.endswith(entry_paths), (
+            "the observed process is not the real Pi CLI -- expected its resolved "
+            f"node entry point to end with one of {entry_paths}, got "
             f"argv: {pi_argv} (resolved: {resolved_entry})"
         )
         assert pi_started, (

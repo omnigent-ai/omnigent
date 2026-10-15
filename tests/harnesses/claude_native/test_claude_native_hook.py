@@ -6,13 +6,17 @@ import io
 import json
 import re
 import shlex
+import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
 import pytest
 
+from omnigent._platform import stable_user_id
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     OBSERVER_HOOK_STDERR_FILE,
@@ -1965,6 +1969,95 @@ def test_evaluate_policy_fails_closed_when_reauth_unavailable(
     assert result["hookSpecificOutput"]["permissionDecisionReason"].startswith(
         native_policy_hook._EVAL_UNAVAILABLE_ASK_REASON
     )
+
+
+def test_generated_policy_command_delivers_its_verdict_through_the_fast_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The generated PreToolUse command still prints a deny verdict before exiting.
+
+    The hook leaves through ``os._exit`` with stdout on a pipe, so a verdict
+    still buffered there would be lost and Claude Code would run the tool.
+    """
+
+    class _DenyEveryPolicyRequest(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            body = b'{"result":"POLICY_ACTION_DENY","reason":"Blocked by policy"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    # The command runs the hook with TMPDIR set to the trusted parent, so the
+    # child derives this same bridge root.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT",
+        tmp_path / f"omnigent-{stable_user_id()}" / "claude-native",
+    )
+    with ThreadingHTTPServer(("127.0.0.1", 0), _DenyEveryPolicyRequest) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+        write_active_session_id(bridge_dir, "conv_active")
+        settings = build_hook_settings(
+            bridge_dir,
+            ap_server_url=f"http://127.0.0.1:{server.server_port}",
+            ap_auth_headers={"Authorization": "Bearer test-token"},
+        )
+        [command] = [
+            hook["command"] for group in settings["hooks"]["PreToolUse"] for hook in group["hooks"]
+        ]
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            input=json.dumps(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "rm -rf /"},
+                }
+            ),
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        server.shutdown()
+
+    assert result.returncode == 0, result.stderr
+    verdict = json.loads(result.stdout)
+    assert verdict["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert verdict["hookSpecificOutput"]["permissionDecisionReason"] == "Blocked by policy"
+
+
+def test_policy_hook_fast_exit_finalizes_in_interpreter_order() -> None:
+    """
+    The fast exit finishes non-daemon threads, then exit handlers, then exits with the hook's code.
+
+    It skips only module teardown, so work a hook leaves on a thread or in an
+    ``atexit`` callback still completes.
+    """
+    code = "\n".join(
+        (
+            "import atexit, threading, time",
+            "from omnigent.harnesses.claude_native import hook",
+            "def late_writer():",
+            "    time.sleep(0.1)",
+            "    print('non-daemon thread finished', flush=True)",
+            "threading.Thread(target=late_writer).start()",
+            "atexit.register(print, 'exit handler ran')",
+            "hook._exit_without_teardown(3)",
+        )
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert result.returncode == 3, result.stderr
+    assert result.stdout.splitlines() == ["non-daemon thread finished", "exit handler ran"]
 
 
 # ── #1782: bound the reattach spin-loop ────────────────────────────────────
