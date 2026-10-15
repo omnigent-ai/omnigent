@@ -24,6 +24,7 @@ import pytest
 import omnigent.inner.terminal as terminal_mod
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.native import owner_claim
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.terminals import TerminalRegistry
@@ -35,6 +36,7 @@ _INPUT_READER = (
     'printf "ready\\n"; while IFS= read -r line; do printf "%s\\n" "$line" >> received.txt; done'
 )
 _SIGNATURE = "tmux unavailable after 3 consecutive probes for terminal antigravity:main"
+_RECOVERY_SIGNATURE = "Recreating reaped tmux socket for terminal antigravity:main"
 
 
 @pytest.fixture
@@ -81,6 +83,45 @@ def test_external_tmux_death_reports_the_required_terminal_exit(
         assert exit_fired.wait(_TIMEOUT_S), "watcher did not report terminal exit"
     assert not terminal.running
     assert any(_SIGNATURE in record.getMessage() for record in caplog.records)
+
+
+def test_reaped_private_socket_is_recovered_while_the_server_lives(
+    terminal: TerminalInstance, caplog: pytest.LogCaptureFixture
+) -> None:
+    exit_fired = threading.Event()
+    healthy_tick = threading.Event()
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
+        terminal.start_idle_watcher_thread(
+            on_exit=exit_fired.set, on_tick=healthy_tick.set, poll_interval_s=0.05
+        )
+        try:
+            assert healthy_tick.wait(_TIMEOUT_S)
+            # macOS periodic cleanup wipes the private socket directory while the
+            # tmux server and its pane are still alive.
+            shutil.rmtree(terminal.private_dir)
+            assert not terminal.socket_path.exists()
+
+            deadline = time.monotonic() + _TIMEOUT_S
+            while not terminal.socket_path.exists():
+                assert not exit_fired.is_set(), "a reaped socket ended a live terminal"
+                assert time.monotonic() < deadline, "watcher never recovered the socket"
+                time.sleep(0.02)
+            assert not exit_fired.is_set()
+            assert terminal.running
+            # The watcher resumes healthy probing and the original pane is still
+            # driveable through the recreated socket: the same server survived.
+            healthy_tick.clear()
+            assert healthy_tick.wait(_TIMEOUT_S), "watcher did not resume after recovery"
+            pane = terminal._tmux_output_sync("capture-pane", "-p", "-t", terminal.tmux_target)
+            assert "ready" in pane, pane
+            # Recovery restored the private dir with locked-down perms and a
+            # fresh owner claim for the orphan sweep, not just the socket.
+            assert stat.S_IMODE(terminal.private_dir.stat().st_mode) == 0o700
+            claim = owner_claim.read_owner_claim(terminal.private_dir)
+            assert claim is not None and claim.pid == os.getpid()
+        finally:
+            terminal._stop_idle_watcher_thread()
+    assert any(_RECOVERY_SIGNATURE in record.getMessage() for record in caplog.records)
 
 
 def _install_tmux_shim(directory: Path, monkeypatch: pytest.MonkeyPatch, script: str) -> str:

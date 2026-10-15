@@ -6,7 +6,9 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -3551,3 +3553,368 @@ async def test_read_join_wrapped_asks_tmux_to_join_wrapped_rows(tmp_path: Path) 
     assert calls[1] == ("capture-pane", "-t", instance.tmux_target, "-p", "-J")
     assert plain["screen"] == joined["screen"]
     assert "https://signin.example.com/device?user_code=ABCDEFGH" in joined["screen"]
+
+
+def test_socket_recovery_refuses_a_preclaimed_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A squatted symlink at the reaped dir name is never followed.
+
+    On a shared ``/tmp`` another user can pre-create the reaped terminal
+    directory name as a symlink. Recovery must refuse the existing path rather
+    than chmod or write an owner claim through it into the target.
+    """
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    os.chmod(victim, 0o755)
+    (victim / "owner.pid").write_text("attacker")
+    private_dir = tmp_path / "omnigent-terminal-squat"
+    private_dir.symlink_to(victim, target_is_directory=True)
+
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=private_dir / "tmux.sock",
+        private_dir=private_dir,
+        running=True,
+    )
+    monkeypatch.setattr(instance, "_tmux_server_process_alive", lambda: True)
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(terminal_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    assert instance._recover_private_socket() is False
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o755
+    assert (victim / "owner.pid").read_text() == "attacker"
+    assert killed == []
+
+
+def test_socket_recovery_refuses_a_symlink_swapped_in_before_the_fd_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dir swapped to a symlink mid-recovery is never followed for a write.
+
+    Models the shared-``/tmp`` replacement race: the reaped name is a real
+    entry when recovery starts but becomes a symlink to a victim directory
+    before recovery opens it. The ``O_NOFOLLOW`` open must refuse it so neither
+    the chmod nor the owner-claim write lands in the victim.
+    """
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    os.chmod(victim, 0o755)
+    (victim / "owner.pid").write_text("attacker")
+    private_dir = tmp_path / "omnigent-terminal-swap"
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=private_dir / "tmux.sock",
+        private_dir=private_dir,
+        running=True,
+    )
+    instance._tmux_server_pid = os.getpid()
+    monkeypatch.setattr(instance, "_tmux_server_process_alive", lambda: True)
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(terminal_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    def mkdir_then_swap(path: str, mode: int = 0o777) -> NoReturn:
+        # The attacker wins the race: the name becomes a symlink to the victim
+        # between recovery's mkdir and its O_NOFOLLOW open.
+        os.symlink(victim, path, target_is_directory=True)
+        raise FileExistsError(path)
+
+    monkeypatch.setattr(terminal_mod.os, "mkdir", mkdir_then_swap)
+
+    assert instance._recover_private_socket() is False
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o755
+    assert (victim / "owner.pid").read_text() == "attacker"
+    assert killed == []
+
+
+def test_socket_recovery_logs_clipboard_degradation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A reap that also took the clipboard socket is logged as degraded.
+
+    Recovery restores the tmux socket but not the clipboard bridge, so the
+    silent loss of copy/paste is recorded rather than reported as healthy.
+    """
+    socket_path = tmp_path / "tmux.sock"
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=socket_path,
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance._tmux_server_pid = os.getpid()
+    instance._clipboard_bridge = terminal_mod.TerminalClipboardBridge(tmp_path, socket_path)
+    assert not instance._clipboard_bridge.socket_path.exists()
+    monkeypatch.setattr(instance, "_tmux_server_process_alive", lambda: True)
+
+    def fake_kill(pid: int, sig: int) -> None:
+        socket_path.touch()  # tmux recreates its -S socket, not the clip socket
+
+    monkeypatch.setattr(terminal_mod.os, "kill", fake_kill)
+    monkeypatch.setattr(terminal_mod, "_SOCKET_RECOVERY_WAIT_SECONDS", 1.0)
+    monkeypatch.setattr(terminal_mod, "_SOCKET_RECOVERY_POLL_SECONDS", 0.005)
+
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
+        assert instance._recover_private_socket() is True
+    assert any("clipboard" in record.getMessage().lower() for record in caplog.records)
+
+
+def test_socket_recovery_rejects_a_recycled_server_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recorded pid whose start time no longer matches is not signalled."""
+    private_dir = tmp_path / "omnigent-terminal-recycled"
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=private_dir / "tmux.sock",
+        private_dir=private_dir,
+        running=True,
+    )
+    instance._tmux_server_pid = os.getpid()
+    instance._tmux_server_create_time = -1.0
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(terminal_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    assert instance._recover_private_socket() is False
+    assert not private_dir.exists()
+    assert killed == []
+
+
+def test_socket_recovery_times_out_when_the_socket_never_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recovery signals the live server but gives up if the socket never reappears."""
+    private_dir = tmp_path / "omnigent-terminal-timeout"
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=private_dir / "tmux.sock",
+        private_dir=private_dir,
+        running=True,
+    )
+    instance._tmux_server_pid = os.getpid()
+    monkeypatch.setattr(instance, "_tmux_server_process_alive", lambda: True)
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(terminal_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(terminal_mod, "_SOCKET_RECOVERY_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(terminal_mod, "_SOCKET_RECOVERY_POLL_SECONDS", 0.005)
+
+    assert instance._recover_private_socket_sync() is False
+    assert private_dir.is_dir() and not private_dir.is_symlink()
+    assert stat.S_IMODE(private_dir.stat().st_mode) == 0o700
+    assert killed == [(os.getpid(), terminal_mod.signal.SIGUSR1)]
+
+
+def test_socket_recovery_reuses_a_surviving_private_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-file sweep that reaps only the socket leaves the private dir.
+
+    Recovery must reuse the surviving directory and signal the live server
+    rather than failing on ``mkdir`` and declaring the terminal dead.
+    """
+    socket_path = tmp_path / "tmux.sock"
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=socket_path,
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance._tmux_server_pid = os.getpid()
+    monkeypatch.setattr(instance, "_tmux_server_process_alive", lambda: True)
+    killed: list[tuple[int, int]] = []
+
+    def fake_kill(pid: int, sig: int) -> None:
+        killed.append((pid, sig))
+        socket_path.touch()  # tmux recreates its -S socket on SIGUSR1
+
+    monkeypatch.setattr(terminal_mod.os, "kill", fake_kill)
+    monkeypatch.setattr(terminal_mod, "_SOCKET_RECOVERY_WAIT_SECONDS", 1.0)
+    monkeypatch.setattr(terminal_mod, "_SOCKET_RECOVERY_POLL_SECONDS", 0.005)
+
+    assert instance._recover_private_socket() is True
+    assert socket_path.exists()
+    assert killed == [(os.getpid(), terminal_mod.signal.SIGUSR1)]
+
+
+def test_socket_recovery_refuses_a_foreign_private_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real directory owned by another user at the reaped name is not adopted."""
+    socket_path = tmp_path / "tmux.sock"
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=socket_path,
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance._tmux_server_pid = os.getpid()
+    monkeypatch.setattr(instance, "_tmux_server_process_alive", lambda: True)
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(terminal_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(terminal_mod.os, "geteuid", lambda: os.stat(tmp_path).st_uid + 1)
+
+    assert instance._recover_private_socket() is False
+    assert not socket_path.exists()
+    assert killed == []
+
+
+def test_failed_identity_recording_clears_a_stale_server(tmp_path: Path) -> None:
+    """A failed re-recording clears a prior identity so recovery fails closed.
+
+    An earlier launch recorded a server; a later launch whose output carries
+    no readable pid must not leave recovery pointing at the old server.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance._tmux_server_pid = 4321
+    instance._tmux_server_create_time = 1.0
+
+    instance._record_tmux_server_identity(b"launched without a numeric pid")
+
+    assert instance._tmux_server_pid is None
+    assert instance._tmux_server_create_time is None
+
+
+def test_socket_recovery_refuses_an_unreadable_server_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An identity psutil cannot read fails closed: no signal is sent to a pid
+    that may have been recycled to another user's process."""
+    private_dir = tmp_path / "omnigent-terminal-denied"
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=private_dir / "tmux.sock",
+        private_dir=private_dir,
+        running=True,
+    )
+    instance._tmux_server_pid = os.getpid()
+    instance._tmux_server_create_time = 1.0
+
+    def raise_access_denied(pid: int) -> NoReturn:
+        raise terminal_mod.psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(terminal_mod.psutil, "Process", raise_access_denied)
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(terminal_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    assert instance._tmux_server_process_alive() is False
+    assert instance._recover_private_socket() is False
+    assert not private_dir.exists()
+    assert killed == []
+
+
+def test_concurrent_recovery_joins_one_attempt_without_a_false_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent callers share one recovery attempt and both observe the
+    restored socket, so a second caller never treats the first's fresh dir as
+    a failure and reports a false exit while the server and pane stay alive."""
+    private_dir = tmp_path / "omnigent-terminal-race"
+    socket_path = private_dir / "tmux.sock"
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=socket_path,
+        private_dir=private_dir,
+        running=True,
+    )
+    instance._tmux_server_pid = os.getpid()
+    monkeypatch.setattr(instance, "_tmux_server_process_alive", lambda: True)
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(terminal_mod.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(terminal_mod, "_SOCKET_RECOVERY_WAIT_SECONDS", 2.0)
+
+    # The first caller signals when it reaches the socket-readiness poll, so
+    # the test releases the socket only once recovery is genuinely pending
+    # and the second caller is blocked on the lock.
+    waiting = threading.Event()
+    real_sleep = time.sleep
+
+    def poll_sleep(duration: float) -> None:
+        waiting.set()
+        real_sleep(duration)
+
+    monkeypatch.setattr(terminal_mod.time, "sleep", poll_sleep)
+    monkeypatch.setattr(terminal_mod, "_SOCKET_RECOVERY_POLL_SECONDS", 0.01)
+
+    results: dict[str, bool] = {}
+
+    def run(key: str) -> None:
+        results[key] = instance._recover_private_socket()
+
+    threads = [threading.Thread(target=run, args=(key,)) for key in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    assert waiting.wait(5)
+    # The first caller created the dir and is waiting; the socket is not back
+    # yet, so a second caller must not treat the existing dir as a failure.
+    assert private_dir.is_dir()
+    assert not socket_path.exists()
+    socket_path.touch()  # tmux finally recreates the socket after SIGUSR1
+    for thread in threads:
+        thread.join(5)
+
+    assert results == {"a": True, "b": True}
+    assert socket_path.exists()
+    assert killed == [(os.getpid(), terminal_mod.signal.SIGUSR1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["_tmux", "_tmux_output"])
+async def test_async_command_recovers_a_reaped_socket_and_retries_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """A missing-socket failure on the async command paths triggers one
+    recovery and exactly one retry, then returns the recovered output."""
+    socket_path = tmp_path / "tmux.sock"
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=socket_path,
+        private_dir=tmp_path,
+        running=True,
+    )
+    detail = f"error connecting to {socket_path} (No such file or directory)".encode()
+    attempts: list[list[str]] = []
+
+    async def fake_create_subprocess_exec(
+        *cmd: str, stdout: object, stderr: object
+    ) -> _ProcessWithStdout:
+        del stdout, stderr
+        attempts.append(list(cmd))
+        if len(attempts) == 1:
+            return _ProcessWithStdout(returncode=1, stderr=detail)
+        return _ProcessWithStdout(stdout=b"recovered\n", returncode=0)
+
+    monkeypatch.setattr(
+        terminal_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    recoveries: list[bool] = []
+
+    async def fake_recover() -> bool:
+        recoveries.append(True)
+        return True
+
+    monkeypatch.setattr(instance, "_recover_private_socket_async", fake_recover)
+
+    result = await getattr(instance, method)("capture-pane", "-p", "-t", instance.tmux_target)
+
+    assert len(attempts) == 2
+    assert recoveries == [True]
+    if method == "_tmux_output":
+        assert result == "recovered\n"
+    else:
+        assert result is None

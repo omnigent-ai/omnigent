@@ -39,13 +39,29 @@ def current_boot_id() -> str | None:
         return None
 
 
-def write_owner_claim(directory: Path) -> None:
-    """Record the current owner; older integer-only readers skip this format."""
+def write_owner_claim(directory: Path, *, dir_fd: int | None = None) -> None:
+    """Record the current owner; older integer-only readers skip this format.
+
+    With ``dir_fd`` the claim is written relative to that already-verified
+    directory descriptor using ``O_NOFOLLOW``, so a symlink planted at the claim
+    name on a shared ``/tmp`` cannot redirect the write out of the directory.
+    """
     lines = [str(os.getpid()), f"pid_ns={current_pid_namespace() or ''}"]
     boot_id = current_boot_id()
     if boot_id is not None:
         lines.append(f"boot={boot_id}")
-    (directory / OWNER_PID_FILENAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    text = "\n".join(lines) + "\n"
+    if dir_fd is None:
+        (directory / OWNER_PID_FILENAME).write_text(text, encoding="utf-8")
+        return
+    fd = os.open(
+        OWNER_PID_FILENAME,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=dir_fd,
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
 
 
 def read_owner_claim(directory: Path) -> OwnerClaim | None:

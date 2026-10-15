@@ -28,6 +28,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias, cast
 
+import psutil  # type: ignore[import-untyped]
+
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event
@@ -319,6 +321,11 @@ _IDLE_POLL_INTERVAL_SECONDS = 1.0
 # A running tmux client can fail transiently while the server and pane remain
 # healthy. Require repeated capture + session-probe failures before exit.
 _IDLE_EXIT_FAILURE_THRESHOLD = 3
+# OS temp cleanup can unlink a terminal's private tmux socket (macOS reaps idle
+# ``$TMPDIR`` entries after ~3 days) while its server and pane keep running.
+# tmux recreates the socket on SIGUSR1; bound the wait for the recreated file.
+_SOCKET_RECOVERY_WAIT_SECONDS = 2.0
+_SOCKET_RECOVERY_POLL_SECONDS = 0.02
 _PROBE_ERROR_MAX_CHARS = 1024
 _EXIT_DIAGNOSTIC_SCROLLBACK_LINES = 100
 _EXIT_STATUS_REFRESH_SECONDS = 0.1
@@ -398,11 +405,23 @@ class _TmuxCommandFailedError(_TmuxCommandError):
     """tmux failed without confirming whether the target is alive."""
 
 
+def _tmux_reports_socket_missing(detail: str) -> bool:
+    """Whether tmux failed because the private socket file itself is gone.
+
+    Distinct from ``no server running`` (socket present but unserved): this is
+    the reaped-socket case the OS temp cleaner produces, where the server
+    process can still be alive and the socket can be recreated.
+    """
+    lowered = detail.lower()
+    return lowered.startswith("error connecting to ") and lowered.endswith(
+        "(no such file or directory)"
+    )
+
+
 def _tmux_reports_target_gone(detail: str) -> bool:
     lowered = detail.lower()
-    return lowered.startswith(_TMUX_TARGET_GONE_STDERR_MARKERS) or (
-        lowered.startswith("error connecting to ")
-        and lowered.endswith("(no such file or directory)")
+    return lowered.startswith(_TMUX_TARGET_GONE_STDERR_MARKERS) or _tmux_reports_socket_missing(
+        detail
     )
 
 
@@ -1167,6 +1186,16 @@ class TerminalInstance:
     # session"). ``None`` until such a probe fails.
     _last_capture_probe_error: str | None = field(default=None, repr=False)
     _last_session_probe_error: str | None = field(default=None, repr=False)
+    # Identity of this instance's private tmux server, captured at launch so a
+    # reaped socket can be recreated (SIGUSR1) without signalling a recycled
+    # pid. ``None`` until launch records it; recovery is a no-op without it.
+    _tmux_server_pid: int | None = field(default=None, repr=False)
+    _tmux_server_create_time: float | None = field(default=None, repr=False)
+    # Serialises socket recovery so the async command path and the threaded
+    # idle watcher cannot race to recreate the private dir concurrently.
+    _recovery_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     @property
     def tmux_target(self) -> str:
@@ -1707,6 +1736,10 @@ class TerminalInstance:
                         inner_str,
                     ],
                     *pane_died_hook,
+                    # Report the server pid on stdout in the same invocation so
+                    # a later reaped socket can be recreated (SIGUSR1) without a
+                    # second launch-time round-trip.
+                    ["display-message", "-p", "#{pid}"],
                 ]
             ),
         ]
@@ -1716,11 +1749,11 @@ class TerminalInstance:
                 self._clipboard_bridge.start()
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
             )
-            _, stderr = await proc.communicate()
+            launch_stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
                 raise RuntimeError(
                     f"tmux launch failed (rc={proc.returncode}): {stderr.decode().strip()}"
@@ -1733,6 +1766,7 @@ class TerminalInstance:
 
         self.running = True
         self.launch_cwd = effective_cwd
+        self._record_tmux_server_identity(launch_stdout)
 
     async def send(
         self,
@@ -2562,6 +2596,12 @@ class TerminalInstance:
                         detail,
                     )
                     return self.running
+                if _tmux_reports_socket_missing(detail) and (
+                    await self._recover_private_socket_async()
+                ):
+                    # The socket was reaped but its server lives and the socket
+                    # is back; the terminal is still running.
+                    return self.running
                 self.running = False
                 return False
             # remain-on-exit can keep the session alive after its process exits.
@@ -2643,36 +2683,44 @@ class TerminalInstance:
             return False
         return True
 
+    async def _run_tmux(self, args: tuple[str, ...], *, capture: bool) -> str | None:
+        """Run a tmux command, recovering a reaped private socket once.
+
+        Shared async body for :meth:`_tmux` and :meth:`_tmux_output` so the
+        missing-socket retry policy lives in one place. Returns decoded stdout
+        when ``capture`` is set, otherwise ``None``.
+        """
+        cmd = [*self._tmux_base_cmd(), *args]
+        recovery_attempted = False
+        while True:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except OSError as exc:
+                raise _tmux_process_start_error(cmd, exc) from exc
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                return stdout.decode() if capture else None
+            error = _tmux_command_failed_error(cmd, proc.returncode, stderr)
+            if (
+                not recovery_attempted
+                and _tmux_reports_socket_missing(error.detail)
+                and await self._recover_private_socket_async()
+            ):
+                recovery_attempted = True
+                continue
+            raise error
+
     async def _tmux(self, *args: str) -> None:
         """Run a tmux command against this instance's server."""
-        cmd = [*self._tmux_base_cmd(), *args]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except OSError as exc:
-            raise _tmux_process_start_error(cmd, exc) from exc
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise _tmux_command_failed_error(cmd, proc.returncode, stderr)
+        await self._run_tmux(args, capture=False)
 
     async def _tmux_output(self, *args: str) -> str:
         """Run a tmux command and return stdout."""
-        cmd = [*self._tmux_base_cmd(), *args]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except OSError as exc:
-            raise _tmux_process_start_error(cmd, exc) from exc
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise _tmux_command_failed_error(cmd, proc.returncode, stderr)
-        return stdout.decode()
+        return cast(str, await self._run_tmux(args, capture=True))
 
     def _tmux_output_sync(self, *args: str) -> str:
         """
@@ -2695,13 +2743,151 @@ class TerminalInstance:
         :raises RuntimeError: When the subprocess permanently cannot start.
         """
         cmd = [*self._tmux_base_cmd(), *args]
+        recovery_attempted = False
+        while True:
+            try:
+                proc = subprocess.run(cmd, capture_output=True, check=False)
+            except OSError as exc:
+                raise _tmux_process_start_error(cmd, exc) from exc
+            if proc.returncode == 0:
+                return proc.stdout.decode()
+            error = _tmux_command_failed_error(cmd, proc.returncode, proc.stderr)
+            if (
+                not recovery_attempted
+                and _tmux_reports_socket_missing(error.detail)
+                and self._recover_private_socket_sync()
+            ):
+                recovery_attempted = True
+                continue
+            raise error
+
+    def _record_tmux_server_identity(self, launch_output: bytes) -> None:
+        """Record server identity; disable recovery when it cannot be verified.
+
+        ``launch`` appends ``display-message -p '#{pid}'`` so the server pid is
+        the last token on stdout. Capturing it with its start time (so a
+        recycled pid is never signalled) lets a reaped socket be recreated via
+        SIGUSR1 later.
+        """
+        text = launch_output.decode(errors="replace")
         try:
-            proc = subprocess.run(cmd, capture_output=True, check=False)
-        except OSError as exc:
-            raise _tmux_process_start_error(cmd, exc) from exc
-        if proc.returncode != 0:
-            raise _tmux_command_failed_error(cmd, proc.returncode, proc.stderr)
-        return proc.stdout.decode()
+            pid = int(text.split()[-1])
+            create_time = psutil.Process(pid).create_time()
+        except (ValueError, IndexError, psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            # Clear any stale identity so a failed re-recording fails closed
+            # instead of signalling a previously recorded server.
+            self._tmux_server_pid = None
+            self._tmux_server_create_time = None
+            logger.debug(
+                "Could not record tmux server identity for terminal %s:%s; "
+                "reaped-socket recovery stays disabled",
+                self.name,
+                self.session_key,
+            )
+            return
+        self._tmux_server_pid = pid
+        self._tmux_server_create_time = create_time
+
+    def _tmux_server_process_alive(self) -> bool:
+        """Whether the recorded private tmux server process is still running.
+
+        Confirms the recorded start time so a recycled pid is never mistaken
+        for the original server, and fails closed when the identity cannot be
+        read so an unverifiable process is never signalled.
+        """
+        pid = self._tmux_server_pid
+        create_time = self._tmux_server_create_time
+        if pid is None or pid <= 1 or create_time is None:
+            return False
+        try:
+            proc = psutil.Process(pid)
+            if proc.create_time() != create_time:
+                return False
+            return proc.status() != psutil.STATUS_ZOMBIE
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
+
+    def _recover_private_socket(self) -> bool:
+        """Rebuild the socket dir and wait for the live server to recreate it.
+
+        Serialised so concurrent synchronous and asynchronous callers join one
+        recovery attempt and observe the same socket readiness: a later caller
+        sees the socket an earlier one restored instead of racing to recreate
+        the private dir and reporting a false exit for a server still alive.
+
+        Restores the private tmux socket only; clipboard-bridge files removed
+        with the directory are not recreated.
+
+        :returns: ``True`` when the socket is present again (already there, or
+            the recorded server recreated it after SIGUSR1); ``False`` when
+            there is no live server to recover or the socket never returned.
+        """
+        with self._recovery_lock:
+            if self.socket_path.exists():
+                return True
+            if not self._tmux_server_process_alive():
+                return False
+            try:
+                # Reuse the dir when a per-file sweep reaped only the socket.
+                # mkdir never follows a symlink and fails on an existing name,
+                # so a planted symlink cannot capture a freshly created dir.
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(self.private_dir, 0o700)
+                # Use the verified directory descriptor so a swapped symlink
+                # cannot redirect the ownership check, chmod, or owner-claim write.
+                dir_fd = os.open(self.private_dir, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+                try:
+                    if os.fstat(dir_fd).st_uid != os.geteuid():
+                        return False
+                    os.fchmod(dir_fd, 0o700)
+                    # The orphan sweep qualifies ownership from this file; the
+                    # cleaner removed it with the dir, so re-establish it.
+                    owner_claim.write_owner_claim(self.private_dir, dir_fd=dir_fd)
+                finally:
+                    os.close(dir_fd)
+                # Re-confirm identity just before signalling so a pid recycled
+                # during recovery is rejected by its start time, not signalled.
+                if not self._tmux_server_process_alive():
+                    return False
+                os.kill(cast(int, self._tmux_server_pid), signal.SIGUSR1)
+            except OSError:
+                return False
+            logger.warning(
+                "Recreating reaped tmux socket for terminal %s:%s: the private "
+                "socket was removed while server pid %s and its pane stayed alive",
+                self.name,
+                self.session_key,
+                self._tmux_server_pid,
+            )
+            deadline = time.monotonic() + _SOCKET_RECOVERY_WAIT_SECONDS
+            while not self.socket_path.exists():
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(_SOCKET_RECOVERY_POLL_SECONDS)
+            bridge = self._clipboard_bridge
+            if bridge is not None and not bridge.socket_path.exists():
+                # The reap took the clipboard bridge's socket and helper with the
+                # directory; the terminal reconnects but copy/paste stays
+                # degraded until the session is resumed.
+                logger.warning(
+                    "Clipboard bridge not restored for terminal %s:%s after socket "
+                    "recovery; copy/paste stays degraded until resume",
+                    self.name,
+                    self.session_key,
+                )
+            return True
+
+    def _recover_private_socket_sync(self) -> bool:
+        """Restore a reaped private socket for the threaded watcher's probes."""
+        return self._recover_private_socket()
+
+    async def _recover_private_socket_async(self) -> bool:
+        """Restore a reaped private socket for asyncio probes without blocking.
+
+        Runs the blocking, lock-guarded recovery in a worker thread so the
+        event loop keeps serving other probes while it waits for the socket.
+        """
+        return await asyncio.to_thread(self._recover_private_socket)
 
 
 @dataclass(frozen=True)
