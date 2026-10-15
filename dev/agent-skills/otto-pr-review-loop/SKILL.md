@@ -1,6 +1,6 @@
 ---
 name: otto-pr-review-loop
-description: Iterate Polly and Open Code Review on an open PR until every finding is fixed or answered with evidence.
+description: Run Polly and OCR on a PR until all findings settle.
 ---
 
 # Iterate Polly and Open Code Review until all findings are settled
