@@ -1407,6 +1407,64 @@ async def test_finished_create_key_replay_does_not_reopen_admission(scenario):
         assert next_upload.json()["upload_id"] == ids["c" * 32]
 
 
+async def test_finished_create_key_replacement_obeys_full_cap(scenario):
+    scenario.hard["max_open_uploads"] = 1
+    ids = {name: uuid.uuid4().hex for name in ("a", "replacement", "b", "c")}
+    creates = 0
+    aborted: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal creates
+        if request.method in ("GET", "HEAD") or request.url.path.endswith("/complete"):
+            return await scenario.handle(request)
+        if request.method == "DELETE":
+            aborted.append(request.url.path.rsplit("/", 1)[-1])
+            return await scenario.handle(request)
+        key = request.headers["Idempotency-Key"]
+        if key == "a" * 32:
+            creates += 1
+            uid = ids["a" if creates == 1 else "replacement"]
+        else:
+            uid = ids[key[0]]
+        return httpx.Response(
+            201,
+            json={
+                "upload_id": uid,
+                "offset": 0,
+                "chunk_bytes": 1024**2,
+                "expires_at": time.time() + 3600,
+            },
+        )
+
+    async def create(key: str) -> httpx.Response:
+        return await scenario.client.post(
+            scenario.base,
+            json={"dir": "", "name": "payload.bin", "size": 3},
+            headers={"Idempotency-Key": key * 32},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://runner"
+    ) as runner:
+        scenario.routing._clients["binary-test"] = runner
+        assert (await create("a")).status_code == 201
+        assert (
+            await scenario.client.post(scenario.base + "/" + ids["a"] + "/complete")
+        ).status_code == 200
+        assert (await create("b")).status_code == 201
+        replay = await create("a")
+        assert replay.status_code == 429
+        assert replay.json()["error"]["code"] == "upload_limit"
+        assert creates == 2
+        assert aborted == [ids["replacement"]]
+        assert (
+            await scenario.client.head(scenario.base + "/" + ids["replacement"])
+        ).status_code == 404
+        assert (await scenario.client.head(scenario.base + "/" + ids["b"])).status_code == 200
+        assert (await scenario.client.delete(scenario.base + "/" + ids["b"])).status_code == 204
+        assert (await create("c")).status_code == 201
+
+
 async def test_create_key_runner_id_change_retires_stale_admission(scenario):
     scenario.hard["max_open_uploads"] = 1
     ids = [uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex]
