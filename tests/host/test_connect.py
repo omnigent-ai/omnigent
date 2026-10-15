@@ -1338,6 +1338,16 @@ async def test_handle_launch_prints_exact_runner_log_path(
     _cleanup_host(host)
 
 
+class _FullDiskStdout:
+    """A background host's stdout (its log file) on a full disk."""
+
+    def write(self, _text: str) -> int:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def flush(self) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+
 async def test_launch_and_stop_reply_when_stdout_is_unwritable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1348,14 +1358,6 @@ async def test_launch_and_stop_reply_when_stdout_is_unwritable(
     printing it raised, the server would wait out its launch timeout for a
     runner that had already started.
     """
-
-    class _FullDiskStdout:
-        def write(self, _text: str) -> int:
-            raise OSError(errno.ENOSPC, "No space left on device")
-
-        def flush(self) -> None:
-            raise OSError(errno.ENOSPC, "No space left on device")
-
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     host = _make_host_process()
@@ -1384,6 +1386,43 @@ async def test_launch_and_stop_reply_when_stdout_is_unwritable(
     assert result.status == "launched", result.error
     assert stop_result.status == "stopped"
     _cleanup_host(host)
+
+
+async def test_refused_launch_replies_when_stdout_is_unwritable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused launch still returns its structured failure on a full log disk."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
+    host = _make_host_process()
+    monkeypatch.setattr(sys, "stdout", _FullDiskStdout())
+
+    result = await host._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_refused_full",
+            binding_token="tok_refused_full",
+            workspace=str(tmp_path / "missing"),
+            session_id="session_refused_full",
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == WORKSPACE_MISSING_ERROR_CODE
+    _cleanup_host(host)
+
+
+async def test_serve_frames_survives_unwritable_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The connect banner must not drop a host that reconnects while its log disk is full."""
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+    monkeypatch.setattr(sys, "stdout", _FullDiskStdout())
+
+    # Reaching the fake recv's disconnect means the banner did not abort the loop.
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
 
 
 class _FakeTunnel:

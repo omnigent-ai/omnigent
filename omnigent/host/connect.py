@@ -1800,12 +1800,11 @@ class HostProcess:
                 ).value,
             ),
         )
-        print(
+        _print_lifecycle_line(
             "  ! Runner launch failed\n"
             f"    session: {session_id!r}\n"
             f"    workspace: {frame.workspace!r}\n"
-            f"    reason: {diagnostic!r}",
-            flush=True,
+            f"    reason: {diagnostic!r}"
         )
         return HostLaunchRunnerResultFrame(
             request_id=frame.request_id,
@@ -4752,11 +4751,10 @@ class HostProcess:
                 await self._report_runner_exit(
                     runner_id, report.error, had_connected=report.had_connected
                 )
-            print(
+            _print_lifecycle_line(
                 f"✓ Connected as {self._identity.name!r} "
                 f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
-                "Listening for sessions — Ctrl-C to disconnect.",
-                flush=True,
+                "Listening for sessions — Ctrl-C to disconnect."
             )
 
             # Readiness refresh runs in its own task, never on this receive loop:
