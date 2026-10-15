@@ -529,9 +529,14 @@ it.each(["space", "header", "empty tree", "Changes"])(
             : (document.querySelector("[data-upload-tree]") as HTMLElement);
     const directory = usesPanel ? "" : "src";
     const transfer = { types: ["Files"], files: [new File(["bytes"], "root.txt")] };
+    if (surface === "header") expect(screen.getByRole("status")).toBeEmptyDOMElement();
     fireEvent.dragOver(target, { dataTransfer: transfer });
     expect(screen.getByText("Upload to workspace")).toBeVisible();
-    expect(screen.getByRole("status")).toHaveTextContent(`Upload to ${usesPanel ? "demo" : "src"}`);
+    expect(
+      screen
+        .getAllByRole("status")
+        .some((region) => region.textContent === `Upload to ${usesPanel ? "demo" : "src"}`),
+    ).toBe(true);
     expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(1);
     fireEvent.drop(target, { dataTransfer: transfer });
     expect(enqueueUploads).toHaveBeenCalledExactlyOnceWith(
@@ -571,6 +576,40 @@ function tree(props: Partial<Parameters<typeof FolderTree>[0]> = {}) {
     />
   );
 }
+
+it("keeps one empty live region mounted and announces each tree drop destination", async () => {
+  view("", tree({ browseLocation: "" }));
+  await screen.findByRole("button", { name: "Upload files" });
+  const liveRegion = screen.getByRole("status");
+  expect(liveRegion).toHaveAttribute("aria-live", "polite");
+  expect(liveRegion).toBeEmptyDOMElement();
+  const transfer = { types: ["Files"], files: [new File(["bytes"], "new.txt")] };
+
+  fireEvent.dragOver(screen.getByText("assets/"), { dataTransfer: transfer });
+  expect(screen.getByRole("status")).toBe(liveRegion);
+  expect(liveRegion).toHaveTextContent("Upload to assets");
+  fireEvent.dragOver(screen.getByText("existing.txt"), { dataTransfer: transfer });
+  expect(liveRegion).toHaveTextContent("Upload to assets");
+  fireEvent.dragOver(screen.getByText("other/"), { dataTransfer: transfer });
+  expect(liveRegion).toHaveTextContent("Upload to other");
+  fireEvent.dragOver(document.querySelector("[data-upload-tree]") as HTMLElement, {
+    dataTransfer: transfer,
+  });
+  expect(liveRegion).toHaveTextContent("Upload to workspace root");
+  fireEvent.dragEnd(screen.getByText("other/"), { dataTransfer: transfer });
+  expect(screen.getByRole("status")).toBe(liveRegion);
+  expect(liveRegion).toBeEmptyDOMElement();
+
+  fireEvent.dragOver(screen.getByText("assets/"), { dataTransfer: transfer });
+  fireEvent.dragLeave(screen.getByText("assets/"), { dataTransfer: transfer });
+  expect(liveRegion).toBeEmptyDOMElement();
+  fireEvent.dragOver(screen.getByText("assets/"), { dataTransfer: transfer });
+  fireEvent.drop(screen.getByText("assets/"), { dataTransfer: transfer });
+  expect(liveRegion).toBeEmptyDOMElement();
+  fireEvent.dragOver(screen.getByText("other/"), { dataTransfer: transfer });
+  fireEvent.dragEnd(document, { dataTransfer: transfer });
+  expect(liveRegion).toBeEmptyDOMElement();
+});
 
 it("swaps the folder icon and glows its name, then freezes the DROP row despite stale hover", async () => {
   view("src", tree());
