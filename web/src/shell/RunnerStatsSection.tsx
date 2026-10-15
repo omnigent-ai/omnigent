@@ -153,10 +153,7 @@ export function RunnerStatsSection({ host, label = host.name }: { host: Host; la
   }
 
   return (
-    <div
-      data-testid="runner-stats-section"
-      className="mt-[19px] border-t border-border pt-2 text-xs"
-    >
+    <div data-testid="runner-stats-section" className="mt-2.5 border-t border-border pt-2 text-xs">
       <p
         data-testid="runner-stats-header"
         className="flex items-center gap-1.5 text-muted-foreground"
