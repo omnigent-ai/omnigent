@@ -110,7 +110,10 @@ vi.mock("@tiptap/react", () => ({
   EditorContent: () => null,
 }));
 
-vi.mock("@tiptap/markdown", () => ({ Markdown: { extend: vi.fn().mockReturnValue({}) } }));
+vi.mock("@tiptap/markdown", () => ({
+  Markdown: { extend: vi.fn().mockReturnValue({}) },
+  MarkdownManager: vi.fn(),
+}));
 vi.mock("@tiptap/starter-kit", () => ({ StarterKit: { configure: vi.fn().mockReturnValue({}) } }));
 vi.mock("@tiptap/extension-table", () => ({
   Table: { configure: vi.fn().mockReturnValue({}) },

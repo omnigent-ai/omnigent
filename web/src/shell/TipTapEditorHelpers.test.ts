@@ -68,7 +68,9 @@ describe("repeated words in Markdown", () => {
           makeComment("word", expected),
           raw,
           editor!.markdown,
-        )!;
+        );
+        expect(range).not.toBeNull();
+        if (!range) return;
         expect(doc.textBetween(0, range.from, "\n")).toBe(doc.textBetween(0, from, "\n"));
         expect(doc.textBetween(range.from, range.to, "\n")).toBe("word");
       }

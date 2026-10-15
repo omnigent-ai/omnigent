@@ -7,6 +7,7 @@ interface Source {
   text: string;
   start: number;
   offsets?: number[];
+  offsetStart?: number;
 }
 interface SourceMap {
   starts: number[];
@@ -23,13 +24,14 @@ const cache = new WeakMap<
 >();
 
 function offset(source: Source, index: number): number {
-  return source.offsets?.[index] ?? source.start + index;
+  return source.offsets?.[(source.offsetStart ?? 0) + index] ?? source.start + index;
 }
 function slice(source: Source, start: number, end = source.text.length): Source {
   return {
     text: source.text.slice(start, end),
     start: offset(source, start),
-    offsets: source.offsets?.slice(start, end),
+    offsets: source.offsets,
+    offsetStart: source.offsets ? (source.offsetStart ?? 0) + start : undefined,
   };
 }
 
@@ -247,7 +249,8 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
       case "strong":
       case "em":
       case "del": {
-        const size = /^(\*\*|__|~~)/.test(view.text) ? 2 : 1;
+        const size =
+          token.type === "strong" || (token.type === "del" && view.text.startsWith("~~")) ? 2 : 1;
         children(token.tokens ?? [], slice(view, size, view.text.length - size));
         return;
       }

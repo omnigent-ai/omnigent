@@ -23,6 +23,7 @@ vi.mock("@tiptap/react", () => ({
 }));
 vi.mock("@tiptap/markdown", () => ({
   Markdown: { extend: vi.fn().mockReturnValue({}) },
+  MarkdownManager: vi.fn(),
 }));
 vi.mock("@tiptap/starter-kit", () => ({ StarterKit: { configure: vi.fn().mockReturnValue({}) } }));
 vi.mock("@tiptap/extension-table", () => ({

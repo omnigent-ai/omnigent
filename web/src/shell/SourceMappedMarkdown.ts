@@ -26,6 +26,7 @@ export const SourceMappedMarkdown = Markdown.extend({
 });
 
 export function markdownTokens(manager: MarkdownManager, source: string): MarkdownToken[] {
+  // Tokenizer errors propagate so markdownSourceMap can cache a failed mapping.
   const marked = manager.instance;
   const previous = parsed.get(marked);
   return previous?.source === source

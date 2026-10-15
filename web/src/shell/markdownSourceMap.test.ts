@@ -41,6 +41,7 @@ const cases: [string, string, number, string?][] = [
   ["heading marker", "# ⟦#⟧ hello\n\n#", 0, "#"],
   ["ordered list marker", "1. ⟦1⟧\n2. 1", 0, "1"],
   ["single-tilde strikethrough", `~word~ **⟦word⟧** word\n\n${link}`, 1],
+  ["triple emphasis", `word ***⟦word⟧*** word\n\n${link}`, 1],
   ["escaped quote", "\\> word ⟦word⟧", 1],
   ["escaped angle", "\\< word ⟦word⟧", 1],
   ["escaped ampersand", "\\& word ⟦word⟧", 1],
