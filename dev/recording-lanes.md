@@ -3,9 +3,10 @@
 Shared reference for **repro-agent** and **resolve-agent**. Both film the same
 kinds of journeys on the same surfaces; only *which* clip they produce differs:
 
-- **repro-agent** films the product journey — a `reproduced` facet yields a
-  **`before`** clip showing the live bug; an `already_fixed` facet yields a
-  **`fixed`** clip showing the correct user-visible outcome.
+- **repro-agent** films the product journey — a `reproduced` or `likely_repro`
+  facet yields a **`before`** clip showing the live bug (on the stand-in, when
+  one was driven); an `already_fixed` facet yields a **`fixed`** clip showing
+  the correct user-visible outcome.
 - **resolve-agent** films the product journey after the fix as the **`after`**
   clip (the human-visible half of the fail→pass proof). The recovered test
   verifies the result separately. On the review path it films the reviewed PR
@@ -45,6 +46,9 @@ the `cli` section below for setup steps.
   just to produce a video.
 - Record one clip per facet, with a `kind` that matches its verdict. Do not add
   unrelated working examples as extra clips.
+- An absence is filmable. When the bug is that nothing happens, show the
+  triggering action and the screen staying in the stale state, with whatever
+  error the product does show, for longer than a healthy response takes.
 
 ## If recording is blocked
 
@@ -54,6 +58,12 @@ Recording is **best-effort**:
   to show, set `recordings: []` for that facet. Name the specific blocker in
   `recording_unavailable_reason`, such as missing `vhs` or `ttyd`, or a server
   that cannot start.
+- A blocker is the observed result of a recorder run. When your environment
+  check found the recorder available, point it at the facet's lane before
+  declaring the facet blocked, and name the command you ran and its observed
+  error. A reason that names no attempted recorder run — "the recorder was not
+  stood up", a multi-process journey, a flaky boot, a bug that is an absence —
+  is insufficient.
 - Text-only CLI output is not a reason to skip recording. A missing recording
   from an earlier run is not a reason either.
 - Do not block the verdict, fix, or PR because footage is missing or rejected.
