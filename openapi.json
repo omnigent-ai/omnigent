@@ -4326,6 +4326,34 @@
         "title": "NativeToolData",
         "type": "object"
       },
+      "NativeUsageBaseline": {
+        "description": "Own-session cumulative tokens for resuming a native usage reporter.\n\nExcludes spawned sessions. Input includes cache reads, matching the native\nusage event contract rather than the display's separate token buckets.",
+        "properties": {
+          "cumulative_cache_read_input_tokens": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Cumulative Cache Read Input Tokens",
+            "type": "integer"
+          },
+          "cumulative_input_tokens": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Cumulative Input Tokens",
+            "type": "integer"
+          },
+          "cumulative_output_tokens": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Cumulative Output Tokens",
+            "type": "integer"
+          }
+        },
+        "title": "NativeUsageBaseline",
+        "type": "object"
+      },
       "OutputFileDoneEvent": {
         "description": "A streamed file output completed materializing.\n\nEmitted by `_emit_file_annotation_events` in\n`omnigent/runtime/workflow.py` once per file annotation in\nthe assistant's output. `filename` and `content_type` are\nonly populated when the originating annotation carried them.",
         "properties": {
@@ -7921,6 +7949,17 @@
             ],
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. `None` means no override is active (the agent's `llm_model` applies). Set via `PATCH /v1/sessions/{id}` or the REPL's `/model` command; both write the same column so the web UI and the TUI stay in sync.",
             "title": "Model Override"
+          },
+          "native_usage_baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NativeUsageBaseline"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pi's own cumulative token baseline, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
           },
           "parent_session_id": {
             "anyOf": [
