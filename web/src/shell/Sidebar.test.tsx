@@ -1557,9 +1557,11 @@ describe("Sidebar session list", () => {
       features: { ...FALLBACK_SERVER_INFO.features, sidebar_grouping_ui: true, host_stats: true },
     };
 
-    async function hoverStatsTooltip(host: object, info?: ServerInfo) {
+    async function hoverStatsTooltip(host: object, info?: ServerInfo, branch?: string) {
       useHostsMock.mockReturnValue({ data: [host] });
-      mockConversations([conv("conv_stats", "Codex", { host_id: "host_stats" })]);
+      mockConversations([
+        conv("conv_stats", "Codex", { host_id: "host_stats", git_branch: branch }),
+      ]);
       renderSidebar(true, "/", undefined, info);
       fireEvent.pointerMove(screen.getByRole("link", { name: "conv_stats" }), {
         pointerType: "mouse",
@@ -1568,12 +1570,28 @@ describe("Sidebar session list", () => {
     }
 
     it("moves the host line into the runner section when the feature is on", async () => {
-      const tooltip = await hoverStatsTooltip(statsHost, hostStatsOn);
+      const tooltip = await hoverStatsTooltip(
+        statsHost,
+        hostStatsOn,
+        "feature/runner-stats-tooltip",
+      );
 
       const section = within(tooltip).getByTestId("runner-stats-section");
       expect(within(section).getByTestId("runner-stats-header")).toHaveTextContent("bryan-mbp");
       expect(within(section).getByRole("meter", { name: "CPU used" })).toBeInTheDocument();
       expect(within(tooltip).queryByTestId("session-tooltip-location")).toBeNull();
+      const details = within(tooltip).getByTestId("session-tooltip-branch").parentElement!;
+      const dividers: Element[] = [];
+      for (
+        let sibling = details.nextElementSibling;
+        sibling;
+        sibling = sibling.nextElementSibling
+      ) {
+        if (sibling.classList.contains("border-t")) dividers.push(sibling);
+        if (sibling === section) break;
+      }
+      expect(dividers).toEqual([section]);
+      expect(section).toHaveClass("border-border");
       // The section closes the card, after the status line.
       expect(tooltip.lastElementChild).toBe(section);
     });

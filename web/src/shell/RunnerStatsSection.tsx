@@ -155,7 +155,7 @@ export function RunnerStatsSection({ host, label = host.name }: { host: Host; la
   return (
     <div
       data-testid="runner-stats-section"
-      className="mt-2 border-t border-foreground/10 pt-2 text-xs"
+      className="mt-[19px] border-t border-border pt-2 text-xs"
     >
       <p
         data-testid="runner-stats-header"

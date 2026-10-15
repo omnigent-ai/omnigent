@@ -4948,10 +4948,7 @@ function SessionTooltipContent({
       <SessionTooltipDetails conversation={conversation} />
       {hasError && <SessionErrorHint />}
       {host && showRunnerStats && (
-        <>
-          <div className="mt-2.5 border-t border-border" />
-          <RunnerStatsSection host={host} label={sessionLocationLabel(conversation, hostsById)} />
-        </>
+        <RunnerStatsSection host={host} label={sessionLocationLabel(conversation, hostsById)} />
       )}
     </TooltipContent>
   );
