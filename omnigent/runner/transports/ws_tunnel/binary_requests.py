@@ -46,7 +46,7 @@ def decode_binary_request(data: bytes) -> tuple[RequestFrame, bytes]:
     try:
         header_text = data[_PREFIX_LEN : _PREFIX_LEN + header_len].decode("utf-8")
         header = json.loads(header_text)
-    except (UnicodeDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise BinaryRequestError("invalid binary request JSON header") from exc
     request_id = header.get("id") if isinstance(header, dict) else None
     request_id = request_id if isinstance(request_id, str) and request_id else None
