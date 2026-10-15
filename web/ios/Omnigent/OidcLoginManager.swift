@@ -20,9 +20,10 @@ final class OidcLoginManager {
       do {
         let ticket = try await Self.requestTicket(origin: originURL)
         guard await UIApplication.shared.open(ticket.loginURL) else { return }
-        guard let token = try await Self.pollForToken(origin: originURL, ticket: ticket.id)
+        guard let session = try await Self.pollForSession(origin: originURL, ticket: ticket.id)
         else { return }
-        let cookie = try Self.sessionCookie(origin: originURL, token: token)
+        let cookie = try Self.sessionCookie(
+          origin: originURL, token: session.token, expiresIn: session.expiresIn)
         await cookieStore.setCookie(cookie)
         guard !Task.isCancelled else { return }
         onSession()
@@ -56,19 +57,32 @@ final class OidcLoginManager {
     return Ticket(id: response.ticket, loginURL: loginURL)
   }
 
-  static func token(from data: Data) throws -> String {
-    let response = try JSONDecoder().decode(PollResponse.self, from: data)
-    guard isJWTShaped(response.token) else { throw LoginError.invalidResponse }
-    return response.token
+  struct Session: Equatable {
+    let token: String
+    /// Seconds until the server session expires, when the poll response reports it.
+    let expiresIn: TimeInterval?
   }
 
-  static func sessionCookie(origin: URL, token: String) throws -> HTTPCookie {
+  static func session(from data: Data) throws -> Session {
+    let response = try JSONDecoder().decode(PollResponse.self, from: data)
+    guard isJWTShaped(response.token) else { throw LoginError.invalidResponse }
+    return Session(token: response.token, expiresIn: response.expiresIn)
+  }
+
+  static func sessionCookie(
+    origin: URL, token: String, expiresIn: TimeInterval? = nil
+  ) throws -> HTTPCookie {
     guard origin.host != nil, isJWTShaped(token) else { throw LoginError.invalidResponse }
+    // A session the server already reports as expired must not become a cookie.
+    if let expiresIn, expiresIn <= 0 { throw LoginError.invalidResponse }
+    // Without an expiry the cookie is session-only and WebKit drops it when iOS
+    // terminates the app, forcing the browser login again on every cold start.
     var properties: [HTTPCookiePropertyKey: Any] = [
       .originURL: origin,
       .path: "/",
       .name: origin.scheme?.lowercased() == "https" ? "__Host-ap_session" : "ap_session",
       .value: token,
+      .expires: Date(timeIntervalSinceNow: expiresIn ?? defaultSessionLifetime),
     ]
     if origin.scheme?.lowercased() == "https" {
       properties[.secure] = "TRUE"
@@ -89,7 +103,7 @@ final class OidcLoginManager {
     return try ticket(from: data, origin: origin)
   }
 
-  private static func pollForToken(origin: URL, ticket: String) async throws -> String? {
+  private static func pollForSession(origin: URL, ticket: String) async throws -> Session? {
     let clock = ContinuousClock()
     let deadline = clock.now + pollTimeout
     while clock.now < deadline {
@@ -104,7 +118,7 @@ final class OidcLoginManager {
         let (data, response) = try await URLSession.shared.data(for: request)
         switch (response as? HTTPURLResponse)?.statusCode {
         case 200:
-          return try token(from: data)
+          return try session(from: data)
         case 202:
           continue
         case 410:
@@ -147,6 +161,12 @@ final class OidcLoginManager {
 
   private struct PollResponse: Decodable {
     let token: String
+    let expiresIn: TimeInterval?
+
+    enum CodingKeys: String, CodingKey {
+      case token
+      case expiresIn = "expires_in"
+    }
   }
 
   private enum LoginError: Error {
@@ -156,4 +176,6 @@ final class OidcLoginManager {
   private static let pollInterval = Duration.seconds(2)
   private static let pollTimeout = Duration.seconds(300)
   private static let requestTimeout: TimeInterval = 10
+  /// Mirrors the server's default OIDC session TTL for poll responses without `expires_in`.
+  private static let defaultSessionLifetime: TimeInterval = 8 * 60 * 60
 }
