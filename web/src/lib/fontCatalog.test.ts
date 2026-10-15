@@ -63,9 +63,7 @@ describe("fontCatalog — integrity", () => {
     expect(geist?.source).toBe("bundled");
     expect(geist?.family).toBe("Geist Mono Variable");
 
-    const codeGeist = getFontById("geist-mono-code-bundled");
-    expect(codeGeist?.source).toBe("bundled");
-    expect(codeGeist?.family).toBe("Geist Mono Variable");
+    expect(getFontById("geist-mono-code-bundled")).toBeUndefined();
 
     const system = getFontById("system-ui");
     expect(system?.source).toBe("bundled");
@@ -92,62 +90,65 @@ describe("fontCatalog — integrity", () => {
     const sans = FONT_CATALOG_BY_CATEGORY.sans
       .filter((entry) => entry.source === "google-css2")
       .map((entry) => entry.family);
-    expect(sans.slice(0, 25)).toEqual([
-      "Roboto",
+    expect(sans).toEqual([
       "Open Sans",
+      "Roboto",
       "Google Sans",
       "Inter",
       "Montserrat",
-      "Poppins",
-      "Lato",
+      "Rubik",
       "Arimo",
+      "Ubuntu",
+      "Lato",
       "Noto Sans",
-      "DM Sans",
       "Raleway",
       "Nunito",
       "Nunito Sans",
-      "Rubik",
+      "Public Sans",
+      "DM Sans",
       "Manrope",
-      "Ubuntu",
       "Outfit",
-      "Kanit",
       "Plus Jakarta Sans",
       "Work Sans",
       "Quicksand",
       "Figtree",
       "PT Sans",
-      "Archivo",
       "Mulish",
+      "Source Sans 3",
+      "Barlow",
+      "Poppins",
+      "Kanit",
+      "Archivo",
+      "Geist",
     ]);
-    expect(sans.slice(25)).toEqual(["Source Sans 3", "Geist"]);
 
     const monospace = ["fixedWidth", "code"] as const;
     const expectedMonoFamilies = [
       "Roboto Mono",
       "JetBrains Mono",
-      "Inconsolata",
       "IBM Plex Mono",
+      "Inconsolata",
       "Source Code Pro",
-      "DM Mono",
       "Space Mono",
+      "DM Mono",
       "Fira Code",
       "Courier Prime",
       "Google Sans Code",
       "Share Tech Mono",
       "PT Mono",
       "Ubuntu Mono",
-      "Cutive Mono",
-      "Red Hat Mono",
-      "Anonymous Pro",
       "Fira Mono",
       "Cousine",
+      "Cutive Mono",
+      "Red Hat Mono",
       "Azeret Mono",
+      "Anonymous Pro",
       "Fragment Mono",
-      "Overpass Mono",
       "Chivo Mono",
       "Spline Sans Mono",
-      "B612 Mono",
       "Martian Mono",
+      "Overpass Mono",
+      "B612 Mono",
     ];
     const nerdFamilies = [
       "JetBrainsMono Nerd Font Mono",
