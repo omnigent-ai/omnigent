@@ -120,7 +120,7 @@ const SANS_GOOGLE_FONTS: readonly [string, string, readonly number[]][] = [
   ["montserrat", "Montserrat", [400, 500, 600, 700]],
   ["rubik", "Rubik", [400, 500, 600, 700]],
   ["arimo", "Arimo", [400, 500, 600, 700]],
-  ["ubuntu", "Ubuntu", [400, 500, 600, 700]],
+  ["ubuntu", "Ubuntu", [400, 500, 700]],
   ["lato", "Lato", [400, 700]],
   ["noto-sans", "Noto Sans", [400, 500, 600, 700]],
   ["raleway", "Raleway", [400, 500, 600, 700]],
@@ -183,7 +183,8 @@ function monospaceFonts(category: "fixedWidth" | "code"): readonly FontCatalogEn
 }
 
 const NERD_FONT_VARIANTS = [
-  // Nerd Fonts are pinned to a release and lazy-loaded only when selected.
+  // Nerd Fonts stay pinned; fetched when webfonts is enabled and a dropdown
+  // previews them or the user selects one.
   [
     "jetbrainsmono-nerd-font-mono",
     "JetBrainsMono Nerd Font Mono",
