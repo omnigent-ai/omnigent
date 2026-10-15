@@ -263,14 +263,20 @@ async def dispatch_via_asgi(
     response_status: list[int] = []
     response_headers_raw: list[tuple[bytes, bytes]] = []
     head_sent_to_ws: bool = False
-    end_sent_to_ws: bool = False
+    terminal_send_task: asyncio.Future[None] | None = None
+
+    def consume_terminal_send_exception(task: asyncio.Future[None]) -> None:
+        if not task.cancelled():
+            task.exception()
 
     async def send_end(error: str | None = None) -> None:
-        nonlocal end_sent_to_ws
-        if not end_sent_to_ws:
-            # Record the terminal attempt before its await so cancellation cannot duplicate it.
-            end_sent_to_ws = True
-            await send_text(encode_frame(ResponseEndFrame(id=frame.id, error=error)))
+        nonlocal terminal_send_task
+        if terminal_send_task is None:
+            terminal_send_task = asyncio.ensure_future(
+                send_text(encode_frame(ResponseEndFrame(id=frame.id, error=error)))
+            )
+            terminal_send_task.add_done_callback(consume_terminal_send_exception)
+        await asyncio.shield(terminal_send_task)
 
     async def receive() -> Message:
         nonlocal body_sent
@@ -345,6 +351,8 @@ async def dispatch_via_asgi(
                     if is_tunnel_open is None or is_tunnel_open():
                         await send_end("runner_request_cancelled")
         finally:
+            if terminal_send_task is not None and not terminal_send_task.done():
+                terminal_send_task.cancel()
             raise cancellation
     except Exception:
         # If the app crashed BEFORE sending head, surface a 500 so
@@ -375,11 +383,8 @@ async def dispatch_via_asgi(
                     )
                 )
             )
-        # If a clean end already went out (more_body=False), the response is
-        # complete on the wire; a second, error-flagged end frame could race
-        # the consumer and spuriously abort a fully-delivered response. Send
-        # at most one end frame per request.
-        if not end_sent_to_ws:
+        # Reuse an in-flight terminal send instead of racing a second end frame.
+        if terminal_send_task is None:
             # Only flag the end frame as an error when head was already sent;
             # the pre-head error response closes cleanly.
             end_error = (
