@@ -361,26 +361,66 @@ def _limits(runner: dict[str, Any] | None = None) -> PublicLimits:
 
 
 async def _read_capped(request: Request, maximum: int) -> bytes:
-    first = b""
+    raw_length = request.headers.get("content-length", "")
+    content_length: int | None = None
+    if re.fullmatch(r"[0-9]+", raw_length):
+        normalized_length = raw_length.lstrip("0") or "0"
+        maximum_text = str(maximum)
+        if len(normalized_length) > len(maximum_text) or (
+            len(normalized_length) == len(maximum_text) and normalized_length > maximum_text
+        ):
+            raise UploadError(ErrorCode.TOO_LARGE)
+        content_length = int(normalized_length)
+
+    if content_length is not None:
+        first: bytes | None = None
+        buffer: io.BytesIO | None = None
+        size = 0
+        async for chunk in request.stream():
+            next_size = size + len(chunk)
+            if next_size > maximum or next_size > content_length:
+                raise UploadError(ErrorCode.TOO_LARGE)
+            if not chunk:
+                continue
+            if buffer is None and first is None:
+                first = chunk
+                size = next_size
+                continue
+            if buffer is None:
+                buffer = io.BytesIO()
+                if content_length:
+                    buffer.seek(content_length - 1)
+                    buffer.write(b"\0")
+                    buffer.seek(0)
+                assert first is not None
+                buffer.write(first)
+                first = None
+            buffer.write(chunk)
+            size = next_size
+        if size != content_length:
+            raise UploadError(ErrorCode.UPLOAD_RELAY_FAILED)
+        return buffer.getvalue() if buffer is not None else first or b""
+
     buffer: io.BytesIO | None = None
     size = 0
     async for chunk in request.stream():
-        size += len(chunk)
-        if size > maximum:
+        next_size = size + len(chunk)
+        if next_size > maximum:
             raise UploadError(ErrorCode.TOO_LARGE)
         if not chunk:
             continue
-        if buffer is None and not first:
-            first = chunk
-            continue
         if buffer is None:
-            # Later parts go into one buffer so no per-part objects outlive their message.
             buffer = io.BytesIO()
-            buffer.write(first)
-            first = b""
+            if maximum:
+                buffer.seek(maximum - 1)
+                buffer.write(b"\0")
+                buffer.seek(0)
         buffer.write(chunk)
-    # A single received part is returned as-is, without a copy.
-    return buffer.getvalue() if buffer is not None else first
+        size = next_size
+    if buffer is None:
+        return b""
+    buffer.truncate(size)
+    return buffer.getvalue()
 
 
 def _response_error(response: httpx.Response) -> UploadError:
