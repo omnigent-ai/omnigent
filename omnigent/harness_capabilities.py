@@ -49,6 +49,34 @@ class Resume(str, Enum):
     COLD_ONLY = "cold-only"  # rebuild from Omnigent transcript / history replay
 
 
+class PauseSemantics(str, Enum):
+    """What a Pause (interrupt) actually does to the vendor agent.
+
+    Published so a client can tell, *before* pressing Pause, whether the work
+    in flight survives. No harness freezes a turn mid-step today, so nothing
+    declares ``SUSPENDS``; the value exists because the wire contract is
+    public and a future harness may earn it.
+    """
+
+    SUSPENDS = "suspends"  # the turn freezes in place and can continue later
+    ENDS_RUN = "ends-run"  # the turn is stopped and abandoned; the work is lost
+    UNSUPPORTED = "unsupported"  # Pause does not reach the vendor agent at all
+
+
+class PauseResume(str, Enum):
+    """What a turn sent *after* a Pause continues.
+
+    ``SAME_THREAD`` means the vendor keeps the conversation it already had, so
+    the next turn lands in it. ``NEW_TURN`` means the vendor session was
+    dropped and the next turn rebuilds it from the Omnigent transcript — the
+    conversation is preserved, the vendor's own thread is not.
+    """
+
+    SAME_THREAD = "same-thread"
+    NEW_TURN = "new-turn"
+    UNSUPPORTED = "unsupported"
+
+
 class EffortFamily(str, Enum):
     """Which reasoning-effort value set applies (see reasoning_effort.py)."""
 
@@ -117,6 +145,17 @@ class HarnessCapabilities:
     :param interrupt: Whether a running turn can be cancelled mid-stream. This
         is a *declared* claim; the harness bench's interrupt probe verifies it
         live and flags drift when a harness does not honor it.
+    :param pause: What Pause does to the vendor agent — ``ends-run`` for every
+        harness that honors an interrupt today, ``unsupported`` where the
+        interrupt never reaches the vendor. Always ``unsupported`` when
+        *interrupt* is ``False``.
+    :param resume_after_pause: What the turn after a Pause continues —
+        ``same-thread`` when the vendor keeps its own conversation across the
+        interrupt, ``new-turn`` when the vendor session is dropped and rebuilt
+        from the Omnigent transcript.
+    :param cancel: Whether Cancel is supported. ``True`` for every harness:
+        Omnigent's own turn teardown records the cancellation and its cause
+        even when the vendor ignores the interrupt.
     :param streaming: Whether the harness forwards token-level deltas (vs a
         single complete blob). Declared claim; verified by the bench's
         streaming probe.
@@ -152,6 +191,9 @@ class HarnessCapabilities:
     subagents: bool
     interrupt: bool
     streaming: bool
+    pause: PauseSemantics = PauseSemantics.ENDS_RUN
+    resume_after_pause: PauseResume = PauseResume.NEW_TURN
+    cancel: bool = True
     steering: bool | None = None
     live_queue: bool | None = None
     images: bool | None = None
@@ -173,6 +215,9 @@ class HarnessCapabilities:
             "subagents": self.subagents,
             "interrupt": self.interrupt,
             "streaming": self.streaming,
+            "pause": self.pause.value,
+            "resume_after_pause": self.resume_after_pause.value,
+            "cancel": self.cancel,
             "steering": self.steering,
             "live_queue": self.live_queue,
             "images": self.images,
