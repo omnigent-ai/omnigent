@@ -41,9 +41,7 @@ async def test_next_turn_recovers_when_live_harness_socket_disappears(
     try:
         await manager.start()
         conversation_id = "socket-disappeared"
-        first_client = await manager.get_client(
-            conversation_id, _TEST_HARNESS, env=spawn_env
-        )
+        first_client = await manager.get_client(conversation_id, _TEST_HARNESS, env=spawn_env)
         first_pid = (await first_client.get("/pid")).json()["pid"]
         socket_path = manager.socket_path(conversation_id)
 
@@ -58,9 +56,7 @@ async def test_next_turn_recovers_when_live_harness_socket_disappears(
         # next request must connect through the now-missing pathname.
         await asyncio.sleep(6)
 
-        next_turn_client = await manager.get_client(
-            conversation_id, _TEST_HARNESS, env=spawn_env
-        )
+        next_turn_client = await manager.get_client(conversation_id, _TEST_HARNESS, env=spawn_env)
         next_pid = (await next_turn_client.get("/pid")).json()["pid"]
 
         assert next_pid != first_pid
