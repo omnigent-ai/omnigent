@@ -37,16 +37,24 @@ final class OidcLoginManagerTests: XCTestCase {
   }
 
   func testDeniedPollReturnsNoToken() async throws {
-    let server = try MockHTTPServer { method, path in
-      XCTAssertEqual(method, "GET")
-      XCTAssertEqual(path, "/auth/cli-poll?ticket=denied")
-      return (410, [:], Data(#"{"token":"aaa.bbb.ccc"}"#.utf8))
+    for status in [400, 403, 410] {
+      var requestCount = 0
+      let server = try MockHTTPServer { method, path in
+        XCTAssertEqual(method, "GET")
+        XCTAssertEqual(path, "/auth/cli-poll?ticket=denied")
+        requestCount += 1
+        // A retry would accept this token and fail the terminal-response assertion.
+        return (
+          requestCount == 1 ? status : 200, [:], Data(#"{"token":"aaa.bbb.ccc"}"#.utf8)
+        )
+      }
+      defer { withExtendedLifetime(server) {} }
+      let origin = try XCTUnwrap(URL(string: "http://localhost:\(server.port)"))
+      let token = try await OidcLoginManager.pollForToken(
+        origin: origin, ticket: "denied", codeVerifier: OidcLoginManager.generateCodeVerifier())
+      XCTAssertNil(token, "HTTP \(status) must end polling without accepting a token")
+      XCTAssertEqual(requestCount, 1)
     }
-    defer { withExtendedLifetime(server) {} }
-    let origin = try XCTUnwrap(URL(string: "http://localhost:\(server.port)"))
-    let token = try await OidcLoginManager.pollForToken(
-      origin: origin, ticket: "denied", codeVerifier: OidcLoginManager.generateCodeVerifier())
-    XCTAssertNil(token)
   }
 
   func testTicketAcceptsRootedSameOriginLoginPath() throws {

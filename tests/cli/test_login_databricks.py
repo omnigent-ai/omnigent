@@ -777,32 +777,6 @@ def test_login_oidc_mode_sets_default_server(
         ]
     )
     _patch_login_env(monkeypatch, fake_httpx=fake)
-    monkeypatch.setattr(
-        httpx,
-        "post",
-        lambda url, **kw: _response(200, body={"ticket": "t", "login_url": "/auth/go"}),
-    )
-    monkeypatch.setattr(webbrowser, "open", lambda url: True)
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-
-    result = CliRunner().invoke(cli_group, ["login", server])
-
-    assert result.exit_code == 0, result.output
-    assert cli_mod._load_global_config().get("server") == server
-
-
-def test_login_oidc_ticket_uses_pkce(monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
-    import time
-    import webbrowser
-
-    server = "http://omni-oidc.internal:6767"
-    fake = _FakeHttpx(
-        responses=[
-            _response(401, body={"login_url": "/auth/login"}),
-            _response(200, body={"token": "jwt", "user_id": "alice", "expires_in": 3600}),
-        ]
-    )
-    _patch_login_env(monkeypatch, fake_httpx=fake)
     post_calls: list[dict[str, object]] = []
 
     def _post(url: str, **kwargs: object) -> httpx.Response:
@@ -819,6 +793,7 @@ def test_login_oidc_ticket_uses_pkce(monkeypatch: pytest.MonkeyPatch, token_dir:
     result = CliRunner().invoke(cli_group, ["login", server])
 
     assert result.exit_code == 0, result.output
+    assert cli_mod._load_global_config().get("server") == server
     body = post_calls[0]["json"]
     assert isinstance(body, dict)
     challenge = body["code_challenge"]

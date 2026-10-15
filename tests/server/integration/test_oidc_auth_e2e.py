@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import re
 import time
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -20,16 +19,19 @@ import httpx
 import jwt
 import pytest
 
-from omnigent.server.admin_list import AdminList
-from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.oidc import derive_code_challenge
 from omnigent.server.routes.auth import (
     _CLI_TICKET_TTL_SECONDS,
     _CliTicket,
     _evict_expired_tickets,
-    create_auth_router,
 )
-from tests.server.integration.oidc_fixtures import TEST_SIGNING_KEY, make_oidc_config
+from tests.server.integration.oidc_fixtures import (
+    TEST_SIGNING_KEY,
+    make_oidc_config,
+)
+from tests.server.integration.oidc_fixtures import (
+    build_oidc_transport as _build_oidc_app,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -37,25 +39,6 @@ pytestmark = pytest.mark.asyncio
 def _pkce_pair() -> tuple[str, str]:
     verifier = "a" * 64
     return verifier, derive_code_challenge(verifier)
-
-
-def _build_oidc_app() -> httpx.ASGITransport:
-    """Build a minimal FastAPI app with only the OIDC auth router."""
-    from fastapi import FastAPI
-
-    config = make_oidc_config()
-    auth_provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
-    admin_list = AdminList(Path("/tmp/nonexistent-admin-list.txt"))
-
-    router = create_auth_router(
-        auth_provider=auth_provider,
-        permission_store=None,
-        admin_list=admin_list,
-    )
-
-    app = FastAPI()
-    app.include_router(router, prefix="/auth")
-    return httpx.ASGITransport(app=app)
 
 
 def _mint_state_cookie(

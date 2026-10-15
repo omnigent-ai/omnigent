@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import AsyncIterator
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -13,14 +12,17 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import jwt
 import pytest
-from fastapi import FastAPI
 
-from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import mint_session_cookie
-from omnigent.server.routes.auth import create_auth_router
-from tests.server.integration.oidc_fixtures import TEST_SIGNING_KEY, make_oidc_config
+from tests.server.integration.oidc_fixtures import (
+    TEST_SIGNING_KEY,
+    make_oidc_config,
+)
+from tests.server.integration.oidc_fixtures import (
+    build_oidc_transport as _build_app,
+)
 from tests.server.integration.test_oidc_auth_e2e import (
     _mint_state_cookie,
     _mock_httpx_client_for_github,
@@ -33,25 +35,6 @@ pytestmark = pytest.mark.asyncio
 @pytest.fixture(autouse=True)
 def _authenticated_origin_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
-
-
-def _build_app(
-    store: DeviceGrantStore | None = None, *, base_path: str = "", redirect_uri: str | None = None
-) -> httpx.ASGITransport:
-    config = make_oidc_config()
-    if redirect_uri is not None:
-        config = replace(config, redirect_uri=redirect_uri)
-    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
-    router = create_auth_router(
-        auth_provider=provider,
-        permission_store=None,
-        admin_list=AdminList(Path("/tmp/nonexistent-admin-list.txt")),
-        device_grant_store=store,
-    )
-    app = FastAPI()
-    app.state.base_path = base_path
-    app.include_router(router, prefix=f"{base_path}/auth")
-    return httpx.ASGITransport(app=app)
 
 
 async def _create_ticket(client: httpx.AsyncClient, base_path: str = "") -> tuple[str, str]:

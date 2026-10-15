@@ -10,33 +10,18 @@ import httpx
 import jwt
 import pytest
 
-from omnigent.server.admin_list import AdminList
-from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import derive_code_challenge, generate_code_verifier
-from omnigent.server.routes.auth import create_auth_router
-from tests.server.integration.oidc_fixtures import TEST_SIGNING_KEY, make_oidc_config
+from tests.server.integration.oidc_fixtures import (
+    TEST_SIGNING_KEY,
+)
+from tests.server.integration.oidc_fixtures import (
+    build_oidc_transport as _build_oidc_app,
+)
 
 pytestmark = pytest.mark.asyncio
 
 _VICTIM_EMAIL = "victim@example.com"
-
-
-def _build_oidc_app(grant_store: DeviceGrantStore) -> httpx.ASGITransport:
-    from fastapi import FastAPI
-
-    config = make_oidc_config()
-    auth_provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
-    admin_list = AdminList(Path("/tmp/nonexistent-admin-list.txt"))
-    router = create_auth_router(
-        auth_provider=auth_provider,
-        permission_store=None,
-        admin_list=admin_list,
-        device_grant_store=grant_store,
-    )
-    app = FastAPI()
-    app.include_router(router, prefix="/auth")
-    return httpx.ASGITransport(app=app)
 
 
 def _mock_idp_for(email: str) -> AsyncMock:
