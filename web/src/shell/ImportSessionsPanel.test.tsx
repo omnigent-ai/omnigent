@@ -249,6 +249,7 @@ it("Retry failed preserves the original request after leaving Settings", async (
   );
   const first = renderPanel();
   fireEvent.change(screen.getAllByRole("combobox")[0], { target: { value: "host_2" } });
+  fireEvent.change(screen.getAllByRole("combobox")[3], { target: { value: "50" } });
   fireEvent.change(screen.getAllByRole("combobox")[1], { target: { value: "session" } });
   fireEvent.change(screen.getAllByRole("combobox")[2], { target: { value: "codex" } });
   fireEvent.change(screen.getByTestId("import-session-id"), {
@@ -258,7 +259,7 @@ it("Retry failed preserves the original request after leaving Settings", async (
   expect(importLocalSessionsMock).toHaveBeenLastCalledWith(
     "host_2",
     "codex",
-    25,
+    50,
     expect.any(Function),
     "thread-to-retry",
   );
@@ -277,7 +278,7 @@ it("Retry failed preserves the original request after leaving Settings", async (
   expect(importLocalSessionsMock).toHaveBeenLastCalledWith(
     "host_2",
     "codex",
-    25,
+    50,
     expect.any(Function),
     "thread-to-retry",
   );

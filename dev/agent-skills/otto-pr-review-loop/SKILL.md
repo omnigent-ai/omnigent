@@ -1,8 +1,22 @@
-### 4.3 — Iterate Polly and Open Code Review until all findings are settled
+---
+name: otto-pr-review-loop
+description: Iterate Polly and Open Code Review on an open PR until every finding is fixed or answered with evidence.
+---
+
+# Iterate Polly and Open Code Review until all findings are settled
+
+Shared by Otto agents that drive a PR (Resolve calls this Step 4.3). Keep
+agent-specific branch, publication and handoff rules in the calling agent.
+
+**Handoff contract.** An agent adopting this loop must emit a handoff that
+`review_cycle.py check --handoff` can validate: `outcome: "fixed"`, an explicit
+`remaining_work: []`, and `review_cycle` with the snapshot's `head_sha` and
+`fingerprint` plus one `dispositions` record per feedback `key`, each with a
+`status` of `addressed`, `invalid` or `not_needed` and a non-empty `reason`.
 
 Run **both Polly AI Review (`/review`) and Open Code Review (`/ocr`)** on the
 PR you are driving. Neither reviewer automatically reruns on every push. Their
-slash-command handlers ignore bot comments, so Resolve uses the equivalent
+slash-command handlers ignore bot comments, so the agent uses the equivalent
 `workflow_dispatch` entry points with its App token (Actions: read and write, for run/artifact reads and dispatch). Use
 `review_cycle.py request` below as the single dispatch path. It reuses verified
 automatic reviews of the current commit and waits for a matching review already
@@ -116,7 +130,8 @@ starts the same loop on the replacement PR.
 Continue fix → test → push → both reviews → triage until no actionable findings
 remain. Follow the workflow-provided review budget when present; otherwise there is no fixed review-round cap. Repeated invalid findings can be
 justified against current code; they do not require meaningless edits to appease
-a reviewer. For ambiguous design intent, use `resolve-investigate` to prepare a
+a reviewer. For ambiguous design intent, use the agent's investigation procedure
+(Resolve: `resolve-investigate`) to prepare a
 supported recommendation on the PR and complete independent work. A remaining
 design choice belongs in `remaining_work` with `partially_fixed`, not an
 interactive question. Concrete blockers and an actual execution deadline still
@@ -134,5 +149,5 @@ python3 <skill-dir>/review_cycle.py check --repository <target_repo> --pr-number
 `review_cycle.head_sha` and `fingerprint`, an evidenced disposition for every
 feedback key, and no `remaining_work`. If stale, read and triage the new feedback,
 update the receipt, and check again. A passing gate covers automated review only:
-Step 4.2 CI/mergeability, impact assessment, human review, and publication-mode
+CI/mergeability (Resolve: Step 4.2), impact assessment, human review, and publication-mode
 requirements still apply. Record both `polly_review` and `ocr_review` accurately.

@@ -1975,6 +1975,10 @@ describe("Composer model/effort label", () => {
     expect(screen.queryByRole("menuitemcheckbox")).toBeNull();
     fireEvent.keyDown(row, { key: "ArrowRight" });
     expect(screen.getByTestId("composer-agent-model-opus")).toHaveTextContent("Opus");
+    expect(screen.getByTestId("composer-agent-model-opus")).toHaveAttribute(
+      "title",
+      "system.ai.claude-opus-4-6",
+    );
     expect(screen.getByTestId("composer-agent-efforts")).toBeVisible();
     expect(screen.getByTestId("composer-agent-effort-high")).toBeVisible();
   });

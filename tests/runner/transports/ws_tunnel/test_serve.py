@@ -420,6 +420,103 @@ async def test_serve_tunnel_fails_loud_on_http_auth_rejection(
     assert attempt == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
 
 
+@pytest.mark.asyncio
+async def test_serve_tunnel_no_credential_error_after_streak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated 401s on bearer-less upgrades end in the no-credential error.
+
+    The streak is kept so a transient mint failure still gets re-minted on retry.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.runner.transports.ws_tunnel.serve import (
+        _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS,
+    )
+
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    attempt = 0
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        """Raise 401 the way the front door answers an unauthenticated upgrade.
+
+        :param app: Runner ASGI app.
+        :param auth_token: Bearer token (expected ``None``).
+        :raises InvalidStatus: Always with 401.
+        """
+        del app
+        assert auth_token is None
+        nonlocal attempt
+        attempt += 1
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    async def _sleep(_delay: float) -> None:
+        """No-op sleep.
+
+        :param _delay: Reconnect delay (unused).
+        """
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent?o=123",
+            runner_id="runner_no_credential",
+            runner_version="0.1.0",
+            auth_token_factory=lambda: None,
+        )
+
+    message = str(exc_info.value)
+    assert attempt == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+    assert message.startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+    assert "login https://ws.cloud.databricks.com/omnigent?o=123` " in message
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_reauth_hint_uses_wrapper_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_WRAPPER_COMMAND`` names the wrapper CLI in the login hint.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        """Raise 401.
+
+        :param app: Runner ASGI app.
+        :raises InvalidStatus: Always with 401.
+        """
+        del app
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    async def _sleep(_delay: float) -> None:
+        """No-op sleep.
+
+        :param _delay: Reconnect delay (unused).
+        """
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"run `isaac omni login https://example.databricksapps\.com` to re-authenticate",
+    ):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://example.databricksapps.com",
+            runner_id="runner_env_hint",
+            runner_version="0.1.0",
+            auth_token="tok-expired",
+        )
+
+
 def test_websocket_auth_redirect_url_detects_https_redirect() -> None:
     """An ``InvalidURI`` carrying an https:// target is classified as auth.
 
@@ -560,6 +657,53 @@ async def test_serve_tunnel_fails_loud_on_auth_redirect(
     assert login_url in message
     # User-actionable next step.
     assert "omnigent setup" in message
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_auth_redirect_hint_uses_wrapper_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_WRAPPER_COMMAND`` names the wrapper CLI in the redirect hints.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        """Redirect every upgrade to the OAuth login page.
+
+        :param app: Runner ASGI app.
+        :raises InvalidURI: Always, carrying the OAuth target.
+        """
+        del app
+        raise InvalidURI(
+            "https://example.databricks.com/oidc/oauth2/v2.0/authorize", "scheme isn't ws or wss"
+        )
+
+    async def _sleep(_delay: float) -> None:
+        """No-op sleep.
+
+        :param _delay: Reconnect delay (unused).
+        """
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://example.databricksapps.com",
+            runner_id="runner_redirect_env_hint",
+            runner_version="0.1.0",
+        )
+
+    message = str(exc_info.value)
+    assert message.startswith(serve_module.RUNNER_TUNNEL_REJECTION_PREFIX)
+    # Both hints name the wrapper the user actually runs, not the naked binary.
+    assert "`isaac omni login https://example.databricksapps.com` to re-authenticate" in message
+    assert "run `isaac omni setup` to configure credentials" in message
+    assert "`omnigent " not in message
 
 
 @pytest.mark.asyncio

@@ -26,14 +26,11 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SessionImportStatus", () => {
-  it("renders nothing while no import is running", () => {
+  it("shows the running import with its count, links to the panel, and clears when done", () => {
     renderStatus();
     expect(screen.queryByTestId("sidebar-import-progress")).toBeNull();
-  });
 
-  it("shows the running import with its count, links to the panel, and clears when done", () => {
     act(() => useSessionImportStore.setState({ importing: true, importedCount: 0 }));
-    renderStatus();
     const status = screen.getByTestId("sidebar-import-progress");
     expect(status).toHaveTextContent("Importing (0)");
     expect(screen.getByRole("link", { name: /Importing sessions/ })).toHaveAttribute(

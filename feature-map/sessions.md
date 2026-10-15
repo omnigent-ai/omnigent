@@ -38,6 +38,8 @@ the header menu), and each place is a separate entry point.
   it; the state survives a reload.
 - `project`: Add to project (Move session once filed) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
+- `project-rename`: the project menu opens a dialog with the name selected;
+  typing replaces it without losing characters as the menu closes.
 - `bulk-actions`: select several rows, then archive, unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
@@ -86,12 +88,20 @@ the header menu), and each place is a separate entry point.
 - `canvas-session-health`: an opened Canvas session receives host health and
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
-  (Default / Status / Updated), Display (All / My / Shared / Archived), Ordering
-  (Updated / Status) and Show (Updated / Environment / Repo / Branch) submenus,
-  saved per device. Shared sessions get their own section above Sessions. A
-  Status or Updated grouping replaces Projects, Shared and Sessions with titled
-  groups; the first group's header takes the Projects header's place. Select
-  sessions sits beside the filter and selects every list below it at once. Behind
+  (Default / Created / Updated), Display (All / My / Shared / Archived), Ordering
+  (Updated / Created) and Show (Updated / Environment / Repo / Branch) submenus,
+  saved per device. Created ordering keeps sessions newest-created first as messages
+  arrive;
+  requests, pagination, and project folders use that order too. Switching order
+  clears the cached rows and shows loading while session timestamps refresh,
+  including project folders, pins, and Archived. With the flag off,
+  sessions always use Updated regardless of the saved preference. Shared sessions
+  get their own section above Sessions. Status grouping is hidden until
+  working/idle detection is reliable; saved Status selections fall back to Default.
+  Created and Updated group by their respective date, independently of ordering,
+  with headings such as “Created today” and “Updated yesterday”. Both replace
+  Projects, Shared and Sessions with titled groups; the first group's header takes
+  the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
   the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
   a flat Display filter and the tooltip keeps its plain layout.
 
@@ -105,6 +115,9 @@ progress and links back to Settings. Imported sessions appear in the normal list
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, add to project (or move
 session), archive or unarchive, and delete.
+
+**Project folder:** right-click its header or open its three-dot menu, then
+choose Rename project. Start typing as soon as the dialog opens.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -138,8 +151,8 @@ choice only when the server supports cleanup.
 menu, then filter by project.
 
 **Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
-Projects header holds Grouping, Display, Ordering and Show. In a Status or
-Updated grouping, Projects is hidden and the funnel sits in the same spot on the
+Projects header holds Grouping, Display, Ordering and Show. In
+Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
 first group's header. The Select sessions button sits beside it and selects
 project, Shared and Sessions rows together; the Sessions header keeps only New
 session. Hovering a row opens
@@ -314,6 +327,9 @@ plain `uv run pytest`, which starts a private server for the test.
   regroup under that project.
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
+- **`project-rename`, project header right-click and three-dot menus:**
+  `tests/e2e_ui/sessions/test_project_rename_dialog_focus.py::test_rename_dialog_preselects_name_so_typing_replaces`
+  covers typing across the menu's exit animation from both menus.
 - **`fork`, message cutoff:**
   `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_fork_from_middle_truncates_history`,
   plus agent switching (own environment):
@@ -323,7 +339,7 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`workspace-recovery`, desktop and mobile conversation, Canvas, and side-chat cards:**
   `tests/browser_ui/chat/test_workspace_missing_recovery.py::test_continue_missing_workspace_in_another_directory`
   runs without a repro instance using `uv run pytest <test>
-  --browser-ui-skip-build --video=on --output=<evidence-directory>`.
+--browser-ui-skip-build --video=on --output=<evidence-directory>`.
   The browser contract covers the error action, visible explanation, blank
   destination, rejected missing directory, directory browser, preflight before
   fork and launch, and navigation to copied history while the original remains
@@ -494,6 +510,9 @@ plain `uv run pytest`, which starts a private server for the test.
   Run `tests/e2e_ui/sessions/test_import_progress_in_session_list.py` for a real
   isolated host reading transcripts, streaming to the server, leaving Settings,
   progress beside the sidebar heading, and clearing it on completion.
+  `tests/e2e_ui/sessions/test_import_oversized_session.py` verifies recent and
+  exact-ID imports through a real host when a transcript exceeds the tunnel's
+  message cap; the batch summary links to all three sessions in the sidebar.
   Component coverage checks compact large batches, failure expansion, retry
   after navigation, and collapsed headings.
 
@@ -572,9 +591,10 @@ plain `uv run pytest`, which starts a private server for the test.
   ordinary sessions still return to the new-session page in
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
 - **`view-options`:**
-  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_status_grouping_and_show_toggles_persist_across_reload`,
-  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`
-  (both enable the flag by patching `GET /v1/info`). Unit tests in
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_date_grouping_and_show_toggles_persist_across_reload`,
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
+  (enable the flag by patching `GET /v1/info`). Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
   that the flag-off sidebar ignores stored view options.
 

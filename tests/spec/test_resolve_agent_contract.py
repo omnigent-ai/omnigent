@@ -29,12 +29,12 @@ def _resolve_procedures() -> str:
             skills["resolve-author-fix"],
             skills["resolve-publish"],
             skills["resolve-drive-pr"],
+            skills["otto-pr-review-loop"],
             *(
                 resource("resolve-drive-pr", name)
                 for name in (
                     "preview.md",
                     "ci.md",
-                    "polly.md",
                     "validation-prompt.md",
                     "final-review.md",
                 )
@@ -306,7 +306,15 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
 
 def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None:
     instructions = _normalized_resolve_instructions()
-    review = instructions.split("### 4.3", 1)[1].split("### 4.4", 1)[0]
+    drive_pr = (_RESOLVE_AGENT / "skills" / "resolve-drive-pr" / "SKILL.md").read_text()
+    assert (
+        "| 4.3, independent Polly and OCR reviews | the shared `otto-pr-review-loop`" in drive_pr
+    )
+    review = " ".join(
+        {skill.name: skill.content for skill in load(_RESOLVE_AGENT).skills}[
+            "otto-pr-review-loop"
+        ].split()
+    )
     for requirement in (
         "Polly AI Review (`/review`)",
         "Open Code Review (`/ocr`)",
@@ -325,3 +333,22 @@ def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None
     handoff = json.loads(output.split("```json\n", 1)[1].split("```", 1)[0])
     assert handoff["ocr_review"]
     assert set(handoff["review_cycle"]) == {"head_sha", "fingerprint", "dispositions"}
+
+
+def test_resolve_agent_bundle_ships_the_shared_review_loop(tmp_path: Path) -> None:
+    """The linked review-loop skill and the legacy helper path reach the server as files."""
+    from omnigent.cli import _bundle
+    from omnigent.spec.tar_utils import extract_safe
+
+    shared = _RESOLVE_AGENT.parent / "agent-skills" / "otto-pr-review-loop"
+    assert (_RESOLVE_AGENT / "skills" / "otto-pr-review-loop").resolve() == shared.resolve()
+
+    extracted = tmp_path / "bundle"
+    extract_safe(_bundle(_RESOLVE_AGENT), extracted)
+
+    assert "otto-pr-review-loop" in {skill.name for skill in load(extracted).skills}
+    helper = (shared / "review_cycle.py").read_text(encoding="utf-8")
+    for path in ("otto-pr-review-loop/review_cycle.py", "resolve-drive-pr/review_cycle.py"):
+        bundled = extracted / "skills" / path
+        assert not bundled.is_symlink()
+        assert bundled.read_text(encoding="utf-8") == helper

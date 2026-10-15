@@ -30,6 +30,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     HookReadResult,
     TranscriptReadResult,
+    _display_text,
     _transcript_items_from_entry,
     compute_transcript_cumulative_cost,
     read_active_session_id,
@@ -771,6 +772,8 @@ class TranscriptForwardState:
         waits for transcript quiescence). Persisted so a restart inside
         that window doesn't lose the settle — the hook cursor has
         already advanced past the Stop edge and won't re-read it.
+    :param api_error_context: Latest explicit API error for the current response.
+        Cleared by subsequent output and persisted for hook retries after restart.
     """
 
     transcript_path: Path
@@ -781,6 +784,7 @@ class TranscriptForwardState:
     cursor_fingerprint: str | None = None
     settled_response_id: str | None = None
     pending_settled_response_id: str | None = None
+    api_error_context: FailureContext | None = None
 
 
 @dataclass(frozen=True)
@@ -3602,20 +3606,30 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
-def _stop_failure_detail(record: ClaudeHookRecord, *, session_id: str) -> str | None:
+def _stop_failure_detail(
+    record: ClaudeHookRecord,
+    *,
+    session_id: str,
+    transcript_context: FailureContext | None = None,
+) -> str | None:
     """
     Return the reason a ``StopFailure`` hook gives for its failed turn.
 
-    When ``error_details`` was absent a WARNING is emitted so the missing
-    field is observable in structured logs; the server can then fall back
-    to the committed API-error text from its own store.
+    When ``error_details`` is absent, prefer an explicit API error from the
+    same response; only the category-or-nothing fallback is logged as a
+    WARNING so the missing field stays observable in structured logs.
 
     :param record: ``StopFailure`` hook record.
     :param session_id: Session id for structured warning logs on fallback.
+    :param transcript_context: Explicit API-error evidence matched to this hook.
     :returns: The error detail, a category-only fallback, or ``None``.
     """
     if record.failure_message is not None:
         return record.failure_message
+    if transcript_context is not None:
+        message = transcript_context.get("native_error_message")
+        if isinstance(message, str):
+            return _display_text(message, is_api_error=True)
     _logger.warning(
         "StopFailure hook carried no error_details; using fallback detail; "
         "session=%s event_cursor=%s category=%s",
@@ -3627,6 +3641,28 @@ def _stop_failure_detail(record: ClaudeHookRecord, *, session_id: str) -> str | 
     if record.failure_category is not None:
         return f"Claude Code ended the turn with an API error ({record.failure_category})."
     return None
+
+
+def _transcript_api_error_for_hook(
+    bridge_dir: Path, record: ClaudeHookRecord, response_id: str | None
+) -> FailureContext | None:
+    """Match durable API-error evidence to the failed response and native session."""
+    if not response_id or not record.claude_session_id:
+        return None
+    state = _read_forward_state(bridge_dir)
+    if state is None or state.current_response_id != response_id:
+        return None
+    context = state.api_error_context
+    if (
+        not context
+        or context.get("native_api_error_message") is not True
+        or context.get("native_session_id") != record.claude_session_id
+        or context.get("native_agent_role") == "subagent"
+        or context.get("native_agent_id")
+        or not isinstance(context.get("native_error_message"), str)
+    ):
+        return None
+    return context
 
 
 def _is_subagent_hook_record(
@@ -3670,11 +3706,16 @@ def _stop_failure_context(
     session_id: str,
     parent_claude_session_ids: Collection[str],
     diagnostic_health: Callable[[], FailureContext] | None = None,
+    transcript_context: FailureContext | None = None,
 ) -> FailureContext:
     """Preserve hook evidence separately from the displayed error detail."""
     reason = _subagent_hook_reason(record, parent_claude_session_ids)
+    # Transcript evidence only stands in for absent ``error_details``, matching
+    # the precedence ``_stop_failure_detail`` applies to the displayed detail.
+    explicit_api_error = transcript_context if record.failure_message is None else None
     context: dict[str, object] = {
         **(record.failure_context or {}),
+        **(explicit_api_error or {}),
         "failure_id": native_failure_id(
             "claude_hook",
             session_id,
@@ -3699,6 +3740,8 @@ def _stop_failure_context(
         "detail_source": (
             "hook_error_details"
             if record.failure_message is not None
+            else "explicit_api_error"
+            if explicit_api_error is not None
             else "hook_error_category"
             if record.failure_category is not None
             else "missing"
@@ -4355,13 +4398,19 @@ async def _forward_available_status_events(
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return durable
         failure_context: FailureContext | None = None
+        transcript_context: FailureContext | None = None
         if status == "failed":
             try:
+                if record.failure_message is None:
+                    transcript_context = await asyncio.to_thread(
+                        _transcript_api_error_for_hook, bridge_dir, record, response_id
+                    )
                 failure_context = _stop_failure_context(
                     record,
                     session_id=session_id,
                     parent_claude_session_ids=parent_claude_session_ids,
                     diagnostic_health=diagnostic_health,
+                    transcript_context=transcript_context,
                 )
             except Exception as exc:  # noqa: BLE001 - telemetry must not prevent status delivery
                 _logger.debug("Claude hook failure telemetry failed: %s", type(exc).__name__)
@@ -4388,7 +4437,9 @@ async def _forward_available_status_events(
                 # the UI can name the shells. Dropped on ``failed`` for the same
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
-                failure_detail=_stop_failure_detail(record, session_id=session_id)
+                failure_detail=_stop_failure_detail(
+                    record, session_id=session_id, transcript_context=transcript_context
+                )
                 if status == "failed"
                 else None,
                 failure_context=failure_context,
@@ -4605,13 +4656,8 @@ def _with_settle_latch(
     :param dedupe: Latch source for both settle fields.
     :returns: The updated state.
     """
-    return TranscriptForwardState(
-        transcript_path=state.transcript_path,
-        line_cursor=state.line_cursor,
-        byte_offset=state.byte_offset,
-        current_response_id=state.current_response_id,
-        seen_source_ids=state.seen_source_ids,
-        cursor_fingerprint=state.cursor_fingerprint,
+    return replace(
+        state,
         settled_response_id=dedupe.settled_response_id,
         pending_settled_response_id=dedupe.pending_settled_response_id,
     )
@@ -4885,10 +4931,40 @@ async def _forward_available_items(
     # that already finished — the user sees idle → running → idle. Items carry
     # their own ``response_id`` (see :func:`_post_external_conversation_item`),
     # so the transcript's job here is items, not status.
-    updated = state
+    updated = (
+        state
+        if state.current_response_id == current_response_id
+        else replace(state, api_error_context=None)
+    )
+    if updated != state:
+        await _write_forward_state_async(bridge_dir, updated)
     for item in items:
         if item.source_id in seen:
             continue
+        if item.response_id == current_response_id:
+            context = normalize_failure_context(item.failure_context)
+            if context.get("native_api_error_message") is not True:
+                context = {}
+            # Multiple text blocks from one error record retain its first error detail.
+            same_error = (
+                context.get("native_record_id") is not None
+                and updated.api_error_context is not None
+                and context.get("native_record_id")
+                == updated.api_error_context.get("native_record_id")
+            )
+            if not same_error and updated.api_error_context != (context or None):
+                updated = replace(
+                    updated,
+                    api_error_context=context or None,
+                    # An error needs its response ID for hooks even if the POST fails.
+                    # Ordinary output must not advance it before a wake marker lands.
+                    current_response_id=current_response_id
+                    if context
+                    else updated.current_response_id,
+                )
+                # Hooks read durable context even when the item's POST is retried.
+                # Keep the delivery cursor unchanged until that POST succeeds.
+                await _write_forward_state_async(bridge_dir, updated)
         # Compaction boundary (primary, durable path). Claude writes an
         # ``isCompactSummary`` user record immediately after it compacts
         # its own context; that record — not the flaky
@@ -4920,7 +4996,8 @@ async def _forward_available_items(
             dedupe.settled_response_id = None
             seen.add(item.source_id)
             seen_source_ids.append(item.source_id)
-            updated = TranscriptForwardState(
+            updated = replace(
+                updated,
                 transcript_path=state.transcript_path,
                 line_cursor=state.line_cursor,
                 byte_offset=state.byte_offset,
@@ -5009,7 +5086,8 @@ async def _forward_available_items(
                     )
                 seen.add(item.source_id)
                 seen_source_ids.append(item.source_id)
-                updated = TranscriptForwardState(
+                updated = replace(
+                    updated,
                     transcript_path=state.transcript_path,
                     line_cursor=state.line_cursor,
                     byte_offset=state.byte_offset,
@@ -5047,7 +5125,8 @@ async def _forward_available_items(
         await _maybe_sync_effort_from_slash_command(client, session_id=session_id, item=item)
         seen.add(item.source_id)
         seen_source_ids.append(item.source_id)
-        updated = TranscriptForwardState(
+        updated = replace(
+            updated,
             transcript_path=state.transcript_path,
             line_cursor=state.line_cursor,
             byte_offset=state.byte_offset,
@@ -5079,7 +5158,8 @@ async def _forward_available_items(
             cursor_fingerprint=fingerprint,
         )
     )
-    updated = TranscriptForwardState(
+    updated = replace(
+        updated,
         transcript_path=cursor.transcript_path,
         line_cursor=cursor.line_cursor,
         byte_offset=cursor.byte_offset,
@@ -5370,15 +5450,9 @@ def _validated_transcript_state(
             # was None because the file was missing). The file now exists and
             # the cursor is still at the start — adopt the computed fingerprint
             # without resetting seen_source_ids.
-            return TranscriptForwardState(
-                transcript_path=state.transcript_path,
-                line_cursor=state.line_cursor,
-                byte_offset=state.byte_offset,
-                current_response_id=state.current_response_id,
-                seen_source_ids=state.seen_source_ids,
+            return replace(
+                state,
                 cursor_fingerprint=current_fingerprint,
-                settled_response_id=state.settled_response_id,
-                pending_settled_response_id=state.pending_settled_response_id,
             )
         _logger.warning(
             "Claude transcript cursor missing fingerprint; skipping to end of transcript; "
@@ -7547,6 +7621,7 @@ def _read_forward_state(bridge_dir: Path) -> TranscriptForwardState | None:
         cursor_fingerprint=cursor_fingerprint,
         settled_response_id=settled_response_id,
         pending_settled_response_id=pending_settled_response_id,
+        api_error_context=normalize_failure_context(raw.get("api_error_context")) or None,
     )
 
 
@@ -7572,6 +7647,8 @@ def _write_forward_state(bridge_dir: Path, state: TranscriptForwardState) -> Non
         payload["byte_offset"] = state.byte_offset
     if state.cursor_fingerprint is not None:
         payload["cursor_fingerprint"] = state.cursor_fingerprint
+    if state.api_error_context is not None:
+        payload["api_error_context"] = normalize_failure_context(state.api_error_context)
     _write_json_atomic(bridge_dir / _FORWARDER_STATE_FILE, payload)
 
 
