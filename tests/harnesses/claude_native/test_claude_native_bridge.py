@@ -2157,9 +2157,10 @@ def test_read_transcript_items_since_ignores_observed_status_records(tmp_path: P
 
     The local transcript audit found status/UI records such as
     ``queue-operation``, ``branch-update``, ``progress``,
-    ``pr-link``, and non-prompt attachments alongside normal
-    message records. They must not show up as chat items or reset
-    the active response id for following assistant output.
+    ``pr-link``, non-prompt attachments, and ``api-request-blob``
+    request copies alongside normal message records. They must not
+    show up as chat items or reset the active response id for
+    following assistant output, even when they carry a ``message``.
     """
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text(
@@ -2214,6 +2215,23 @@ def test_read_transcript_items_since_ignores_observed_status_records(tmp_path: P
                 ),
                 json.dumps(
                     {
+                        "type": "api-request-blob",
+                        "hash": "blob-1",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "<system-reminder>\nProject instructions.\n"
+                                    "</system-reminder>",
+                                },
+                                {"type": "text", "text": "Run sleep 1."},
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
                         "type": "user",
                         "uuid": "tool-result-1",
                         "parentUuid": "assistant-tool-1",
@@ -2251,7 +2269,7 @@ def test_read_transcript_items_since_ignores_observed_status_records(tmp_path: P
         agent_name="claude-native-ui",
     )
 
-    assert cursor == 8, "cursor should advance past ignored status/UI records"
+    assert cursor == 9, "cursor should advance past ignored status/UI records"
     assert [item.item_type for item in items] == [
         "function_call",
         "function_call_output",
@@ -2956,6 +2974,153 @@ def test_read_transcript_items_since_surfaces_combined_shell_record(
         {"kind": "output", "stdout": "hi", "stderr": None},
     ]
     assert items[0].response_id == items[1].response_id
+
+
+@pytest.mark.parametrize(
+    ("content", "kind", "name", "arguments"),
+    [
+        (
+            "<command-name>/model</command-name>\n"
+            "            <command-message>model</command-message>\n"
+            "            <command-args>example-model</command-args>",
+            "command",
+            "model",
+            "example-model",
+        ),
+        (
+            "<command-message>example:simplify</command-message>\n"
+            "<command-name>/example:simplify</command-name>\n"
+            "<command-args>the parser</command-args>",
+            "skill",
+            "example:simplify",
+            "the parser",
+        ),
+    ],
+    ids=["builtin", "plugin-skill-message-first"],
+)
+def test_read_transcript_items_since_surfaces_top_level_slash_command_echo(
+    tmp_path: Path,
+    content: str,
+    kind: str,
+    name: str,
+    arguments: str,
+) -> None:
+    """
+    A top-level ``local_command`` command echo becomes a ``slash_command`` item.
+
+    Claude Code can record ``/model`` as a ``type="system"`` record instead of
+    a ``role=user`` message. Dropping it leaves the web input that ran the
+    command queued until a later message reports it as lost. The stdout record
+    Claude writes next stays hidden.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "type": "system",
+                    "subtype": "local_command",
+                    "level": "info",
+                    "isMeta": False,
+                    "uuid": "command-echo",
+                    "content": content,
+                },
+                {
+                    "type": "system",
+                    "subtype": "local_command",
+                    "level": "info",
+                    "isMeta": False,
+                    "uuid": "command-stdout",
+                    "commandRun": {"command": name, "args": arguments},
+                    "content": "<local-command-stdout>Set model to Example</local-command-stdout>",
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items] == ["slash_command"]
+    assert items[0].data == {
+        "agent": "claude-native-ui",
+        "kind": kind,
+        "name": name,
+        "arguments": arguments,
+    }
+    assert items[0].response_id == response_id
+    byte_result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert byte_result.items == items
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        # Tags printed by a shell command or by a command's own output.
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<bash-stdout><command-name>/model</command-name></bash-stdout>",
+        },
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<local-command-stderr><command-name>/model</command-name>"
+            "</local-command-stderr>",
+        },
+        # UI-only built-ins stay hidden, as in the ``role=user`` shape.
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<command-name>/resume</command-name><command-args></command-args>",
+        },
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "content": "<command-name>  </command-name>",
+        },
+    ],
+    ids=["bash-stdout", "command-stderr", "dropped-builtin", "empty-name"],
+)
+def test_read_transcript_items_since_ignores_non_echo_local_command_tags(
+    tmp_path: Path, record: dict[str, Any]
+) -> None:
+    """Command tags that are not Claude's own echo never become a ``slash_command``."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(json.dumps({"uuid": "rec", **record}) + "\n", encoding="utf-8")
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items if item.item_type == "slash_command"] == []
+
+
+def test_read_transcript_items_since_keeps_prose_mentioning_command_tags(
+    tmp_path: Path,
+) -> None:
+    """A typed prompt quoting ``<command-name>`` stays the user's message."""
+    text = "Why does the transcript contain <command-name>/model</command-name>?"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "user", "uuid": "prose", "message": {"role": "user", "content": text}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [(item.item_type, item.data) for item in items] == [
+        ("message", {"role": "user", "content": [{"type": "input_text", "text": text}]})
+    ]
 
 
 def test_read_transcript_items_since_surfaces_skill_when_command_name_is_not_first_tag(

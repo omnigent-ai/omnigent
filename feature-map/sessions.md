@@ -64,6 +64,10 @@ the header menu), and each place is a separate entry point.
 - `message-recovery`: a message racing initial runner binding or replacement
   reaches the available runner without a false failed turn. Native sessions
   initialize before delivery; SDK sub-agents reuse their loaded session state.
+- `import-progress`: import recent sessions or one session by ID from an online
+  machine. Settings shows a spinner and count; the sidebar heading retains
+  progress after leaving Settings. Results stay compact, with expandable failure
+  details and retry of the original selection.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
 - `recent-switcher`: the desktop app opens the five most recent sessions with
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
@@ -102,6 +106,13 @@ the header menu), and each place is a separate entry point.
   a flat Display filter and the tooltip keeps its plain layout.
 
 ## How to get to it (user POV)
+
+**Import:** open Settings → Import sessions, or choose **Import your recent
+sessions** on the empty landing. Choose a machine, harness, and recent count
+or session ID. After starting, go Back to the session list; its heading shows
+progress and links back to Settings. Imported sessions appear in the normal list.
+On phones, the progress link opens the Import panel directly; its header arrow
+returns to the Settings menu.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, add to project (or move
@@ -495,6 +506,20 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/server/integration/test_sessions_child_sessions.py::test_sdk_subagent_recovery_skips_session_init`
   covers recovery during ancestor healing and during the final binding refresh,
   without initializing the SDK child's already-loaded session again.
+- **`import-progress`:** run
+  `tests/e2e_ui/sessions/test_import_sessions.py` for Settings recent imports,
+  exact-ID imports, and the empty-landing entry point (mocked import responses).
+  Run `tests/e2e_ui/sessions/test_import_progress_in_session_list.py` for a real
+  isolated host reading transcripts, streaming to the server, leaving Settings,
+  progress beside the sidebar heading, and clearing it on completion. Desktop
+  and mobile cases follow the indicator back to the panel and verify that the
+  content can receive clicks, including behind the mobile drawer boundary.
+  `tests/e2e_ui/sessions/test_import_oversized_session.py` verifies recent and
+  exact-ID imports through a real host when a transcript exceeds the tunnel's
+  message cap; the batch summary links to all three sessions in the sidebar.
+  Component coverage checks compact large batches, failure expansion, retry
+  after navigation, and collapsed headings.
+
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`
 - **`recent-switcher` (manual Electron):** open at least six sessions, hold

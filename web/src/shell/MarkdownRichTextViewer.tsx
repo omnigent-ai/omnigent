@@ -50,6 +50,7 @@ import { CodeBlockWithLanguage } from "./TipTapCodeBlockExtension";
 import { isUserEditUpdate } from "./codeBlockLanguageEdit";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
+import { SoftBreak } from "./TipTapSoftBreak";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
@@ -370,6 +371,9 @@ function MarkdownRichTextViewerInner({
       ImageAwareLink.configure({ openOnClick: false, autolink: false }),
       GitHubAlertBlockquote,
       HtmlPassthrough,
+      // Soft line breaks in hard-wrapped source render as spaces so Edit mode
+      // reflows prose to the viewer width like Preview; see TipTapSoftBreak.ts.
+      SoftBreak,
       Markdown,
       createWorkspaceImageExtension(conversationId, path),
       createCommentDecorationExtension(commentStateRef),

@@ -5,6 +5,8 @@ and the second prompt must complete with only its own answer."""
 from __future__ import annotations
 
 import json
+import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -54,13 +56,23 @@ def _errors(events: list) -> list[str]:
 
 
 @pytest.mark.timeout(300)
+@pytest.mark.parametrize("sandboxed", [False, True], ids=["unsandboxed", "sandboxed"])
 async def test_pi_session_stays_in_sync_after_retry_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mock_llm_server_url: str,
+    sandboxed: bool,
 ) -> None:
     """The prompt after a retry-recovered turn gets only its own answer."""
     skip_if_harness_cli_missing("pi")
+    if sandboxed and sys.platform != "darwin" and not shutil.which("bwrap"):
+        pytest.skip("requires Seatbelt or bubblewrap")
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", home / ".pi/agent")
 
     mock_model = "mock-pi-retry-session-sync"
     reset_mock_llm(mock_llm_server_url)
@@ -82,13 +94,28 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     )
     monkeypatch.setenv("HARNESS_PI_GATEWAY_HOST", mock_llm_server_url)
     monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_COMMAND", "printf %s mock-key")
-    monkeypatch.setenv("HARNESS_PI_CWD", str(tmp_path))
+    monkeypatch.setenv("HARNESS_PI_CWD", str(workspace))
     monkeypatch.setenv("HARNESS_PI_CONTEXT_FILES", "false")
     for name in _STALE_HARNESS_ENV:
         monkeypatch.delenv(name, raising=False)
+    if sandboxed:
+        monkeypatch.setenv(
+            "HARNESS_PI_OS_ENV",
+            json.dumps(
+                {
+                    "type": "caller_process",
+                    "sandbox": {
+                        "type": "darwin_seatbelt" if sys.platform == "darwin" else "linux_bwrap",
+                        # The editable Python install is outside the workspace.
+                        "read_paths": [str(Path(__file__).resolve().parents[3] / "omnigent")],
+                    },
+                }
+            ),
+        )
 
     executor = _build_pi_executor()
     try:
+        assert executor._sandboxed is sandboxed
         first = await _run_turn(executor, _FIRST_PROMPT)
         second = await _run_turn(executor, _SECOND_PROMPT)
     finally:
