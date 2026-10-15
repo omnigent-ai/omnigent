@@ -8379,6 +8379,25 @@ describe("NewChatLandingScreen attachments", () => {
     );
   });
 
+  it.each([
+    {
+      policy: { extensions: [".gz", ".har"], all_types: false },
+      offered: [".gz", ".har"],
+      withheld: [".zip"],
+    },
+    // No accept filter at all: every file can be picked.
+    { policy: { extensions: [".zip"], all_types: true }, offered: null, withheld: [] },
+  ])("offers the server's filesystem attachment types in the file picker", (expected) => {
+    renderLanding({ filesystem_attachments: expected.policy });
+    const accept = screen.getByTestId("new-chat-landing-file-input").getAttribute("accept");
+    if (expected.offered === null) {
+      expect(accept).toBeNull();
+      return;
+    }
+    expect(accept?.split(",")).toEqual(expect.arrayContaining(expected.offered));
+    for (const extension of expected.withheld) expect(accept).not.toContain(extension);
+  });
+
   it("keeps the supported files from a mixed drop and names the rejected one", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");

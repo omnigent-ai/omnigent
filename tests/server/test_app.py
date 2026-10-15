@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -477,6 +478,7 @@ def _build_branding_app(
     label: str,
     *,
     server_config: dict[str, object] | None = None,
+    **create_app_kwargs: Any,
 ) -> FastAPI:
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
@@ -491,7 +493,86 @@ def _build_branding_app(
             cache_dir=tmp_path / f"cache-{label}",
         ),
         server_config=server_config,
+        **create_app_kwargs,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_config", "create_app_kwargs", "expected"),
+    [
+        (
+            {},
+            {},
+            {
+                "extensions": [".db", ".docx", ".pptx", ".sqlite", ".sqlite3", ".xlsx", ".zip"],
+                "all_types": False,
+            },
+        ),
+        (
+            {"filesystem_attachment_allowed_extensions": [".gz"]},
+            {},
+            {"extensions": [".gz"], "all_types": False},
+        ),
+        # A deployment-supplied value or callable takes precedence over the config file.
+        (
+            {"filesystem_attachment_allowed_extensions": [".gz"]},
+            {"filesystem_attachment_allowed_extensions": [".har"]},
+            {"extensions": [".har"], "all_types": False},
+        ),
+        (
+            {"filesystem_attachment_allowed_extensions": [".gz"]},
+            {"filesystem_attachment_allowed_extensions": lambda: ["*"]},
+            {
+                "extensions": [".db", ".docx", ".pptx", ".sqlite", ".sqlite3", ".xlsx", ".zip"],
+                "all_types": True,
+            },
+        ),
+    ],
+)
+async def test_info_reports_the_filesystem_attachment_policy(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    server_config: dict[str, object],
+    create_app_kwargs: dict[str, Any],
+    expected: dict[str, object],
+) -> None:
+    """Clients read which uploads become files from /v1/info."""
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "attachments",
+        server_config=server_config,
+        **create_app_kwargs,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        info = (await client.get("/v1/info")).json()
+
+    assert info["filesystem_attachments"] == expected
+
+
+async def test_info_evaluates_a_callable_policy_per_request(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """A callable policy can change while the server runs, e.g. behind a feature flag."""
+    policies = iter([[".gz"], ["*"]])
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "attachments",
+        filesystem_attachment_allowed_extensions=lambda: next(policies),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = (await client.get("/v1/info")).json()["filesystem_attachments"]
+        second = (await client.get("/v1/info")).json()["filesystem_attachments"]
+
+    assert first == {"extensions": [".gz"], "all_types": False}
+    assert second["all_types"] is True
 
 
 def test_session_title_instructions_are_wired_into_coordinator(

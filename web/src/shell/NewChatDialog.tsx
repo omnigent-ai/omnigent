@@ -2313,8 +2313,16 @@ export function NewChatLandingScreen() {
   // — without it the upload only fails after the session is created and
   // navigated into, where the first turn's 415 strands the typed message in
   // a session the user never wanted.
-  const { files, attachmentError, addFiles, removeFile, restoreFiles, onPaste, clearError } =
-    useComposerAttachments({ initialFiles: restoredDraft?.files ?? [] });
+  const {
+    files,
+    attachmentError,
+    accept: fileAccept,
+    addFiles,
+    removeFile,
+    restoreFiles,
+    onPaste,
+    clearError,
+  } = useComposerAttachments({ initialFiles: restoredDraft?.files ?? [] });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
@@ -6683,7 +6691,7 @@ export function NewChatLandingScreen() {
                       ref={fileInputRef}
                       type="file"
                       multiple
-                      accept="image/*,application/pdf,text/*,application/json,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3"
+                      accept={fileAccept}
                       className="hidden"
                       data-testid="new-chat-landing-file-input"
                       onChange={(e) => {

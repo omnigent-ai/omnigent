@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager, suppress
 from importlib import import_module
 from itertools import batched, groupby
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
 from fastapi import FastAPI, Query, Request
@@ -152,6 +152,9 @@ from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
+if TYPE_CHECKING:
+    from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+
 _logger = logging.getLogger(__name__)
 _RECONNECT_BINDING_BATCH_SIZE = 128
 
@@ -172,6 +175,13 @@ class BrandingInfo(BaseModel):
     heading: str | None
     logos: BrandingLogosInfo
     powered_by: bool
+
+
+class FilesystemAttachmentsInfo(BaseModel):
+    """Which uploads native sessions receive as files, for client-side checks."""
+
+    extensions: list[str]
+    all_types: bool
 
 
 class ServerInfoResponse(BaseModel):
@@ -205,6 +215,8 @@ class ServerInfoResponse(BaseModel):
     agent_install: bool = False
     # GET /v1/agents/{id}; absent on older servers, which clients treat as unsupported.
     agent_detail: bool = False
+    # Absent on older servers, which clients treat as the default extensions.
+    filesystem_attachments: FilesystemAttachmentsInfo | None = None
     branding: BrandingInfo
 
 
@@ -1344,6 +1356,9 @@ def create_app(
     public_sharing: bool | Callable[[], bool] | None = None,
     public_sharing_max_level: str | Callable[[], str] | None = None,
     default_public_sessions: str | Callable[[], str] | None = None,
+    filesystem_attachment_allowed_extensions: (
+        str | list[str] | Callable[[], str | list[str] | None] | None
+    ) = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
@@ -1478,6 +1493,12 @@ def create_app(
         ``None`` reads ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` (default ``off``)
         with an admin-editable file override; a static value or callable is
         authoritative. Never grants past ``sharing_mode``/``public_sharing``.
+    :param filesystem_attachment_allowed_extensions: Which uploads native
+        Claude Code and Codex sessions receive as files: a list of extensions,
+        ``[]`` for none, or ``"*"`` for everything that can't be inlined (see
+        :func:`~omnigent.server.server_config.parse_filesystem_attachment_policy`).
+        A callable is evaluated per request. ``None`` uses the server config
+        key of the same name, read at startup.
     :param server_config: Resolved non-secret server settings. The optional
         ``session_title_instructions`` string augments the isolated automatic
         title prompt. ``None`` loads the standard server config.
@@ -2067,6 +2088,23 @@ def create_app(
         _default_public_static = DefaultPublicSessions.coerce(default_public_sessions)
         app.state.default_public_sessions = lambda: _default_public_static
         app.state.default_public_sessions_writable = False
+    from omnigent.server.server_config import parse_filesystem_attachment_policy
+
+    if callable(filesystem_attachment_allowed_extensions):
+        _allowed_extensions = filesystem_attachment_allowed_extensions
+
+        def _resolve_filesystem_attachment_policy() -> "FilesystemAttachmentPolicy":
+            return parse_filesystem_attachment_policy(_allowed_extensions())
+
+        app.state.filesystem_attachment_policy = _resolve_filesystem_attachment_policy
+    else:
+        # A static setting is parsed once; /v1/info serves it without file reads.
+        _static_policy = parse_filesystem_attachment_policy(
+            resolved_server_config.get("filesystem_attachment_allowed_extensions")
+            if filesystem_attachment_allowed_extensions is None
+            else filesystem_attachment_allowed_extensions
+        )
+        app.state.filesystem_attachment_policy = lambda: _static_policy
     # Tracks in-flight background managed-host launches (POST
     # /v1/sessions returns before the sandbox exists) so a message
     # racing the provision can rendezvous instead of failing with
@@ -3123,6 +3161,7 @@ def create_app(
         from omnigent.server.dictation import engine_availability
 
         dictation_available, _ = engine_availability()
+        filesystem_attachment_policy = app.state.filesystem_attachment_policy()
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -3148,6 +3187,10 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
+                "filesystem_attachments": {
+                    "extensions": sorted(filesystem_attachment_policy.extensions),
+                    "all_types": filesystem_attachment_policy.all_types,
+                },
                 "branding": branding_snapshot.config(),
             }
         )

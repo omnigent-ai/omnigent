@@ -1355,7 +1355,10 @@ async def _send_hello(
         pass
 
     from omnigent.host.frames import CAP_MCP_REGISTRY
-    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+    from omnigent.inner.native_attachments import (
+        CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
+        CAP_FILESYSTEM_ATTACHMENTS,
+    )
 
     await send_text(
         encode_frame(
@@ -1364,6 +1367,7 @@ async def _send_hello(
                 frame_protocol_version=1,
                 capabilities=[
                     CAP_FILESYSTEM_ATTACHMENTS,
+                    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                     CAP_MCP_REGISTRY,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
