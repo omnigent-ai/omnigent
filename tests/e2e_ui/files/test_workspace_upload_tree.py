@@ -29,6 +29,7 @@ from tests.e2e_ui.files.test_workspace_upload import upload_session as upload_se
 def _assert_folder_cue(page: Page, path: str) -> None:
     row = page.locator(f'[data-drop-dir="{path}"][data-drop-folder]')
     expect(row).to_have_attribute("data-upload-hover", "")
+    expect(row).to_have_class(re.compile(r"\bbg-info/10\b"))
     expect(row.locator("svg.lucide-upload")).to_have_count(1)
     expect(row.locator("svg.lucide-folder, svg.lucide-folder-open")).to_have_count(0)
     expect(row.locator("[data-upload-glow]")).to_have_count(1)
@@ -59,9 +60,11 @@ def _folder_name_contrast(page: Page, path: str) -> float:
           const foreground = luminance(pixel(getComputedStyle(name).color));
           const ratio = background => (Math.max(foreground, background) + 0.05) /
             (Math.min(foreground, background) + 0.05);
+          const row = name.closest('[data-drop-folder]');
           return Math.min(
             ratio(luminance(pixel(base))),
-            ratio(luminance(pixel(root.getPropertyValue('--muted'))))
+            ratio(luminance(pixel(root.getPropertyValue('--muted')))),
+            ratio(luminance(pixel(getComputedStyle(row).backgroundColor)))
           );
         }"""
     )
@@ -101,8 +104,18 @@ def test_workspace_upload_tree_narrow_cue(
     _assert_folder_cue(page, "src/assets")
     _drag(page, '[data-drop-dir=""]:not([data-drop-folder])', "dragover")
     expect(page.get_by_text("Upload to workspace", exact=True)).to_be_visible()
-    expect(page.locator('[data-drop-variant="upload"]')).to_have_count(1)
+    root_cue = page.locator('[data-drop-variant="upload"]')
+    expect(root_cue).to_have_count(1)
+    expect(root_cue).to_have_css("background-color", "rgba(0, 0, 0, 0)")
+    label = page.locator("[data-upload-root-label]").bounding_box()
+    tree = rail.locator("section[data-upload-tree]").bounding_box()
+    assert label is not None and tree is not None and label["y"] + label["height"] <= tree["y"]
     expect(page.locator("[data-upload-hover]")).to_have_count(0)
+    _drag(page, '[data-drop-dir="src/assets"][data-drop-folder]', "dragover")
+    _assert_folder_cue(page, "src/assets")
+    expect(root_cue).to_have_count(0)
+    _drag(page, '[data-drop-dir="src/assets"]:not([data-drop-folder])', "dragover")
+    _assert_folder_cue(page, "src/assets")
 
 
 def test_workspace_upload_tree_folder_file_and_spring_load(
