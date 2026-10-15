@@ -5,6 +5,19 @@ import { resolveUploadTarget } from "./WorkspaceUploads";
 export interface TreeDropHover {
   directory: string;
   row: HTMLElement | null;
+  folderRow: HTMLElement | null;
+}
+
+const SPRING_LOAD_DELAY_MS = 1000;
+
+function folderRowFor(target: HTMLElement | null, row: HTMLElement | null): HTMLElement | null {
+  if (!row) return null;
+  if (row.hasAttribute("data-drop-folder")) return row;
+  return (
+    Array.from(target?.querySelectorAll<HTMLElement>("[data-drop-folder]") ?? []).find(
+      (folder) => folder.dataset.dropDir === row.dataset.dropDir,
+    ) ?? null
+  );
 }
 
 export function useTreeUploadDrop(
@@ -39,8 +52,9 @@ export function useTreeUploadDrop(
           : null;
       const directory = resolveUploadTarget(event, options.directory);
       if (currentHover.current?.row === row && currentHover.current.directory === directory) return;
+      const folderRow = folderRowFor(target, row);
       const rowChanged = row !== currentHover.current?.row;
-      currentHover.current = { directory, row };
+      currentHover.current = { directory, row, folderRow };
       setHover(currentHover.current);
       if (!rowChanged) return;
       clearTimeout(timer.current);
@@ -51,7 +65,7 @@ export function useTreeUploadDrop(
             return;
           }
           latest.current.onExpand(row.dataset.dropDir ?? "");
-        }, 600);
+        }, SPRING_LOAD_DELAY_MS);
       }
     },
   });
@@ -62,7 +76,17 @@ export function useTreeUploadDrop(
     }
     target.dataset.uploadTree = "";
     const observer = new MutationObserver(() => {
-      if (currentHover.current?.row && !target.contains(currentHover.current.row)) clear();
+      const hovered = currentHover.current;
+      if (!hovered?.row) return;
+      if (!target.contains(hovered.row)) {
+        clear();
+        return;
+      }
+      const folderRow = folderRowFor(target, hovered.row);
+      if (folderRow !== hovered.folderRow) {
+        currentHover.current = { ...hovered, folderRow };
+        setHover(currentHover.current);
+      }
     });
     observer.observe(target, { childList: true, subtree: true });
     return () => {

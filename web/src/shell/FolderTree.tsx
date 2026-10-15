@@ -1,7 +1,6 @@
-import { ChevronRightIcon, FolderIcon, FolderOpenIcon } from "lucide-react";
+import { ChevronRightIcon, FolderIcon, FolderOpenIcon, UploadIcon } from "lucide-react";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
-import { createPortal } from "react-dom";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { droppedUploadFiles, resolveUploadTarget, useWorkspaceUpload } from "./WorkspaceUploads";
 import { useTreeUploadDrop } from "./useTreeUploadDrop";
@@ -760,51 +759,23 @@ function FolderTreeInner({
     onExpand: togglePath,
   });
   const dropRoot = scrollElementRef.current?.closest<HTMLElement>("[data-upload-drop-root]");
-  const hoverBounds = dropHover?.row?.getBoundingClientRect();
-  const rootBounds = dropRoot?.getBoundingClientRect();
   const dropFeedback =
-    dropActive &&
-    dropHover &&
-    dropRoot &&
-    upload &&
-    (dropHover.row && hoverBounds && rootBounds ? (
+    dropActive && dropHover && dropRoot && upload ? (
       <>
-        {/* A root-level file row targets the browsed root, so outline the root too. */}
-        {dropHover.directory === browseLocation.replace(/\/$/, "") &&
-          createPortal(
-            <div
-              aria-hidden="true"
-              data-upload-root-outline=""
-              className="pointer-events-none absolute inset-0 z-40 m-2 rounded-md border-2 border-dashed border-info"
-            />,
-            dropRoot,
-          )}
-        {/* The rail's transform must not offset the label's viewport coordinates. */}
-        {createPortal(
-          <div
-            aria-hidden="true"
-            data-drop-variant="upload"
-            className="pointer-events-none fixed z-40 truncate rounded-md border border-info bg-card-solid px-2 py-1 text-ui text-info shadow-composer"
-            style={{
-              left: rootBounds.left + 8,
-              top: Math.min(hoverBounds.bottom, rootBounds.bottom - 32),
-              maxWidth: rootBounds.width - 16,
-            }}
-          >
-            Upload to {dropHover.directory || upload.destination}
-          </div>,
-          document.body,
+        <span className="sr-only" role="status" aria-live="polite">
+          Upload to {dropHover.directory || upload.destination}
+        </span>
+        {!dropHover.folderRow && (
+          <FileDropOverlay
+            container={dropRoot}
+            variant="upload"
+            label="Upload to workspace"
+            destination={dropHover.directory || upload.destination}
+            subtext="Saved to this session's files"
+          />
         )}
       </>
-    ) : (
-      <FileDropOverlay
-        container={dropRoot}
-        variant="upload"
-        label="Upload to workspace"
-        destination={upload.destination}
-        subtext="Saved to this session's files"
-      />
-    ));
+    ) : null;
 
   // Once a revealed directory's row exists in the flat tree (its ancestors'
   // lazy listings have landed), smooth-scroll it into view and start the
@@ -969,9 +940,7 @@ function FolderTreeInner({
                   dirtyDirMap={dirtyDirMap}
                   onNavigateDir={onNavigateDir}
                   highlighted={row.kind === "node" && row.key === revealedPath}
-                  dropHighlighted={
-                    dropHover?.directory === [browseLocation, row.key].filter(Boolean).join("/")
-                  }
+                  dropHighlighted={dropHover?.folderRow?.dataset.dropDir === row.key}
                 />
               )}
             </div>
@@ -1310,7 +1279,6 @@ const TreeNodeRow = memo(function TreeNodeRow({
         // Reveal flash: reuse the chat nav-jump ring pulse so a folder opened
         // from search catches the eye briefly, then settles.
         highlighted && "animate-user-msg-flash",
-        dropHighlighted && "ring-2 ring-info ring-inset",
       )}
       style={{ paddingLeft: `${indentFor(depth)}px` }}
     >
@@ -1323,8 +1291,16 @@ const TreeNodeRow = memo(function TreeNodeRow({
         aria-expanded={open}
       >
         <span className="relative flex size-3.5 shrink-0 items-center justify-center">
-          <span className="flex transition-opacity group-hover/folder:opacity-0 group-focus-visible/folder:opacity-0">
-            {open ? (
+          <span
+            className={cn(
+              "flex transition-opacity",
+              !dropHighlighted &&
+                "group-hover/folder:opacity-0 group-focus-visible/folder:opacity-0",
+            )}
+          >
+            {dropHighlighted ? (
+              <UploadIcon className="size-3.5 text-foreground" />
+            ) : open ? (
               <FolderOpenIcon className="size-3.5 text-muted-foreground" />
             ) : (
               <FolderIcon className="size-3.5 text-muted-foreground" />
@@ -1332,12 +1308,28 @@ const TreeNodeRow = memo(function TreeNodeRow({
           </span>
           <ChevronRightIcon
             className={cn(
-              "absolute size-3.5 text-muted-foreground opacity-0 transition-[transform,opacity] group-hover/folder:opacity-100 group-focus-visible/folder:opacity-100",
+              "absolute size-3.5 text-muted-foreground opacity-0 transition-[transform,opacity]",
+              !dropHighlighted &&
+                "group-hover/folder:opacity-100 group-focus-visible/folder:opacity-100",
               open && "rotate-90",
             )}
           />
         </span>
-        <span className={cn("min-w-0 flex-1 truncate text-ui", dirDotClass)}>{node.name}/</span>
+        <span
+          data-upload-glow={dropHighlighted ? "" : undefined}
+          className={cn(
+            "min-w-0 flex-1 truncate text-ui",
+            dirDotClass,
+            dropHighlighted && "text-foreground",
+          )}
+          style={
+            dropHighlighted
+              ? { textShadow: "0 0 6px var(--info), 0 0 12px var(--info)" }
+              : undefined
+          }
+        >
+          {node.name}/
+        </span>
         {dirStatus && (
           <span
             className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}
