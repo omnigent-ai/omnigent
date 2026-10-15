@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import socket
 import threading
-from collections.abc import AsyncIterator
+import tracemalloc
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
 import httpx
@@ -18,6 +20,7 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.asyncio.server import serve
 
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
+from omnigent.runner.transports.ws_tunnel import transport as transport_module
 from omnigent.runner.transports.ws_tunnel.binary_requests import encode_binary_request
 from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -537,13 +540,14 @@ async def _runner_dispatch(
     app,
     binary_sizes: list[int] | None = None,
     sent_frames: list | None = None,
+    send_frame: Callable[[str], Awaitable[None]] | None = None,
 ) -> AsyncIterator[dict[str, asyncio.Task[None]]]:
     dispatches: dict[str, asyncio.Task[None]] = {}
 
     async def send(raw: str) -> None:
         if sent_frames is not None:
             sent_frames.append(decode_frame(raw))
-        await ws.send(raw)
+        await (send_frame(raw) if send_frame is not None else ws.send(raw))
 
     async def receive() -> None:
         async for raw in ws:
@@ -805,6 +809,314 @@ async def test_transport_reports_oversized_binary_request() -> None:
         assert not session.binary_requests
 
 
+async def test_oversized_streaming_binary_body_stops_at_envelope_limit() -> None:
+    chunk_size = 64 * 1024
+    consumed = 0
+    source_closed = asyncio.Event()
+
+    async def body() -> AsyncGenerator[bytes, None]:
+        nonlocal consumed
+        try:
+            for _ in range(RUNNER_TUNNEL_MAX_MESSAGE_BYTES // chunk_size + 2):
+                chunk = b"x" * chunk_size
+                consumed += len(chunk)
+                yield chunk
+        finally:
+            source_closed.set()
+
+    class BodyStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.source = body()
+
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            return self.source
+
+        async def aclose(self) -> None:
+            await self.source.aclose()
+
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        request = httpx.Request(
+            "PATCH",
+            "http://runner/upload",
+            stream=BodyStream(),
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        header = RequestFrame(
+            "0" * 32,
+            request.method,
+            request.url.path,
+            query_string=request.url.query.decode("utf-8"),
+            headers=[[key, value] for key, value in request.headers.items()],
+            stream=True,
+        )
+        body_budget = RUNNER_TUNNEL_MAX_MESSAGE_BYTES - len(encode_binary_request(header, b""))
+        with pytest.raises(
+            httpx.LocalProtocolError, match=r"binary request.*message limit"
+        ) as error:
+            await client.send(request)
+        assert error.value.request is request
+        assert body_budget < consumed <= body_budget + chunk_size
+        assert source_closed.is_set()
+
+        session = registry.get(_RUNNER)
+        assert session is not None
+        assert not session.binary_requests
+        assert not session.in_flight
+        assert session.outbound_queue.empty()
+
+        retry = asyncio.create_task(
+            client.patch(
+                "/upload",
+                content=b"retry",
+                extensions={"runner_tunnel_binary_request_body": True},
+            )
+        )
+        try:
+            raw = await asyncio.wait_for(ws.recv(), 2)
+            assert isinstance(raw, bytes)
+            retry_id = _envelope_header(raw)["id"]
+            assert session.binary_requests == {retry_id}
+            await _reply(ws, retry_id)
+            assert (await asyncio.wait_for(retry, 2)).status_code == 204
+            assert not session.binary_requests
+        finally:
+            retry.cancel()
+            await asyncio.gather(retry, return_exceptions=True)
+
+
+async def test_binary_envelope_releases_buffer_while_waiting_for_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message_limit = 16 * 1024 * 1024
+    body_size = 8 * 1024 * 1024
+    chunk_size = 64 * 1024
+    monkeypatch.setattr(transport_module, "RUNNER_TUNNEL_MAX_MESSAGE_BYTES", message_limit)
+    sender_resume = _pause_sender(monkeypatch)
+    request_enqueued = asyncio.Event()
+    allow_request = asyncio.Event()
+
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        original_send_request = registry.send_request
+
+        async def hold_request(session, data, *, request_id: str) -> None:
+            await original_send_request(session, data, request_id=request_id)
+            request_enqueued.set()
+            await allow_request.wait()
+
+        monkeypatch.setattr(registry, "send_request", hold_request)
+
+        async def body() -> AsyncIterator[bytes]:
+            chunk = b"x" * chunk_size
+            for _ in range(body_size // chunk_size):
+                yield chunk
+
+        request = client.build_request(
+            "PATCH",
+            "/upload",
+            content=body(),
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        gc.collect()
+        tracemalloc.start()
+        baseline, _ = tracemalloc.get_traced_memory()
+        task = asyncio.create_task(client.send(request, stream=True))
+        try:
+            await asyncio.wait_for(request_enqueued.wait(), 5)
+            gc.collect()
+            retained, _ = tracemalloc.get_traced_memory()
+            assert retained - baseline < body_size * 3 // 2
+
+            allow_request.set()
+            sender_resume.set()
+            raw = await asyncio.wait_for(ws.recv(), 5)
+            assert isinstance(raw, bytes)
+            request_id = _envelope_header(raw)["id"]
+            await _reply(ws, request_id)
+            response = await asyncio.wait_for(task, 5)
+            assert response.status_code == 204
+            await response.aclose()
+        finally:
+            allow_request.set()
+            sender_resume.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            tracemalloc.stop()
+
+
+async def test_binary_request_closes_custom_stream_once_after_consumption() -> None:
+    class NonIdempotentStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            stream = self
+
+            class Iterator:
+                def __init__(self) -> None:
+                    self.sent = False
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self) -> bytes:
+                    if self.sent:
+                        raise StopAsyncIteration
+                    self.sent = True
+                    return b"payload"
+
+                async def aclose(self) -> None:
+                    await stream.aclose()
+
+            return Iterator()
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            if self.close_calls > 1:
+                raise RuntimeError("stream closed twice")
+
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        stream = NonIdempotentStream()
+        request = httpx.Request(
+            "PATCH",
+            "http://runner/upload",
+            stream=stream,
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        task = asyncio.create_task(client.send(request, stream=True))
+        try:
+            raw = await asyncio.wait_for(ws.recv(), 2)
+            assert isinstance(raw, bytes)
+            request_id = _envelope_header(raw)["id"]
+            assert stream.close_calls == 1
+            await _reply(ws, request_id)
+            response = await asyncio.wait_for(task, 2)
+            assert response.status_code == 204
+            await response.aclose()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        session = registry.get(_RUNNER)
+        assert session is not None
+        assert not session.binary_requests
+
+
+async def test_overlimit_cleanup_error_preserves_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transport_module, "RUNNER_TUNNEL_MAX_MESSAGE_BYTES", 1024 * 1024)
+    chunk_size = 64 * 1024
+    source_closed = asyncio.Event()
+
+    async def body() -> AsyncGenerator[bytes, None]:
+        try:
+            for _ in range(1024 * 1024 // chunk_size + 2):
+                yield b"x" * chunk_size
+        finally:
+            source_closed.set()
+            raise ValueError("cleanup failed")
+
+    class BodyStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.source = body()
+
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            return self.source
+
+        async def aclose(self) -> None:
+            await self.source.aclose()
+
+    async with _tunnel([_CAPABILITY]) as (client, _, _):
+        request = httpx.Request(
+            "PATCH",
+            "http://runner/upload",
+            stream=BodyStream(),
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        with pytest.raises(
+            httpx.LocalProtocolError, match=r"binary request.*message limit"
+        ) as error:
+            await client.send(request)
+        assert error.value.request is request
+        assert source_closed.is_set()
+
+
+async def test_overlimit_closes_public_wrapper_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transport_module, "RUNNER_TUNNEL_MAX_MESSAGE_BYTES", 1024)
+
+    class InnerStream:
+        def __init__(self) -> None:
+            self.closed = 0
+            self.sent = False
+
+        def __aiter__(self) -> InnerStream:
+            return self
+
+        async def __anext__(self) -> bytes:
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return b"x" * 2048
+
+        async def aclose(self) -> None:
+            self.closed += 1
+
+    class WrapperStream(httpx.AsyncByteStream):
+        def __init__(self, inner: InnerStream) -> None:
+            self.inner = inner
+            self._stream = inner
+            self.close_calls = 0
+
+        def __aiter__(self) -> AsyncIterator[bytes]:
+            return self.inner
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            await self.inner.aclose()
+
+    async with _tunnel([_CAPABILITY]) as (client, _, registry):
+        inner = InnerStream()
+        stream = WrapperStream(inner)
+        request = httpx.Request(
+            "PATCH",
+            "http://runner/upload",
+            stream=stream,
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        with pytest.raises(httpx.LocalProtocolError, match=r"binary request.*message limit"):
+            await client.send(request)
+
+        assert stream.close_calls == 1
+        assert inner.closed == 1
+        session = registry.get(_RUNNER)
+        assert session is not None
+        assert not session.binary_requests
+
+
+async def test_body_value_error_propagates_and_releases_slot() -> None:
+    failure = ValueError("upstream body read failed")
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"partial"
+        raise failure
+
+    async with _tunnel([_CAPABILITY]) as (client, _, registry):
+        request = client.build_request(
+            "PATCH",
+            "/upload",
+            content=body(),
+            extensions={"runner_tunnel_binary_request_body": True},
+        )
+        with pytest.raises(ValueError) as error:
+            await client.send(request)
+
+        assert error.value is failure
+        session = registry.get(_RUNNER)
+        assert session is not None
+        assert not session.binary_requests
+
+
 async def test_binary_request_across_consumer_loop() -> None:
     def consume() -> int:
         async def send() -> int:
@@ -896,6 +1208,72 @@ async def test_post_head_close_recovers_binary_admission() -> None:
                 blocked.set()
                 for response in responses:
                     await response.aclose()
+
+
+async def test_cancelled_terminal_send_is_delivered_once_and_releases_binary_admission() -> None:
+    terminal_started = asyncio.Event()
+    terminal_cancelled = asyncio.Event()
+    release_terminal = asyncio.Event()
+    terminal_delivered = asyncio.Event()
+    delivered_ends: list[ResponseEndFrame] = []
+
+    async def app(scope, receive, send) -> None:
+        await receive()
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        try:
+            await send({"type": "http.response.body", "body": b""})
+        except asyncio.CancelledError:
+            terminal_cancelled.set()
+            raise
+
+    async with _tunnel([_CAPABILITY]) as (client, ws, registry):
+        session = registry.get(_RUNNER)
+        assert session is not None
+        original_send = ws.send
+
+        async def send_frame(raw: str) -> None:
+            frame = decode_frame(raw)
+            if isinstance(frame, ResponseEndFrame):
+                terminal_started.set()
+                await release_terminal.wait()
+            await original_send(raw)
+            if isinstance(frame, ResponseEndFrame):
+                delivered_ends.append(frame)
+                terminal_delivered.set()
+
+        frames: list = []
+        async with _runner_dispatch(ws, app, sent_frames=frames, send_frame=send_frame):
+            response = await client.send(
+                client.build_request(
+                    "PATCH",
+                    "/upload",
+                    content=b"chunk",
+                    extensions={"runner_tunnel_binary_request_body": True},
+                ),
+                stream=True,
+            )
+            try:
+                await asyncio.wait_for(terminal_started.wait(), 2)
+                request_id = next(iter(session.binary_requests))
+                assert len(session.binary_requests) == 1
+
+                await response.aclose()
+                await asyncio.wait_for(terminal_cancelled.wait(), 2)
+                release_terminal.set()
+                await asyncio.wait_for(terminal_delivered.wait(), 2)
+                async with asyncio.timeout(2):
+                    while request_id in session.binary_requests:
+                        await asyncio.sleep(0.01)
+
+                ends = [frame for frame in frames if isinstance(frame, ResponseEndFrame)]
+                assert len(ends) == 1
+                assert ends[0].error is None
+                assert len(delivered_ends) == 1
+                assert delivered_ends[0].id == request_id
+                assert not session.binary_requests
+            finally:
+                release_terminal.set()
+                await response.aclose()
 
 
 async def test_cancel_after_completed_response_emits_no_duplicate_end() -> None:
