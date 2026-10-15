@@ -52,3 +52,9 @@ def test_repro_agent_loads_the_screen_evidence_caption_rule_as_instructions() ->
     spec = load(_REPRO_AGENT, expand_env=False)
     assert "Caption the screen from screen evidence" in spec.instructions
     assert "Base screen claims on inspected frames" in _normalized(_DEV / "recording-lanes.md")
+
+
+def test_repro_agent_loads_caption_timing_guidance() -> None:
+    spec = load(_REPRO_AGENT, expand_env=False)
+    assert "Omit unverified opening states and timestamps" in spec.instructions
+    assert "Omit unverified opening states and timings" in _normalized(_DEV / "recording-lanes.md")

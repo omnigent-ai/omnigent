@@ -414,3 +414,8 @@ For each recording, also write a short **`caption`** in its handoff entry descri
 what the clip shows: e.g. `"start a session → open the model picker → select the
 catalog → picker shows raw IDs"`. This is what a reader sees under the video on
 the ticket, so make it read like a journey, not a restatement of the bug title.
+
+Name views and timestamps only when recorded evidence establishes them. Omit
+unverified opening states and timings; do not infer them from pixel-similarity
+scores. If you cannot inspect frames, disclose that in `evidence` and limit the
+caption to visible states the driver verified.
