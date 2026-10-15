@@ -783,10 +783,18 @@ def test_redact_log_text_strips_url_userinfo(text: str, expected: str) -> None:
 
 
 def test_redact_log_text_handles_large_url_without_userinfo_in_linear_time() -> None:
+    # Guards against catastrophic regex backtracking on a long userinfo-less URL
+    # (that failure mode takes seconds to minutes). A 0.5s wall-clock literal
+    # flaked on loaded CI runners, where linear redaction of ~450K chars — a few
+    # ms of real work — still loses a scheduler race across xdist workers. Keep a
+    # wall-clock bound (it cleanly separates linear-ms from backtracking-seconds)
+    # but widen it and scale by the suite's timeout multiplier so contention,
+    # not a regression, can't trip it.
     text = "https://" + "a" * 200_000 + " " + "://" * 50_000
+    budget = 2.0 * float(os.environ.get("OMNIGENT_TEST_TIMEOUT_SCALE", "1"))
     started = time.perf_counter()
     output = redact_log_text(text)
-    assert time.perf_counter() - started < 0.5
+    assert time.perf_counter() - started < budget
     assert output == text
 
 
