@@ -154,6 +154,30 @@ def _string_object_dict(value: object) -> _JsonObject | None:
     return cast("_JsonObject", value)
 
 
+# One ``/v1/sessions/{id}`` path segment: the characters every supported
+# session-id spelling uses (bare or dashed uuid, legacy ``prefix_hex``).
+# Anything else could escape the route or rewrite its query string.
+_SESSION_ROUTE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def _is_session_route_id(value: str) -> bool:
+    """Return whether *value* can be spliced into a session route unchanged."""
+    return _SESSION_ROUTE_ID.fullmatch(value) is not None
+
+
+def _invalid_session_route_id(tool_name: str, arg: str, value: str) -> str:
+    """JSON error for a model-supplied session identifier that is not one route segment."""
+    return json.dumps(
+        {
+            "error": (
+                f"{tool_name} requires '{arg}' to be a single session identifier "
+                "(letters, digits, '-' or '_')"
+            ),
+            arg: value,
+        }
+    )
+
+
 def _optional_string(value: object) -> str | None:
     """Return *value* when it is a string, otherwise ``None``."""
     return value if isinstance(value, str) else None
@@ -2526,6 +2550,11 @@ async def _execute_subagent_tool(
             return (
                 "Error: sys_session_send received both 'session_id' and "
                 "'agent'/'title' — supply exactly one addressing mode"
+            )
+        if not _is_session_route_id(target_session_id):
+            return (
+                "Error: sys_session_send 'session_id' must be a single session "
+                f"identifier (letters, digits, '-' or '_'); got {target_session_id!r}"
             )
         if model is not None:
             return (
@@ -5027,6 +5056,8 @@ async def _session_get_info_via_rest(
         return json.dumps(
             {"error": "sys_session_get_info requires a non-empty 'session_id' string"}
         )
+    if not _is_session_route_id(raw_target):
+        return _invalid_session_route_id("sys_session_get_info", "session_id", raw_target)
     try:
         resp = await server_client.get(
             f"/v1/sessions/{raw_target}",
@@ -5166,6 +5197,8 @@ async def _session_share_via_rest(
     target = args.get("session_id") or conversation_id
     if not isinstance(target, str) or not target:
         return json.dumps({"error": "sys_session_share requires a non-empty 'session_id' string"})
+    if not _is_session_route_id(target):
+        return _invalid_session_route_id("sys_session_share", "session_id", target)
     user_id = args.get("user_id")
     if not isinstance(user_id, str) or not user_id:
         return json.dumps({"error": "sys_session_share requires a non-empty 'user_id'"})
@@ -5294,6 +5327,8 @@ async def _execute_agent_tool(
     session_id = args.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         return json.dumps({"error": f"{tool_name} requires a non-empty 'session_id' string"})
+    if not _is_session_route_id(session_id):
+        return _invalid_session_route_id(tool_name, "session_id", session_id)
     if tool_name == "sys_agent_get":
         return await _agent_get_via_rest(session_id, server_client)
     return await _agent_download_via_rest(
@@ -6238,6 +6273,8 @@ async def _session_get_history_via_rest(
         return json.dumps(
             {"error": "sys_session_get_history requires a non-empty 'conversation_id' string"}
         )
+    if not _is_session_route_id(target_id):
+        return _invalid_session_route_id("sys_session_get_history", "conversation_id", target_id)
     tail_items = _clamp_tail_items(args.get("tail_items", _HISTORY_DEFAULT_TAIL))
     if isinstance(tail_items, str):
         return tail_items
@@ -6416,6 +6453,8 @@ async def _session_close_via_rest(
         return json.dumps(
             {"error": "sys_session_close requires a non-empty 'conversation_id' string"}
         )
+    if not _is_session_route_id(target_id):
+        return _invalid_session_route_id("sys_session_close", "conversation_id", target_id)
     target_snap = await _fetch_close_target(target_id, server_client)
     if isinstance(target_snap, str):
         return target_snap
@@ -7401,6 +7440,10 @@ async def _execute_rest_tool(
     if tool_name == SysCancelAsyncTool.name():
         # ``task_id`` fallback supports older clients; remove in 0.8.0.
         handle_id = args.get("handle_id") or args.get("task_id", "")
+        if not isinstance(handle_id, str) or not handle_id:
+            return 'Error: sys_cancel_async requires "handle_id"'
+        if not _is_session_route_id(handle_id):
+            return f"Error: no in-flight task with handle_id {handle_id}"
         try:
             resp = await server_client.post(
                 f"/v1/sessions/{handle_id}/events",
@@ -8767,6 +8810,8 @@ async def _cancel_evicted_native_subagent(
 
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
+    if not _is_session_route_id(task_id):
+        return f"Error: no in-flight task with task_id {task_id}"
     try:
         resp = await server_client.get(f"/v1/sessions/{task_id}", timeout=10.0)
     except httpx.HTTPError as exc:
