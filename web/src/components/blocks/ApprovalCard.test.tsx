@@ -567,6 +567,94 @@ describe("ApprovalCard — Codex MCP persistence choices", () => {
   });
 });
 
+describe("ApprovalCard — Antigravity permission prompt details", () => {
+  const baseProps = {
+    elicitationId: "elic_agy_perm",
+    message: "Antigravity wants to run: pwd",
+    phase: "agy_permission",
+    policyName: "agy_native_permission",
+    contentPreview: "",
+    requestedSchema: {},
+  } as const;
+
+  it("shows the action description and both persist choices when advertised", () => {
+    const submitSpy = vi.fn();
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="pending"
+        response={null}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+        onSubmit={submitSpy}
+      />,
+    );
+
+    expect(screen.getByText("Running pwd command")).toBeDefined();
+    const sessionAllow = screen.getByRole("button", {
+      name: "Allow commands starting with pwd for this session",
+    });
+    expect(sessionAllow.getAttribute("title")).toBe(
+      "Ask Antigravity to allow commands starting with “pwd” for this conversation",
+    );
+    fireEvent.click(sessionAllow);
+    expect(submitSpy).toHaveBeenCalledWith("elic_agy_perm", "accept", undefined, {
+      persist: "session",
+    });
+    const alwaysAllow = screen.getByRole("button", {
+      name: "Always allow commands starting with pwd",
+    });
+    expect(alwaysAllow.getAttribute("title")).toBe(
+      "Ask Antigravity to save a rule allowing commands starting with “pwd” for this Omnigent session",
+    );
+    fireEvent.click(alwaysAllow);
+    expect(submitSpy).toHaveBeenCalledWith("elic_agy_perm", "accept", undefined, {
+      persist: "always",
+    });
+  });
+
+  it("offers no persist choice when agy's prompt advertises none", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="pending"
+        response={null}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: null }}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTestId("approval-card-agy-session-allow")).toBeNull();
+    expect(screen.queryByTestId("approval-card-agy-always-allow")).toBeNull();
+    expect(screen.getByRole("button", { name: /^approve$/i })).toBeDefined();
+  });
+
+  it("records an always-allow request without claiming it was saved", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="responded"
+        response={{ action: "accept", _meta: { persist: "always" } }}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+      />,
+    );
+
+    expect(screen.getByText("Always allow requested")).toBeDefined();
+  });
+
+  it("records a session allow request without claiming it was saved", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="responded"
+        response={{ action: "accept", _meta: { persist: "session" } }}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+      />,
+    );
+
+    expect(screen.getByText("Session allow requested")).toBeDefined();
+  });
+});
+
 describe("ApprovalCard — multi-choice options", () => {
   beforeEach(() => {
     useChatStore.setState({

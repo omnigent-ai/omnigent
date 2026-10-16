@@ -3289,6 +3289,7 @@ async def test_persist_error_labels_records_passed_owner_runner_despite_rebind(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("background_task_count", [2, None], ids=["background-shells", "unknown"])
 @pytest.mark.parametrize(
     ("labels", "fail_idle_top_level", "decision"),
     [
@@ -3303,6 +3304,7 @@ async def test_persist_error_labels_records_passed_owner_runner_despite_rebind(
 )
 async def test_offline_sweep_saved_subagent_turn_without_a_cached_edge(
     db_uri: str,
+    background_task_count: int | None,
     labels: dict[str, str],
     fail_idle_top_level: bool,
     decision: str,
@@ -3329,6 +3331,8 @@ async def test_offline_sweep_saved_subagent_turn_without_a_cached_edge(
     snapshot = store.get_conversation(child.id)
     assert snapshot is not None
     error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
+    if background_task_count is not None:
+        sessions_module._session_background_task_count_cache[child.id] = background_task_count
 
     try:
         with capture_debug_rows("server") as rows:
@@ -3346,12 +3350,20 @@ async def test_offline_sweep_saved_subagent_turn_without_a_cached_edge(
             assert _interrupted(refreshed)
         else:
             assert persisted is not None and persisted["code"] == "runner_disconnected"
+            assert child.id not in sessions_module._session_background_task_count_cache
         logged = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
         assert logged["attributes"]["origin"] == "runner_offline_sweep"
         assert logged["attributes"]["decision"] == decision
         assert logged["attributes"]["status_source"] == "persisted"
         assert logged["attributes"]["session_kind"] == "sub_agent"
+        if background_task_count is not None:
+            assert logged["attributes"]["cached_background_task_count"] == str(
+                background_task_count
+            )
+        else:
+            assert "cached_background_task_count" not in logged["attributes"]
     finally:
+        sessions_module._session_background_task_count_cache.pop(child.id, None)
         sessions_module._session_status_cache.pop(child.id, None)
         session_stream.close(child.id)
 

@@ -1875,6 +1875,7 @@ async def _post_model_change_with_status_sequence(
     picker_source: str = "bridge",
     empty_session_catalog: bool = False,
     stored_catalog_rows: list[dict[str, object]] | None = None,
+    pane_idle_after_polls: int | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
@@ -1953,6 +1954,17 @@ async def _post_model_change_with_status_sequence(
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
+    if pane_idle_after_polls is not None:
+        polls = 0
+
+        def _turn_settles(_bridge_dir: Any, *, hint: str) -> bool:
+            nonlocal polls
+            polls += 1
+            if polls >= pane_idle_after_polls:
+                app.state.native_pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = "idle"
+            return False
+
+        monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", _turn_settles)
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
@@ -2148,6 +2160,24 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
         monkeypatch,
         ["claude-opus-4-6"],
         pane_status="running",
+    )
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_stays_queued_when_the_turn_settles_mid_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch typed into a busy pane is queued even if the turn ends before the deadline.
+
+    Claude applies the queued ``/model`` after the turn settles, which can land after
+    the confirmation window. An idle pane at the last poll is not a refusal.
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status="running",
+        pane_idle_after_polls=2,
     )
     assert resp.status_code == 204, resp.text
 

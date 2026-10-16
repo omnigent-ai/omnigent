@@ -600,6 +600,10 @@ describe("getValidStoredToken", () => {
 
   it("logs token request metadata without credentials or raw error responses", async () => {
     const logs = [];
+    const events = [];
+    mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+      events.push(args),
+    );
     mock.method(console, "log", (...args) => logs.push(args));
     mock.method(console, "warn", (...args) => logs.push(args));
     oauth.saveWorkspaceToken(
@@ -631,6 +635,19 @@ describe("getValidStoredToken", () => {
     assert.match(output, /refresh_token/);
     assert.match(output, /invalid_scope/);
     assert.doesNotMatch(output, /SENSITIVE_TEST/);
+    assert.deepEqual(events, [
+      [
+        "databricks_token",
+        {
+          origin: WS,
+          phase: "refresh_token",
+          status: 403,
+          code: "invalid_scope",
+          requestId: "trace-test",
+          outcome: "rejected",
+        },
+      ],
+    ]);
   });
 
   it("throws when nothing is stored", async () => {

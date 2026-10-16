@@ -78,6 +78,8 @@ from omnigent.harness_plugins import (
     DEVIN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
+from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
+from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import failure_log_attributes
 from omnigent.native.native_coding_agents import (
@@ -89,7 +91,7 @@ from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
-from omnigent.runner.launch_failure import classify_native_turn_error
+from omnigent.runner.launch_failure import classify_native_turn_error, diagnose_model_unavailable
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
@@ -3348,6 +3350,27 @@ async def _persist_external_assistant_message(
     return persisted.id
 
 
+def _diagnose_external_error(data: ErrorData) -> ErrorData:
+    """
+    Attach the shared model-unavailable card to a bare forwarded provider error.
+
+    Pi mirrors provider rejections verbatim (``Pi model error: 404 …``) with no
+    next step; a harness that already classified its failure keeps its own card.
+    """
+    if data.level == "info" or data.title or data.cause or data.remediation:
+        return data
+    diagnosis = diagnose_model_unavailable(data.message)
+    if diagnosis is None:
+        return data
+    return data.model_copy(
+        update={
+            "title": diagnosis.title,
+            "cause": diagnosis.cause,
+            "remediation": diagnosis.remediation,
+        }
+    )
+
+
 def _parse_external_conversation_item(
     body: SessionEventInput,
 ) -> NewConversationItem:
@@ -3404,6 +3427,8 @@ def _parse_external_conversation_item(
         ) from exc
     if message_id is not None and isinstance(data, MessageData) and data.role == "assistant":
         data = data.model_copy(update={"stream_message_id": message_id})
+    if isinstance(data, ErrorData):
+        data = _diagnose_external_error(data)
     return NewConversationItem(
         type=item_type,
         response_id=response_id.strip(),
@@ -4980,6 +5005,7 @@ def _publish_status(
                 code=failure_code,
                 previous_status=previous_status or "unknown",
                 response_id=response_id,
+                cached_background_task_count=_session_background_task_count_cache.get(session_id),
                 **failure_log_attributes(failure_context),
             ),
         )
@@ -5088,7 +5114,7 @@ def reconcile_orphaned_running_status(
     return True
 
 
-def _truncate_label(value: str) -> str:
+def _truncate_label(value: str, limit: int = _LABEL_VALUE_MAX_LEN) -> str:
     """Truncate a label value to fit the ``conversation_labels.value`` column.
 
     Long failure messages (tracebacks, 5xx bodies) overflow the column and
@@ -5099,12 +5125,49 @@ def _truncate_label(value: str) -> str:
     makes the call site directly testable.
 
     :param value: The raw string to truncate.
+    :param limit: Maximum length, e.g. ``120`` for one part of a composed
+        label. Defaults to the column width.
     :returns: ``value`` unchanged if it already fits, else the head trimmed to
-        the column width with a trailing ``…`` to signal truncation.
+        ``limit`` with a trailing ``…`` to signal truncation.
     """
-    if len(value) <= _LABEL_VALUE_MAX_LEN:
+    if len(value) <= limit:
         return value
-    return value[: _LABEL_VALUE_MAX_LEN - 1] + "…"
+    return value[: limit - 1] + "…"
+
+
+# Marks the log lines dropped between a runner exit's summary and its last line.
+_ELIDED_LOG_LINES_MARKER = "\n…\n"
+# Shortest summary kept ahead of that line, e.g. "runner process exited with code 1".
+_RUNNER_EXIT_SUMMARY_MIN_CHARS = 40
+
+
+def _truncate_error_message_label(message: str) -> str:
+    """Fit a failure message into one label, keeping a runner exit's cause.
+
+    A host's runner-exit report is a summary, then the runner's log tail under
+    :data:`RUNNER_LOG_TAIL_HEADING`. The tail's last line names the cause, e.g.
+    ``"error: runner tunnel rejected by server (HTTP 401 ...)"``, but head
+    truncation keeps only the summary and the start of a traceback, so a
+    reloaded session would no longer show why the runner died. For such a
+    report, keep the start of the summary and the whole last line. Any other
+    message is head-truncated by :func:`_truncate_label`.
+
+    :param message: The failure message, e.g. ``"runner process exited with
+        code 1 (log on host: ~/x.log)\\n--- runner log tail ---\\n...\\nerror: boom"``.
+    :returns: ``message`` unchanged if it fits, else a value no longer than the
+        label column.
+    """
+    if len(message) <= _LABEL_VALUE_MAX_LEN:
+        return message
+    summary, heading, tail = message.partition(f"\n{RUNNER_LOG_TAIL_HEADING}\n")
+    tail_lines = tail.strip().splitlines()
+    if not heading or not tail_lines:
+        return _truncate_label(message)
+    budget = _LABEL_VALUE_MAX_LEN - len(_ELIDED_LOG_LINES_MARKER)
+    summary_reserve = min(len(summary), _RUNNER_EXIT_SUMMARY_MIN_CHARS)
+    last_line = _truncate_label(tail_lines[-1].strip(), budget - summary_reserve)
+    summary = _truncate_label(summary, budget - len(last_line))
+    return f"{summary}{_ELIDED_LOG_LINES_MARKER}{last_line}"
 
 
 async def _persist_session_status_error_labels(
@@ -5143,7 +5206,7 @@ async def _persist_session_status_error_labels(
     updates = (
         {
             _LAST_TASK_ERROR_CODE_LABEL_KEY: _truncate_label(error.code),
-            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: _truncate_label(error.message),
+            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: _truncate_error_message_label(error.message),
             _LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY: _truncate_label(agent_name or ""),
             _LAST_TASK_ERROR_TITLE_LABEL_KEY: _truncate_label(error.title or ""),
             _LAST_TASK_ERROR_CAUSE_LABEL_KEY: _truncate_label(error.cause or ""),
@@ -5258,7 +5321,9 @@ def _publish_sandbox_status(*args: Any, **kwargs: Any) -> None:
     return _facade._publish_sandbox_status(*args, **kwargs)
 
 
-def _publish_sandbox_status_impl(session_id: str, stage: str, error: str | None = None) -> None:
+def _publish_sandbox_status_impl(
+    session_id: str, stage: str, error: str | None = None, *, provider: str | None = None
+) -> None:
     """
     Publish a typed :class:`SessionSandboxStatusEvent` and update the
     cache the snapshot reads.
@@ -5281,13 +5346,21 @@ def _publish_sandbox_status_impl(session_id: str, stage: str, error: str | None 
     :param error: Failure detail when *stage* is ``"failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` for non-terminal stages.
+    :param provider: Sandbox provider being launched, e.g. ``"arclet"``.
+        Later stages keep the cached launch's provider when omitted.
     """
     # "ready" evicts: from then on the session looks like any
     # host-bound session and the snapshot carries no launch state.
     # Failures stay cached (mirroring ManagedLaunchTracker retention)
     # so a reload after a dead launch still shows the reason.
-    status = SandboxStatus.model_validate({"stage": stage, "error": error})
     previous = _session_sandbox_status_cache.get(session_id)
+    status = SandboxStatus.model_validate(
+        {
+            "stage": stage,
+            "error": error,
+            "provider": provider or (previous.provider if previous else None),
+        }
+    )
     log = _logger.error if stage == "failed" else _logger.info
     log(
         "Managed sandbox launch stage: %s",
@@ -5307,6 +5380,7 @@ def _publish_sandbox_status_impl(session_id: str, stage: str, error: str | None 
         conversation_id=session_id,
         stage=status.stage,
         error=status.error,
+        provider=status.provider,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -5599,7 +5673,7 @@ async def _query_host_runner_status(
     runner_id: str,
 ) -> str | None:
     """
-    Ask a host whether a runner's process is alive, dead, or unknown.
+    Ask the host for this runner's liveness or bounded pending-sign-in state.
 
     The host owns runner-process liveness (it holds the ``Popen``), so it
     can answer the one question the server's tunnel registry cannot: is an
@@ -5610,7 +5684,7 @@ async def _query_host_runner_status(
     :param host_conn: Live host connection to query.
     :param host_registry: Registry used to enqueue the outbound frame.
     :param runner_id: Runner to ask about, e.g. ``"runner_abc123..."``.
-    :returns: ``"alive"``, ``"dead"``, or ``"unknown"`` from the host; or
+    :returns: ``"alive"``, ``"sign_in_pending"``, ``"dead"``, or ``"unknown"``; or
         ``None`` when the host didn't reply in time, the connection
         dropped, or the host is too old to support the query. ``None``
         means "no authoritative answer" — the caller falls back to the
@@ -6247,6 +6321,8 @@ async def _provision_managed_sandbox(
     relaunch_host: Host | None,
     provider: str | None = None,
     agent_name: str | None = None,
+    host_id: str | None = None,
+    relaunch_slice_key_enabled: bool = False,
 ) -> ManagedHostLaunch | None:
     """
     Run the provision phase of a background managed launch.
@@ -6270,6 +6346,11 @@ async def _provision_managed_sandbox(
     :param agent_name: Server-resolved built-in agent name the session
         runs, stamped as the runner Pod's ``omnigent.ai/agent`` classifier
         (Kubernetes only), or ``None`` to leave it unstamped.
+    :param host_id: Host id a managed create asked for, or
+        ``None`` to mint one. Ignored on a relaunch, which keeps the host's
+        identity.
+    :param relaunch_slice_key_enabled: On a relaunch, whether the host routes
+        by its own id, as at its first launch.
     :returns: The launch result, or ``None`` when the launch failed
         (the tracker entry is already settled with the reason).
     """
@@ -6296,6 +6377,7 @@ async def _provision_managed_sandbox(
                 repos=repos,
                 agent_name=agent_name,
                 on_stage=_on_stage,
+                slice_key_enabled=relaunch_slice_key_enabled,
             )
         return await launch_managed_host(
             config=sandbox_config,
@@ -6305,6 +6387,7 @@ async def _provision_managed_sandbox(
             provider=provider,
             agent_name=agent_name,
             on_stage=_on_stage,
+            host_id=host_id,
         )
     except HTTPException as exc:
         _logger.warning(
@@ -7616,7 +7699,7 @@ async def _dispatch_skill_slash_command_to_runner(
         "role": "user",
         "content": meta_content,
         "agent_id": conv.agent_id,
-        "agent_revision": agent.bundle_location,
+        "agent_revision": mcp_selection_revision(agent.bundle_location, conv.labels),
         "model": agent.name,
         "has_mcp_servers": has_mcp_servers,
         # Live-renderer hint: the runner drops ``browser_*`` schemas for
@@ -8755,11 +8838,15 @@ def _load_agent_spec_for_session_impl(
     if agent is None:
         return None
     agent_cache = cast(AgentCache, get_agent_cache())
-    return agent_cache.load(
+    spec = agent_cache.load(
         agent.id,
         agent.bundle_location,
         expand_env=agent.operator_authored,
     ).spec
+
+    from omnigent.mcp_selection import selected_mcp_spec
+
+    return selected_mcp_spec(spec, conv.labels)
 
 
 def _build_policy_engine_from_spec(*args: Any, **kwargs: Any) -> PolicyEngine:
@@ -10270,6 +10357,13 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.mcp_selection import MCP_SELECTION_PREFIX
+
+    if any(key.startswith(MCP_SELECTION_PREFIX) for key in labels):
+        raise OmnigentError(
+            "MCP selection must be changed through the session MCP endpoint",
+            code=ErrorCode.INVALID_INPUT,
+        )
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
     from omnigent.stores.conversation_store import SIDE_CHAT_SOURCE_LABEL_KEY
 

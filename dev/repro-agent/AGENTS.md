@@ -129,7 +129,8 @@ Your first turn is a fixed checklist — do all of it before Step 1:
    emitting a verdict handoff; the workflow must retry it). Also note — without failing —
    whether the recorders are available (Playwright browsers for
    `pytest --video`, `vhs` for CLI tapes): Step 4 degrades gracefully when they
-   are missing.
+   are missing, and expects a recorder run for every filmable facet when they
+   are present.
 
 If you cannot reach the app at all, stop and report an operational failure
 without emitting a verdict handoff so the workflow retries. App, network,
@@ -516,8 +517,11 @@ The `tests/e2e_ui/` suite drives a mock LLM (`tests/server/integration/mock_llm_
 whose scripted responses take fault fields: `error` + `status_code` (fail the
 request at open time), `truncate_after: N` (open a normal `200` SSE stream, emit
 N events, then cut it off mid-stream — dropping the completion event so the turn
-dies in flight), and `block` + the `/gate/release` endpoint (hold a turn open to
-drive a stall/cancel). For faults on the *transport* rather than the model — a
+dies in flight), `chunk_delay: seconds` (sleep between SSE events so the reply
+streams in visibly — pair with `stream: true` for word-by-word deltas — letting
+you scroll, click, or watch layout *while* deltas are still arriving), and
+`block` + the `/gate/release` endpoint (hold a turn open to drive a
+stall/cancel). For faults on the *transport* rather than the model — a
 transient 4xx/5xx on the session stream, dropped events — a Playwright `route`
 handler that `fulfill`s or `abort`s the request works too (see
 `tests/e2e_ui/chat/test_stream_transient_404.py` and `test_stale_stream.py`).
@@ -525,6 +529,17 @@ Pick the injection that matches the reported trigger, drive the turn through it,
 and observe the SPA's error/recovery UI (the error pill, retry, reconnect) — that
 observed error state is the reproduction. The same journey driver can film it
 in Step 4, even when permanent coverage uses a narrower test.
+
+**A mid-stream symptom must be driven mid-stream.** The mock is not
+single-batch: `chunk_delay` paces the SSE stream on both `/v1/responses` (the
+default openai-agents e2e_ui fixture) and `/v1/messages`. When the report ties
+the failure to a live or just-finished turn — scroll snaps back while a long
+reply streams in, layout jumps as deltas render — a settled transcript has not
+exercised the trigger: pace the stream and drive the reported action while
+deltas are still arriving. `not_reproduced` may carry
+`environment_fidelity: real` only after that mid-stream trigger was actually
+driven; if you could not drive it, name the untested trigger in the facet's
+`evidence` and do not claim the reported environment in the verdict.
 
 Judge **each sub-symptom** honestly and independently:
 
@@ -639,40 +654,58 @@ saved under `recordings/<slug>/` in your workspace. **See
 [`dev/recording-lanes.md`](../recording-lanes.md) for the full how-to** — which
 surface to drive, standing the recorder's server up (build the SPA first, strip
 leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal` /
-`cli` / `desktop`), plus the empty-recordings and caption rules. This section states only
+`cli` / `desktop`), plus the empty-recordings and caption rules. Burn timed
+step-by-step captions into each new clip using `dev/caption_recording.py` and
+inspect the render as described there before handing it off. This section states only
 *which clip repro-agent produces*. Use the selected regression test when it can
 drive that surface. Otherwise reuse or create a separate temporary recording
 driver for the observed journey. Keep its source and command in the evidence
 for Resolve to re-record; producing footage does not require selecting that
 driver as permanent regression coverage.
 
-- a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): use the
-  journey driver to reproduce and verify the failure, but film only the product surface
-  and the user-visible bug (e.g. `recordings/1234/before-picker.webm`). Never film
-  pytest, assertion output, or the test source.
+- a **`reproduced`** or **`likely_repro`** facet → **before-fix footage**
+  (`kind: "before"`): use the journey driver to reproduce and verify the failure,
+  but film only the product surface and the user-visible bug (captioned output:
+  `recordings/1234/before-picker.mp4`). Never film pytest, assertion output, or
+  the test source. A `likely_repro` clip films the stand-in you drove; its
+  caption names that stand-in.
 - an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): use
   a journey driver to verify the passing journey, while the video shows only
-  the product behaving correctly (e.g. `recordings/1234/fixed-picker.webm`).
+  the product behaving correctly (captioned output: `recordings/1234/fixed-picker.mp4`).
 
-`not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
-Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
+`not_reproduced`, `needs_more_info`, and `needs_manual_review` facets have
+nothing to film — skip them.
+Keep raw captures under `recordings/<slug>/raw/<before|fixed>-<facet>.<ext>`.
+Declare the inspected captioned MP4, or use the shared guide's explicit
+`uncaptioned-<kind>-<facet>.<ext>` fallback if captioning fails.
 
 Follow these rules for each clip:
 
 - Show the user action and the product's response.
-- **Caption the screen from screen evidence.** Compare claimed outcomes with
-  inspected frames or visible-state assertions from the clip. Backend storage
-  and logs do not establish what the UI displayed; keep those findings in
-  `evidence`. Correct captions that conflict with the frames.
+- **Caption the screen from screen evidence.** Check that claimed elements are
+  in view and unobstructed, and quote only visibly rendered text. DOM attributes,
+  hidden accessibility labels and backend logs are not screen evidence. Disclose
+  unavailable frame inspection and limit claims to verified states. Follow
+  `dev/recording-lanes.md` and correct captions that conflict with the frames.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.
 - For internal/API-only results with no visible user interaction, written
   evidence is enough. Set `recordings: []` and describe the result in `evidence`.
+- An absence is filmable. When the bug is that nothing happens (a parent chat
+  never shows its sub-agent's return, a toast never appears), film the
+  triggering action and the screen staying in that stale state, with whatever
+  error the product does show, for longer than a healthy response takes.
 - If recording is blocked by missing tools or an environment that cannot run
   the journey, set `recordings: []` and name the specific blocker in
   `recording_unavailable_reason`. Do not block the verdict because footage is
   missing or rejected; explain the gap and continue.
+- A blocker is the observed result of a recorder run. When the preflight
+  recorder check passed, point the recorder at the facet's lane before declaring
+  it blocked, and name the command you ran and its observed error in
+  `recording_unavailable_reason`. "The recorder was not stood up", a
+  multi-process journey, a flaky native boot, or a bug that is an absence are
+  not blockers; a reason that names no attempted recorder run is insufficient.
 
 ## Output — the reproduction artifacts
 
@@ -733,7 +766,7 @@ choice:
   ],
   "test_path": "tests/e2e_ui/model_catalog/test_1234.py",
   "recordings": [
-    {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm",
+    {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.mp4", "format": "mp4",
      "capture_mode": "playwright_ui",
      "caption": "open the model picker → select the catalog → picker shows raw IDs instead of names"}
   ],
@@ -818,16 +851,18 @@ Field meanings:
   connection checks, and keep unexercised outcomes unverified throughout the handoff.
 - `recordings` — the Step 4 captures: a list of
   `{"surface", "kind", "path", "format", "capture_mode", "caption"}` objects. `kind` is
-  `"before"` for a `reproduced` facet's failing run or `"fixed"` for an
-  `already_fixed` facet's passing run (the fix step later re-records the same
-  drivers post-fix as `"after"`); `path` workspace-relative. `caption` is a
-  short, human-readable description of **the actions this specific clip
-  performs**, written as the ordered steps a viewer will watch and ending in
+  `"before"` for a `reproduced` or `likely_repro` facet's failing run or
+  `"fixed"` for an `already_fixed` facet's passing run (the fix step later
+  re-records the same drivers post-fix as `"after"`); `path` workspace-relative.
+  `caption` is a short, human-readable description of **the actions this specific
+  clip performs**, written as the ordered steps a viewer will watch and ending in
   what the clip shows — e.g. `"start a session → open the model picker → select
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
   behavior (the journey completing). Each screen claim comes from screen
-  evidence, not from a transcript or API check (Step 4). This is per-recording
+  evidence, not from a transcript, API check, or DOM attribute read (Step 4). This attachment description
+  is separate from the timed captions burned into the video using
+  `dev/caption_recording.py`. This is per-recording
   (each clip drives its own steps), distinct from the bug-level `journey`
   field. `capture_mode` is one of the surface-appropriate values in
   `dev/recording-lanes.md`. Keep an authored-but-unrendered VHS tape in the
@@ -839,7 +874,9 @@ Field meanings:
   - For internal/API-only results, say there is no visible user interaction
     and put the written evidence in `evidence`.
   - For a recording failure, name the missing tool or the environment problem.
-    Text-only CLI output is not a reason to skip recording.
+    When the preflight recorder check passed, name the recorder command you ran
+    and its observed error; a reason that names no attempted recorder run is
+    insufficient. Text-only CLI output is not a reason to skip recording.
   - Do not substitute a video of test output or a made-up demonstration.
 
 Keep other prose terse, but include the full manual reproduction recipe and

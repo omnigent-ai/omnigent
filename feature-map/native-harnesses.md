@@ -57,6 +57,10 @@ view appear in the session.
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
 
+**Approval inbox:** open Inbox in the sidebar to answer a pending permission
+without opening its session. Antigravity's Chat and Inbox cards both offer
+the advertised session and saved-rule choices.
+
 **Skill contents:** Settings → Harnesses → configured harness card (or gear),
 then Skills → a skill, or Plugins → a plugin → a skill. Back returns to the
 list or plugin.
@@ -130,6 +134,14 @@ the extra fields. Resolver and raw-tunnel checks:
 
 Cross-harness journeys:
 
+- **Antigravity permission choices (Chat and Inbox):**
+  `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`
+  uses a recorded permission prompt and the real server to check both choices
+  on both surfaces. Chat records the choice as requested, since Antigravity
+  does not confirm rule persistence. This does not run a live Antigravity
+  terminal or prove that a rule is saved. Saved rules belong to the current
+  Omnigent session; new sessions have separate settings.
+
 - **`launch-cli` and `launch-web`, Pi CLI compatibility (own environment):**
   `tests/e2e/test_pi_native_cli_version_floor_e2e.py::test_real_pi_cli_version_floor`
   runs real unsupported and supported npm Pi installations through `omnigent pi`
@@ -179,12 +191,17 @@ Cross-harness journeys:
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_preserves_supported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_switch_clamps_inherited_effort`,
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_pick_recreates_closed_terminal`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_combined_model_and_reset_uses_target_default`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_effort_reset_survives_next_turn`.
   These own their environment: run with plain `uv run pytest`. They drive a
   real Codex TUI and REST session settings, checking the outgoing Responses
   effort, native settings, private config, and session state. Only the model
-  replies are mocked; models absent from the installed CLI are skipped.
+  replies are mocked; models absent from the installed CLI are skipped. Set
+  `OMNIGENT_TEST_CODEX_STANDARD_MODEL` (low..xhigh), `OMNIGENT_TEST_CODEX_EXTENDED_MODEL`
+  (max/ultra), and `OMNIGENT_TEST_CODEX_SWITCH_MODEL` (a different default) to
+  substitute models; a configured model the installed catalog lacks fails
+  instead of skipping, and replies stay on the local mock server.
   Existing-session cases also require the picker to show the applied effort
   when an unsupported request clamps back to the already active native value.
   Concurrent runner controls are covered by
@@ -232,9 +249,17 @@ Cross-harness journeys:
   An older server resets the previous model first, even with an updated runner;
   its default is then inherited if the target supports it. On older servers,
   switch models first and select Default as a separate action afterward.
-  While a connected runner is still starting Codex and has no loaded bridge,
-  live settings return a retryable 503 and retain the previous selection.
-  Retry once the terminal is ready; fully offline and silent saves remain deferred.
+  On a connected runner, live settings recreate an idle-reaped Codex pane and
+  wait up to 15 seconds for startup to publish its bridge. An unloaded saved
+  thread is resumed once before retrying a rejected update. Overlapping picks
+  retain their apply order, including while recovery is in progress
+  (`tests/server/integration/test_codex_model_change_after_idle_reap.py`).
+  A refused connection to an owned backend whose process has exited replaces
+  that exact launch once within the same readiness budget, then confirms the
+  settings RPC. A replacement backend, live process, authentication refusal,
+  or failure after sending settings is not replayed.
+  Failed startup or resume returns a retryable 503 and retains the previous
+  selection; fully offline and silent saves remain deferred.
   An older server keeps such a refused change, so the updated runner applies it
   on the next turn; an older runner keeps it itself, so the updated server keeps
   it too. A hung connect fails after five seconds; a hung update is unconfirmed,
@@ -270,6 +295,14 @@ Cross-harness journeys:
   retain their endpoint; history, model, effort and permissions survive.
   `tests/harnesses/codex_native/session/test_terminal_prepare.py::test_prepare_codex_terminal_resumes_with_launch_provider`
   covers the CLI resume call site with configured and unpinned launches.
+- **`resume`, Codex `/new` followed by Stop session and a new message:**
+  `tests/e2e/test_codex_rotated_bridge_relaunch_e2e.py::test_rotated_codex_session_relaunches_into_its_bridge_directory`
+  (own environment, real server, host, runner, Codex and tmux; local model replies)
+  starts a conversation, runs `/new` in the native terminal, and verifies the
+  rotated conversation before stopping its runner. A chat message relaunches
+  the session, then a terminal message verifies the reattached TUI. It covers
+  retained bridge state and an absent bridge directory. Machine-wide Codex
+  managed settings require an isolated container for the local model endpoint.
 - **`chat-render`, `steer`, per harness:** use the matrix.
 - **`chat-render`, Claude shell commands from the web composer:**
   `tests/browser_ui/chat/test_native_shell_settlement.py::test_shell_mirror_settles_its_bubble_before_the_next_prompt`
@@ -280,6 +313,15 @@ Cross-harness journeys:
   covers the real CLI and transcript forwarder through the repro environment.
   It requires Claude Code and tmux; machine-managed Claude settings need an
   isolated container for the scripted model endpoint.
+  If shell mode or the prompt-history search still occupies Claude Code's input
+  box after Omnigent tries to dismiss it with Escape, the web message is refused
+  with a notice to open the terminal, dismiss it, and resend. No message text is
+  typed into the pane.
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_refuses_a_shell_mode_draft_escape_cannot_clear`
+  covers the refusal with a fake tmux (plain `uv run pytest`);
+  `tests/e2e_ui/messages/test_claude_native_refused_delivery_persistence.py::test_claude_refused_message_survives_reload`
+  (own environment; a scripted stand-in for the Claude TUI and real tmux) checks
+  that the refused input is still shown after a reload.
 - **`chat-render`, Claude shell commands from the agent terminal:**
   `tests/browser_ui/chat/test_native_shell_settlement.py::test_terminal_shell_commands_keep_their_user_turns`
   replays terminal-origin records in the built SPA at desktop and phone widths.
@@ -325,7 +367,8 @@ Cross-harness journeys:
   a web message through the public bridge into a real retained dead tmux pane.
   It checks prompt budgets equal to the hard cap and early exit detection with
   longer budgets. `test_claude_native_slow_ready.py` checks successful delivery
-  after slow startup, an early crash, and the live-pane timeout. These tests
+  after slow startup, an early crash, the live-pane timeout, and content-free
+  failing-operation evidence when tmux exits after readiness. These tests
   exercise the injection used by existing-session and first-message composers;
   CLI typing bypasses the web injection gate. They do not run a vendor model.
 - **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**

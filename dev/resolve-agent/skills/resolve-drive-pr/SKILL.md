@@ -1,6 +1,6 @@
 ---
 name: resolve-drive-pr
-description: Drive an open PR through current CI, independent Polly and OCR reviews, preview, and maintainer handoff.
+description: Drive an open PR through Polly/OCR, validation, and maintainer handoff.
 ---
 
 # Drive an open PR
@@ -9,13 +9,13 @@ Read each resource when reaching its substep, preserving the publication mode:
 
 | Substep | Resource |
 | --- | --- |
-| 4.2, current CI and mergeability | [ci.md](ci.md) |
-| 4.3, independent Polly and OCR reviews | [polly.md](polly.md) |
-| 4.1, preview after CI and both reviews are clean | [preview.md](preview.md) |
+| 4.2, current CI and mergeability | `ci.md` in the shared `otto-drive-pr` skill (load it) |
+| 4.3, independent Polly and OCR reviews | the shared `otto-pr-review-loop` skill (load it) |
+| 4.1, preview after CI and both reviews are clean | `preview.md` in the shared `otto-drive-pr` skill (load it) |
 | 4.4, live-validation instructions | [validation-prompt.md](validation-prompt.md) |
 | 4.5, final review and maintainer handoff | [final-review.md](final-review.md) |
 
-Use `read_skill_file` with this skill name and the relative filename, or read
+Use `read_skill_file` with the owning skill's name and the relative filename, or read
 relative to the directory supplied by the native Skill tool. Workflow-owned
 author runs read only `validation-prompt.md` for deferred body preparation;
 local-only author runs skip this skill. Review-remediation follows its mode's
