@@ -6,7 +6,7 @@ agp = "9.1.1"
 androidxCore = "1.18.0"
 androidxActivity = "1.12.4"
 androidxWebkit = "1.15.0"
-androidxBrowser = "1.9.0"
+androidxBrowser = "1.10.0"
 # AppCompat 1.8.x is currently in preview; stick with the latest stable 1.7.x.
 androidxAppcompat = "1.7.1"
 junit = "4.13.2"
