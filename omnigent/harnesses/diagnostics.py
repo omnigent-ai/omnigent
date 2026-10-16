@@ -288,12 +288,9 @@ _YES_NO_PROMPT = re.compile(
     r"[(\[](?:y/n|yes/no)[)\]][ \t]*:?[ \t]*$", re.IGNORECASE | re.MULTILINE
 )
 _TRACEBACK_HEADER = "Traceback (most recent call last):"
-# A traceback's frames are indented, so its exception is the first unindented line naming one.
-_EXCEPTION_LINE = re.compile(
-    r"^((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:Error|Exception|Expired|Exit|Interrupt|Timeout))"
-    r"(?::|[ \t]*$)",
-    re.MULTILINE,
-)
+# A traceback's frames are indented, so its exception ("pkg.FooError: …", "Abort") is
+# the first unindented line after the header.
+_EXCEPTION_LINE = re.compile(r"((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)(?::.*)?")
 _BOX_DRAWING = frozenset("─━│┃╭╮╯╰┌┐└┘├┤┬┴┼═║╔╗╚╝")
 
 
@@ -319,7 +316,9 @@ def describe_pane_shape(screen: str | None) -> dict[str, str | int]:
         shape["pane_state"] = "blank"
     elif _TRACEBACK_HEADER in screen:
         shape["pane_state"] = "traceback"
-        raised = _EXCEPTION_LINE.search(screen.rsplit(_TRACEBACK_HEADER, 1)[1])
+        block = screen.rsplit(_TRACEBACK_HEADER, 1)[1].splitlines()
+        first = next((line for line in block if line.strip() and not line[0].isspace()), "")
+        raised = _EXCEPTION_LINE.fullmatch(first.rstrip())
         if raised:
             # The class name alone: a module path can name the person's own code.
             shape["pane_traceback_type"] = raised[1].rsplit(".", 1)[-1][:80]

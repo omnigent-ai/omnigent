@@ -365,6 +365,9 @@ async def test_observer_outlives_a_diagnostics_failure(
     assert "terminal_last_output" not in {
         k for r in caplog.records for k, v in getattr(r, "attributes", {}).items() if v
     }
+    # The text-free shape was taken before the sanitizer failed, so it is kept.
+    (slow,) = [r for r in caplog.records if r.event_name == "terminal_interactive_slow"]
+    assert slow.attributes["pane_state"] == "text"
 
 
 @pytest.mark.asyncio

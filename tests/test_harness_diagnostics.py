@@ -479,6 +479,12 @@ _PANE_TEXT = "example-repo"
         ),
         (
             "Traceback (most recent call last):\n"
+            '  File "/srv/app/cli.py", line 7, in main\n'
+            "click.exceptions.Abort\n",
+            {"pane_state": "traceback", "pane_lines": 3, "pane_traceback_type": "Abort"},
+        ),
+        (
+            "Traceback (most recent call last):\n"
             '  File "launcher.py", line 2\n'
             "KeyboardInterrupt\n",
             {
@@ -508,6 +514,7 @@ _PANE_TEXT = "example-repo"
         "whitespace",
         "traceback",
         "traceback-own-exception-not-later-output",
+        "traceback-unsuffixed-exception",
         "traceback-bare-exception",
         "yes-no-prompt",
         "dialog",

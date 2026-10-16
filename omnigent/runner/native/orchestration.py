@@ -454,12 +454,12 @@ async def _observe_terminal_interactive(
         raise
     except Exception as exc:  # noqa: BLE001 — observer failure must not fail session creation
         # A stopped pane's tail stays with its exit records; only its shape is taken here.
-        if isinstance(exc, TimeoutError):
-            tail, sign_in_prompt, shape = await _stalled_pane_diagnostics(instance)
-        elif not instance.running:
+        if not instance.running:
             tail, sign_in_prompt, shape = None, None, _stopped_pane_shape(instance)
+        elif isinstance(exc, TimeoutError):
+            tail, sign_in_prompt, shape = await _stalled_pane_diagnostics(instance)
         else:
-            tail, sign_in_prompt, shape = None, None, {}
+            tail, sign_in_prompt, shape = None, None, {"pane_state": "unreadable"}
         unobserved_event = debug_event("terminal_interactive_unobserved", session_id=session_id)
         unobserved_event["attributes"] = {
             "harness": harness,
@@ -5716,6 +5716,7 @@ async def _stalled_pane_diagnostics(
         detect_sign_in_prompt,
     )
 
+    shape: dict[str, str | int] = {}
     try:
         screen = await _read_pane_screen_or_none(instance)
         shape = describe_pane_shape(screen)
@@ -5728,7 +5729,7 @@ async def _stalled_pane_diagnostics(
         _logger.debug(
             "Stalled pane diagnostics failed for %s", instance.diagnostic_id, exc_info=True
         )
-        return None, False, {}
+        return None, False, shape
 
 
 def _stopped_pane_shape(instance: TerminalInstance) -> dict[str, str | int]:
