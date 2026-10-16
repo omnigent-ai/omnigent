@@ -1464,7 +1464,10 @@ describe("ForkSessionDialog", () => {
             sandbox_provider_capabilities: { static: { reusable_hosts: true } },
           },
         });
-        fireEvent.click(screen.getByRole("button", { name: "Choose existing static sandbox…" }));
+        openHostSelect();
+        const options = screen.getAllByRole("option");
+        expect(options.at(-1)).toHaveTextContent("Existing Static Sandbox");
+        fireEvent.click(screen.getByRole("option", { name: "Existing Static Sandbox" }));
         fireEvent.click(await screen.findByRole("button", { name: /Existing box/ }));
         await waitFor(() =>
           expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Existing box"),

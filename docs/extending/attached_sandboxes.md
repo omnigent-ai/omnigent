@@ -50,7 +50,8 @@ the existing registry, backed by their own controller.
 
 ## Discover and reuse existing boxes
 
-**Choose existing static sandbox…** in New session and Clone session lists the
+**+ Existing Static Sandbox** at the bottom of the host picker in New session
+and Clone session lists the
 controller's inventory for the authenticated caller. Users can have several
 boxes, including ones created before they used Omnigent. Opening or refreshing
 the list does not register, wake, or create anything. Selecting a box uses the
@@ -206,8 +207,8 @@ entry to wake it. Ordinary ad hoc sandbox hosts must never appear in that menu.
 Use separate directories or the existing worktree option for concurrent edits.
 
 Create another session with **New static sandbox** and verify it gets a different
-box. Have the controller create a box independently, then choose **Choose existing
-static sandbox…**, select it and start a session. Refreshing the list must not
+box. Have the controller create a box independently, then choose **+ Existing
+Static Sandbox**, select it and start a session. Refreshing the list must not
 start any boxes. Repeat selection and verify the same host registration is reused.
 
 ## Prototype limits

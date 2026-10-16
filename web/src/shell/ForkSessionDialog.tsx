@@ -9,6 +9,7 @@ import {
   GitBranchIcon,
   InfoIcon,
   MonitorIcon,
+  PlusIcon,
   TriangleAlertIcon,
 } from "lucide-react";
 import {
@@ -22,6 +23,7 @@ import {
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
   SelectSeparator,
   SelectTrigger,
@@ -100,6 +102,7 @@ import {
 // non-empty value). When chosen, the fork omits agent_id and the server
 // clones the source's agent.
 const SAME_AS_SOURCE = "__same__";
+const DISCOVER_SANDBOX_PREFIX = "__discover_static:";
 
 // This dialog's pickers use the compact `text-sm` font (matching the Agent
 // field), on both the trigger value and the open dropdown's options. Items set
@@ -1516,6 +1519,10 @@ function SupportedForkSessionForm({
                   }
                   componentId="fork_session.host"
                   onValueChange={(v) => {
+                    if (v.startsWith(DISCOVER_SANDBOX_PREFIX)) {
+                      setDiscoveryProvider(v.slice(DISCOVER_SANDBOX_PREFIX.length));
+                      return;
+                    }
                     const provider = sandboxHostChoiceProvider(v);
                     if (provider !== undefined) {
                       selectSandbox(provider);
@@ -1586,23 +1593,29 @@ function SupportedForkSessionForm({
                         <HostLabel host={host} />
                       </SelectItem>
                     ))}
+                    {managedSandboxesEnabled &&
+                      sandboxProviderRows.map((provider) =>
+                        provider !== null &&
+                        info.sandbox_provider_capabilities?.[provider]?.reusable_hosts ? (
+                          <SelectGroup key={`discover-${provider}`}>
+                            <SelectSeparator />
+                            <SelectItem
+                              value={`${DISCOVER_SANDBOX_PREFIX}${provider}`}
+                              className="text-muted-foreground"
+                            >
+                              <span className="flex items-center gap-2">
+                                <PlusIcon className="size-4" aria-hidden="true" />
+                                <span>
+                                  Existing Static Sandbox
+                                  {sandboxProviderRows.length > 1 && ` (${provider})`}
+                                </span>
+                              </span>
+                            </SelectItem>
+                          </SelectGroup>
+                        ) : null,
+                      )}
                   </SelectContent>
                 </Select>
-                {managedSandboxesEnabled &&
-                  sandboxProviderRows.map((provider) =>
-                    provider !== null &&
-                    info.sandbox_provider_capabilities?.[provider]?.reusable_hosts ? (
-                      <Button
-                        key={`discover-${provider}`}
-                        variant="ghost"
-                        className="self-start"
-                        onClick={() => setDiscoveryProvider(provider)}
-                      >
-                        Choose existing static sandbox…
-                        {sandboxProviderRows.length > 1 && ` (${provider})`}
-                      </Button>
-                    ) : null,
-                  )}
                 {discoveryProvider !== null && (
                   <StaticSandboxPicker
                     provider={discoveryProvider}

@@ -7077,19 +7077,6 @@ export function NewChatLandingScreen() {
                               </Tooltip>
                             </DropdownMenuItem>
                           ))}
-                        {managedSandboxesEnabled &&
-                          sandboxProviderRows.map((provider) =>
-                            provider !== null &&
-                            info.sandbox_provider_capabilities?.[provider]?.reusable_hosts ? (
-                              <DropdownMenuItem
-                                key={`discover-${provider}`}
-                                onSelect={() => setDiscoveryProvider(provider)}
-                              >
-                                Choose existing static sandbox…
-                                {sandboxProviderRows.length > 1 && ` (${provider})`}
-                              </DropdownMenuItem>
-                            ) : null,
-                          )}
                         {cloudHosts.map(renderHostMenuItem)}
                         {showArcaOption && (
                           <DropdownMenuItem
@@ -7191,6 +7178,23 @@ export function NewChatLandingScreen() {
                           </>
                         )}
                         <DropdownMenuSeparator />
+                        {managedSandboxesEnabled &&
+                          sandboxProviderRows.map((provider) =>
+                            provider !== null &&
+                            info.sandbox_provider_capabilities?.[provider]?.reusable_hosts ? (
+                              <DropdownMenuItem
+                                key={`discover-${provider}`}
+                                onSelect={() => setDiscoveryProvider(provider)}
+                                className="composer-host-connect text-muted-foreground"
+                              >
+                                <PlusIcon className="size-4" aria-hidden="true" />
+                                <span>
+                                  Existing Static Sandbox
+                                  {sandboxProviderRows.length > 1 && ` (${provider})`}
+                                </span>
+                              </DropdownMenuItem>
+                            ) : null,
+                          )}
                         {/* Persistent escape hatch: open the connect-a-host
                     instructions. Present even with zero hosts so a fresh user
                     is never stuck. */}

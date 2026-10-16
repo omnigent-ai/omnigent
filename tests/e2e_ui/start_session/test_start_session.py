@@ -3560,7 +3560,9 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(built_spa, 
                 await page.goto(f"{base_url}/")
                 chip = page.get_by_test_id("new-chat-landing-host-chip")
                 await chip.click()
-                await page.get_by_role("menuitem", name="Choose existing static sandbox").click()
+                await page.get_by_role(
+                    "menuitem", name="Existing Static Sandbox", exact=True
+                ).click()
                 discovery = page.get_by_role("dialog", name="Choose existing static sandbox")
                 await expect(discovery.get_by_role("alert")).to_contain_text("Could not load")
                 await discovery.get_by_role("button", name="Refresh").click()
@@ -3594,6 +3596,11 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(built_spa, 
                 row = page.get_by_test_id("new-chat-landing-host-host_devbox")
                 await expect(row).to_be_visible()
                 await expect(row).to_contain_text("Asleep")
+                menu = page.get_by_test_id("new-chat-landing-host-menu")
+                await expect(menu.get_by_role("menuitem").nth(-2)).to_have_text(
+                    "Existing Static Sandbox"
+                )
+                await expect(menu.get_by_role("menuitem").last).to_have_text("Connect new host")
                 await expect(
                     page.get_by_test_id("new-chat-landing-host-host_adhoc")
                 ).to_have_count(0)
