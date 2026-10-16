@@ -359,21 +359,43 @@ def test_mark_launch_default_preserves_a_hidden_configured_default() -> None:
 
 
 def test_mark_launch_default_prefers_omnigent_default_over_codex_default() -> None:
-    """An unpinned catalog prefers Sol over Codex's current catalog default."""
+    """An unpinned catalog prefers Luna over Codex's current catalog default."""
+    from omnigent.harnesses.codex_native.app_server import mark_launch_default
+
+    # Sol precedes Luna in the listing so crowning Luna proves preference order
+    # decides the default, not merely the first preferred arm the listing shows.
+    rows = [
+        {"id": "gpt-6-astra", "isDefault": True},
+        {"id": "system.ai.gpt-5-6-sol"},
+        {"id": "gpt-6-luna"},
+    ]
+
+    assert mark_launch_default(rows, None) == [
+        {"id": "gpt-6-astra"},
+        {"id": "system.ai.gpt-5-6-sol"},
+        {"id": "gpt-6-luna", "isDefault": True},
+    ]
+    assert mark_launch_default(rows, "gpt-6-astra") == [
+        {"id": "gpt-6-astra", "isDefault": True},
+        {"id": "system.ai.gpt-5-6-sol"},
+        {"id": "gpt-6-luna"},
+    ]
+
+
+def test_mark_launch_default_keeps_sol_on_a_catalog_that_predates_luna() -> None:
+    """An older codex catalog without GPT-6 Luna still launches on Sol, not Astra."""
     from omnigent.harnesses.codex_native.app_server import mark_launch_default
 
     rows = [
         {"id": "gpt-6-astra", "isDefault": True},
         {"id": "system.ai.gpt-5-6-sol"},
+        {"id": "gpt-5.6-luna"},
     ]
 
     assert mark_launch_default(rows, None) == [
         {"id": "gpt-6-astra"},
         {"id": "system.ai.gpt-5-6-sol", "isDefault": True},
-    ]
-    assert mark_launch_default(rows, "gpt-6-astra") == [
-        {"id": "gpt-6-astra", "isDefault": True},
-        {"id": "system.ai.gpt-5-6-sol"},
+        {"id": "gpt-5.6-luna"},
     ]
 
 

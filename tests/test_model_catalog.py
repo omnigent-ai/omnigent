@@ -38,7 +38,12 @@ from omnigent.models.model_catalog import (
     resolve_model_provider,
     spec_harness,
 )
-from omnigent.models.model_fallbacks import _SMART_ROUTING_FALLBACKS, CODEX_DEFAULT_MODEL
+from omnigent.models.model_fallbacks import (
+    _SMART_ROUTING_FALLBACKS,
+    BACKGROUND_TITLE_CODEX_ECONOMY_MODEL,
+    CODEX_DEFAULT_MODEL,
+    CODEX_LAUNCH_DEFAULT_PREFERENCE,
+)
 from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -1287,17 +1292,33 @@ def test_static_model_fallbacks_document_ownership(table_key: str) -> None:
 
 
 def test_codex_default_model_names_a_concrete_variant() -> None:
-    """The codex launch default is codex's own spelling of a tiered model.
+    """The codex launch defaults are concrete slugs in codex's own spelling.
 
-    The bundled OpenAI catalog's newest row is ``gpt-5.6``, which codex
-    rejects as a family name, and codex's backend 400s the hyphenated
-    Databricks serving spelling — the default must be a dotted concrete
-    variant codex serves.
+    A family alias is not safe for launch code that pins a concrete model, and
+    codex's backend 400s the hyphenated Databricks spelling. The preference
+    leads with Luna; CODEX_DEFAULT_MODEL is the trailing Sol arm, which a path
+    that cannot read the installed catalog can pin on an older codex too.
     """
-    assert not CODEX_DEFAULT_MODEL.startswith("databricks-")
-    assert codex_spawn_model(CODEX_DEFAULT_MODEL) == CODEX_DEFAULT_MODEL
-    # A bare family alias has no tier segment after the dotted version.
-    assert re.fullmatch(r"gpt-\d+\.\d+", CODEX_DEFAULT_MODEL) is None
+    assert CODEX_LAUNCH_DEFAULT_PREFERENCE == ("gpt-6-luna", "gpt-5.6-sol")
+    assert CODEX_LAUNCH_DEFAULT_PREFERENCE[-1] == CODEX_DEFAULT_MODEL
+    for model in CODEX_LAUNCH_DEFAULT_PREFERENCE:
+        assert not model.startswith("databricks-")
+        assert codex_spawn_model(model) == model
+        # A bare family alias has no tier segment after the version.
+        assert re.fullmatch(r"gpt-\d+(\.\d+)?", model) is None
+
+
+def test_background_title_codex_economy_model_stays_catalog_compatible() -> None:
+    """The codex background-title pin names an arm older codex CLIs still serve.
+
+    Background titles launch with ``--model`` without reading the installed
+    codex catalog, so the economy pin stays on a GPT-5.x arm; GPT-6 Luna ships
+    only from codex 0.157.0 and its backend rejects it on older CLIs.
+    """
+    assert BACKGROUND_TITLE_CODEX_ECONOMY_MODEL == "gpt-5.6-luna"
+    assert codex_spawn_model(BACKGROUND_TITLE_CODEX_ECONOMY_MODEL) == (
+        BACKGROUND_TITLE_CODEX_ECONOMY_MODEL
+    )
 
 
 def test_cursor_listing_uses_live_cli_base_models(
