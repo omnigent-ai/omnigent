@@ -2,7 +2,7 @@
 # module builds against. AGP 9.x and the newest androidx libs are required for
 # compileSdk 36+, so these versions move together rather than one at a time.
 [versions]
-agp = "9.1.1"
+agp = "9.4.1"
 androidxCore = "1.18.0"
 androidxActivity = "1.12.4"
 androidxWebkit = "1.15.0"
