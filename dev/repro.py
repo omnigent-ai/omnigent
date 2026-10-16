@@ -33,7 +33,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -42,19 +41,11 @@ from typing import NoReturn
 # dev/repro.py → repo root is the parent of dev/.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _AGENT_REL = "dev/repro-agent"
-_PREPARED_AGENT_FILES = ("config.yaml", "AGENTS.md")
 
 
 def _die(msg: str) -> NoReturn:
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(1)
-
-
-def _copy_prepared_agent(source: Path, worktree: Path) -> None:
-    target = worktree / _AGENT_REL
-    target.mkdir(parents=True, exist_ok=True)
-    for name in _PREPARED_AGENT_FILES:
-        shutil.copy2(source / name, target / name)
 
 
 def _launch_env(bug_url: str) -> dict[str, str]:
@@ -209,16 +200,12 @@ def main() -> None:
     except WorktreeError as exc:
         _die(f"could not create worktree: {exc}")
     worktree = Path(created.worktree_path)
-    try:
-        _copy_prepared_agent(agent_dir, worktree)
-    except OSError as exc:
-        _die(f"could not prepare agent in worktree: {exc}")
     print(f"→ worktree: {worktree}  (branch {created.branch})")
 
     # Run the agent FROM the worktree so the worktree is its workspace (local
-    # mode uses the runner's cwd as the workspace). dev/repro-agent resolves
-    # relative to the worktree, which is a full checkout of the same commit.
-    cmd = ["omnigent", "run", _AGENT_REL, "-p", prompt]
+    # mode uses the runner's cwd as the workspace). Use the source agent path
+    # so local preparation does not dirty the reproduction branch.
+    cmd = ["omnigent", "run", str(agent_dir), "-p", prompt]
     if args.server is not None:
         cmd += ["--server", args.server]
 
