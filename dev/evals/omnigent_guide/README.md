@@ -43,7 +43,12 @@ it, using facts `referee_probe.py` reads from that build:
 
 The fabrication rate is the share of answers with at least one claim that
 does not exist in that build. Mentions the answer itself negates ("there is no
-`omnigent schedule` command") do not count.
+`omnigent schedule` command") do not count. Two near cases are reported
+separately: a real key name in the wrong place (for example a single-file key
+in a bundle `config.yaml`) counts as invalid config, and a name that only the
+newest build has (`--latest`) counts as a version mismatch. A key name is
+invented when the spec loaders never use it and, for a compound name such as
+`omnigent_mcp`, nothing else in the package does either.
 
 ## Arms
 
@@ -72,7 +77,7 @@ run.py sessions --arms OUT/arms.json --out RESULTS --split test --runs 2 \
 run.py sessions --arms NATIVE_ARMS.json --out RESULTS --split test --runs 1 \
   --harness claude-native --arm a0 --arm a3
 run.py grade --arms OUT/arms.json --out RESULTS --profile dev --site-routes routes.txt \
-  --judge llama=databricks-llama-4-maverick --judge gptoss=databricks-gpt-oss-120b
+  --latest a3 --judge llama=databricks-llama-4-maverick --judge gptoss=databricks-gpt-oss-120b
 run.py report --arms OUT/arms.json --out RESULTS --pair a3:a0 --pair a1:a0 --pair a2:a1 \
   --pair a3:a2 --pair a4:a3 --pair t3:t0 --pair s3:s0
 run.py blind --out RESULTS --size 40   # sample for a maintainer to label
@@ -85,7 +90,10 @@ start. `report` pairs arms by case and gives 95% bootstrap intervals over
 cases for the pass rate, the fabrication rate, and how often the guide
 loaded. It also shows where agents looked things up (docs pinned to their own
 release tag, main, `llms.txt`, CLI help) and how much lost score sits in
-answers with a fabrication.
+answers with a fabrication. A docs fetch counts as successful only when it
+returned text, because a piped `curl -s` exits 0 with no output when it
+fails. `grade` reuses judge verdicts for answers it graded before, so a
+referee change re-grades every arm in about a minute.
 
 `routes.txt` lists omnigent.ai paths, one per line, from the site's source
 repository: its pages (`app/**/page.*`, `public/`) and the literal redirect

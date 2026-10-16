@@ -15,11 +15,13 @@ from dev.evals.omnigent_guide.record import INFRA_ERROR, GradedRun
 from dev.evals.omnigent_guide.stats import agreement, paired_bootstrap
 
 #: Per-case metrics, each a mean over that case's runs.
-METRICS = ("score", "fabricated", "loaded", "yaml_invalid")
+METRICS = ("score", "score_completed", "fabricated", "loaded", "yaml_invalid")
 _RAW_RE = re.compile(r"raw\.githubusercontent\.com/omnigent-ai/omnigent/([^/\s\"']+)/")
+# A piped `curl -s` exits 0 with empty output when it fails, so the exit code
+# says nothing; a fetch succeeded only when it returned text without these.
 _FETCH_FAILED_RE = re.compile(
-    r"404: Not Found|Could not resolve host|Couldn't connect|Operation not permitted|"
-    r"\"exit_code\": (?!0[,}])\d+"
+    r"404: Not Found|Could not resolve host|Failed to connect|Couldn't connect|"
+    r"Operation not permitted|curl: \(\d+\)|hook error|BLOCKED:"
 )
 _HELP_RE = re.compile(r"\bomni(gent)?\b[^\n]*(--help|\s-h\b)")
 _VERSION_RE = re.compile(r"\bomni(gent)?\s+--version")
@@ -28,7 +30,7 @@ _SOURCE_KEYS = (
     "pinned_other",
     "main",
     "llms_txt",
-    "fetch_failed",
+    "doc_fetch_ok",
     "cli_help",
     "cli_version",
 )
@@ -39,7 +41,8 @@ def doc_sources(runs: Sequence[GradedRun], version: str) -> dict[str, float]:
     How the agent looked things up, as a share of *runs*.
 
     ``pinned_own`` counts runs that fetched repo docs at the build's own
-    release tag (``v0.18.0`` for 0.18.0); ``main`` counts fetches from main.
+    release tag (``v0.18.0`` for 0.18.0); ``main`` counts fetches from main;
+    ``doc_fetch_ok`` counts runs where at least one repo docs fetch returned text.
     """
     if not runs:
         return {}
@@ -55,8 +58,8 @@ def doc_sources(runs: Sequence[GradedRun], version: str) -> dict[str, float]:
                     seen.add("pinned_own")
                 else:
                     seen.add("main" if ref == "main" else "pinned_other")
-                if _FETCH_FAILED_RE.search(out):
-                    seen.add("fetch_failed")
+                if _fetch_returned_text(out):
+                    seen.add("doc_fetch_ok")
             if "omnigent.ai/llms" in args:
                 seen.add("llms_txt")
             if _HELP_RE.search(args):
@@ -65,6 +68,18 @@ def doc_sources(runs: Sequence[GradedRun], version: str) -> dict[str, float]:
                 seen.add("cli_version")
         counts.update(seen)
     return {key: counts[key] / len(runs) for key in _SOURCE_KEYS}
+
+
+def _fetch_returned_text(output: str) -> bool:
+    try:
+        parsed = json.loads(output)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        text = f"{parsed.get('stdout') or ''}{parsed.get('stderr') or ''}"
+    else:
+        text = output
+    return bool(text.strip()) and not _FETCH_FAILED_RE.search(text)
 
 
 _INVENTED_TOOL_RE = re.compile(r"Tool (.+?) not found in agent")
@@ -100,6 +115,9 @@ def per_case(runs: Sequence[GradedRun], cases: Mapping[str, Case]) -> dict[str, 
         case = cases[run.record.case_id]
         if case.should_trigger and run.score is not None:
             buckets["score"][case.id].append(run.score)
+            # A turn that failed has no answer; this score leaves those out.
+            if run.record.status == "completed":
+                buckets["score_completed"][case.id].append(run.score)
         if case.should_trigger:
             buckets["fabricated"][case.id].append(float(run.fabricated))
             if run.yaml_blocks:
@@ -129,6 +147,7 @@ def _arm_summary(
         "infra_errors": len(runs) - len(ok),
         "cases": len(positives),
         "score": mean_of(metrics["score"], positives),
+        "score_completed": mean_of(metrics["score_completed"], positives),
         "fabricated": mean_of(metrics["fabricated"], positives),
         "loaded": mean_of(metrics["loaded"], positives),
         "false_loads": mean_of(metrics["loaded"], negatives),
@@ -206,7 +225,7 @@ def write_report(
                 if arm not in metrics or base not in metrics:
                     continue
                 row: dict[str, Any] = {"arm": arm, "baseline": base}
-                for metric in ("score", "fabricated", "loaded"):
+                for metric in ("score", "score_completed", "fabricated", "loaded"):
                     result = paired_bootstrap(metrics[base][metric], metrics[arm][metric])
                     row[metric] = result.to_json() if result else None
                 comparisons.append(row)
@@ -251,9 +270,10 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             lines += [
                 f"### {split} split, {harness}",
                 "",
-                "| Arm | Cases | Pass rate | Fabricated | Invented tool call | Guide loaded "
-                "| Loaded on near misses | Invalid YAML | Tokens | Infra errors |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+                "| Arm | Cases | Pass rate | Pass rate, completed turns | Fabricated "
+                "| Turn failed on a bad tool call | Guide loaded | Loaded on near misses "
+                "| Invalid YAML | Tokens | Infra errors |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
             ]
             for arm, s in data["arms"].items():
                 tokens = "—" if s["tokens"] is None else f"{s['tokens'] / 1000:.1f}k"
@@ -261,6 +281,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                     arm,
                     str(s["cases"]),
                     _pct(s["score"]),
+                    _pct(s["score_completed"]),
                     _pct(s["fabricated"]),
                     _pct(s["invented_tool"]),
                     _pct(s["loaded"]),
@@ -273,14 +294,15 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             if data["comparisons"]:
                 lines += [
                     "",
-                    "| Arm vs baseline | Pass rate Δ [95% CI] | Fabricated Δ [95% CI] "
-                    "| Guide loaded Δ [95% CI] |",
-                    "| --- | --- | --- | --- |",
+                    "| Arm vs baseline | Pass rate Δ [95% CI] | Completed turns Δ [95% CI] "
+                    "| Fabricated Δ [95% CI] | Guide loaded Δ [95% CI] |",
+                    "| --- | --- | --- | --- | --- |",
                 ]
                 for row in data["comparisons"]:
                     cells = [
                         f"{row['arm']} vs {row['baseline']}",
                         _delta(row["score"]),
+                        _delta(row["score_completed"]),
                         _delta(row["fabricated"]),
                         _delta(row["loaded"]),
                     ]
