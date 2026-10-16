@@ -633,9 +633,9 @@ class UploadEngine:
         }
 
     def _complete(self, upload: _Upload, offset: int, publication: object) -> dict[str, object]:
-        """SHA256 describes bytes at plan verification time, before publication.
+        """Return a checksum for staging bytes verified immediately before publication.
 
-        Other workspace writers can edit this inode during or after publication.
+        Other workspace writers can still edit the published inode afterward.
         """
         plan = publication if isinstance(publication, dict) else self._plan(upload, offset)
         name = str(plan["final_name"])
@@ -654,6 +654,23 @@ class UploadEngine:
                 identity = info.st_dev, info.st_ino
             if identity != (plan["target_dev"], plan["target_ino"]):
                 raise UploadError("plan_changed", "Destination changed before publication")
+
+        os.fsync(upload.fd)
+        digest = hashlib.sha256()
+        position = 0
+        while block := os.pread(upload.fd, 1024 * 1024, position):
+            digest.update(block)
+            position += len(block)
+        checksum = digest.hexdigest()
+        if (
+            position != upload.size
+            or os.fstat(upload.fd).st_size != upload.size
+            or (plan.get("sha256") is not None and checksum != plan["sha256"])
+            or (upload.sha256 is not None and checksum != upload.sha256)
+        ):
+            raise UploadError("checksum_mismatch", "Staging bytes changed before publication")
+
+        if upload.conflict == "replace":
             os.replace(
                 upload.staging, name, src_dir_fd=upload.parent_fd, dst_dir_fd=upload.parent_fd
             )

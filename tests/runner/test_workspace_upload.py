@@ -1577,6 +1577,48 @@ async def test_unpublished_finalize_timeout_can_retry(
 
 
 @pytest.mark.asyncio
+async def test_changed_staging_bytes_reject_complete_and_abort_releases_quota(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"a" * 200_000
+    response = await create(
+        client,
+        name="changed.bin",
+        size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    uid = response.json()["upload_id"]
+    url = BASE + "/" + uid
+    manager = client._transport.app.state.workspace_uploads
+    record = manager.records[uid]
+    helper = await manager._helper("session", DEFAULT_ENVIRONMENT_ID)
+    original = helper.call
+
+    def alter_before_complete(metadata, raw=b"", **kwargs):
+        if metadata["op"] == "complete":
+            Path(record.staging_path).write_bytes(b"b" * len(payload))
+        return original(metadata, raw, **kwargs)
+
+    monkeypatch.setattr(helper, "call", alter_before_complete)
+    assert (
+        await client.patch(url, params={"created_by": "alice"}, headers=HEADERS, content=payload)
+    ).status_code == 204
+
+    completed = await client.post(url + "/complete", params={"created_by": "alice"})
+    assert completed.status_code == 409
+    assert completed.json()["error"]["code"] == "checksum_mismatch"
+    assert not (tmp_path / "workspace" / "changed.bin").exists()
+    assert Path(record.staging_path).read_bytes() == b"b" * len(payload)
+
+    assert (await client.delete(url, params={"created_by": "alice"})).status_code == 204
+    assert not Path(record.staging_path).exists()
+    assert uid not in manager.records
+    assert not manager._pinned(("session", DEFAULT_ENVIRONMENT_ID))
+    assert (await asyncio.to_thread(helper.call, {"op": "status", "id": uid}))["code"] == "gone"
+    assert (await create(client, name="quota-after-abort", size=len(payload))).status_code == 201
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "conflict,expected", [("fail", "created"), ("replace", "replaced"), ("rename", "renamed")]
 )
