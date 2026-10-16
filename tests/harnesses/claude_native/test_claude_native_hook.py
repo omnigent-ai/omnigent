@@ -15,6 +15,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import respx
 
 from omnigent._platform import stable_user_id
 from omnigent.harnesses.claude_native import hook as claude_native_hook
@@ -805,7 +806,12 @@ def test_permission_request_hook_posts_to_active_session_from_bridge_config(
             posted["json"] = json
             return httpx.Response(
                 200,
-                text='{"hookSpecificOutput":{"hookEventName":"PermissionRequest","permissionDecision":"allow"}}',
+                json={
+                    "hookSpecificOutput": {
+                        "hookEventName": "PermissionRequest",
+                        "decision": {"behavior": "allow"},
+                    }
+                },
                 request=httpx.Request("POST", url),
             )
 
@@ -846,7 +852,7 @@ def test_permission_request_hook_posts_to_active_session_from_bridge_config(
         f"re-attach id outside the claude-hook namespace: {sent.get('_omnigent_elicitation_id')!r}"
     )
     assert posted["headers"] == {"Authorization": "Bearer xyz"}
-    assert json.loads(captured.out)["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert json.loads(captured.out)["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
     assert captured.err == ""
 
 
@@ -870,6 +876,89 @@ def _prepare_permission_bridge(tmp_path: Path, session_id: str) -> Path:
         ap_auth_headers={"Authorization": "Bearer xyz"},
     )
     return bridge_dir
+
+
+@pytest.mark.parametrize("permission_mode", ["default", "plan", "bypassPermissions"])
+@pytest.mark.parametrize("reply", ["selections", "custom", "deny", "bare_allow", "empty"])
+def test_ask_user_question_permission_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    respx_mock: respx.MockRouter,
+    permission_mode: str,
+    reply: str,
+) -> None:
+    """Native questions and verdicts cross the hook without a mirrored tool record."""
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_questions")
+    transcript_path = tmp_path / "not-yet-mirrored.jsonl"
+    tool_input = {
+        "questions": [
+            {
+                "question": "Which framework?",
+                "header": "Framework",
+                "options": [
+                    {"label": "React", "description": "Component library"},
+                    {"label": "Vue", "description": "Progressive framework"},
+                ],
+                "multiSelect": False,
+            },
+            {
+                "question": "Which platforms?",
+                "header": "Platforms",
+                "options": [
+                    {"label": "Web", "description": "Browser"},
+                    {"label": "Mobile", "description": "Phone"},
+                ],
+                "multiSelect": True,
+            },
+        ],
+        "metadata": {"source": "question-transport-test"},
+    }
+    payload = {
+        "session_id": "native_claude_session",
+        "transcript_path": str(transcript_path),
+        "cwd": str(tmp_path),
+        "permission_mode": permission_mode,
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "AskUserQuestion",
+        "tool_input": tool_input,
+    }
+    decision: dict[str, object] = {"behavior": "deny" if reply == "deny" else "allow"}
+    if reply in {"selections", "custom"}:
+        decision["updatedInput"] = {
+            **tool_input,
+            "answers": {
+                "Which framework?": 'Svelte — my "Other" choice' if reply == "custom" else "Vue",
+                "Which platforms?": ["Web", "Mobile"],
+            },
+        }
+    response = {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content)
+        assert sent.pop("_omnigent_elicitation_id").startswith("elicit_claude_")
+        assert sent == payload
+        assert "tool_use_id" not in sent
+        assert approval_wait_is_fresh("conv_questions", bridge_dir=bridge_dir)
+        return httpx.Response(200) if reply == "empty" else httpx.Response(200, json=response)
+
+    route = respx_mock.post(
+        "http://127.0.0.1:8787/v1/sessions/conv_questions/hooks/permission-request"
+    ).mock(side_effect=respond)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    assert claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+
+    captured = capsys.readouterr()
+    assert route.call_count == 1
+    assert route.calls[0].request.headers["Authorization"] == "Bearer xyz"
+    if reply == "empty":
+        assert captured.out == ""
+    else:
+        assert json.loads(captured.out) == response
+    assert captured.err == ""
+    assert not transcript_path.exists()
+    assert not approval_wait_is_fresh("conv_questions", bridge_dir=bridge_dir)
 
 
 def test_permission_request_hook_retries_transport_cut_with_same_id(
@@ -976,10 +1065,12 @@ def test_permission_request_hook_retries_transport_cut_with_same_id(
     assert decision == {"behavior": "allow"}
 
 
+@pytest.mark.parametrize("status_code", [400, 404, 409])
 def test_permission_request_hook_does_not_retry_rejections(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    status_code: int,
 ) -> None:
     """
     A 4xx from the Omnigent server is a deliberate answer — no retry.
@@ -992,7 +1083,7 @@ def test_permission_request_hook_does_not_retry_rejections(
 
     class _RejectingHttpxClient:
         """
-        Client stub that always returns HTTP 400.
+        Client stub that always rejects the request.
 
         :param headers: Headers passed to :class:`httpx.Client`.
         :param timeout: Timeout passed to :class:`httpx.Client`.
@@ -1027,16 +1118,16 @@ def test_permission_request_hook_does_not_retry_rejections(
 
         def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
             """
-            Reject every attempt with HTTP 400.
+            Reject every attempt with the configured client error.
 
             :param url: Target Omnigent URL.
             :param json: Request JSON body.
-            :returns: HTTP 400 response.
+            :returns: HTTP error response.
             """
             del json
             attempts.append(url)
             return httpx.Response(
-                400,
+                status_code,
                 text='{"error": "bad payload"}',
                 request=httpx.Request("POST", url),
             )

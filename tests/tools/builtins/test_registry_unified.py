@@ -142,6 +142,7 @@ def test_builtin_names_size_matches_registry() -> None:
                 # ToolContext.conversation_id.
                 "list_comments",
                 "update_comment",
+                "sys_ask_user",
                 # sys_list_models / sys_advise_models: auto-registered
                 # by ToolManager alongside the sub-agent dispatch grant.
                 # sys_advise_models is only included when smart routing

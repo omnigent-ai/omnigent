@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+from ._async_questions import AsyncUserInput
 from ._types import Response
 
 
@@ -149,6 +150,7 @@ class TextDone(StreamBlock):
 
     full_text: str
     has_code_blocks: bool = False
+    async_user_input: AsyncUserInput | None = None
 
 
 # ── Reasoning ────────────────────────────────────────────

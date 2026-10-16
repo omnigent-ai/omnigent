@@ -1,3 +1,4 @@
+import type { AsyncUserInput, AsyncQuestionReply } from "./asyncQuestions";
 // TypeScript types mirroring the server's `ConversationItem` discriminated
 // union, plus fetch helpers for cursor-paginated history loading.
 //
@@ -25,6 +26,8 @@ export interface BaseItem {
 }
 
 export interface MessageItem extends BaseItem {
+  async_user_input?: AsyncUserInput;
+  async_question_reply?: AsyncQuestionReply;
   type: "message";
   role: "user" | "assistant";
   content: MessageContentBlock[];

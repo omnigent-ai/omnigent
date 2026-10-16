@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ._async_questions import AsyncUserInput
 from ._types import ErrorInfo, Response
 
 # ── Native tool type constants ───────────────────────────
@@ -222,6 +223,8 @@ class MessageDone:
     """The final assistant message from ``output_item.done`` (type ``message``)."""
 
     content: list[dict[str, object]] = field(default_factory=list)
+
+    async_user_input: AsyncUserInput | None = None
 
 
 @dataclass

@@ -605,3 +605,59 @@ def test_new_item_terminal_command() -> None:
         data=TerminalCommandData(kind="input", input="ls"),
     )
     assert item.type == "terminal_command"
+
+
+@pytest.mark.parametrize(
+    "questions",
+    [
+        [],
+        [{"title": " "}],
+        [{"title": "Pick", "options": []}],
+        [{"title": "Pick", "options": [" "]}],
+        [{"title": "Pick", "options": [1]}],
+    ],
+)
+def test_async_question_metadata_rejects_malformed_payload(questions: object) -> None:
+    with pytest.raises(ValidationError):
+        parse_item_data(
+            "message",
+            {
+                "role": "assistant",
+                "agent": "codex-native-ui",
+                "content": [],
+                "async_user_input": {"call_id": "native_call", "questions": questions},
+            },
+        )
+
+
+def test_async_question_metadata_and_reply_survive_message_parsing() -> None:
+    question = {
+        "call_id": "native_call",
+        "questions": [
+            {"title": "Pick", "options": ["One", "Two"]},
+            {"title": "Detail", "options": None},
+        ],
+    }
+    parsed = parse_item_data(
+        "message",
+        {
+            "role": "assistant",
+            "agent": "codex-native-ui",
+            "content": [{"type": "output_text", "text": "Original"}],
+            "async_user_input": question,
+        },
+    )
+    assert parsed.model_dump()["async_user_input"] == question
+    reply = {
+        "source_item_id": "source",
+        "answers": {"native_call:0": "Two", "native_call:1": "Custom"},
+        "cancelled": False,
+    }
+    assert (
+        parse_item_data(
+            "message", {"role": "user", "content": [], "async_question_reply": reply}
+        ).model_dump()["async_question_reply"]
+        == reply
+    )
+    with pytest.raises(ValidationError, match="only assistant"):
+        parse_item_data("message", {"role": "user", "content": [], "async_user_input": question})

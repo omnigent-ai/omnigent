@@ -1,3 +1,4 @@
+import type { AsyncUserInput, AsyncQuestionReply } from "./asyncQuestions";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
 // Hand-ported. When _blocks.py changes, update this file and the
@@ -231,6 +232,7 @@ export interface ResponseStartBlock {
  * user input directly, not as a block).
  */
 export interface UserMessageBlock {
+  asyncQuestionReply?: AsyncQuestionReply;
   type: "user_message";
   ctx: BlockContext;
   /** Same shape as `MessageItem.content` from the items API. */
@@ -380,6 +382,7 @@ export interface TextChunk {
 
 /** Complete text from a text-streaming section. */
 export interface TextDone {
+  asyncUserInput?: AsyncUserInput;
   type: "text_done";
   ctx: BlockContext;
   fullText: string;
