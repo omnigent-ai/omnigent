@@ -3,18 +3,65 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+from typing import cast
 
 import pytest
 
+from omnigent.debug_logging import debug_event
 from omnigent.runner.transports.ws_tunnel import diagnostics as diagnostics_module
 from omnigent.runner.transports.ws_tunnel.diagnostics import (
     OutboundFrame,
     TunnelDiagnosticAttrs,
     TunnelDiagnostics,
+    _host_pressure_attrs,
 )
 from tests.budgets import budget
+from tests.debug_log_helpers import capture_debug_rows
+
+# Synthetic procfs with a distinct value per field, so a mixed-up line or window shows.
+_PROCFS_FILES = {
+    "pressure/cpu": (
+        "some avg10=2.15 avg60=0.59 avg300=0.75 total=1000\n"
+        "full avg10=9.01 avg60=9.02 avg300=9.03 total=0\n"
+    ),
+    "pressure/memory": (
+        "some avg10=41.10 avg60=33.20 avg300=21.30 total=2000\n"
+        "full avg10=25.50 avg60=20.25 avg300=9.75 total=3000\n"
+    ),
+    "pressure/io": (
+        "some avg10=7.00 avg60=6.00 avg300=5.00 total=4000\n"
+        "full avg10=1.50 avg60=1.25 avg300=0.50 total=5000\n"
+    ),
+    "loadavg": "3.25 2.50 1.75 4/512 12345\n",
+    "meminfo": (
+        "MemTotal:        8192000 kB\n"
+        "MemFree:          100000 kB\n"
+        "MemAvailable:    2097152 kB\n"
+        "Buffers:           50000 kB\n"
+    ),
+    "self/status": (
+        "Name:\tpython\nVmPeak:\t  300000 kB\nVmRSS:\t  102400 kB\nRssAnon:\t   90000 kB\n"
+    ),
+}
+_HOST_PRESSURE = {
+    "psi_cpu_some_avg10": 2.15,
+    "psi_cpu_some_avg60": 0.59,
+    "psi_memory_full_avg10": 25.5,
+    "psi_memory_full_avg60": 20.25,
+    "psi_memory_full_avg300": 9.75,
+    "psi_io_full_avg60": 1.25,
+    "loadavg_1m": 3.25,
+    "mem_available_mb": 2048.0,
+    "process_rss_mb": 100.0,
+}
+_NO_PRESSURE = dict.fromkeys(_HOST_PRESSURE)
 
 
 @dataclass
@@ -26,6 +73,27 @@ class _Clock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+@pytest.fixture(autouse=True)
+def proc_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """An empty procfs stand-in, so snapshots never depend on the machine running the tests."""
+    monkeypatch.setattr(
+        diagnostics_module, "_host_pressure_attrs", partial(_host_pressure_attrs, tmp_path)
+    )
+    return tmp_path
+
+
+def _write_procfs(root: Path) -> None:
+    for name, text in _PROCFS_FILES.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+def _host_pressure(snapshot: TunnelDiagnosticAttrs) -> dict[str, object]:
+    # A dropped key must not pass for a null one.
+    return {key: snapshot.get(key, "absent") for key in _HOST_PRESSURE}
 
 
 async def test_stall_is_visible_even_before_monitor_resumes(
@@ -314,3 +382,126 @@ async def test_concurrent_send_sampling_is_bounded(monkeypatch: pytest.MonkeyPat
         await asyncio.gather(*tasks, return_exceptions=True)
     assert diagnostics.snapshot()["sends_in_flight"] == 0
     assert diagnostics.snapshot()["oldest_tracked_send_age_s"] is None
+
+
+def test_host_pressure_reads_the_selected_procfs_fields(proc_root: Path) -> None:
+    _write_procfs(proc_root)
+    assert _host_pressure_attrs(proc_root) == _HOST_PRESSURE
+
+
+def test_server_side_snapshot_skips_host_pressure(proc_root: Path) -> None:
+    """A stalled server reports every tunnel at once; it must not read procfs per tunnel."""
+    _write_procfs(proc_root)
+    server = TunnelDiagnostics()
+    server.settings["tunnel_side"] = "server"
+    runner = TunnelDiagnostics()
+    runner.settings["tunnel_side"] = "runner"
+    assert not set(_HOST_PRESSURE) & set(server.snapshot())
+    assert _host_pressure(runner.snapshot()) == _HOST_PRESSURE
+
+
+def test_snapshot_freezes_host_pressure_and_a_reconnect_reads_it_afresh(proc_root: Path) -> None:
+    _write_procfs(proc_root)
+    clock = _Clock()
+    diagnostics = TunnelDiagnostics(clock=clock)
+    live = diagnostics.snapshot()
+    assert _host_pressure(live) == _HOST_PRESSURE
+    assert set(live) <= TunnelDiagnosticAttrs.__optional_keys__
+    (proc_root / "loadavg").write_text("7.00 2.50 1.75 4/512 12345\n", encoding="utf-8")
+    assert diagnostics.snapshot()["loadavg_1m"] == 7.0
+    diagnostics.freeze()
+    (proc_root / "loadavg").write_text("0.10 2.50 1.75 4/512 12345\n", encoding="utf-8")
+    clock.advance(4)
+    frozen = diagnostics.snapshot()
+    assert frozen["loadavg_1m"] == 7.0
+    assert frozen["diagnostics_age_s"] == 4.0
+    assert TunnelDiagnostics(clock=clock).snapshot()["loadavg_1m"] == 0.1
+
+
+def _remove_procfs(root: Path) -> None:
+    for name in _PROCFS_FILES:
+        (root / name).unlink()
+
+
+def _garble_procfs(root: Path) -> None:
+    junk = b"\xff\xfe\x00 some avg10=oops avg60= full avg300=1=2\nMemAvailable: lots kB\nVmRSS:\n"
+    for name in _PROCFS_FILES:
+        (root / name).write_bytes(junk)
+
+
+def _make_procfs_unreadable(root: Path) -> None:
+    for name in _PROCFS_FILES:
+        (root / name).unlink()
+        (root / name).mkdir()
+
+
+@pytest.mark.parametrize(
+    "break_procfs",
+    [_remove_procfs, _garble_procfs, _make_procfs_unreadable],
+    ids=["missing", "garbage", "unreadable"],
+)
+def test_unavailable_host_pressure_is_null_never_zero_and_never_raises(
+    proc_root: Path, break_procfs: Callable[[Path], None]
+) -> None:
+    _write_procfs(proc_root)
+    break_procfs(proc_root)
+    diagnostics = TunnelDiagnostics(clock=_Clock())
+    assert _host_pressure(diagnostics.snapshot()) == _NO_PRESSURE
+    diagnostics.freeze()
+    assert _host_pressure(diagnostics.snapshot()) == _NO_PRESSURE
+
+
+@pytest.mark.skipif(not Path("/proc/self/status").exists(), reason="needs a Linux procfs")
+def test_default_root_reads_this_process_from_the_real_procfs() -> None:
+    attrs = _host_pressure_attrs()
+    assert attrs["process_rss_mb"] is not None and attrs["process_rss_mb"] > 0
+    assert attrs["loadavg_1m"] is not None and attrs["loadavg_1m"] >= 0
+
+
+def test_kernel_without_psi_still_reports_load_and_memory(proc_root: Path) -> None:
+    _write_procfs(proc_root)
+    shutil.rmtree(proc_root / "pressure")
+    assert _host_pressure_attrs(proc_root) == {
+        key: None if key.startswith("psi_") else value for key, value in _HOST_PRESSURE.items()
+    }
+
+
+async def test_sampler_ticks_do_not_read_procfs(monkeypatch: pytest.MonkeyPatch) -> None:
+    reads: list[None] = []
+    read_procfs = diagnostics_module._host_pressure_attrs
+
+    def counting_read() -> dict[str, float | None]:
+        reads.append(None)
+        return read_procfs()
+
+    monkeypatch.setattr(diagnostics_module, "_host_pressure_attrs", counting_read)
+    clock = _Clock()
+    diagnostics = TunnelDiagnostics(clock=clock)
+    sampled = asyncio.Event()
+    async with diagnostics.monitoring(sampled.set):
+        clock.advance(8)  # The sampler wakes late and reports without taking a snapshot.
+        await asyncio.wait_for(sampled.wait(), timeout=budget(1))
+        assert not reads
+        diagnostics.snapshot()
+        assert len(reads) == 1
+    assert len(reads) == 2  # The disconnect freeze reads once more.
+    diagnostics.snapshot()
+    diagnostics.snapshot()
+    assert len(reads) == 2
+
+
+def test_debug_row_stringifies_host_pressure_and_omits_unavailable_values(
+    proc_root: Path,
+) -> None:
+    _write_procfs(proc_root)
+    (proc_root / "pressure" / "io").unlink()
+    snapshot = TunnelDiagnostics(clock=_Clock()).snapshot()
+    with capture_debug_rows("runner") as rows:
+        logging.getLogger("omnigent.runner.test").info(
+            "health", extra=debug_event("runner_tunnel_health", **snapshot)
+        )
+    (row,) = rows
+    attributes = cast(dict[str, str], row["attributes"])
+    assert attributes["psi_memory_full_avg60"] == "20.25"
+    assert attributes["mem_available_mb"] == "2048.0"
+    assert "psi_io_full_avg60" not in attributes
