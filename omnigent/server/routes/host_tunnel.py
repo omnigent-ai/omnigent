@@ -1202,7 +1202,7 @@ async def _ping_loop(
     """
     while True:
         await asyncio.sleep(PING_INTERVAL_S)
-        elapsed = time.time() - conn.last_frame_at
+        elapsed = time.monotonic() - conn.last_frame_monotonic
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
             conn.close_requested_code = 4003
             conn.close_requested_reason = "ping timeout"
