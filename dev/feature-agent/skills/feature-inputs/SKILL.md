@@ -30,7 +30,8 @@ Optional fields:
    that and continue.
 2. Confirm the workspace: `git remote get-url origin` is
    `omnigent-ai/omnigent`, the worktree is on a fresh branch off current
-   `main`, and `git`, `gh` (`gh auth status`), and the test runner work.
+   `main` (in `review_pr` mode, the PR's current head branch instead), and
+   `git`, `gh` (`gh auth status`), and the test runner work.
 3. Read the ticket with the Linear GraphQL API, using
    `${LINEAR_API_KEY:-$DATABRICKS_LINEAR_API_KEY}` (local runs set the first,
    `--server` runs the second): title, description, comments, labels, parent,

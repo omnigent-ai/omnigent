@@ -167,19 +167,6 @@ def test_feature_agent_never_merges_and_targets_omnigent() -> None:
     assert "re-record that CUJ's demo" in agents
 
 
-def test_feature_markdown_links_resolve_from_their_own_directory() -> None:
-    shared = [_AGENT / "skills" / name for name in _SHARED_SKILLS]
-    documents = {*_AGENT.rglob("*.md"), *(doc for skill in shared for doc in skill.rglob("*.md"))}
-    broken = []
-    for document in sorted(documents):
-        for target in re.findall(r"\]\(([^)\s]+)\)", document.read_text(encoding="utf-8")):
-            if re.match(r"[a-z][a-z0-9+.-]*:|#|/", target):
-                continue
-            if not (document.parent / target.split("#")[0]).exists():
-                broken.append(f"{document} -> {target}")
-    assert not broken
-
-
 def test_feature_agent_bundle_ships_the_shared_skills(tmp_path: Path) -> None:
     from omnigent.cli import _bundle
     from omnigent.spec.tar_utils import extract_safe

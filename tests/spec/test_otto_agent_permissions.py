@@ -22,3 +22,9 @@ def test_resolve_agent_fully_bypasses_sdk_permission_prompts() -> None:
     assert _executor_config("dev/resolve-agent/config.yaml")["permission_mode"] == (
         "bypassPermissions"
     )
+
+
+def test_feature_agent_fully_bypasses_sdk_permission_prompts() -> None:
+    assert _executor_config("dev/feature-agent/config.yaml")["permission_mode"] == (
+        "bypassPermissions"
+    )
