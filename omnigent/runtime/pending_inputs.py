@@ -112,7 +112,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
@@ -140,6 +140,56 @@ _MAX_ENTRIES_PER_CONVERSATION = 64
 # the person typed is never mistaken for a generated one.
 _ONE_LEADING_ATTACHMENT_MARKER_RE = re.compile(rf"^\s*(?:{ATTACHMENT_MARKER_STRIP_PATTERN})\s*")
 _ATTACHMENT_BLOCK_TYPES = frozenset({"input_image", "input_file"})
+
+NativeInputCauseClass = Literal[
+    "rejected_before_handoff",
+    "rejected_by_native",
+    "accepted_missing_native_record",
+    "reconciliation_ambiguity",
+    "interrupted_or_lifecycle",
+    "unknown",
+]
+NativeInputDeliveryStage = Literal[
+    "server_queued",
+    "forward_requested",
+    "forward_accepted",
+    "native_turn_started",
+    "native_turn_accepted",
+    "native_turn_completed",
+    "native_turn_failed",
+    "native_turn_cancelled",
+    "native_turn_incomplete",
+    "rejected_before_handoff",
+    "unknown",
+]
+
+_CAUSE_CLASSES = frozenset(
+    {
+        "rejected_before_handoff",
+        "rejected_by_native",
+        "accepted_missing_native_record",
+        "reconciliation_ambiguity",
+        "interrupted_or_lifecycle",
+        "unknown",
+    }
+)
+_DELIVERY_STAGES = frozenset(
+    {
+        "server_queued",
+        "forward_requested",
+        "forward_accepted",
+        "native_turn_started",
+        "native_turn_accepted",
+        "native_turn_completed",
+        "native_turn_failed",
+        "native_turn_cancelled",
+        "native_turn_incomplete",
+        "rejected_before_handoff",
+        "unknown",
+    }
+)
+_DISPOSITION_CODE_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+_DISPOSITION_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,256}")
 
 
 def _now() -> float:
@@ -192,6 +242,10 @@ class DrainedInput:
     input_enqueued_at_ms: int | None = None
     delivery_attempt_id: str | None = None
     last_delivery_stage: str = "unknown"
+    cause_class: NativeInputCauseClass | None = None
+    reason_code: str | None = None
+    native_turn_id: str | None = None
+    lifecycle_response_id: str | None = None
 
 
 @dataclass
@@ -265,6 +319,10 @@ class _Entry:
     input_enqueued_at_ms: int | None = field(default_factory=lambda: int(time.time() * 1000))
     delivery_attempt_id: str | None = field(default_factory=lambda: uuid.uuid4().hex)
     last_delivery_stage: str = "server_queued"
+    cause_class: NativeInputCauseClass | None = None
+    reason_code: str | None = None
+    native_turn_id: str | None = None
+    lifecycle_response_id: str | None = None
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -413,6 +471,10 @@ def delivery_attributes(entry: DrainedInput | _Entry) -> dict[str, object]:
         )
     )
     attrs["last_delivery_stage"] = entry.last_delivery_stage
+    for key in ("cause_class", "reason_code", "native_turn_id", "lifecycle_response_id"):
+        value = getattr(entry, key)
+        if value is not None:
+            attrs[key] = value
     if entry.input_enqueued_at_ms is not None:
         attrs["pending_age_ms"] = max(0, int(time.time() * 1000) - entry.input_enqueued_at_ms)
     return attrs
@@ -442,8 +504,86 @@ def mark_delivery_stage(
         return
     with _lock:
         entry = _pending.get(conversation_id, {}).get(pending_id)
-        if entry is not None:
+        if entry is not None and entry.last_delivery_stage in {
+            "server_queued",
+            "forward_requested",
+            "forward_accepted",
+        }:
             entry.last_delivery_stage = stage
+
+
+def mark_lifecycle(
+    conversation_id: str,
+    stable_id: str,
+    *,
+    stage: NativeInputDeliveryStage,
+    cause_class: NativeInputCauseClass | None = None,
+    reason_code: str | None = None,
+    native_turn_id: str | None = None,
+    lifecycle_response_id: str | None = None,
+) -> str | None:
+    """Attach one identity-linked runner lifecycle edge to a queued input."""
+    stable = input_attributes({"input_stable_id": stable_id}).get("input_stable_id")
+    if not isinstance(stable, str) or stage not in _DELIVERY_STAGES:
+        return None
+    if cause_class is not None and cause_class not in _CAUSE_CLASSES:
+        cause_class = None
+    if reason_code is not None and not _DISPOSITION_CODE_RE.fullmatch(reason_code):
+        reason_code = None
+    if native_turn_id is not None and not _DISPOSITION_ID_RE.fullmatch(native_turn_id):
+        native_turn_id = None
+    if lifecycle_response_id is not None and not _DISPOSITION_ID_RE.fullmatch(
+        lifecycle_response_id
+    ):
+        lifecycle_response_id = None
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        for entry in _pending.get(conversation_id, {}).values():
+            if entry.stable_id != stable:
+                continue
+            entry.last_delivery_stage = stage
+            if cause_class is not None:
+                entry.cause_class = cause_class
+            if reason_code is not None:
+                entry.reason_code = reason_code
+            if native_turn_id is not None:
+                entry.native_turn_id = native_turn_id
+            if lifecycle_response_id is not None:
+                entry.lifecycle_response_id = lifecycle_response_id
+            return entry.pending_id
+    return None
+
+
+def classify_missing_native_record(entry: DrainedInput) -> DrainedInput:
+    """Classify a skipped input from its strongest identity-linked evidence."""
+    if entry.cause_class is not None:
+        return entry
+    if entry.interrupted or entry.last_delivery_stage in {
+        "native_turn_cancelled",
+        "native_turn_incomplete",
+    }:
+        return replace(
+            entry,
+            cause_class="interrupted_or_lifecycle",
+            reason_code=entry.reason_code or "turn_interrupted",
+        )
+    if entry.last_delivery_stage in {"native_turn_accepted", "native_turn_completed"}:
+        return replace(
+            entry,
+            cause_class="accepted_missing_native_record",
+            reason_code="completed_without_native_record",
+        )
+    if entry.reason_code is not None:
+        reason_code = entry.reason_code
+    elif entry.last_delivery_stage == "native_turn_started":
+        reason_code = "native_turn_started_without_outcome"
+    elif entry.last_delivery_stage == "native_turn_failed":
+        reason_code = "native_turn_failed_without_record"
+    elif entry.last_delivery_stage in {"forward_requested", "forward_accepted"}:
+        reason_code = "no_identity_linked_lifecycle"
+    else:
+        reason_code = "missing_delivery_evidence"
+    return replace(entry, cause_class="unknown", reason_code=reason_code)
 
 
 def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
@@ -613,6 +753,10 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         input_enqueued_at_ms=drained.input_enqueued_at_ms,
         delivery_attempt_id=drained.delivery_attempt_id,
         last_delivery_stage=drained.last_delivery_stage,
+        cause_class=drained.cause_class,
+        reason_code=drained.reason_code,
+        native_turn_id=drained.native_turn_id,
+        lifecycle_response_id=drained.lifecycle_response_id,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -822,6 +966,10 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         input_enqueued_at_ms=entry.input_enqueued_at_ms,
         delivery_attempt_id=entry.delivery_attempt_id,
         last_delivery_stage=entry.last_delivery_stage,
+        cause_class=entry.cause_class,
+        reason_code=entry.reason_code,
+        native_turn_id=entry.native_turn_id,
+        lifecycle_response_id=entry.lifecycle_response_id,
     )
 
 

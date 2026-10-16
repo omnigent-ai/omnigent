@@ -16,6 +16,7 @@ import type { SessionHostResolveOptions } from "@/lib/identity";
 import {
   getSessionHost,
   getSessionParent,
+  sessionRoutingHostId,
   setSessionHost,
   setSessionParent,
 } from "@/lib/sessionHost";
@@ -214,7 +215,7 @@ export async function prefetchSessionHostChain(
     const session: Session = await queryClient.fetchQuery(queryOptions);
     // `sessionFromWire` records these on a live fetch; re-record so a cached
     // snapshot seeds the map the same way.
-    setSessionHost(session.id, session.hostId);
+    setSessionHost(session.id, sessionRoutingHostId(session.hostId, session.labels));
     setSessionParent(session.id, session.parentSessionId, session.labels);
     id = getSessionParent(session.id);
   }
