@@ -416,6 +416,9 @@ def _plugin_install_paths(
     # skipped so a tampered/odd manifest can't turn an arbitrary directory into
     # a discovery root.
     plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
+    # Profile managers (e.g. ccs) symlink ``plugins/cache`` to a cache shared
+    # across config dirs; its target is as trusted as the root that links it.
+    trusted_roots = (plugins_root, (plugins_root / "cache").resolve())
     out: dict[str, Path] = {}
     for key, entries in plugins.items():
         if (enabled is not None and key not in enabled) or not isinstance(entries, list):
@@ -431,7 +434,7 @@ def _plugin_install_paths(
             # (its only sensible base), never the runner's cwd.
             path_obj = Path(path)
             resolved = (path_obj if path_obj.is_absolute() else plugins_root / path_obj).resolve()
-            if not resolved.is_relative_to(plugins_root):
+            if not any(resolved.is_relative_to(root) for root in trusted_roots):
                 _log.warning(
                     "Skipping plugin %r: installPath %r is outside %s",
                     key,
