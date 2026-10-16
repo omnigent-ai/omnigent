@@ -2,6 +2,7 @@ import { filterSessionScope } from "@/lib/sessionVisibility";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
+import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
 import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
 import { useArchivedSessions } from "@/hooks/useScopeCache";
 import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/InfiniteScrollSentinel";
@@ -1773,6 +1774,7 @@ function ConversationList({
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
   );
+  const workingIds = useSidebarWorkingIds(allConversations, startingId, statusView);
 
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
@@ -1964,8 +1966,10 @@ function ConversationList({
       if (frozen) return frozen;
       const unseen = isConversationUnseen(c.id, c.updated_at, c.status);
       const bucket = statusBucket(c, unseen, hasSessionDraft(c.id));
-      // Like the row's spinner, the open session is Working while it starts up.
-      const live = bucket !== "Needs attention" && c.id === startingId ? "Working" : bucket;
+      const live =
+        bucket !== "Needs attention" && (c.id === startingId || workingIds.has(c.id))
+          ? "Working"
+          : bucket;
       frozenStatus?.set(c.id, live);
       return live;
     };
@@ -2017,6 +2021,7 @@ function ConversationList({
     unseenTick,
     draftIds,
     startingId,
+    workingIds,
   ]);
 
   const config = useContext(SidebarConfigContext);
@@ -2043,12 +2048,17 @@ function ConversationList({
     };
   }, [loadedSections, displayPagination.rows]);
   // The paginated Sessions rows split into titled groups; null keeps the single
-  // "Sessions" section (default grouping, or nothing to group).
+  // "Sessions" section (default/date grouping with nothing to group).
   const sessionGroups = useMemo(() => {
     const titles = loadedSections.groupTitles;
-    if (!titles || sections.sessions.length === 0) return null;
-    return groupConversations(sections.sessions, (c) => titles.get(c.id), groupOrder);
-  }, [loadedSections.groupTitles, sections.sessions, groupOrder]);
+    if (!titles || (sections.sessions.length === 0 && !statusView)) return null;
+    return groupConversations(
+      sections.sessions,
+      (c) => titles.get(c.id),
+      groupOrder,
+      statusView ? "Working" : undefined,
+    );
+  }, [loadedSections.groupTitles, sections.sessions, groupOrder, statusView]);
 
   // Scope-active flags: which section owns the current selection UI (checkboxes
   // + bulk-action bar). Only one is true at a time unless the selection is unified.
@@ -2860,6 +2870,7 @@ function ConversationList({
                               key={group.title}
                               title={group.title}
                               conversations={group.conversations}
+                              emptyMessage={group.title === "Working" ? "No sessions" : undefined}
                               footer={
                                 index === sessionGroups.length - 1 ? sessionStatus : undefined
                               }

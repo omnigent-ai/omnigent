@@ -6,11 +6,12 @@ grouping is deterministic; everything else comes from the live server.
 
 from __future__ import annotations
 
+import json
 from time import time
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from playwright.sync_api import Locator, Page, Route, expect
+from playwright.sync_api import Locator, Page, Route, WebSocketRoute, expect
 
 _RUNNING = f"{1:032x}"
 _AWAITING = f"{2:032x}"
@@ -103,10 +104,33 @@ def _section_header(page: Page, title: str) -> Locator:
     return page.get_by_role("button", name=title, exact=True)
 
 
-def test_date_grouping_and_show_toggles_persist_across_reload(
+def test_grouping_and_show_toggles_persist_across_reload(
     page: Page, stubbed_sidebar: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Status falls back to Default; both date groupings and Show persist."""
+    """Status holds idle transitions; all grouping choices and Show persist."""
+    sockets: list[WebSocketRoute] = []
+    page.route_web_socket("**/v1/sessions/updates*", lambda socket: sockets.append(socket))
+    _open_view_submenu(page, "session-grouping-menu")
+    page.get_by_role("menuitemradio", name="Status", exact=True).click()
+    page.keyboard.press("Escape")
+    page.reload()
+    working = page.locator("section").filter(has=_section_header(page, "Working"))
+    done = page.locator("section").filter(has=_section_header(page, "Done"))
+    running_link = f'a[href="/c/{_RUNNING}"]'
+    expect(working.locator(running_link)).to_be_visible()
+    expect(done.locator(f'a[href="/c/{_IDLE}"]')).to_be_visible()
+    page.get_by_text("What should we build?", exact=True).hover()
+    assert sockets, "Session updates socket never connected"
+    monkeypatch.setitem(_ROWS[0], "status", "idle")
+    sockets[-1].send(json.dumps({"type": "changed", "items": [_ROWS[0]]}))
+    expect(working.locator(running_link)).to_be_visible()
+    expect(done.locator(running_link)).to_be_visible(timeout=15_000)
+    expect(working.get_by_text("No sessions", exact=True)).to_be_visible()
+    monkeypatch.setitem(_ROWS[0], "status", "running")
+    sockets[-1].send(json.dumps({"type": "changed", "items": [_ROWS[0]]}))
+    expect(working.locator(running_link)).to_be_visible(timeout=2_000)
+    expect(working.get_by_text("No sessions", exact=True)).to_have_count(0)
+
     today, yesterday = page.evaluate("""() => {
         const day = new Date();
         day.setHours(0, 0, 0, 0);
@@ -121,13 +145,8 @@ def test_date_grouping_and_show_toggles_persist_across_reload(
     ]:
         monkeypatch.setitem(row, "created_at", created_at)
         monkeypatch.setitem(row, "updated_at", updated_at)
-    page.evaluate(
-        "localStorage.setItem('omnigent:sidebar-view', JSON.stringify({grouping: 'status'}))"
-    )
     page.reload()
-    expect(_section_header(page, "Sessions")).to_be_visible()
-    expect(_section_header(page, "Working")).to_have_count(0)
-    expect(_section_header(page, "Done")).to_have_count(0)
+    expect(_section_header(page, "Working")).to_be_visible()
     filter_button = page.get_by_test_id("session-filter")
     expect(filter_button).to_have_accessible_name("Group, sort, and filter sessions")
     filter_button.hover()
@@ -135,8 +154,7 @@ def test_date_grouping_and_show_toggles_persist_across_reload(
     before = filter_button.bounding_box()
 
     _open_view_submenu(page, "session-grouping-menu")
-    expect(page.get_by_test_id("session-grouping-status")).to_have_count(0)
-    expect(page.get_by_role("menuitemradio", name="Default", exact=True)).to_be_checked()
+    expect(page.get_by_role("menuitemradio", name="Status", exact=True)).to_be_checked()
     expect(page.get_by_role("menuitemradio", name="Created", exact=True)).to_be_visible()
     page.get_by_test_id("session-grouping-updated").click()
     page.keyboard.press("Escape")
