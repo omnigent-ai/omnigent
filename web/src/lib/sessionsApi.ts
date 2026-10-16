@@ -118,6 +118,10 @@ interface SessionResponseWire {
   host_id?: string | null;
   runner_online?: boolean | null;
   host_online?: boolean | null;
+  /** Bound host name for shared viewers; absent on older servers. */
+  host_name?: string | null;
+  /** Managed host provider; absent for external hosts or older servers. */
+  host_sandbox_provider?: string | null;
   /**
    * Whether this session is bound to a dormant managed host the server can
    * wake in place (its sandbox provider supports resume). Read only when the
@@ -327,6 +331,8 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     runnerOnline: wire.runner_online ?? undefined,
     hostId: wire.host_id ?? null,
     hostOnline: wire.host_online ?? undefined,
+    hostName: wire.host_name ?? null,
+    hostSandboxProvider: wire.host_sandbox_provider ?? null,
     hostResumable: wire.host_resumable ?? false,
     archived: wire.archived ?? false,
     status: wire.status,

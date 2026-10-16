@@ -300,6 +300,10 @@ export interface Session {
   hostId?: string | null;
   /** Current host reachability; absent when the snapshot omits liveness. */
   hostOnline?: boolean;
+  /** Bound host name for shared viewers; absent on older servers. */
+  hostName?: string | null;
+  /** Managed host provider; absent for external hosts or older servers. */
+  hostSandboxProvider?: string | null;
   /**
    * Whether this session's host is a dormant resumable managed host the
    * server can wake on the next message. Carried on the snapshot so the open

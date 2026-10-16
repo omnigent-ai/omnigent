@@ -1313,6 +1313,8 @@ def _build_session_response(
     runner_online: bool | None = None,
     host_online: bool | None = None,
     host_resumable: bool = False,
+    host_name: str | None = None,
+    host_sandbox_provider: str | None = None,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
@@ -1372,6 +1374,10 @@ def _build_session_response(
         ``None`` when the session has no ``host_id`` or no lookup is
         wired (see :class:`SessionLiveness`). Used only to decide what
         the open view shows when ``runner_online`` is ``False``.
+    :param host_name: Bound host name for viewers without host-list access;
+        None if unbound or the host row is gone.
+    :param host_sandbox_provider: Provider label for a managed host; None for
+        an external host or missing host row.
     :param pending_elicitation_events: Optional precomputed
         outstanding elicitation events. ``None`` reads only the
         current session's entries from the pending-elicitations index.
@@ -1430,6 +1436,8 @@ def _build_session_response(
         labels=labels,
         runner_id=conv.runner_id,
         host_id=conv.host_id,
+        host_name=host_name,
+        host_sandbox_provider=host_sandbox_provider,
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
@@ -12907,10 +12915,16 @@ async def _get_session_snapshot(
     # liveness arrives via the poll/stream). One indexed host read, gated to
     # host-bound sessions.
     host_resumable = False
-    if host_store is not None and sandbox_config is not None and conv.host_id is not None:
-        host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
-        if host_for_resume is not None:
-            host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    # Shared viewers cannot list the owner’s hosts; include display identity here.
+    host_name: str | None = None
+    host_sandbox_provider: str | None = None
+    if host_store is not None and conv.host_id is not None:
+        bound_host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+        if bound_host is not None:
+            host_name = bound_host.name
+            host_sandbox_provider = bound_host.sandbox_provider
+            if sandbox_config is not None:
+                host_resumable = host_resume_supported(bound_host, sandbox_config)
     response = _build_session_response(
         conv,
         items,
@@ -12928,6 +12942,8 @@ async def _get_session_snapshot(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
+        host_name=host_name,
+        host_sandbox_provider=host_sandbox_provider,
         pending_elicitation_events=await asyncio.to_thread(
             _pending_elicitation_snapshot_for_session,
             conv_store,
