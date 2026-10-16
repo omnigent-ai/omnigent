@@ -1784,11 +1784,13 @@ def create_runner_app(
         if process_manager is None:
             return
         session_id = event.session_id
-        exit_error = _required_terminal_exit_errors.get(session_id)
         turn_epoch = _turn_bind_epoch.get(session_id)
         session_generation = _session_cache_generation(session_id)
 
         def _still_owns_release() -> bool:
+            # Not keyed on the recorded exit error: the failing stream consumes it
+            # to report the exit, which must not cancel this cleanup. A new turn
+            # stamps a new epoch; delete and reset bump the generation.
             terminals = resource_registry.terminal_registry
             current = (
                 terminals.get(session_id, event.terminal_name, event.session_key)
@@ -1796,8 +1798,7 @@ def create_runner_app(
                 else None
             )
             return (
-                _required_terminal_exit_errors.get(session_id) is exit_error
-                and _turn_bind_epoch.get(session_id) == turn_epoch
+                _turn_bind_epoch.get(session_id) == turn_epoch
                 and _session_cache_generation_is_current(session_id, session_generation)
                 and (current is None or current.diagnostic_id == event.terminal_instance_id)
             )
