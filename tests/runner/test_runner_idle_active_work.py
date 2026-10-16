@@ -390,6 +390,7 @@ async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: s
         await _post_status(client, conv_id, status)
         assert conv_id not in app.state.active_turns
         assert app.state.has_active_work() is True
+        assert app.state.has_turn_in_flight() is True
 
         async def _release() -> None:
             await _post_status(client, conv_id, "idle")
@@ -398,6 +399,7 @@ async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: s
             has_active_work=app.state.has_active_work,
             release=_release,
         )
+        assert app.state.has_turn_in_flight() is False
 
 
 @pytest.mark.asyncio
@@ -509,3 +511,24 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
             await asyncio.sleep(0.01)
         app.state.native_pane_status[conv_id] = "running"
         assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_timers_and_approvals_are_not_turns_in_flight() -> None:
+    """Background waits pin idle shutdown but must not keep a laptop awake.
+
+    :returns: None.
+    """
+    app = _scaffold_app()
+    assert app.state.has_turn_in_flight() is False
+    finish = asyncio.Event()
+    task = asyncio.create_task(finish.wait(), name="timer-awake")
+    register_timer("conv_awake", "timer_awake", task)
+    pending_approvals.register("elicit_awake")
+
+    assert app.state.has_active_work() is True
+    assert app.state.has_turn_in_flight() is False
+
+    finish.set()
+    await task
+    unregister_timer("conv_awake", "timer_awake")
