@@ -24,8 +24,8 @@ parsing can fail before native logging initializes. Neither path reads Codex's
 private log files. Claude's debug channel does
 not capture arbitrary child-process stderr, terminal screen contents, or errors
 that occur before Claude initializes its logger. The terminal's file descriptors
-remain unchanged. Both harnesses also export a bounded excerpt of a live pane that
-has not become interactive; see
+remain unchanged. When capture is enabled, both harnesses also export a bounded
+excerpt of a live pane that has not become interactive; see
 [Native startup stall records](#native-startup-stall-records).
 
 ## Content and destinations

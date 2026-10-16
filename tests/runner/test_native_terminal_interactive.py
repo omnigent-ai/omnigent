@@ -128,8 +128,15 @@ _SIGN_IN_PROMPT = "Sign in to continue:\n  https://signin.example.com/device\n  
             _SIGN_IN_PROMPT + "See https://docs.example.com/oauth/troubleshooting\n",
             {"sign_in_prompt_detected": False},
         ),
+        # The prompt scrolled away and left only the code above the launcher's wait line.
+        ("1", "HQ7M-2KPD\nwaiting...\n", {"sign_in_prompt_detected": False}),
     ],
-    ids=["capture-disabled", "sign-in-prompt", "sign-in-material-after-prompt"],
+    ids=[
+        "capture-disabled",
+        "sign-in-prompt",
+        "sign-in-material-after-prompt",
+        "standalone-code",
+    ],
 )
 @pytest.mark.asyncio
 async def test_observer_keeps_pane_text_out_unless_captured_and_not_a_sign_in(

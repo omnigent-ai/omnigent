@@ -394,6 +394,7 @@ def test_detect_sign_in_prompt_does_not_treat_an_auth_shaped_hostname_as_the_end
         "Sign in to continue:\n\n\n\n  code: HQ7M-2KPD\n",
         "Sign in to continue:\n  HQ7M-2KPD\n",
         "code: HQ7M-2KPD",
+        "HQ7M-2KPD\nwaiting...\n",
     ],
     ids=[
         "moved-past-prompt",
@@ -405,6 +406,7 @@ def test_detect_sign_in_prompt_does_not_treat_an_auth_shaped_hostname_as_the_end
         "code-below-a-gap",
         "unlabelled-code",
         "labelled-code-without-cue",
+        "standalone-code",
     ],
 )
 def test_contains_sign_in_material_outlives_an_actionable_prompt(screen: str) -> None:

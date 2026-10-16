@@ -160,10 +160,10 @@ def contains_sign_in_material(screen: str | None) -> bool:
     but the address and one-time code it printed are still on screen and still
     secret. Diagnostics that export pane text use this broader check to decide
     whether the text may be logged at all, so it errs toward withholding: sign-in
-    wording anywhere with a code-shaped token anywhere counts, as does a value
-    labelled ``code:``. A line that merely mentions a code counts only beside
-    sign-in wording, whatever the code looks like: "Claude Code" is on most
-    launcher lines.
+    wording anywhere with a code-shaped token anywhere counts, as do a value
+    labelled ``code:`` and a line holding only a device code. A line that merely
+    mentions a code counts only beside sign-in wording, whatever the code looks
+    like: "Claude Code" is on most launcher lines.
 
     :param screen: ANSI-stripped terminal screen text, or ``None``.
     :returns: ``True`` when any sign-in material is on screen.
@@ -178,6 +178,9 @@ def contains_sign_in_material(screen: str | None) -> bool:
     if _SIGN_IN_CUE.search(screen) and _SIGN_IN_CODE_ANY_CASE.search(screen):
         return True
     if _LABELLED_SIGN_IN_CODE.search(screen):
+        return True
+    # A line that is nothing but a device code, e.g. left behind by a scrolled-off prompt.
+    if any(_SIGN_IN_CODE.fullmatch(line.strip()) for line in lines):
         return True
     return any(
         _SIGN_IN_CODE_LINE.search(line) and _SIGN_IN_CUE.search(_nearby(lines, index))
