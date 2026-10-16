@@ -15,7 +15,6 @@ Environment:
 from __future__ import annotations
 
 import asyncio
-import configparser
 import datetime as dt
 import json
 import logging
@@ -148,12 +147,10 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
     try:
         cfg = Config(profile=sdk_profile)
         headers = cfg.authenticate()
-    except (configparser.Error, UnicodeError):
-        # Ambient credential probes must not expose malformed profile contents.
-        return None
     except ValueError as profile_exc:
-        # Config raises ValueError for missing profiles, credentials, and
-        # unsupported auth types. Anything else (e.g. network errors
+        # ValueError is what Config raises for every user-facing resolution
+        # failure (missing profile, malformed file, no credentials in env,
+        # unknown auth_type, etc.). Anything else (e.g. network errors
         # fetching OAuth tokens) should propagate.
         logger.debug(
             "databricks-sdk credential resolution failed for profile %r: %s",
@@ -169,8 +166,6 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
             try:
                 cfg = Config()
                 headers = cfg.authenticate()
-            except (configparser.Error, UnicodeError):
-                return None
             except ValueError:
                 return _read_databrickscfg_file_fallback(profile)
         else:
@@ -216,10 +211,7 @@ def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksC
         return None
 
     config = configparser.ConfigParser()
-    try:
-        config.read(cfg_path)
-    except (configparser.Error, UnicodeError):
-        return None
+    config.read(cfg_path)
 
     resolved_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
     if resolved_profile and resolved_profile in config:

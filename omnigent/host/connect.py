@@ -779,7 +779,6 @@ _BASE_HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "GEMINI_API_KEY",
-        "GOOGLE_GEMINI_BASE_URL",
         "GIT_TOKEN",
         "GIT_USERNAME",
     }
@@ -5090,8 +5089,6 @@ def _generate_ucode_configs() -> None:
     the runner never has to fall back to a synchronous on-demand ``ucode
     configure`` when opencode first launches — the slow path for opencode startup.
     """
-    import configparser
-
     from omnigent.host.databricks_credential import (
         HOST_DATABRICKS_PROFILE,
         broker_token_command,
@@ -5101,14 +5098,7 @@ def _generate_ucode_configs() -> None:
     from omnigent.onboarding.provider_config import load_config
     from omnigent.onboarding.ucode_setup import configure_ucode_for_sandbox
 
-    try:
-        workspace = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
-    except (configparser.Error, OSError, UnicodeError):
-        _logger.warning(
-            "Skipping managed gateway configuration: repair the Databricks profile file, "
-            "then run omni setup."
-        )
-        return
+    workspace = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
     if not workspace:
         return
     bearer_command = broker_token_command(workspace)
