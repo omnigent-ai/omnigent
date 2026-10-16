@@ -20,7 +20,6 @@ import httpx
 
 from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
-from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
@@ -52,6 +51,9 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.harnesses.claude_native.rejection_telemetry import (
+    forwarder_rejection_context as _forwarder_rejection_context,
+)
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
 from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
 from omnigent.models.model_metadata import concrete_reported_model
@@ -186,17 +188,6 @@ _HTTP_POST_RETRY_MAX_DELAY_S = 30.0
 # range for any realistic max_delay_s / base_delay_s ratio.
 _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT = 32
 _HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
-_FORWARDER_REJECTION_REASONS = frozenset(
-    {
-        ErrorCode.FORBIDDEN,
-        ErrorCode.INVALID_INPUT,
-        ErrorCode.NOT_FOUND,
-        "event batch exceeds count or size limit",
-        "event type is not allowed on runner tunnel",
-        "source_id required for tunnel replay",
-        "invalid session event",
-    }
-)
 # A 503 ``subagent_delivery_not_confirmed`` means the runner could not deliver a
 # terminal sub-agent result to the parent inbox. It is retried (the work entry can
 # be created slightly after the child reports terminal — a short dispatch race), but
@@ -6763,21 +6754,6 @@ async def _maybe_sync_effort_from_slash_command(
             exc_info=True,
             extra={"session_id": session_id},
         )
-
-
-def _forwarder_rejection_context(error: httpx.HTTPError) -> FailureContext:
-    """Retain rejection metadata without copying echoed transcript content."""
-    if not isinstance(error, httpx.HTTPStatusError):
-        return {}
-    context: FailureContext = {"http_status": error.response.status_code}
-    try:
-        body = error.response.json()
-    except ValueError:
-        return context
-    detail = body.get("detail") if isinstance(body, dict) else None
-    if isinstance(detail, str) and detail in _FORWARDER_REJECTION_REASONS:
-        context["forwarder_rejection_reason"] = detail
-    return context
 
 
 async def _post_forwarder_failed_status(

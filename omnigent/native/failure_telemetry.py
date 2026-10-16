@@ -16,6 +16,9 @@ _TEXT_FIELDS = frozenset(
         "failure_source",
         "forwarder_source_id",
         "forwarder_rejection_reason",
+        "forwarder_http_request_id",
+        "forwarder_rejection_diagnostic_state",
+        "forwarder_validation_errors",
         "detail_source",
         "failure_decision",
         "suppression_reason",
@@ -51,6 +54,7 @@ _BOOL_FIELDS = frozenset(
         "diagnostic_marker_present",
         "diagnostic_file_present",
         "diagnostic_truncated",
+        "forwarder_validation_truncated",
     }
 )
 _INT_FIELDS = frozenset(
@@ -61,6 +65,7 @@ _INT_FIELDS = frozenset(
         "diagnostic_read_offset",
         "diagnostic_lines_omitted",
         "diagnostic_bytes_omitted",
+        "forwarder_validation_error_count",
     }
 )
 _TIME_FIELDS = frozenset({"native_hook_recorded_at", "diagnostic_last_read_at"})
@@ -92,7 +97,7 @@ def normalize_failure_context(value: object) -> FailureContext:
         if key == "provider_error_code" and type(raw) is int and abs(raw) <= 2**63 - 1:
             raw = str(raw)
         if isinstance(raw, str) and raw.strip():
-            limit = 1024 if key == "native_error_message" else 256
+            limit = 1024 if key in {"native_error_message", "forwarder_validation_errors"} else 256
             # Clipping first can turn a quoted credential into an unrecognized fragment.
             redacted = redact_log_text(raw, include_whitespace_credentials=True).strip()[:limit]
             result[key] = redacted.encode("utf-8", errors="replace").decode("utf-8")
