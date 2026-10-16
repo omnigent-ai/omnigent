@@ -10,7 +10,7 @@ from opentelemetry import metrics as otel_metrics
 from opentelemetry.util.types import Attributes
 from websockets.exceptions import ConnectionClosed
 
-from omnigent.runtime.telemetry import telemetry_enabled
+from omnigent.runtime.telemetry import metrics_enabled
 
 _logger = logging.getLogger(__name__)
 
@@ -236,7 +236,7 @@ def _default_metrics() -> ClientWebSocketMetrics:
 
 def record_websocket_connected(kind: TunnelKind, *, reconnect: bool) -> None:
     """Best-effort record of an accepted client WebSocket upgrade."""
-    if not telemetry_enabled():
+    if not metrics_enabled():
         return
     try:
         _default_metrics().record_connected(kind, reconnect=reconnect)
@@ -252,7 +252,7 @@ def record_websocket_disconnected(
     resumed_from_suspend: bool = False,
 ) -> None:
     """Best-effort record of an ended client WebSocket connection."""
-    if not telemetry_enabled():
+    if not metrics_enabled():
         return
     try:
         _default_metrics().record_disconnected(

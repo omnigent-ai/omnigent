@@ -235,3 +235,31 @@ def test_resolve_execution_timeout(cfg: dict[str, int], expected_timeout: int) -
     from deploy.docker.entrypoint import _resolve_execution_timeout
 
     assert _resolve_execution_timeout(cfg) == expected_timeout
+
+
+def test_uvicorn_log_config_is_json_only_when_requested(
+    _fresh_entrypoint_import: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JSON mode yields a loadable dictConfig; the default keeps uvicorn's own."""
+    import logging.config
+
+    module = importlib.import_module(_ENTRYPOINT_MODULE)
+
+    monkeypatch.delenv("OMNIGENT_LOG_FORMAT", raising=False)
+    assert module._uvicorn_log_config() is None
+
+    monkeypatch.setenv("OMNIGENT_LOG_FORMAT", "json")
+    config = module._uvicorn_log_config()
+    assert config is not None
+    loggers = [logging.getLogger(name) for name in ("uvicorn", "uvicorn.error", "uvicorn.access")]
+    saved = [(lg.handlers[:], lg.level, lg.propagate) for lg in loggers]
+    try:
+        logging.config.dictConfig(config)
+        handler = logging.getLogger("uvicorn.access").handlers[0]
+        assert type(handler.formatter).__name__ == "JsonAccessFormatter"
+    finally:
+        for lg, (handlers, level, propagate) in zip(loggers, saved, strict=True):
+            lg.handlers[:] = handlers
+            lg.setLevel(level)
+            lg.propagate = propagate

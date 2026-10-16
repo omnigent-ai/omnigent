@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -469,6 +470,60 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+@pytest.mark.parametrize(
+    ("failure", "status", "error_code", "expected"),
+    [
+        (None, "running", None, "ok"),
+        (None, "failed", "host_offline", "client_error"),
+        (None, "failed", "launch_failed", "server_error"),
+        ("update", "running", None, "server_error"),
+        ("create_run", "running", None, "server_error"),
+        ("create_run", "failed", "host_offline", "server_error"),
+    ],
+)
+def test_record_run_metrics_wait_for_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+    status: str,
+    error_code: str | None,
+    expected: str,
+) -> None:
+    task = _task()
+    store = FakeScheduledTaskStore(rows={task.id: task})
+    clock = [110]
+    samples: list[tuple[str, float, str, int, int]] = []
+    monkeypatch.setattr(fire_mod, "time", SimpleNamespace(time=lambda: clock[0]))
+
+    def record_operation(name: str, duration: float, outcome: str) -> None:
+        samples.append((name, duration, outcome, len(store.updates), len(store.runs)))
+
+    monkeypatch.setattr(fire_mod.operation_metrics, "record_operation", record_operation)
+    create_run = store.create_run
+
+    def persist_run(*args: Any, **kwargs: Any) -> Any:
+        clock[0] = 120
+        return create_run(*args, **kwargs)
+
+    monkeypatch.setattr(store, "create_run", persist_run)
+    if failure is not None:
+
+        def fail_write(*args: Any, **kwargs: Any) -> None:
+            clock[0] = 120
+            raise RuntimeError("persistence failed")
+
+        monkeypatch.setattr(store, failure, fail_write)
+        with pytest.raises(RuntimeError, match="persistence failed"):
+            fire_mod._record_run_sync(
+                _deps(store), task, "conv_1", 100, status, error_code=error_code
+            )
+    else:
+        fire_mod._record_run_sync(_deps(store), task, "conv_1", 100, status, error_code=error_code)
+
+    assert samples == [
+        ("scheduled_task_run", 20, expected, 0 if failure == "update" else 1, 0 if failure else 1)
+    ]
 
 
 @pytest.mark.asyncio

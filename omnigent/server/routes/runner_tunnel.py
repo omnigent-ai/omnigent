@@ -45,7 +45,12 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
-from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
+from omnigent.server import (
+    managed_host_keepalive,
+    operation_metrics,
+    session_live_state,
+    shutdown_state,
+)
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
@@ -380,6 +385,7 @@ def create_runner_tunnel_router(
         }
 
     @router.websocket("/runners/{runner_id}/tunnel")
+    @operation_metrics.tracked_tunnel("runner")
     async def tunnel(ws: WebSocket, runner_id: str) -> None:
         """Accept a runner's outbound WebSocket tunnel.
 

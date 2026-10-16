@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
     from opentelemetry.context import Context
     from opentelemetry.sdk._logs.export import LogRecordExporter
-    from opentelemetry.sdk.metrics.export import MetricExporter
+    from opentelemetry.sdk.metrics.export import MetricExporter, MetricReader
     from opentelemetry.sdk.trace.export import SpanExporter
     from opentelemetry.trace import Span
 
@@ -120,9 +120,41 @@ def telemetry_enabled() -> bool:
     return _env_bool("OMNIGENT_TELEMETRY_ENABLED")
 
 
+_PROMETHEUS_METRICS_ADDR_ENV = "OMNIGENT_PROMETHEUS_METRICS_ADDR"
+
+
+def prometheus_metrics_addr() -> str:
+    """
+    Return the ``host:port`` to serve Prometheus metrics on, or ``""``.
+
+    Set by ``OMNIGENT_PROMETHEUS_METRICS_ADDR``, e.g.
+    ``"127.0.0.1:9464"``. A deployment that scrapes the server sets it;
+    the listener only answers pulls, so the process makes no outbound
+    connection for metrics.
+
+    :returns: Configured address, stripped, or ``""`` when unset.
+    """
+    return os.environ.get(_PROMETHEUS_METRICS_ADDR_ENV, "").strip()
+
+
+def metrics_enabled() -> bool:
+    """
+    Return whether metric instruments should record in this process.
+
+    True when telemetry is enabled, or when only the Prometheus pull
+    endpoint is configured: metrics-only mode needs no
+    ``OMNIGENT_TELEMETRY_ENABLED`` because it creates no spans and
+    exports nothing on its own.
+
+    :returns: ``True`` when some metrics reader will collect.
+    """
+    return telemetry_enabled() or bool(prometheus_metrics_addr())
+
+
 def telemetry_guarded(func: Callable[..., Any]) -> Callable[..., Any]:
     """
-    Make a best-effort ``record_*`` a no-op when telemetry is off, and never raise.
+    Make a best-effort ``record_*`` metric hook a no-op unless metrics are
+    enabled (see :func:`metrics_enabled`), and never raise.
 
     :param func: Telemetry function whose return value is ignored.
     :returns: The wrapped function.
@@ -130,7 +162,7 @@ def telemetry_guarded(func: Callable[..., Any]) -> Callable[..., Any]:
 
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
-        if not telemetry_enabled():
+        if not metrics_enabled():
             return None
         try:
             return func(*args, **kwargs)
@@ -1085,49 +1117,107 @@ def _init_otel_traces(endpoint: str) -> None:
         _logger.exception("failed to initialize OpenTelemetry tracing")
 
 
+def _parse_metrics_addr(addr: str) -> tuple[str, int]:
+    """
+    Split a ``host:port`` metrics address.
+
+    :param addr: Address such as ``"127.0.0.1:9464"`` or ``"[::1]:9464"``.
+    :returns: ``(host, port)``.
+    :raises ValueError: When the address has no host or a non-numeric
+        or out-of-range port.
+    """
+    host, sep, port_text = addr.rpartition(":")
+    host = host.strip("[]")
+    if not sep or not host or not port_text.isdigit():
+        raise ValueError(f"{_PROMETHEUS_METRICS_ADDR_ENV} must be host:port, got {addr!r}")
+    port = int(port_text)
+    if not 0 < port < 65536:
+        raise ValueError(f"{_PROMETHEUS_METRICS_ADDR_ENV} port out of range: {addr!r}")
+    return host, port
+
+
+def _create_prometheus_metric_reader(addr: str) -> MetricReader:
+    """
+    Start the Prometheus pull endpoint and return its metric reader.
+
+    ``target_info`` is disabled: a scraper already labels every series
+    with its target, so the extra family would only repeat resource
+    attributes on every scrape.
+
+    :param addr: ``host:port`` to bind, e.g. ``"127.0.0.1:9464"``.
+    :returns: Reader to attach to the ``MeterProvider``.
+    """
+    from opentelemetry.exporter.prometheus import PrometheusMetricReader
+    from prometheus_client import start_http_server
+
+    host, port = _parse_metrics_addr(addr)
+    reader = PrometheusMetricReader(disable_target_info=True)
+    start_http_server(port, addr=host)
+    _logger.info("serving Prometheus metrics on %s", addr)
+    return reader
+
+
 def _init_otel_metrics() -> None:
     """
     Initialize the OpenTelemetry SDK meter provider when configured.
 
-    Metrics remain no-op unless the operator configures an OTLP
-    endpoint or sets ``OTEL_METRICS_EXPORTER=otlp``. Setting
-    ``OTEL_METRICS_EXPORTER=none`` explicitly disables metrics.
+    Two independent readers, either or both of which may be installed:
+
+    * **Prometheus pull.** ``OMNIGENT_PROMETHEUS_METRICS_ADDR`` starts a
+      ``/metrics`` listener. It does not need
+      ``OMNIGENT_TELEMETRY_ENABLED``.
+    * **OTLP push.** Only with telemetry enabled, and only when the
+      operator configures an OTLP endpoint or sets
+      ``OTEL_METRICS_EXPORTER=otlp``. ``OTEL_METRICS_EXPORTER=none``
+      explicitly disables it.
+
+    With neither, metrics remain no-op.
     """
     global _metrics_initialized
 
     if _metrics_initialized:
         return
+    _metrics_initialized = True
 
-    exporter_name = _metrics_exporter_name()
-    if exporter_name == "none":
-        _metrics_initialized = True
-        return
-    if exporter_name != "otlp":
-        _logger.warning(
-            "unsupported OTEL_METRICS_EXPORTER=%s; server metrics export disabled",
-            exporter_name,
-        )
-        _metrics_initialized = True
+    readers: list[MetricReader] = []
+    prometheus_addr = prometheus_metrics_addr()
+    if prometheus_addr:
+        try:
+            readers.append(_create_prometheus_metric_reader(prometheus_addr))
+        except Exception:
+            _logger.exception("failed to start the Prometheus metrics endpoint")
+
+    if telemetry_enabled():
+        exporter_name = _metrics_exporter_name()
+        if exporter_name == "otlp":
+            try:
+                from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+
+                readers.append(PeriodicExportingMetricReader(_create_otlp_metric_exporter()))
+            except Exception:
+                _logger.exception("failed to initialize OpenTelemetry metrics")
+        elif exporter_name != "none":
+            _logger.warning(
+                "unsupported OTEL_METRICS_EXPORTER=%s; server metrics export disabled",
+                exporter_name,
+            )
+
+    if not readers:
         return
 
     try:
         from opentelemetry import metrics as otel_metrics
         from opentelemetry.sdk.metrics import MeterProvider
-        from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
         from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 
-        exporter = _create_otlp_metric_exporter()
-        reader = PeriodicExportingMetricReader(exporter)
         service_name = os.environ.get("OTEL_SERVICE_NAME", "omnigent")
         provider = MeterProvider(
-            metric_readers=[reader],
+            metric_readers=readers,
             resource=Resource.create({SERVICE_NAME: service_name}),
         )
         otel_metrics.set_meter_provider(provider)
-        _metrics_initialized = True
     except Exception:
         _logger.exception("failed to initialize OpenTelemetry metrics")
-        _metrics_initialized = True
 
 
 def _logs_exporter_name() -> str:
@@ -1273,6 +1363,10 @@ def init(service_name: str | None = None) -> None:
         # Master opt-in off (the default): stay fully inert — no provider, no
         # OTEL_SERVICE_NAME mutation, no httpx/metrics/logs instrumentation, no
         # spans. Only operators who set OMNIGENT_TELEMETRY_ENABLED pay any cost.
+        # The one exception is an explicitly configured Prometheus pull
+        # endpoint: metrics only, served on a listener, nothing exported.
+        if prometheus_metrics_addr():
+            _init_otel_metrics()
         return
 
     _capture_content = _env_bool("OMNIGENT_OTEL_CAPTURE_CONTENT")

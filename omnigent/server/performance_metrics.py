@@ -14,6 +14,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only on Windows
     resource = None  # type: ignore[assignment]
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from threading import Lock
 from typing import Protocol
@@ -22,6 +23,7 @@ from opentelemetry import metrics as otel_metrics
 from opentelemetry.util.types import Attributes
 from uvicorn.logging import AccessFormatter
 
+from omnigent.log_format import JsonFormatter
 from omnigent.process_logging import log_record_display_fields
 
 _DEFAULT_WINDOWS_SECONDS = (1.0, 10.0, 30.0)
@@ -176,6 +178,8 @@ class MeterLike(Protocol):
         name: str,
         unit: str = "",
         description: str = "",
+        *,
+        explicit_bucket_boundaries_advisory: Sequence[float] | None = None,
     ) -> HistogramInstrument:
         """
         Create a histogram instrument.
@@ -184,6 +188,7 @@ class MeterLike(Protocol):
             ``"omnigent.server.http.request.duration"``.
         :param unit: UCUM unit string, e.g. ``"s"``.
         :param description: Human-readable metric description.
+        :param explicit_bucket_boundaries_advisory: Suggested bucket bounds.
         :returns: OpenTelemetry histogram instrument.
         """
         ...
@@ -267,6 +272,76 @@ class RequestDurationAccessFormatter(AccessFormatter):
             _REQUEST_USER_AGENT_CONTEXT.set(None)
             _REQUEST_SESSION_ID_CONTEXT.set(None)
         return " ".join(parts)
+
+
+class JsonAccessFormatter(JsonFormatter):
+    """
+    Uvicorn access formatter emitting one JSON line per request.
+
+    Reads the same request context as :class:`RequestDurationAccessFormatter`
+    and clears it afterwards. The query string is dropped so tokens passed
+    as query parameters never reach the log pipeline.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Render one Uvicorn access record as JSON."""
+        try:
+            return super().format(record)
+        finally:
+            _REQUEST_DURATION_CONTEXT.set(None)
+            _REQUEST_ID_CONTEXT.set(None)
+            _REQUEST_USER_AGENT_CONTEXT.set(None)
+            _REQUEST_SESSION_ID_CONTEXT.set(None)
+
+    def message(self, record: logging.LogRecord) -> str:  # noqa: ARG002 - fixed by design
+        """Use a fixed message; the request line (and its query) stays out."""
+        return "request completed"
+
+    def extra_fields(self, record: logging.LogRecord) -> dict[str, object]:
+        """Return access fields: method, path, status, duration, ids, UA."""
+        fields = dict(super().extra_fields(record))
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5:
+            _client, method, full_path, _http_version, status_code = args
+            fields["method"] = str(method)
+            fields["path"] = str(full_path).split("?", 1)[0]
+            fields["status"] = status_code if isinstance(status_code, int) else str(status_code)
+        duration_seconds = _REQUEST_DURATION_CONTEXT.get()
+        if duration_seconds is not None:
+            fields["duration_ms"] = round(duration_seconds * 1000.0, 1)
+        request_id = _REQUEST_ID_CONTEXT.get()
+        if request_id is not None:
+            fields["request_id"] = request_id
+        user_agent = _REQUEST_USER_AGENT_CONTEXT.get()
+        if user_agent is not None:
+            fields["user_agent"] = user_agent[
+                : RequestDurationAccessFormatter._MAX_USER_AGENT_LENGTH
+            ]
+        session_id = _REQUEST_SESSION_ID_CONTEXT.get()
+        if session_id is not None:
+            fields["session_id"] = session_id
+        return fields
+
+
+class HealthCheckAccessFilter(logging.Filter):
+    """Drop access records for ``/health``, the probes' and sidebar's poll."""
+
+    def __init__(self, name: str = "", *, base_path: str | None = None) -> None:
+        """Match health paths using the server's configured deployment prefix."""
+        from omnigent.server.app import _normalize_base_path
+
+        super().__init__(name)
+        prefix = _normalize_base_path(
+            base_path if base_path is not None else os.environ.get("OMNIGENT_WEB_BASE_PATH")
+        )
+        self._health_paths = frozenset(("/health", f"{prefix}/health"))
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return ``False`` for a ``/health`` access record."""
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5:
+            return str(args[2]).split("?", 1)[0] not in self._health_paths
+        return True
 
 
 @dataclass(frozen=True)
@@ -796,6 +871,24 @@ class ServerPerformanceMetrics:
         return (cpu_delta / wall_delta) * 100.0
 
 
+_HTTP_DURATION_BUCKETS_S = (
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.075,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1,
+    2.5,
+    5,
+    7.5,
+    10,
+)
+
+
 def _create_request_otel_instruments(meter: MeterLike) -> _RequestOtelInstruments:
     """
     Create OpenTelemetry instruments for request and WebSocket state.
@@ -823,6 +916,8 @@ def _create_request_otel_instruments(meter: MeterLike) -> _RequestOtelInstrument
             "omnigent.server.http.request.duration",
             unit="s",
             description="HTTP request processing duration.",
+            # OpenTelemetry's recommended http.server.request.duration buckets.
+            explicit_bucket_boundaries_advisory=_HTTP_DURATION_BUCKETS_S,
         ),
         in_flight=meter.create_gauge(
             "omnigent.server.http.requests.in_flight",
@@ -966,6 +1061,7 @@ class ServerMetricsOtelPublisher:
         method: str,
         route: str,
         status_code: int | None,
+        outcome: str | None = None,
     ) -> None:
         """
         Record one completed HTTP request duration.
@@ -979,6 +1075,8 @@ class ServerMetricsOtelPublisher:
             ``"/v1/sessions/{session_id}"``.
         :param status_code: HTTP response status code, e.g. ``200``.
             ``None`` when no response status was available.
+        :param outcome: ``"ok"``, ``"client_error"`` or ``"server_error"``
+            (see :mod:`omnigent.server.operation_metrics`). ``None`` omits it.
         """
         attributes: dict[str, str | bool | int] = {
             "failed": failed,
@@ -987,6 +1085,8 @@ class ServerMetricsOtelPublisher:
         }
         if status_code is not None:
             attributes["http.response.status_code"] = status_code
+        if outcome is not None:
+            attributes["outcome"] = outcome
         self._request.duration.record(
             duration_seconds,
             attributes=attributes,

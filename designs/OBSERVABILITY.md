@@ -295,10 +295,31 @@ All standard OpenTelemetry env vars; nothing backend-specific in code.
 | `OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION` | `true` | Server/runner HTTP spans + extract |
 | `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` (dev only) | Include payloads on spans; **off in prod** (PII) |
 
-Telemetry is **opt-in**: nothing is instrumented and no spans are created unless
-`OMNIGENT_TELEMETRY_ENABLED` is truthy, so a default install is never burdened with
-telemetry it didn't ask for. Opt in first, then point `OTEL_EXPORTER_OTLP_ENDPOINT` at a
-backend.
+These two are independent of `OMNIGENT_TELEMETRY_ENABLED`: neither creates spans nor
+opens an outbound connection, so a deployment can turn them on without enabling export.
+
+| Variable | Example | Effect |
+|---|---|---|
+| `OMNIGENT_PROMETHEUS_METRICS_ADDR` | `127.0.0.1:9464` | Serves the server's OTel metrics as Prometheus text on `host:port/metrics` (pull only). Install with `uv pip install "omnigent[tracing]"`; enabling pull metrics does not enable tracing or OTLP export. The listener is per process: give each worker process its own address. |
+| `OMNIGENT_LOG_FORMAT` | `json` | Docker entrypoint only: one JSON object per log line, keyed like Go `log/slog` (`time`, `level`, `msg`, `source`) plus `logger` and request context (`trace_id`, `request_id`, `session_id`, `runner_id`, `user_id`). Each serialized field value is capped at 16 KiB of UTF-8, including JSON quoting and escaping. Non-finite numbers (`NaN`, positive and negative infinity) become `null`, including in nested values. Access lines drop query strings and `/health`. |
+
+With metrics on, the server records `omnigent.server.operation.duration` by
+`operation.name` (`session_create`, `event_post`, `sandbox_launch`, `sandbox_resume`,
+`scheduled_task_run`) and `outcome` (`ok`, `client_error`, `server_error`); the HTTP
+duration histogram carries the same `outcome`. For `scheduled_task_run` the duration is the
+time from the scheduled fire time until the run is recorded (scheduler lag plus launch), in
+whole seconds. Success is emitted only after the task update and run-row write both
+succeed; a recording failure emits `server_error`. Only `server_error` is the server's fault,
+so availability is `1 - server_error / total` over the histogram count. Also exported:
+`omnigent.server.errors` by `error.code`, and `omnigent.server.tunnel.active` /
+`.closed` by `tunnel.kind`. An incoming W3C `traceparent` becomes the request's ambient
+trace, so log lines carry the caller's `trace_id` even with export off.
+
+Telemetry is **opt-in**: metrics stay inactive unless
+`OMNIGENT_TELEMETRY_ENABLED` is truthy or `OMNIGENT_PROMETHEUS_METRICS_ADDR` is set.
+Span creation and export require `OMNIGENT_TELEMETRY_ENABLED`; installing the
+`tracing` extra alone enables neither. For OTLP export, opt in and point
+`OTEL_EXPORTER_OTLP_ENDPOINT` at a backend.
 
 **Session correlation (`session.id`).** Every span that originates from a session is
 tagged with the Omnigent session (conversation) id (`conv_…`) under the `session.id`

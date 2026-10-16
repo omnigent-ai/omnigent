@@ -9,7 +9,7 @@ from typing import Literal, Protocol
 from opentelemetry import metrics as otel_metrics
 from opentelemetry.util.types import Attributes
 
-from omnigent.runtime.telemetry import telemetry_enabled
+from omnigent.runtime.telemetry import metrics_enabled
 
 _logger = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ def _default_metrics() -> DatabaseMetrics:
 
 def record_transaction_retry(operation: str, outcome: RetryOutcome) -> None:
     """Best-effort record of a CockroachDB transaction retry outcome."""
-    if not telemetry_enabled():
+    if not metrics_enabled():
         return
     try:
         _default_metrics().record_transaction_retry(operation, outcome)

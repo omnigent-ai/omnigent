@@ -23,6 +23,9 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from opentelemetry import context as otel_context
+from opentelemetry import trace as otel_trace
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from pydantic import BaseModel
 from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -77,7 +80,12 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
+from omnigent.server import (
+    managed_host_keepalive,
+    operation_metrics,
+    session_live_state,
+    shutdown_state,
+)
 from omnigent.server.auth import (
     AuthProvider,
     SharingMode,
@@ -657,6 +665,25 @@ def request_route_template_for_metrics(request: Request) -> str:
     if isinstance(route, Route | Mount):
         return route.path
     return _UNMATCHED_ROUTE_TEMPLATE
+
+
+_TRACE_CONTEXT_PROPAGATOR = TraceContextTextMapPropagator()
+
+
+def _adopt_incoming_trace_context(request: Request) -> None:
+    """Make the caller's W3C ``traceparent`` this request's ambient trace.
+
+    Log lines then carry the same ``trace_id`` as the caller that sent the
+    ``traceparent`` (a load balancer, gateway, or client), even with span
+    export off. Skipped when instrumentation already started a span. Never
+    detached: uvicorn runs each request in its own task, and the access log
+    is emitted after this middleware returns.
+    """
+    if otel_trace.get_current_span().get_span_context().is_valid:
+        return
+    if "traceparent" not in request.headers:
+        return
+    otel_context.attach(_TRACE_CONTEXT_PROPAGATOR.extract(request.headers))
 
 
 def _resolve_audit_route(request: Request) -> tuple[str, str, str | None]:
@@ -2128,6 +2155,7 @@ def create_app(
             the matched route and returns its response.
         :returns: The downstream route response.
         """
+        _adopt_incoming_trace_context(request)
         request_id = uuid.uuid4().hex
         request.state.audit_request_id = request_id
         set_request_id_for_access_log(request_id)
@@ -2296,13 +2324,22 @@ def create_app(
                 status_code,
                 failed=failed,
             )
+            outcome = operation_metrics.classify_outcome(
+                status_code,
+                failed=failed,
+                error_code=_bag.get("code"),
+            )
             server_metrics_otel.record_request_duration(
                 duration_seconds=duration_seconds,
                 failed=request_failed,
                 method=request.method,
                 route=route,
                 status_code=metrics_status_code,
+                outcome=outcome,
             )
+            http_operation = operation_metrics.HTTP_OPERATIONS.get(operation)
+            if http_operation is not None:
+                operation_metrics.record_operation(http_operation, duration_seconds, outcome)
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -2329,6 +2366,7 @@ def create_app(
             error_impact=exc.impact.value,
             error_phase=exc.phase.value,
         )
+        operation_metrics.record_error(str(exc.code))
         if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
             # A session state, not a fault: the user's machine is asleep or
             # the host disconnected, and clients render it as a reconnect

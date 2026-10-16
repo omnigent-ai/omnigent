@@ -926,6 +926,7 @@ def test_make_span_attribute_processor_is_generic() -> None:
 def test_telemetry_guarded_no_op_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """A guarded ``record_*`` does not call through when telemetry is off."""
     monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "false")
+    monkeypatch.delenv("OMNIGENT_PROMETHEUS_METRICS_ADDR", raising=False)
     calls: list[int] = []
 
     @telemetry.telemetry_guarded
@@ -934,6 +935,22 @@ def test_telemetry_guarded_no_op_when_disabled(monkeypatch: pytest.MonkeyPatch) 
 
     assert record(1) is None
     assert calls == []
+
+
+def test_telemetry_guarded_records_in_prometheus_only_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Prometheus pull endpoint alone is enough for guarded metric hooks to run."""
+    monkeypatch.delenv("OMNIGENT_TELEMETRY_ENABLED", raising=False)
+    monkeypatch.setenv("OMNIGENT_PROMETHEUS_METRICS_ADDR", "127.0.0.1:9464")
+    calls: list[int] = []
+
+    @telemetry.telemetry_guarded
+    def record(n: int) -> None:
+        calls.append(n)
+
+    record(7)
+    assert calls == [7]
 
 
 def test_telemetry_guarded_swallows_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1427,3 +1444,61 @@ def test_instrument_httpx_client_injects_over_custom_transport(
         f"{_RESP_HEX!r} after instrument_client — the server->runner forward "
         "would not stay in the originating trace."
     )
+
+
+# ── Prometheus metrics-only mode ─────────────────────────
+
+
+def test_metrics_enabled_by_prometheus_addr_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Prometheus endpoint enables metrics without the telemetry opt-in."""
+    monkeypatch.delenv("OMNIGENT_TELEMETRY_ENABLED", raising=False)
+    monkeypatch.delenv("OMNIGENT_PROMETHEUS_METRICS_ADDR", raising=False)
+    assert telemetry.metrics_enabled() is False
+
+    monkeypatch.setenv("OMNIGENT_PROMETHEUS_METRICS_ADDR", "127.0.0.1:9464")
+    assert telemetry.telemetry_enabled() is False
+    assert telemetry.metrics_enabled() is True
+
+
+def test_init_prometheus_only_installs_reader_without_otlp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Metrics-only mode starts the pull endpoint and builds no OTLP exporter."""
+    from opentelemetry import metrics as otel_metrics
+
+    monkeypatch.delenv("OMNIGENT_TELEMETRY_ENABLED", raising=False)
+    monkeypatch.setenv("OMNIGENT_PROMETHEUS_METRICS_ADDR", "127.0.0.1:9464")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317")
+    monkeypatch.setattr(telemetry, "_initialized", False)
+    monkeypatch.setattr(telemetry, "_metrics_initialized", False)
+    started: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        "prometheus_client.start_http_server",
+        lambda port, addr="0.0.0.0", **_: started.append((port, addr)),
+    )
+
+    def _no_otlp() -> None:
+        raise AssertionError("metrics-only mode must not build an OTLP exporter")
+
+    monkeypatch.setattr(telemetry, "_create_otlp_metric_exporter", _no_otlp)
+    monkeypatch.setattr(telemetry, "_init_otel_traces", lambda _endpoint: _no_otlp())
+    installed: list[object] = []
+    monkeypatch.setattr(otel_metrics, "set_meter_provider", installed.append)
+
+    telemetry.init()
+
+    assert started == [(9464, "127.0.0.1")]
+    assert len(installed) == 1
+    assert telemetry._initialized is False
+
+
+@pytest.mark.parametrize("addr", ["9464", ":9464", "127.0.0.1:http", "127.0.0.1:70000"])
+def test_parse_metrics_addr_rejects_malformed(addr: str) -> None:
+    """A malformed address is refused rather than bound somewhere unexpected."""
+    with pytest.raises(ValueError, match="OMNIGENT_PROMETHEUS_METRICS_ADDR"):
+        telemetry._parse_metrics_addr(addr)
+
+
+def test_parse_metrics_addr_accepts_ipv6() -> None:
+    """A bracketed IPv6 host is accepted."""
+    assert telemetry._parse_metrics_addr("[::1]:9464") == ("::1", 9464)
