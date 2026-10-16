@@ -381,8 +381,11 @@ async def test_cancel_auto_forwarder_task_cancels_and_awaits_registered_task() -
         await _drain_forwarder_runs([run])
 
 
+@pytest.mark.parametrize("replaced", [False, True])
 @pytest.mark.asyncio
-async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_server() -> None:
+async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_server(
+    replaced: bool,
+) -> None:
     """
     Codex pane teardown cancels the forwarder and closes the app-server.
 
@@ -393,38 +396,52 @@ async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_ser
     """
     session_id = "c0d3f00d0000000000000000deadbeef"
     run = _ForwarderRun()
-    closed = False
+    replacement_run = _ForwarderRun()
 
-    async def _parked() -> None:
-        run.task = asyncio.current_task()
+    async def _parked(state: _ForwarderRun) -> None:
+        state.task = asyncio.current_task()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
-            run.cancelled = True
+            state.cancelled = True
+            if state is run and replaced:
+                successor = asyncio.create_task(_parked(replacement_run))
+                runner_app_mod._register_auto_forwarder_task(session_id, successor)
+                runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] = replacement_server
             raise
 
     class _FakeAppServer:
+        closed = False
+
         async def close(self) -> None:
-            nonlocal closed
-            closed = True
+            self.closed = True
+
+    original_server = _FakeAppServer()
+    replacement_server = _FakeAppServer()
 
     try:
-        task = asyncio.create_task(_parked())
+        task = asyncio.create_task(_parked(run))
         runner_app_mod._register_auto_forwarder_task(session_id, task)
-        runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] = _FakeAppServer()
+        runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] = original_server
         await asyncio.sleep(0)
 
         await runner_app_mod.teardown_codex_native_app_server(session_id)
 
         assert task.cancelled(), "forwarder must be finished-cancelled after teardown"
         assert run.cancelled is True
-        assert closed is True, "registered codex app-server must be closed"
-        assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
-        assert session_id not in runner_app_mod._AUTO_FORWARDER_TASKS
+        assert replacement_server.closed is False
+        assert original_server.closed is True, "registered codex app-server must be closed"
+        if replaced:
+            assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is replacement_server
+            assert runner_app_mod._AUTO_FORWARDER_TASKS[session_id] is replacement_run.task
+            assert replacement_run.task is not None and not replacement_run.task.done()
+        else:
+            assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+            assert session_id not in runner_app_mod._AUTO_FORWARDER_TASKS
     finally:
         runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
-        await _drain_forwarder_runs([run])
+        await _drain_forwarder_runs([run, replacement_run])
 
 
 @pytest.mark.asyncio

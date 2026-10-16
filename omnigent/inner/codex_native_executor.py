@@ -43,6 +43,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_startup_failure,
     read_bridge_startup_timeout,
     read_bridge_state,
+    read_bridge_state_result,
     read_codex_config_effort,
     read_codex_config_model,
     read_mcp_startup,
@@ -735,7 +736,8 @@ class CodexNativeExecutor(Executor):
             # active_turn_id write must be atomic with respect to mid-turn
             # steering. The terminal event is yielded after the lock releases.
             async with self._inject_lock:
-                state = read_bridge_state(self._bridge_dir)
+                state_read = read_bridge_state_result(self._bridge_dir)
+                state = state_read.state
                 if state is None:
                     startup_error = read_bridge_startup_error(self._bridge_dir)
                     if startup_error is None and not startup_timeout_observed:
@@ -774,6 +776,22 @@ class CodexNativeExecutor(Executor):
                         else f"Codex native thread never started: {startup_error}"
                         if startup_error
                         else "Codex native bridge state is missing"
+                    )
+                    _logger.info(
+                        "Codex native bridge unavailable before input delivery",
+                        extra=with_input_attributes(
+                            debug_event(
+                                "codex_bridge_state_unavailable",
+                                session_id=self._request_session_id,
+                                bridge_state_status=state_read.status,
+                                bridge_state_errno=state_read.os_errno,
+                                wait_sleep_ms=round(waited_seconds * 1000),
+                                wait_budget_ms=round(max_wait_seconds * 1000),
+                                startup_wait_extended=startup_timeout_observed,
+                                startup_error_present=startup_error is not None,
+                                startup_failure_coded=startup_failure is not None,
+                            )
+                        ),
                     )
                     undelivered = True
                 elif not _session_is_active(state.session_id, self._request_session_id):

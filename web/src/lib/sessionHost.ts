@@ -44,6 +44,21 @@ export function setSessionHost(sessionId: string, hostId: string | null | undefi
   notifySessionHostChanges();
 }
 
+// A managed create that chose its sandbox host's id records it in this label;
+// the row's host_id stays null until the host binds.
+export const REQUESTED_HOST_ID_LABEL = "omnigent.sandbox.requested_host_id";
+
+/**
+ * The host id a session routes by: its bound host, else the id its managed
+ * create chose for a sandbox host that hasn't bound yet.
+ */
+export function sessionRoutingHostId(
+  hostId: string | null | undefined,
+  labels: Record<string, string> | null | undefined,
+): string | null {
+  return hostId || labels?.[REQUESTED_HOST_ID_LABEL] || null;
+}
+
 // A sub-agent or side chat runs on its parent's runner, whose tunnel lives on the
 // replica keyed by the PARENT's host — the child row carries no host_id of its
 // own. Recording the parent link lets a child key its traffic by the nearest

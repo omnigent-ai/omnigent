@@ -1255,15 +1255,13 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   }
 
   if (itemType === "error") {
+    // Same parse as `response.error`, so a classified item's title / cause /
+    // remediation render live exactly as they do after a reload.
     return {
       type: "error",
       source: String(rec.source ?? ""),
       toolName: null,
-      error: {
-        code: String(rec.code ?? ""),
-        message: String(rec.message ?? ""),
-        ...(rec.level === "info" ? { level: "info" as const } : {}),
-      },
+      error: parseErrorInfo(rec),
       itemId,
       responseId,
     } satisfies ErrorEvent;

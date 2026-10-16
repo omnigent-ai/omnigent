@@ -6,11 +6,12 @@ grouping is deterministic; everything else comes from the live server.
 
 from __future__ import annotations
 
+import json
 from time import time
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from playwright.sync_api import Locator, Page, Route, expect
+from playwright.sync_api import Locator, Page, Route, WebSocketRoute, expect
 
 _RUNNING = f"{1:032x}"
 _AWAITING = f"{2:032x}"
@@ -103,10 +104,40 @@ def _section_header(page: Page, title: str) -> Locator:
     return page.get_by_role("button", name=title, exact=True)
 
 
-def test_date_grouping_and_show_toggles_persist_across_reload(
+def test_grouping_and_show_toggles_persist_across_reload(
     page: Page, stubbed_sidebar: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Status falls back to Default; both date groupings and Show persist."""
+    """Status holds idle transitions; all grouping choices and Show persist."""
+    sockets: list[WebSocketRoute] = []
+    page.route_web_socket("**/v1/sessions/updates*", lambda socket: sockets.append(socket))
+    _open_view_submenu(page, "session-grouping-menu")
+    page.get_by_role("menuitemradio", name="Status", exact=True).click()
+    page.keyboard.press("Escape")
+    page.reload()
+    working = page.locator("section").filter(has=_section_header(page, "Working"))
+    done = page.locator("section").filter(has=_section_header(page, "Done"))
+    running_link = f'a[href="/c/{_RUNNING}"]'
+    expect(working.locator(running_link)).to_be_visible()
+    expect(done.locator(f'a[href="/c/{_IDLE}"]')).to_be_visible()
+    running_badge = (
+        page.locator("li")
+        .filter(has=page.locator(running_link))
+        .get_by_test_id("session-state-badge")
+    )
+    expect(running_badge).to_have_attribute("data-state", "running")
+    page.get_by_text("What should we build?", exact=True).hover()
+    assert sockets, "Session updates socket never connected"
+    monkeypatch.setitem(_ROWS[0], "status", "idle")
+    sockets[-1].send(json.dumps({"type": "changed", "items": [_ROWS[0]]}))
+    expect(running_badge).to_have_count(0)
+    expect(working.locator(running_link)).to_be_visible()
+    expect(done.locator(running_link)).to_be_visible(timeout=15_000)
+    expect(working.get_by_text("No sessions", exact=True)).to_be_visible()
+    monkeypatch.setitem(_ROWS[0], "status", "running")
+    sockets[-1].send(json.dumps({"type": "changed", "items": [_ROWS[0]]}))
+    expect(working.locator(running_link)).to_be_visible(timeout=2_000)
+    expect(working.get_by_text("No sessions", exact=True)).to_have_count(0)
+
     today, yesterday = page.evaluate("""() => {
         const day = new Date();
         day.setHours(0, 0, 0, 0);
@@ -121,13 +152,8 @@ def test_date_grouping_and_show_toggles_persist_across_reload(
     ]:
         monkeypatch.setitem(row, "created_at", created_at)
         monkeypatch.setitem(row, "updated_at", updated_at)
-    page.evaluate(
-        "localStorage.setItem('omnigent:sidebar-view', JSON.stringify({grouping: 'status'}))"
-    )
     page.reload()
-    expect(_section_header(page, "Sessions")).to_be_visible()
-    expect(_section_header(page, "Working")).to_have_count(0)
-    expect(_section_header(page, "Done")).to_have_count(0)
+    expect(_section_header(page, "Working")).to_be_visible()
     filter_button = page.get_by_test_id("session-filter")
     expect(filter_button).to_have_accessible_name("Group, sort, and filter sessions")
     filter_button.hover()
@@ -135,15 +161,12 @@ def test_date_grouping_and_show_toggles_persist_across_reload(
     before = filter_button.bounding_box()
 
     _open_view_submenu(page, "session-grouping-menu")
-    expect(page.get_by_test_id("session-grouping-status")).to_have_count(0)
-    expect(page.get_by_role("menuitemradio", name="Default", exact=True)).to_be_checked()
+    expect(page.get_by_role("menuitemradio", name="Status", exact=True)).to_be_checked()
     expect(page.get_by_role("menuitemradio", name="Created", exact=True)).to_be_visible()
     page.get_by_test_id("session-grouping-updated").click()
     page.keyboard.press("Escape")
     expect(_section_header(page, "Updated today")).to_be_visible()
-    updated_yesterday = page.locator("section").filter(
-        has=_section_header(page, "Updated yesterday")
-    )
+    updated_yesterday = page.locator("section").filter(has=_section_header(page, "Yesterday"))
     expect(updated_yesterday.locator(f'a[href="/c/{_AWAITING}"]')).to_be_visible()
     expect(_section_header(page, "Sessions")).to_have_count(0)
     # The first group takes the Projects header's place, so the filter stays put.
@@ -162,9 +185,10 @@ def test_date_grouping_and_show_toggles_persist_across_reload(
     page.get_by_test_id("session-show-environment").click()
     page.get_by_test_id("session-show-repo").click()
     page.keyboard.press("Escape")
-    # Environment · Repo (from the sandbox label) · Branch.
+    # Environment is icon-only visually; its label remains available to screen readers.
     meta = "Local machine·omnigent·fix/payment-retries"
     expect(idle_row.get_by_test_id("session-row-meta")).to_have_text(meta)
+    expect(idle_row.get_by_text("Local machine", exact=True)).to_have_class("sr-only")
 
     page.reload()
     expect(_section_header(page, "Updated today")).to_be_visible(timeout=30_000)
@@ -176,8 +200,8 @@ def test_date_grouping_and_show_toggles_persist_across_reload(
     page.keyboard.press("Escape")
     for title, session_id in [
         ("Created today", _IDLE),
-        ("Created yesterday", _RUNNING),
-        ("Created earlier", _AWAITING),
+        ("Yesterday", _RUNNING),
+        ("Earlier", _AWAITING),
     ]:
         section = page.locator("section").filter(has=_section_header(page, title))
         expect(section.locator(f'a[href="/c/{session_id}"]')).to_be_visible()
@@ -187,11 +211,30 @@ def test_date_grouping_and_show_toggles_persist_across_reload(
 
 
 def test_tooltip_fetches_repo_and_pr_only_when_opened(
-    page: Page, request: pytest.FixtureRequest
+    page: Page, request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Hovering a workspace session loads its repo and PR into the tooltip on demand."""
+    """Branch resolves without hovering; repo and PR still load only on hover."""
     base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
     github_requests: list[str] = []
+    worktree_requests: list[str] = []
+    monkeypatch.setitem(_ROWS[2], "git_branch", None)
+    monkeypatch.setitem(_ROWS[2], "host_id", "sidebar-host")
+
+    def serve_worktrees(route: Route) -> None:
+        worktree_requests.append(route.request.url)
+        route.fulfill(
+            json={
+                "object": "list",
+                "data": [
+                    {
+                        "path": "/tmp/sidebar-view-options",
+                        "branch": "fix/payment-retries",
+                        "is_main": True,
+                        "detached": False,
+                    }
+                ],
+            }
+        )
 
     def serve_github(route: Route) -> None:
         github_requests.append(route.request.url)
@@ -211,9 +254,20 @@ def test_tooltip_fetches_repo_and_pr_only_when_opened(
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", _serve_sessions)
     page.route("**/v1/sessions/*/resources/github*", serve_github)
+    page.route("**/v1/hosts/sidebar-host/worktrees?*", serve_worktrees)
     page.goto(base_url)
     expect(page.get_by_text("Idle session", exact=True)).to_be_visible(timeout=30_000)
     page.wait_for_load_state("networkidle")
+    assert github_requests == []
+    assert worktree_requests == []
+
+    _open_view_submenu(page, "session-show-menu")
+    page.get_by_test_id("session-show-branch").click()
+    page.keyboard.press("Escape")
+    row = page.locator("li").filter(has=page.locator(f'a[href="/c/{_IDLE}"]'))
+    expect(row.get_by_test_id("session-row-meta")).to_have_text("fix/payment-retries")
+    assert worktree_requests
+    assert parse_qs(urlparse(worktree_requests[0]).query)["path"] == ["/tmp/sidebar-view-options"]
     assert github_requests == []
 
     page.locator(f'a[href="/c/{_IDLE}"]').hover()

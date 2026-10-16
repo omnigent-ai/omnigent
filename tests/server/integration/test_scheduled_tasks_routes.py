@@ -139,6 +139,51 @@ def _create_body(**overrides: object) -> dict[str, object]:
     return body
 
 
+@pytest.mark.parametrize("operation", ["create", "update"])
+async def test_schedule_validation_keeps_requests_responsive(
+    auth_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    import asyncio
+    import threading
+
+    url = "/v1/scheduled-tasks"
+    method = "POST"
+    body = _create_body(rrule="FREQ=DAILY")
+    if operation == "update":
+        created = await auth_client.post(url, json=body, headers=_headers())
+        assert created.status_code == 200, created.text
+        url += "/" + created.json()["id"]
+        method = "PATCH"
+        body = {"rrule": "FREQ=WEEKLY"}
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def recurrence_clock() -> float:
+        # Hold the clock boundary to check concurrent HTTP service, then expire
+        # the real iterator's deadline without an expensive recurrence.
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5), "recurrence validation blocked the event loop"
+            return 0
+        return 1
+
+    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", recurrence_clock)
+    pending = asyncio.create_task(auth_client.request(method, url, json=body, headers=_headers()))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        response = await asyncio.wait_for(
+            auth_client.get("/v1/scheduled-tasks", headers=_headers()), timeout=2
+        )
+        assert response.status_code == 200, response.text
+        assert not pending.done()
+    finally:
+        release.set()
+        result = await pending
+    assert result.status_code == 400, result.text
+    assert "time limit" in result.text
+
+
 async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
     resp = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())

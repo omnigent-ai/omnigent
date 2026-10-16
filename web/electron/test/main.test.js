@@ -1923,6 +1923,35 @@ describe("Databricks auth mode wiring", () => {
     assert.equal(h.api.windows.get(h.win).origin, new URL(workspace).origin);
   });
 
+  it("attributes an account-first landing failure to the resolved workspace", async (t) => {
+    const events = [];
+    t.mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+      events.push(args),
+    );
+    const account = "https://accounts.cloud.databricks.com/omnigent";
+    const h = loadNavigationHarness({
+      serverUrl: account,
+      databricksMode: "browser",
+      ensureSession: async () => new URL(workspace).origin,
+      loadURL: async () => {
+        throw new Error("landing failed");
+      },
+    });
+    t.after(h.cleanup);
+    await assert.rejects(
+      h.api.loadServerUrl(h.win, account, undefined, { interactive: true }),
+      /landing failed/,
+    );
+    assert.ok(
+      events.some(
+        ([event, fields]) =>
+          event === "connection_result" &&
+          fields.outcome === "failed" &&
+          fields.origin === new URL(workspace).origin,
+      ),
+    );
+  });
+
   it("reports authentication and cancels only the owning setup window's matching request", async (t) => {
     let signal;
     const h = loadNavigationHarness({
