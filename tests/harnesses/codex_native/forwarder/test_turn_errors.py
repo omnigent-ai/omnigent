@@ -6,6 +6,7 @@ Resume uses the same verdict. Empty turns warn and stay idle, as do clean turns.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -338,6 +339,196 @@ async def test_error_without_usable_detail_leaves_the_turn_to_turn_completed(
     }
     state = read_bridge_state(tmp_path)
     assert state is not None and state.active_turn_id is None
+
+
+def _write_rollout(tmp_path: Path, content: bytes) -> None:
+    """Write the bridge thread's Codex rollout under the private ``CODEX_HOME``."""
+    rollout_dir = tmp_path / "codex-home" / "sessions" / "2026" / "10" / "15"
+    rollout_dir.mkdir(parents=True, exist_ok=True)
+    (rollout_dir / "rollout-2026-10-15T16-28-06-thread_123.jsonl").write_bytes(content)
+
+
+def _turn_context_line(model: str | None) -> bytes:
+    turn: dict[str, object] = {"turn_id": "turn_0", "cwd": "/repo"}
+    if model is not None:
+        turn["model"] = model
+    return (json.dumps({"type": "turn_context", "payload": turn}) + "\n").encode()
+
+
+async def _fail_turn(tmp_path: Path, compaction_status: str = "in_progress") -> dict[str, object]:
+    """Fail the active turn with a terminal error and return the posted status data."""
+    client = _RecordingClient()
+    forwarder_state = fwd._CodexForwarderState(
+        model="system.ai.gpt-6-1-sol", compaction_status_posted=compaction_status
+    )
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "error",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": "turn_123",
+                "willRetry": False,
+                "error": {"message": "unexpected status 403 Forbidden: budget limit reached"},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        forwarder_state=forwarder_state,
+    )
+    return client.posts[0][1]["data"]
+
+
+_COMPACTION_MODELS = {
+    "compaction_model": "system.ai.gpt-6-astra",
+    "selected_model": "system.ai.gpt-6-1-sol",
+}
+_NO_COMPACTION_MODELS = {"compaction_model": None, "selected_model": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rollout_model", "compaction_status", "catalog_entries", "reported"),
+    [
+        ("system.ai.gpt-6-astra", "in_progress", None, True),
+        (
+            "system.ai.gpt-6-astra",
+            "in_progress",
+            ({"comp_hash": "3000"}, {"comp_hash": "2911"}),
+            True,
+        ),
+        # Matching catalog entries mean Codex compacted on the selected model itself.
+        (
+            "system.ai.gpt-6-astra",
+            "in_progress",
+            ({"comp_hash": "3000"}, {"comp_hash": "3000"}),
+            False,
+        ),
+        # With matching hashes, Codex compacts on the model with the larger usable window.
+        (
+            "system.ai.gpt-6-astra",
+            "in_progress",
+            (
+                {"comp_hash": "3000", "effective_context_window_percent": 95},
+                {"comp_hash": "3000", "effective_context_window_percent": 90},
+            ),
+            True,
+        ),
+        (
+            "system.ai.gpt-6-astra",
+            "in_progress",
+            (
+                {
+                    "comp_hash": "3000",
+                    "context_window": 300000,
+                    "effective_context_window_percent": 80,
+                },
+                {"comp_hash": "3000", "effective_context_window_percent": 95},
+            ),
+            False,
+        ),
+        # A hash declared by only one model can't trigger it, so the windows decide.
+        (
+            "system.ai.gpt-6-astra",
+            "in_progress",
+            ({"comp_hash": "3000"}, {}),
+            False,
+        ),
+        # Without both windows, the catalog can't rule the compaction out.
+        (
+            "system.ai.gpt-6-astra",
+            "in_progress",
+            ({"comp_hash": "3000", "context_window": None}, {"comp_hash": "3000"}),
+            True,
+        ),
+        # Gateway and Codex spellings of the selected model compare equal.
+        ("gpt-6.1-sol", "in_progress", None, False),
+        ("system.ai.gpt-6-astra", "completed", None, False),
+        (None, "in_progress", None, False),
+    ],
+    ids=[
+        "previous-model",
+        "catalog-hash-changed",
+        "catalog-rules-it-out",
+        "previous-usable-window-larger",
+        "selected-usable-window-larger",
+        "one-hash-missing",
+        "catalog-window-unknown",
+        "selected-model",
+        "outside-compaction",
+        "no-recorded-model",
+    ],
+)
+async def test_error_during_compaction_reports_the_previous_model_it_ran_on(
+    tmp_path: Path,
+    rollout_model: str | None,
+    compaction_status: str,
+    catalog_entries: tuple[dict[str, object], dict[str, object]] | None,
+    reported: bool,
+) -> None:
+    """A compaction failure names the rollout's previous model when Codex compacts on it."""
+    _seed_active_turn(tmp_path, "turn_123")
+    if catalog_entries is not None:
+        catalog = tmp_path / "catalog.json"
+        catalog.write_text(
+            json.dumps(
+                {
+                    "models": [
+                        {"slug": slug, "context_window": 272000, **entry}
+                        for slug, entry in zip(
+                            ("system.ai.gpt-6-astra", "system.ai.gpt-6-1-sol"),
+                            catalog_entries,
+                            strict=True,
+                        )
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (tmp_path / "codex-home").mkdir()
+        (tmp_path / "codex-home" / "config.toml").write_text(
+            f'model_catalog_json = "{catalog}"\n', encoding="utf-8"
+        )
+    _write_rollout(tmp_path, _turn_context_line(rollout_model))
+
+    data = await _fail_turn(tmp_path, compaction_status)
+
+    assert data["status"] == "failed"
+    assert {key: data.get(key) for key in _COMPACTION_MODELS} == (
+        _COMPACTION_MODELS if reported else _NO_COMPACTION_MODELS
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_rollout_line_does_not_hide_the_previous_model(tmp_path: Path) -> None:
+    _seed_active_turn(tmp_path, "turn_123")
+    _write_rollout(tmp_path, b"\xff\xfe torn line\n" + _turn_context_line("system.ai.gpt-6-astra"))
+
+    data = await _fail_turn(tmp_path)
+
+    assert {key: data.get(key) for key in _COMPACTION_MODELS} == _COMPACTION_MODELS
+
+
+@pytest.mark.asyncio
+async def test_a_failed_diagnosis_still_posts_the_turn_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The turn is already marked surfaced, so a lost edge would leave no error card."""
+    _seed_active_turn(tmp_path, "turn_123")
+
+    def _unreadable(_bridge_dir: Path, _selected_model: str) -> str | None:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(fwd, "_failed_compaction_model", _unreadable)
+
+    data = await _fail_turn(tmp_path)
+
+    assert data["status"] == "failed"
+    assert "budget limit reached" in str(data["output"])
+    assert {key: data.get(key) for key in _COMPACTION_MODELS} == _NO_COMPACTION_MODELS
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,7 @@ from omnigent.runner.identity import (
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
 from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
+    RUNNER_IDLE_SHUTDOWN_CLOSE_REASON,
     PingFrame,
     RequestCancelFrame,
     RequestFrame,
@@ -1422,37 +1423,34 @@ async def test_graceful_drain_bounded_when_task_never_finishes(
             await task
 
 
-@pytest.mark.asyncio
-async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Setting the shutdown event ends the read loop and closes the socket.
+class _ShutdownFakeWS:
+    """Fake tunnel socket whose ``recv`` blocks forever and records closes."""
 
-    Drives the real ``_serve_tunnel_once`` with a fake WS whose ``recv`` blocks
-    forever. When the shutdown event fires, the loop must cancel the pending
-    recv, run the drain hook, return cleanly, and let the context manager close
-    the connection — the clean end-of-stream that replaces an abrupt drop.
-    """
+    def __init__(self) -> None:
+        self.closed = False
+        self.close_frames: list[tuple[int, str]] = []
+        self.receiving = asyncio.Event()
+
+    async def send(self, data: str) -> None:
+        del data
+
+    async def recv(self) -> str:
+        self.receiving.set()
+        await asyncio.Event().wait()
+        raise AssertionError("recv should have been cancelled")  # pragma: no cover
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.close_frames.append((code, reason))
+
+
+def _install_shutdown_fake_ws(monkeypatch: pytest.MonkeyPatch) -> _ShutdownFakeWS:
+    """Route ``websockets.connect`` to one :class:`_ShutdownFakeWS`."""
     import websockets
 
-    shutdown_event = asyncio.Event()
-    drain_calls: list[str] = []
-
-    class _FakeWS:
-        def __init__(self) -> None:
-            self.closed = False
-
-        async def send(self, data: str) -> None:
-            del data
-
-        async def recv(self) -> str:
-            await asyncio.Event().wait()
-            raise AssertionError("recv should have been cancelled")  # pragma: no cover
-
-    ws = _FakeWS()
+    ws = _ShutdownFakeWS()
 
     class _Ctx:
-        async def __aenter__(self) -> _FakeWS:
+        async def __aenter__(self) -> _ShutdownFakeWS:
             return ws
 
         async def __aexit__(self, *_exc: object) -> None:
@@ -1464,6 +1462,23 @@ async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
 
     monkeypatch.setattr(websockets, "connect", _fake_connect)
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
+    return ws
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setting the shutdown event ends the read loop and closes the socket.
+
+    Drives the real ``_serve_tunnel_once`` with a fake WS whose ``recv`` blocks
+    forever. When the shutdown event fires, the loop must cancel the pending
+    recv, run the drain hook, return cleanly, and close the connection with the
+    idle-shutdown reason the server uses to settle the runner's sessions.
+    """
+    shutdown_event = asyncio.Event()
+    drain_calls: list[str] = []
+    ws = _install_shutdown_fake_ws(monkeypatch)
 
     # Pre-arm the shutdown so the very first recv() race resolves to shutdown
     # (recv blocks forever). Deterministic — no real-time sleep to lose to load.
@@ -1483,7 +1498,38 @@ async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
     )
 
     assert drain_calls == ["drained"]
+    assert ws.close_frames == [(1000, RUNNER_IDLE_SHUTDOWN_CLOSE_REASON)]
     assert ws.closed is True
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_cancelled_shutdown_omits_idle_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signal-driven stop cancels the tunnel without attesting idle work.
+
+    SIGTERM and host stops cancel the tunnel task instead of setting the idle
+    shutdown event, so their close must not carry the idle-shutdown reason.
+    """
+    ws = _install_shutdown_fake_ws(monkeypatch)
+    task = asyncio.create_task(
+        _serve_tunnel_once(
+            _noop_app,
+            tunnel_url="wss://acme.databricks.com/v1/runners/r/tunnel",
+            server_url="https://acme.databricks.com",
+            runner_id="r",
+            runner_version="0.1.0",
+            auth_token="tok",
+            shutdown_event=asyncio.Event(),
+        )
+    )
+    await asyncio.wait_for(ws.receiving.wait(), timeout=5.0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert ws.closed is True
+    assert ws.close_frames == []
 
 
 @pytest.mark.asyncio

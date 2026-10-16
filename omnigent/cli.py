@@ -695,6 +695,7 @@ _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "COHERE_API_KEY",
         "DEEPSEEK_API_KEY",
         "GEMINI_API_KEY",
+        "GOOGLE_GEMINI_BASE_URL",
         "GOOGLE_API_KEY",
         "GROQ_API_KEY",
         "MISTRAL_API_KEY",
@@ -12659,6 +12660,8 @@ def _resolve_server_url(server: str) -> ServerUrl:
     org_id = _org_id_from_url(server)
 
     def _resolved(api_base: str) -> ServerUrl:
+        from omnigent.debug_logging import publish_origin_identity
+
         if org_id is not None:
             resolved = ServerUrl(api_base=api_base, org_id=org_id)
             if resolved.is_workspace_hosted:
@@ -12671,8 +12674,12 @@ def _resolve_server_url(server: str) -> ServerUrl:
                         "Could not persist the workspace routing selector. "
                         "Check that the Omnigent data directory is writable, then retry."
                     ) from exc
-            return resolved
-        return ServerUrl.from_api_base(api_base)
+        else:
+            resolved = ServerUrl.from_api_base(api_base)
+        # Every remote CLI command resolves its server here, so this attributes
+        # the CLI's own debug-log rows.
+        publish_origin_identity(resolved.api_base)
+        return resolved
 
     # A URL copied from the browser while a conversation is open carries the
     # SPA's ``/c/<id>`` route. The SPA catch-all answers any GET under it with

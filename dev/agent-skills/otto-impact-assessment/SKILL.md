@@ -1,15 +1,16 @@
 ---
-name: resolve-impact-assessment
-description: Check the full candidate diff, affected consumers, focused tests, evidence identities, and verification gaps.
+name: otto-impact-assessment
+description: Check the final diff's consumers, focused tests, evidence, and gaps.
 ---
 
 ## Shared impact assessment — every resolution path
 
-Before claiming `fixed` or approving a PR, check what the **full final diff**
-could break beyond the reported bug. This applies to author, existing-PR review,
-ticket-only, and review-remediation modes, including `skip_push` and
-workflow-owned publication. Ticket-only and review-remediation still do not
-require an inherited repro; their publication/branch permissions are unchanged.
+Before claiming success (Resolve: `fixed`) or approving a PR, check what the
+**full final diff** could break beyond the requested change. This applies to every
+mode (Resolve: author, existing-PR review, ticket-only, and review-remediation),
+including `skip_push` and workflow-owned publication. (Resolve: ticket-only and
+review-remediation still do not require an inherited repro; their
+publication/branch permissions are unchanged.)
 
 1. **Inspect the candidate and its consumers.** Start the assessment while
    investigating, then refresh it after the last edit. Record the target branch's
@@ -28,14 +29,14 @@ require an inherited repro; their publication/branch permissions are unchanged.
    | Shared startup, configuration, auth, or serialization | Existing/default configurations and other affected consumers; exercise configuration creation, transport/decoding, and real process startup together. Correctly constructed objects supplied directly to a unit test do not cover that path. |
    | Sandboxing | The applicable real OS sandbox with its intended gates enabled. A disabled gate or an unsupported/skipped sandbox test leaves that boundary uncovered. |
    | UI state or interaction | The reported journey and affected adjacent journeys on the candidate build, including relevant selection, persistence, or reconnect behavior. |
-   | Environment-derived defaults | Ordinary configuration and relevant ambient variables populated; apply the hermetic check in 2B.5. |
+   | Environment-derived defaults | Ordinary configuration and relevant ambient variables populated; apply the agent's hermetic check (Resolve: 2B.5). |
    | Performance or timing | Measure the claimed quantity under the relevant workload. Distinguish simulated-clock tests from elapsed-time measurements; functional success alone does not establish latency or throughput. |
 
    Use existing tests where they cover the invariant; add a behavioral regression
-   test only for a meaningful gap. Tests of the bug follow their mode's baseline
-   requirements; review-remediation still skips fail-before proof. Checks
-   protecting previously correct behavior may **pass on both
-   base and candidate**; do not manufacture a failing baseline for them. Run the
+   test only for a meaningful gap. Tests of the requested change follow their
+   mode's baseline requirements (Resolve: review-remediation still skips
+   fail-before proof). Checks protecting previously correct behavior may **pass
+   on both base and candidate**; do not manufacture a failing baseline for them. Run the
    focused checks for each affected consumer/boundary, even when they live in a
    different module. Do not run the full repository suite locally. Do not weaken
    isolation or change global rollout settings to obtain a passing result.
@@ -65,14 +66,15 @@ require an inherited repro; their publication/branch permissions are unchanged.
    original identity rather than relabeling old evidence as a new execution.
    Commit hooks can change tested files too. Keep earlier evidence and the saved
    checkpoint; never reset work to make the identities match.
-5. **Let gaps affect the verdict.** `fixed` requires the original behavior to be
-   proven as its mode requires, all identified regression risks checked, and no
-   uncovered required boundary. A discovered regression must be repaired and
-   checked before `fixed` or approval. If a fix is only partly verified, preserve
-   the work, use `partially_fixed`, and name the failing/unrun checks in
+5. **Let gaps affect the verdict.** Success (Resolve: `fixed`) requires the
+   original behavior to be proven as its mode requires, all identified regression
+   risks checked, and no uncovered required boundary. A discovered regression must
+   be repaired and checked before success or approval. If a change is only partly
+   verified, preserve the work, use the partial outcome (Resolve:
+   `partially_fixed`), and name the failing/unrun checks in
    `remaining_work`; use `needs_more_info` when verification cannot establish a
    resolution. Setup failures are blockers, not proof of a product regression.
-   A missing recording alone still follows the recording rules below.
+   A missing recording alone still follows the agent's recording rules.
 
 Summarize the affected behavior, checks, and gaps in the PR's Test Plan or review
 body. The assessment is an agent-authored explanation, not an execution recorder

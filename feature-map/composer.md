@@ -41,6 +41,11 @@ and steers messages while the agent is busy.
   selection and launch wait for success. States: connected, pending, cancelled,
   failed, popup blocked, Databricks workspace prompt, bearer token needed.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
+  The main composer lists its full built-in set and the session's skills; a live
+  side chat offers a narrower menu — `/help` plus the session's skills. A built-in
+  such as `/help` is handled locally; a recognised skill routes through
+  `slash_command` so it runs on an in-process harness. A native terminal side
+  chat shows no menu and sends slash text to the vendor TUI.
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
@@ -272,7 +277,8 @@ Other connection providers alone do not enable the managed MCP picker.
   covers deleted projects with dangling session membership.
   No running agent is needed.
 - **`slash-menu`:**
-  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
+  `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`
 - **`attachments`:**
   `tests/browser_ui/chat/test_composer_attachments.py::test_attach_supported_files_and_remove`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,
@@ -282,8 +288,8 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
 - **`list-formatting`, both composers:** no browser-level coverage; the list
   cases in `web/src/components/composer/ChatComposer.test.tsx`
-  (`pnpm --dir web test`). Manually: type `1.` then Space and expect `  1. `;
-  type an item, press Shift+Enter and expect `  2. ` on the next line; press
+  (`pnpm --dir web test`). Manually: type `1.` then Space and expect ` 1.`;
+  type an item, press Shift+Enter and expect ` 2.` on the next line; press
   Shift+Enter on the empty item and expect the marker removed. With Enter as
   the send gesture, plain Enter still sends a list; with Mod+Enter chosen,
   plain Enter continues it.
