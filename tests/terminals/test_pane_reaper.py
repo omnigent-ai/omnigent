@@ -16,7 +16,7 @@ from omnigent.harness_aliases import NATIVE_HARNESSES, native_terminal_name
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.inner.terminal import TerminalInstance
-from omnigent.native import native_cost_popup
+from omnigent.native import _native_forwarder_health, native_cost_popup
 from omnigent.runner.app import create_runner_app
 from omnigent.runner.native import orchestration as native_runtime
 from omnigent.runner.resource_registry import SessionResourceRegistry
@@ -635,3 +635,47 @@ async def test_runner_reap_leaves_a_pane_a_turn_reused_while_it_waited(
         forwarder.cancel()
         await asyncio.gather(forwarder, return_exceptions=True)
         native_runtime._AUTO_FORWARDER_TASKS.pop(conv, None)
+
+
+async def test_runner_busy_check_spares_a_pane_whose_sub_agent_is_streaming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A codex parent pane stays busy while its forwarder still posts sub-agent items.
+
+    A background sub-agent streams through the parent's forwarder with no parent
+    turn, status, input or pane output; reaping the pane would tear down the
+    app-server the child runs in. A forwarder silent for the busy window releases it.
+    """
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=SessionResourceRegistry(terminal_registry=registry),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    pane = PaneRef(
+        "conv_parent", terminal_resource_id("codex", "main"), "codex", tmp_path / "tmux.sock"
+    )
+    _native_forwarder_health.clear()
+
+    async def child_post() -> None:
+        _native_forwarder_health.bind_forwarder_session("conv_parent")
+        _native_forwarder_health.note_post_success()
+
+    try:
+        assert not await reaper._is_busy(pane)
+        await asyncio.create_task(child_post())
+        assert await reaper._is_busy(pane)
+        other = PaneRef("conv_other", pane.terminal_id, "codex", pane.socket_path)
+        assert not await reaper._is_busy(other)
+        posted_at = time.monotonic() - PANE_OUTPUT_BUSY_WINDOW_S - 1.0
+        _native_forwarder_health._last_post_at_by_session["conv_parent"] = posted_at
+        assert not await reaper._is_busy(pane)
+    finally:
+        _native_forwarder_health.clear()
