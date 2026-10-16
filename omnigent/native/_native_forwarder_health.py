@@ -56,6 +56,10 @@ class NativeSubagentActivity:
         if thread_id not in self._observed_threads:
             self.note(thread_id, active=True, authoritative=False)
 
+    def tracks(self, thread_id: str) -> bool:
+        """Return whether this connection has observed *thread_id* as a child."""
+        return thread_id in self._observed_threads
+
     def note(
         self,
         thread_id: str,

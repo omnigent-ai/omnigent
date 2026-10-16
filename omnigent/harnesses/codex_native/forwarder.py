@@ -678,6 +678,22 @@ class _CodexForwarderState:
             return thread_id in self.pending_child_threads
         return recorded_parent_thread_id == parent_thread_id
 
+    def tracks_child_activity(self, thread_id: str | None) -> bool:
+        """
+        Return whether a thread's lifecycle events feed the child activity tracker.
+
+        Parent rotation clears pending discovery, so a child the tracker already
+        observes keeps reporting its turns even if it never registered.
+
+        :param thread_id: Codex thread id from the event, e.g. ``"thread_child"``.
+        :returns: ``True`` for a pending or tracker-observed child thread.
+        """
+        if thread_id is None:
+            return False
+        if thread_id in self.pending_child_threads:
+            return True
+        return self.child_activity is not None and self.child_activity.tracks(thread_id)
+
     def needs_child_thread_backfill(self, thread_id: str) -> bool:
         """
         Return whether a child thread's backlog should be replayed.
@@ -3046,10 +3062,10 @@ async def _handle_event(
     route_session_id, is_child = _resolve_event_session(
         params, method, expected_thread_id, forwarder_state, fallback_session_id=session_id
     )
-    if forwarder_state is not None:
-        child_thread_id = _thread_id_from_params(params)
-        if is_child or child_thread_id in forwarder_state.pending_child_threads:
-            _note_child_activity_event(forwarder_state, method, params)
+    if forwarder_state is not None and (
+        is_child or forwarder_state.tracks_child_activity(_thread_id_from_params(params))
+    ):
+        _note_child_activity_event(forwarder_state, method, params)
     if route_session_id is None:
         return
     # First model-produced item settles the synthesized MCP startup round

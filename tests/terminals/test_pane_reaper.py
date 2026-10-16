@@ -210,8 +210,9 @@ async def test_quiet_codex_discovered_child_holds_its_parent_pane(
         )
         assert await reaper._is_busy(pane)
         if outcome != "disconnected" and not outcome.startswith("unknown"):
+            # A failed child turn ends through its own notification method.
             await client.emit(
-                "turn/completed",
+                "turn/failed" if outcome == "failed" else "turn/completed",
                 {
                     "threadId": "thread_child",
                     "turn": {
