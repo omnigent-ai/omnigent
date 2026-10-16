@@ -240,7 +240,11 @@ class SessionPrRegistry:
                     entry.title_lookup_timed_out = title is None and entry.url in timed_out_urls
                     changed = True
                 pr_state = states.get(entry.url)
-                if pr_state is not None and entry.state_checked_at <= now and entry.state != pr_state:
+                if (
+                    pr_state is not None
+                    and entry.state_checked_at <= now
+                    and entry.state != pr_state
+                ):
                     entry.state = pr_state
                     entry.state_checked_at = now
                     changed = True
