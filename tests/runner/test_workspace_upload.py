@@ -1585,7 +1585,6 @@ async def test_changed_staging_bytes_reject_complete_and_abort_releases_quota(
         client,
         name="changed.bin",
         size=len(payload),
-        sha256=hashlib.sha256(payload).hexdigest(),
     )
     uid = response.json()["upload_id"]
     url = BASE + "/" + uid
