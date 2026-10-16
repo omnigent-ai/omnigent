@@ -11,10 +11,14 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import dev.resolve as resolve
+import omnigent.host.git_worktree as git_worktree
 from dev.resolve import (
     _unique_branch,
     branch_slug,
@@ -209,3 +213,47 @@ def test_unique_branch_skips_local_branches_under_each_prefix(tmp_path: Path) ->
     assert _unique_branch("omni-1", tmp_path) == "fix/omni-1-2"
     assert _unique_branch("omni-1", tmp_path, prefix="feat") == "feat/omni-1-3"
     assert _unique_branch("omni-2", tmp_path, prefix="feat") == "feat/omni-2"
+
+
+def test_ticket_only_launch_forwards_the_linear_key_to_the_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    launched: dict[str, object] = {}
+
+    def run(cmd: list[str], cwd: str, env: dict[str, str], check: bool) -> object:
+        launched["env"] = env
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(resolve, "_resolve_base_ref", lambda root: "a" * 40)
+    monkeypatch.setattr(resolve, "_unique_branch", lambda slug, root: f"fix/{slug}")
+    monkeypatch.setattr(resolve, "_confirm_launch", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        git_worktree,
+        "create_worktree",
+        lambda **kwargs: SimpleNamespace(
+            worktree_path=str(tmp_path), branch=kwargs["branch_name"]
+        ),
+    )
+    monkeypatch.setattr(resolve.subprocess, "run", run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "dev/resolve.py",
+            "--bug-url",
+            "https://linear.app/omnigent/issue/OMNI-7",
+            "--server",
+            "s",
+        ],
+    )
+    monkeypatch.setenv("LINEAR_API_KEY", "lin-key")
+    monkeypatch.delenv("DATABRICKS_LINEAR_API_KEY", raising=False)
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
+
+    with pytest.raises(SystemExit):
+        resolve.main()
+
+    # The daemon drops LINEAR_API_KEY and the runner drops unnamed DATABRICKS_ vars.
+    env = launched["env"]
+    assert env["DATABRICKS_LINEAR_API_KEY"] == "lin-key"
+    assert env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "DATABRICKS_LINEAR_API_KEY"
