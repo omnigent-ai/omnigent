@@ -1099,6 +1099,39 @@ async def test_cli_cold_start_skips_when_conversation_already_real(
     assert after.conversation_id == real_id
 
 
+async def test_cli_cold_start_discards_phantom_when_reader_adopted_meanwhile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A CLI cold-start races the reader; if recovery adopts agy's TUI-minted
+    cascade while ``StartCascade`` is in flight, the cold-start must re-check
+    bridge state and discard its phantom instead of clobbering the binding."""
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_cs_race")
+    _seed_bridge_state(bridge_dir, "agy_conv_placeholder")
+    adopted_id = "1f5f3f7a-58c9-4a8f-9a5e-0b8d3f6c2e11"
+
+    monkeypatch.setattr(_mod, "resolve_cold_start_agy_rpc_port", lambda _sock, _tgt: 52548)
+
+    def _start_and_adopt(_port: int, _cascade_id: str) -> None:
+        # While StartCascade is in flight the reader adopts the TUI cascade.
+        _seed_bridge_state(bridge_dir, adopted_id)
+
+    monkeypatch.setattr(_mod, "start_cascade", _start_and_adopt)
+
+    await _mod._cold_start_agy_conversation(
+        bridge_dir,
+        "conv_cs",
+        base_url="http://test",
+        headers={},
+        timeout_s=1.0,
+    )
+
+    # The adopted TUI cascade survives; the phantom was discarded.
+    after = read_bridge_state(bridge_dir)
+    assert after is not None
+    assert after.conversation_id == adopted_id
+
+
 async def test_cli_cold_start_scopes_to_pane_agy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
