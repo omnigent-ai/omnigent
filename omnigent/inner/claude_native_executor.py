@@ -200,7 +200,8 @@ class ClaudeNativeExecutor(Executor):
                     "Claude Code's sign-in runs in its own terminal, so /login and "
                     "/logout do nothing from the web chat. Run omni setup on the host "
                     "to sign in again — or to sign out — then retry."
-                )
+                ),
+                undelivered=True,
             )
             return
         from omnigent.runtime import telemetry
@@ -264,7 +265,7 @@ class ClaudeNativeExecutor(Executor):
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message)
+            yield ExecutorError(message=message, undelivered=True)
             return
         except ClaudePromptTimeout as exc:
             _logger.exception(

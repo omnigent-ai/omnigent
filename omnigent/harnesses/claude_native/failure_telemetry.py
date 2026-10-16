@@ -6,7 +6,11 @@ import json
 import re
 
 from omnigent.models.model_metadata import concrete_reported_model
-from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
+from omnigent.native.failure_telemetry import (
+    FailureContext,
+    normalize_failure_context,
+    provider_error_fields,
+)
 
 _API_ERROR = re.compile(r"^\s*API Error:\s*([1-5][0-9]{2})\b")
 _API_ERROR_BODY_MAX_CHARS = 16384
@@ -64,13 +68,7 @@ def claude_failure_context(
                 envelope = decoded
                 error = decoded.get("error", decoded)
     if isinstance(error, dict):
-        context.update(
-            provider_error_type=error.get("type"),
-            provider_error_code=(
-                error["code"] if error.get("code") is not None else error.get("error_code")
-            ),
-            provider_error_param=error.get("param"),
-        )
+        context.update(provider_error_fields(error))
         error_message = error.get("message")
         if isinstance(error_message, str) and error_message.strip():
             context["native_error_message"] = error_message

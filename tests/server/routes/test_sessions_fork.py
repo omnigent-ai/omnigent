@@ -24,10 +24,11 @@ from omnigent.entities import (
     PagedList,
     StoredFile,
 )
-from omnigent.errors import OmnigentError
+from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, OmnigentError
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
+    REQUESTED_HOST_ID_LABEL_KEY,
     ManagedLaunchTracker,
     parse_sandbox_config,
     resolve_managed_agent_label,
@@ -1924,6 +1925,63 @@ async def test_fork_managed_schedules_sandbox_launch(
     assert conv_store.label_writes == []
 
 
+class _HostIdentityStore:
+    """Host store answering only the requested-host-id collision check."""
+
+    def __init__(self, *, taken: bool) -> None:
+        """
+        :param taken: What ``host_identity_taken`` reports for every lookup.
+        """
+        self.taken = taken
+        self.lookups: list[dict[str, str]] = []
+
+    def host_identity_taken(self, *, host_id: str, user_id: str, name: str) -> bool:
+        """Record the lookup and report the configured answer."""
+        self.lookups.append({"host_id": host_id, "user_id": user_id, "name": name})
+        return self.taken
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("taken", [False, True])
+async def test_fork_managed_launches_its_requested_host_id(
+    monkeypatch: pytest.MonkeyPatch, taken: bool
+) -> None:
+    """A managed fork's ``host_id`` names its sandbox host, as on a managed create.
+
+    The label lets the caller route the fork by that id before the host binds;
+    a taken id 409s before the fork exists.
+    """
+    host_id = "0123456789abcdef0123456789abcdef"
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)
+    app.state.host_store = host_store = _HostIdentityStore(taken=taken)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed", "host_id": host_id},
+    )
+
+    assert host_store.lookups == [
+        {"host_id": host_id, "user_id": "local", "name": "managed-01234567"}
+    ]
+    if taken:
+        assert resp.status_code == 409, f"got {resp.status_code}: {resp.text}"
+        assert conv_store.fork_calls == []
+        assert launches == []
+        return
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert launches[0]["host_id"] == host_id
+    assert body["labels"][REQUESTED_HOST_ID_LABEL_KEY] == host_id
+    # Born with the row (not patched onto the response): a list read racing the
+    # fork can't return the row without the id the caller routes it by.
+    assert conv_store.fork_calls[0]["extra_labels"] == {REQUESTED_HOST_ID_LABEL_KEY: host_id}
+    assert conv_store.label_writes == [(body["id"], {REQUESTED_HOST_ID_LABEL_KEY: host_id})]
+
+
 @pytest.mark.asyncio
 async def test_fork_managed_launch_classifies_like_a_fresh_builtin_session(
     monkeypatch: pytest.MonkeyPatch,
@@ -2367,8 +2425,10 @@ async def test_fork_copies_only_another_users_agent(
 
 def _cross_user_fork(
     artifact_store: _ArtifactStore | None,
+    *,
+    source_owner: str | None = "owner@example.com",
 ) -> tuple[TestClient, _ConversationStore]:
-    """A forker's client for a session whose agent belongs to another user."""
+    """Build a fork client for a session agent with the given owner."""
     agent_id = "30f9aa4d441e344d3eb273f8cc13e4a5"
     conv_store = _ConversationStore(
         conversations={"e9f8f58523cec9a57d3bdf93be543e8c": _make_conversation(agent_id=agent_id)},
@@ -2386,7 +2446,14 @@ def _cross_user_fork(
                 name="orion",
                 bundle_location=f"{agent_id}/e70dc208",
                 session_id="e9f8f58523cec9a57d3bdf93be543e8c",
-                created_by="owner@example.com",
+                created_by=source_owner,
+            ),
+            "44b4151dd6cdfed6ee19430832398e05": Agent(
+                id="44b4151dd6cdfed6ee19430832398e05",
+                created_at=1,
+                name="codex",
+                bundle_location="44b4151dd6cdfed6ee19430832398e05/hash",
+                version=1,
             ),
         }
     )
@@ -2442,6 +2509,44 @@ async def test_failed_cross_user_fork_removes_its_copied_bundle() -> None:
     assert resp.status_code == 500, resp.text
     assert len(written) == 1 and not written[0].startswith("30f9aa4d"), written
     assert set(artifacts.blobs) == {original}, "the unused copy must be deleted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller", "source_owner"),
+    [
+        ("owner@example.com", None),
+        ("forker@example.com", "owner@example.com"),
+    ],
+    ids=["legacy-own-session-null-owner", "cross-user"],
+)
+async def test_fork_needing_a_copy_of_a_missing_bundle_is_refused_cleanly(
+    caller: str, source_owner: str | None
+) -> None:
+    artifacts = _ArtifactStore(blobs={})
+    client, conv_store = _cross_user_fork(artifact_store=artifacts, source_owner=source_owner)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={},
+        headers={"X-Forwarded-Email": caller},
+    )
+
+    assert resp.status_code == 410, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "session_agent_missing"
+    assert error["message"] == SESSION_AGENT_BUNDLE_MISSING_MESSAGE
+    assert conv_store.fork_calls == []
+    assert artifacts.blobs == {}, "no copy may be written without a source"
+
+    switched = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05"},
+        headers={"X-Forwarded-Email": caller},
+    )
+    assert switched.status_code == 201, switched.text
+    assert conv_store.fork_calls[0]["agent_id"] == "44b4151dd6cdfed6ee19430832398e05"
+    assert artifacts.blobs == {}, "a server agent is bound, not copied"
 
 
 def _attachment_fork_client(

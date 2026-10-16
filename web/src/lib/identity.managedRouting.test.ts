@@ -253,3 +253,34 @@ describe("managed first-message routing", () => {
     },
   );
 });
+
+describe("managed create routing by a chosen host id", () => {
+  it.each([
+    [
+      { host_type: "managed", host_id: "0123456789abcdef0123456789abcdef" },
+      "0123456789abcdef0123456789abcdef",
+    ],
+    [{ host_type: "managed" }, null],
+  ])("keys a managed POST /v1/sessions by the body's host_id (%o)", async (body, key) => {
+    const { authenticatedFetch } = await setup();
+    fetchMock.mockResolvedValueOnce(Response.json({ id: "conv_new" }, { status: 201 }));
+
+    await authenticatedFetch("/v1/sessions", { method: "POST", body: JSON.stringify(body) });
+
+    expect(requestHeaders(0).get(SLICE_KEY)).toBe(key);
+  });
+
+  it("routes a session by its chosen host id until the host binds", async () => {
+    const { authenticatedFetch, sessionRoutingHostId, setSessionHost } = await setup();
+    const labels = { "omnigent.sandbox.requested_host_id": "0123456789abcdef0123456789abcdef" };
+    setSessionHost(SESSION_ID, sessionRoutingHostId(null, labels));
+    fetchMock.mockResolvedValue(Response.json({ queued: true }));
+
+    await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" });
+    setSessionHost(SESSION_ID, sessionRoutingHostId("bound-host", labels));
+    await authenticatedFetch(EVENTS_URL, { method: "POST", body: "{}" });
+
+    expect(requestHeaders(0).get(SLICE_KEY)).toBe("0123456789abcdef0123456789abcdef");
+    expect(requestHeaders(1).get(SLICE_KEY)).toBe("bound-host");
+  });
+});

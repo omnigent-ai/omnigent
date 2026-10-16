@@ -233,6 +233,14 @@ sandbox:
 The server resolves the provider through the registry and calls
 `prepare()` → `provision()` → `start_host()` → wait for online registration.
 Each managed sandbox authenticates back with a server-minted per-launch token.
+`start_host()` must start the host under the `host_id` it is given: the token
+only resolves for that id, and a client may have chosen the id at create time
+(a managed create's `host_id`) so it can route the session's requests to it
+before the host connects. The host then keys its own traffic by that id, and a
+host whose create chose none does not, so it reaches the same server replica as
+the caller's unkeyed requests. The server sets this through
+`host.slice_key_enabled` in `host_config`, so `start_host()` must accept and
+install `host_config` (as `ExecModelHostLauncher` does).
 
 Sandbox automations use this same launch path and create a fresh sandbox for
 each run. Existing managed sandbox hosts cannot be pinned as automation targets.

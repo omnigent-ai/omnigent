@@ -72,7 +72,11 @@ from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
-from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
+from omnigent.harnesses.diagnostics import (
+    detect_sign_in_prompt,
+    sign_in_next_step,
+    sign_in_running_elsewhere,
+)
 from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
@@ -363,14 +367,19 @@ _PERMISSION_MODE_FOOTERS: dict[str, str] = {
     "acceptEdits": "accept edits on",
     "plan": "plan mode on",
     "auto": "auto mode on",
-    # Launch-only, but readable: a pane launched into bypass must report
-    # its own mode so the cycler has a starting point to leave it from.
+    # Launch-only, but readable: a pane launched into bypass or don't-ask
+    # must report its own mode so the cycler has a starting point to leave
+    # it from.
     "bypassPermissions": "bypass permissions on",
+    "dontAsk": "don't ask on",
 }
 # Modes shift+tab can reach from any session. ``dontAsk`` is never in the
 # cycle and ``bypassPermissions`` only joins it when launched into, so
 # neither is a switch target.
-CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS) - {"bypassPermissions"}
+CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS) - {
+    "bypassPermissions",
+    "dontAsk",
+}
 # Cap on shift+tab presses. The cycle is 3-5 modes wide depending on which
 # optional modes are enabled, so a full lap plus slack proves the target is
 # unreachable rather than slow.
@@ -396,10 +405,12 @@ _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
 # What :func:`_occupying_surface` reports when no input box is drawn.
 _OVERLAY_SURFACE = "an overlay"
 # The dismissal every surface drawn over the input box advertises in its
-# footer ("Esc to cancel", "Esc to clear"). A screen without a composer that
-# lacks it is not such a surface — e.g. a launch wrapper's output before
-# Claude Code has drawn its input box — and an Escape cannot clear it.
-_ESCAPE_DISMISS_HINT = re.compile(r"\bEsc to \w", re.IGNORECASE)
+# footer ("Esc to cancel", "Esc to clear"). Claude Code joins keys that share
+# an action with "/", so the task details panels print "Esc/Enter/Space to
+# close". A screen without a composer that lacks it is not such a surface —
+# e.g. a launch wrapper's output before Claude Code has drawn its input box —
+# and an Escape cannot clear it.
+_ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)* to \w", re.IGNORECASE)
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -410,7 +421,7 @@ EFFORT_DIALOG_HINT = "Change effort level?"
 _CONFIRM_DIALOG_HINTS = (SWITCH_MODEL_DIALOG_HINT, EFFORT_DIALOG_HINT)
 # Only this informational notice is acknowledged automatically. The gateway
 # varies; all decision text and the continuation footer must match exactly.
-_AUTO_MODE_BILLING_NOTICE = re.compile(
+_AUTO_MODE_BILLING_BODY_PATTERN = (
     re.escape(
         (
             "We're changing auto mode to no longer charge for classifier requests "
@@ -426,9 +437,14 @@ _AUTO_MODE_BILLING_NOTICE = re.compile(
             "are billed as before. To fix it and access the new version of auto mode, "
             "ask your gateway to implement: "
             "https://code.claude.com/docs/en/auto-mode-classifier-billing "
-            "Enter to continue · Esc to cancel"
         ).replace(" ", "")
     )
+)
+_AUTO_MODE_BILLING_NOTICE = re.compile(
+    _AUTO_MODE_BILLING_BODY_PATTERN + re.escape("Entertocontinue·Esctocancel")
+)
+_AUTO_MODE_BILLING_CONSENT = re.compile(
+    _AUTO_MODE_BILLING_BODY_PATTERN + re.escape("ytocontinue·ntocancel")
 )
 # Footer rows the ctrl+r prompt-history search renders directly under the
 # input box's closing rule since Claude Code 2.1.212, where the search rides
@@ -4164,7 +4180,7 @@ def inject_user_message(
     rejects that guess ("Unknown command: /<name>") it drops the whole
     message without calling the model, so after such a submit the pane
     is watched briefly for the rejection and the message is re-delivered
-    escaped (zero-width prefix) as plain user text — the message is never
+    escaped (space prefix) as plain user text — the message is never
     silently swallowed. A recognized skill prints no rejection and runs
     exactly as before.
 
@@ -4299,6 +4315,9 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message."
         )
     delivery_diagnostics.set_stage("pasting")
+    # Space returns focus to the input box if the footer (shells item or agent
+    # list) holds it. Either way it types a space, which the clear removes.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     # Clear stale text first: raw controls can otherwise become pasted text.
     # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
@@ -4704,7 +4723,9 @@ def inject_slash_command(
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
+    # not interrupt an in-flight generation. Space first refocuses the input
+    # box from the footer, as in :func:`_paste_and_submit`; C-u clears its space.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
@@ -5592,7 +5613,8 @@ def _user_prompt_visible(pane: str) -> bool:
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
     return (
-        "Do you want to " in region
+        _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
+        or "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
             any(hint in region for hint in ("Enter to select", "Enter to submit"))
@@ -5606,10 +5628,21 @@ def _has_approval_wait(bridge_dir: Path) -> bool:
     return session_id is not None and approval_wait_is_fresh(session_id, bridge_dir=bridge_dir)
 
 
-def _raise_if_user_prompt_pending(bridge_dir: Path | None, pane: str) -> None:
+def _raise_if_user_prompt_pending(
+    bridge_dir: Path | None,
+    pane: str,
+    *,
+    message: str = "Claude is waiting for an explicit answer; input not sent.",
+) -> None:
     """Protect live hook waits even when a captured pane is torn or stale."""
+    if _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT):
+        raise ClaudeUserPromptPending(
+            "Claude Code is waiting for your auto-mode classifier billing choice. "
+            "The message was not delivered. Open the terminal, answer the prompt, "
+            "then resend your message."
+        )
     if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(pane):
-        raise ClaudeUserPromptPending("Claude is waiting for an explicit answer; input not sent.")
+        raise ClaudeUserPromptPending(message)
 
 
 def has_pending_user_prompt(bridge_dir: Path) -> bool:
@@ -5631,6 +5664,11 @@ def has_pending_user_prompt(bridge_dir: Path) -> bool:
 
 def auto_mode_billing_notice_visible(pane: str) -> bool:
     """Recognize the exact informational notice below the live pane's last rule."""
+    return _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_NOTICE)
+
+
+def _auto_mode_billing_prompt_matches(pane: str, pattern: re.Pattern[str]) -> bool:
+    """Match only the live billing prompt, excluding transcript and composer text."""
     if _composer_row(pane) is not None:
         return False
     lines = pane.splitlines()
@@ -5640,7 +5678,7 @@ def auto_mode_billing_notice_visible(pane: str) -> bool:
     # Ignore transcript text above the dialog; tolerate terminal line wrapping,
     # including wraps within the gateway hostname and documentation URL.
     body = "".join("".join(lines[rules[-1] + 1 :]).split())
-    return _AUTO_MODE_BILLING_NOTICE.fullmatch(body) is not None
+    return pattern.fullmatch(body) is not None
 
 
 def _acknowledge_auto_mode_billing_notice(socket_path: str, tmux_target: str) -> bool:
@@ -5725,8 +5763,9 @@ def _restore_occupied_input(
     in two shapes, both reported by :func:`_occupying_surface`: an overlay
     drawn where the input box was (the ctrl+r prompt-history search, a
     hand-opened ``/model`` picker, the double-Escape rewind dialog, a
-    ``/config`` or ``/resume`` panel), or the box itself switched to
-    another input mode (``!`` shell mode). Keystrokes injected into either
+    ``/config`` or ``/resume`` panel, a background task's details panel),
+    or the box itself switched to another input mode (``!`` shell mode).
+    Keystrokes injected into either
     do not become a chat message: the history search filters on the pasted
     text and its Enter replays an old prompt, the rewind dialog's Enter
     restores a checkpoint, and shell mode runs the message as a bash
@@ -5768,13 +5807,14 @@ def _restore_occupied_input(
     unclearable_seen = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
-        if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
-            pane
-        ):
-            raise ClaudeUserPromptPending(
+        _raise_if_user_prompt_pending(
+            bridge_dir,
+            pane,
+            message=(
                 "Answer the pending Claude question or permission request "
                 "before sending a message."
-            )
+            ),
+        )
         if auto_mode_billing_notice_visible(pane):
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
             return None
@@ -6159,6 +6199,8 @@ def _wait_for_claude_prompt_ready(
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
         card can offer it; the pane is left alive for the sign-in to finish.
+        Also raised when the launcher waits on two consecutive polls for a
+        sign-in that another process started.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
@@ -6184,17 +6226,17 @@ def _wait_for_claude_prompt_ready(
     pane_exited = False
     dialog_headline: str | None = None
     sign_in_url: str | None = None
+    waited_on_sign_in = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
         _check_injection_cancelled()
         pane = _capture_pane(socket_path, tmux_target)
-        if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
-            pane
-        ):
-            raise ClaudeUserPromptPending(
-                "Claude is waiting for an explicit answer; message not sent."
-            )
+        _raise_if_user_prompt_pending(
+            bridge_dir,
+            pane,
+            message="Claude is waiting for an explicit answer; message not sent.",
+        )
         polls += 1
         if pane.strip():
             last_nonempty = pane
@@ -6233,6 +6275,21 @@ def _wait_for_claude_prompt_ready(
                 remediation=sign_in_next_step("Claude Code"),
             )
         sign_in_url = sign_in.url if sign_in is not None else None
+        # Another launch's sign-in holds the launcher's lock. Reaping the pane at
+        # the budget would kill this wait, so report the sign-in instead.
+        waiting_on_sign_in = sign_in is None and sign_in_running_elsewhere(pane)
+        if waiting_on_sign_in and waited_on_sign_in:
+            raise ClaudeSignInPending(
+                "Claude Code is waiting for a sign-in that another session started, "
+                "so the message was not delivered.",
+                title="Claude Code can't start until you sign in to Databricks",
+                remediation=(
+                    "Finish the sign-in that another session opened, in your browser or in "
+                    "that session's terminal. Claude Code continues on its own once it "
+                    "completes; then send your message again."
+                ),
+            )
+        waited_on_sign_in = waiting_on_sign_in
         now = time.monotonic()
         if now >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)
@@ -8041,6 +8098,12 @@ def _transcript_items_from_entry(
             agent_name=agent_name,
             current_response_id=current_response_id,
         )
+    # Only ``user``/``assistant`` records are conversation turns. Other typed
+    # records can carry a ``message`` too, e.g. ``api-request-blob`` copies of
+    # API requests that include injected ``<system-reminder>`` context.
+    entry_type = entry.get("type")
+    if isinstance(entry_type, str) and entry_type not in ("user", "assistant"):
+        return current_response_id, []
     message = entry.get("message")
     if not isinstance(message, dict):
         return current_response_id, []
@@ -8376,15 +8439,16 @@ def _escape_slash_command_text(content: str) -> str:
     """
     Return *content* escaped so it is treated as plain user text.
 
-    Inserts a zero-width no-break space (U+FEFF) immediately before the
-    leading slash. Claude Code sees a non-slash first character, so the
-    input is submitted as a regular message, while the user still sees
-    their original slash.
+    Inserts a space immediately before the leading slash. Claude Code sees
+    a non-slash first character, so the input is submitted as a regular
+    message, while the user still sees their original slash. An invisible
+    prefix does not work: Claude Code strips invisible characters before
+    it parses the command.
     """
     match = re.match(r"^(\s*)(/)(.*)$", content, re.DOTALL)
     if not match:
         return content
-    return f"{match.group(1)}\ufeff{match.group(2)}{match.group(3)}"
+    return f"{match.group(1)} {match.group(2)}{match.group(3)}"
 
 
 def _escape_unsupported_slash_command(content: str) -> str:
@@ -8496,6 +8560,57 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
 
 
+def _is_slash_command_echo(content: str) -> bool:
+    """
+    Whether *content* is Claude Code's own slash-command echo markup.
+
+    Claude writes the echo with ``<command-name>`` first, or with
+    ``<command-message>`` first for skills invoked with arguments. Command
+    tags appearing later — inside shell output, command stdout, or user
+    prose — are not an echo.
+
+    :param content: Raw transcript record content.
+    :returns: ``True`` when the content begins with a command tag.
+    """
+    return content.lstrip().startswith(("<command-name>", "<command-message>"))
+
+
+def _slash_command_item_from_echo(
+    content: str,
+    *,
+    source_key: str,
+    agent_name: str,
+    response_id: str,
+) -> ClaudeTranscriptItem | None:
+    """
+    Build the ``slash_command`` item for a Claude slash-command echo.
+
+    :param content: Echo markup accepted by :func:`_is_slash_command_echo`.
+    :param source_key: Base transcript record key used for the source id.
+    :param agent_name: Agent/model name attributed to the invocation.
+    :param response_id: Response id that opens the command's turn.
+    :returns: The item, or ``None`` for unparseable markup and UI-only
+        built-ins that are never surfaced.
+    """
+    payload = _parse_slash_command_record(content)
+    if payload is None or payload.name in _CLAUDE_CLI_DROPPED_COMMANDS:
+        return None
+    data: _JsonObject = {
+        "agent": agent_name,
+        "kind": "command" if payload.name in _CLAUDE_CLI_SURFACED_COMMANDS else "skill",
+        "name": payload.name,
+        "arguments": payload.arguments,
+    }
+    if payload.output is not None:
+        data["output"] = payload.output
+    return ClaudeTranscriptItem(
+        source_id=_source_id(source_key, 0, "slash_command"),
+        item_type="slash_command",
+        data=data,
+        response_id=response_id,
+    )
+
+
 def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> bool:
     """Honor native peer provenance and the existing task-notification boundary."""
     if isinstance(origin, dict) and origin.get("kind") == "peer":
@@ -8559,12 +8674,12 @@ def _local_command_transcript_items_from_entry(
     """
     Parse a top-level Claude ``local_command`` transcript entry.
 
-    Newer Claude Code builds can record shell-mode ``!cmd`` activity
-    as top-level transcript records with ``subtype="local_command"``
-    and a string ``content`` field instead of wrapping the same markup
-    inside ``message.role=user``. Only ``<bash-*>`` records are
-    conversation-visible here; slash-command local records are still
-    handled by hook/fork detection and otherwise ignored.
+    Newer Claude Code builds can record shell-mode ``!cmd`` activity and
+    slash-command echoes (e.g. ``/model``) as top-level transcript records
+    with ``subtype="local_command"`` and a string ``content`` field instead
+    of wrapping the same markup inside ``message.role=user``. Both are
+    parsed exactly as their ``role=user`` counterparts; command stdout
+    records stay hidden apart from the ``/compact`` refusal.
 
     :param entry: Decoded Claude transcript record.
     :param line_number: One-based transcript line number.
@@ -8574,8 +8689,8 @@ def _local_command_transcript_items_from_entry(
     :param current_response_id: Response id for an in-progress shell
         command group, if the input record was parsed in an earlier
         line.
-    :returns: Updated active response id and parsed terminal-command
-        items.
+    :returns: Updated active response id and parsed slash-command or
+        terminal-command items.
     """
     content = entry.get("content")
     if not isinstance(content, str) or not content:
@@ -8605,6 +8720,16 @@ def _local_command_transcript_items_from_entry(
             )
         ]
     fallback_response_id = _response_id_from_source(source_key)
+    if _is_slash_command_echo(content):
+        item = _slash_command_item_from_echo(
+            content,
+            source_key=source_key,
+            agent_name=agent_name,
+            response_id=fallback_response_id,
+        )
+        if item is None:
+            return current_response_id, []
+        return fallback_response_id, [item]
     response_id = (
         fallback_response_id
         if _BASH_INPUT_RE.search(content) is not None
@@ -8779,38 +8904,22 @@ def _user_transcript_items_from_entry(
                 items,
             )
         stripped = content.lstrip()
-        # Skill invocations with args ship the tag order
-        # ``<command-message>…<command-name>…<command-args>…`` — i.e.
-        # ``<command-name>`` is NOT the first tag. Detect it anywhere
-        # in the content, not just at the start.
-        if "<command-name>" in stripped:
-            payload = _parse_slash_command_record(content)
+        if _is_slash_command_echo(content):
             # Drop unparseable markup rather than letting it fall through
             # to the user-bubble path — that rendered the markup verbatim
             # in the original bug.
-            if payload is None or payload.name in _CLAUDE_CLI_DROPPED_COMMANDS:
-                return current_response_id, []
-            kind = "command" if payload.name in _CLAUDE_CLI_SURFACED_COMMANDS else "skill"
-            data: _JsonObject = {
-                "agent": agent_name,
-                "kind": kind,
-                "name": payload.name,
-                "arguments": payload.arguments,
-            }
-            if payload.output is not None:
-                data["output"] = payload.output
-            items.append(
-                ClaudeTranscriptItem(
-                    source_id=_source_id(source_key, 0, "slash_command"),
-                    item_type="slash_command",
-                    data=data,
-                    response_id=fallback_response_id,
-                )
+            item = _slash_command_item_from_echo(
+                content,
+                source_key=source_key,
+                agent_name=agent_name,
+                response_id=fallback_response_id,
             )
+            if item is None:
+                return current_response_id, []
             # Slash command opens a new logical turn; subsequent
             # assistant text must inherit this id so it clusters with
             # the indicator, not the prior bubble.
-            return fallback_response_id, items
+            return fallback_response_id, [item]
         # ``!cmd`` terminal commands may arrive here in older Claude
         # builds; newer builds use top-level ``local_command`` records.
         # In both shapes, surface the command and result as their own

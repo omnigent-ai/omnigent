@@ -1699,7 +1699,7 @@ async def test_message_relaunch_classifies_replacement_runner_liveness(
             if liveness_source == "local":
                 own_stamps[runner_id] = stamp
 
-    monkeypatch.setattr(routes_events, "_wait_for_runner_client", _replacement_connect_miss)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _replacement_connect_miss)
     set_runner_client(None)
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     try:
@@ -2646,11 +2646,13 @@ async def test_first_message_during_host_spawn_does_not_launch_replacement(
         await comm.wait(timeout=budget(5.0))
 
 
+@pytest.mark.parametrize("sign_in_pending", [False, True])
 async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    sign_in_pending: bool,
 ) -> None:
     """The first message waits for the already-bound runner to register.
 
@@ -2669,6 +2671,15 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     """
     from omnigent.server.routes import sessions as sessions_module
 
+    if sign_in_pending:
+        from omnigent.server.routes._sessions import orchestration
+
+        monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.05)
+        monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0.01, raising=False)
+        monkeypatch.setattr(
+            orchestration, "_query_host_runner_status", AsyncMock(return_value="sign_in_pending")
+        )
+
     comm = await _connect_host(app)
     session = await _inline_launch_session(client, comm)
     session_id = session["id"]
@@ -2676,6 +2687,7 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
 
     runner_paths: list[str] = []
     init_bodies: list[dict[str, Any]] = []
+    event_bodies: list[dict[str, Any]] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
         """Record runner POSTs and accept session init/message calls.
@@ -2689,6 +2701,7 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
             if request.url.path == "/v1/sessions":
                 init_bodies.append(json.loads(request.content))
         if request.url.path.endswith("/events"):
+            event_bodies.append(json.loads(request.content))
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(200, json={})
 
@@ -2737,9 +2750,17 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
             )
         )
         await _wait_for_runner_connect_waiter(app, original_runner_id)
+        if sign_in_pending:
+            # Longer than normal startup grace, still inside the explicit sign-in window.
+            await asyncio.sleep(0.1)
+            current = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+            assert current is not None and current.runner_id == original_runner_id
+            assert not post_task.done()
         app.state.tunnel_registry.register(original_runner_id, _NoopRunnerWS(), _runner_hello())
         resp = await post_task
     finally:
+        post_task.cancel()
+        await asyncio.gather(post_task, return_exceptions=True)
         await fake_runner.aclose()
 
     saw_launch = await _expect_no_launch(comm, budget_s=budget(0.2))
@@ -2764,6 +2785,8 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
         f"recorded runner POSTs were {runner_paths!r}"
     )
     event_paths = [path for path in runner_paths if path.endswith("/events")]
+    assert len(event_bodies) == 1
+    assert event_bodies[0]["content"] == [{"type": "input_text", "text": "hi"}]
     assert event_paths, (
         f"the user message should be forwarded after session init; "
         f"recorded runner POSTs were {runner_paths!r}"
@@ -2771,6 +2794,56 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     assert init_bodies and init_bodies[0]["session_id"] == session_id, (
         f"session-init body should target {session_id!r}; got {init_bodies!r}"
     )
+
+
+@pytest.mark.parametrize("interruption", ["cancel", "stop", "rebind"])
+async def test_pending_sign_in_interruption_does_not_consume_input(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: str,
+) -> None:
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.05)
+    monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0.01)
+    monkeypatch.setattr(
+        orchestration, "_query_host_runner_status", AsyncMock(return_value="sign_in_pending")
+    )
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id, runner_id = session["id"], session["runner_id"]
+    set_runner_client(None)
+    post = asyncio.create_task(_post_hello(client, session_id))
+    try:
+        await _wait_for_runner_connect_waiter(app, runner_id)
+        await asyncio.sleep(0.1)
+        assert not post.done()
+        if interruption == "cancel":
+            post.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await post
+        else:
+            if interruption == "stop":
+                monkeypatch.setitem(
+                    orchestration._intentional_stop_sessions, session_id, runner_id
+                )
+            else:
+                SqlAlchemyConversationStore(db_uri).replace_runner_id(
+                    session_id, "runner-replacement", expected_runner_id=runner_id
+                )
+            response = await asyncio.wait_for(post, budget(5))
+            assert response.status_code >= 400
+        items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+        assert [item for item in items if item["type"] in {"message", "error"}] == []
+        assert app.state.tunnel_registry.connect_waiter_count(runner_id) == 0
+        assert not await _expect_no_launch(comm, budget_s=budget(0.1))
+    finally:
+        post.cancel()
+        await asyncio.gather(post, return_exceptions=True)
 
 
 async def test_relaunch_posts_session_init_before_forwarding_message(
