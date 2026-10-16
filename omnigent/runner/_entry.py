@@ -1168,8 +1168,13 @@ def _run_parent_death_killer(
     request_shutdown: Callable[[], None],
     *,
     adopted: threading.Event | None = None,
+    finish_work: threading.Event | None = None,
+    has_active_work: Callable[[], bool] | None = None,
+    request_idle_shutdown: Callable[[], None] | None = None,
     poll_interval_s: float = 0.5,
     grace_s: float = 2.0,
+    idle_grace_s: float = _GRACEFUL_SHUTDOWN_TUNNEL_TIMEOUT_S + 5.0,
+    finish_work_max_s: float = 1800.0,
     exit_fn: Callable[[int], None] = os._exit,
 ) -> None:
     """Force the runner to exit once its parent (host daemon) dies.
@@ -1190,6 +1195,10 @@ def _run_parent_death_killer(
     The CLI sets it (via the adopt signal) while it is still alive, so the
     flag is observed before the subsequent parent-death is detected.
 
+    When *finish_work* is set (the host's terminal hung up) and work is in
+    flight, the runner keeps serving until *has_active_work* reports idle or
+    *finish_work_max_s* passes; a finished runner then closes as idle.
+
     :param parent_pid: The launcher's process id to monitor, e.g.
         ``12345``.
     :param request_shutdown: Callback that triggers a graceful shutdown
@@ -1197,10 +1206,18 @@ def _run_parent_death_killer(
     :param adopted: Event set when the runner has been adopted; once set,
         the watcher returns without requesting shutdown. ``None`` disables
         adoption (watch until parent death).
+    :param finish_work: Event set by :data:`RUNNER_FINISH_WORK_SIGNAL`;
+        ``None`` disables finishing in-flight work.
+    :param has_active_work: Whether an agent turn is still running.
+    :param request_idle_shutdown: Clean idle close used once finished work
+        drains; ``None`` falls back to *request_shutdown*.
     :param poll_interval_s: Seconds between parent-liveness probes, e.g.
         ``0.5``.
     :param grace_s: Seconds to allow graceful shutdown before the hard
         exit, e.g. ``2.0``.
+    :param idle_grace_s: Grace before the hard exit after an idle close,
+        covering the tunnel's graceful-close budget.
+    :param finish_work_max_s: Bound on finishing in-flight work, e.g. ``1800``.
     :param exit_fn: Hard-exit function, defaults to :func:`os._exit`;
         injectable so tests can observe it without killing the runner.
     :returns: None.
@@ -1213,6 +1230,31 @@ def _run_parent_death_killer(
     # parent's exit so an intentional detach is never torn down.
     if adopted is not None and adopted.is_set():
         return
+    if (
+        finish_work is not None
+        and finish_work.is_set()
+        and has_active_work is not None
+        and _work_still_active(has_active_work)
+    ):
+        _logger.info(
+            "parent process hung up with work in flight; finishing it before exiting",
+            extra={"session_id": runner_primary_session_id()},
+        )
+        deadline = time.monotonic() + finish_work_max_s
+        while _work_still_active(has_active_work):
+            if time.monotonic() >= deadline:
+                _logger.warning(
+                    "runner exiting: in-flight work did not finish within %.0fs "
+                    "after the parent process hung up",
+                    finish_work_max_s,
+                    extra={"session_id": runner_primary_session_id()},
+                )
+                break
+            time.sleep(poll_interval_s)
+        else:
+            if request_idle_shutdown is not None:
+                request_shutdown = request_idle_shutdown
+                grace_s = idle_grace_s
     request_shutdown()
     time.sleep(grace_s)
     # The hard exit is a backstop reached only when graceful shutdown did not
@@ -1229,6 +1271,14 @@ def _run_parent_death_killer(
     with contextlib.suppress(Exception):
         sys.stderr.flush()
     exit_fn(0)
+
+
+def _work_still_active(has_active_work: Callable[[], bool]) -> bool:
+    """Probe loop-owned work state from a thread; a racing mutation counts as active."""
+    try:
+        return bool(has_active_work())
+    except RuntimeError:
+        return True
 
 
 def _runner_workspace_from_env() -> Path | None:
@@ -1833,10 +1883,13 @@ async def _run_tunnel_from_env() -> None:
     # Set when the launcher adopts this runner (tmux detach); makes the
     # parent-death killer stand down so the runner outlives the CLI.
     adopted_event = threading.Event()
+    # Set when the host hangs up; the parent-death killer then lets work finish.
+    finish_work_event = threading.Event()
     _shutting_down_state = getattr(app.state, "shutting_down", None)
     _install_signal_handlers(
         stop_event,
         adopted_event=adopted_event,
+        finish_work_event=finish_work_event,
         record_reason=_record_exit_reason,
         mark_shutting_down=(
             _shutting_down_state.set if _shutting_down_state is not None else None
@@ -1942,6 +1995,14 @@ async def _run_tunnel_from_env() -> None:
             _record_exit_reason("parent process died")
             loop.call_soon_threadsafe(stop_event.set)
 
+        def _request_finished_work_shutdown() -> None:
+            """Close the tunnel as idle once a hung-up host's work finished.
+
+            :returns: None.
+            """
+            _record_exit_reason("parent process hung up; in-flight work finished")
+            loop.call_soon_threadsafe(tunnel_shutdown_event.set)
+
         # Orphan guard runs on a dedicated daemon thread, not the event
         # loop: if the loop wedges during shutdown (harness mid-boot when
         # the host dies), an event-loop watchdog could never fire. The
@@ -1950,7 +2011,12 @@ async def _run_tunnel_from_env() -> None:
         threading.Thread(
             target=_run_parent_death_killer,
             args=(parent_pid, _request_parent_death_shutdown),
-            kwargs={"adopted": adopted_event},
+            kwargs={
+                "adopted": adopted_event,
+                "finish_work": finish_work_event,
+                "has_active_work": _has_active_work,
+                "request_idle_shutdown": _request_finished_work_shutdown,
+            },
             name=f"runner-parent-killer:{parent_pid}",
             daemon=True,
         ).start()
@@ -2006,6 +2072,7 @@ def _install_signal_handlers(
     adopted_event: threading.Event | None = None,
     record_reason: Callable[[str], None] | None = None,
     mark_shutting_down: Callable[[], None] | None = None,
+    finish_work_event: threading.Event | None = None,
 ) -> None:
     """Install process signal handlers that request graceful shutdown.
 
@@ -2021,6 +2088,9 @@ def _install_signal_handlers(
         shutdown signal arrives, before any teardown runs — lets app.py tell
         an intentional stop from a real crash when a terminal watcher races
         the shutdown. ``None`` skips it.
+    :param finish_work_event: Optional event set when
+        :data:`RUNNER_FINISH_WORK_SIGNAL` or SIGHUP arrives (the host hung up).
+        ``None`` skips the handler.
     :returns: None.
     """
     loop = asyncio.get_running_loop()
@@ -2072,12 +2142,17 @@ def _install_signal_handlers(
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         _try_add_handler(sig, _handle_shutdown_signal, sig)
-    if adopted_event is not None:
-        from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
+    from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL, RUNNER_FINISH_WORK_SIGNAL
 
-        if RUNNER_ADOPT_SIGNAL is None:
-            return
+    if adopted_event is not None and RUNNER_ADOPT_SIGNAL is not None:
         _try_add_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
+    if finish_work_event is not None and RUNNER_FINISH_WORK_SIGNAL is not None:
+        _try_add_handler(RUNNER_FINISH_WORK_SIGNAL, finish_work_event.set)
+    # A terminal hangup reaches the whole foreground group; finish in-flight work
+    # once the host is gone. No reason is recorded: the eventual exit path names it.
+    sighup = getattr(signal, "SIGHUP", None)
+    if finish_work_event is not None and sighup is not None:
+        _try_add_handler(sighup, finish_work_event.set)
 
 
 def _install_crash_logging() -> None:

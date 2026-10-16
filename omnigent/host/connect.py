@@ -1361,6 +1361,26 @@ class HostProcess:
             pids.add(zygote_pid)
         return pids
 
+    def signal_runners_finish_work(self, kill: Callable[[int, int], None] = os.kill) -> None:
+        """Tell live runners to finish in-flight work once this host exits.
+
+        Runs on the hangup signal-exit thread, so it only snapshots handles and
+        sends signals; the zygote is not a runner and is never signalled.
+
+        :param kill: Signal sender, defaults to :func:`os.kill`; injectable for tests.
+        """
+        from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+        if RUNNER_FINISH_WORK_SIGNAL is None:
+            return
+        zygote_pid = self._zygote.unreaped_pid if self._zygote is not None else None
+        for handle in list(self._runners.values()):
+            pid = handle.proc.pid
+            if handle.proc.returncode is not None or pid == zygote_pid:
+                continue
+            with contextlib.suppress(OSError):
+                kill(pid, RUNNER_FINISH_WORK_SIGNAL)
+
     @staticmethod
     def _orphan_child_pids() -> list[int]:
         """Snapshot direct children without consuming any exit status."""
@@ -5343,6 +5363,7 @@ def _serve_host_until_exit(
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
     )
+    crash_reporting.set_hangup_callback(host.signal_runners_finish_work)
     try:
         asyncio.run(host.run())
     except HostConnectError as exc:

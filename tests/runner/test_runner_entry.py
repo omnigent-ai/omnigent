@@ -11,6 +11,7 @@ import signal
 import sys
 import tarfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -2383,6 +2384,75 @@ def test_run_parent_death_killer_logs_reason_before_hard_exit(
     ), f"expected a parent-death exit log line, got {[r.message for r in caplog.records]}"
 
 
+def _finish_work_killer(
+    has_active_work: Callable[[], bool],
+    *,
+    finish_work_set: bool = True,
+    finish_work_max_s: float = 5.0,
+) -> list[str]:
+    """Run an already-orphaned killer with the finish-work path wired; return events."""
+    import threading
+
+    events: list[str] = []
+    finish_work = threading.Event()
+    if finish_work_set:
+        finish_work.set()
+    _run_parent_death_killer(
+        os.getppid() + 100000,  # already "orphaned"
+        lambda: events.append("stop"),
+        finish_work=finish_work,
+        has_active_work=has_active_work,
+        request_idle_shutdown=lambda: events.append("idle_close"),
+        poll_interval_s=0.01,
+        grace_s=0.01,
+        idle_grace_s=0.01,
+        finish_work_max_s=finish_work_max_s,
+        exit_fn=lambda code: events.append("exit"),
+    )
+    return events
+
+
+def test_run_parent_death_killer_finishes_in_flight_work_after_hangup() -> None:
+    """A hung-up host's runner closes as idle only after its turn finishes."""
+    probes: list[str] = []
+
+    def has_active_work() -> bool:
+        probes.append("probe")
+        if len(probes) == 2:
+            raise RuntimeError("dictionary changed size during iteration")
+        return len(probes) < 5
+
+    events = _finish_work_killer(has_active_work)
+
+    assert len(probes) == 5, "shutdown must wait until the work reports idle"
+    assert events == ["idle_close", "exit"]
+
+
+def test_run_parent_death_killer_without_hangup_stops_despite_active_work() -> None:
+    """A plain parent death (e.g. ``host stop``) still stops a busy runner at once."""
+    events = _finish_work_killer(lambda: True, finish_work_set=False)
+
+    assert events == ["stop", "exit"]
+
+
+def test_run_parent_death_killer_bounds_finishing_work(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Work that never finishes is stopped once the bound passes."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner._entry"):
+        events = _finish_work_killer(lambda: True, finish_work_max_s=0.05)
+
+    assert events == ["stop", "exit"]
+    assert any("did not finish" in record.message for record in caplog.records)
+
+
+def test_run_parent_death_killer_idle_runner_exits_immediately_after_hangup() -> None:
+    """An idle runner exits on a hangup exactly as on any parent death."""
+    events = _finish_work_killer(lambda: False)
+
+    assert events == ["stop", "exit"]
+
+
 def test_install_crash_logging_records_uncaught_exception(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2448,6 +2518,65 @@ async def test_install_signal_handlers_records_signal_reason() -> None:
             loop.remove_signal_handler(sig)
 
     assert reasons == ["received SIGTERM"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGUSR2") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_finish_work_signal_sets_event() -> None:
+    """The host's hangup signal flags in-flight work to finish, without stopping."""
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    assert RUNNER_FINISH_WORK_SIGNAL is not None
+    stop_event = asyncio.Event()
+    finish_work = threading.Event()
+    _install_signal_handlers(stop_event, finish_work_event=finish_work)
+    loop = asyncio.get_running_loop()
+    try:
+        os.kill(os.getpid(), RUNNER_FINISH_WORK_SIGNAL)
+        deadline = time.monotonic() + 2.0
+        while not finish_work.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM, RUNNER_FINISH_WORK_SIGNAL):
+            loop.remove_signal_handler(sig)
+
+    assert finish_work.is_set()
+    assert not stop_event.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGHUP") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_sighup_finishes_work_instead_of_dying() -> None:
+    """A terminal hangup sent to the whole process group keeps the runner serving."""
+    import threading
+
+    stop_event = asyncio.Event()
+    finish_work = threading.Event()
+    reasons: list[str] = []
+    _install_signal_handlers(
+        stop_event, finish_work_event=finish_work, record_reason=reasons.append
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        os.kill(os.getpid(), signal.SIGHUP)
+        deadline = time.monotonic() + 2.0
+        while not finish_work.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGUSR2):
+            loop.remove_signal_handler(sig)
+
+    assert finish_work.is_set()
+    assert not stop_event.is_set()
+    assert reasons == [], "the eventual exit path, not the hangup, names the exit"
 
 
 @pytest.mark.asyncio

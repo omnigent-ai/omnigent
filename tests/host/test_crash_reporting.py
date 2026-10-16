@@ -639,3 +639,45 @@ def test_stop_signal_still_kills_when_the_watchdog_cannot_start(tmp_path: Path) 
             proc.kill()
 
     assert proc.returncode == -signal.SIGTERM
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+@pytest.mark.parametrize(
+    ("signum", "expect_hangup"), [(signal.SIGHUP, True), (signal.SIGTERM, False)]
+)
+def test_hangup_callback_runs_only_on_sighup_before_dying(
+    tmp_path: Path, signum: int, expect_hangup: bool
+) -> None:
+    """A terminal hangup lets runners finish their turns; a stop does not."""
+    rows_path = tmp_path / "rows.jsonl"
+    marker = tmp_path / "hangup"
+    proc = _run_child(
+        f"""
+        cr.set_hangup_callback(lambda: open({str(marker)!r}, "w").close())
+        cr.install_host_signal_handlers()
+        print("ready", flush=True)
+        while True:
+            time.sleep(0.05)
+        """,
+        rows_path,
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "ready"
+        proc.send_signal(signum)
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    assert proc.returncode == -signum
+    assert marker.exists() is expect_hangup
+    assert len(_exit_rows(rows_path)) == 1
+
+
+def test_failing_hangup_callback_does_not_block_the_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    def explode() -> None:
+        raise RuntimeError("callback failed")
+
+    monkeypatch.setattr(cr, "_hangup_callback", explode)
+    cr._run_hangup_callback(signal.SIGHUP)  # must not raise
