@@ -1354,10 +1354,12 @@ describe("buildSlashCommandMap", () => {
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
-    // /btw (claude-native) and /side (codex-native) are gated off by default,
-    // so both are excluded here.
+    // /btw (claude-native), /side (codex-native), and /goal (goal-capable
+    // sessions) are gated off by default, so all three are excluded here.
     expect(Object.keys(map)).toEqual(
-      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter(
+        (name) => name !== "/btw" && name !== "/side" && name !== "/goal",
+      ),
     );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
@@ -1371,6 +1373,13 @@ describe("buildSlashCommandMap", () => {
     expect(buildSlashCommandMap([], true, true, true, false, true)["/side"]).toBe(
       BUILTIN_SLASH_COMMANDS["/side"],
     );
+  });
+
+  it("includes /goal only when showGoal is true", () => {
+    expect(buildSlashCommandMap([], true, true)["/goal"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "$", false, true)["/goal"],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/goal"]);
   });
 
   it("includes /btw only when showBtw is true (claude-native)", () => {
@@ -1430,9 +1439,11 @@ describe("buildSlashCommandMap", () => {
       true,
     );
     // Built-ins first, then skills in their input order — the menu
-    // surfaces built-ins above user skills. /btw and /side are gated off.
+    // surfaces built-ins above user skills. /btw, /side, and /goal are gated off.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter(
+        (name) => name !== "/btw" && name !== "/side" && name !== "/goal",
+      ),
       "/triage-issues",
       "/mlflow-bug",
     ]);
@@ -1483,6 +1494,14 @@ describe("buildSlashCommandWithArgsSet", () => {
     expect(buildSlashCommandWithArgsSet([], false, true).has("/model")).toBe(true);
     expect(buildSlashCommandWithArgsSet([], false, true).size).toBe(1);
     expect(buildSlashCommandWithArgsSet([], false, false).has("/model")).toBe(false);
+  });
+
+  it("includes /goal as an arg-fill command only when goals are supported", () => {
+    // Selecting /goal fills "/goal " so the user can type the objective.
+    expect(buildSlashCommandWithArgsSet([], false, false).has("/goal")).toBe(false);
+    expect(buildSlashCommandWithArgsSet([], false, false, false, false, "$", true)).toEqual(
+      new Set(["/goal"]),
+    );
   });
 
   it("treats every skill as args-fill so the user can append context", () => {

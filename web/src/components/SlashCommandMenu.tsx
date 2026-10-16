@@ -23,6 +23,7 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
   "/side":
     "Start a side chat: an ephemeral fork opened as its own sub-agent chat, kept out of this conversation",
+  "/goal": "Set a goal for this session: /goal <objective>, or /goal to open the Goal dialog",
   "/help": "Show available slash commands",
 };
 

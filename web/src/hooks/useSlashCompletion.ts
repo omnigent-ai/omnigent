@@ -43,6 +43,11 @@ export interface UseSlashCompletionOptions {
   commands: Record<string, string>;
   /** Explicit skill inventory, including names that collide with built-ins. */
   skills: Record<string, string>;
+  /**
+   * Names a leading command lists as built-ins. Defaults to the `commands`
+   * names absent from `skills`.
+   */
+  builtinNames?: ReadonlySet<string>;
   /** Skill display names by prefixed command; a query may match either. */
   labels?: Readonly<Record<string, string>>;
   textareaRef?: RefObject<HTMLTextAreaElement | null>;
@@ -112,6 +117,7 @@ export function useSlashCompletion({
   text,
   commands,
   skills,
+  builtinNames: leadingBuiltinNames,
   labels = NO_LABELS,
   textareaRef,
   prefix,
@@ -140,9 +146,9 @@ export function useSlashCompletion({
   const tokenSuffix = text.slice(caret).match(/^\S*/)?.[0] ?? "";
   const end = caret + tokenSuffix.length;
   const inline = text.slice(0, start).trim().length > 0 || text.slice(end).trim().length > 0;
-  const builtinNames = new Set(
-    Object.keys(commands).filter((name) => !Object.hasOwn(skills, name)),
-  );
+  const builtinNames =
+    (!inline && leadingBuiltinNames) ||
+    new Set(Object.keys(commands).filter((name) => !Object.hasOwn(skills, name)));
   const menuCommands = inline ? skills : commands;
   const baseOpen = Boolean(hasPrefix) && caret === selectionEnd && /^[\w:-]*$/.test(tokenSuffix);
   const isDismissed =

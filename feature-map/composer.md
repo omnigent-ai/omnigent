@@ -41,6 +41,12 @@ and steers messages while the agent is busy.
   selection and launch wait for success. States: connected, pending, cancelled,
   failed, popup blocked, Databricks workspace prompt, bearer token needed.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
+- `goal-command`: where **+ → Goal** is available (Codex-native sessions, or
+  top-level Polly sessions on Claude SDK or Codex), `/goal` is listed under
+  Commands. `/goal <objective>`
+  sends the objective for the harness to set as the goal; a bare `/goal` opens
+  the Goal dialog, as **+ → Goal** does. A draft with attachments is sent as
+  typed, like every command, so it does not set a goal.
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
@@ -93,6 +99,9 @@ and steers messages while the agent is busy.
   return to Chat.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
+- In a Codex-native session, or a top-level Polly session on Claude SDK or
+  Codex, type `/goal <objective>` or a bare `/goal`, or
+  choose **+ → Goal**.
 - Send while the agent is working to queue a message, then steer it.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
   page in the same project. Selecting **/new** in Commands also opens it.
@@ -273,6 +282,15 @@ Other connection providers alone do not enable the managed MCP picker.
   No running agent is needed.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`
+- **`goal-command`:** no browser-level coverage; the `Composer typed /goal`
+  web unit tests in `web/src/pages/ChatPage.composer.test.tsx` cover it.
+  Manually, in a Codex-native session: type `/go`. The menu lists `/goal` under
+  Commands; the first Enter fills `/goal `, and a second Enter opens the Goal
+  dialog with the composer cleared. Then send `/goal <objective>`. Codex starts
+  working on the objective. By the time the turn ends, without a reload, a target
+  icon appears at the right end of the workspace bar above the message box (its
+  tooltip reads "Goal active" and the objective), and **+ → Goal** is marked
+  active. Both can appear earlier.
 - **`attachments`:**
   `tests/browser_ui/chat/test_composer_attachments.py::test_attach_supported_files_and_remove`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,

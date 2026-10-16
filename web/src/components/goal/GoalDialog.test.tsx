@@ -96,6 +96,15 @@ describe("GoalDialog", () => {
     expect(objective).toHaveClass("wrap-anywhere");
   });
 
+  it("gives the scroll region room for the fields' focus ring", async () => {
+    renderDialog();
+
+    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledWith("conv_codex"));
+    const scrollRegion = screen.getByTestId("goal-objective").closest(".overflow-y-auto");
+    if (!scrollRegion) throw new Error("goal scroll region not found");
+    expect(scrollRegion).toHaveClass("p-1", "-m-1");
+  });
+
   it("saves a trimmed objective, token budget, and selected status", async () => {
     const updatedGoal = { ...ACTIVE_GOAL, objective: "Finish tests", status: "paused" };
     mockSetGoal.mockResolvedValueOnce({ goal: updatedGoal });

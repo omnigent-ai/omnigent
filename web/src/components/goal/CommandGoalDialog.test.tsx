@@ -40,6 +40,16 @@ describe("CommandGoalDialog", () => {
     expect(screen.getByText(/Codex keeps working until this condition is met/)).toBeInTheDocument();
   });
 
+  it("gives the scroll region room for the field's focus ring", () => {
+    render(
+      <CommandGoalDialog open onOpenChange={vi.fn()} readOnly={false} onStartGoal={vi.fn()} />,
+    );
+
+    const scrollRegion = screen.getByTestId("goal-condition").closest(".overflow-y-auto");
+    if (!scrollRegion) throw new Error("goal scroll region not found");
+    expect(scrollRegion).toHaveClass("p-1", "-m-1");
+  });
+
   it("rejects an empty condition", () => {
     const onStartGoal = vi.fn();
     render(

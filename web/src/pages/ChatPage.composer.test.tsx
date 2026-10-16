@@ -825,6 +825,229 @@ describe("Composer native goal state", () => {
 
     await waitFor(() => expect(mockGetGoal).toHaveBeenCalledWith("conv_goal"));
   });
+
+  it("re-reads the goal when a turn starts and ends", async () => {
+    const mockGetGoal = vi.mocked(getGoal);
+    mockGetGoal.mockClear().mockResolvedValue({ goal: null });
+    useChatStore.setState({ conversationId: "conv_goal" });
+    const props = { showGoalControl: true, runnerOnline: true };
+
+    const { rerender } = renderWithTooltips(
+      <Composer {...composerProps({ ...props, isWorking: false })} />,
+    );
+    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(1));
+
+    const rerenderWorking = (isWorking: boolean) =>
+      rerender(
+        <TooltipProvider>
+          <Composer {...composerProps({ ...props, isWorking })} />
+        </TooltipProvider>,
+      );
+    rerenderWorking(true);
+    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(2));
+    rerenderWorking(false);
+    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledTimes(3));
+  });
+});
+
+describe("Composer typed /goal", () => {
+  beforeEach(() => {
+    vi.mocked(getGoal).mockResolvedValue({ goal: null });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  type GoalSession = "codex-native" | "polly-claude" | "polly-codex";
+
+  // Codex-native sessions get the API-backed GoalDialog; Polly sessions run
+  // in-process (so they have onSendSlashCommand) and get CommandGoalDialog.
+  function renderGoalSession(session: GoalSession) {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    const { sessionHarness } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness }));
+    useChatStore.setState(
+      session === "codex-native"
+        ? { conversationId: "conv_goal", sessionHarness: "codex-native" }
+        : { conversationId: "conv_polly" },
+    );
+    const sessionProps =
+      session === "codex-native"
+        ? { isNativeWrapper: true, showGoalControl: true, runnerOnline: true }
+        : session === "polly-claude"
+          ? { onSendSlashCommand, showClaudeGoalControl: true }
+          : { onSendSlashCommand, showPollyCodexGoalControl: true };
+    renderWithTooltips(<Composer {...composerProps({ onSend, ...sessionProps })} />);
+    return { onSend, onSendSlashCommand };
+  }
+
+  const dialogFieldFor = (session: GoalSession) =>
+    session === "codex-native" ? "goal-objective" : "goal-condition";
+
+  it("suggests /goal and fills it for an objective", () => {
+    renderGoalSession("codex-native");
+
+    fireEvent.change(textarea(), { target: { value: "/go" } });
+    expect(activeRow()?.textContent).toContain("/goal");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(textarea()).toHaveValue("/goal ");
+  });
+
+  it.each<GoalSession>(["codex-native", "polly-claude", "polly-codex"])(
+    "opens the Goal dialog for a bare /goal (%s)",
+    async (session) => {
+      const { onSend, onSendSlashCommand } = renderGoalSession(session);
+
+      fireEvent.change(textarea(), { target: { value: "/goal " } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(await screen.findByTestId(dialogFieldFor(session))).toBeInTheDocument();
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onSendSlashCommand).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("");
+    },
+  );
+
+  it.each<[GoalSession, string, string]>([
+    ["codex-native", "/goal Fix CI", "/goal Fix CI"],
+    ["codex-native", "/Goal Fix CI", "/goal Fix CI"],
+    ["codex-native", "/goal\nFix CI", "/goal Fix CI"],
+    ["codex-native", "/goal   Fix\nCI  ", "/goal Fix\nCI"],
+    ["polly-claude", "/goal Fix CI", "/goal Fix CI"],
+    ["polly-claude", "/Goal Fix CI", "/goal Fix CI"],
+    ["polly-codex", "/goal Fix CI", "/goal Fix CI"],
+    ["polly-codex", "/goal\nFix CI", "/goal Fix CI"],
+  ])("on %s, sends %j as the plaintext %j the harness parses", (session, text, sent) => {
+    const { onSend, onSendSlashCommand } = renderGoalSession(session);
+
+    fireEvent.change(textarea(), { target: { value: text } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(onSend.mock.calls[0]?.[0]).toBe(sent);
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(screen.queryByTestId(dialogFieldFor(session))).toBeNull();
+  });
+
+  it.each(["goal", "Goal"])("lists a skill named %s as the built-in it runs as", async (name) => {
+    setComposerState({ skills: [{ name, description: "Track a goal" }] });
+    const { onSend, onSendSlashCommand } = renderGoalSession("polly-codex");
+
+    fireEvent.change(textarea(), { target: { value: "/go" } });
+    expect(screen.getAllByTestId(/^slash-menu-item-goal$/i)).toHaveLength(1);
+    expect(screen.getByTestId("slash-menu-item-goal")).toHaveTextContent(
+      BUILTIN_SLASH_COMMANDS["/goal"],
+    );
+    expect(screen.queryByText("Track a goal")).toBeNull();
+    expect(screen.queryByText("Skills")).toBeNull();
+
+    fireEvent.change(textarea(), { target: { value: "/goal " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(await screen.findByTestId("goal-condition")).toBeInTheDocument();
+
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    fireEvent.change(textarea(), { target: { value: "/goal Fix CI" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend.mock.calls[0]?.[0]).toBe("/goal Fix CI");
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("runs the built-in when a skill named help is selected", () => {
+    const onSendSlashCommand = vi.fn();
+    setComposerState({
+      conversationId: "conv_plain",
+      skills: [{ name: "help", description: "Custom help skill" }],
+    });
+    render(<Composer {...composerProps({ onSendSlashCommand })} />);
+
+    fireEvent.change(textarea(), { target: { value: "/hel" } });
+    expect(screen.getByTestId("slash-menu-item-help")).toHaveTextContent(
+      BUILTIN_SLASH_COMMANDS["/help"],
+    );
+    expect(screen.queryByText("Custom help skill")).toBeNull();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(textarea()).toHaveValue("");
+    expect(document.body).toHaveTextContent(`/help — ${BUILTIN_SLASH_COMMANDS["/help"]}`);
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it.each(["/Goal Fix CI", "/goal"])(
+    "sends %j with an attachment as typed, as for every command",
+    (text) => {
+      const { onSend } = renderGoalSession("codex-native");
+      fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+        target: { files: [new File(["hello"], "notes.txt", { type: "text/plain" })] },
+      });
+
+      fireEvent.change(textarea(), { target: { value: text } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(onSend.mock.calls[0]?.[0]).toBe(text);
+      expect(onSend.mock.calls[0]?.[1]).toHaveLength(1);
+      expect(screen.queryByTestId("goal-objective")).toBeNull();
+    },
+  );
+
+  it.each(["goal", "Goal"])("still offers a skill named %s mid-sentence", (name) => {
+    setComposerState({ skills: [{ name, description: "Track a goal" }] });
+    const { onSend, onSendSlashCommand } = renderGoalSession("polly-codex");
+
+    fireEvent.change(textarea(), { target: { value: "please /go" } });
+    expect(screen.getByText("Skills")).toBeVisible();
+    expect(screen.queryByText("Commands")).toBeNull();
+    expect(screen.getByTestId(`slash-menu-item-${name}`)).toHaveTextContent("Track a goal");
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+
+    expect(textarea()).toHaveValue(`please /${name} `);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("lets a multi-word skill starting with goal outrank the /goal built-in", () => {
+    // Same precedence as every built-in ("/Help Desk summarize" runs the skill),
+    // so a "goal fix" skill stays reachable in a Goal-enabled session.
+    setComposerState({ skills: [{ name: "goal fix", description: "Fix toward a goal" }] });
+    const { onSend, onSendSlashCommand } = renderGoalSession("polly-codex");
+
+    fireEvent.change(textarea(), { target: { value: "/goal fix CI" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith("goal fix", "CI");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["/goal", ""],
+    ["/goal Fix CI", "Fix CI"],
+  ])("runs a session skill named goal without goal control (%s)", (text, args) => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    setComposerState({
+      conversationId: "conv_plain",
+      skills: [{ name: "goal", description: "Track a goal" }],
+    });
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+
+    fireEvent.change(textarea(), { target: { value: `${text} ` } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith("goal", args);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Unknown command/)).toBeNull();
+  });
+
+  it("does not suggest /goal when the session has no goal control", () => {
+    useChatStore.setState({ conversationId: "conv_plain" });
+    render(<Composer {...composerProps()} />);
+
+    fireEvent.change(textarea(), { target: { value: "/go" } });
+
+    expect(screen.queryByText("/goal")).toBeNull();
+  });
 });
 
 describe("Composer slash-command menu", () => {
