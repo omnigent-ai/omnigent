@@ -402,13 +402,11 @@ export function WorkspaceUploadDropRoot({ children }: { children: ReactNode }) {
       className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
     >
       {children}
+      <span className="sr-only" role="status" aria-live="polite">
+        {active && context ? `Upload to ${context.dropDestination}` : ""}
+      </span>
       {active && target && context && (
-        <>
-          <span className="sr-only" role="status" aria-live="polite">
-            Upload to {context.dropDestination}
-          </span>
-          <WorkspaceUploadRootIndicator container={target} destination={context.dropDestination} />
-        </>
+        <WorkspaceUploadRootIndicator container={target} destination={context.dropDestination} />
       )}
     </div>
   );
