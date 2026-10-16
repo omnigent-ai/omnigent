@@ -14,6 +14,7 @@ retain configuration, fault injection and behavioral assertions.
 | Real host with isolated identity/home | `isolated_host` in [host.py](host.py) | [Host reconnect](../e2e/test_host_transient_404_restart.py) |
 | Per-user page, sync or async | `user_page`, `async_user_page` in [browser.py](browser.py) | [Permissions](../e2e_ui/collaboration/test_permissions_modal.py), [async readiness](../e2e_ui/chat/test_credentialless_host_harness_readiness.py) |
 | Native-wrapper session | `create_native_session` in [native_session.py](native_session.py) | [Native workspace](../e2e_ui/messages/test_native_codex_workspace_cwd.py) |
+| Hermetic stdio ACP agent process | `FAKE_ACP_AGENT_SCRIPT`, `FAKE_ACP_AGENT_REPLY` in [acp_agent.py](acp_agent.py) | [Files tab survives an ACP reply](../e2e_ui/files/test_files_tab_survives_acp_reply.py) |
 
 ## Session inputs stay explicit
 

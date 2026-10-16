@@ -1066,6 +1066,272 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
     assert captured["parent_os_env"] is agent_os_env
 
 
+class _TerminalLaunchCaptured(Exception):
+    """Raised by the fake registry once the terminal launch is recorded."""
+
+
+def _stub_goose_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.harnesses.goose_native.bridge as bridge
+    import omnigent.harnesses.goose_native.main as main
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "goose-bridge")
+    monkeypatch.setattr(main, "resolve_goose_executable", lambda: "goose")
+
+
+def _stub_hermes_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.harnesses.hermes_native.bridge as bridge
+    import omnigent.harnesses.hermes_native.main as main
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "hermes-bridge")
+    monkeypatch.setattr(main, "resolve_hermes_executable", lambda: "hermes")
+
+
+def _stub_kiro_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.harnesses.kiro_native.main as main
+
+    monkeypatch.setattr(kiro_native_bridge, "_BRIDGE_ROOT", tmp_path / "kiro-bridge")
+    monkeypatch.setattr(main, "resolve_kiro_executable", lambda **_kwargs: "kiro-cli")
+
+    async def _fake_launch_config(**_kwargs: Any) -> _KiroNativeLaunchConfig:
+        return _KiroNativeLaunchConfig(
+            workspace=tmp_path / "workspace",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._kiro_native_launch_config", _fake_launch_config)
+
+
+def _stub_devin_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.harnesses.devin_native.bridge as bridge
+    import omnigent.harnesses.devin_native.main as main
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "devin-bridge")
+    monkeypatch.setattr(main, "resolve_devin_executable", lambda **_kwargs: "devin")
+    monkeypatch.setattr(main, "resolve_devin_launch_model", lambda _model, _effort: None)
+
+
+def _stub_qwen_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.harnesses.qwen_native.bridge as bridge
+    import omnigent.harnesses.qwen_native.main as main
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "qwen-bridge")
+    monkeypatch.setattr(main, "resolve_qwen_executable", lambda: "qwen")
+
+
+def _stub_kimi_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.harnesses.kimi_native.bridge as bridge
+    import omnigent.harnesses.kimi_native.credentials as credentials
+    import omnigent.harnesses.kimi_native.main as main
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "kimi-bridge")
+    monkeypatch.setattr(main, "resolve_kimi_executable", lambda: "kimi")
+    monkeypatch.setattr(
+        credentials,
+        "build_kimi_session_home",
+        lambda session_home, **_kwargs: {"KIMI_CODE_HOME": str(session_home)},
+    )
+
+
+@pytest.mark.parametrize(
+    ("terminal_name", "builder_name", "stub_launch"),
+    [
+        ("goose", "_auto_create_goose_terminal", _stub_goose_launch),
+        ("hermes", "_auto_create_hermes_terminal", _stub_hermes_launch),
+        ("kiro", "_auto_create_kiro_terminal", _stub_kiro_launch),
+        ("devin", "_auto_create_devin_terminal", _stub_devin_launch),
+        ("qwen", "_auto_create_qwen_terminal", _stub_qwen_launch),
+        ("kimi", "_auto_create_kimi_terminal", _stub_kimi_launch),
+    ],
+    ids=["goose", "hermes", "kiro", "devin", "qwen", "kimi"],
+)
+@pytest.mark.asyncio
+async def test_auto_create_native_terminal_inherits_agent_sandbox(
+    terminal_name: str,
+    builder_name: str,
+    stub_launch: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Goose/hermes/kiro/devin/qwen/kimi auto-create honour the agent's ``os_env.sandbox``.
+
+    Same regression as the pi test above (#10262): these builders built the
+    terminal ``OSEnvSpec`` with no ``sandbox`` and passed no ``parent_os_env``,
+    so ``launch_required_terminal`` fell back to
+    ``_default_sandbox_for_platform`` (``linux_bwrap`` on Linux) and an agent
+    declaring ``os_env.sandbox.type: none`` failed to start on a host without
+    ``bwrap``.
+
+    The fake registry raises once it has recorded the launch, so the builders'
+    post-launch forwarder/relay startup never runs; only the launch spec is
+    under test.
+
+    :param terminal_name: Native terminal name, e.g. ``"hermes"``.
+    :param builder_name: ``omnigent.runner.app`` auto-create builder to call.
+    :param stub_launch: Stubs the builder's pre-launch dependencies.
+    :param tmp_path: Pytest-provided temporary directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner import app as runner_app
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda **_kwargs: None)
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=workspace,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+    stub_launch(tmp_path, monkeypatch)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec and parent os_env, then stops."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec + parent_os_env and end the builder here."""
+            del session_id, session_key, resource_role
+            captured["terminal_name"] = terminal_name
+            captured["spec"] = spec
+            captured["parent_os_env"] = parent_os_env
+            raise _TerminalLaunchCaptured
+
+    agent_os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(type="none"),
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name=f"{terminal_name}_code",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": f"{terminal_name}-native"},
+        ),
+        os_env=agent_os_env,
+    )
+
+    builder = getattr(runner_app, builder_name)
+    with pytest.raises(_TerminalLaunchCaptured):
+        await builder(
+            "5f0c2d7e9a8b4c6d8e1f2a3b4c5d6e7f",
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=None,
+            agent_spec=agent_spec,
+        )
+
+    assert captured["terminal_name"] == terminal_name
+    launched_sandbox = captured["spec"].os_env.sandbox
+    assert launched_sandbox is not None, (
+        "auto-create dropped the agent's sandbox; launch_required_terminal will "
+        "fall back to _default_sandbox_for_platform (bwrap), overriding sandbox: none"
+    )
+    assert launched_sandbox.type == "none"
+    assert captured["parent_os_env"] is agent_os_env
+
+
+@pytest.mark.parametrize("terminal_name", ["goose", "hermes", "kiro", "qwen"])
+@pytest.mark.asyncio
+async def test_native_launch_arms_resolve_agent_spec_for_terminal(
+    terminal_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The create-session and ensure arms hand goose/hermes/kiro/qwen the agent spec.
+
+    The builders can only inherit ``os_env.sandbox`` (#10262) if the launch
+    context carries ``agent_spec``. Before the fix these four harnesses were
+    missing from the create-session ``_launch_resolve_spec`` arm in
+    ``omnigent.runner.app`` and from the ensure ``build_context`` arm in
+    ``omnigent.runner.resource_routes``, so ``ctx.agent_spec`` stayed ``None``
+    on both paths and the terminal fell back to the platform-default sandbox.
+
+    :param terminal_name: Native terminal name, e.g. ``"hermes"``.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    agent_os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(type="none"),
+    )
+    native_spec = AgentSpec(
+        spec_version=1,
+        name=f"{terminal_name}_code",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": f"{terminal_name}-native"},
+        ),
+        os_env=agent_os_env,
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    launched_specs: list[Any] = []
+
+    async def _fake_launch(ctx: Any) -> SessionResourceView:
+        launched_specs.append(ctx.agent_spec)
+        return SessionResourceView(
+            id=f"terminal_{terminal_name}_main",
+            type="terminal",
+            session_id=ctx.session_id,
+            name=f"{terminal_name}:main",
+        )
+
+    monkeypatch.setattr(f"omnigent.runner.native._launch_{terminal_name}", _fake_launch)
+
+    session_id = "c4b1e6f2a9d84e0b8f3a7c5d2e1b9a60"
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "9a3f0c1e7b2d4e6f8a0b1c2d3e4f5a6b"},
+        )
+        assert created.status_code == 201, created.text
+        # The fake launch registers no terminal, so the ensure arm builds again.
+        ensured = await client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={
+                "terminal": terminal_name,
+                "session_key": "main",
+                "ensure_native_terminal": True,
+            },
+        )
+        assert ensured.status_code == 200, ensured.text
+
+    assert len(launched_specs) == 2, launched_specs
+    for launched_spec in launched_specs:
+        assert launched_spec is not None, "launch context carried no agent spec"
+        assert _agent_os_env_from_spec(launched_spec) is agent_os_env
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
 async def test_auto_create_claude_terminal_passes_session_effort(
