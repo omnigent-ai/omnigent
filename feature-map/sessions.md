@@ -258,7 +258,8 @@ a separate action that leaves the session connected.
 
 **Side-chat lifecycle:** use **Workspace → + → Side chat**, type `/side` in the
 parent composer, or choose **Start a new side chat** from the composer's add
-tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
+tray. Selecting assistant text also offers **Ask in side chat** unless the
+composer is read-only. On mobile,
 side chats open in a drawer; the header's **Conversation actions → Side
 chats** reopens it. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Sending to
@@ -278,7 +279,9 @@ side chat**. It appends a removable quote to the visible side-chat tab, includin
 an unsent tab, while keeping the draft. With no eligible tab visible, it opens a
 new unsent tab. In the desktop side-chat pane or mobile drawer, select transcript
 text and choose **Reply** to quote it in that chat's composer. Adding a quote
-does not send a message; enter a question and send when ready.
+does not send a message; enter a question and send when ready. A viewer whose
+composer is read-only (for example a Read grant) gets neither **Reply** nor
+**Ask in side chat** when selecting parent text.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -522,6 +525,9 @@ plain `uv run pytest`, which starts a private server for the test.
   checks pending/live tab reuse, draft preservation, and replies sent only to
   the child. Hide Workspace and repeat Ask in side chat to verify
   a new tab opens instead of changing the hidden draft.
+  `tests/e2e_ui/collaboration/test_sharing_journey.py::test_share_grant_downgrade_revoke_journey`
+  checks that an Edit collaborator is offered Reply on selected text and a
+  Read viewer is not.
 - **`side-chat-quotes`, mobile drawer Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_opens_in_a_drawer_on_mobile`
   checks that Reply stays on screen and the quoted follow-up reaches only the
@@ -680,7 +686,8 @@ plain `uv run pytest`, which starts a private server for the test.
   stays unbound.
 - Ask in side chat reuses only a visible, writable tab belonging to the current
   parent. Hidden, ended, and currently starting tabs are ineligible; another
-  selection opens a new unsent tab. Ended chats do not offer Reply.
+  selection opens a new unsent tab. Ended chats do not offer Reply, and a
+  read-only parent composer offers neither Reply nor Ask in side chat.
 - A phone-width browser run does not prove the mobile side-chat drawer in the
   embedded web app or the native apps. Both style the drawer only inside the
   app's own page area: placed outside it, the drawer stays off screen when
