@@ -2826,7 +2826,8 @@ def register_events_routes(
         native_terminal_ready = False
         initializer = getattr(request.app.state, "runner_session_initializer", None)
         if _runner_needs_session_init or (
-            _is_native_terminal_session(conv)
+            conv.runner_id is not None
+            and _is_native_terminal_session(conv)
             and initializer is not None
             and not initializer.is_initialized(conv, runner_client)
         ):
