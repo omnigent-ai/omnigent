@@ -945,7 +945,10 @@ class SandboxHostLauncher(SandboxLifecycle):
 
         :param sandbox_id: The sandbox from :meth:`provision`.
         :param token: The raw launch token the host authenticates with.
-        :param host_id: Server-chosen host identity, e.g. ``"host_a1b2c3d4..."``.
+        :param host_id: Host identity, e.g. ``"host_a1b2c3d4..."``, minted by the
+            server or chosen by a managed create's ``host_id``. The host must
+            register under exactly this id: *token* resolves only for it, and the
+            session's caller may already route by it.
         :param host_name: Server-chosen host display name, e.g.
             ``"managed-a1b2c3d4"``.
         :param server_url: URL of this server the host dials back to.

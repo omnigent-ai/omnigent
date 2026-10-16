@@ -9,6 +9,7 @@ import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -16,6 +17,7 @@ from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.entities.environment_filesystem import (
+    DirectoryNotEmpty,
     FilesystemPathNotFound,
     InvalidPath,
     PathUnreachable,
@@ -95,6 +97,117 @@ async def test_list_environment_root(
     names = {e["name"] for e in body["data"]}
     assert "hello.txt" in names
     assert "src" in names
+
+
+@pytest.mark.asyncio
+async def test_list_directory_enumeration_failure_returns_404(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def failed_enumeration(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"error": "Directory disappeared", "exit_code": 1}
+
+    monkeypatch.setattr(
+        "omnigent.runner.environment_filesystem._run_os_env_async", failed_enumeration
+    )
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/src"
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "path_not_found"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name_character", "name_length", "entry_count"),
+    [("x", 180, 500), ("é", 100, 200)],
+)
+async def test_large_directory_listing_pages_beyond_shell_output_limit(
+    tmp_path: Path, name_character: str, name_length: int, entry_count: int
+) -> None:
+    large = tmp_path / "large"
+    large.mkdir()
+    names = [f"{i:04d}-" + name_character * name_length + ".txt" for i in range(entry_count)]
+    for name in names:
+        (large / name).touch()
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+    found: list[str] = []
+    after: str | None = None
+    while True:
+        page = await fs.list_dir("large", limit=1000, after=after, order="asc")
+        found.extend(entry.name for entry in page.data)
+        if not page.has_more:
+            break
+        assert page.last_id is not None
+        assert page.last_id != after
+        after = page.last_id
+
+    assert found == names
+    assert len(found) == len(set(found))
+
+
+@pytest.mark.asyncio
+async def test_directory_listing_before_cursor_keeps_nearest_entries(tmp_path: Path) -> None:
+    for name in ("a.txt", "b.txt", "c.txt", "d.txt", "e.txt"):
+        (tmp_path / name).touch()
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    page = await fs.list_dir(limit=2, before="e.txt", order="asc")
+    assert [entry.name for entry in page.data] == ["c.txt", "d.txt"]
+    assert page.has_more is True
+    assert page.first_id == "c.txt"
+    assert page.last_id == "d.txt"
+
+
+@pytest.mark.asyncio
+async def test_directory_listing_descending_after_cursor(tmp_path: Path) -> None:
+    for name in ("a.txt", "b.txt", "c.txt", "d.txt", "e.txt"):
+        (tmp_path / name).touch()
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    first = await fs.list_dir(limit=2, order="desc")
+    assert [entry.name for entry in first.data] == ["e.txt", "d.txt"]
+    assert first.has_more is True
+
+    second = await fs.list_dir(limit=2, after=first.last_id, order="desc")
+    assert [entry.name for entry in second.data] == ["c.txt", "b.txt"]
+    assert second.has_more is True
+
+    last = await fs.list_dir(limit=2, after=second.last_id, order="desc")
+    assert [entry.name for entry in last.data] == ["a.txt"]
+    assert last.has_more is False
+
+
+@pytest.mark.asyncio
+async def test_directory_listing_rejects_truncated_helper_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    async def truncated_output(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"stdout": '[{"n": "partial"}\n[stdout truncated]', "exit_code": 0}
+
+    monkeypatch.setattr(
+        "omnigent.runner.environment_filesystem._run_os_env_async", truncated_output
+    )
+    with pytest.raises(RuntimeError, match="Invalid directory listing"):
+        await fs.list_dir()
 
 
 @pytest.mark.asyncio
@@ -361,6 +474,198 @@ async def test_delete_directory_recursive(
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
     assert not (workspace / "src").exists()
+
+
+_FS_URL = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+
+
+_IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+@pytest.fixture
+def outside(tmp_path: Path) -> Path:
+    """A directory beside the workspace holding entries deletes must not reach."""
+    out = tmp_path / "outside"
+    out.mkdir()
+    (out / "victim.txt").write_text("keep me")
+    (out / "nested").mkdir()
+    (out / "nested" / "keep.txt").write_text("keep me")
+    return out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "recursive"), [("link/victim.txt", False), ("link/nested", True)]
+)
+async def test_delete_through_symlinked_parent_leading_outside_is_refused(
+    client: httpx.AsyncClient, workspace: Path, outside: Path, target: str, recursive: bool
+) -> None:
+    (workspace / "link").symlink_to(outside, target_is_directory=True)
+
+    resp = await client.delete(f"{_FS_URL}/{target}", params={"recursive": recursive})
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_path"
+    assert str(outside) not in resp.text
+    assert (outside / "victim.txt").read_text() == "keep me"
+    assert (outside / "nested" / "keep.txt").read_text() == "keep me"
+
+
+@pytest.mark.asyncio
+async def test_delete_through_symlinked_parent_inside_workspace_still_works(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    (workspace / "current").symlink_to(workspace / "src", target_is_directory=True)
+
+    resp = await client.delete(f"{_FS_URL}/current/main.py")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["type"] == "file"
+    assert not (workspace / "src" / "main.py").exists()
+    assert (workspace / "current").is_symlink()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["outside_dir", "outside_file", "dangling"])
+async def test_delete_symlink_leaf_removes_only_the_link(
+    client_with_registry: httpx.AsyncClient, workspace: Path, outside: Path, target: str
+) -> None:
+    pointee = {
+        "outside_dir": outside,
+        "outside_file": outside / "victim.txt",
+        "dangling": outside / "missing",
+    }[target]
+    (workspace / "link").symlink_to(pointee)
+
+    resp = await client_with_registry.delete(f"{_FS_URL}/link")
+    changes = await client_with_registry.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deleted"] is True
+    assert resp.json()["type"] == "symlink"
+    assert not (workspace / "link").is_symlink()
+    assert (outside / "victim.txt").read_text() == "keep me"
+    assert {e["path"]: e["status"] for e in changes.json()["data"]}["link"] == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_delete_empty_directory_without_recursive(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    (workspace / "empty").mkdir()
+
+    resp = await client.delete(f"{_FS_URL}/empty")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["type"] == "directory"
+    assert not (workspace / "empty").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_missing_path_is_404(client: httpx.AsyncClient) -> None:
+    resp = await client.delete(f"{_FS_URL}/src/nope.py")
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "path_not_found"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(_IS_ROOT, reason="root bypasses permission checks")
+async def test_delete_refused_by_permissions_is_403(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    sealed = workspace / "sealed"
+    sealed.mkdir()
+    (sealed / "keep.txt").write_text("keep")
+    sealed.chmod(0o500)
+    try:
+        resp = await client.delete(f"{_FS_URL}/sealed/keep.txt")
+    finally:
+        sealed.chmod(0o700)
+
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "permission_denied"
+    assert (sealed / "keep.txt").read_text() == "keep"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(_IS_ROOT, reason="root reads any directory")
+async def test_delete_unlistable_nonempty_directory_is_not_treated_as_empty(
+    client: httpx.AsyncClient, workspace: Path, tmp_path: Path
+) -> None:
+    """Both routes refuse: the workspace one with an atomic rmdir, the
+    absolute one because a failed listing no longer counts as empty."""
+    locked_dirs = [workspace / "locked", tmp_path / "locked"]
+    for locked in locked_dirs:
+        locked.mkdir()
+        (locked / "data.txt").write_text("keep me")
+        locked.chmod(0o000)
+    try:
+        relative = await client.delete(f"{_FS_URL}/locked")
+        absolute = await client.delete(f"{_FS_URL}/%2F{str(tmp_path / 'locked').lstrip('/')}")
+    finally:
+        for locked in locked_dirs:
+            locked.chmod(0o700)
+
+    for resp in (relative, absolute):
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"]["code"] == "directory_not_empty"
+    for locked in locked_dirs:
+        assert (locked / "data.txt").read_text() == "keep me"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "helper_result",
+    [
+        {"error": "os_env helper exception: boom"},
+        {"error": "This environment does not support delete", "code": "unsupported"},
+        {},
+        {"deleted": "yes", "type": "file"},
+    ],
+)
+async def test_unconfirmed_workspace_delete_is_a_failure(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    helper_result: dict[str, object],
+) -> None:
+    async def unconfirmed(*args: object, **kwargs: object) -> dict[str, object]:
+        return helper_result
+
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._run_os_env_async", unconfirmed)
+
+    resp = await client.delete(f"{_FS_URL}/hello.txt")
+
+    assert resp.status_code == 500, resp.text
+    assert resp.json()["error"]["code"] == "resource_error"
+    assert (workspace / "hello.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_absolute_delete_without_exit_status_is_a_failure(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shell launch failure carries an error but no exit code."""
+    import omnigent.runner.environment_filesystem as efs
+
+    real = efs._run_os_env_async
+
+    async def rm_never_runs(method: Any, command: str, *args: Any, **kwargs: Any) -> Any:
+        if command.startswith("rm "):
+            return {"error": "Failed to run shell command: [Errno 12] Cannot allocate memory"}
+        return await real(method, command, *args, **kwargs)
+
+    monkeypatch.setattr(efs, "_run_os_env_async", rm_never_runs)
+    target = tmp_path / "absolute.txt"
+    target.write_text("still here")
+
+    resp = await client.delete(f"{_FS_URL}/%2F{str(target).lstrip('/')}")
+
+    assert resp.status_code == 500, resp.text
+    assert target.exists()
 
 
 # ── shell-injection regression for stat/_stat_via_shell/_check_dir_empty ──
@@ -675,6 +980,50 @@ async def test_download_under_real_sandbox_refuses_masked_file(
             assert plain.content == payload
     finally:
         os_env.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_type", _SANDBOX_BACKENDS)
+async def test_workspace_delete_under_real_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_type: str,
+) -> None:
+    """The helper's delete op runs inside the sandbox with the same results."""
+    ws = tmp_path / "workspace"
+    (ws / "full").mkdir(parents=True)
+    (ws / "full" / "a.txt").write_text("a")
+    (ws / "empty").mkdir()
+    (ws / "file.txt").write_text("x")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.txt").write_text("keep me")
+    (ws / "link").symlink_to(outside)
+    monkeypatch.setenv("PYTHONPATH", f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(
+                type=sandbox_type, read_paths=[str(_REPO_ROOT)], write_paths=[str(ws)]
+            ),
+        )
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+    try:
+        assert (await fs.delete("file.txt")).type == "file"
+        assert (await fs.delete("empty")).type == "directory"
+        with pytest.raises(DirectoryNotEmpty):
+            await fs.delete("full")
+        assert (await fs.delete("full", recursive=True)).type == "directory"
+        with pytest.raises(InvalidPath):
+            await fs.delete("link/victim.txt")
+        assert (await fs.delete("link")).type == "symlink"
+    finally:
+        os_env.close()
+    assert list(ws.iterdir()) == []
+    assert (outside / "victim.txt").read_text() == "keep me"
 
 
 @pytest.mark.asyncio

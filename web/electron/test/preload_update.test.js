@@ -25,6 +25,7 @@ function loadPreload() {
   };
   vm.runInNewContext(PRELOAD, {
     console,
+    process: { platform: "linux" },
     require: (specifier) => {
       assert.equal(specifier, "electron");
       return {
@@ -43,6 +44,22 @@ function loadPreload() {
     invokes,
   };
 }
+
+describe("browser action bridge", () => {
+  it("forwards typed actions to main", async () => {
+    const h = loadPreload();
+    const params = { ref: 2, text: "hello" };
+    await h.desktop.browserPerformAction("conversation", "type", params);
+    const { channel, args } = h.invokes.at(-1);
+    assert.equal(channel, "omnigent:browser-perform-action");
+    assert.equal(args.conversationId, "conversation");
+    assert.equal(args.action, "type");
+    assert.deepEqual(args.params, params);
+    await h.desktop.browserExecute("conversation", "legacy input");
+    assert.equal(h.invokes.at(-1).channel, "omnigent:browser-execute");
+    assert.equal(h.invokes.at(-1).args.js, "legacy input");
+  });
+});
 
 describe("server-page update bridge", () => {
   it("hides every shell-owned update prompt state, including download progress", async () => {

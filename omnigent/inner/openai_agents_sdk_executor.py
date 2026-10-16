@@ -17,8 +17,10 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
+import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass
 from types import ModuleType
@@ -26,9 +28,11 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 
 import httpx
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
 from omnigent.models import model_catalog
+from omnigent.process_logging import redact_log_text
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
@@ -407,6 +411,20 @@ def _ensure_agents_sdk() -> ModuleType:
         ) from exc
 
 
+def _normalize_databricks_host(host: str) -> str:
+    """Normalize a Databricks workspace host URL for equality comparison.
+
+    Strips scheme, trailing slash, and case so hosts from different
+    sources (env override vs. profile config) compare correctly.
+    """
+    normalized = host.strip().lower()
+    for prefix in ("https://", "http://"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    return normalized.rstrip("/")
+
+
 def _get_openai_async_client(
     profile: str | None = None,
     api_key: str | None = None,
@@ -478,10 +496,30 @@ def _get_openai_async_client(
                 "HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND."
             )
         host = host_override.rstrip("/")
+        gateway_auth: httpx.Auth
+        if IS_WINDOWS:
+            # The generated auth command is a POSIX sh script and Windows has no
+            # ``sh``; mint the profile's token in-process with the Databricks SDK.
+            if not profile:
+                raise OSError(
+                    "OpenAIAgentsSDKExecutor gateway auth on Windows requires a "
+                    "Databricks profile (no 'sh' available to run the auth command)."
+                )
+            from .databricks_executor import _resolve_databricks_auth
+
+            gateway_auth, resolved_host = _resolve_databricks_auth(profile)
+            if _normalize_databricks_host(resolved_host) != _normalize_databricks_host(host):
+                raise OSError(
+                    f"Databricks profile {profile!r} resolves to workspace host "
+                    f"{resolved_host!r}, which does not match the gateway host "
+                    f"{host_override!r}. Use a profile for the gateway's workspace."
+                )
+        else:
+            gateway_auth = _ShellCommandBearerAuth(databricks_auth_command)
         return AsyncOpenAI(
             base_url=base_url_override,
             api_key=_OPENAI_KEY_PLACEHOLDER,
-            http_client=httpx.AsyncClient(auth=_ShellCommandBearerAuth(databricks_auth_command)),
+            http_client=httpx.AsyncClient(auth=gateway_auth),
             **retry_kwargs,
         )
 
@@ -616,17 +654,35 @@ class _ShellCommandBearerAuth(httpx.Auth):
 
         :param request: The outgoing httpx request.
         :yields: The request with the auth header set.
-        :raises RuntimeError: When the command fails or prints no token.
+        :raises DatabricksAuthError: When ``sh`` is not on PATH or the command
+            fails or prints no token. Any other exception raised here is
+            collapsed by the OpenAI SDK into an opaque ``APIConnectionError``.
         """
+        from .databricks_executor import DatabricksAuthError
+
+        sh = shutil.which("sh")
+        if sh is None:
+            raise DatabricksAuthError(
+                "Databricks gateway auth command needs `sh` on PATH to mint a gateway "
+                "token, but no `sh` was found. Install a POSIX shell or add it to PATH."
+            )
         result = subprocess.run(
-            ["sh", "-c", self._command],
+            [sh, "-c", self._command],
             check=False,
             capture_output=True,
             text=True,
         )
         token = result.stdout.strip()
         if result.returncode != 0 or not token:
-            raise RuntimeError("Databricks auth command failed to return a bearer token.")
+            logger.error(
+                "Databricks gateway auth command failed (exit %d): %s",
+                result.returncode,
+                redact_log_text(result.stderr.strip()) or "<no stderr>",
+            )
+            raise DatabricksAuthError(
+                "Databricks gateway auth command failed to return a gateway token "
+                f"(exit {result.returncode}); its error output is in the harness log."
+            )
         request.headers["Authorization"] = f"Bearer {token}"
         yield request
 
@@ -1835,8 +1891,19 @@ class OpenAIAgentsSDKExecutor(Executor):
                     logger.error("OpenAIAgentsSDKExecutor: auth failed: %s", auth_msg)
                     yield ExecutorError(message=auth_msg)
                 else:
-                    logger.error("OpenAIAgentsSDKExecutor: run failed: %s", exc)
-                    yield ExecutorError(message=f"OpenAI Agents SDK error: {exc}")
+                    # The OpenAI SDK collapses any transport or auth-hook failure
+                    # into a bare "Connection error."; surface what caused it.
+                    # Cause type is safe for users; full (redacted) detail and
+                    # traceback go to the log only — never via raw exc_info.
+                    cause = exc.__cause__ or exc.__context__
+                    safe_detail = f"{exc} ({type(cause).__name__})" if cause else str(exc)
+                    log_detail = f"{exc} ({type(cause).__name__}: {cause})" if cause else str(exc)
+                    logger.error(
+                        "OpenAIAgentsSDKExecutor: run failed: %s\n%s",
+                        redact_log_text(log_detail),
+                        redact_log_text(traceback.format_exc()),
+                    )
+                    yield ExecutorError(message=f"OpenAI Agents SDK error: {safe_detail}")
                 return
             finally:
                 # If the outer generator was aclose'd before the

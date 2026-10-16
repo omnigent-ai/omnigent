@@ -2374,7 +2374,8 @@ async def test_close_reaps_the_agents_forked_children(tmp_path: Path) -> None:
 
     await ex._start_process()
     deadline = time.monotonic() + 10.0
-    while not pid_file.exists():
+    # write_text creates the file before it writes the pid, so wait for content.
+    while not (pid_file.exists() and pid_file.read_text()):
         assert time.monotonic() < deadline, "the fake agent never forked its child"
         await asyncio.sleep(0.05)
     grandchild = int(pid_file.read_text())

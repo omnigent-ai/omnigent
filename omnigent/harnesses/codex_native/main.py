@@ -71,6 +71,7 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.codex_native.forwarder import (
     _replay_dead_letters_before_resume,
+    codex_rollout_last_turn_model,
     supervise_forwarder,
 )
 from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
@@ -107,6 +108,7 @@ from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
 from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
+from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -1296,6 +1298,11 @@ async def _prepare_codex_terminal(
                     thread_id,
                     terminal_launch_args=codex_args,
                     cwd=Path.cwd(),
+                    model_provider=(
+                        codex_session_meta_model_provider(_codex_launch)
+                        if native_codex_launch_pins_model_provider(_codex_launch)
+                        else None
+                    ),
                     retain_client=codex_remote_resume_omits_permission_args(
                         app_server.codex_cli_version
                     ),
@@ -1850,6 +1857,10 @@ def _copy_rollout_with_cwd(
             dst.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
+class _CodexForkModelMismatchError(Exception):
+    """A fork's source rollout last ran on a model other than the fork's."""
+
+
 def _clone_codex_rollout(
     *,
     source_session_id: str,
@@ -1857,6 +1868,7 @@ def _clone_codex_rollout(
     target_thread_id: str,
     clone_codex_home: Path,
     clone_workspace: Path,
+    clone_model: str | None = None,
 ) -> Path | None:
     """
     Clone a source Codex rollout into the clone's own ``CODEX_HOME``.
@@ -1889,9 +1901,17 @@ def _clone_codex_rollout(
     :param clone_workspace: The resolved directory the clone will run in
         (its worktree or same dir). Written into the structural ``cwd``
         fields. Pass an already-resolved path.
+    :param clone_model: Model the clone launches on, e.g.
+        ``"system.ai.gpt-6-1-sol"``. When the source's last turn ran on a
+        different model, the clone is declined: Codex would first compact
+        the copied history on the source's model, and the fork would fail
+        whenever that model is unavailable (for example, over budget).
+        ``None`` skips the check.
     :returns: Path to the written clone rollout, or ``None`` when the ids
-        are unsafe or the source rollout can't be found on this host
-        (caller launches fresh in that case).
+        are unsafe or the source rollout can't be found on this host (the
+        caller rebuilds from Omnigent items or launches fresh).
+    :raises _CodexForkModelMismatchError: If the source's last turn used a
+        model other than *clone_model*; the caller must rebuild the history.
     :raises click.ClickException: If the source rollout is malformed.
     """
     if not _CODEX_THREAD_ID_RE.fullmatch(source_thread_id):
@@ -1902,6 +1922,17 @@ def _clone_codex_rollout(
     source = _find_codex_rollout(source_home, source_thread_id)
     if source is None:
         return None
+    if clone_model is not None:
+        from omnigent.models.codex_model_vocabulary import comparable_model_id
+
+        source_model = codex_rollout_last_turn_model(source)
+        if source_model is not None and comparable_model_id(source_model) != comparable_model_id(
+            clone_model
+        ):
+            raise _CodexForkModelMismatchError(
+                f"Codex rollout {source.name} last ran on {source_model}, "
+                f"but the fork launches on {clone_model}"
+            )
     # Preserve the source's ``sessions/<YYYY>/<MM>/<DD>/`` layout; only swap
     # the thread id embedded in the rollout filename so the clone lands in
     # its own CODEX_HOME under the assigned id.
@@ -2117,6 +2148,14 @@ class _CodexResumeHistoryUnavailableError(click.ClickException):
     """Server history is temporarily unavailable for Codex cold resume."""
 
 
+_CODEX_HISTORY_FETCH_ATTEMPTS = 3
+_CODEX_HISTORY_RETRY_MAX_DELAY_S = 10.0
+
+
+async def _codex_history_retry_sleep(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
 async def _fetch_all_session_items_for_codex_resume(
     client: httpx.AsyncClient,
     session_id: str,
@@ -2128,8 +2167,8 @@ async def _fetch_all_session_items_for_codex_resume(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :returns: Flat API item dicts from
         ``GET /v1/sessions/{id}/items``.
-    :raises _CodexResumeHistoryUnavailableError: If transport or server errors
-        prevent fetching an item page.
+    :raises _CodexResumeHistoryUnavailableError: If transport or server errors,
+        or persistent throttling, prevent fetching an item page.
     :raises click.ClickException: If the server rejects the request or returns
         an invalid page.
     """
@@ -2139,16 +2178,35 @@ async def _fetch_all_session_items_for_codex_resume(
         params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
         if after is not None:
             params["after"] = after
-        try:
-            resp = await client.get(
-                f"/v1/sessions/{url_component(session_id)}/items",
-                params=params,
+        for attempt in range(1, _CODEX_HISTORY_FETCH_ATTEMPTS + 1):
+            try:
+                resp = await client.get(
+                    f"/v1/sessions/{url_component(session_id)}/items",
+                    params=params,
+                )
+            except httpx.TransportError as exc:
+                raise _CodexResumeHistoryUnavailableError(
+                    f"Failed to fetch history for {session_id!r}: {exc}"
+                ) from exc
+            if resp.status_code != 429 or attempt == _CODEX_HISTORY_FETCH_ATTEMPTS:
+                break
+            delay = jittered_retry_delay(
+                resp,
+                backoff=0.5 * (2 ** (attempt - 1)),
+                max_delay=_CODEX_HISTORY_RETRY_MAX_DELAY_S,
             )
-        except httpx.TransportError as exc:
-            raise _CodexResumeHistoryUnavailableError(
-                f"Failed to fetch history for {session_id!r}: {exc}"
-            ) from exc
-        if resp.status_code >= 500:
+            if delay is None:
+                break
+            _logger.warning(
+                "Session history throttled for %r (attempt %d/%d); retrying in %.2fs",
+                session_id,
+                attempt,
+                _CODEX_HISTORY_FETCH_ATTEMPTS,
+                delay,
+                extra={"session_id": session_id},
+            )
+            await _codex_history_retry_sleep(delay)
+        if resp.status_code == 429 or resp.status_code >= 500:
             raise _CodexResumeHistoryUnavailableError(
                 f"Failed to fetch history for {session_id!r} "
                 f"({resp.status_code}): {error_text(resp)}"
@@ -2604,6 +2662,11 @@ def _codex_message_payload_from_session_item(item: _JsonObject) -> _JsonObject |
     return {"type": "message", "role": role, "content": content}
 
 
+# The Responses API rejects a function_call whose arguments exceed 1,048,576
+# characters, and a rebuilt thread replays every call; leave headroom.
+_MAX_REPLAYED_ARGUMENTS_CHARS = 900_000
+
+
 def _codex_function_call_payload_from_session_item(
     item: _JsonObject,
 ) -> _JsonObject | None:
@@ -2635,6 +2698,17 @@ def _codex_function_call_payload_from_session_item(
         raise click.ClickException(
             "Cannot synthesize Codex resume rollout: Omnigent function_call "
             f"{item_id!r} has non-string arguments."
+        )
+    if len(arguments) > _MAX_REPLAYED_ARGUMENTS_CHARS:
+        # An apply_patch mirror carries whole files for added or deleted ones. One
+        # oversized call would fail every request in the thread, so replay a stub.
+        _logger.warning(
+            "Replaying an oversized Codex function_call as a stub: name=%s chars=%d",
+            name,
+            len(arguments),
+        )
+        arguments = json.dumps(
+            {"omitted": f"{len(arguments)} characters of arguments, too large to replay"}
         )
     payload: _JsonObject = {
         "type": "function_call",

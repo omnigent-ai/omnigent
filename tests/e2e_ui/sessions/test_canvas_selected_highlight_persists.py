@@ -57,6 +57,9 @@ def test_clicked_card_keeps_selected_highlight_across_live_updates(
     expect(page.get_by_role("status", name="Loading sessions")).to_have_count(0)
 
     target_card.click()
+    # Opening the session narrows the canvas and keeps the viewport, so with a
+    # long session list cards can fall off-screen (and stop rendering). Refit.
+    page.get_by_role("button", name="Fit view").click()
     target_node = page.locator(".react-flow__node").filter(has_text="Canvas highlight target")
     expect(target_node).to_have_class(SELECTED_NODE_CLASS)
     expect(target_card).to_have_class(SELECTED_CARD_CLASS)

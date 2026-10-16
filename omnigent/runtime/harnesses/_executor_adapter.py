@@ -1171,7 +1171,10 @@ class ExecutorAdapter(HarnessApp):
         """
         from omnigent.errors import OmnigentError
         from omnigent.inner.model_auth import ProviderAuthRequired
-        from omnigent.runner.launch_failure import diagnose_client_update_required
+        from omnigent.runner.launch_failure import (
+            diagnose_client_update_required,
+            diagnose_model_unavailable,
+        )
         from omnigent.server.schemas import ErrorDetail
 
         if isinstance(exception, ProviderAuthRequired):
@@ -1213,6 +1216,12 @@ class ExecutorAdapter(HarnessApp):
                 cause=diagnosis.cause,
                 remediation=diagnosis.remediation,
             )
+
+        # Preserve the failure metadata; add only the recovery guidance.
+        model_diagnosis = diagnose_model_unavailable(message)
+        if model_diagnosis is not None:
+            detail = super()._build_error_detail(exception)
+            return detail.model_copy(update={"remediation": model_diagnosis.remediation})
 
         return super()._build_error_detail(exception)
 

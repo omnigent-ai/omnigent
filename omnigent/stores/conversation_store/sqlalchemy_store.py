@@ -1453,6 +1453,31 @@ class SqlAlchemyConversationStore(ConversationStore):
                 result[parent_id].append(child_id)
         return result
 
+    def list_child_conversation_ids_page(
+        self,
+        parent_conversation_id: str,
+        *,
+        after: tuple[int, str] | None = None,
+        limit: int = 128,
+    ) -> list[tuple[str, int]]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        stmt = select(SqlConversation.id, SqlConversation.created_at).where(
+            SqlConversation.workspace_id == current_workspace_id(),
+            SqlConversation.parent_conversation_id == parent_conversation_id,
+        )
+        if after is not None:
+            stmt = stmt.where(tuple_(SqlConversation.created_at, SqlConversation.id) < after)
+        with self._conv_session("list_child_conversation_ids_page") as ap_sess:
+            return [
+                (child_id, created_at)
+                for child_id, created_at in ap_sess.execute(
+                    stmt.order_by(
+                        desc(SqlConversation.created_at), desc(SqlConversation.id)
+                    ).limit(limit)
+                ).all()
+            ]
+
     def set_labels(
         self,
         conversation_id: str,
@@ -4488,7 +4513,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         columns (``external_session_id``, ``workspace``,
         ``git_branch``) are deliberately NOT copied — a fork is a
         fresh session that re-binds those on its own launch. Source
-        labels are copied EXCEPT instance-scoped ones
+        ``workspace_missing`` errors become notices about that old binding.
+        Labels are copied EXCEPT instance-scoped ones
         (:data:`_INSTANCE_SCOPED_LABEL_KEYS` — native bridge ids,
         context metrics), which belong to the source's running instance
         and would mis-route or mis-display on the clone.
@@ -4789,15 +4815,53 @@ class SqlAlchemyConversationStore(ConversationStore):
                 src_item.id: generate_item_id(decode_item_type(src_item.type))
                 for src_item in source_items
             }
-            # Copied rows reuse the source's already-encoded payload bytes (the
-            # encode transform depends only on item data); only payloads that
-            # embed an id needing remapping change (compaction boundary item
-            # ids, session-scoped file references), each remapped via one
-            # batch decode + one batch encode so a store whose encode is a
-            # per-call RPC never pays one round-trip per copied item.
-            # Preparation happens here, before the insert transaction, so a
-            # CockroachDB 40001 replay repeats SQL only — never ID generation
-            # or the encode/decode hooks.
+
+            # A fork binds its own workspace. Keep the source diagnosis as a
+            # historical notice, preserving item order and compaction cursors.
+            error_positions = [
+                pos
+                for pos, item in enumerate(source_items)
+                if decode_item_type(item.type) == "error"
+            ]
+            remapped_error_data: dict[int, str] = {}
+            remapped_error_search_text: dict[int, str | None] = {}
+            if error_positions:
+                decoded_errors = self._decode_item_data_batch(
+                    [source_items[pos].data for pos in error_positions]
+                )
+                changed_positions: list[int] = []
+                changed_errors: list[str] = []
+                for pos, payload in zip(error_positions, decoded_errors, strict=True):
+                    error_data = json.loads(payload)
+                    if error_data.get("code") != ErrorCode.WORKSPACE_MISSING:
+                        continue
+                    error_data.update(
+                        code="source_workspace_missing",
+                        level="info",
+                        title="The original session’s workspace was unavailable.",
+                        cause=None,
+                        remediation=None,
+                    )
+                    changed_positions.append(pos)
+                    changed_errors.append(json.dumps(error_data))
+                    remapped_error_search_text[pos] = self._item_search_text(
+                        NewConversationItem(
+                            type="error",
+                            response_id=source_items[pos].response_id,
+                            data=parse_item_data("error", error_data),
+                        )
+                    )
+                if changed_errors:
+                    remapped_error_data = dict(
+                        zip(
+                            changed_positions,
+                            self._encode_item_data_batch(changed_errors),
+                            strict=True,
+                        )
+                    )
+            # Payload rewrites use batch codecs before the insert transaction;
+            # a CockroachDB retry repeats SQL only. Unchanged payloads reuse
+            # their stored encoding, avoiding per-item codec round-trips.
             compaction_positions = [
                 pos
                 for pos, src_item in enumerate(source_items)
@@ -4860,10 +4924,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             prepared_item_rows: list[dict[str, Any]] = []
             fts_rows: list[tuple[str, str, str]] = []
             for pos, src_item in enumerate(source_items):
-                # src_item.type/status/data are copied verbatim to the new row;
-                # only compaction payloads (embedded item id) and file-
-                # referencing payloads (mapped file ids) are rewritten.
+                # Rewrite referenced IDs and historical workspace notices;
+                # other payloads are copied verbatim.
                 new_item_id = copied_item_ids[src_item.id]
+                search_text = remapped_error_search_text.get(pos, src_item.search_text)
                 # Forked items keep the source item's original timestamp
                 # (#6924); only the conversation row itself is stamped `now`.
                 prepared_item_rows.append(
@@ -4878,13 +4942,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "position": pos,
                         "type": src_item.type,
                         "data": remapped_compaction_data.get(
-                            pos, remapped_file_data.get(pos, src_item.data)
+                            pos,
+                            remapped_file_data.get(
+                                pos, remapped_error_data.get(pos, src_item.data)
+                            ),
                         ),
-                        "search_text": src_item.search_text,
+                        "search_text": search_text,
                         "created_by": src_item.created_by,
                     }
                 )
-                fts_rows.append((new_item_id, new_conv_id, src_item.search_text or ""))
+                fts_rows.append((new_item_id, new_conv_id, search_text or ""))
 
             # The clone copied len(source_items) items at dense positions
             # 0..N-1, so its position allocator starts at N. Seed it from the
@@ -4924,6 +4991,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # user's pin key along as dead data, and inheriting the repo labels
             # would re-clone the source's repos even into a fork asked for empty.
             source_labels = _fetch_labels(session, source_conversation_id)
+            source_workspace_missing = (
+                source_labels.get("omnigent.last_task_error_code") == ErrorCode.WORKSPACE_MISSING
+            )
             fork_labels = {
                 key: value
                 for key, value in source_labels.items()
@@ -4935,6 +5005,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
+                and not (source_workspace_missing and key.startswith("omnigent.last_task_error_"))
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
             source_ext_session = source_meta_ref.external_session_id if source_meta_ref else None

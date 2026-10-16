@@ -1,4 +1,4 @@
-import { createRef, type FormEvent, type ReactNode } from "react";
+import { createRef, useState, type FormEvent, type ReactNode } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -9,6 +9,137 @@ import {
 } from "./ChatComposer";
 
 describe("ChatComposer", () => {
+  function renderEditor(initial: string, submitWithModEnter = false) {
+    const onKeyDown = vi.fn();
+    function Editor() {
+      const [value, setValue] = useState(initial);
+      return (
+        <ChatComposer
+          keyboard={{ submitWithModEnter, preventsKeyboardSubmit: false }}
+          input={{
+            "aria-label": "Draft",
+            value,
+            onChange: (event) => setValue(event.target.value),
+            onKeyDown,
+          }}
+          actions={{ leading: null, trailing: null }}
+        />
+      );
+    }
+    render(<Editor />);
+    return { input: screen.getByRole("textbox") as HTMLTextAreaElement, onKeyDown };
+  }
+
+  function caretToEnd(input: HTMLTextAreaElement) {
+    input.setSelectionRange(input.value.length, input.value.length);
+  }
+
+  it.each([
+    ["1.", "  1. "],
+    ["2)", "  2) "],
+    ["-", "  - "],
+    ["*", "  * "],
+  ])("indents %s when typed with a space and keeps the Markdown marker", (marker, expected) => {
+    const { input } = renderEditor(marker);
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: " " });
+    expect(input).toHaveValue(expected);
+  });
+
+  it("leaves markers after other text alone", () => {
+    const { input } = renderEditor("Step 1.");
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: " " });
+    expect(input).toHaveValue("Step 1.");
+  });
+
+  it("increments numbered lists with Shift+Enter", () => {
+    const { input, onKeyDown } = renderEditor("  9. First item");
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    expect(input).toHaveValue("  9. First item\n  10. ");
+    expect(onKeyDown).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ shouldSubmitFromKeyboard: false }),
+    );
+  });
+
+  it.each(["-", "*", "•"])("continues %s bullets with the same marker", (marker) => {
+    const { input } = renderEditor(`  ${marker} First item`);
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    expect(input).toHaveValue(`  ${marker} First item\n  ${marker} `);
+  });
+
+  it("ends a list when Shift+Enter follows an empty marker", () => {
+    const { input } = renderEditor("- First item\n- ");
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    expect(input).toHaveValue("- First item\n");
+  });
+
+  it("preserves the unselected marker when Shift+Enter replaces a selected list body", () => {
+    const { input } = renderEditor("- selected text");
+    input.setSelectionRange(2, input.value.length);
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    expect(input).toHaveValue("- \n- ");
+    expect(input.selectionStart).toBe(5);
+    expect(input.selectionEnd).toBe(5);
+  });
+
+  it("leaves list continuation to a route handler that prevents Shift+Enter", () => {
+    const { input, onKeyDown } = renderEditor("- First item");
+    onKeyDown.mockImplementation((event) => event.preventDefault());
+    caretToEnd(input);
+    expect(fireEvent.keyDown(input, { key: "Enter", shiftKey: true })).toBe(false);
+    expect(onKeyDown).toHaveBeenCalledOnce();
+    expect(input).toHaveValue("- First item");
+  });
+
+  it("ignores Enter and Space while an IME composition is active", () => {
+    const { input } = renderEditor("  1. 日本", true);
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    expect(input).toHaveValue("  1. 日本");
+    fireEvent.change(input, { target: { value: "-" } });
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: " ", isComposing: true });
+    expect(input).toHaveValue("-");
+  });
+
+  it("submits a list on plain Enter with the default shortcut", () => {
+    const { input, onKeyDown } = renderEditor("  1. First item");
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(input).toHaveValue("  1. First item");
+    expect(onKeyDown).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ shouldSubmitFromKeyboard: true }),
+    );
+  });
+
+  it("continues a list on plain Enter when Mod+Enter is the send shortcut", () => {
+    const { input, onKeyDown } = renderEditor("  1. First item", true);
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(input).toHaveValue("  1. First item\n  2. ");
+    expect(onKeyDown).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ shouldSubmitFromKeyboard: false }),
+    );
+  });
+
+  it("sends on Mod+Enter without continuing the list", () => {
+    const { input, onKeyDown } = renderEditor("  1. First item", true);
+    caretToEnd(input);
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+    expect(input).toHaveValue("  1. First item");
+    expect(onKeyDown).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ shouldSubmitFromKeyboard: true }),
+    );
+  });
+
   it("keeps route-owned input and submit handlers on the shared surface", () => {
     const onChange = vi.fn();
     const onSubmit = vi.fn((event: FormEvent) => event.preventDefault());

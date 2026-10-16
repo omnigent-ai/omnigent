@@ -1371,7 +1371,10 @@ describe("model picker hotkey", () => {
     // Lands directly on the selected harness's edit submenu (Models / Effort),
     // not just the harness list.
     expect(await screen.findByTestId("new-chat-landing-agent-models")).toBeVisible();
-    const selectedModel = screen.getByRole("menuitemcheckbox", { name: "Harness default" });
+    const selectedModel = within(screen.getByTestId("new-chat-landing-agent-models")).getByRole(
+      "menuitemcheckbox",
+      { name: "Default" },
+    );
     await waitFor(() => expect(selectedModel).toHaveFocus());
     await user.keyboard("{ArrowDown}");
     const nextModel = screen.getByRole("menuitemcheckbox", { name: "Opus 4.8" });
@@ -1390,7 +1393,11 @@ describe("model picker hotkey", () => {
     expect(screen.getByRole("menuitem", { name: "Claude Code" })).toHaveFocus();
     fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
     await waitFor(() =>
-      expect(screen.getByRole("menuitemcheckbox", { name: "Harness default" })).toHaveFocus(),
+      expect(
+        within(screen.getByTestId("new-chat-landing-agent-models")).getByRole("menuitemcheckbox", {
+          name: "Default",
+        }),
+      ).toHaveFocus(),
     );
   });
 });
@@ -2858,6 +2865,8 @@ describe("Run on this machine (desktop host enrollment)", () => {
     const userAgent = vi
       .spyOn(navigator, "userAgent", "get")
       .mockReturnValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)");
+    // An unrelated stopped host is hidden and must not replace the action with a notice.
+    mockHosts([host("offline", 2)]);
     renderLanding();
     await act(async () => {});
     await openHostMenu();
@@ -2866,6 +2875,10 @@ describe("Run on this machine (desktop host enrollment)", () => {
     expect(item).toHaveTextContent("This Mac");
     expect(within(item).getByTestId("new-chat-landing-use-this-machine")).toHaveTextContent(
       "Use this machine",
+    );
+    expect(screen.queryByTestId("new-chat-landing-host-host_2")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-host-menu")).not.toHaveTextContent(
+      "No hosts online.",
     );
     userAgent.mockRestore();
   });
@@ -2883,6 +2896,7 @@ describe("Run on this machine (desktop host enrollment)", () => {
   it("shows Use this machine on a known local host after it disconnects", async () => {
     mockHosts([
       { host_id: "this-machine", name: "jackson-laptop", owner: "me", status: "offline" },
+      host("offline", 2),
     ]);
     renderLanding();
     await act(async () => {});
@@ -2894,6 +2908,13 @@ describe("Run on this machine (desktop host enrollment)", () => {
     expect(screen.getByTestId("new-chat-landing-use-this-machine")).toHaveTextContent(
       "Use this machine",
     );
+    // The reconnect action stays outside the collapsed offline group.
+    expect(screen.queryByTestId("new-chat-landing-host-host_2")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Offline hosts (1)" }));
+    expect(
+      within(screen.getByRole("group", { name: "Offline hosts" })).getAllByRole("menuitem"),
+    ).toHaveLength(1);
+    expect(screen.getAllByTestId("new-chat-landing-run-on-this-machine")).toHaveLength(1);
   });
 
   it("hides Use this machine while the local host is connected", async () => {
@@ -2965,7 +2986,10 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     vi.mocked(isElectronShell).mockReturnValue(true);
     vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: false, hostId: null });
     vi.mocked(onHostStatusChanged).mockReturnValue(() => {});
-    vi.mocked(getDesktopFeatures).mockResolvedValue({ databricksInternalFeatures: true });
+    vi.mocked(getDesktopFeatures).mockResolvedValue({
+      databricksInternalFeatures: true,
+      arcaPreviewRecovery: true,
+    });
     vi.mocked(connectArcaHost).mockClear();
     vi.mocked(fetchHosts).mockClear();
   });
@@ -2999,7 +3023,7 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
   });
 
-  it("offers reconnect after relaunch while preserving the remembered online host row", async () => {
+  it("hides Run on Arca while preserving the remembered online host row", async () => {
     // The row is recognized by the host id remembered at connect time — a
     // host's name (machine hostname) is deliberately not matched against
     // anything from `arca status`.
@@ -3010,16 +3034,26 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
 
     const row = await screen.findByTestId("new-chat-landing-host-arca-1");
     expect(row.textContent).toContain("Arca instance");
-    expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
-      "Reconnect to Arca",
-    );
+    expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
     fireEvent.click(row);
     await waitFor(() => expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1"));
   });
 
+  it("keeps Run on Arca visible in an older shell without preview recovery", async () => {
+    vi.mocked(getDesktopFeatures).mockResolvedValue({ databricksInternalFeatures: true });
+    localStorage.setItem("omnigent:arca-host-id", "arca-1");
+    mockHosts([{ host_id: "arca-1", name: "remote-box", owner: "me", status: "online" }]);
+    renderLanding();
+    await openHostMenu();
+
+    expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
+      /^Run on Arca$/,
+    );
+  });
+
   it("recaptures an already-running host through the same reconnect action", async () => {
     localStorage.setItem("omnigent:arca-host-id", "actual-arca");
-    mockHosts([{ host_id: "actual-arca", name: "remote-box", owner: "me", status: "online" }]);
+    mockHosts([{ host_id: "actual-arca", name: "remote-box", owner: "me", status: "offline" }]);
     vi.mocked(connectArcaHost).mockResolvedValue({
       ok: true,
       alreadyRunning: true,
@@ -3027,7 +3061,7 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     });
     renderLanding();
     await openHostMenu();
-    fireEvent.click(await screen.findByText("Reconnect to Arca"));
+    fireEvent.click(await screen.findByText("Run on Arca"));
     await waitFor(() =>
       expect(localStorage.getItem("omnigent:last-host-choice")).toBe("actual-arca"),
     );
@@ -3038,7 +3072,7 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
   it("keeps reconnect usable after a console failure without changing host selection", async () => {
     localStorage.setItem("omnigent:arca-host-id", "arca-1");
     localStorage.setItem("omnigent:last-host-choice", "arca-1");
-    mockHosts([{ host_id: "arca-1", name: "remote-box", owner: "me", status: "online" }]);
+    mockHosts([{ host_id: "arca-1", name: "remote-box", owner: "me", status: "offline" }]);
     vi.mocked(connectArcaHost).mockResolvedValue({
       ok: false,
       shownInConsole: true,
@@ -3046,20 +3080,40 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     });
     renderLanding();
     await openHostMenu();
-    fireEvent.click(await screen.findByText("Reconnect to Arca"));
+    fireEvent.click(await screen.findByText("Run on Arca"));
     await waitFor(() => expect(connectArcaHost).toHaveBeenCalledTimes(1));
     await openHostMenu();
-    fireEvent.click(await screen.findByText("Reconnect to Arca"));
+    fireEvent.click(await screen.findByText("Run on Arca"));
     await waitFor(() => expect(connectArcaHost).toHaveBeenCalledTimes(2));
     expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1");
   });
+
+  it.each(["missing", "offline"] as const)(
+    "shows Run on Arca when the remembered host is %s",
+    async (status) => {
+      localStorage.setItem("omnigent:arca-host-id", "arca-1");
+      mockHosts(
+        status === "missing"
+          ? []
+          : [{ host_id: "arca-1", name: "remote-box", owner: "me", status }],
+      );
+      renderLanding();
+      await openHostMenu();
+
+      expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
+        /^Run on Arca$/,
+      );
+      // A stopped instance is reached through Run on Arca, not a dead Cloud row.
+      expect(screen.queryByTestId("new-chat-landing-host-arca-1")).toBeNull();
+    },
+  );
 
   it("shows a plain Run on Arca item (no status line) while not connected", async () => {
     renderLanding();
     await openHostMenu();
 
     const item = await screen.findByTestId("new-chat-landing-run-on-arca");
-    expect(item.textContent).toContain("Run on Arca");
+    expect(item).toHaveTextContent(/^Run on Arca$/);
     expect(screen.queryByTestId("new-chat-landing-arca-subtitle")).toBeNull();
   });
 
@@ -3230,7 +3284,7 @@ describe("NewChatLandingScreen", () => {
         RECENT_KEY,
         JSON.stringify({ host_1: ["/Users/corey/repo"], host_2: ["/work/repo"] }),
       );
-      mockHosts([host("online", 1), host("offline", 2)]);
+      mockHosts([host("online", 1), host("offline", 2), host("offline", 3)]);
       renderLanding({ managed_sandboxes_enabled: managedSandboxesEnabled });
 
       const chip = screen.getByTestId("new-chat-landing-host-chip");
@@ -3251,11 +3305,124 @@ describe("NewChatLandingScreen", () => {
         "data-active",
         "true",
       );
+      // The remembered host stays visible without also appearing in the offline group.
+      expect(screen.queryByTestId("new-chat-landing-host-host_3")).toBeNull();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Offline hosts (1)" }));
+      expect(
+        within(screen.getByRole("group", { name: "Offline hosts" })).getAllByRole("menuitem"),
+      ).toHaveLength(1);
+      expect(screen.getAllByTestId("new-chat-landing-host-host_2")).toHaveLength(1);
+      expect(screen.getByTestId("new-chat-landing-host-host_1")).not.toHaveAttribute(
+        "aria-disabled",
+      );
       fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
       await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
       expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_1");
     },
   );
+
+  it("keeps offline hosts collapsed and reveals them five at a time", async () => {
+    mockHosts([
+      host("online", 1),
+      // API recency order deliberately differs from name/id order.
+      ...[4, 2, 8, 3, 6, 7, 5, 10, 9, 12, 13, 11].map((i) => host("offline", i)),
+    ]);
+    renderLanding();
+
+    const chip = screen.getByTestId("new-chat-landing-host-chip");
+    await waitFor(() => expect(chip).toHaveAccessibleName(/, Online$/));
+    fireEvent.pointerDown(chip, { button: 0 });
+    const toggle = screen.getByRole("menuitem", { name: "Offline hosts (12)" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("new-chat-landing-host-host_2")).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const offline = screen.getByRole("group", { name: "Offline hosts" });
+    expect(within(offline).getAllByRole("menuitem")).toHaveLength(5);
+    expect(
+      within(offline)
+        .getAllByRole("menuitem")
+        .map((row) => row.getAttribute("data-testid")),
+    ).toEqual([4, 2, 8, 3, 6].map((i) => `new-chat-landing-host-host_${i}`));
+    expect(screen.getByTestId("new-chat-landing-host-host_2")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(screen.queryByTestId("new-chat-landing-host-host_7")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Show more (7 remaining)" }));
+    expect(within(offline).getAllByRole("menuitem")).toHaveLength(10);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Show more (2 remaining)" }));
+    expect(within(offline).getAllByRole("menuitem")).toHaveLength(12);
+    expect(screen.queryByRole("menuitem", { name: /Show more/ })).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(screen.queryByRole("group", { name: "Offline hosts" })).toBeNull();
+    fireEvent.click(toggle);
+    expect(
+      within(screen.getByRole("group", { name: "Offline hosts" })).getAllByRole("menuitem"),
+    ).toHaveLength(5);
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+    fireEvent.pointerDown(chip, { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Offline hosts (12)" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it.each([
+    {
+      name: "no hosts",
+      hosts: [] as Host[],
+      chip: /No host selected/,
+      text: "No hosts connected yet.",
+    },
+    {
+      name: "every host offline",
+      hosts: [host("offline", 1), host("offline", 2)],
+      chip: /No host selected/,
+      text: "No hosts online.",
+    },
+    {
+      name: "only a cloud host",
+      hosts: [
+        { host_id: "cloud-1", name: "team-cloud-box", owner: "me", status: "online" },
+      ] as Host[],
+      chip: /, Online$/,
+      text: "No hosts connected yet.",
+    },
+  ])(
+    "explains an empty My machines list ($name) instead of listing dead rows",
+    async ({ hosts, chip: chipName, text }) => {
+      mockHosts(hosts);
+      renderLanding();
+
+      const chip = screen.getByTestId("new-chat-landing-host-chip");
+      await waitFor(() => expect(chip).toHaveAccessibleName(chipName));
+      fireEvent.pointerDown(chip, { button: 0 });
+      const menu = screen.getByTestId("new-chat-landing-host-menu");
+      expect(menu.querySelectorAll('[data-testid^="new-chat-landing-host-host_"]')).toHaveLength(0);
+      expect(menu).toHaveTextContent(text);
+    },
+  );
+
+  it("keeps the My machines notice when only a cloud host is online", async () => {
+    mockHosts([
+      { host_id: "cloud-1", name: "team-cloud-box", owner: "me", status: "online" },
+      host("offline", 2),
+    ]);
+    renderLanding();
+
+    const chip = screen.getByTestId("new-chat-landing-host-chip");
+    await waitFor(() =>
+      expect(chip).toHaveAccessibleName(/^Host: (This machine|team-cloud-box), Online$/),
+    );
+    fireEvent.pointerDown(chip, { button: 0 });
+    const menu = screen.getByTestId("new-chat-landing-host-menu");
+    expect(screen.getByTestId("new-chat-landing-host-cloud-1")).toBeVisible();
+    expect(screen.queryByTestId("new-chat-landing-host-host_2")).toBeNull();
+    expect(menu).toHaveTextContent("No hosts online.");
+  });
 
   it.each(["offline", "missing"])(
     "blocks creation when the selected host becomes %s and recovers when it returns",
@@ -3283,6 +3450,65 @@ describe("NewChatLandingScreen", () => {
       );
     },
   );
+
+  it.each([
+    {
+      state: "an online host",
+      remembered: "host_2",
+      hosts: [host("online", 1), host("online", 2)],
+      info: {},
+      rows: ["Host: machine-2", "Status: Connected"],
+    },
+    {
+      state: "an offline host",
+      remembered: "host_2",
+      hosts: [host("online", 1), host("offline", 2)],
+      info: {},
+      rows: ["Host: machine-2", "Status: Disconnected"],
+    },
+    {
+      state: "a sandbox",
+      remembered: null,
+      hosts: [host("online", 1)],
+      info: { managed_sandboxes_enabled: true },
+      rows: ["Host: New Sandbox", "Status: Starts when you send"],
+    },
+  ])(
+    "names $state and its connection in the host chip tooltip",
+    async ({ remembered, hosts, info, rows }) => {
+      if (remembered) localStorage.setItem("omnigent:last-host-choice", remembered);
+      mockHosts(hosts);
+      renderLanding(info);
+
+      fireEvent.focus(screen.getByTestId("new-chat-landing-host-chip"));
+      await waitFor(() => {
+        const tooltip = screen.getByTestId("new-chat-landing-host-tooltip");
+        for (const row of rows) expect(tooltip).toHaveTextContent(row);
+      });
+      const tooltip = screen.getByTestId("new-chat-landing-host-tooltip");
+      // Same surface and bold keys as the agent pill's tooltip, sized to its text.
+      expect(tooltip).toHaveClass("bg-popover", "text-popover-foreground", "w-max", "max-w-64");
+      expect(tooltip).not.toHaveClass("w-64");
+      for (const key of within(tooltip).getAllByText(/^(Host|Status):$/)) {
+        expect(key).toHaveClass("font-semibold");
+      }
+    },
+  );
+
+  it("names no host in the host chip tooltip when the remembered host is gone", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    mockHosts([host("online", 1)]);
+    renderLanding();
+
+    const chip = screen.getByTestId("new-chat-landing-host-chip");
+    await waitFor(() =>
+      expect(chip).toHaveAccessibleName(expect.stringContaining("No host selected")),
+    );
+    fireEvent.focus(chip);
+    const tooltip = await screen.findByTestId("new-chat-landing-host-tooltip");
+    expect(tooltip).toHaveTextContent("Host: None");
+    expect(tooltip).not.toHaveTextContent("Status:");
+  });
 
   it("uses a home-specific focus shadow without a resting shadow or focus border", () => {
     renderLanding();
@@ -3413,7 +3639,8 @@ describe("NewChatLandingScreen", () => {
       "md:h-7",
     );
     expect(hostChip).toHaveClass("justify-center");
-    expect(hostChip).toHaveAttribute("title", "Host: This machine, Online");
+    expect(hostChip).toHaveAccessibleName("Host: This machine, Online");
+    expect(hostChip).not.toHaveAttribute("title");
     expect(permission).toHaveClass(
       "h-8",
       "w-auto",
@@ -3672,6 +3899,53 @@ describe("NewChatLandingScreen", () => {
     }
 
     it.each([false, true])(
+      "waits for the new workspace's worktree discovery before starting with a drafted branch (auto-seeded: %s)",
+      async (autoSeeded) => {
+        let nextDiscovered = false;
+        useHostWorktreesMock.mockImplementation(
+          (_host, path) =>
+            (path === nextWorkspace && !nextDiscovered
+              ? { ...PENDING_QUERY_STATE, data: undefined }
+              : {
+                  ...SUCCESS_QUERY_STATE,
+                  data:
+                    path === gitWorkspace || path === nextWorkspace
+                      ? [{ ...mainWorktree, path }]
+                      : [],
+                  isPlaceholderData: false,
+                }) as ReturnType<typeof useHostWorktrees>,
+        );
+        const worktree = await selectNewWorktree(autoSeeded);
+        const requestedBranch = autoSeeded ? worktree.textContent : branchName;
+        selectWorkspace(nextWorkspace);
+        const input = screen.getByTestId("new-chat-landing-input");
+        fireEvent.change(input, { target: { value: "continue on the drafted branch" } });
+        const submit = screen.getByTestId("new-chat-landing-submit");
+        // Starting now would silently drop the drafted worktree.
+        expect(submit).toBeDisabled();
+        fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+        expect(await screen.findByRole("tooltip")).toHaveTextContent(
+          "Loading session configuration",
+        );
+
+        nextDiscovered = true;
+        fireEvent.change(input, { target: { value: "continue on the drafted branch now" } });
+        await waitFor(() => expect(submit).toBeEnabled());
+        fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+        await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+        const [, init] = authenticatedFetchMock.mock.calls[0];
+        const body = JSON.parse((init as RequestInit).body as string) as {
+          workspace?: string;
+          git?: { branch_name: string; base_branch?: string | null };
+        };
+        expect(body.workspace).toBe(nextWorkspace);
+        expect(body.git?.branch_name).toBe(requestedBranch);
+        expect(body.git?.base_branch).toBe("release");
+      },
+    );
+
+    it.each([false, true])(
       "clears a named worktree when the new workspace is confirmed non-git (auto-seeded: %s)",
       async (autoSeeded) => {
         await selectNewWorktree(autoSeeded);
@@ -3820,6 +4094,10 @@ describe("NewChatLandingScreen", () => {
     expect(summary).toHaveClass("text-right");
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus");
+    expect(screen.getByTestId("new-chat-landing-agent-model-opus")).toHaveAttribute(
+      "title",
+      "system.ai.claude-opus-4-6",
+    );
   });
 
   it.each([true, false])(
@@ -4608,7 +4886,7 @@ describe("NewChatLandingScreen", () => {
     ["Mozilla/5.0 (X11; Linux x86_64)", "This machine"],
     ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", "This Mac"],
     ["unknown-browser", "machine-1"],
-  ])("keeps compact controls accessibly named for %s", (userAgent, label) => {
+  ])("keeps compact controls accessibly named for %s", async (userAgent, label) => {
     vi.spyOn(navigator, "userAgent", "get").mockReturnValue(userAgent);
     renderLanding();
 
@@ -4616,13 +4894,17 @@ describe("NewChatLandingScreen", () => {
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
     expect(hostTrigger).toHaveAccessibleName(`Host: ${label}, Online`);
     expect(workspaceTrigger).toHaveAccessibleName("Working directory: /Users/corey/repo");
-    expect(hostTrigger).toHaveAttribute("title", `Host: ${label}, Online`);
+    expect(hostTrigger).not.toHaveAttribute("title");
     expect(within(hostTrigger).getByTestId("new-chat-landing-host-status")).toHaveClass(
       "bg-success",
     );
     expect(within(hostTrigger).getByTestId("new-chat-landing-host-icon")).toBeTruthy();
     expect(within(workspaceTrigger).getByText("repo")).toHaveClass("truncate");
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeVisible();
+    fireEvent.focus(hostTrigger);
+    expect(await screen.findByTestId("new-chat-landing-host-tooltip")).toHaveTextContent(
+      `Host: ${label}`,
+    );
   });
 
   it("keeps placeholder worktrees from relabeling the selected directory", async () => {
@@ -5100,6 +5382,84 @@ describe("NewChatLandingScreen", () => {
     expect(submit.disabled).toBe(false);
   });
 
+  it("starts the session while the host's worktree discovery is still pending", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    useHostWorktreesMock.mockReturnValue({
+      ...PENDING_QUERY_STATE,
+      data: undefined,
+    } as ReturnType<typeof useHostWorktrees>);
+    renderLanding();
+    // The directory control keeps reporting the pending discovery.
+    expect(await screen.findByRole("status", { name: "Loading working directory" })).toBeVisible();
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Enter a message to get started");
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "set up the project" },
+    });
+    expect(submit).toBeEnabled();
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as {
+      host_id?: string;
+      workspace?: string;
+      git?: unknown;
+    };
+    expect(body.host_id).toBe("host_1");
+    expect(body.workspace).toBe("/Users/corey/repo");
+    expect(body).not.toHaveProperty("git");
+  });
+
+  it("waits for worktree discovery when the always-use-worktree default needs it", async () => {
+    localStorage.setItem("omnigent:always-use-worktree", "true");
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    let discovered = false;
+    useHostWorktreesMock.mockImplementation((_host, path) => {
+      if (path === null) return DISABLED_QUERY_RESULT as ReturnType<typeof useHostWorktrees>;
+      if (!discovered) {
+        return { ...PENDING_QUERY_STATE, data: undefined } as ReturnType<typeof useHostWorktrees>;
+      }
+      return {
+        ...SUCCESS_QUERY_STATE,
+        data: [{ path, branch: "main", is_main: true, detached: false }],
+      } as ReturnType<typeof useHostWorktrees>;
+    });
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "set up the project" } });
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    // The seeded branch needs the discovery result, so the start waits for it.
+    expect(submit).toBeDisabled();
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Loading session configuration");
+
+    discovered = true;
+    fireEvent.change(input, { target: { value: "set up the project in a worktree" } });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveTextContent(
+        /^worktree-[0-9a-f]{8}$/,
+      ),
+    );
+    expect(submit).toBeEnabled();
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as {
+      git?: { branch_name: string };
+    };
+    expect(body.git?.branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
+  });
+
   it("keeps the disabled reason tooltip on the new-chat submit button", async () => {
     renderLanding();
     await waitFor(() =>
@@ -5529,7 +5889,7 @@ describe("NewChatLandingScreen", () => {
       target: { value: "run the build" },
     });
     const trigger = selectedPickerModel();
-    expect(trigger.textContent).toContain("Harness default");
+    expect(trigger.textContent).toContain("Default");
     expect(trigger.textContent).not.toContain("Haiku 4.5");
 
     // Saving the fallback sends no override, so the launch uses the provider's default.
@@ -5644,7 +6004,7 @@ describe("NewChatLandingScreen", () => {
     // The Codex model is remembered under codex-native only; Claude Code's
     // picker should reopen on its own Default instead of inheriting the GPT id.
     openAgentModels("a1");
-    expect(selectedPickerModel().textContent).toContain("Harness default");
+    expect(selectedPickerModel().textContent).toContain("Default");
     expect(selectedPickerModel().textContent).not.toContain("GPT-5.6");
     closePrimaryPicker();
 
@@ -7116,6 +7476,14 @@ describe("NewChatLandingScreen", () => {
       body: { detail: "managed host did not come online within 120s" },
       expected: "managed host did not come online within 120s",
     },
+    {
+      // Usually a duplicate of this create already holds the id; resending
+      // would start a second session.
+      name: "chosen host id conflict",
+      status: 409,
+      body: { error: { code: "already_exists", message: "host 0123 already exists" } },
+      expected: "host 0123 already exists",
+    },
   ])("surfaces the $name from a failed managed create", async ({ status, body, expected }) => {
     authenticatedFetchMock.mockResolvedValue({
       ok: false,
@@ -7136,7 +7504,36 @@ describe("NewChatLandingScreen", () => {
       expect(screen.getByTestId("new-chat-landing-error").textContent).toContain(expected),
     );
     expect(screen.queryByTestId("new-chat-landing-provisioning")).toBeNull();
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it.each([true, false])(
+    "chooses the sandbox host's id only on a server that accepts it (%s)",
+    async (accepts) => {
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "modal",
+        request_managed_sandbox_host_id: accepts,
+      });
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "audit the repo" },
+      });
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+      const [, init] = authenticatedFetchMock.mock.calls[0];
+      const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+      expect(body.host_type).toBe("managed");
+      if (accepts) {
+        expect(body.host_id).toMatch(/^[0-9a-f]{32}$/);
+      } else {
+        expect("host_id" in body).toBe(false);
+      }
+    },
+  );
 
   it("sends the added repositories as the managed workspaces list", async () => {
     authenticatedFetchMock.mockResolvedValue({
@@ -8968,7 +9365,7 @@ describe("NewChatLandingScreen smart routing", () => {
   // the server flag off, Smart Routing is never an option.
   it.each([
     ["Claude Code", "a1", true, "Smart Routing", "Opus 4.8"],
-    ["Claude Code", "a1", false, null, "Harness default"],
+    ["Claude Code", "a1", false, null, "Default"],
     ["Codex", "a2", true, "Smart Routing", "GPT-5.5"],
   ] as const)(
     "%s Model dropdown with the flag %s offers %s alongside %s",
@@ -8980,7 +9377,11 @@ describe("NewChatLandingScreen smart routing", () => {
       } else {
         expect(screen.getByRole("menuitemcheckbox", { name: routingOption })).toBeTruthy();
       }
-      expect(screen.getByRole("menuitemcheckbox", { name: siblingOption })).toBeTruthy();
+      expect(
+        within(screen.getByTestId("new-chat-landing-agent-models")).getByRole("menuitemcheckbox", {
+          name: siblingOption,
+        }),
+      ).toBeTruthy();
     },
   );
 
@@ -9209,7 +9610,7 @@ describe("NewChatLandingScreen smart routing", () => {
     // Claude Code never had routing picked, so it stays on Default.
     openAgentModels("a1");
     const model = selectedPickerModel();
-    expect(model.textContent).toContain("Harness default");
+    expect(model.textContent).toContain("Default");
     expect(model.textContent).not.toContain("Smart Routing");
   });
 
@@ -9219,14 +9620,18 @@ describe("NewChatLandingScreen smart routing", () => {
     pickPrimaryOption("model", "Smart Routing");
     closePrimaryPicker();
     openAgentModels("a1");
-    // By role, not text: "Default" also labels the Permissions row's value.
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Harness default" }));
+    // Model and effort sections both have a Default choice.
+    fireEvent.click(
+      within(screen.getByTestId("new-chat-landing-agent-models")).getByRole("menuitemcheckbox", {
+        name: "Default",
+      }),
+    );
     closePrimaryPicker();
 
     remountLanding({ smart_routing_enabled: true });
     openAgentModels("a1");
     const model = selectedPickerModel();
-    expect(model.textContent).toContain("Harness default");
+    expect(model.textContent).toContain("Default");
     expect(model.textContent).not.toContain("Smart Routing");
   });
 
@@ -9238,7 +9643,7 @@ describe("NewChatLandingScreen smart routing", () => {
     renderLanding({ smart_routing_enabled: false });
     openAgentModels("a1");
     const model = selectedPickerModel();
-    expect(model.textContent).toContain("Harness default");
+    expect(model.textContent).toContain("Default");
     expect(model.textContent).not.toContain("Smart Routing");
   });
 
@@ -9962,7 +10367,7 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     );
     selectSmartRoutingHarness();
     const { body } = await submitAndReadBody("  refactor the auth\u0007 module  ");
-    expect(body.smart_routing_message).toBe("refactor the auth module");
+    expect(body.smart_routing_message).toBe("  refactor the auth module");
   });
 
   it("sends no routing on a create after the restored pick degraded", async () => {
@@ -10727,5 +11132,301 @@ describe("managed sandbox inference models", () => {
       "true",
     );
     mounted.unmount();
+  });
+});
+
+describe("managed sandbox gateway preview", () => {
+  beforeEach(setupLandingMocks);
+
+  const astra = {
+    id: "system.ai.gpt-6-astra",
+    displayName: "Astra 6",
+    supportedReasoningEfforts: ["low", "medium", "high", "max"].map((reasoningEffort) => ({
+      reasoningEffort,
+    })),
+  };
+  const catalog: SandboxModelOptions = {
+    configured: false,
+    status: "ready",
+    models: [astra],
+    configuration_revision: null,
+    provider_label: "AI Gateway",
+    default_model: null,
+  };
+  const claude = {
+    id: "system.ai.claude-opus-4-8",
+    displayName: "Gateway Opus",
+    supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+  };
+
+  function preview(data: SandboxModelOptions | undefined = catalog, error: Error | null = null) {
+    vi.mocked(useSandboxModelOptions).mockReturnValue({
+      data,
+      isLoading: data === undefined && error === null,
+      error,
+    } as unknown as ReturnType<typeof useSandboxModelOptions>);
+  }
+
+  function renderGatewaySandbox() {
+    return renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "arclet",
+      sandbox_provider_capabilities: { arclet: { default_models: true } },
+    });
+  }
+
+  it("offers gateway models without a host and carries Codex model and effort into create", async () => {
+    preview();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    selectAgent("a2");
+    openAgentModels("a2");
+    expect(screen.getByTestId("sandbox-model-provider")).toHaveTextContent("AI Gateway");
+    pickPrimaryOption("model", "Astra 6");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      agent_id: "a2",
+      host_type: "managed",
+      sandbox_provider: "arclet",
+      model_override: astra.id,
+      reasoning_effort: "max",
+    });
+    expect(body.host_id).toBeUndefined();
+    expect(body.inference_configuration_revision).toBeUndefined();
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "arclet",
+      "codex-native",
+      "a2",
+      null,
+      true,
+    );
+  });
+
+  it.each(["unavailable", "empty"] as const)(
+    "offers an intentional harness default when gateway discovery is %s",
+    async (status) => {
+      preview({ ...catalog, status, models: [] });
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderGatewaySandbox();
+      selectAgent("a2");
+      openAgentModels("a2");
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-default"));
+      closeMenu();
+      const { body } = await submitAndReadBody();
+      expect(body.model_override).toBeUndefined();
+      expect(body.reasoning_effort).toBeUndefined();
+    },
+  );
+
+  it("waits for the selected harness's catalog without probing a host", () => {
+    mockHosts([]);
+    localStorage.setItem(LAST_AGENT_KEY, "a2");
+    vi.mocked(useSandboxModelOptions).mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      error: null,
+    } as unknown as ReturnType<typeof useSandboxModelOptions>);
+    renderGatewaySandbox();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "waiting" },
+    });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+      null,
+      "codex-native",
+      false,
+      expect.any(Object),
+    );
+    preview();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ready" },
+    });
+    openAgentModels("a2");
+    expect(screen.getByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeVisible();
+    closeMenu();
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+  });
+
+  it("changes catalogs and efforts when switching Codex, Claude Code, and Polly", async () => {
+    const claudeCatalog = { ...catalog, models: [claude] };
+    vi.mocked(useSandboxModelOptions).mockImplementation(
+      (_provider, harness) =>
+        ({
+          data: harness?.startsWith("codex") ? catalog : claudeCatalog,
+          isLoading: false,
+          error: null,
+        }) as ReturnType<typeof useSandboxModelOptions>,
+    );
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      testAgent("a_polly", "polly", { display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Astra 6");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+    closeMenu();
+    selectAgent("a1");
+    openAgentModels("a1");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
+    pickPrimaryOption("model", "Gateway Opus");
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-max")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
+    closeMenu();
+    selectAgent("a_polly");
+    openAgentModels("a_polly");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    pickPrimaryOption("model", "Gateway Opus");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-high"));
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      agent_id: "a_polly",
+      model_override: claude.id,
+      reasoning_effort: "high",
+    });
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "arclet",
+      "claude-sdk",
+      "a_polly",
+      null,
+      true,
+    );
+  });
+
+  it("drops an effort unsupported by the newly selected model", async () => {
+    const glm = {
+      id: "system.ai.glm-5-2",
+      displayName: "Gateway GLM",
+      supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+    };
+    preview({ ...catalog, models: [astra, glm] });
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Astra 6");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+    pickPrimaryOption("model", "Gateway GLM");
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-max")).toBeNull();
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe(glm.id);
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("requires an intentional default after an explicit model becomes unavailable", async () => {
+    preview();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Astra 6");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+    closeMenu();
+    preview(catalog, new Error("Gateway temporarily unavailable"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("Choose another model or Default");
+    openAgentModels("a2");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
+    expect(screen.getByText("Gateway temporarily unavailable")).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-default"));
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("keeps a harness's ordinary picker when the gateway lists nothing for it", () => {
+    preview({ ...catalog, status: "unconfigured", models: [], provider_label: null });
+    renderGatewaySandbox();
+    openAgentModels("a1");
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "arclet",
+      "claude-native",
+      "a1",
+      null,
+      true,
+    );
+    expect(screen.queryByTestId("sandbox-model-provider")).toBeNull();
+    const menu = screen
+      .getByTestId("new-chat-landing-agent-models")
+      .closest<HTMLElement>('[role="menu"]')!;
+    expect(within(menu).queryByText("Models unavailable")).toBeNull();
+    expect(within(menu).getByTestId("new-chat-landing-agent-model-opus")).toBeVisible();
+    expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+  });
+
+  // The gateway catalog owns the model like a bound target does, so the
+  // per-turn router is offered only once the harness falls back to its own list.
+  it.each<[string, SandboxModelOptions, boolean]>([
+    ["owns the catalog", catalog, false],
+    [
+      "cannot serve the harness",
+      { ...catalog, status: "unconfigured", models: [], provider_label: null },
+      true,
+    ],
+  ])("offers Smart Routing only when the gateway %s", (_case, data, offered) => {
+    preview(data);
+    mockHosts([]);
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "arclet",
+      sandbox_provider_capabilities: { arclet: { default_models: true } },
+      smart_routing_enabled: true,
+      smart_routing_sources: { external: true, oss: true },
+    });
+    openAgentModels("a2");
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Smart Routing" }) !== null).toBe(
+      offered,
+    );
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`) !== null).toBe(
+      !offered,
+    );
+  });
+
+  it("keeps a connected host's authoritative discovery when Arclet preview is offered", () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_1");
+    preview();
+    renderGatewaySandbox();
+    openAgentModels("a2");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+      "host_1",
+      "codex-native",
+      true,
+      expect.any(Object),
+    );
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "arclet",
+      "codex-native",
+      "a2",
+      null,
+      false,
+    );
+    expect(
+      screen.getByTestId(`new-chat-landing-agent-model-${CODEX_MODEL_OPTIONS_RESULT.data[0].id}`),
+    ).toBeVisible();
   });
 });

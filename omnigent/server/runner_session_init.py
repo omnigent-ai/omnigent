@@ -17,6 +17,7 @@ from omnigent.runner.session_init_protocol import build_runner_session_init_payl
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runtime.agent_cache import AgentCache
     from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.conversation_store import ConversationStore
     from omnigent.stores.file_store import FileStore
@@ -92,12 +93,14 @@ class RunnerSessionInitializer:
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
         agent_store: AgentStore | None = None,
+        agent_cache: AgentCache | None = None,
     ) -> None:
         self._registry = registry
         self._server_version = server_version
         self._conversation_store = conversation_store
         self._file_store = file_store
         self._agent_store = agent_store
+        self._agent_cache = agent_cache
         self._tasks: dict[
             tuple[str, int, str, str, str | None, bool],
             asyncio.Task[httpx.Response],
@@ -135,6 +138,24 @@ class RunnerSessionInitializer:
         if generation is None:
             generation = self.generation_for(runner_id, runner_client)
         self.require_generation(runner_id, runner_client, generation)
+        connection = self._registry.get(runner_id)
+        if (
+            connection is not None
+            and self._agent_store is not None
+            and self._agent_cache is not None
+        ):
+            from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+
+            async with store_slots or nullcontext():
+                await asyncio.to_thread(
+                    require_session_registry_mcp_support,
+                    conversation,
+                    connection.hello.capabilities,
+                    component="runner",
+                    agent_store=self._agent_store,
+                    agent_cache=self._agent_cache,
+                )
+            self.require_generation(runner_id, runner_client, generation)
         key = (
             runner_id,
             generation,
