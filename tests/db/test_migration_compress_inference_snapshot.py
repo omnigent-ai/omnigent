@@ -150,6 +150,9 @@ def test_compression_migration_retains_fitting_snapshots_and_all_sessions(
         assert columns["inference_snapshot"]["nullable"]
         assert isinstance(columns["inference_snapshot"]["type"], sa.LargeBinary)
         assert not any(name.startswith("_inference_snapshot") for name in columns)
+        # The store maps the live schema, so read sessions back at head rather
+        # than the pinned compress revision, which predates later columns.
+        _migrate(engine, "head")
         store = SqlAlchemyConversationStore(db_uri)
         for (workspace_id, row_id), value in original.items():
             if workspace_id != 0:

@@ -1759,18 +1759,20 @@ async def test_runner_disconnect_rechecks_tunnel_after_session_lookup(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
-@pytest.mark.parametrize("foreign_write", [True, False])
+@pytest.mark.parametrize("foreign_write", ["fresh", "blip", "none"])
 async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
-    foreign_write: bool,
+    foreign_write: str,
 ) -> None:
     """A dropped runner that re-tunnelled to another replica is not failed.
 
-    This replica's registry only knows its own tunnels. When the runner's
-    row carries a fresh ``runner_last_seen`` newer than this replica's own
-    last stamp, another replica wrote it — the runner is live there, so the
-    grace timer must leave the mid-turn session alone.
+    This replica's registry only knows its own tunnels. When the runner's row
+    carries a stamp newer than this replica's own last write, another replica
+    wrote it — the runner is live there, so the grace timer must leave the
+    mid-turn session alone. The ``blip`` case clears the sibling's
+    ``runner_last_seen`` and keeps only the never-cleared connect stamp, so this
+    holds even across the sibling's own transient reconnect blip.
     """
 
     from omnigent.runtime import get_conversation_store
@@ -1815,13 +1817,17 @@ async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
         # Let this replica's own disconnect-time liveness write land first,
         # then stamp the row the way the replica now holding the tunnel does.
         await asyncio.sleep(0.1)
-        if foreign_write:
+        if foreign_write != "none":
             own = session_live_state.last_liveness_stamp(runner_id)
             assert own is not None, "the hello did not record this replica's own stamp"
             store.touch_runner_liveness([runner_id], own + 1)
+            if foreign_write == "blip":
+                # The sibling's tunnel then blips: its heartbeat clears but the
+                # never-cleared connect stamp still proves the runner is live there.
+                store.clear_runner_liveness(runner_id)
         await asyncio.sleep(grace * 3)
         cached = sessions_module._session_status_cache.get(session_id)
-        if foreign_write:
+        if foreign_write != "none":
             assert cached is None, (
                 f"a runner live on another replica left stale local state {cached!r}"
             )

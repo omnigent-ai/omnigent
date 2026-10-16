@@ -265,6 +265,7 @@ def _to_conversation(
         ),
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         runner_last_seen=meta.runner_last_seen if meta else None,
+        runner_last_connected=meta.runner_last_connected if meta else None,
         project_id=meta.project_id if meta else None,
     )
 
@@ -1274,19 +1275,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             ).all()
         return {row.id: row.runner_id for row in rows}
 
-    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
-        """Read one session's bound runner and heartbeat from the metadata DB only."""
+    def get_runner_liveness(
+        self, conversation_id: str
+    ) -> tuple[str | None, int | None, int | None] | None:
+        """Read one session's bound runner and liveness stamps from the metadata DB only."""
         with self._session("get_runner_liveness") as session:
             row = session.execute(
                 select(
                     SqlConversationMetadata.runner_id,
                     SqlConversationMetadata.runner_last_seen,
+                    SqlConversationMetadata.runner_last_connected,
                 ).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.id == conversation_id,
                 )
             ).one_or_none()
-        return (row.runner_id, row.runner_last_seen) if row is not None else None
+        if row is None:
+            return None
+        return (row.runner_id, row.runner_last_seen, row.runner_last_connected)
 
     def get_session_connectivity(
         self, conversation_ids: list[str]
@@ -3743,7 +3749,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id == conversation_id,
                 )
                 .where(SqlConversationMetadata.runner_id.is_(None))
-                .values(runner_id=runner_id)
+                .values(
+                    runner_id=runner_id,
+                    runner_last_seen=None,
+                    runner_last_connected=None,
+                )
             )
             result = cast(_RowCountResult, session.execute(stmt))
             return result.rowcount == 1
@@ -3752,11 +3762,13 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
         """
-        Stamp ``runner_last_seen`` for sessions bound to live runners.
+        Stamp ``runner_last_seen`` and ``runner_last_connected`` for live runners.
 
         One bulk ``UPDATE`` on ``omnigent_conversation_metadata``, so
         ``conversations.updated_at`` (sidebar ordering) is untouched by
-        construction. See the abstract method.
+        construction. Both stamps advance together on every touch; they
+        diverge only on a graceful disconnect, which clears
+        ``runner_last_seen`` alone. See the abstract method.
 
         :param runner_ids: Runner ids with a live tunnel. Empty = no-op.
         :param now: Epoch seconds to stamp.
@@ -3772,7 +3784,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.runner_id.in_(runner_ids),
                 )
-                .values(runner_last_seen=now)
+                .values(runner_last_seen=now, runner_last_connected=now)
             )
 
         run_write_transaction(self._session_immediate, "touch_runner_liveness", write)
@@ -3781,8 +3793,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Clear ``runner_last_seen`` for sessions bound to a runner.
 
-        Lives on ``omnigent_conversation_metadata``, so ``conversations.updated_at``
-        (sidebar ordering) is untouched by construction. See the abstract method.
+        Leaves ``runner_last_connected`` intact so a cross-replica liveness
+        check can still tell a re-tunnelled runner from a departed one across
+        a graceful disconnect. Lives on ``omnigent_conversation_metadata``, so
+        ``conversations.updated_at`` (sidebar ordering) is untouched by
+        construction. See the abstract method.
 
         :param runner_id: The disconnected runner's id.
         :param not_after: When given, skip a row whose stamp is newer —
@@ -3945,8 +3960,18 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation {conversation_id!r} does not exist",
                 )
             if expected_runner_id is None:
+                if meta.runner_id != runner_id:
+                    # A real rebind drops the previous runner's liveness stamps;
+                    # the durable connect stamp would otherwise read as live
+                    # elsewhere until the new runner's tunnel re-stamps the row.
+                    meta.runner_last_seen = None
+                    meta.runner_last_connected = None
                 meta.runner_id = runner_id
             else:
+                new_values: dict[str, str | int | None] = {"runner_id": runner_id}
+                if expected_runner_id != runner_id:
+                    new_values["runner_last_seen"] = None
+                    new_values["runner_last_connected"] = None
                 session.execute(
                     update(SqlConversationMetadata)
                     .where(
@@ -3954,7 +3979,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         SqlConversationMetadata.id == conversation_id,
                         SqlConversationMetadata.runner_id == expected_runner_id,
                     )
-                    .values(runner_id=runner_id)
+                    .values(**new_values)
                 )
                 session.refresh(meta)
             return meta
@@ -3987,6 +4012,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation {conversation_id!r} does not exist",
                 )
             meta.runner_id = None
+            meta.runner_last_seen = None
+            meta.runner_last_connected = None
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_runner_id", write)
@@ -4025,6 +4052,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.workspace = None
             meta.git_branch = None
             meta.runner_id = None
+            meta.runner_last_seen = None
+            meta.runner_last_connected = None
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_host_binding", write)

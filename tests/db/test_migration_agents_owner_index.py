@@ -100,6 +100,14 @@ def test_postgres_retry_rebuilds_only_its_own_invalid_index() -> None:
             conn.execute(sa.text(f"CREATE INDEX {_INDEX} ON other.t (x)"))
             conn.execute(sa.text(invalidate), {"i": f"other.{_INDEX}"})
         _run_migrations(sa.create_engine(uri), uri)
+        # A failed concurrent build never advances past mm, so roll the schema
+        # back to mm; the invalidated index below stands in for that build and
+        # the retry re-applies any later migrations cleanly.
+        cfg = _build_alembic_config(uri)
+        with sa.create_engine(uri).connect() as conn:
+            cfg.attributes["connection"] = conn
+            command.downgrade(cfg, "mm1a2b3c4d5e")
+            conn.commit()
         with setup.connect() as conn:
             conn.execute(sa.text(invalidate), {"i": f"public.{_INDEX}"})
             conn.execute(sa.text("UPDATE alembic_version SET version_num = 'll1a2b3c4d5e'"))
