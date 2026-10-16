@@ -206,6 +206,11 @@ class WSCloseFrame:
 # not tunneled HTTP responses or terminal WebSocket channel frames.
 EVENT_INGEST_CAPABILITY = "session-event-ingest-v1"
 
+# Close reason a runner sends with code 1000 when its idle reaper shuts it
+# down. The runner had no active work, so the server settles the runner's
+# sessions instead of reading the close as an interrupted turn.
+RUNNER_IDLE_EXIT_CLOSE_REASON = "runner idle timeout"
+
 
 @dataclass
 class EventReadyFrame:

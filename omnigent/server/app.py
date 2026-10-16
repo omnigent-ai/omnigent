@@ -3479,7 +3479,7 @@ def create_app(
             pending.cancel()
 
     async def _mark_disconnected_runner_failed(
-        runner_id: str, reference_stamp: int | None
+        runner_id: str, reference_stamp: int | None, *, idle_exit: bool = False
     ) -> None:
         """Reconcile a dropped runner's sessions once the liveness lease expires.
 
@@ -3513,7 +3513,10 @@ def create_app(
             *runner_id*, captured in :func:`_on_runner_disconnect` before
             the clear — the reference the cross-replica check compares
             against.
+        :param idle_exit: The runner closed with the idle-exit reason, so its
+            stored sessions settle as intentionally stopped.
         """
+        from omnigent.server.routes._sessions.orchestration import _note_runner_idle_exit
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
@@ -3572,6 +3575,8 @@ def create_app(
             runner_id,
             len(affected),
         )
+        if idle_exit:
+            _note_runner_idle_exit(runner_id, affected)
         await _mark_runner_sessions_offline(
             affected,
             ErrorDetail(
@@ -3627,10 +3632,25 @@ def create_app(
                 runner_id,
             )
             return
+        # An idle-reaper exit is the runner's own orderly stop. Mark relay-bound
+        # sessions now so their relays settle them idle instead of waiting out
+        # the grace and failing them.
+        from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_EXIT_CLOSE_REASON
+        from omnigent.server.routes._sessions.orchestration import _note_runner_idle_exit
+
+        peer_close_reason = getattr(connection, "peer_close_reason", None)
+        idle_exit = peer_close_reason == RUNNER_IDLE_EXIT_CLOSE_REASON
         _logger.info(
             "Runner disconnected",
-            extra=debug_event("runner_disconnected", runner_id=runner_id),
+            extra=debug_event(
+                "runner_disconnected",
+                runner_id=runner_id,
+                peer_close_reason=peer_close_reason,
+                idle_exit=idle_exit,
+            ),
         )
+        if idle_exit:
+            _note_runner_idle_exit(runner_id)
         # Capture this replica's own last stamp before clearing, so the grace
         # timer can tell a fresher stamp another replica writes later from
         # one we wrote ourselves (the clear itself never erases this record).
@@ -3647,7 +3667,7 @@ def create_app(
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
         task = asyncio.create_task(
-            _mark_disconnected_runner_failed(runner_id, reference_stamp),
+            _mark_disconnected_runner_failed(runner_id, reference_stamp, idle_exit=idle_exit),
             name=f"runner-disconnect-grace-{runner_id}",
         )
         _disconnect_grace_tasks[runner_id] = task

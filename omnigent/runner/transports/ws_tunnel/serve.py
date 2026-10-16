@@ -47,6 +47,7 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runner.transports.ws_tunnel.frames import (
     EVENT_INGEST_CAPABILITY,
+    RUNNER_IDLE_EXIT_CLOSE_REASON,
     EventAckFrame,
     EventReadyFrame,
     HelloFrame,
@@ -1220,6 +1221,11 @@ async def _serve_tunnel_once(
                                 dispatch_tasks,
                                 on_graceful_shutdown,
                             )
+                            # Name the close so the server can tell this idle
+                            # exit from a runner lost mid-turn. Leaving the
+                            # connect context would otherwise send a bare 1000.
+                            with contextlib.suppress(Exception):
+                                await ws.close(code=1000, reason=RUNNER_IDLE_EXIT_CLOSE_REASON)
                             break
                         try:
                             raw = recv_task.result()

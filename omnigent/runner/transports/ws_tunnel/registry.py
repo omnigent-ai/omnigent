@@ -105,6 +105,8 @@ class RunnerSession:
         the registry lock before helpers can observe retirement.
     :param close_reason: Reason accompanying ``close_code``.
     :param diagnostics: Timing observations owned by this connection's socket loop.
+    :param peer_close_reason: Reason of the close frame the runner sent,
+        e.g. ``"runner idle timeout"``.
     """
 
     runner_id: str
@@ -124,6 +126,7 @@ class RunnerSession:
     close_code: int | None = None
     close_reason: str | None = None
     diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
+    peer_close_reason: str | None = None
 
 
 @dataclass
