@@ -451,6 +451,13 @@ plain `uv run pytest`, which starts a private server for the test.
   real runner crash that must still report a failure. Requires both native
   CLIs and tmux; Claude's machine-managed credentials require an isolated
   container for the local model endpoint.
+- **`stop`, `archive`, host-bound sub-agent children:**
+  `tests/server/integration/test_session_host_launch.py` (`-k shared_runner`)
+  creates a child through `POST /v1/sessions` with `host_id` and
+  `parent_session_id`, so it rides its parent's runner over a real host tunnel.
+  Archiving, stopping, or relaunching the child leaves that runner up for the
+  parent and its siblings, including a grandchild still bound to the root's
+  runner; a child bound to a runner of its own still tears it down.
 - **`stop`, `side-chat-lifecycle`, hosted side chats (own environment):**
   `tests/e2e_ui/sessions/test_stop_side_chats.py::test_stop_session_stops_hosted_side_chats`
   drives both desktop sidebar menus and the mobile long-press menu with a real
