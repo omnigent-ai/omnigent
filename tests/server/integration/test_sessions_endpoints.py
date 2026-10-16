@@ -38,7 +38,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
-from omnigent.runner.transports.ws_tunnel.frames import EventBatchFrame
+from omnigent.runner.transports.ws_tunnel.frames import EventAckFrame, EventBatchFrame
 from omnigent.runtime import inflight_text
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
@@ -1538,10 +1538,12 @@ async def test_runner_ingest_requires_bound_runner_and_replays_source_key(
     }
     ingest = app.state.runner_event_ingest
     batch = EventBatchFrame(id="b1", session_id=session["id"], events=[event])
-    rejected = await ingest(
+    # A runner the session moved off gets its late events acknowledged but not written.
+    superseded = await ingest(
         app=app, headers=Headers({}), owner=None, runner_id="another-runner", batch=batch
     )
-    assert rejected.applied == 0 and not rejected.retryable
+    assert superseded == EventAckFrame("b1", 1)
+    assert (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"] == []
     first = await ingest(
         app=app, headers=Headers({}), owner=None, runner_id="runner-owning-session", batch=batch
     )
@@ -5665,34 +5667,60 @@ _OLD_CLI_CARD = {
 }
 
 
+_CODEX_MODEL_DETAIL = (
+    "The 'system.ai.gpt-6-1-sol' model is not supported when using Codex with a ChatGPT account."
+)
+_CODEX_MODEL_CARD = {
+    "title": "Model unavailable with ChatGPT login",
+    "cause": _CODEX_MODEL_DETAIL,
+    "remediation": (
+        "Choose a model supported by your ChatGPT account using the model picker or /model. "
+        "To use another provider, configure it for Codex with `omnigent setup` "
+        "on the host, then start a new session."
+    ),
+}
+
+
 @pytest.mark.parametrize("wire_output", [False, True])
 @pytest.mark.parametrize(
-    ("detail", "expected_code", "card"),
+    ("detail", "expected_code", "card", "wrapper", "reauth_required"),
     [
         (
             'API Error: 499 {"error_code":"CANCELLED","message":""}',
             "transient_upstream_error",
             {},
+            "claude-code-native-ui",
+            False,
         ),
-        (_OLD_CLI_DETAIL, "client_update_required", _OLD_CLI_CARD),
+        (_OLD_CLI_DETAIL, "client_update_required", _OLD_CLI_CARD, "claude-code-native-ui", False),
+        (_CODEX_MODEL_DETAIL, None, _CODEX_MODEL_CARD, "codex-native-ui", False),
+        (_CODEX_MODEL_DETAIL, "native_turn_error", {}, "claude-code-native-ui", False),
+        (_CODEX_MODEL_DETAIL, "codex_reauth_required", {}, "codex-native-ui", True),
     ],
 )
-async def test_native_gateway_cancel_and_old_cli_failures_are_coded_live_and_after_reload(
+async def test_native_failures_are_coded_live_and_after_reload(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     wire_output: bool,
     detail: str,
-    expected_code: str,
+    expected_code: str | None,
     card: dict[str, str],
+    wrapper: str,
+    reauth_required: bool,
 ) -> None:
-    """A gateway 499 is retryable and an old-CLI refusal names its fix, live and on reload."""
+    """Native failures keep their diagnosis and raw detail through status and persistence."""
     published: list[dict[str, Any]] = []
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda _session_id, event: published.append(event),
     )
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
+    harness = "codex-native" if wrapper == "codex-native-ui" else "claude-native"
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}
+    )
+    session = await _create_session(client, agent["id"], labels={"omnigent.wrapper": wrapper})
+    if expected_code is None:
+        expected_code = "codex_turn_error" if wire_output else "native_turn_error"
     session_id = session["id"]
     response_id = "resp_native_coded_failure"
     item_resp = await client.post(
@@ -5705,7 +5733,7 @@ async def test_native_gateway_cancel_and_old_cli_failures_are_coded_live_and_aft
                 "source_id": "src_native_coded_failure",
                 "item_data": {
                     "role": "assistant",
-                    "agent": "claude-native-ui",
+                    "agent": wrapper,
                     "content": [{"type": "output_text", "text": detail}],
                 },
             },
@@ -5714,6 +5742,8 @@ async def test_native_gateway_cancel_and_old_cli_failures_are_coded_live_and_aft
     assert item_resp.status_code == 202, item_resp.text
 
     data: dict[str, Any] = {"status": "failed", "response_id": response_id}
+    if reauth_required:
+        data["reauth_required"] = True
     if wire_output:
         data["output"] = detail
     status_resp = await client.post(
@@ -5735,7 +5765,7 @@ async def test_native_gateway_cancel_and_old_cli_failures_are_coded_live_and_aft
     assert snapshot_resp.json()["last_task_error"] == {
         "code": expected_code,
         "message": detail,
-        "agent_name": "claude-native-ui",
+        "agent_name": wrapper,
         **card,
     }
 
@@ -10032,6 +10062,86 @@ async def test_retry_session_retries_native_terminal_ensure_after_runner_reconne
         await runner_client.aclose()
 
 
+async def test_native_message_is_refused_with_input_kept_when_host_runner_tunnel_drops(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A send as a host runner's tunnel drops is refused, not recorded as a failed turn."""
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import routes_events
+
+    host_id = "8b9c07bfb42f687d53af44f018adebee"
+    HostStore(db_uri).upsert_on_connect(host_id, "remote-host", "owner@example.com")
+    agent = await create_test_agent(client, name="claude-native-ui")
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(session["id"], host_id=host_id, workspace="/tmp/native")
+    store.replace_runner_id(session["id"], "native-runner")
+    terminals_path = f"/v1/sessions/{session['id']}/resources/terminals"
+    runner_paths: list[str] = []
+    tunnel_up = False
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        runner_paths.append(request.url.path)
+        if request.url.path == terminals_path:
+            if not tunnel_up:
+                # What WSTunnelTransport raises when the tunnel dies under the request.
+                raise ConnectionError("tunnel closed before request completed")
+            return httpx.Response(200, json={})
+        return httpx.Response(202, json={})
+
+    message = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "run the tests"}]},
+    }
+    wait_for_runner = AsyncMock(return_value=False)
+    monkeypatch.setattr(RunnerRouter, "wait_for_runner", wait_for_runner)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    ) as runner_client:
+        monkeypatch.setattr(
+            routes_events, "_get_runner_client", AsyncMock(return_value=runner_client)
+        )
+        monkeypatch.setattr(
+            routes_events, "_ensure_runner_relay_ready", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock()
+        )
+        try:
+            refused = await client.post(f"/v1/sessions/{session['id']}/events", json=message)
+
+            assert refused.status_code == 503, refused.text
+            assert refused.json()["error"]["code"] == "runner_unavailable"
+            wait_for_runner.assert_awaited_once_with(
+                "native-runner",
+                timeout_s=orchestration_module._NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S,
+            )
+            # Only the ensure probe reached the runner; nothing was recorded or queued.
+            assert runner_paths == [terminals_path]
+            snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+            assert snapshot["items"] == []
+            assert snapshot["status"] != "failed"
+            assert not pending_inputs.has_pending(session["id"])
+
+            # Once the tunnel is back the same message goes through.
+            tunnel_up = True
+            resent = await client.post(f"/v1/sessions/{session['id']}/events", json=message)
+
+            assert resent.status_code == 202, resent.text
+            assert runner_paths[-1] == f"/v1/sessions/{session['id']}/events"
+        finally:
+            for pending in pending_inputs.snapshot_for(session["id"]):
+                pending_inputs.resolve(session["id"], pending["pending_id"])
+
+
 async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
     client: httpx.AsyncClient,
 ) -> None:
@@ -10689,24 +10799,21 @@ async def test_cancelled_message_the_agent_did_record_drains_as_matched(
         assert pending_inputs.pending_ids(session_id) == []
 
 
-async def test_btw_settles_its_own_entry_rather_than_a_cancelled_one(
+async def test_btw_sidechat_event_leaves_an_unrelated_queued_web_message_in_place(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A ``/btw`` typed after a cancelled message settles its own bubble.
+    A relayed ``/btw`` overlay settles nothing: a web message queued meanwhile keeps its entry.
 
-    The overlay never round-trips through the transcript, so the server drops the
-    oldest pending entry when it arrives. That must be the ``/btw`` entry, not the
-    cancelled one: otherwise the session list shows "running" and the ``/btw``
-    bubble comes back on every reload until the TTL.
+    A web ``/btw`` is never queued, so no entry belongs to the overlay. Settling the
+    oldest one would drop the other message's entry, and its own mirror would then
+    find nothing to settle.
     """
     from omnigent.runtime import pending_inputs
 
-    async with _codex_native_session(client, monkeypatch) as (session_id, _published):
-        cancelled = _queue_web_message(session_id, "cancel me")
-        await _press_stop(client, session_id)
-        _queue_web_message(session_id, "/btw what is this?")
+    async with _codex_native_session(client, monkeypatch) as (session_id, published):
+        queued = _queue_web_message(session_id, "go on")
 
         response = await client.post(
             f"/v1/sessions/{session_id}/events",
@@ -10717,10 +10824,17 @@ async def test_btw_settles_its_own_entry_rather_than_a_cancelled_one(
         )
 
         assert response.status_code == 202, response.text
-        assert pending_inputs.snapshot_for(session_id) == []
-        assert pending_inputs.has_pending(session_id) is False
-        # The cancelled entry is hidden and left to the TTL.
-        assert pending_inputs.pending_ids(session_id) == [cancelled]
+        overlays = [
+            event for _sid, event in published if event.get("type") == "session.btw_sidechat"
+        ]
+        assert [(o["question"], o["answer"]) for o in overlays] == [("what is this?", "A test.")]
+        snapshot = pending_inputs.snapshot_for(session_id)
+        assert [entry["pending_id"] for entry in snapshot] == [queued]
+
+        await _mirror_user_message(client, session_id, "go on", "codex:go-on:0")
+
+        assert _consumed_pending_ids(published) == [queued]
+        assert pending_inputs.pending_ids(session_id) == []
 
 
 @dataclass

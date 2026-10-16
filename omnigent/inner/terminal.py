@@ -23,7 +23,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias, cast
@@ -31,6 +31,7 @@ from typing import Any, TypeAlias, cast
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native import owner_claim
 from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import strip_runner_auth_secrets
@@ -40,6 +41,7 @@ from . import _proc
 from .agent_env import strip_desktop_session_env
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
+from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
 from .os_env import (
     OSEnvironment,
     _copy_tree,
@@ -661,6 +663,7 @@ def _clone_sandbox_spec(sandbox: OSEnvSandboxSpec | None) -> OSEnvSandboxSpec | 
             list(sandbox.env_passthrough) if sandbox.env_passthrough is not None else None
         ),
         egress_rules=list(sandbox.egress_rules) if sandbox.egress_rules is not None else None,
+        git_ssh=list(sandbox.git_ssh) if sandbox.git_ssh is not None else None,
     )
 
 
@@ -723,6 +726,61 @@ def _has_utf8_locale(env: dict[str, str]) -> bool:
     return _is_utf8_locale_value(env.get("LANG"))
 
 
+def terminal_pane_environment(
+    *,
+    inherit_env: bool,
+    env: Mapping[str, str],
+    env_unset: Iterable[str],
+    launch_environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """
+    Build the environment a terminal pane's command starts with.
+
+    Clipboard and sandbox adjustments made later by :meth:`TerminalInstance.launch`
+    are not included.
+
+    :param inherit_env: Whether the pane inherits the current process environment.
+    :param env: Per-terminal overrides, e.g. ``{"CLAUDE_CONFIG_DIR": "/srv/claude"}``.
+    :param env_unset: Names removed after the overrides, e.g. ``["ANTHROPIC_API_KEY"]``.
+    :param launch_environment: This launch's lifecycle identity variables, or
+        ``None`` when there are none.
+    :returns: The pane environment, e.g. ``{"HOME": "/home/user", "LANG": "C.UTF-8"}``.
+    """
+    # Do NOT advertise the tmux control socket path to the
+    # pane. The tmux server runs unsandboxed, so exposing its socket
+    # let pane code run ``tmux -S <sock> run-shell '...'`` to execute
+    # commands outside the sandbox. The host-side control plane
+    # addresses the socket via the instance's ``socket_path`` and never
+    # needs the env var; any inherited value is stripped below too.
+    result: dict[str, str] = os.environ.copy() if inherit_env else {}
+    result.pop("OMNIGENT_TMUX_SOCK", None)
+    # Apply per-terminal env overrides (takes precedence over inherited env).
+    result.update(env)
+    # Apply exclusions last so overrides cannot leak credentials to MCP servers.
+    for key in env_unset:
+        result.pop(key, None)
+    # Never reuse a parent's launch identity if diagnostic initialization fails.
+    for key in (
+        TERMINAL_INSTANCE_ID_ENV,
+        TERMINAL_LAUNCH_ID_ENV,
+        TERMINAL_LAUNCH_SESSION_ID_ENV,
+    ):
+        result.pop(key, None)
+    result.update(launch_environment or {})
+    # Strip the runner-auth secret: native agents run their shell in
+    # this tmux pane, so the binding token must never reach it.
+    # After ``update`` so overrides can't re-admit it.
+    result = strip_runner_auth_secrets(result)
+    # Force a UTF-8 locale into the pane env when the inherited env
+    # carries no UTF-8 signal in the vars the native TUI CLIs actually
+    # read (LC_ALL/LANG). Without it, CLIs that read LC_ALL/LANG directly
+    # (opencode/pi/hermes) instead of calling setlocale fall back to an
+    # ASCII/Latin-1 codeset and re-encode their UTF-8 output byte-by-byte,
+    # rendering multibyte characters as mojibake in the pane (issue #2427).
+    _apply_utf8_locale_default(result)
+    return result
+
+
 def _apply_utf8_locale_default(env: dict[str, str]) -> None:
     """Force ``LANG=LC_ALL=C.UTF-8`` when the env lacks a UTF-8 locale signal.
 
@@ -747,20 +805,40 @@ def _tmux_available() -> bool:
     return shutil.which("tmux") is not None
 
 
+class TmuxUnavailableError(OmnigentError, RuntimeError):
+    """The host has no tmux that managed terminals can use.
+
+    Coded ``HARNESS_NOT_CONFIGURED``: only the person can fix the host's tmux,
+    and the message says how, so a terminal start failure shows it verbatim.
+    Subclasses :class:`RuntimeError` so callers that already catch that keep
+    working.
+    """
+
+    def __init__(self, message: str) -> None:
+        """
+        :param message: Client-safe remedy, e.g. ``"tmux 3.2 is too old; ..."``.
+        """
+        super().__init__(message, code=ErrorCode.HARNESS_NOT_CONFIGURED)
+
+
 def _require_supported_tmux() -> None:
     """Fail before terminal setup when tmux is missing, unknown, or too old."""
     tmux = shutil.which("tmux")
     if tmux is None:
-        raise RuntimeError("tmux is not installed or not on PATH")
+        raise TmuxUnavailableError(
+            "tmux is not installed or not on PATH. Native terminals need tmux "
+            f"{MIN_TMUX_VERSION_HINT} or newer: install it (macOS: `brew install tmux`), "
+            "or restart the Omnigent host from a shell where `tmux -V` works."
+        )
     version = tmux_version(tmux)
     if version is None:
-        raise RuntimeError(
+        raise TmuxUnavailableError(
             "Could not determine the installed tmux version; managed terminals require "
             f"tmux {MIN_TMUX_VERSION_HINT} or newer"
         )
     if version < MIN_TMUX_VERSION:
         detected = f"{version[0]}.{version[1]}"
-        raise RuntimeError(
+        raise TmuxUnavailableError(
             f"tmux {detected} is too old; managed terminals require "
             f"tmux {MIN_TMUX_VERSION_HINT} or newer"
         )
@@ -950,22 +1028,13 @@ def build_terminal_os_env_spec(
         if not spec.allow_sandbox_override:
             raise ValueError("This terminal does not allow sandbox overrides")
         sandbox = effective_os_env_spec.sandbox or OSEnvSandboxSpec(type="none")
-        # Defense in depth on top of the parse-time check
-        # (omnigent/inner/loader.py rejects allow_sandbox_override:
-        # true paired with egress_rules at agent-load time). This
-        # branch also fires for specs built programmatically without
-        # going through the loader and catches any future code path
-        # that synthesizes an override before launch. An override to
-        # ``"none"`` can't hard-enforce network isolation; letting the
-        # override drop ``sandbox.type`` to it while ``egress_rules``
-        # stay on the policy would silently bypass the network
-        # allow-list.
-        if sandbox.egress_rules:
+        # Programmatic specs can bypass the loader's network policy guard.
+        if sandbox.requires_network_enforcement:
             raise ValueError(
                 "sandbox_override is not allowed on a terminal whose "
-                "effective sandbox declares egress_rules: overriding "
+                "effective sandbox declares egress_rules or git_ssh: overriding "
                 "to 'none' would drop hard network "
-                "enforcement while egress_rules remain as inert "
+                "enforcement while network policy remains as inert "
                 "decoration on the policy."
             )
         if any(p.copy_on_write for p in sandbox.write_path_specs):
@@ -1055,6 +1124,8 @@ class TerminalInstance:
     # Unix socket don't outlive the terminal.
     _egress_handle: EgressProxyHandle | None = field(default=None, repr=False)
     _egress_tmpdir: Path | None = field(default=None, repr=False)
+    _git_ssh_broker: GitSshBroker | None = field(default=None, repr=False)
+    _git_ssh_tmpdir: Path | None = field(default=None, repr=False)
     _clipboard_bridge: TerminalClipboardBridge | None = field(default=None, init=False, repr=False)
     _idle_task: asyncio.Task[None] | None = field(default=None, repr=False)
     # Threaded idle-watcher state. Mirrors :attr:`_idle_task` but for
@@ -1511,6 +1582,13 @@ class TerminalInstance:
 
     async def launch(self, *, cwd: Path | None = None) -> None:
         """Start the tmux session."""
+        try:
+            await self._launch_impl(cwd=cwd)
+        except BaseException:
+            self._stop_network_brokers()
+            raise
+
+    async def _launch_impl(self, *, cwd: Path | None = None) -> None:
         if self.running:
             return
         self._last_exit_snapshot = None
@@ -1518,44 +1596,17 @@ class TerminalInstance:
         self._last_exit_signal = None
         effective_cwd = str(cwd or self.private_dir)
 
-        # Do NOT advertise the tmux control socket path to the
-        # pane. The tmux server runs unsandboxed, so exposing its socket
-        # let pane code run ``tmux -S <sock> run-shell '...'`` to execute
-        # commands outside the sandbox. The host-side control plane
-        # addresses the socket via ``self.socket_path`` directly and never
-        # needs the env var; any inherited value is stripped below too.
-        if self.inherit_env:
-            env = os.environ.copy()
-        else:
-            env = {}
-        env.pop("OMNIGENT_TMUX_SOCK", None)
-        # Apply per-terminal env overrides (takes precedence over inherited env).
-        env.update(self.env)
-        # Apply exclusions last so overrides cannot leak credentials to MCP servers.
-        for key in self.env_unset:
-            env.pop(key, None)
-        # Never reuse a parent's launch identity if diagnostic initialization fails.
-        for key in (
-            TERMINAL_INSTANCE_ID_ENV,
-            TERMINAL_LAUNCH_ID_ENV,
-            TERMINAL_LAUNCH_SESSION_ID_ENV,
-        ):
-            env.pop(key, None)
         try:
-            env.update(self.lifecycle_trace.launch_environment(self.diagnostic_id))
+            launch_environment = self.lifecycle_trace.launch_environment(self.diagnostic_id)
         except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent launch.
             logger.debug("Terminal lifecycle correlation unavailable (%s)", type(exc).__name__)
-        # Strip the runner-auth secret: native agents run their shell in
-        # this tmux pane, so the binding token must never reach it.
-        # After ``env.update`` so ``self.env`` can't re-admit it.
-        env = strip_runner_auth_secrets(env)
-        # Force a UTF-8 locale into the pane env when the inherited env
-        # carries no UTF-8 signal in the vars the native TUI CLIs actually
-        # read (LC_ALL/LANG). Without it, CLIs that read LC_ALL/LANG directly
-        # (opencode/pi/hermes) instead of calling setlocale fall back to an
-        # ASCII/Latin-1 codeset and re-encode their UTF-8 output byte-by-byte,
-        # rendering multibyte characters as mojibake in the pane (issue #2427).
-        _apply_utf8_locale_default(env)
+            launch_environment = {}
+        env = terminal_pane_environment(
+            inherit_env=self.inherit_env,
+            env=self.env,
+            env_unset=self.env_unset,
+            launch_environment=launch_environment,
+        )
         if self._clipboard_bridge is not None:
             self._clipboard_bridge.prepare_environment(env)
 
@@ -1581,14 +1632,20 @@ class TerminalInstance:
             env = strip_desktop_session_env(env)
             if self.egress_rules:
                 sandbox_for_launcher = self._bootstrap_egress_proxy(sandbox_for_launcher, env)
+            if sandbox_for_launcher.git_ssh:
+                sandbox_for_launcher = self._bootstrap_git_ssh(sandbox_for_launcher, env)
             cli_path = shutil.which(self.command) or self.command
-            if sandbox_for_launcher.copy_on_write_namespace:
-                host_cwd = "/"
-                launcher_path = create_exec_launcher(
-                    cli_path, sandbox_for_launcher, cwd=effective_cwd
-                )
-            else:
-                launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
+            try:
+                if sandbox_for_launcher.copy_on_write_namespace:
+                    host_cwd = "/"
+                    launcher_path = create_exec_launcher(
+                        cli_path, sandbox_for_launcher, cwd=effective_cwd
+                    )
+                else:
+                    launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
+            except Exception:
+                self._stop_git_ssh()
+                raise
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
@@ -1671,6 +1728,7 @@ class TerminalInstance:
         except BaseException:
             if self._clipboard_bridge is not None:
                 await asyncio.to_thread(self._clipboard_bridge.close)
+            self._stop_git_ssh()
             raise
 
         self.running = True
@@ -1832,6 +1890,47 @@ class TerminalInstance:
             egress_socket_path=str(self._egress_handle.socket_path),
         )
 
+    def _bootstrap_git_ssh(self, sandbox: SandboxPolicy, env: dict[str, str]) -> SandboxPolicy:
+        """Expose a per-terminal Git broker socket inside the sandbox."""
+        bindings = sandbox.git_ssh
+        assert bindings is not None
+        self._git_ssh_tmpdir = create_private_tmpdir()
+        try:
+            sandbox = with_additional_write_roots(sandbox, [self._git_ssh_tmpdir])
+            self._git_ssh_broker = start_git_ssh_broker(bindings, self._git_ssh_tmpdir)
+        except Exception:
+            self._stop_git_ssh()
+            raise
+        apply_git_ssh_env(env, self._git_ssh_broker)
+        return replace(sandbox, git_ssh_socket_path=str(self._git_ssh_broker.socket_path))
+
+    def _stop_git_ssh(self) -> None:
+        if self._git_ssh_broker is not None:
+            try:
+                self._git_ssh_broker.stop()
+            except Exception:
+                logger.exception(
+                    "Git SSH broker stop failed for terminal %s:%s", self.name, self.session_key
+                )
+            self._git_ssh_broker = None
+        if self._git_ssh_tmpdir is not None:
+            cleanup_private_tmpdir(self._git_ssh_tmpdir)
+            self._git_ssh_tmpdir = None
+
+    def _stop_network_brokers(self) -> None:
+        if self._egress_handle is not None:
+            try:
+                self._egress_handle.stop()
+            except Exception:
+                logger.exception(
+                    "egress proxy stop failed for terminal %s:%s", self.name, self.session_key
+                )
+            self._egress_handle = None
+        if self._egress_tmpdir is not None:
+            cleanup_private_tmpdir(self._egress_tmpdir)
+            self._egress_tmpdir = None
+        self._stop_git_ssh()
+
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
         try:
@@ -1874,19 +1973,7 @@ class TerminalInstance:
         # Order: stop first so the proxy isn't listening on a
         # socket inside a soon-to-be-deleted dir, then remove the
         # tmpdir.
-        if self._egress_handle is not None:
-            try:
-                self._egress_handle.stop()
-            except Exception:
-                logger.exception(
-                    "egress proxy stop failed for terminal %s:%s",
-                    self.name,
-                    self.session_key,
-                )
-            self._egress_handle = None
-        if self._egress_tmpdir is not None:
-            cleanup_private_tmpdir(self._egress_tmpdir)
-            self._egress_tmpdir = None
+        self._stop_network_brokers()
 
         # Clean up the private dir (contains socket + fork).
         if self.private_dir.exists():

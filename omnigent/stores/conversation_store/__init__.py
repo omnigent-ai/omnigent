@@ -1869,6 +1869,8 @@ class ConversationStore(ABC):
         ``response_id``, ``type``, ``status``, and ``data``. FTS
         records are inserted for each copied item. The entire
         operation runs in a single transaction for atomicity.
+        Source ``workspace_missing`` errors become historical notices and
+        matching failure labels are omitted; the fork binds its own workspace.
 
         :param source_conversation_id: ID of the conversation to
             fork, e.g. ``"conv_abc123"``.

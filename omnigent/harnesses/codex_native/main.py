@@ -107,6 +107,7 @@ from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
 from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
+from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -1296,6 +1297,11 @@ async def _prepare_codex_terminal(
                     thread_id,
                     terminal_launch_args=codex_args,
                     cwd=Path.cwd(),
+                    model_provider=(
+                        codex_session_meta_model_provider(_codex_launch)
+                        if native_codex_launch_pins_model_provider(_codex_launch)
+                        else None
+                    ),
                     retain_client=codex_remote_resume_omits_permission_args(
                         app_server.codex_cli_version
                     ),
@@ -2117,6 +2123,14 @@ class _CodexResumeHistoryUnavailableError(click.ClickException):
     """Server history is temporarily unavailable for Codex cold resume."""
 
 
+_CODEX_HISTORY_FETCH_ATTEMPTS = 3
+_CODEX_HISTORY_RETRY_MAX_DELAY_S = 10.0
+
+
+async def _codex_history_retry_sleep(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
 async def _fetch_all_session_items_for_codex_resume(
     client: httpx.AsyncClient,
     session_id: str,
@@ -2128,8 +2142,8 @@ async def _fetch_all_session_items_for_codex_resume(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :returns: Flat API item dicts from
         ``GET /v1/sessions/{id}/items``.
-    :raises _CodexResumeHistoryUnavailableError: If transport or server errors
-        prevent fetching an item page.
+    :raises _CodexResumeHistoryUnavailableError: If transport or server errors,
+        or persistent throttling, prevent fetching an item page.
     :raises click.ClickException: If the server rejects the request or returns
         an invalid page.
     """
@@ -2139,16 +2153,35 @@ async def _fetch_all_session_items_for_codex_resume(
         params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
         if after is not None:
             params["after"] = after
-        try:
-            resp = await client.get(
-                f"/v1/sessions/{url_component(session_id)}/items",
-                params=params,
+        for attempt in range(1, _CODEX_HISTORY_FETCH_ATTEMPTS + 1):
+            try:
+                resp = await client.get(
+                    f"/v1/sessions/{url_component(session_id)}/items",
+                    params=params,
+                )
+            except httpx.TransportError as exc:
+                raise _CodexResumeHistoryUnavailableError(
+                    f"Failed to fetch history for {session_id!r}: {exc}"
+                ) from exc
+            if resp.status_code != 429 or attempt == _CODEX_HISTORY_FETCH_ATTEMPTS:
+                break
+            delay = jittered_retry_delay(
+                resp,
+                backoff=0.5 * (2 ** (attempt - 1)),
+                max_delay=_CODEX_HISTORY_RETRY_MAX_DELAY_S,
             )
-        except httpx.TransportError as exc:
-            raise _CodexResumeHistoryUnavailableError(
-                f"Failed to fetch history for {session_id!r}: {exc}"
-            ) from exc
-        if resp.status_code >= 500:
+            if delay is None:
+                break
+            _logger.warning(
+                "Session history throttled for %r (attempt %d/%d); retrying in %.2fs",
+                session_id,
+                attempt,
+                _CODEX_HISTORY_FETCH_ATTEMPTS,
+                delay,
+                extra={"session_id": session_id},
+            )
+            await _codex_history_retry_sleep(delay)
+        if resp.status_code == 429 or resp.status_code >= 500:
             raise _CodexResumeHistoryUnavailableError(
                 f"Failed to fetch history for {session_id!r} "
                 f"({resp.status_code}): {error_text(resp)}"
@@ -2604,6 +2637,11 @@ def _codex_message_payload_from_session_item(item: _JsonObject) -> _JsonObject |
     return {"type": "message", "role": role, "content": content}
 
 
+# The Responses API rejects a function_call whose arguments exceed 1,048,576
+# characters, and a rebuilt thread replays every call; leave headroom.
+_MAX_REPLAYED_ARGUMENTS_CHARS = 900_000
+
+
 def _codex_function_call_payload_from_session_item(
     item: _JsonObject,
 ) -> _JsonObject | None:
@@ -2635,6 +2673,17 @@ def _codex_function_call_payload_from_session_item(
         raise click.ClickException(
             "Cannot synthesize Codex resume rollout: Omnigent function_call "
             f"{item_id!r} has non-string arguments."
+        )
+    if len(arguments) > _MAX_REPLAYED_ARGUMENTS_CHARS:
+        # An apply_patch mirror carries whole files for added or deleted ones. One
+        # oversized call would fail every request in the thread, so replay a stub.
+        _logger.warning(
+            "Replaying an oversized Codex function_call as a stub: name=%s chars=%d",
+            name,
+            len(arguments),
+        )
+        arguments = json.dumps(
+            {"omitted": f"{len(arguments)} characters of arguments, too large to replay"}
         )
     payload: _JsonObject = {
         "type": "function_call",

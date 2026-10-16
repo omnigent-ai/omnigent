@@ -267,6 +267,7 @@ async def test_run_turn_points_auth_commands_at_omni_setup(
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "omni setup" in events[0].message
+    assert events[0].undelivered is True
 
 
 @pytest.mark.asyncio
@@ -1724,6 +1725,100 @@ async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("submitted", "refusal"),
+    [
+        (False, "pending_prompt"),
+        (True, "pending_prompt"),
+        (True, "draft_persisted"),
+        (False, "missing_target"),
+    ],
+    ids=["before_submit", "after_submit", "draft_not_accepted", "missing_target"],
+)
+async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    submitted: bool,
+    refusal: str,
+) -> None:
+    """
+    Refusals preserve input; a prompt after Enter may belong to its accepted turn.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    pane = "❯ "
+    enters = 0
+    prompt_pending = False
+    killed: list[Path] = []
+
+    def run_tmux(socket_path: str, *args: str) -> None:
+        nonlocal pane, enters, prompt_pending
+        del socket_path
+        if args[0] == "paste-buffer":
+            pane = "❯ review this function"
+            prompt_pending = not submitted
+        elif args[-1] == "Enter":
+            # The draft stays visible, so submit verification looks to retry.
+            enters += 1
+            prompt_pending = refusal == "pending_prompt"
+
+    if refusal == "missing_target":
+        wait_for_target = claude_bridge._wait_for_tmux_info
+        monkeypatch.setattr(
+            claude_bridge,
+            "_wait_for_tmux_info",
+            lambda directory, **_kwargs: wait_for_target(directory, timeout_s=0.0),
+        )
+    else:
+        monkeypatch.setattr(
+            claude_bridge,
+            "_wait_for_tmux_info",
+            lambda *_a, **_k: {"socket_path": "/unused/socket", "tmux_target": "main"},
+        )
+    monkeypatch.setattr(claude_bridge, "_restore_occupied_input", lambda *_a, **_k: None)
+    monkeypatch.setattr(claude_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None)
+    monkeypatch.setattr(claude_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(claude_bridge, "_capture_pane", lambda *_a: pane)
+    monkeypatch.setattr(claude_bridge, "_has_approval_wait", lambda _bridge: prompt_pending)
+    monkeypatch.setattr(claude_bridge, "_PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr(claude_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(claude_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(claude_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "review this function"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    if refusal == "draft_persisted":
+        assert enters >= 1
+        assert pane == "❯ review this function"
+    else:
+        assert enters == int(submitted)
+    assert killed == []
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    expected_detail = {
+        "pending_prompt": "waiting for an explicit answer",
+        "draft_persisted": "draft is still in the input box",
+        "missing_target": "tmux target is not advertised",
+    }[refusal]
+    assert expected_detail in error.message
+    assert error.undelivered is (refusal != "pending_prompt" or not submitted)
+
+
+@pytest.mark.asyncio
 async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1824,6 +1919,7 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     # The turn still fails: the pane is gone either way.
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+    assert events[0].undelivered is True
 
     records = [r for r in caplog.records if "terminal exited" in r.getMessage()]
     assert len(records) == 1
@@ -1954,18 +2050,22 @@ async def test_run_turn_does_not_reap_unrelated_runtime_error(
 
     assert killed == []
     assert isinstance(events[0], ExecutorError)
+    assert events[0].message == "tmux send-keys failed"
+    assert events[0].undelivered is False
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [ClaudePromptTimeout, ClaudeTerminalExited])
 async def test_run_turn_reports_reap_failure_with_prompt_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    failure: type[ClaudePromptTimeout],
 ) -> None:
     """A failed hard-stop remains visible beside the delivery error."""
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
-        raise ClaudePromptTimeout("terminal did not become ready")
+        raise failure("terminal did not become ready")
 
     def fail_kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
         del bridge_dir_arg, timeout_s
@@ -1987,6 +2087,7 @@ async def test_run_turn_reports_reap_failure_with_prompt_timeout(
     assert isinstance(events[0], ExecutorError)
     assert "terminal did not become ready" in events[0].message
     assert "Cleanup also failed: tmux kill failed" in events[0].message
+    assert events[0].undelivered is True
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,12 @@ To provision a fresh sandbox per firing, set `execution_target: "managed_sandbox
 
 ## Schedules are RRULEs, not cron
 
+Agent calls to `sys_scheduled_task_create` and `sys_scheduled_task_update`
+require interactive approval before persisting future work. Review the agent,
+prompt, host and permission settings in that request. This also applies when
+the call inherits defaults. Direct changes you make in the UI or REST API keep
+their existing authorization rules.
+
 A schedule is an [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545) recurrence rule evaluated in the task's IANA timezone.
 
 | Intent | `rrule` |

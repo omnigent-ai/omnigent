@@ -17,6 +17,7 @@ vi.mock("./App", () => ({
       <div className="electron-drag-strip" />
       <div className="sidebar-header-row" />
       <div className="traffic-light-clearance" />
+      <div className="canvas-workspace" />
       <aside aria-label="Workspace" data-maximized="true">
         <div className="workspace-tab-strip" />
       </aside>
@@ -76,6 +77,7 @@ describe("macOS Electron embed", () => {
       "electron-drag-strip",
       "sidebar-header-row",
       "traffic-light-clearance",
+      "canvas-workspace",
       "workspace-tab-strip",
     ]) {
       const selector = selectorFor(`.${className}`);
@@ -97,5 +99,24 @@ describe("macOS Electron embed", () => {
     document.body.appendChild(outside);
     expect(outside.matches(controlsSelector)).toBe(false);
     outside.remove();
+  });
+});
+
+describe("embed color scheme", () => {
+  // The scope root resolves `color` from the light tokens, so the portal root
+  // must re-apply the foreground color for overlays to read dark-mode text.
+  it.each([
+    ["dark", true],
+    ["light", false],
+  ])("re-applies the foreground color on the %s portal root", (_name, isDarkMode) => {
+    render(
+      <MemoryRouter>
+        <OmnigentApp fetcher={fetcher} isDarkMode={isDarkMode} />
+      </MemoryRouter>,
+    );
+
+    const portalRoot = getEmbedRoot()!;
+    expect(portalRoot).toHaveClass("text-foreground");
+    expect(portalRoot.classList.contains("dark")).toBe(isDarkMode);
   });
 });

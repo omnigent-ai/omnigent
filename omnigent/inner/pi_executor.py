@@ -1576,17 +1576,18 @@ def _try_sandbox_pi(
         sandbox = resolve_sandbox(os_env, resolved_cwd)
         if not sandbox.active:
             return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
-        # Pi needs to read its own installation + node_modules.
-        pi_dir = pathlib.Path(pi_path).resolve().parent.parent
+        # Bundled and legacy CLIs both need their sibling npm dependencies.
+        executable = pathlib.Path(pi_path).resolve()
+        pi_dir = next(
+            (parent for parent in executable.parents if parent.name == "node_modules"),
+            executable.parent,
+        )
         sandbox = with_additional_read_roots(sandbox, [pi_dir])
-        # Pi writes to ~/.pi, /tmp, and $TMPDIR (on macOS $TMPDIR is a
-        # per-user dir under /var/folders/, not /tmp — grant both so
-        # PI_CODING_AGENT_DIR (created via tempfile.mkdtemp) is reachable.
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
-        sys_tmpdir = pathlib.Path(tempfile.gettempdir())
-        sandbox = with_additional_write_roots(sandbox, [home_pi, pathlib.Path("/tmp"), sys_tmpdir])
+        sandbox = with_additional_write_roots(sandbox, [home_pi])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-        launcher = create_exec_launcher(pi_path, sandbox)
+        # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
+        launcher = create_exec_launcher(str(executable), sandbox)
         return SandboxedPiCli(launch_path=launcher, sandboxed=True)
     except (OSError, ImportError, NotImplementedError) as exc:
         logger.warning("Could not apply sandbox for Pi: %s", exc)
@@ -2290,7 +2291,11 @@ class PiExecutor(Executor):
             is pinned (Pi picks its own default).
         """
         env = dict(self._env)
-        tmp_dir = tempfile.mkdtemp(prefix="omnigent_pi_")
+        tmp_parent = None
+        if self._sandboxed:
+            tmp_parent = pathlib.Path.home() / ".pi"
+            tmp_parent.mkdir(parents=True, exist_ok=True)
+        tmp_dir = tempfile.mkdtemp(prefix="omnigent_pi_", dir=tmp_parent)
         extra_args: list[str] = list(self._extra_args)
 
         if self._gateway:

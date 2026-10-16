@@ -71,14 +71,22 @@ def test_canvas_controls_clear_the_macos_titlebar(
     strip = page.locator(".electron-drag-strip").bounding_box()
     assert strip is not None
     titlebar_bottom = strip["y"] + strip["height"]
-    expand = page.get_by_role("navigation", name="Collapsed sidebar").get_by_role(
-        "button", name="Expand sidebar", exact=True
-    )
-    for control in (expand, heading):
+    expand = page.get_by_role("button", name="Open sidebar", exact=True)
+    expect(expand).to_have_count(1)
+    expect(page.get_by_role("navigation", name="Collapsed sidebar")).to_have_count(0)
+    for control in (expand, heading) if width < 768 else (heading,):
         bounds = control.bounding_box()
         assert bounds is not None and bounds["y"] >= titlebar_bottom, (
             f"Canvas control overlaps the native titlebar: {bounds}, bottom={titlebar_bottom}"
         )
+    if width >= 768:
+        expect(
+            page.locator(".electron-sidebar-header-actions").get_by_role(
+                "button", name="Open sidebar", exact=True
+            )
+        ).to_be_visible()
+        bounds = expand.bounding_box()
+        assert bounds and bounds["y"] + bounds["height"] <= titlebar_bottom
     expand.click()
     expect(page.get_by_test_id("canvas-nav")).to_be_visible()
     if width < 768:
@@ -89,12 +97,22 @@ def test_canvas_controls_clear_the_macos_titlebar(
         ).click()
     card = page.locator(f'.react-flow__node[data-id="{first}"]').get_by_test_id("session-card")
     card.click()
+    expect(expand).to_have_count(1)
     if width < 760:
         restore = page.get_by_role("button", name="Back to canvas", exact=True)
     else:
         page.get_by_role("button", name="Focus conversation", exact=True).click()
         restore = page.get_by_role("button", name="Show canvas beside conversation", exact=True)
     expect(restore).to_be_visible()
+    expect(expand).to_have_count(1)
+    expand.click()
+    expect(page.get_by_test_id("canvas-nav")).to_be_visible()
+    if width < 768:
+        page.get_by_test_id("sidebar-scrim").click(position={"x": width - 28, "y": 100})
+    else:
+        page.locator(".electron-sidebar-header-actions").get_by_role(
+            "button", name="Close sidebar", exact=True
+        ).click()
     bounds = restore.bounding_box()
     assert bounds is not None and bounds["y"] >= titlebar_bottom
     restore.click()
@@ -111,8 +129,7 @@ def test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions(
     _stub_server_info(page, canvas=True)
     page.goto(f"{base_url}/c/{first}")
     page.get_by_test_id("canvas-nav").click()
-    rail = page.get_by_role("navigation", name="Collapsed sidebar")
-    expect(rail).to_be_visible()
+    expect(page.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
     project = page.get_by_role("tab", name=re.compile("Canvas review"))
     project.click()
     cards = page.get_by_test_id("session-card")
@@ -146,7 +163,7 @@ def test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions(
         timeout=30_000
     )
     composer.fill("Keep this draft while I check another session")
-    page.get_by_role("button", name="Expand sidebar", exact=True).click()
+    page.get_by_role("button", name="Open sidebar", exact=True).click()
     expect(page.get_by_test_id("canvas-nav")).to_be_visible()
     second_card.click()
     expect(page.get_by_test_id("canvas-nav")).to_be_visible()
@@ -251,18 +268,27 @@ def test_canvas_stays_visible_when_workspace_opens(
     assert board.evaluate("element => element.isConnected")
 
 
+@pytest.mark.parametrize("width", [390, 767])
 def test_canvas_deep_link_and_mobile_return_keep_the_project(
     page: Page,
     canvas_project: tuple[str, str, str, str],
+    width: int,
 ) -> None:
     base_url, first, _second, project_id = canvas_project
     _stub_server_info(page, canvas=True)
-    page.set_viewport_size({"width": 390, "height": 844})
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(f"{base_url}/c/{first}")
+    menu = page.get_by_role("button", name="Open sidebar", exact=True)
+    expect(menu).to_be_visible()
+    ordinary_icon = menu.locator("svg").inner_html()
+    ordinary_bounds = menu.bounding_box()
+    assert ordinary_bounds is not None
+
     page.goto(f"{base_url}/canvas/c/{first}?canvas={project_id}")
     expect(page.get_by_label("Message the agent", exact=True)).to_be_visible()
     expect(page.get_by_role("region", name="Canvas pane", exact=True)).not_to_be_visible()
     page.get_by_role("button", name="Back to canvas", exact=True).click()
-    expect(page).to_have_url(re.compile(rf"/canvas\?canvas={project_id}$"))
+    expect(page).to_have_url(re.compile(rf"/canvas\?canvas={re.escape(project_id)}$"))
     expect(page.get_by_role("tab", name=re.compile("Canvas review"))).to_have_attribute(
         "aria-selected", "true"
     )
@@ -270,6 +296,30 @@ def test_canvas_deep_link_and_mobile_return_keep_the_project(
         "session-card"
     )
     expect(first_card).to_be_visible()
+    expect(page.get_by_role("navigation", name="Collapsed sidebar")).not_to_be_visible()
+    expect(menu).to_be_visible()
+    assert menu.locator("svg").inner_html() == ordinary_icon
+    board_bounds = menu.bounding_box()
+    assert board_bounds is not None
+    for key in ("x", "y", "width", "height"):
+        assert board_bounds[key] == pytest.approx(ordinary_bounds[key], abs=1)
+    menu.click()
+    expect(page.get_by_test_id("canvas-nav")).to_be_visible()
+    page.get_by_test_id("sidebar-scrim").click(position={"x": width - 28, "y": 100})
+    expect(menu).to_be_visible()
+
+    first_card.click()
+    expect(page.get_by_role("button", name="Back to canvas", exact=True)).to_be_visible()
+    expect(menu).to_be_visible()
+    assert menu.locator("svg").inner_html() == ordinary_icon
+    conversation_bounds = menu.bounding_box()
+    assert conversation_bounds is not None
+    for key in ("x", "y", "width", "height"):
+        assert conversation_bounds[key] == pytest.approx(ordinary_bounds[key], abs=1)
+    menu.click()
+    page.get_by_test_id("canvas-nav").click()
+    expect(page).to_have_url(re.compile(rf"/canvas\?canvas={re.escape(project_id)}$"))
+    expect(menu).to_be_visible()
     first_card.click()
     expect(page.get_by_role("button", name="Back to canvas", exact=True)).to_be_visible()
     page.reload()
@@ -277,4 +327,5 @@ def test_canvas_deep_link_and_mobile_return_keep_the_project(
     expect(page.get_by_role("tab", name=re.compile("Canvas review"))).to_have_attribute(
         "aria-selected", "true"
     )
+    expect(menu).to_be_visible()
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")

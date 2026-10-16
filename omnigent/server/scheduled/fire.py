@@ -58,6 +58,7 @@ from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
@@ -842,7 +843,9 @@ async def _own_task_agent(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
 async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
     """The bundle the kickoff runs, so the runner can tell when it later changes."""
     agent = await asyncio.to_thread(deps.agent_store.get, conv.agent_id) if conv.agent_id else None
-    return agent.bundle_location if agent is not None else None
+    return (
+        mcp_selection_revision(agent.bundle_location, conv.labels) if agent is not None else None
+    )
 
 
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:

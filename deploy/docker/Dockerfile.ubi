@@ -16,7 +16,9 @@ ARG PYTHON_VERSION=3.12
 ARG NODE_VERSION=22
 
 # ── Web UI builder ──────────────────────────────────────
-FROM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION} AS web-builder
+# Build-platform pinned like the standard Dockerfile's web-builder: the
+# bundle is arch-independent and the emulated arm64 web build has stalled.
+FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION} AS web-builder
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 

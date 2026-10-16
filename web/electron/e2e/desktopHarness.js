@@ -28,6 +28,8 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 
+const applicationsByWindow = new WeakMap();
+
 /** Repo root: web/electron/e2e → ../../.. */
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 /** The Electron app package root (its package.json `main` is src/main.js). */
@@ -393,7 +395,11 @@ async function launchDesktop(opts) {
   const profileBootstrap = path.join(userDataDir, "isolate-profile.cjs");
   fs.writeFileSync(
     profileBootstrap,
-    `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n`,
+    `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n` +
+      `const mod = require(${JSON.stringify(path.join(APP_ROOT, "src/browserViewRegistry.js"))});\n` +
+      `const create = mod.createBrowserViewRegistry;\n` +
+      `global.omnigentTestBrowserRegistries = [];\n` +
+      `mod.createBrowserViewRegistry = (...args) => { const registry = create(...args); global.omnigentTestBrowserRegistries.push(registry); return registry; };\n`,
   );
   const preloads = (opts.preload ?? []).flatMap((file) => ["-r", file]);
   const args = ["-r", profileBootstrap, ...preloads, APP_ROOT, `--user-data-dir=${userDataDir}`];
@@ -460,6 +466,7 @@ async function launchDesktop(opts) {
     await stopDisplayCapture();
     throw err;
   }
+  applicationsByWindow.set(window, electronApp);
   return { electronApp, window, userDataDir, stopDisplayCapture };
 }
 
@@ -514,7 +521,27 @@ function saveRecording(recordDir, name) {
   return saved;
 }
 
+/** Create a local fixture through main's test driver, outside renderer IPC. */
+async function openBrowserFixture(window, conversationId, url) {
+  const application = applicationsByWindow.get(window);
+  if (!application) throw new Error("Unknown desktop test window");
+  return application.evaluate(
+    (_electron, { conversationId: viewId, url: target }) => {
+      const registry = global.omnigentTestBrowserRegistries[0];
+      const { ok, error } = registry.openOrNavigate(viewId, target, {
+        x: 40,
+        y: 80,
+        width: 900,
+        height: 520,
+      });
+      return { ok, error };
+    },
+    { conversationId, url },
+  );
+}
+
 module.exports = {
+  openBrowserFixture,
   APP_ROOT,
   REPO_ROOT,
   WEB_UI_DIST,

@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,9 @@ from fastapi import FastAPI
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from omnigent.runner import app as _runner_app
 from omnigent.runner import create_runner_app
+from omnigent.runner import native as _runner_native
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
 from omnigent.terminals import TerminalRegistry
@@ -34,6 +36,43 @@ REAL_CODEX_REPROBED_LAUNCH_CATALOG = codex_native_app_server.codex_reprobed_laun
 
 # Project root: two parents up from this conftest (tests/runner/ → repo root).
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# ``omnigent.runner.app`` serves the private native helpers listed in
+# ``omnigent.runner.native.__all__`` through a module ``__getattr__`` that
+# forwards to the orchestration module, and its ``_native_builder`` wrappers
+# copy any *app-level* override of those names onto orchestration for the
+# duration of an ``_auto_create_*`` call. That keeps
+# ``monkeypatch.setattr(runner_app, "<helper>", ...)`` working — but
+# ``MonkeyPatch.undo`` restores the "old" value it read through ``__getattr__``
+# with a plain ``setattr``, which MATERIALIZES the pristine orchestration
+# function as a permanent ``runner_app`` global. From then on the wrapper sees
+# that stale original as an intentional override and clobbers any
+# orchestration-level patch a later test in the same xdist worker makes
+# (``test_codex_tui_recovery_preserves_live_control_plane`` failed exactly this
+# way whenever a test that patched ``runner_app._codex_native_launch_config``
+# had run first). Snapshot which forwarded names are absent from the app
+# module before any test runs, and drop whatever a test leaves behind.
+_FORWARDED_NATIVE_NAMES: frozenset[str] = frozenset(
+    name for name in _runner_native.__all__ if name not in vars(_runner_app)
+)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> Iterator[None]:
+    """Un-materialize native helpers leaked into ``omnigent.runner.app`` globals.
+
+    A hook wrapper (not an autouse fixture) so the scrub runs after *every*
+    fixture finalizer — including the ``monkeypatch`` undo that creates the
+    leak — regardless of fixture setup order.
+
+    :param item: The test item being torn down.
+    :param nextitem: The next scheduled item, if any (unused).
+    """
+    del item, nextitem
+    yield
+    for name in _FORWARDED_NATIVE_NAMES:
+        if name in vars(_runner_app):
+            delattr(_runner_app, name)
 
 
 @pytest.fixture(autouse=True)
