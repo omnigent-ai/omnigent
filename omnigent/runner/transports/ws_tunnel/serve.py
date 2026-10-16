@@ -47,6 +47,7 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runner.transports.ws_tunnel.frames import (
     EVENT_INGEST_CAPABILITY,
+    RUNNER_IDLE_SHUTDOWN_CLOSE_REASON,
     EventAckFrame,
     EventReadyFrame,
     HelloFrame,
@@ -1220,6 +1221,9 @@ async def _serve_tunnel_once(
                                 dispatch_tasks,
                                 on_graceful_shutdown,
                             )
+                            # Only the idle watchdog sets shutdown_event; tell the
+                            # server this exit attests no active work.
+                            await ws.close(code=1000, reason=RUNNER_IDLE_SHUTDOWN_CLOSE_REASON)
                             break
                         try:
                             raw = recv_task.result()
@@ -1279,8 +1283,8 @@ async def _graceful_drain(
        actually handed to ``ws.send`` (bounded — a wedged stream is left for
        the caller's ``_cancel_dispatch_tasks`` so it can't hang shutdown).
 
-    The caller then returns, and its ``async with websockets.connect`` closes
-    the socket with a normal close handshake. The handshake completing is the
+    The caller then closes the socket with a normal close handshake carrying
+    :data:`RUNNER_IDLE_SHUTDOWN_CLOSE_REASON`. The handshake completing is the
     confirmation the server read our frames (WebSocket/TCP ordering), which is
     what turns an abrupt ``runner_disconnected`` drop into a clean
     end-of-stream on the server relay. Tunneled-WS channels (browser terminal

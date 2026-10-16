@@ -1552,6 +1552,7 @@ def create_app(
             )
 
     from omnigent.runner.routing import RunnerRouter
+    from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
     from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
     from omnigent.server.host_registry import HostRegistry, RunnerExitReports
     from omnigent.server.routes._host_launch import configure_host_sharding
@@ -3479,7 +3480,7 @@ def create_app(
             pending.cancel()
 
     async def _mark_disconnected_runner_failed(
-        runner_id: str, reference_stamp: int | None
+        runner_id: str, reference_stamp: int | None, *, idle_shutdown: bool = False
     ) -> None:
         """Reconcile a dropped runner's sessions once the liveness lease expires.
 
@@ -3513,9 +3514,13 @@ def create_app(
             *runner_id*, captured in :func:`_on_runner_disconnect` before
             the clear — the reference the cross-replica check compares
             against.
+        :param idle_shutdown: Whether the runner closed with
+            ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``. Its idle watchdog found no
+            active work, so a stale mid-turn status is settled like a Stop.
         """
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
+            _intentional_stop_sessions,
             _mark_runner_sessions_offline,
             _relinquish_session_live_state,
             _runner_live_on_another_replica_from_conversations,
@@ -3567,11 +3572,27 @@ def create_app(
                 runner_id,
             )
             return
-        _logger.warning(
-            "Runner %s disconnected; reconciling %d bound session(s)",
-            runner_id,
-            len(affected),
-        )
+        if idle_shutdown:
+            # The sweep's stop path settles these to idle instead of failing them.
+            for conv in affected:
+                if conv.runner_id == runner_id and _intentional_stop_sessions.get(conv.id) is None:
+                    _intentional_stop_sessions[conv.id] = runner_id
+            _logger.info(
+                "Runner %s shut down with no active work; settling %d bound session(s)",
+                runner_id,
+                len(affected),
+                extra=debug_event(
+                    "runner_idle_shutdown",
+                    runner_id=runner_id,
+                    session_count=len(affected),
+                ),
+            )
+        else:
+            _logger.warning(
+                "Runner %s disconnected; reconciling %d bound session(s)",
+                runner_id,
+                len(affected),
+            )
         await _mark_runner_sessions_offline(
             affected,
             ErrorDetail(
@@ -3647,7 +3668,11 @@ def create_app(
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
         task = asyncio.create_task(
-            _mark_disconnected_runner_failed(runner_id, reference_stamp),
+            _mark_disconnected_runner_failed(
+                runner_id,
+                reference_stamp,
+                idle_shutdown=connection.peer_close_reason == RUNNER_IDLE_SHUTDOWN_CLOSE_REASON,
+            ),
             name=f"runner-disconnect-grace-{runner_id}",
         )
         _disconnect_grace_tasks[runner_id] = task
