@@ -113,9 +113,10 @@ YAML, and include **every** key below, even when empty (`""`, `[]`).
 - `outcome`:
   - `implemented`: every success condition in AGENTS.md holds, including the
     live Polly/OCR gate.
-  - `partially_implemented`: a PR exists but something is missing, such as a
-    blocked recording, an unresolved finding, or failing CI. Name each gap in
-    `remaining_work`.
+  - `partially_implemented`: the feature is built and committed but something
+    is missing, such as a blocked recording, an unresolved finding, failing CI,
+    or, in local-only and workflow-owned runs, the publication and PR review you
+    did not run. Name each gap in `remaining_work`.
   - `not_implemented`: you tried and could not build it; explain why.
   - `nothing_to_build`: already delivered; name the PR or commit.
   - `needs_split`: stopped before building because the ticket is too big;
@@ -140,7 +141,10 @@ YAML, and include **every** key below, even when empty (`""`, `[]`).
 - `impact_assessment`: as `otto-impact-assessment` describes.
 - `pr_url`, `pushed_branch`, `ci_status`, `polly_review`, `ocr_review`,
   `review_cycle`, `ui_preview`, `maintainer_review`: the publication state.
-  `review_cycle` must pass `review_cycle.py check` for `implemented`.
+  `review_cycle` must pass `review_cycle.py check` for `implemented`. A
+  local-only (`skip_push`) run leaves `pr_url` empty, sets `pushed_branch` to the
+  committed local branch for a human to push, and lists publishing and the PR
+  loop in `remaining_work`.
 - `reviewed_pr_url`, `review_fingerprint`, `handled_review_ids`,
   `last_pushed_sha`: set in `review_remediation` mode (with `reviewed_pr_url`
   and `pr_url` both the `review_pr` URL); otherwise `""` or `[]`. In this mode,

@@ -146,27 +146,38 @@ def test_feature_handoff_passes_the_shared_review_gate() -> None:
             ],
         ),
         (
+            "AGENTS.md",
+            [
+                "You do **not** merge or approve.",
+                "The target is always `omnigent-ai/omnigent`",
+                "re-record that CUJ's demo",
+            ],
+        ),
+        (
+            "feature-handoff",
+            [
+                "A local-only (`skip_push`) run leaves `pr_url` empty, sets `pushed_branch` "
+                "to the committed local branch",
+                "the publication and PR review you did not run",
+            ],
+        ),
+        (
             "feature-publish",
             [
                 "**ready for review, never a draft**",
                 "`<!-- omnigent-feature-managed -->`",
                 "Never approve or merge",
                 "**never** commit `recordings/`",
+                "leave `pr_url` empty",
             ],
         ),
     ],
 )
 def test_feature_procedures_keep_their_contract(skill: str, phrases: list[str]) -> None:
-    content = _normalized(_skills()[skill])
+    source = (_AGENT / skill).read_text(encoding="utf-8") if skill == "AGENTS.md" else None
+    content = _normalized(source or _skills()[skill])
     for phrase in phrases:
         assert _normalized(phrase) in content, phrase
-
-
-def test_feature_agent_never_merges_and_targets_omnigent() -> None:
-    agents = _normalized((_AGENT / "AGENTS.md").read_text(encoding="utf-8"))
-    assert "You do **not** merge or approve." in agents
-    assert "The target is always `omnigent-ai/omnigent`" in agents
-    assert "re-record that CUJ's demo" in agents
 
 
 def test_feature_agent_bundle_ships_the_shared_skills(tmp_path: Path) -> None:

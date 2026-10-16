@@ -30,7 +30,7 @@ coverage, never a clean result. In CI's checked-publication mode, record these
 as `review_failures` with the run URL, head and reason, or retain the host's
 request-failure receipt. They are warnings and do not require code changes.
 Continue checking product CI and dispositioning every real finding. CI's helper
-validates those conditions before allowing `fixed` with a review warning. Do not fall back to bot-authored slash comments.
+validates those conditions before allowing success (Resolve: `fixed`) with a review warning. Do not fall back to bot-authored slash comments.
 
 #### Collect complete, current-head feedback
 
@@ -134,12 +134,13 @@ justified against current code; they do not require meaningless edits to appease
 a reviewer. For ambiguous design intent, use the agent's investigation procedure
 (Resolve: `resolve-investigate`) to prepare a
 supported recommendation on the PR and complete independent work. A remaining
-design choice belongs in `remaining_work` with `partially_fixed`, not an
+design choice belongs in `remaining_work` with the agent's partial outcome
+(Resolve: `partially_fixed`), not an
 interactive question. Concrete blockers and an actual execution deadline still
 permit an early handoff. Preserve the head, review run links, findings,
 dispositions, and next actions; never call an incomplete state ready or clean.
 
-Before `fixed`, approval, or a ready-for-maintainer handoff, write the complete
+Before claiming success (Resolve: `fixed`), approval, or a ready-for-maintainer handoff, write the complete
 handoff to a local JSON file and run the live gate:
 
 ```bash

@@ -17,7 +17,9 @@ hook changed tested files, rerun their checks. If the checkout has
 ## Choose the publication mode
 
 - **Local-only (`skip_push: true`):** stop after committing. Report the branch in
-  `pushed_branch`; do not prepare a PR or drive one.
+  `pushed_branch` and leave `pr_url` empty; do not prepare a PR or drive one.
+  The outcome is `partially_implemented`, with publishing and the PR loop in
+  `remaining_work`.
 - **Workflow-owned (a CI publisher contract is appended to your instructions):**
   do not push or make any `gh` write. Write and validate `.omnigent/pr-body.md`
   (below), write the final handoff, and stop. The workflow publishes the PR and
