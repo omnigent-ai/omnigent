@@ -11,6 +11,7 @@ from omnigent.harnesses.diagnostics import (
     contains_sign_in_material,
     describe_pane_shape,
     detect_sign_in_prompt,
+    pane_shape_summary,
     sanitize_diagnostic_text,
     sign_in_next_step,
 )
@@ -459,7 +460,7 @@ _PANE_TEXT = "example-repo"
             {
                 "pane_state": "traceback",
                 "pane_lines": 3,
-                "pane_traceback_type": "json.decoder.JSONDecodeError",
+                "pane_traceback_type": "JSONDecodeError",
             },
         ),
         (
@@ -506,3 +507,34 @@ def test_describe_pane_shape_names_the_screen_without_its_text(
     shape = describe_pane_shape(screen)
     assert shape == expected
     assert _PANE_TEXT not in repr(shape)
+
+
+@pytest.mark.parametrize(
+    ("shape", "summary"),
+    [
+        ({}, ""),
+        ({"pane_state": "unreadable"}, " pane=unreadable"),
+        ({"pane_state": "blank", "pane_lines": 0}, " pane=blank lines=0"),
+        (
+            {"pane_state": "traceback", "pane_lines": 3, "pane_traceback_type": "JSONDecodeError"},
+            " pane=traceback(JSONDecodeError) lines=3",
+        ),
+    ],
+    ids=["none", "unreadable", "blank", "traceback"],
+)
+def test_pane_shape_summary_renders_the_labels_for_a_log_message(
+    shape: dict[str, object], summary: str
+) -> None:
+    assert pane_shape_summary(shape) == summary
+
+
+def test_describe_pane_shape_keeps_only_the_exception_class_name() -> None:
+    """A module path can name the person's own code, so only the class name is kept."""
+    screen = (
+        "Traceback (most recent call last):\n"
+        '  File "/srv/app/main.py", line 4\n'
+        f"{_PANE_TEXT.replace('-', '_')}.errors.LicenseError: expired\n"
+    )
+    shape = describe_pane_shape(screen)
+    assert shape["pane_traceback_type"] == "LicenseError"
+    assert _PANE_TEXT.replace("-", "_") not in repr(shape)

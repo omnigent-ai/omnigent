@@ -295,9 +295,16 @@ material is on screen: a sign-in address, or a line mentioning a code beside
 sign-in wording, even from a prompt the launcher has moved past. One-time codes
 therefore stay out of logs. The early
 record exists so a runner lost before the deadline, for example by a host
-restart, still leaves the pane on record. A pane that has already stopped is
-described by its exit records instead; with capture disabled these records stay
-content-free.
+restart, still leaves the pane on record. A pane that has already stopped keeps
+its tail with its exit records instead.
+
+With or without capture, these records (and `terminal_interactive_unobserved`
+for a pane that stopped first) also describe the screen without its text:
+`pane_state` is one of `unreadable`, `blank`, `traceback`, `yes_no_prompt`,
+`dialog`, `tui` or `text`, `pane_lines` counts the non-blank lines, and a Python
+traceback adds `pane_traceback_type`, the exception's class name. The same
+labels are appended to the log message, for example
+`pane=traceback(JSONDecodeError) lines=4`.
 
 ## Native turn failure evidence
 

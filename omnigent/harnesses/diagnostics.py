@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from omnigent.process_logging import redact_log_text
@@ -294,7 +295,7 @@ def describe_pane_shape(screen: str | None) -> dict[str, str | int]:
     :returns: ``pane_state``, one of ``unreadable``, ``blank``, ``traceback``,
         ``yes_no_prompt``, ``dialog``, ``tui`` or ``text``, plus ``pane_lines`` (the
         non-blank line count) for a readable pane. A traceback adds
-        ``pane_traceback_type``, e.g. ``"json.decoder.JSONDecodeError"``.
+        ``pane_traceback_type``, the exception's class name, e.g. ``"JSONDecodeError"``.
     """
     if screen is None:
         return {"pane_state": "unreadable"}
@@ -306,7 +307,8 @@ def describe_pane_shape(screen: str | None) -> dict[str, str | int]:
         shape["pane_state"] = "traceback"
         raised = _EXCEPTION_LINE.findall(screen.rsplit(_TRACEBACK_HEADER, 1)[1])
         if raised:
-            shape["pane_traceback_type"] = raised[-1][:80]
+            # The class name alone: a module path can name the person's own code.
+            shape["pane_traceback_type"] = raised[-1].rsplit(".", 1)[-1][:80]
     elif _YES_NO_PROMPT.search(screen):
         shape["pane_state"] = "yes_no_prompt"
     elif _KEY_HINT.search(screen):
@@ -316,3 +318,20 @@ def describe_pane_shape(screen: str | None) -> dict[str, str | int]:
     else:
         shape["pane_state"] = "text"
     return shape
+
+
+def pane_shape_summary(shape: Mapping[str, object]) -> str:
+    """
+    Render a :func:`describe_pane_shape` result for a log message, or ``""`` for none.
+
+    :param shape: The shape attributes, e.g. ``{"pane_state": "traceback", "pane_lines": 3,
+        "pane_traceback_type": "JSONDecodeError"}``.
+    :returns: e.g. ``" pane=traceback(JSONDecodeError) lines=3"``.
+    """
+    state = shape.get("pane_state")
+    if not state:
+        return ""
+    traceback_type = shape.get("pane_traceback_type")
+    summary = f" pane={state}({traceback_type})" if traceback_type else f" pane={state}"
+    lines = shape.get("pane_lines")
+    return f"{summary} lines={lines}" if lines is not None else summary

@@ -286,6 +286,44 @@ async def test_observer_describes_a_stalled_pane_without_capture(
         assert record.attributes["pane_lines"] == 2
         assert "terminal_last_output" not in record.attributes
         assert "Upgrade" not in record.getMessage()
+        # The local runner log renders only messages, so the labels ride on it too.
+        assert "pane=yes_no_prompt lines=2" in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_observer_describes_a_pane_that_stopped_before_it_was_interactive(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launcher that crashed leaves its traceback's class name, never its text."""
+    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
+    screen = (
+        "Traceback (most recent call last):\n"
+        '  File "/opt/launcher/settings.py", line 9, in load\n'
+        "json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)\n"
+        "Pane is dead (status 1)\n"
+    )
+    terminal = _FakeTerminal([screen], running=False)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        await _observe_terminal_interactive(
+            session_id="conv_crashed",
+            terminal_id="terminal_claude_main",
+            harness="claude-native",
+            readiness_signal="claude_composer",
+            instance=terminal,  # type: ignore[arg-type]
+            is_interactive=lambda _pane: False,
+            timeout_s=1.0,
+            poll_interval_s=0.0,
+        )
+
+    (record,) = [r for r in caplog.records if r.event_name == "terminal_interactive_unobserved"]
+    assert record.attributes["reason"] == "RuntimeError"
+    assert record.attributes["pane_state"] == "traceback"
+    assert record.attributes["pane_traceback_type"] == "JSONDecodeError"
+    # A stopped pane's text stays with its exit records, even with capture on.
+    assert "terminal_last_output" not in record.attributes
+    assert "Expecting value" not in record.getMessage()
 
 
 @pytest.mark.asyncio

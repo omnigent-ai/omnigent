@@ -394,6 +394,8 @@ async def _observe_terminal_interactive(
     By default the mark is ``_TERMINAL_INTERACTIVE_SLOW_S`` or a third of
     *timeout_s*, whichever is shorter; an explicit *slow_after_s* is used as given.
     """
+    from omnigent.harnesses.diagnostics import pane_shape_summary
+
     loop = asyncio.get_running_loop()
     started_at = loop.time()
     deadline = started_at + timeout_s
@@ -438,11 +440,12 @@ async def _observe_terminal_interactive(
                 # Most slow starts still succeed, so this stays below the deadline's WARNING.
                 _logger.info(
                     "Native terminal is not interactive yet: session=%s harness=%s "
-                    "terminal_id=%s waited_s=%.0f%s",
+                    "terminal_id=%s waited_s=%.0f%s%s",
                     session_id,
                     harness,
                     terminal_id,
                     loop.time() - started_at,
+                    pane_shape_summary(shape),
                     _pane_tail_message(tail),
                     extra=slow_event,
                 )
@@ -450,12 +453,14 @@ async def _observe_terminal_interactive(
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — observer failure must not fail session creation
-        # A stopped pane reports its final screen with the exit; a live one is read here.
-        tail, sign_in_prompt, shape = (
-            await _stalled_pane_diagnostics(instance)
-            if isinstance(exc, TimeoutError)
-            else (None, None, {})
-        )
+        # A live pane is read here in full. A stopped one keeps its tail with the exit
+        # records, but its text-free shape is read here, where every harness reports it.
+        if isinstance(exc, TimeoutError):
+            tail, sign_in_prompt, shape = await _stalled_pane_diagnostics(instance)
+        elif isinstance(exc, RuntimeError):
+            tail, sign_in_prompt, shape = None, None, await _stopped_pane_shape(instance)
+        else:
+            tail, sign_in_prompt, shape = None, None, {}
         unobserved_event = debug_event("terminal_interactive_unobserved", session_id=session_id)
         unobserved_event["attributes"] = {
             "harness": harness,
@@ -467,11 +472,12 @@ async def _observe_terminal_interactive(
         }
         _logger.warning(
             "Native terminal interactivity was not observed: session=%s harness=%s "
-            "terminal_id=%s reason=%s%s",
+            "terminal_id=%s reason=%s%s%s",
             session_id,
             harness,
             terminal_id,
             str(exc),
+            pane_shape_summary(shape),
             _pane_tail_message(tail),
             extra=unobserved_event,
         )
@@ -5726,6 +5732,17 @@ async def _stalled_pane_diagnostics(
         return None, False, {}
 
 
+async def _stopped_pane_shape(instance: TerminalInstance) -> dict[str, str | int]:
+    """Return the text-free shape of a pane that stopped before it was interactive."""
+    from omnigent.harnesses.diagnostics import describe_pane_shape
+
+    try:
+        return describe_pane_shape(await _read_pane_screen_or_none(instance))
+    except Exception:  # noqa: BLE001 — a diagnostics failure costs the shape, not the record
+        _logger.debug("Stopped pane shape failed for %s", instance.diagnostic_id, exc_info=True)
+        return {}
+
+
 class _CodexTerminalExited(RuntimeError):
     """The exact TUI stopped before its thread could be discovered."""
 
@@ -5847,6 +5864,7 @@ async def _record_agent_startup_pending(
         contains_sign_in_material,
         describe_pane_shape,
         detect_sign_in_prompt,
+        pane_shape_summary,
         sign_in_next_step,
     )
 
@@ -5883,19 +5901,27 @@ async def _record_agent_startup_pending(
         "sign_in_prompt_detected": prompt is not None,
         "code": code,
     }
-    attributes.update(describe_pane_shape(raw_screen))
-    # The pane is the only record of what holds startup, unless sign-in material is on it.
-    tail = None if contains_sign_in_material(screen) else _redacted_terminal_text(screen)
+    shape: dict[str, str | int] = {}
+    tail = None
+    try:
+        shape = describe_pane_shape(raw_screen)
+        # The pane is the only record of what holds startup, unless sign-in material is on it.
+        if not contains_sign_in_material(screen):
+            tail = _redacted_terminal_text(screen)
+    except Exception:  # noqa: BLE001 — a diagnostics failure costs the pane record, not the wait
+        _logger.debug("Codex pending pane diagnostics failed for %s", session_id, exc_info=True)
+    attributes.update(shape)
     if tail:
         attributes["terminal_last_output"] = tail
     pending_event["attributes"] = attributes
     _logger.warning(
         "Codex TUI for %s has not started a thread after %.0fs but its pane is alive; "
-        "recorded %s and waiting without a deadline%s%s",
+        "recorded %s and waiting without a deadline%s%s%s",
         session_id,
         waited_seconds,
         code,
         " (a sign-in prompt is on screen)" if prompt is not None else "",
+        pane_shape_summary(shape),
         _pane_tail_message(tail),
         extra=pending_event,
     )
