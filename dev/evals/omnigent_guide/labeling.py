@@ -9,7 +9,6 @@ from __future__ import annotations
 import csv
 import json
 import random
-import secrets
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -83,7 +82,7 @@ def write_blind_sample(
     md = ["# Blind sample", "", "Labels go in `labels.csv`. See `README.md`.", ""]
     rows: list[list[str]] = []
     for run in chosen:
-        item = secrets.token_hex(4)
+        item = f"{rng.getrandbits(32):08x}"  # seeded, so the sample is reproducible
         case = cases[run.record.case_id]
         key[item] = {
             "harness": run.record.harness,
@@ -92,10 +91,9 @@ def write_blind_sample(
             "run_index": run.record.run_index,
         }
         md += [f"## Item {item}", "", f"**Question:** {case.prompt}", "", "**Answer:**", ""]
-        md += [
-            f"> {line}" if line else ">"
-            for line in (run.record.answer or "(no answer)").splitlines()
-        ]
+        # The sample goes to someone else: hide this machine's home directory.
+        answer = (run.record.answer or "(no answer)").replace(str(Path.home()), "~")
+        md += [f"> {line}" if line else ">" for line in answer.splitlines()]
         md += ["", "**Criteria:**", ""]
         # The run's own criteria: only those that hold for its build's version.
         for crit in run.criteria:

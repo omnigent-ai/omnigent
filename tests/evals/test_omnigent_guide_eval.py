@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -85,7 +86,9 @@ def test_referee_checks_commands_and_flags_against_the_cli(referee: Referee) -> 
             "omnigent upgrade --latest\n```",
             "There is no `omnigent schedule` command.",
             "`omnigent claude --dangerously-skip-permissions` forwards the flag.",
-            'Run `omnigent host https://omni.example.com`, or wrap it: `omnigent "$@"`.',
+            'Run `omnigent host https://omni.example.com`, or wrap it: `omnigent "$@"`. '
+            "You run `omnigent 0.19.0.dev0`; `omnigent config set KEY=VALUE` sets a default. "
+            "Logs: `omnigent server 2>&1 | tee log`. See omnigent/docs/POLICIES.md.",
         ]
     )
 
@@ -113,8 +116,11 @@ def test_referee_loads_yaml_through_the_spec_loaders(referee: Referee) -> None:
 
     assert [f.text for f in invented.fabrications] == ["os_env.sandbox.network"]
     assert [f.kind for f in bad_value.findings] == ["config_value"]
-    # A bundle config.yaml takes policies under guardrails; the parser ignores this one.
-    assert [f.text for f in bundle_policies.fabrications] == ["policies"]
+    # A bundle config.yaml takes policies under guardrails: a real key in the wrong place.
+    assert not bundle_policies.fabrications
+    assert [(f.kind, f.text) for f in bundle_policies.findings] == [
+        ("config_misplaced", "policies")
+    ]
     assert not fragment.findings and "os_env.sandbox.allow_network" in fragment.config_paths
 
 
@@ -144,7 +150,9 @@ def test_referee_checks_user_config_keys_by_reader_names(referee: Referee) -> No
         [
             "Add the agent under `acp.agents`, set `runner.zz_invented_leaf`, and read "
             "`os.environ` as usual. The Docker image reads `OMNIGENT_ARTIFACT_URI`.\n"
-            "```yaml\nproviders:\n  my-gateway:\n    kind: gateway\n    zz_invented_field: 1\n```"
+            "```yaml\nproviders:\n  my-gateway:\n    kind: gateway\n"
+            "    zz_invented_field: 1\n```\n"
+            "A provider entry:\n```yaml\nname: my-gateway\nkind: gateway\nbase_url: https://x\n```"
         ]
     )
 
@@ -154,6 +162,22 @@ def test_referee_checks_user_config_keys_by_reader_names(referee: Referee) -> No
         ("config_key", "runner.zz_invented_leaf"),
         ("config_key", "providers.my-gateway.zz_invented_field"),
     }
+
+
+def test_referee_reports_names_from_a_newer_build_as_version_mismatches(referee: Referee) -> None:
+    commands = {k: v for k, v in referee.surface.cli["commands"].items() if k != "upgrade"}
+    older = Surface.from_json(
+        {**referee.surface.to_json(), "cli": {**referee.surface.cli, "commands": commands}}
+    )
+    (review,) = Referee(older, referee.python, latest=referee.surface).review(
+        ["Run `omnigent upgrade`, then `omnigent zz-nothing`."]
+    )
+
+    assert {(f.kind, f.text) for f in review.findings} == {
+        ("version_mismatch", "command: omnigent upgrade"),
+        ("command", "omnigent zz-nothing"),
+    }
+    assert [f.text for f in review.fabrications] == ["omnigent zz-nothing"]
 
 
 class _FakeJudge:
@@ -297,7 +321,7 @@ def test_blind_sample_hides_arms_and_round_trips(tmp_path: Path) -> None:
     write_blind_sample(runs, cases, tmp_path, size=2, seed=1)  # type: ignore[arg-type]
 
     sample = (tmp_path / "sample.md").read_text()
-    assert "a0" not in sample and "a3" not in sample
+    assert not re.search(r"\ba[03]\b", sample)
     rows = list(csv.reader((tmp_path / "labels.csv").open()))
     key = json.loads((tmp_path / "key.json").read_text())
     for row in rows[1:]:

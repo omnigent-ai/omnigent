@@ -67,6 +67,17 @@ def doc_sources(runs: Sequence[GradedRun], version: str) -> dict[str, float]:
     return {key: counts[key] / len(runs) for key in _SOURCE_KEYS}
 
 
+_INVENTED_TOOL_RE = re.compile(r"Tool (.+?) not found in agent")
+
+
+def invented_tool(run: GradedRun) -> str | None:
+    """The tool name a failed turn called that the agent does not have, if any."""
+    if run.record.status != "failed":
+        return None
+    match = _INVENTED_TOOL_RE.search(str(run.record.error or ""))
+    return match.group(1).split("\n")[0].strip() if match else None
+
+
 def failure_breakdown(runs: Sequence[GradedRun]) -> dict[str, float | None]:
     """Where the lost score sits: answers with a fabrication versus the rest."""
     scored = [(r, r.score) for r in runs if r.score is not None]
@@ -124,6 +135,12 @@ def _arm_summary(
         "yaml_invalid": mean_of(metrics["yaml_invalid"], positives),
         "doc_sources": doc_sources(pos, version),
         "failure_breakdown": failure_breakdown(pos),
+        "invented_tool": (sum(invented_tool(r) is not None for r in pos) / len(pos))
+        if pos
+        else None,
+        "invented_tool_names": dict(
+            Counter(name for r in pos if (name := invented_tool(r))).most_common(10)
+        ),
         "fabrication_kinds": dict(kinds.most_common()),
         "tokens": fmean(tokens) if tokens else None,
         "seconds": fmean(r.record.duration_s for r in ok) if ok else None,
@@ -182,12 +199,9 @@ def write_report(
             }
             metrics = {arm: per_case(rs, cases) for arm, rs in arm_runs.items()}
             comparisons = []
-            wanted = [
-                f"{arm}:{baseline}"
-                for arm in sorted(arm_runs)
-                if arm != baseline and not any(p.startswith(f"{arm}:") for p in pairs)
-            ]
-            for pair in [*wanted, *pairs]:
+            # Explicit pairs replace the default of every arm against the baseline.
+            wanted = pairs or [f"{arm}:{baseline}" for arm in sorted(arm_runs) if arm != baseline]
+            for pair in wanted:
                 arm, _, base = pair.partition(":")
                 if arm not in metrics or base not in metrics:
                     continue
@@ -237,9 +251,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             lines += [
                 f"### {split} split, {harness}",
                 "",
-                "| Arm | Cases | Pass rate | Fabricated | Guide loaded "
+                "| Arm | Cases | Pass rate | Fabricated | Invented tool call | Guide loaded "
                 "| Loaded on near misses | Invalid YAML | Tokens | Infra errors |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
             ]
             for arm, s in data["arms"].items():
                 tokens = "—" if s["tokens"] is None else f"{s['tokens'] / 1000:.1f}k"
@@ -248,6 +262,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                     str(s["cases"]),
                     _pct(s["score"]),
                     _pct(s["fabricated"]),
+                    _pct(s["invented_tool"]),
                     _pct(s["loaded"]),
                     _pct(s["false_loads"]),
                     _pct(s["yaml_invalid"]),

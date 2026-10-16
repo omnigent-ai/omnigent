@@ -83,6 +83,32 @@ _FILE_SUFFIXES = (
     ".html",
     ".js",
     ".ts",
+    # Executables, packages, and other files an answer may name.
+    ".exe",
+    ".bat",
+    ".cmd",
+    ".ps1",
+    ".app",
+    ".dmg",
+    ".deb",
+    ".rpm",
+    ".msi",
+    ".whl",
+    ".zip",
+    ".gz",
+    ".tgz",
+    ".cfg",
+    ".ini",
+    ".conf",
+    ".plist",
+    ".lock",
+    ".pid",
+    ".sock",
+    ".jsonl",
+    ".csv",
+    ".env",
+    ".pem",
+    ".manifest",
 )
 _PLACEHOLDER_RE = re.compile(r"^(<.*>|\{.*\}|\[.*\]|\.\.\.|…|\$\{?\w+\}?|X+|N)$")
 _NEGATION_RE = re.compile(
@@ -157,6 +183,7 @@ class Surface:
     config_set_keys: frozenset[str] = frozenset()
     spec_root_keys: frozenset[str] = frozenset()
     string_literals: frozenset[str] = frozenset()
+    spec_literals: frozenset[str] = frozenset()
 
     @classmethod
     def probe(cls, python: Path, *, source: Path) -> Surface:
@@ -178,6 +205,7 @@ class Surface:
             harnesses=frozenset(facts["harnesses"]),
             env_vars=frozenset(facts["env_vars"]) | _deploy_env_vars(source, files),
             string_literals=frozenset(facts.get("string_literals", ())),
+            spec_literals=frozenset(facts.get("spec_literals", ())),
             repo_paths=frozenset(files),
             config_set_keys=frozenset(facts.get("config_set_keys", ())),
             spec_root_keys=frozenset(facts["spec_root_keys"]),
@@ -193,6 +221,7 @@ class Surface:
             "harnesses": sorted(self.harnesses),
             "env_vars": sorted(self.env_vars),
             "string_literals": sorted(self.string_literals),
+            "spec_literals": sorted(self.spec_literals),
             "repo_paths": sorted(self.repo_paths),
             "config_set_keys": sorted(self.config_set_keys),
             "spec_root_keys": sorted(self.spec_root_keys),
@@ -208,6 +237,7 @@ class Surface:
             harnesses=frozenset(raw["harnesses"]),
             env_vars=frozenset(raw["env_vars"]),
             string_literals=frozenset(raw.get("string_literals", ())),
+            spec_literals=frozenset(raw.get("spec_literals", ())),
             repo_paths=frozenset(raw["repo_paths"]),
             config_set_keys=frozenset(raw.get("config_set_keys", ())),
             spec_root_keys=frozenset(raw.get("spec_root_keys", ())),
@@ -351,6 +381,9 @@ def _looks_like_shell(body: str) -> bool:
 # ── CLI ─────────────────────────────────────────────────────────────────
 
 
+_REDIRECT_RE = re.compile(r"^(\d?>>?|&>|<|\d>&\d)")
+
+
 def _segments(line: str) -> Iterable[list[str]]:
     line = re.sub(r"^\s*[$%>]\s*", "", line)
     line = re.split(r"\s+#", line, maxsplit=1)[0]
@@ -359,6 +392,8 @@ def _segments(line: str) -> Iterable[list[str]]:
             tokens = shlex.split(part)
         except ValueError:
             tokens = part.split()
+        redirect = next((i for i, t in enumerate(tokens) if _REDIRECT_RE.match(t)), None)
+        tokens = tokens[:redirect]
         while tokens and (
             ("=" in tokens[0] and not tokens[0].startswith("-")) or tokens[0] in _WRAPPERS
         ):
@@ -370,8 +405,12 @@ def _segments(line: str) -> Iterable[list[str]]:
 
 
 def _is_placeholder(token: str) -> bool:
+    # Upper-case words (`KEY`, `URL`, `HOST_ID`) stand for values: real names are lower case.
     return (
-        bool(_PLACEHOLDER_RE.match(token)) or token.startswith(("<", "$")) or token.endswith(">")
+        bool(_PLACEHOLDER_RE.match(token))
+        or token.startswith(("<", "$"))
+        or token.endswith(">")
+        or bool(re.fullmatch(r"[A-Z][A-Z0-9_]*", token))
     )
 
 
@@ -380,6 +419,7 @@ def _url_or_path(token: str) -> bool:
     return (
         "://" in token
         or token.startswith(("/", "./", "~"))
+        or ("/" in token and not token.startswith("-"))
         or bool(re.match(r"^[\w.-]+\.[a-z]{2,}(:\d+)?(/|$)|^[\w.-]+:\d+(/|$)", token))
     )
 
@@ -412,6 +452,8 @@ def _walk_cli(
             continue
         if node["commands"]:
             sub = node["commands"].get(token)
+            if sub is None and re.fullmatch(r"v?\d+(\.\d+)+\S*", token):
+                break  # version output, e.g. `omnigent 0.19.0.dev0`
             if sub is None and _url_or_path(token):
                 continue  # a group that takes a URL, e.g. `omnigent host https://...`
             if sub is None:
@@ -490,9 +532,17 @@ class Referee:
         ``"/docs/policies/overview"``; empty skips omnigent.ai link checks.
     """
 
-    def __init__(self, surface: Surface, python: Path, site_routes: Iterable[str] = ()) -> None:
+    def __init__(
+        self,
+        surface: Surface,
+        python: Path,
+        site_routes: Iterable[str] = (),
+        latest: Surface | None = None,
+    ) -> None:
         self.surface = surface
         self.python = python
+        # The newest build: names it has but this build lacks are version mismatches.
+        self.latest = latest
         # Routes in the omnigent.ai source repo; empty skips omnigent.ai checks.
         self.site_routes = frozenset(site_routes) | (_SITE_EXTRAS if site_routes else frozenset())
 
@@ -552,6 +602,8 @@ class Referee:
                         Finding("env_var", name, "the package never reads it", negated)
                     )
             for doc in set(_DOC_PATH_RE.findall(_URL_RE.sub(" ", answer))):
+                if doc.startswith("omnigent/") and doc not in self.surface.repo_paths:
+                    doc = doc[len("omnigent/") :]
                 if doc not in self.surface.repo_paths:
                     review.findings.append(Finding("doc_path", doc, "not in the source tree"))
             for url in set(_URL_RE.findall(answer)):
@@ -562,7 +614,8 @@ class Referee:
                 if not _DOTTED_KEY_RE.match(span) or span.endswith(_FILE_SUFFIXES):
                     continue
                 if span.startswith("omnigent."):
-                    pyrefs.append((index, span))
+                    if ".exe" not in span:  # `omnigent.exe` is a program, not a module
+                        pyrefs.append((index, span))
                     continue
                 root = span.split(".", 1)[0]
                 if root in USER_CONFIG_ROOTS:
@@ -597,7 +650,7 @@ class Referee:
                     )
                     continue
                 if not self._is_agent_config(block):
-                    self._check_user_config_block(review, block)
+                    self._check_other_config(review, block)
                     continue
                 # Without spec_version the block may be a single-file agent or a
                 # bundle config.yaml shown without its header; accept either.
@@ -624,7 +677,34 @@ class Referee:
             for (index, ref), ok in zip(pyrefs, found, strict=True):
                 if not ok:
                     reviews[index].findings.append(Finding("python_ref", ref, "does not import"))
+        if self.latest is not None:
+            for review in reviews:
+                review.findings = [self._version_mismatch(f) for f in review.findings]
         return reviews
+
+    def _version_mismatch(self, finding: Finding) -> Finding:
+        """Reclassify a finding the latest build does not share."""
+        latest = self.latest
+        assert latest is not None
+        exists = False
+        if finding.kind in ("command", "option"):
+            tokens = finding.text.split()[1:]
+            _path, _options, problems = _walk_cli(tokens, latest.cli)
+            exists = not problems
+        elif finding.kind == "tool":
+            exists = finding.text in latest.tools
+        elif finding.kind == "env_var":
+            exists = finding.text in latest.env_vars
+        elif finding.kind == "doc_path":
+            exists = finding.text in latest.repo_paths
+        elif finding.kind == "harness":
+            exists = finding.text in latest.harnesses
+        if not exists:
+            return finding
+        detail = f"exists in {latest.version}, not in this build"
+        return Finding(
+            "version_mismatch", f"{finding.kind}: {finding.text}", detail, finding.negated
+        )
 
     def validate_key(
         self, kind: str, values: Sequence[str], options: Sequence[str] = ()
@@ -680,9 +760,11 @@ class Referee:
                 return part
         return None
 
-    def _check_user_config_block(self, review: Review, block: Mapping[str, Any]) -> None:
-        """Check the leaf keys of a ``~/.omnigent/config.yaml`` block against reader names."""
-        roots = {str(k) for k in block} & USER_CONFIG_ROOTS
+    def _check_user_config_block(
+        self, review: Review, block: Mapping[str, Any], roots: frozenset[str] | None = None
+    ) -> None:
+        """Check the leaf keys of a user or server config block against reader names."""
+        roots = {str(k) for k in block} & (USER_CONFIG_ROOTS if roots is None else roots)
         if not roots:
             return
         for root in sorted(roots):
@@ -695,7 +777,17 @@ class Referee:
                 else:
                     review.config_paths.add(path)
 
+    def _check_other_config(self, review: Review, block: Mapping[str, Any]) -> None:
+        if _is_provider_entry(block):
+            self._check_user_config_block(review, {"providers": {"entry": block}})
+        elif _is_server_sandbox(block):
+            self._check_user_config_block(review, block, frozenset({"sandbox"}))
+        else:
+            self._check_user_config_block(review, block)
+
     def _is_agent_config(self, block: Mapping[str, Any]) -> bool:
+        if _is_provider_entry(block) or _is_server_sandbox(block):
+            return False
         keys = {str(k) for k in block}
         user_roots = USER_CONFIG_ROOTS - {"server", "host", "model", "harness"}
         if keys & {
@@ -736,7 +828,7 @@ class Referee:
                     reviews[index].yaml_invalid += 1
                 for key in result["unread"]:
                     reviews[index].findings.append(
-                        Finding("config_key", key, f"never read in {parents[0]}")
+                        Finding(self._key_kind(key), key, f"never read in {parents[0]}")
                     )
                 if result["error"]:
                     reviews[index].findings.append(
@@ -753,7 +845,12 @@ class Referee:
                 reviews[index].config_paths.add(span)
             else:
                 reviews[index].findings.append(
-                    Finding("config_key", span, "never read by the spec parser", negated == "True")
+                    Finding(
+                        self._key_kind(span),
+                        span,
+                        "never read by the spec parser",
+                        negated == "True",
+                    )
                 )
         for (index, _block_index), candidates in by_block.items():
             review = reviews[index]
@@ -779,7 +876,7 @@ class Referee:
                         key[len(prefix) + 1 :] if prefix and key.startswith(prefix + ".") else key
                     )
                     review.findings.append(
-                        Finding("config_key", shown, "never read by the spec parser")
+                        Finding(self._key_kind(shown), shown, "never read by the spec parser")
                     )
                 continue
             # Every placement failed to load; keys after the failure were never
@@ -795,12 +892,31 @@ class Referee:
                     Finding("config_error", error[:200], "load failed; cause unclear")
                 )
 
+    def _key_kind(self, dotted: str) -> str:
+        """``config_key`` for a key name no reader uses; ``config_misplaced`` otherwise.
+
+        A real key name in the wrong place (a single-file key in a bundle, a
+        server setting in an agent config) is an invalid config, not an
+        invented name.
+        """
+        leaf = re.sub(r"\[\d+\]$", "", dotted.split(".")[-1])
+        vocabulary = self.surface.spec_literals or self.surface.string_literals
+        if vocabulary and leaf in vocabulary:
+            return "config_misplaced"
+        if "_" in leaf and leaf in self.surface.string_literals:
+            return "config_misplaced"
+        return "config_key"
+
     def _check_names(self, review: Review, block: Mapping[str, Any]) -> None:
         tools = block.get("tools")
         builtins = tools.get("builtins") if isinstance(tools, Mapping) else None
         for entry in builtins if isinstance(builtins, list) else []:
             name = entry.get("name") if isinstance(entry, Mapping) else entry
-            if isinstance(name, str) and name not in self.surface.spec_builtins:
+            if (
+                isinstance(name, str)
+                and not _is_placeholder(name)
+                and name not in self.surface.spec_builtins
+            ):
                 review.findings.append(Finding("builtin", name, "not a builtin a spec can enable"))
         executor = block.get("executor")
         if isinstance(executor, Mapping):
@@ -808,7 +924,12 @@ class Referee:
             harness = executor.get("harness") or (
                 config.get("harness") if isinstance(config, Mapping) else None
             )
-            if isinstance(harness, str) and harness not in self.surface.harnesses:
+            if (
+                isinstance(harness, str)
+                and not _is_placeholder(harness)
+                and not harness.startswith("acp:")
+                and harness not in self.surface.harnesses
+            ):
                 review.findings.append(Finding("harness", harness, "not a known harness"))
 
     # ── URLs ────────────────────────────────────────────────────────────
@@ -853,6 +974,25 @@ USER_CONFIG_ROOTS = frozenset(
         "acp",
     }
 )
+
+
+def _is_provider_entry(block: Mapping[str, Any]) -> bool:
+    """A provider entry from ``~/.omnigent/config.yaml`` shown without its ``providers:`` key."""
+    keys = {str(k) for k in block}
+    provider_keys = {"base_url", "api_key_ref", "api_key", "cli", "families", "models"}
+    agent_keys = {"prompt", "instructions", "spec_version", "executor"}
+    return "kind" in keys and bool(keys & provider_keys) and not keys & agent_keys
+
+
+def _is_server_sandbox(block: Mapping[str, Any]) -> bool:
+    """The server's ``sandbox:`` section, which names a provider; an agent's names a type."""
+    sandbox = block.get("sandbox")
+    return (
+        {str(k) for k in block} == {"sandbox"}
+        and isinstance(sandbox, Mapping)
+        and "provider" in sandbox
+        and "type" not in sandbox
+    )
 
 
 def _leaf_paths(node: Any, prefix: str) -> list[str]:

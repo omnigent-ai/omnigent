@@ -8,21 +8,25 @@ built from an sdist, the way releases are built.
 ## Questions
 
 `questions.yaml` holds real questions, mined from GitHub issues and
-discussions and from one user's Omnigent session history (paraphrased and
-scrubbed). The 269 questions were embedded, clustered with k-means
-(`sample.py`), and drawn at random within clusters in proportion to cluster
-size. A drawn question was replaced by the next draw from its cluster only
-when the code and docs do not establish an answer: a bug whose only answer is
-a code fix, a question about the asker's private state, a question about
-another product, or a duplicate. Near misses are real questions about other
-tools, used to measure loading the guide when it is not needed.
+discussions (235) and from one user's Omnigent session history (34,
+paraphrased and scrubbed). The 269 questions were embedded, clustered with
+k-means into 14 clusters (`sample.py`), and 60 were drawn at random within
+clusters in proportion to cluster size. A drawn question was replaced by the
+next draw from its cluster only when the code and docs do not establish an
+answer: a bug whose only answer is a code fix or which release fixed it, a
+question about the asker's private state, a question about another product,
+or a duplicate. `questions_skipped.yaml` lists the 18 replacements and why.
+One cluster ran out, so 59 questions remain. 19 near misses, real questions
+about other tools, measure loading the guide when it is not needed.
 
 Each question's criteria come from the code, with a file and line per
-criterion. A criterion with a `check` is decided by code; the rest by two LLM
-judges from different model families. `questions.lock` freezes the test split;
-`run.py sessions --split test` refuses to run if the split changed, and runs
-each (arm, case, repeat) once. `cases.yaml` is the earlier hand-written set,
-kept for regression.
+criterion; criteria that differ between releases carry a `versions` range.
+A criterion with a `check` is decided by code; the rest by two LLM judges
+from different model families, which also grade the checked criteria so the
+two can be compared. `questions.lock` freezes the 56-case test split (43
+questions, 13 near misses) before any test session runs; `run.py sessions
+--split test` refuses to run if the split changed. `cases.yaml` is the
+earlier hand-written set, kept for regression.
 
 ## The referee
 
@@ -62,31 +66,50 @@ gateway credentials available (a Databricks profile):
 
 ```sh
 run.py() { uv run --no-sync python -m dev.evals.omnigent_guide.run "$@"; }
-run.py freeze --arms OUT/arms.json --out RESULTS          # once, before any test run
-run.py sessions --arms OUT/arms.json --out RESULTS --split dev --runs 1 \
+run.py freeze --arms OUT/arms.json --validate-on a3 --validate-on s3  # once, before any test run
+run.py sessions --arms OUT/arms.json --out RESULTS --split test --runs 2 \
   --harness openai-agents --arm a0 --arm a3 --model databricks-qwen35-122b-a10b --profile dev
+run.py sessions --arms NATIVE_ARMS.json --out RESULTS --split test --runs 1 \
+  --harness claude-native --arm a0 --arm a3
 run.py grade --arms OUT/arms.json --out RESULTS --profile dev --site-routes routes.txt \
   --judge llama=databricks-llama-4-maverick --judge gptoss=databricks-gpt-oss-120b
-run.py report --arms OUT/arms.json --out RESULTS --baseline a0 --pair t3:t0 --pair s3:s0
-run.py blind --out RESULTS        # sample for a maintainer to label
+run.py report --arms OUT/arms.json --out RESULTS --pair a3:a0 --pair a1:a0 --pair a2:a1 \
+  --pair a3:a2 --pair a4:a3 --pair t3:t0 --pair s3:s0
+run.py blind --out RESULTS --size 40   # sample for a maintainer to label
 run.py agreement --out RESULTS --labels RESULTS/blind/labels.csv
 ```
 
-`report` pairs each arm with the baseline by case and gives 95% bootstrap
-intervals over cases for the pass rate, the fabrication rate, and how often
-the guide loaded.
+`sessions` runs each (arm, case, repeat) once and retries only infrastructure
+errors: gateway auth failures, rate limits, timeouts, and stacks that fail to
+start. `report` pairs arms by case and gives 95% bootstrap intervals over
+cases for the pass rate, the fabrication rate, and how often the guide
+loaded. It also shows where agents looked things up (docs pinned to their own
+release tag, main, `llms.txt`, CLI help) and how much lost score sits in
+answers with a fabrication.
+
+`routes.txt` lists omnigent.ai paths, one per line, from the site's source
+repository: its pages (`app/**/page.*`, `public/`) and the literal redirect
+sources in `next.config.mjs` (for example `/install.sh`).
 
 ## Environment
 
 - openai-agents runs give the agent's shell a `darwin_seatbelt` sandbox: it
   can run the arm's CLI and write only to its workspace and a scratch data
-  dir, and it cannot signal other processes. Without that, `omnigent stop`
-  in an agent's shell would stop whatever server answers on port 6767. Arm a4
-  sets `allow_network: false`; the runner keeps its own gateway connection.
+  dir, and it cannot read the rest of the home directory or signal other
+  processes (`omnigent stop` would otherwise stop whatever server answers on
+  port 6767). Arm a4 sets `allow_network: false`; the runner keeps its own
+  gateway connection.
+- The gateway limits input tokens per minute for each model, and an agent
+  resends its context on every tool call, so more than two parallel lanes
+  mostly trade sessions for rate-limit retries.
 - claude-native runs use Claude Code's own login (a scratch Omnigent config
-  with only a subscription provider), launch with `--permission-mode dontAsk`
-  and an allowed-tools list, and load no user settings (`skills: none`).
-  They cannot use the sandbox, so `shims/` refuses commands that would change
-  the machine. Managed Claude Code settings on the machine still apply: for
-  example, a hook that blocks `curl` to hosts outside an allowlist also
-  blocks the guide's docs fetches.
+  with only a subscription provider) and load no user settings
+  (`skills: none`). They cannot use the sandbox, so they launch with
+  `--permission-mode dontAsk`, a short allowed-tools list, and deny rules for
+  `~/Repositories`, `~/.omnigent`, and `~/.claude`; `shims/` refuses commands
+  that would change the machine. Install the claude-native arms outside the
+  checkout (for example under `~/.cache`) so `which omnigent` does not point
+  at it, and pass them in their own arms file.
+- Managed Claude Code settings on the machine still apply. For example, a
+  hook that blocks `curl` to hosts outside an allowlist also blocks the
+  guide's docs fetches in claude-native runs.

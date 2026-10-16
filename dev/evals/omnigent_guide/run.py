@@ -26,10 +26,13 @@ import argparse
 import concurrent.futures
 import dataclasses
 import datetime
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -79,6 +82,17 @@ def is_infra_error(error: str | None) -> bool:
 
 
 _SHIMS = Path(__file__).with_name("shims")
+
+
+def _copy_shims() -> Path:
+    """The guard shims in a fresh directory outside the checkout."""
+    target = Path(tempfile.mkdtemp(prefix="omnigent-eval-shims-"))
+    guard = target / "guard.sh"
+    shutil.copy2(_SHIMS / "guard.sh", guard)
+    for link in _SHIMS.iterdir():
+        if link.is_symlink():
+            (target / link.name).symlink_to(guard.name)
+    return target
 
 
 def _sandboxed_os_env(arm: Arm, scratch: Path) -> dict[str, Any]:
@@ -308,8 +322,9 @@ def _drive(
                 "claude-native cannot block the network: seatbelt would cut Claude's own API calls"
             )
         # No sandbox here (Claude Code needs the real HOME for its login), so
-        # guard shims refuse commands that would change the machine.
-        extra_env["PATH"] = f"{_SHIMS}{os.pathsep}{extra_env['PATH']}"
+        # guard shims refuse commands that would change the machine. They are
+        # copied out of the checkout so `which omnigent` does not lead into it.
+        extra_env["PATH"] = f"{_copy_shims()}{os.pathsep}{extra_env['PATH']}"
     else:
         extra_env.update(isolated_claude_env(scratch))
         config_home = scratch / "config"
@@ -413,17 +428,48 @@ def cmd_grade(args: argparse.Namespace) -> int:
     arms = load_arms(args.arms)
     judges = _make_judges(args.judge, args.profile)
     routes = args.site_routes.read_text().split() if args.site_routes else []
+    latest = surface_for(arms[args.latest], args.out) if args.latest else None
     for runs_file in sorted((args.out / "runs").glob("*.jsonl")):
         harness, arm_name = runs_file.stem.split("__")
+        if args.arm and arm_name not in args.arm:
+            continue
+        path = _graded_path(args.out, harness, arm_name)
+        if (
+            not args.regrade
+            and path.exists()
+            and path.stat().st_mtime >= runs_file.stat().st_mtime
+        ):
+            print(f"{harness} / {arm_name} is already graded", flush=True)
+            continue
         arm = arms[arm_name]
         records = [r for r in _read_records(runs_file) if r.case_id in cases]
-        referee = Referee(surface_for(arm, args.out), arm.python, site_routes=routes)
-        graded = _grade_parallel(cases, records, referee, judges, arm.version)
-        path = _graded_path(args.out, harness, arm_name)
+        referee = Referee(
+            surface_for(arm, args.out), arm.python, site_routes=routes, latest=latest
+        )
+        previous = _previous_verdicts(path)
+        graded = _grade_parallel(cases, records, referee, judges, arm.version, previous)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(json.dumps(dataclasses.asdict(g)) + "\n" for g in graded))
         print(f"graded {len(graded)} run(s) for {harness} / {arm_name}", flush=True)
     return 0
+
+
+def _answer_key(record: RunRecord) -> tuple[str, int, str]:
+    digest = hashlib.sha256(record.answer.encode()).hexdigest()
+    return (record.case_id, record.run_index, digest)
+
+
+def _previous_verdicts(path: Path) -> dict[tuple[str, int, str], dict[str, dict[str, Any]]]:
+    """Judge verdicts already given for each unchanged answer, by criterion id."""
+    if not path.exists():
+        return {}
+    found: dict[tuple[str, int, str], dict[str, dict[str, Any]]] = {}
+    for line in path.read_text().splitlines():
+        if line.strip():
+            raw = json.loads(line)
+            key = _answer_key(RunRecord(**raw["record"]))
+            found[key] = {c["id"]: c["judges"] for c in raw["criteria"]}
+    return found
 
 
 def _grade_parallel(
@@ -432,9 +478,11 @@ def _grade_parallel(
     referee: Referee,
     judges: list[Judge],
     version: str,
+    previous: Mapping[tuple[str, int, str], Mapping[str, Mapping[str, Any]]] = {},
 ) -> list[GradedRun]:
     # The referee batches its probe calls; judges are slow network calls, so
-    # grade without judges first and fan the judge calls out.
+    # grade without judges first and fan the judge calls out. A judge verdict
+    # on an unchanged answer is reused, so a referee fix does not re-ask judges.
     graded = grade_runs(cases, records, referee, (), installed_version=version)
     if not judges:
         return graded
@@ -443,6 +491,11 @@ def _grade_parallel(
         run, judge = item
         criteria = applicable(cases[run.record.case_id], version)
         if run.record.status == INFRA_ERROR or not criteria:
+            return
+        before = previous.get(_answer_key(run.record), {})
+        if all(judge.name in before.get(r.id, {}) for r in run.criteria):
+            for result in run.criteria:
+                result.judges[judge.name] = before[result.id][judge.name]
             return
         verdicts = judge.grade(cases[run.record.case_id].prompt, run.record.answer, criteria)
         for result in run.criteria:
@@ -555,6 +608,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--judge", action="append", default=[], help="name=model, repeatable.")
     p.add_argument(
         "--site-routes", type=Path, default=None, help="omnigent.ai page paths, one per line."
+    )
+    p.add_argument("--arm", action="append", default=[], help="Grade only these arms.")
+    p.add_argument("--regrade", action="store_true", help="Grade runs that are already graded.")
+    p.add_argument(
+        "--latest",
+        default=None,
+        help="Arm with the newest build; names only it has count as version mismatches.",
     )
     p.set_defaults(func=cmd_grade)
 

@@ -29,6 +29,20 @@ _ENV_VAR_RE = re.compile(r"\bOMNIGENT_[A-Z0-9_]*[A-Z0-9]\b")
 _LITERAL_RE = re.compile(r"(?<![\w])[\"']([A-Za-z_][A-Za-z0-9_-]{1,60})[\"']")
 
 
+_SPEC_SOURCES = ("spec/*.py", "inner/loader.py", "inner/datamodel.py")
+
+
+def _literals_in(patterns: tuple[str, ...], package_dir: Path) -> set[str]:
+    found: set[str] = set()
+    for pattern in patterns:
+        for source in package_dir.glob(pattern):
+            try:
+                found.update(_LITERAL_RE.findall(source.read_text(encoding="utf-8")))
+            except (OSError, UnicodeDecodeError):
+                continue
+    return found
+
+
 def surface() -> dict[str, Any]:
     """Facts that do not depend on an answer: CLI, tools, harnesses, env vars."""
     import click
@@ -88,6 +102,8 @@ def surface() -> dict[str, Any]:
         "env_vars": sorted(env_vars),
         # Names some reader uses, for config files that have no schema.
         "string_literals": sorted(literals),
+        # Names the agent-spec loaders use: a key outside this set is invented.
+        "spec_literals": sorted(_literals_in(_SPEC_SOURCES, package_dir)),
         # Keys `omnigent config set/unset` accepts.
         "config_set_keys": sorted(getattr(cli_module, "_GLOBAL_CONFIG_KEYS", ())),
     }

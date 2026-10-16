@@ -17,6 +17,10 @@ unset IFS
 [ -n "$real" ] || { echo "$name: command not found" >&2; exit 127; }
 
 refuse() {
+  # A command that does not exist changes nothing: let the real CLI report it.
+  if [ "$name" = omnigent ] || [ "$name" = omni ]; then
+    "$real" "${1:-}" --help >/dev/null 2>&1 || exec "$real" "$@"
+  fi
   echo "This environment disables '$name $*' because it would change the machine. Describe the command to the user instead of running it." >&2
   exit 1
 }
