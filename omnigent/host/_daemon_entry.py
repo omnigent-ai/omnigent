@@ -46,8 +46,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from omnigent.process_logging import configure_process_logging
+    from omnigent.process_logging import (
+        configure_process_logging,
+        ensure_stdio_survives_unencodable_output,
+    )
 
+    # The daemon's stdio is its log file; on a legacy code page (Windows ANSI)
+    # the connect loop's ✓/⚠ glyphs would raise UnicodeEncodeError and drop the tunnel.
+    ensure_stdio_survives_unencodable_output()
     log_path = configure_process_logging("host", force=True)
 
     from omnigent.host.crash_reporting import install_host_crash_hooks, set_host_exit_context

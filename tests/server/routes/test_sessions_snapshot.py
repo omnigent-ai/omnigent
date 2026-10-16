@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,7 +13,9 @@ import pytest
 from sqlalchemy.exc import StatementError
 
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
+from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
 from omnigent.server.routes import sessions as _sessions_mod
+from omnigent.server.routes._sessions.helpers import _truncate_error_message_label
 from omnigent.server.routes.sessions import (
     _LABEL_VALUE_MAX_LEN,
     SessionLiveness,
@@ -589,6 +592,105 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
     assert snapshot.last_task_error["code"] == "runner_failed_to_start"
     # The daemon's full cause (incl. log tail) rides through verbatim.
     assert snapshot.last_task_error["message"] == daemon_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True], ids=["persisted", "cached"])
+@pytest.mark.parametrize("live_status", ["failed", "running"])
+async def test_session_snapshot_existing_failure_survives_runner_exit(
+    monkeypatch: pytest.MonkeyPatch, cached: bool, live_status: str
+) -> None:
+    """A saved failure cause outlives the exit report; an interrupted turn still takes it."""
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "30cc5cfcaab3427698d56838f8b636cd"
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        runner_id="runner_exit_after_failure",
+        agent_id="synthetic-agent",
+        live_status=None if cached else live_status,
+        labels={
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+        },
+    )
+    store = _ConversationStore([], conversations={session_id: conv})
+    _use_runner_client(monkeypatch, None)
+    if cached:
+        monkeypatch.setitem(sessions_module._session_status_cache, session_id, live_status)
+    else:
+        monkeypatch.delitem(sessions_module._session_status_cache, session_id, raising=False)
+    reports = RunnerExitReports()
+    reports.record(conv.runner_id, "Synthetic runner exit", owner=None)
+
+    snapshot = await _get_session_snapshot(
+        store,
+        session_id,
+        runner_exit_reports=reports,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.status == "failed"
+    assert snapshot.last_task_error == (
+        original
+        if live_status == "failed"
+        else {"code": "runner_failed_to_start", "message": "Synthetic runner exit"}
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_matches", [True, False], ids=["same_runner", "replacement_runner"])
+async def test_session_snapshot_scopes_existing_failure_to_owning_runner(
+    monkeypatch: pytest.MonkeyPatch, owner_matches: bool
+) -> None:
+    """A failed cause owned by a prior runner yields to the current runner's exit.
+
+    When a session is rebound to a new runner that then dies before connecting,
+    the snapshot surfaces that runner's startup failure instead of the previous
+    runner's stale cause; a cause owned by the current runner still survives.
+    """
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "4d9f2c1b7a0e4d5e8c1f2a3b4c5d6e7f"
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    owner_runner = "runner_current" if owner_matches else "runner_previous"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        runner_id="runner_current",
+        agent_id="synthetic-agent",
+        live_status="failed",
+        labels={
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+            "omnigent.last_task_error_runner_id": owner_runner,
+        },
+    )
+    store = _ConversationStore([], conversations={session_id: conv})
+    _use_runner_client(monkeypatch, None)
+    monkeypatch.delitem(sessions_module._session_status_cache, session_id, raising=False)
+    reports = RunnerExitReports()
+    reports.record("runner_current", "Synthetic runner exit", owner=None)
+
+    snapshot = await _get_session_snapshot(
+        store,
+        session_id,
+        runner_exit_reports=reports,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.status == "failed"
+    assert snapshot.last_task_error == (
+        original
+        if owner_matches
+        else {"code": "runner_failed_to_start", "message": "Synthetic runner exit"}
+    )
 
 
 @pytest.mark.asyncio
@@ -2892,6 +2994,69 @@ def test_truncate_label_empty_string() -> None:
     assert _truncate_label("") == ""
 
 
+# ── _truncate_error_message_label ────────────────────────────────────────────
+
+_REJECTED_TUNNEL_ERROR = (
+    "error: runner tunnel rejected by server (HTTP 401 persisted across 3 attempts); "
+    "run `omnigent login https://omnigent.example.com/omnigent` to re-authenticate"
+)
+_TRACEBACK_LINES = (
+    "Traceback (most recent call last):",
+    *(f'  File "/venv/site-packages/pkg/module_{n}.py", line {n}, in call' for n in range(10)),
+    "asyncio.exceptions.CancelledError",
+)
+
+
+def _runner_exit_report(summary: str, *tail_lines: str) -> str:
+    """Build a host runner-exit report: summary, log-tail heading, tail lines."""
+    return "\n".join([summary, RUNNER_LOG_TAIL_HEADING, *tail_lines])
+
+
+def test_truncate_error_message_label_keeps_runner_exit_cause() -> None:
+    """A long runner-exit report keeps its summary and the tail's last line."""
+    summary = "runner process exited with code 1 (log on host: ~/logs/runner-a1.log)"
+    report = _runner_exit_report(summary, *_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR)
+    assert len(report) > _LABEL_VALUE_MAX_LEN
+
+    result = _truncate_error_message_label(report)
+
+    # The traceback is dropped; the line naming the cause survives whole.
+    assert result == f"{summary}\n…\n{_REJECTED_TUNNEL_ERROR}"
+    assert len(result) <= _LABEL_VALUE_MAX_LEN
+
+
+def test_truncate_error_message_label_trims_an_oversized_last_line() -> None:
+    """An oversized last line is trimmed so the summary's start still fits."""
+    report = _runner_exit_report(
+        "runner process exited with code 1 (log on host: ~/x.log)", "error: " + "y" * 400
+    )
+
+    result = _truncate_error_message_label(report)
+
+    assert len(result) == _LABEL_VALUE_MAX_LEN
+    assert result.startswith("runner process exited with code 1")
+    assert "…\n…\nerror: yyy" in result
+    assert result.endswith("y…")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param("Runner MCP execute failed: " + "x" * 300, id="no-log-tail"),
+        pytest.param(_runner_exit_report("x" * 300, ""), id="empty-log-tail"),
+    ],
+)
+def test_truncate_error_message_label_head_truncates_other_messages(message: str) -> None:
+    """Without a runner log tail line to keep, the message keeps its head."""
+    assert _truncate_error_message_label(message) == _truncate_label(message)
+
+
+def test_truncate_error_message_label_short_report_unchanged() -> None:
+    """A report that fits the column is stored verbatim, log tail included."""
+    report = _runner_exit_report("runner process exited with code 1", "error: boom")
+    assert _truncate_error_message_label(report) == report
+
+
 # ── _persist_session_status_error_labels ─────────────────────────────────────
 
 
@@ -2944,6 +3109,37 @@ async def test_persist_error_labels_truncates_long_message() -> None:
     assert len(stored) <= _LABEL_VALUE_MAX_LEN
     # The diagnostic prefix survives so the reload-visible reason is still useful.
     assert stored.startswith("Runner MCP execute failed: ")
+
+
+@pytest.mark.asyncio
+async def test_persist_error_labels_keeps_host_runner_exit_cause(tmp_path: Path) -> None:
+    """A host's runner-exit report still names its cause once stored.
+
+    The live failure event carries the whole report, but a reloaded session
+    shows the stored label, so the runner's final error line must survive it.
+    """
+    from omnigent.host.connect import _runner_exit_error
+    from omnigent.server.schemas import ErrorDetail
+
+    log_path = tmp_path / "runner.log"
+    log_path.write_text("\n".join([*_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR]) + "\n")
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(code="runner_failed_to_start", message=_runner_exit_error(1, log_path))
+    assert len(error.message) > _LABEL_VALUE_MAX_LEN
+
+    await _persist_session_status_error_labels(
+        "d397345925f08ea06e7303c01686efff", error, _MockStore()
+    )  # type: ignore[arg-type]
+
+    stored = captured["d397345925f08ea06e7303c01686efff"]["omnigent.last_task_error_message"]
+    assert len(stored) <= _LABEL_VALUE_MAX_LEN
+    assert stored.startswith("runner process exited with code 1")
+    assert stored.endswith(f"\n…\n{_REJECTED_TUNNEL_ERROR}")
 
 
 @pytest.mark.asyncio

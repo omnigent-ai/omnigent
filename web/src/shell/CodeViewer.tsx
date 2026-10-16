@@ -51,6 +51,7 @@ import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
 import rehypeSlug from "rehype-slug";
 import { createMathPlugin } from "@streamdown/math";
+import { ExternalPreviewLink } from "./ExternalPreviewLink";
 import { MermaidPreview } from "./MermaidPreview";
 import type { Comment } from "@/hooks/useComments";
 import {
@@ -182,7 +183,8 @@ const MarkdownPreviewPathContext = createContext<string | null>(null);
  * Anchor for the Markdown preview. A link to another workspace file (`notes.md`,
  * `../docs/`) opens in the FileViewer: as a plain anchor the browser resolves it
  * against the app URL (`/c/<id>` → `/c/notes.md`) and loads a session that
- * doesn't exist. URLs, `mailto:` and in-page `#` links keep their href.
+ * doesn't exist. URLs and `mailto:` links open outside the app window (see
+ * ExternalPreviewLink); in-page `#` links keep their href.
  */
 function MarkdownPreviewLink({
   href,
@@ -192,7 +194,14 @@ function MarkdownPreviewLink({
 }: ComponentPropsWithoutRef<"a"> & { node?: unknown }) {
   const openFile = useFileViewer();
   const filePath = useContext(MarkdownPreviewPathContext);
-  if (!href || href.startsWith("#") || !isWorkspaceRelativeSrc(href)) {
+  if (href && !isWorkspaceRelativeSrc(href)) {
+    return (
+      <ExternalPreviewLink href={href} {...props}>
+        {children}
+      </ExternalPreviewLink>
+    );
+  }
+  if (!href || href.startsWith("#")) {
     return (
       <a href={href} {...props}>
         {children}
@@ -485,6 +494,11 @@ export interface CodeViewerProps {
   panelOpen: boolean;
   searchOpen: boolean;
   setSearchOpen: (open: boolean) => void;
+  /**
+   * Bumped by FileViewer on each Cmd+F. Forwarded to the Monaco editor so a
+   * press with the find widget already open refocuses its input.
+   */
+  searchFocusNonce?: number;
   searchInputRef: RefObject<HTMLInputElement | null>;
   viewMode: "editor" | "preview" | "source" | "diff";
   onDirtyChange?: (isDirty: boolean) => void;
@@ -520,6 +534,7 @@ export function CodeViewer({
   panelOpen,
   searchOpen,
   setSearchOpen,
+  searchFocusNonce,
   searchInputRef,
   viewMode,
   onDirtyChange,
@@ -979,6 +994,7 @@ export function CodeViewer({
           onDirtyChange={onDirtyChange}
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}
+          searchFocusNonce={searchFocusNonce}
           onSearchHandled={handleSearchHandled}
           comments={comments}
           activeSelection={activeSelection}
@@ -1254,7 +1270,7 @@ export function CodeViewer({
               <button
                 data-attach-agent-btn
                 type="button"
-                className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+                className={ADD_COMMENT_BUTTON_CLASS_NAME}
                 onClick={() => {
                   // Convert the selection's char offsets to a 1-based inclusive
                   // line span. ``end_index`` is exclusive, so step back one char

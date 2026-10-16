@@ -8,7 +8,7 @@ description: Select the Resolve mode, recover its input, check the workspace, an
 Read only the resource matching the work source before preflight:
 
 - `session` or `ci_link`: read [reproduction.md](reproduction.md).
-- `review_pr`: read [review-remediation.md](review-remediation.md). It takes
+- `review_pr`: load the shared `otto-review-remediation` skill. It takes
   precedence over repro recovery and candidate discovery.
 - `bug_url` alone: read [ticket-only.md](ticket-only.md).
 
@@ -20,7 +20,7 @@ After preflight, load `resolve-investigate` in every mode. Apply it before the
 repro audit or choosing a fix. After `resolve-repro-audit` for reproduction-driven
 work, read
 [existing-fix.md](existing-fix.md) before choosing author or review. Skip discovery
-in review-remediation mode. Load `resolve-impact-assessment` for every mode.
+in review-remediation mode. Load `otto-impact-assessment` for every mode.
 
 ## Input contract
 

@@ -33,7 +33,8 @@ export const STREAMDOWN_PLUGINS = {
 export const SECURE_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(false);
 export const FILE_LINK_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(true);
 
-// Attribute carrying the original, unhardened href of a workspace-file link.
+// Attribute carrying the workspace path a file link names, percent-decoded
+// from its (unhardened) href so it matches the real filename on disk.
 export const WORKSPACE_FILE_LINK_ATTR = "data-omnigent-file";
 
 // An href that can only be a protocol URL, a protocol-relative URL, or an
@@ -111,7 +112,14 @@ export function rewriteFileUriLinks() {
   };
 }
 
-/** Returns a local absolute path only when rewriting preserves href meaning. */
+/**
+ * Returns a local absolute path only when rewriting preserves href meaning.
+ *
+ * The path is returned still percent-encoded, exactly as any other markdown
+ * destination arrives, so that {@link markWorkspaceFileLinks} decodes every
+ * file link once. Decoding here as well would turn a file literally named
+ * `report%20final.md` (linked as `report%2520final.md`) into `report final.md`.
+ */
 function fileUriToLocalPath(href: string): string | null {
   let url: URL;
   try {
@@ -120,6 +128,7 @@ function fileUriToLocalPath(href: string): string | null {
     return null;
   }
   if (url.protocol !== "file:" || url.hostname || url.search) return null;
+  // Validate the decoded form: that is the path the FileViewer will open.
   let path: string;
   try {
     path = decodeURIComponent(url.pathname);
@@ -130,9 +139,9 @@ function fileUriToLocalPath(href: string): string | null {
   if (!path.startsWith("/") || path.startsWith("//") || path === "/" || /[?#]/.test(path)) {
     return null;
   }
-  if (!url.hash) return path;
+  if (!url.hash) return url.pathname;
   const cited = splitWorkspaceFileCitation(`${path}${url.hash}`);
-  return cited.hasPosition ? `${path}${url.hash}` : null;
+  return cited.hasPosition ? `${url.pathname}${url.hash}` : null;
 }
 
 /**
@@ -152,6 +161,12 @@ function fileUriToLocalPath(href: string): string | null {
  * unresolvable URL. Only hrefs that could name a real file are moved: a URL,
  * a `mailto:`/`javascript:` scheme, or anything carrying a query or fragment
  * is left for harden to judge exactly as before.
+ *
+ * This pass owns percent-decoding: the stored path is decoded exactly once,
+ * here, whether the href came straight from markdown (`My%20Notes.md`) or was
+ * handed over still encoded by {@link rewriteFileUriLinks}. The citation
+ * suffix is split off first and only the filename is decoded, so an encoded
+ * delimiter in a filename is never read back as a line citation.
  */
 export function markWorkspaceFileLinks() {
   return (tree: HastElement) => {
@@ -165,10 +180,27 @@ export function markWorkspaceFileLinks() {
       node.properties = {
         ...node.properties,
         href: PARKED_FILE_HREF,
-        [WORKSPACE_FILE_LINK_ATTR]: href,
+        [WORKSPACE_FILE_LINK_ATTR]: decodeFilePath(cited.path) + href.slice(cited.path.length),
       };
     });
   };
+}
+
+/**
+ * Decodes the filename unless decoding fails or creates citation syntax. A
+ * lone `%` is a legal filename character, so a malformed sequence keeps the raw
+ * text rather than dropping the link. The opener re-parses citations, so an
+ * ambiguous name (`report.md%23L12`) must stay encoded to avoid opening a
+ * sibling file.
+ */
+function decodeFilePath(path: string): string {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(path);
+  } catch {
+    return path;
+  }
+  return splitWorkspaceFileCitation(decoded).hasPosition ? path : decoded;
 }
 
 function visitElements(node: HastElement, visitor: (node: HastElement) => void): void {

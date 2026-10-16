@@ -4,6 +4,8 @@
 
 "use strict";
 
+const { diagnostics } = require("./diagnostics");
+
 const { shell } = require("electron");
 const { makePkce, runLoopbackAuthorization } = require("./loopback-oauth");
 const { createTokenStore } = require("./token_store");
@@ -128,6 +130,11 @@ async function signInWithBrowser(serverUrl, { signal, openExternal } = {}) {
       signal,
     });
   } catch (error) {
+    diagnostics.record("oidc_browser", {
+      origin: new URL(serverUrl).origin,
+      outcome: error?.name === "AbortError" || signal?.aborted ? "cancelled" : "failed",
+      code: error?.code ?? error?.errorCode,
+    });
     if (error?.name === "AbortError" || signal?.aborted) throw error;
     if (error?.code === "LOOPBACK_TIMEOUT") throw oidcError("timed_out", error.message);
     if (error?.code === "BROWSER_UNAVAILABLE") {
@@ -138,6 +145,7 @@ async function signInWithBrowser(serverUrl, { signal, openExternal } = {}) {
     });
   }
 
+  diagnostics.record("oidc_browser", { origin: new URL(serverUrl).origin, outcome: "accepted" });
   const { status, body } = await postForm(
     serverEndpoint(serverUrl, "/auth/native-token"),
     {
@@ -148,6 +156,11 @@ async function signInWithBrowser(serverUrl, { signal, openExternal } = {}) {
     { signal },
   );
   const minted = status === 200 ? tokenFrom(body) : null;
+  diagnostics.record("oidc_exchange", {
+    origin: new URL(serverUrl).origin,
+    status,
+    outcome: minted ? "accepted" : "rejected",
+  });
   if (!minted) {
     throw oidcError("sign_in_failed", `native sign-in exchange returned HTTP ${status}`);
   }
@@ -178,8 +191,12 @@ async function doRefresh(serverUrl, origin) {
     refresh_token: entry.refresh_token,
   });
   const minted = status === 200 ? tokenFrom(body) : null;
-  if (minted) return minted;
+  if (minted) {
+    diagnostics.record("oidc_refresh", { origin, status, outcome: "accepted" });
+    return minted;
+  }
   const error = typeof body?.error === "string" ? body.error : null;
+  diagnostics.record("oidc_refresh", { origin, status, outcome: "rejected" });
   // A dead grant (revoked, past its lifetime) or a server without the token
   // route: forget it, so the next connect signs in through the browser.
   if (error === "invalid_grant" || error === "expired_token" || status === 404) {

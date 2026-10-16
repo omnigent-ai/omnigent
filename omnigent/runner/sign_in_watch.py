@@ -105,13 +105,12 @@ def build_sign_in_watch(
     def _sign_in_agent_ready(conv_id: str, harness: str | None, screens: list[str]) -> bool:
         """Return whether the agent can take a message now that no sign-in prompt is on screen."""
         if harness == "codex-native":
-            from omnigent.harnesses.codex_native.bridge import (
-                bridge_dir_for_bridge_id,
-                read_bridge_state,
-            )
+            from omnigent.harnesses.codex_native.bridge import read_bridge_state
+            from omnigent.runner.native.orchestration import codex_native_bridge_dir
 
-            # Thread discovery publishes the bridge state the moment the TUI starts a thread.
-            return read_bridge_state(bridge_dir_for_bridge_id(conv_id)) is not None
+            # Thread discovery publishes the bridge state the moment the TUI starts a thread,
+            # in the directory the launch used (a rotated session's label directory).
+            return read_bridge_state(codex_native_bridge_dir(conv_id)) is not None
         if harness == "claude-native":
             from omnigent.harnesses.claude_native.bridge import _claude_prompt_rendered
 

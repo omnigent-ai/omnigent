@@ -28,6 +28,7 @@ and codes rather than put content in an allowed field.
 | `native_rpc_attempt_id` | Pairs one Codex RPC attempt with its accepted, failed, or cancelled result, including attempts recovered by retrying. |
 | `requested_native_turn_id` | The target of that specific steer; absent for a new turn start. |
 | `initial_native_turn_id` | Bridge state before a complete injection, which can differ from the target of a recovered RPC attempt. |
+| `lifecycle_response_id` | The Omnigent turn lifecycle that named this stable input before settlement. |
 
 Join within the same workspace and Omnigent session. Missing IDs mean that a
 producer did not supply them; do not infer ownership from timestamps alone.
@@ -43,8 +44,10 @@ producer did not supply them; do not infer ownership from timestamps alone.
 | `native_input_execution_started` / `native_input_execution_finished` | The executor call and its bounded result, including cancellation or an explicitly reported undelivered input. `executor_returned` alone does not prove a transcript record exists. `executor_stream_ended` means the executor exited without reporting a final result. |
 | `native_input_steering_started` / `native_input_steering_finished` | A direct in-band harness injection carrying its own input identity. `executor_accepted` means the executor accepted the injection; `executor_refused` means it returned false. `cancelled` means the injection was interrupted, and `error` means it raised an exception. Acceptance does not prove transcript persistence. |
 | `claude_native_delivery_finished` | Claude's existing stages, verification, retries, and local delivery ID, now joined to the original input. `draft_cleared` means the submitted draft disappeared; it does not prove native transcript persistence. Other delivery outcomes remain `unknown`. |
-| `codex_native_delivery_attempt` / `codex_native_delivery_finished` | One pair per RPC, with `turn_start` or `turn_steer` and an `rpc_accepted`, `rpc_accepted_missing_turn_id`, `rpc_error`, or `cancelled` outcome. The missing-ID outcome means the RPC returned without a nonempty turn ID. A recovered stale steer generates separate pairs for the rejected and retried requests. No new delivery events are emitted without an input identity. |
-| `codex_turn_injection_failed` | The input identity, RPC error code when available, and native thread context for a failed injection. An RPC failure can be ambiguous about acceptance. |
+| `codex_native_delivery_attempt` / `codex_native_delivery_finished` | One pair per RPC, with `turn_start` or `turn_steer` and an `rpc_accepted`, `rpc_accepted_missing_turn_id`, `rpc_rejected_draining`, `rpc_error`, or `cancelled` outcome. The missing-ID outcome means the RPC returned without a nonempty turn ID. A recovered stale steer or drain rejection generates separate pairs for the rejected and retried requests. No new delivery events are emitted without an input identity. |
+| `codex_native_delivery_reconnecting` | Codex explicitly refused the input while draining. One reconnect is attempted before retrying that RPC, with the same input identity. A missing or changed session, thread, or transport prevents resubmission. |
+| `codex_app_server_draining` | Initialization was refused while draining, before a turn could be submitted. The sender's input remains undelivered. |
+| `codex_turn_injection_failed` | The input identity, RPC error code when available, and native thread context for a failed injection. `undelivered` identifies a proven drain refusal or a failure before resubmission; other RPC failures can be ambiguous about acceptance. |
 | `native_input_settled` | The server's decision after durable persistence. See outcomes below. |
 | `native_input_invalid_delivery_stage` | A caller supplied an unsupported server stage. The existing stage is preserved; the caller's invalid value is not logged. |
 
@@ -75,12 +78,25 @@ emit these input-delivery events.
 - `reported_undelivered`: the runner explicitly reported that this particular
   input had not reached the harness.
 
+Skipped inputs also carry a bounded `cause_class`:
+
+- `rejected_before_handoff`: the runner proved the harness never received the input.
+- `accepted_missing_native_record`: the correlated turn completed but no user record appeared.
+- `interrupted_or_lifecycle`: cancellation or lifecycle teardown invalidated the send.
+- `reconciliation_ambiguity`: FIFO or source-less attribution prevents a delivery claim.
+- `rejected_by_native`: reserved for an identity-linked native refusal.
+- `unknown`: the available identity-linked evidence cannot distinguish the cause.
+
+`reason_code` is a bounded machine code such as an error code or
+`completed_without_native_record`; it never contains prompt or terminal text.
+
 `match_method` is `normalized_text`, `attachment_normalized_text`,
 `fifo_fallback`, or `input_stable_id`. `last_delivery_stage` records the last
-stage the **server** had observed when it drained the entry: `server_queued`,
-`forward_requested`, `forward_accepted`, or `unknown`. It is not a substitute
-for the runner's delivery trace. A transcript can arrive before the forwarding
-HTTP response, so a settled input can still say `forward_requested`.
+identity-linked stage the server observed: enqueue/forward stages, native turn
+start/terminal stages, or `rejected_before_handoff`. A transcript can arrive
+before the forwarding HTTP response, so a settled input can still say
+`forward_requested`. Older runners omit lifecycle identity; those entries stay
+`unknown` instead of being classified from timestamps.
 
 SSE logging retains `item.response_id` and the `item_id` and
 `cleared_pending_id` nested in `session.input.consumed.data`. That consumed
@@ -90,6 +106,12 @@ event clears a pending bubble; it is not proof of delivery. Join it to
 A runner's `response.failed` event can carry top-level `input_stable_id`.
 SSE logging retains this validated ID to connect the failure to its original
 web submission, even before a transcript item exists.
+
+Claude reports an input as undelivered when the tmux target was never
+advertised or submit verification found its draft still in the input box.
+The executor keeps the terminal for recovery and reports this refusal so the
+server can persist the queued web input. A question or permission prompt
+discovered after Enter may belong to a delivered message and remains uncertain.
 
 ## Verification
 

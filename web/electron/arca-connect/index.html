@@ -121,6 +121,8 @@
       }
       #status {
         min-height: 1.4em;
+        max-height: 7em;
+        overflow: auto;
         font-weight: 500;
       }
       #status[data-kind="error"] {
@@ -179,11 +181,11 @@
     </style>
   </head>
   <body data-phase="asking">
-    <h1>Connect your Arca instance?</h1>
+    <h1 id="title">Connect your Arca instance?</h1>
     <p>
-      This runs the command below over <span id="server">…</span>. While connected as a runner, that
-      server can execute agent code and commands on the Arca instance on its behalf. Only confirm
-      for servers you trust.
+      <span id="intro">This runs the command below over </span><span id="server">…</span>. While
+      connected as a runner, that server can execute agent code and commands on the Arca instance on
+      its behalf. Only confirm for servers you trust.
     </p>
     <div id="console">
       <div id="command">…</div>

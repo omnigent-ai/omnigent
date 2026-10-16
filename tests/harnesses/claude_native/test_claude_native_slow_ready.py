@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import shlex
 import shutil
 import subprocess
@@ -14,10 +15,12 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge
 
 _TERMINAL = r"""
 import json
+import logging
 import os
 import sys
 import time
@@ -60,10 +63,10 @@ while True:
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
-@pytest.mark.parametrize("startup", ["slow", "dead", "base-budget-only"])
+@pytest.mark.parametrize("startup", ["slow", "dead", "base-budget-only", "exit-after-ready"])
 @pytest.mark.timeout(20)
 def test_first_message_survives_slow_terminal_startup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Hold startup until the real readiness gate starts, then exceed its base budget."""
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
@@ -88,6 +91,13 @@ def test_first_message_survives_slow_terminal_startup(
         started_at.append(time.monotonic())
         gate_started.touch()
         original_wait(socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir)
+        if startup == "exit-after-ready":
+            subprocess.run(
+                ["tmux", "-S", socket_path, "kill-server"],
+                check=True,
+                capture_output=True,
+                timeout=5,
+            )
 
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", observe_wait)
     with tempfile.TemporaryDirectory(prefix="claude-ready-", dir="/tmp") as socket_dir:
@@ -131,6 +141,23 @@ def test_first_message_survives_slow_terminal_startup(
                 assert time.monotonic() - started_at[0] >= 1.0
                 assert json.loads(delivered.read_text()) == ["FIRST_PROMPT_DELIVERED"]
                 assert bridge._claude_pane_state(str(socket_path), "main").alive
+            elif startup == "exit-after-ready":
+                caplog.set_level(logging.WARNING)
+                with pytest.raises(RuntimeError, match="tmux command failed"):
+                    bridge.inject_user_message(
+                        bridge_dir, content="MUST_NOT_DELIVER", timeout_s=0.3
+                    )
+                record = next(
+                    r
+                    for r in caplog.records
+                    if getattr(r, "event_name", None) == "claude_native_delivery_finished"
+                )
+                row = record_to_row(record, source="runner")
+                assert row["attributes"]["tmux_operation"] == "send-keys"
+                assert row["attributes"]["tmux_returncode"] == "1"
+                assert "MUST_NOT_DELIVER" not in json.dumps(row)
+                assert str(socket_path) not in json.dumps(row)
+                assert not delivered.exists()
             elif startup == "dead":
                 with pytest.raises(
                     bridge.ClaudeTerminalExited,

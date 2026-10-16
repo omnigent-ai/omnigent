@@ -31,6 +31,7 @@ from typing import Any, TypeAlias, cast
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native import owner_claim
 from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import strip_runner_auth_secrets
@@ -40,6 +41,7 @@ from . import _proc
 from .agent_env import strip_desktop_session_env
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
+from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
 from .os_env import (
     OSEnvironment,
     _copy_tree,
@@ -661,6 +663,7 @@ def _clone_sandbox_spec(sandbox: OSEnvSandboxSpec | None) -> OSEnvSandboxSpec | 
             list(sandbox.env_passthrough) if sandbox.env_passthrough is not None else None
         ),
         egress_rules=list(sandbox.egress_rules) if sandbox.egress_rules is not None else None,
+        git_ssh=list(sandbox.git_ssh) if sandbox.git_ssh is not None else None,
     )
 
 
@@ -802,20 +805,40 @@ def _tmux_available() -> bool:
     return shutil.which("tmux") is not None
 
 
+class TmuxUnavailableError(OmnigentError, RuntimeError):
+    """The host has no tmux that managed terminals can use.
+
+    Coded ``HARNESS_NOT_CONFIGURED``: only the person can fix the host's tmux,
+    and the message says how, so a terminal start failure shows it verbatim.
+    Subclasses :class:`RuntimeError` so callers that already catch that keep
+    working.
+    """
+
+    def __init__(self, message: str) -> None:
+        """
+        :param message: Client-safe remedy, e.g. ``"tmux 3.2 is too old; ..."``.
+        """
+        super().__init__(message, code=ErrorCode.HARNESS_NOT_CONFIGURED)
+
+
 def _require_supported_tmux() -> None:
     """Fail before terminal setup when tmux is missing, unknown, or too old."""
     tmux = shutil.which("tmux")
     if tmux is None:
-        raise RuntimeError("tmux is not installed or not on PATH")
+        raise TmuxUnavailableError(
+            "tmux is not installed or not on PATH. Native terminals need tmux "
+            f"{MIN_TMUX_VERSION_HINT} or newer: install it (macOS: `brew install tmux`), "
+            "or restart the Omnigent host from a shell where `tmux -V` works."
+        )
     version = tmux_version(tmux)
     if version is None:
-        raise RuntimeError(
+        raise TmuxUnavailableError(
             "Could not determine the installed tmux version; managed terminals require "
             f"tmux {MIN_TMUX_VERSION_HINT} or newer"
         )
     if version < MIN_TMUX_VERSION:
         detected = f"{version[0]}.{version[1]}"
-        raise RuntimeError(
+        raise TmuxUnavailableError(
             f"tmux {detected} is too old; managed terminals require "
             f"tmux {MIN_TMUX_VERSION_HINT} or newer"
         )
@@ -1005,22 +1028,13 @@ def build_terminal_os_env_spec(
         if not spec.allow_sandbox_override:
             raise ValueError("This terminal does not allow sandbox overrides")
         sandbox = effective_os_env_spec.sandbox or OSEnvSandboxSpec(type="none")
-        # Defense in depth on top of the parse-time check
-        # (omnigent/inner/loader.py rejects allow_sandbox_override:
-        # true paired with egress_rules at agent-load time). This
-        # branch also fires for specs built programmatically without
-        # going through the loader and catches any future code path
-        # that synthesizes an override before launch. An override to
-        # ``"none"`` can't hard-enforce network isolation; letting the
-        # override drop ``sandbox.type`` to it while ``egress_rules``
-        # stay on the policy would silently bypass the network
-        # allow-list.
-        if sandbox.egress_rules:
+        # Programmatic specs can bypass the loader's network policy guard.
+        if sandbox.requires_network_enforcement:
             raise ValueError(
                 "sandbox_override is not allowed on a terminal whose "
-                "effective sandbox declares egress_rules: overriding "
+                "effective sandbox declares egress_rules or git_ssh: overriding "
                 "to 'none' would drop hard network "
-                "enforcement while egress_rules remain as inert "
+                "enforcement while network policy remains as inert "
                 "decoration on the policy."
             )
         if any(p.copy_on_write for p in sandbox.write_path_specs):
@@ -1110,6 +1124,8 @@ class TerminalInstance:
     # Unix socket don't outlive the terminal.
     _egress_handle: EgressProxyHandle | None = field(default=None, repr=False)
     _egress_tmpdir: Path | None = field(default=None, repr=False)
+    _git_ssh_broker: GitSshBroker | None = field(default=None, repr=False)
+    _git_ssh_tmpdir: Path | None = field(default=None, repr=False)
     _clipboard_bridge: TerminalClipboardBridge | None = field(default=None, init=False, repr=False)
     _idle_task: asyncio.Task[None] | None = field(default=None, repr=False)
     # Threaded idle-watcher state. Mirrors :attr:`_idle_task` but for
@@ -1566,6 +1582,13 @@ class TerminalInstance:
 
     async def launch(self, *, cwd: Path | None = None) -> None:
         """Start the tmux session."""
+        try:
+            await self._launch_impl(cwd=cwd)
+        except BaseException:
+            self._stop_network_brokers()
+            raise
+
+    async def _launch_impl(self, *, cwd: Path | None = None) -> None:
         if self.running:
             return
         self._last_exit_snapshot = None
@@ -1609,14 +1632,20 @@ class TerminalInstance:
             env = strip_desktop_session_env(env)
             if self.egress_rules:
                 sandbox_for_launcher = self._bootstrap_egress_proxy(sandbox_for_launcher, env)
+            if sandbox_for_launcher.git_ssh:
+                sandbox_for_launcher = self._bootstrap_git_ssh(sandbox_for_launcher, env)
             cli_path = shutil.which(self.command) or self.command
-            if sandbox_for_launcher.copy_on_write_namespace:
-                host_cwd = "/"
-                launcher_path = create_exec_launcher(
-                    cli_path, sandbox_for_launcher, cwd=effective_cwd
-                )
-            else:
-                launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
+            try:
+                if sandbox_for_launcher.copy_on_write_namespace:
+                    host_cwd = "/"
+                    launcher_path = create_exec_launcher(
+                        cli_path, sandbox_for_launcher, cwd=effective_cwd
+                    )
+                else:
+                    launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
+            except Exception:
+                self._stop_git_ssh()
+                raise
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
@@ -1699,6 +1728,7 @@ class TerminalInstance:
         except BaseException:
             if self._clipboard_bridge is not None:
                 await asyncio.to_thread(self._clipboard_bridge.close)
+            self._stop_git_ssh()
             raise
 
         self.running = True
@@ -1860,6 +1890,47 @@ class TerminalInstance:
             egress_socket_path=str(self._egress_handle.socket_path),
         )
 
+    def _bootstrap_git_ssh(self, sandbox: SandboxPolicy, env: dict[str, str]) -> SandboxPolicy:
+        """Expose a per-terminal Git broker socket inside the sandbox."""
+        bindings = sandbox.git_ssh
+        assert bindings is not None
+        self._git_ssh_tmpdir = create_private_tmpdir()
+        try:
+            sandbox = with_additional_write_roots(sandbox, [self._git_ssh_tmpdir])
+            self._git_ssh_broker = start_git_ssh_broker(bindings, self._git_ssh_tmpdir)
+        except Exception:
+            self._stop_git_ssh()
+            raise
+        apply_git_ssh_env(env, self._git_ssh_broker)
+        return replace(sandbox, git_ssh_socket_path=str(self._git_ssh_broker.socket_path))
+
+    def _stop_git_ssh(self) -> None:
+        if self._git_ssh_broker is not None:
+            try:
+                self._git_ssh_broker.stop()
+            except Exception:
+                logger.exception(
+                    "Git SSH broker stop failed for terminal %s:%s", self.name, self.session_key
+                )
+            self._git_ssh_broker = None
+        if self._git_ssh_tmpdir is not None:
+            cleanup_private_tmpdir(self._git_ssh_tmpdir)
+            self._git_ssh_tmpdir = None
+
+    def _stop_network_brokers(self) -> None:
+        if self._egress_handle is not None:
+            try:
+                self._egress_handle.stop()
+            except Exception:
+                logger.exception(
+                    "egress proxy stop failed for terminal %s:%s", self.name, self.session_key
+                )
+            self._egress_handle = None
+        if self._egress_tmpdir is not None:
+            cleanup_private_tmpdir(self._egress_tmpdir)
+            self._egress_tmpdir = None
+        self._stop_git_ssh()
+
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
         try:
@@ -1902,19 +1973,7 @@ class TerminalInstance:
         # Order: stop first so the proxy isn't listening on a
         # socket inside a soon-to-be-deleted dir, then remove the
         # tmpdir.
-        if self._egress_handle is not None:
-            try:
-                self._egress_handle.stop()
-            except Exception:
-                logger.exception(
-                    "egress proxy stop failed for terminal %s:%s",
-                    self.name,
-                    self.session_key,
-                )
-            self._egress_handle = None
-        if self._egress_tmpdir is not None:
-            cleanup_private_tmpdir(self._egress_tmpdir)
-            self._egress_tmpdir = None
+        self._stop_network_brokers()
 
         # Clean up the private dir (contains socket + fork).
         if self.private_dir.exists():

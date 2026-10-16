@@ -189,6 +189,13 @@ def test_canvas_plus_creates_session_on_the_selected_board(
             body = {
                 key: payload[key] for key in ("agent_id", "project_id", "labels") if key in payload
             }
+            # This synthetic create publishes an unbound row. Let the HTTP
+            # response resolve the draft only after the fixture binds it.
+            body["labels"] = {
+                key: value
+                for key, value in payload.get("labels", {}).items()
+                if key != "omnigent.client_create_token"
+            }
             assert payload.get("agent_id") == agent_id, (
                 "Canvas creation must use the fixture agent"
             )
@@ -197,7 +204,11 @@ def test_canvas_plus_creates_session_on_the_selected_board(
             created = response.json()
             created_ids.append(created["id"])
             bind_session_runner(
-                httpx.patch, base_url, created["id"], source["runner_id"], timeout=10
+                httpx.patch,
+                base_url,
+                created["id"],
+                source["runner_id"],
+                timeout=httpx.Timeout(10.0, read=30.0),
             )
             route.fulfill(status=response.status_code, json=created)
         except Exception as error:

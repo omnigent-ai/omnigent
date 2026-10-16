@@ -115,17 +115,22 @@ def isolated_process_env(
     if {"HOME", "OMNIGENT_DATA_DIR"} & overrides.keys():
         raise ValueError("HOME and OMNIGENT_DATA_DIR are owned by the isolated stack")
     env = local_server_env({}, base_env=base_env)
+    # Keep the suite's private harness root so this runtime never sweeps a live one.
+    harness_tmp_parent = env.get("OMNIGENT_HARNESS_TMP_PARENT")
     # A parent runner's identity, zygote FDs and logging paths cannot belong to
     # this fresh runtime. Tests opt into their required settings explicitly.
     for name in list(env):
         if name.startswith("OMNIGENT") or name == "RUNNER_SERVER_URL":
             env.pop(name)
+    if harness_tmp_parent is not None:
+        env["OMNIGENT_HARNESS_TMP_PARENT"] = harness_tmp_parent
     env.update(
         HOME=str(home),
         OMNIGENT_DATA_DIR=str(home / ".omnigent"),
         OMNIGENT_AUTH_PROVIDER="header",
         OMNIGENT_LOCAL_SINGLE_USER="1",
         OMNIGENT_DISABLE_CATALOG_LOOKUP="1",
+        OMNIGENT_DISABLE_TELEMETRY="1",
     )
     for name, value in overrides.items():
         if value is None:
