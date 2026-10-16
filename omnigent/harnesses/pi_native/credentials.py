@@ -27,6 +27,7 @@ import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypeAlias, TypedDict, TypeGuard
@@ -37,6 +38,11 @@ from omnigent.databricks_ai_gateway import (
     DATABRICKS_AI_GATEWAY_LABEL,
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
     is_databricks_ai_gateway_url,
+)
+from omnigent.harnesses.pi_native.auth_command import (
+    AUTH_DIR_ENV,
+    AUTH_DIR_NAME,
+    wrap_auth_command,
 )
 from omnigent.inner._proc import kill_tree, spawn_kwargs
 from omnigent.models import model_catalog
@@ -1903,6 +1909,12 @@ def write_pi_models_config(
         rendered = provider.to_models_config()
     agent_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(agent_dir, 0o700)
+    rendered = deepcopy(rendered)
+    for provider_id, config in rendered["providers"].items():
+        api_key = config.get("apiKey")
+        # Windows Pi can use a configured PowerShell; preserve its own resolver.
+        if os.name == "posix" and isinstance(api_key, str) and api_key.startswith("!"):
+            config["apiKey"] = wrap_auth_command(agent_dir, provider_id, api_key[1:])
     models_path = agent_dir / "models.json"
     # 0o600: the apiKey may be a literal token (key-kind providers).
     fd = os.open(models_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -2015,6 +2027,10 @@ def pi_native_provider_launch(
         overlay["enabledModels"] = enabled_refs
     prepare_managed_pi_agent_dir(agent_dir, overlay=overlay)
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
+    if os.name == "posix" and any(
+        config.get("apiKey", "").startswith("!") for config in rendered["providers"].values()
+    ):
+        env[AUTH_DIR_ENV] = str(agent_dir / AUTH_DIR_NAME)
     if provider.inference_bound:
         env["OMNIGENT_PI_INFERENCE_BOUND"] = "1"
     # When the model id contains a "/" Pi's arg parser splits on the first

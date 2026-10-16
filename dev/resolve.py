@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -439,7 +438,10 @@ def main() -> None:
     if args.server is not None:
         cmd += ["--server", args.server]
 
-    env = os.environ.copy()
+    # A Linear key must be mirrored and named for passthrough to reach the runner.
+    from dev.repro import _launch_env
+
+    env = _launch_env(args.bug_url or "")
     print(f"→ running: {' '.join(cmd)}")
     print(f"→ cwd:     {worktree}\n")
 

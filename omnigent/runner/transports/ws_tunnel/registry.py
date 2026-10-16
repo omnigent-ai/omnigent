@@ -104,9 +104,9 @@ class RunnerSession:
     :param close_code: First server-requested close code, recorded under
         the registry lock before helpers can observe retirement.
     :param close_reason: Reason accompanying ``close_code``.
+    :param peer_close_reason: Reason in the runner's own close frame, e.g.
+        ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``; ``None`` until the runner closes.
     :param diagnostics: Timing observations owned by this connection's socket loop.
-    :param peer_close_reason: Reason of the close frame the runner sent,
-        e.g. ``"runner idle timeout"``.
     """
 
     runner_id: str
@@ -125,8 +125,8 @@ class RunnerSession:
     ws_channels: dict[str, WSChannelState] = field(default_factory=dict)
     close_code: int | None = None
     close_reason: str | None = None
-    diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
     peer_close_reason: str | None = None
+    diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
 
 
 @dataclass

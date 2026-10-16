@@ -7815,44 +7815,6 @@ def _owned_by_parent_runtime(conv: Conversation | _RelayStatusSnapshot | None) -
     return conv is not None and is_parent_owned_subagent(conv)
 
 
-def _note_runner_idle_exit(runner_id: str, convs: Sequence[Conversation] = ()) -> None:
-    """Treat a runner's idle-reaper exit as an intentional stop of its sessions.
-
-    The runner exits on idle only when it has no active work, so its sessions
-    settle to idle through the intentional-stop paths instead of failing as
-    ``runner_disconnected``. A session this replica still believes mid-turn is
-    logged: the runner and server disagreed about whether a turn was in flight.
-
-    :param runner_id: Runner that closed its tunnel with the idle-exit reason.
-    :param convs: Stored sessions bound to the runner, for sessions without a
-        local relay; relay-bound sessions are found here.
-    """
-    session_ids = {
-        session_id
-        for session_id, handle in _runner_relay_tasks.items()
-        if handle.runner_id == runner_id
-    }
-    session_ids.update(conv.id for conv in convs if conv.runner_id == runner_id)
-    for session_id in sorted(session_ids):
-        cached = _session_status_cache.get(session_id)
-        already_stopping = _intentional_stop_sessions.get(session_id) == runner_id
-        if cached in _MID_TURN_STATUSES and not already_stopping:
-            _logger.warning(
-                "Runner %s exited on idle timeout while session=%s was %s here; settling it idle",
-                runner_id,
-                session_id,
-                cached,
-                extra=debug_event(
-                    "runner_idle_exit_status_mismatch",
-                    session_id=session_id,
-                    turn_id=_session_active_response_cache.get(session_id),
-                    runner_id=runner_id,
-                    cached_session_status=cached,
-                ),
-            )
-        _intentional_stop_sessions[session_id] = runner_id
-
-
 async def _runner_disconnect_requires_failure(
     session_id: str,
     conversation_store: ConversationStore,

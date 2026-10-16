@@ -230,22 +230,22 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
     cancelled; the next native-terminal ensure can recreate the TUI.
 
     Cancelling the forwarder closes the app-server via the forwarder's own
-    ``finally`` (see :func:`_codex_discover_thread_and_forward`); the pop
-    below is the belt-and-suspenders close for the discovery-failed case
-    where no forwarder ever adopted the server. No-op for a session that
-    has no registered codex app-server, so this is safe to call from the
-    required-session teardown paths regardless of harness.
+    ``finally`` (see :func:`_codex_discover_thread_and_forward`). The captured
+    server is also closed if no forwarder adopted it; a replacement registered
+    during cancellation keeps its ownership. No-op for a session without a
+    registered codex app-server, so other harnesses can share this teardown path.
 
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :returns: None.
     """
-    if session_id not in _AUTO_CODEX_APP_SERVERS:
+    app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+    if app_server is None:
         return
     await _cancel_auto_forwarder_task(session_id)
-    leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
-    if leftover_app_server is not None:
-        with contextlib.suppress(Exception):
-            await leftover_app_server.close()
+    if _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+    with contextlib.suppress(Exception):
+        await app_server.close()
 
 
 async def teardown_all_codex_native_app_servers() -> None:
