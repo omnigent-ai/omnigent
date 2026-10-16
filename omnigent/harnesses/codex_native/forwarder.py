@@ -43,6 +43,7 @@ from omnigent.harnesses.codex_native.bridge import (
     clear_certificate_failure,
     codex_config_revision,
     codex_home_for_bridge_dir,
+    mirror_applied_codex_settings,
     pending_mcp_servers,
     read_bridge_state,
     read_certificate_failure,
@@ -50,6 +51,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_effort,
     read_codex_config_model,
     read_mcp_startup,
+    read_unmirrored_codex_settings,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -444,8 +446,8 @@ class _CodexForwarderState:
 
     model: str | None = None
     posted_model: str | None = None
-    # The running thread's authoritative model, from a live
-    # ``thread/settings/updated``; beats a stale config.toml re-read.
+    # The running thread's authoritative model: a live ``thread/settings/updated``
+    # or an adopted config.toml rewrite; beats a stale config.toml re-read.
     settings_model: str | None = None
     # The config.toml model as of the last _refresh_model_from_config read,
     # so the refresh can tell an unchanged file from a rewritten one.
@@ -2660,10 +2662,10 @@ async def _subscribe_until_ready_inner(
             return
         if forwarder_state is not None:
             forwarder_state.note_resume_response(response)
+            await _mirror_resumed_model(bridge_dir, response)
             # Source of truth for the cost policy is config.toml's model (what
             # /model writes). Read it now so model_override reflects it from
-            # the first tool call, not a turn later. Falls back to the resume
-            # response's model when config.toml has none.
+            # the first tool call, not a turn later.
             _refresh_model_from_config(bridge_dir, forwarder_state)
             _refresh_developer_instructions_from_config(bridge_dir, forwarder_state)
             _refresh_effort_from_config(bridge_dir, forwarder_state)
@@ -3296,6 +3298,52 @@ async def _maybe_handle_codex_request(
     return False
 
 
+async def _mirror_resumed_model(bridge_dir: Path, response: CodexMessage) -> None:
+    """
+    Bring config.toml in line with the model a resumed thread actually runs.
+
+    The resume relaunch pins config.toml to the saved pick or the default
+    before Codex resumes the thread, and Codex can keep the thread's rollout
+    model instead; ``thread/resume`` reports which. Every reader treats the
+    file as the running model (this mirror, the cost-gate hook, the
+    executor), so write the reported model when the file disagrees, as the
+    executor does for a routed switch. The write is bound to the revision
+    read, so a terminal ``/model`` landing meanwhile keeps its newer pick. A
+    failed write is recorded for the readers that honor unmirrored settings.
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :param response: Codex ``thread/resume`` response envelope.
+    :returns: None.
+    """
+    result = response.get("result")
+    model = result.get("model") if isinstance(result, dict) else None
+    if not isinstance(model, str) or not model:
+        return
+
+    def adopt() -> dict[str, str]:
+        revision = codex_config_revision(bridge_dir)
+        # A stale failed-write record would otherwise shadow the file's value.
+        if read_codex_config_model(bridge_dir) == model and read_unmirrored_codex_settings(
+            bridge_dir
+        ).get("model") in (None, model):
+            return {}
+        return mirror_applied_codex_settings(
+            bridge_dir, {"model": model}, expected_revision=revision
+        )
+
+    try:
+        failed = await asyncio.to_thread(adopt)
+    except Exception:  # noqa: BLE001 - a mirror file must not break the subscription.
+        _logger.warning("Failed to record resumed Codex model %s", model, exc_info=True)
+        return
+    if failed:
+        _logger.warning(
+            "Failed to mirror resumed Codex model %s into config.toml (bridge=%s)",
+            model,
+            bridge_dir,
+        )
+
+
 def _refresh_model_from_config(bridge_dir: Path, forwarder_state: _CodexForwarderState) -> None:
     """
     Update the forwarder's known model from config.toml and thread settings.
@@ -3309,24 +3357,31 @@ def _refresh_model_from_config(bridge_dir: Path, forwarder_state: _CodexForwarde
 
     Precedence: a config.toml value that CHANGED since the last read wins
     (an in-TUI ``/model`` or the executor's mirror write — the freshest
-    signal). An unchanged config defers to the last live
+    signal) and becomes the running thread's model, so later unchanged
+    re-reads keep it. An unchanged config defers to the last live
     ``thread/settings/updated`` model when one was seen: an
     Omnigent-initiated ``thread/settings/update`` switches the running
     thread without touching config.toml, so re-adopting the stale file
-    would revert a routed model one turn after it applied. No-op when
-    nothing is known, leaving the prior value.
+    would revert a routed model one turn after it applied. A model whose
+    mirror write failed counts as the file's value until the file is
+    rewritten. No-op when nothing is known, leaving the prior value.
 
     :param bridge_dir: The session's native-Codex bridge directory.
     :param forwarder_state: Mutable forwarder state whose ``model`` is
         updated in place.
     :returns: None.
     """
-    config_model = read_codex_config_model(bridge_dir)
+    config_model = read_unmirrored_codex_settings(bridge_dir).get(
+        "model"
+    ) or read_codex_config_model(bridge_dir)
     config_changed = bool(config_model) and config_model != forwarder_state.last_config_model
     if config_model:
         forwarder_state.last_config_model = config_model
     if config_changed:
         forwarder_state.model = config_model
+        # The rewrite moved the running thread too, so later unchanged re-reads
+        # must not revert to an older live model.
+        forwarder_state.settings_model = config_model
     elif forwarder_state.settings_model:
         forwarder_state.model = forwarder_state.settings_model
     elif config_model:

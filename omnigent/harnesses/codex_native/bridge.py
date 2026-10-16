@@ -600,8 +600,12 @@ def codex_config_revision(bridge_dir: Path) -> tuple[int, int] | None:
     Config writers replace the file atomically, so any rewrite changes the revision
     even when it keeps every value.
     """
+    return _config_revision(codex_home_for_bridge_dir(bridge_dir) / "config.toml")
+
+
+def _config_revision(config_path: Path) -> tuple[int, int] | None:
     try:
-        config_stat = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").stat()
+        config_stat = config_path.stat()
     except OSError:
         return None
     return config_stat.st_ino, config_stat.st_mtime_ns
@@ -823,7 +827,9 @@ def read_codex_config_developer_instructions_from_home(codex_home: Path) -> str 
     return result.value
 
 
-def write_codex_config_model(bridge_dir: Path, model: str) -> bool:
+def write_codex_config_model(
+    bridge_dir: Path, model: str, *, expected_revision: tuple[int, int] | None = None
+) -> bool:
     """
     Upsert the top-level ``model`` key in this session's Codex ``config.toml``.
 
@@ -844,6 +850,8 @@ def write_codex_config_model(bridge_dir: Path, model: str) -> bool:
 
     :param bridge_dir: The session's native-Codex bridge directory.
     :param model: Model id to record, e.g. ``"gpt-5.6-luna"``.
+    :param expected_revision: When given, write only while config.toml is still
+        this :func:`codex_config_revision`; a newer rewrite wins instead.
     :returns: ``True`` when the file was updated.
     """
     from omnigent.util.reasoning_effort import clamp_effort_for_model
@@ -864,6 +872,7 @@ def write_codex_config_model(bridge_dir: Path, model: str) -> bool:
         "model",
         model,
         mutate_document=_clamp_stale_effort,
+        expected_revision=expected_revision,
     )
 
 
@@ -899,14 +908,25 @@ def write_codex_config_effort(bridge_dir: Path, effort: str) -> bool:
     )
 
 
-def mirror_applied_codex_settings(bridge_dir: Path, applied: Mapping[str, str]) -> dict[str, str]:
+def mirror_applied_codex_settings(
+    bridge_dir: Path,
+    applied: Mapping[str, str],
+    *,
+    expected_revision: tuple[int, int] | None = None,
+) -> dict[str, str]:
     """Write a model and effort Codex applied into ``config.toml``, recording any that fail.
 
     The model is written first, since that write clamps a stale effort. Settings
-    recorded earlier that *applied* does not replace stay recorded.
+    recorded earlier that *applied* does not replace stay recorded. With
+    ``expected_revision``, the model is written only while config.toml is still
+    the revision the caller observed; a newer rewrite (a terminal ``/model``)
+    wins and nothing is recorded. The check is best-effort, since Codex does
+    not take this lock.
 
     :param bridge_dir: The session's native-Codex bridge directory.
     :param applied: Applied values keyed ``"model"`` / ``"effort"``.
+    :param expected_revision: :func:`codex_config_revision` the applied model
+        was derived against, or ``None`` to write unconditionally.
     :returns: The values whose write failed.
     """
     writers = {"model": write_codex_config_model, "effort": write_codex_config_effort}
@@ -915,11 +935,21 @@ def mirror_applied_codex_settings(bridge_dir: Path, applied: Mapping[str, str]) 
     # another's superseded record against the config revision it just wrote.
     with _bridge_state_lock(bridge_dir, _UNMIRRORED_SETTINGS_LOCK_FILE):
         expected = codex_config_revision(bridge_dir)
+        if expected_revision is not None and expected != expected_revision:
+            return failed
         pending = read_unmirrored_codex_settings(bridge_dir)
         for key, write in writers.items():
             if key in applied:
                 pending.pop(key, None)
-                if write(bridge_dir, applied[key]):
+                if key == "model" and expected_revision is not None:
+                    written = write_codex_config_model(
+                        bridge_dir, applied[key], expected_revision=expected
+                    )
+                    if not written and codex_config_revision(bridge_dir) != expected:
+                        return failed
+                else:
+                    written = write(bridge_dir, applied[key])
+                if written:
                     expected = codex_config_revision(bridge_dir)
                 else:
                     failed[key] = applied[key]
@@ -935,6 +965,7 @@ def _upsert_top_level_config_key(
     value: str,
     *,
     mutate_document: Callable[[MutableMapping[str, object]], None] | None = None,
+    expected_revision: tuple[int, int] | None = None,
 ) -> bool:
     """
     Upsert one top-level key in a ``config.toml``, best-effort.
@@ -956,9 +987,12 @@ def _upsert_top_level_config_key(
     :param mutate_document: Optional extra mutation of the parsed document,
         applied before serializing; used by the model writer to clamp a stale
         effort. Only top-level keys are visible to it.
+    :param expected_revision: When given, the replace is skipped once the file
+        no longer has this inode/mtime. Best-effort: Codex writes without our
+        lock, so a rewrite between that check and the replace is still lost.
     :returns: ``True`` when the file was updated; ``False`` when it could not
         be read, parsed (malformed/undecodable — never made worse), or
-        written.
+        written, or when another writer replaced it first.
     """
     import tomlkit
     from tomlkit.exceptions import TOMLKitError
@@ -983,6 +1017,11 @@ def _upsert_top_level_config_key(
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(output)
+            if (
+                expected_revision is not None
+                and _config_revision(config_path) != expected_revision
+            ):
+                return False
             os.replace(tmp_name, config_path)
         finally:
             if os.path.exists(tmp_name):

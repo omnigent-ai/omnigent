@@ -295,6 +295,16 @@ Cross-harness journeys:
   retain their endpoint; history, model, effort and permissions survive.
   `tests/harnesses/codex_native/session/test_terminal_prepare.py::test_prepare_codex_terminal_resumes_with_launch_provider`
   covers the CLI resume call site with configured and unpinned launches.
+- **`resume`, Codex picker follows the resumed thread's model:**
+  `tests/harnesses/codex_native/forwarder/test_settings.py::test_refresh_after_resume_keeps_thread_model_until_config_is_rewritten`,
+  `tests/harnesses/codex_native/forwarder/test_settings.py::test_subscribe_keeps_a_model_the_tui_picked_during_resume_mirroring`,
+  and
+  `tests/harnesses/codex_native/forwarder/test_settings.py::test_subscribe_records_unmirrored_model_when_config_write_fails`.
+  A relaunch pins the private config to the saved pick or the default; when
+  Codex keeps the thread's rollout model instead, the forwarder writes that
+  model back into the private config (recording a failed write like other
+  applied settings) and the composer picker shows the model the `thread/resume`
+  response reports, matching the terminal. A later in-TUI `/model` still wins.
 - **`chat-render`, `steer`, per harness:** use the matrix.
 - **`chat-render`, Claude shell commands from the web composer:**
   `tests/browser_ui/chat/test_native_shell_settlement.py::test_shell_mirror_settles_its_bubble_before_the_next_prompt`

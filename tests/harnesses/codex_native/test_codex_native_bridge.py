@@ -1389,6 +1389,65 @@ def test_mirror_applied_codex_settings_ignores_values_codex_rewrote_after_them(
     assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {}
 
 
+def test_mirror_applied_codex_settings_skips_a_model_the_config_outran(bridge_dir: Path) -> None:
+    """A write bound to an older revision neither replaces a newer config nor records itself."""
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / "config.toml"
+    config.write_text('model = "gpt-5.4"\n')
+    revision = codex_native_bridge.codex_config_revision(bridge_dir)
+    # A terminal /model replaces the file after the caller observed it.
+    replacement = config.with_name("config.toml.terminal")
+    replacement.write_text('model = "gpt-5.5"\n')
+    os.replace(replacement, config)
+
+    failed = codex_native_bridge.mirror_applied_codex_settings(
+        bridge_dir, {"model": "gpt-6-sol"}, expected_revision=revision
+    )
+
+    assert failed == {}
+    assert codex_native_bridge.read_codex_config_model(bridge_dir) == "gpt-5.5"
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {}
+    # The same write against the current revision applies.
+    current = codex_native_bridge.codex_config_revision(bridge_dir)
+    assert (
+        codex_native_bridge.mirror_applied_codex_settings(
+            bridge_dir, {"model": "gpt-6-sol"}, expected_revision=current
+        )
+        == {}
+    )
+    assert codex_native_bridge.read_codex_config_model(bridge_dir) == "gpt-6-sol"
+
+
+def test_mirror_applied_codex_settings_keeps_a_rewrite_that_lands_mid_write(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal /model landing while the replacement is prepared survives unrecorded."""
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / "config.toml"
+    config.write_text('model = "gpt-5.4"\n')
+    revision = codex_native_bridge.codex_config_revision(bridge_dir)
+    real_mkstemp = codex_native_bridge.tempfile.mkstemp
+
+    def terminal_switch_then_mkstemp(*args: Any, **kwargs: Any) -> tuple[int, str]:
+        replacement = config.with_name("config.toml.terminal")
+        replacement.write_text('model = "gpt-5.5"\n')
+        os.replace(replacement, config)
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(codex_native_bridge.tempfile, "mkstemp", terminal_switch_then_mkstemp)
+
+    failed = codex_native_bridge.mirror_applied_codex_settings(
+        bridge_dir, {"model": "gpt-6-sol"}, expected_revision=revision
+    )
+
+    assert failed == {}
+    assert codex_native_bridge.read_codex_config_model(bridge_dir) == "gpt-5.5"
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {}
+    assert not list(home.glob("config.toml.*"))
+
+
 def test_clear_bridge_state_removes_egress_certificate_failure(tmp_path: Path) -> None:
     """A relaunch must not inherit the previous launcher's certificate evidence."""
     bridge_dir = tmp_path / "bridge"
