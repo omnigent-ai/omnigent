@@ -3200,7 +3200,11 @@ def mocked_native_codex_session(
 
 
 def _create_native_cursor_session(
-    base_url: str, runner_id: str, *, launch_args: tuple[str, ...] = ("-f",)
+    base_url: str,
+    runner_id: str,
+    *,
+    launch_args: tuple[str, ...] = ("-f",),
+    workspace: Path | None = None,
 ) -> str:
     """Register the ``cursor-native`` wrapper agent and bind its session.
 
@@ -3223,6 +3227,7 @@ def _create_native_cursor_session(
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
+    :param workspace: The session's working folder; defaults to the repo root.
     :returns: The new session/conversation id.
     """
     # An empty launch_args enables approval prompts; the default trusts the workspace.
@@ -3230,7 +3235,10 @@ def _create_native_cursor_session(
         httpx,
         base_url,
         harness="cursor",
-        metadata={"workspace": str(_REPO_ROOT), "terminal_launch_args": list(launch_args)},
+        metadata={
+            "workspace": str(workspace or _REPO_ROOT),
+            "terminal_launch_args": list(launch_args),
+        },
     )
     session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
