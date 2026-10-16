@@ -491,7 +491,7 @@ const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
 };
 
 /**
- * Label for the new-session sandbox option, named per provider.
+ * Label for the new-session sandbox option; static sandboxes use a generic label.
  *
  * Returns e.g. "Modal Sandbox" or "Databricks Sandbox" when the
  * server reports a provider, and the generic "New Sandbox" when it
@@ -499,10 +499,11 @@ const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
  * providers were surfaced.
  */
 export function sandboxOptionLabel(provider: string | null, reusable = false): string {
+  if (reusable) return "New static sandbox";
   if (!provider) return "New Sandbox";
   const name =
     SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
-  return reusable ? `New ${name} static sandbox` : `${name} Sandbox`;
+  return `${name} Sandbox`;
 }
 
 /**

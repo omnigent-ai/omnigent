@@ -36,7 +36,7 @@ def capabilities(self):
     return replace(super().capabilities, reusable_hosts=True, resume_stopped=True)
 ```
 
-The regular new-session provider option becomes **New Acme static sandbox**.
+The regular new-session provider option becomes **New static sandbox**.
 It calls the existing `provision` and `start_host` methods, including repository
 setup. The resulting host is saved with the same ownership marker and appears in
 host pickers for later sessions. No separate Add static sandbox dialog or creation
@@ -88,7 +88,7 @@ host identity and token; returning an HTTP endpoint alone is insufficient.
 
 After the [schema/application rollout](../sandbox-attachment-rollout.md), install
 and configure an opt-in provider on an isolated server. Open New session, select
-**New Acme static sandbox** and submit a prompt. Once the session starts, open
+**New static sandbox** and submit a prompt. Once the session starts, open
 New session again: its `static-...` host should now be available to select. Create
 a second session on that host, then delete the first; the second must stay bound
 and the provider must not delete the box.
@@ -99,7 +99,7 @@ To attach a pre-existing box instead, authenticate as its owner and call:
 POST /v1/hosts/attach
 Content-Type: application/json
 
-{"provider":"acme","sandbox_id":"my-existing-box","name":"My devbox"}
+{"provider":"static","sandbox_id":"my-existing-box","name":"My devbox"}
 ```
 
 This waits for the ordinary host connection and returns `{"host_id":"..."}`.

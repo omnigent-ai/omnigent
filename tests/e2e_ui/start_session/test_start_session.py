@@ -3490,7 +3490,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(built_spa, 
                 "name": "My devbox",
                 "owner": "e2e",
                 "status": "offline",
-                "sandbox_provider": "acme",
+                "sandbox_provider": "static",
                 "sandbox_attached": True,
                 "configured_harnesses": {"claude-native": True},
             }
@@ -3513,9 +3513,9 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(built_spa, 
 
             info = json.loads(_managed_info_body())
             info.update(
-                sandbox_provider="acme",
-                sandbox_providers=["acme"],
-                sandbox_provider_capabilities={"acme": {"reusable_hosts": True}},
+                sandbox_provider="static",
+                sandbox_providers=["static"],
+                sandbox_provider_capabilities={"static": {"reusable_hosts": True}},
             )
             await page.route("**/v1/info", lambda route: route.fulfill(json=info))
             await page.route("**/v1/hosts", lambda route: route.fulfill(json={"hosts": hosts}))
@@ -3532,13 +3532,11 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(built_spa, 
                 await page.goto(f"{base_url}/")
                 chip = page.get_by_test_id("new-chat-landing-host-chip")
                 await chip.click()
-                create_static = page.get_by_role(
-                    "menuitem", name="New Acme static sandbox", exact=True
-                )
+                create_static = page.get_by_role("menuitem", name="New static sandbox", exact=True)
                 await expect(create_static).to_be_visible()
                 await create_static.click()
                 await expect(chip).to_have_attribute(
-                    "aria-label", re.compile("New Acme static sandbox")
+                    "aria-label", re.compile("New static sandbox")
                 )
                 await expect(create_static).to_be_hidden()
                 await chip.click()

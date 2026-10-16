@@ -306,6 +306,6 @@ describe("custom agents settings capability", () => {
 });
 
 it("labels reusable provider creation as a new static sandbox", () => {
-  expect(sandboxOptionLabel("acme", true)).toBe("New Acme static sandbox");
-  expect(sandboxOptionLabel("acme")).toBe("Acme Sandbox");
+  expect(sandboxOptionLabel("modal", true)).toBe("New static sandbox");
+  expect(sandboxOptionLabel("modal")).toBe("Modal Sandbox");
 });
