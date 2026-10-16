@@ -16,7 +16,7 @@ in the Files drawer.
   Upload after selection or cancellation.
 - `upload-tree`: folder drops, file drops to their parent, spring-loaded folders,
   root drops and Changed-view root drops; a folder target tints its full row,
-  swaps its icon to Upload and glows, while root targets show a dashed edge cue
+  swaps its icon to Upload, while root targets show a dashed edge cue
   that leaves the tree visible in both themes.
 - `upload-tray`: committed progress, cancel, retry, conflict decisions, completion
   and announcements; survives a viewer swap, drawer close and session switch.
