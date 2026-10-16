@@ -58,6 +58,7 @@ HELPER_CACHE_MAX = 32
 HELPER_IDLE_S = 300
 STARTUP_SWEEP_BUDGET_S = 0.5
 GONE_MAX = 4096
+COMPLETED_RECEIPTS_MAX = 256
 PUBLICATION_ATTEMPTS = 3
 T = TypeVar("T")
 _sweep_active = ContextVar("upload_sweep_active", default=False)
@@ -261,6 +262,7 @@ class UploadManager:
         self.stopping = False
         self.task: asyncio.Task[None] | None = None
         self.gone: OrderedDict[str, tuple[tuple[str, str, str], float]] = OrderedDict()
+        self.restored: set[str] = set()
         if state_path.exists():
             try:
                 values = json.loads(state_path.read_text())
@@ -276,6 +278,8 @@ class UploadManager:
                 except OSError:
                     logger.exception("Unable to move unreadable upload index aside")
         self.restored = set(self.records)
+        if self._prune_completed_receipts():
+            self.index_dirty = True
 
     def _pinned(self, key: tuple[str, str]) -> bool:
         return any(
@@ -450,6 +454,7 @@ class UploadManager:
 
     async def _save_settled(self) -> None:
         # The index lock must outlive its save thread, even during shutdown.
+        self._prune_completed_receipts()
         self.index_dirty = True
         task = asyncio.create_task(asyncio.to_thread(self._save))
         try:
@@ -491,6 +496,20 @@ class UploadManager:
         self.records.pop(uid, None)
         self.restored.discard(uid)
         self.upload_locks.pop(uid, None)
+
+    def _prune_completed_receipts(self) -> bool:
+        completed = sorted(
+            (
+                (record.last_activity, uid, record)
+                for uid, record in self.records.items()
+                if record.result is not None
+            ),
+            key=lambda item: item[0],
+        )
+        excess = len(completed) - COMPLETED_RECEIPTS_MAX
+        for _, uid, record in completed[: max(0, excess)]:
+            self._drop(uid, record)
+        return excess > 0
 
     async def _remove(self, uid: str, record: UploadRecord) -> None:
         try:
