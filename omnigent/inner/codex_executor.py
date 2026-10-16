@@ -214,6 +214,8 @@ _CODEX_HOME_SYMLINK_DIRS = (
     # same memories and rules as the real home without replicating them.
     Path("memories"),
     Path("rules"),
+    # Relative agents.<name>.config_file paths resolve from the config home.
+    Path("agents"),
 )
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
