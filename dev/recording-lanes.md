@@ -13,7 +13,7 @@ they produce differs:
   head.
 - **feature-agent** films each covered CUJ as a **`demo`** clip, with the CUJ ID
   as the facet. Its demo is required, not best-effort; its `feature-demo` skill
-  replaces "If recording is blocked" below.
+  replaces "Internal/API-only results" and "If recording is blocked" below.
 
 Everything else below — which surface to drive, how to stand the recorder up, and
 the per-surface mechanics — is identical for all of them. Each agent's own AGENTS.md says

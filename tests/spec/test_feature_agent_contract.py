@@ -29,7 +29,9 @@ def _normalized(text: str) -> str:
 
 def _handoff_example() -> dict:
     handoff = _skills()["feature-handoff"]
-    return json.loads(re.findall(r"```json\n(\{.*?\})\n```", handoff, re.DOTALL)[-1])
+    blocks = re.findall(r"```json\n(\{.*?\})\n```", handoff, re.DOTALL)
+    assert blocks, "feature-handoff has no fenced JSON example"
+    return json.loads(blocks[-1])
 
 
 def test_feature_agent_routes_every_phase_to_a_bundled_skill() -> None:
