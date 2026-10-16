@@ -26,11 +26,24 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+_TABLE = "omnigent_conversation_metadata"
+_COLUMN = "live_status_at"
+
+
+def _column_exists() -> bool:
+    return _COLUMN in {column["name"] for column in sa.inspect(op.get_bind()).get_columns(_TABLE)}
+
+
 def upgrade() -> None:
-    with op.batch_alter_table("omnigent_conversation_metadata") as batch_op:
-        batch_op.add_column(sa.Column("live_status_at", sa.BigInteger(), nullable=True))
+    # A retry that replays this revision after the column was added must not fail.
+    if _column_exists():
+        return
+    with op.batch_alter_table(_TABLE) as batch_op:
+        batch_op.add_column(sa.Column(_COLUMN, sa.BigInteger(), nullable=True))
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("omnigent_conversation_metadata") as batch_op:
-        batch_op.drop_column("live_status_at")
+    if not _column_exists():
+        return
+    with op.batch_alter_table(_TABLE) as batch_op:
+        batch_op.drop_column(_COLUMN)
