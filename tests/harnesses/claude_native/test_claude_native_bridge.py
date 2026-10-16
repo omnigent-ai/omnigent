@@ -4759,9 +4759,11 @@ def test_inject_user_message_raises_on_tmux_failure(
         inject_user_message(bridge_dir, content="hi")
 
 
+@pytest.mark.parametrize("truncated_title", [False, True])
 def test_inject_user_message_waits_for_claude_prompt_before_typing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    truncated_title: bool,
 ) -> None:
     """
     Injection polls for Claude's prompt before sending any keystrokes.
@@ -4781,14 +4783,21 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     )
 
     send_keys: list[list[str]] = []
+
     # Prompt is absent for the first two polls (TUI still booting),
     # then renders. A wrong gate would send keys during the empty
     # polls; a correct gate waits for the third capture. After boot the
     # fake behaves like the live input box: the paste deposits the
     # draft, Enter clears it (so the submit-verification gate passes).
-    boot_panes = ["", "", _composer_pane()]
+    def ready_pane(draft: str = "") -> str:
+        pane = _composer_pane(draft)
+        if truncated_title:
+            pane = " A session title longer than the terminal width… ─\n" + pane.split("\n", 1)[1]
+        return pane
+
+    boot_panes = ["", "", ready_pane()]
     capture_calls = {"n": 0}
-    tui = {"pane": _composer_pane()}
+    tui = {"pane": ready_pane()}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
@@ -4810,9 +4819,9 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
-            tui["pane"] = _composer_pane("hello")
+            tui["pane"] = ready_pane("hello")
         if cmd[-1] == "Enter":
-            tui["pane"] = _composer_pane()
+            tui["pane"] = ready_pane()
         send_keys.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -9186,6 +9195,39 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+def test_claude_prompt_rendered_sees_prompt_under_truncated_label() -> None:
+    """A clipped title can consume every leading glyph of the opening rule."""
+    rule = "─" * 103
+    pane = "\n".join(
+        [
+            '● Agent "fix the webhook retry path" finished · 3m 48s',
+            " Retry failed billing webhook deliveries with exponential backoff and"
+            " jitter, capped at one hour(… ─",  # opening rule: no leading run
+            "❯",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",
+            "  ⏵⏵ auto mode on · 1 shell",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_ignores_draft_line_trailing_off_in_a_glyph() -> None:
+    """Indented draft content cannot replace the composer's opening rule."""
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            rule,  # opening rule
+            "❯ first line of the draft",
+            "  second line of the draft trails off… ─",
+            "  third line",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
 @pytest.mark.parametrize(
     "line",
     [
@@ -9200,6 +9242,9 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
         # 46-char title on a browser terminal only 50 columns wide.
         "── " + "t" * 75 + " ─",
         "─ fix-the-billing-webhook-retry-backoff-path-now ─",
+        # A title wider than the pane is cut with "…" and loses the leading run.
+        " Retry failed billing webhook deliveries with exponential backoff … ─",
+        " 修复计费回调的重试路径并加入指数退避与抖动以及每小时上限… ─",  # wide-character title
     ],
 )
 def test_is_box_rule_accepts_rules(line: str) -> None:
@@ -9224,6 +9269,13 @@ def test_is_box_rule_accepts_rules(line: str) -> None:
         "│   │   │",  # deeper nesting, same shape
         "│   ├── src",  # a ``tree`` row
         "─" * 40 + " a │ b ─",  # a rule glyph inside the label
+        # No leading run: only a label cut with a spaced-off "…" may stand in for it.
+        "a sentence that ends in a box glyph ─",
+        "a truncated sentence that ends…─",
+        "… " + "─" * 30,  # the mark with no label before it
+        # Indented past the rule's edge: a draft or transcript line, not a title.
+        "  the build was cancelled because the graph is huge… ─",
+        "- item one that trails off somewhere… ─",
     ],
 )
 def test_is_box_rule_rejects_non_rules(line: str) -> None:
