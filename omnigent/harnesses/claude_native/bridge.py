@@ -397,6 +397,8 @@ _MODEL_PICKER_OPEN_HINT = "use this session only"
 # dialog (whose Enter restores a checkpoint), while 1.0s apart do not.
 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
 _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
+# What :func:`_occupying_surface` reports when no input box is drawn.
+_OVERLAY_SURFACE = "an overlay"
 # The dismissal every surface drawn over the input box advertises in its
 # footer ("Esc to cancel", "Esc to clear"). Claude Code joins keys that share
 # an action with "/", so the task details panels print "Esc/Enter/Space to
