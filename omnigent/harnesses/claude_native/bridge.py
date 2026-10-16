@@ -5841,7 +5841,8 @@ def _restore_occupied_input(
         # mounts, a dialog that offers no dismissal, or a startup prompt whose
         # cancel quits Claude Code.
         unclearable = surface == _OVERLAY_SURFACE and (
-            not _ESCAPE_DISMISS_HINT.search(pane) or _EXIT_OPTION_ROW.search(_dialog_option_rows(pane)) is not None
+            not _ESCAPE_DISMISS_HINT.search(pane)
+            or _EXIT_OPTION_ROW.search(_dialog_option_rows(pane)) is not None
         )
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
