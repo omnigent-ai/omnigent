@@ -517,8 +517,13 @@ def _clock_advanced_by_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 @pytest.mark.asyncio
 async def test_serve_tunnel_waits_for_a_pending_sign_in_then_connects(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     """A never-connected runner polls a pending sign-in instead of upgrading without a token."""
+    from omnigent.runner.identity import RUNNER_CONNECT_MARKER_ENV_VAR, sign_in_pending_marker_path
+
+    marker = tmp_path / "runner.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
     factory = _SignInFactory(pending_calls=4, token="tok-after-sign-in")
     upgrades: list[str | None] = []
 
@@ -543,6 +548,7 @@ async def test_serve_tunnel_waits_for_a_pending_sign_in_then_connects(
     # No unauthenticated upgrade while pending: the first one carries the new token.
     assert upgrades == ["tok-after-sign-in"]
     assert len(sleeps) == 4
+    assert not sign_in_pending_marker_path(marker).exists()
 
 
 @pytest.mark.asyncio
@@ -3536,3 +3542,32 @@ async def test_serve_tunnel_keeps_escalating_after_brief_connection(
     # Attempt 3 (brief_drop): connected for 2 s < 5 s; no reset → sleep 2.0
     # Attempt 4 (stop): CancelledError before sleep
     assert sleeps == [0.5, 1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_pending_sign_in_cancellation_clears_launch_marker(tmp_path, monkeypatch) -> None:
+    from omnigent.runner.identity import RUNNER_CONNECT_MARKER_ENV_VAR, sign_in_pending_marker_path
+
+    marker = tmp_path / "runner.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
+    task = asyncio.create_task(
+        serve_tunnel(
+            _noop_app,
+            server_url="http://synthetic.invalid",
+            runner_id="runner-owned",
+            runner_version="0.1",
+            auth_token_factory=_SignInFactory(pending_calls=10_000, token=None),
+        )
+    )
+    try:
+        async with asyncio.timeout(1):
+            while not sign_in_pending_marker_path(marker).exists():
+                await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not sign_in_pending_marker_path(marker).exists()
+        assert not marker.exists()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
