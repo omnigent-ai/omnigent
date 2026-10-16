@@ -7773,7 +7773,6 @@ def _native_terminal_start_failure_cause(exc: BaseException) -> str:
         ``"RuntimeError (cause ReadTimeout)"``.
     """
     class_name = type(exc).__name__
-    configuration_error = isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
     os_error = _os_error_with_errno(exc)
     if os_error is not None:
         assert os_error.errno is not None
@@ -7811,13 +7810,18 @@ def _native_terminal_start_error_payload(
         if isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES
         else None
     )
+    configuration_error = (
+        isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
+    )
     os_error = _os_error_with_errno(exc)
     extra = debug_event(
         "native_terminal_start_failed",
         session_id=session_id,
         error_id=error_id,
         runtime=runtime_name,
-        code=ErrorCode.HARNESS_NOT_CONFIGURED if configuration_error else lifecycle_code or _NATIVE_TERMINAL_START_FAILED_CODE,
+        code=ErrorCode.HARNESS_NOT_CONFIGURED
+        if configuration_error
+        else lifecycle_code or _NATIVE_TERMINAL_START_FAILED_CODE,
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
         cause_code=exc.code if isinstance(exc, OmnigentError) else None,
@@ -7829,8 +7833,8 @@ def _native_terminal_start_error_payload(
         exception_context_type=type(exc.__context__).__name__
         if exc.__context__ is not None
         else None,
-        # The warning below carries no exc_info for a missing agent, so the
-        # sink cannot derive its category.
+        # Expected lifecycle and configuration errors have no stack, so
+        # preserve their category explicitly for the log sink.
         error_category=exc.category.value
         if isinstance(exc, OmnigentError) and (lifecycle_code is not None or configuration_error)
         else None,
@@ -7839,9 +7843,16 @@ def _native_terminal_start_error_payload(
     if isinstance(exc, OmnigentError) and configuration_error:
         _logger.warning(
             "Native %s configuration needs attention; error_id=%s: %s",
-            runtime_name, error_id, exc.message, extra=extra,
+            runtime_name,
+            error_id,
+            exc.message,
+            extra=extra,
         )
-        return {"code": exc.code, "error_id": error_id, "message": exc.message}
+        return {
+            "code": exc.code,
+            "error_id": error_id,
+            "message": f"{exc.message} Error ID: {error_id}.",
+        }
     if lifecycle_code is not None:
         # Expected session-lifecycle condition: a required session resource was
         # removed. Log it without a stack and surface a distinct code plus a
@@ -7915,9 +7926,6 @@ def _native_terminal_start_error_payload(
         # The raise site composes a client-safe message (versions + upgrade
         # command), so it can be shown verbatim.
         message = str(exc)
-    elif isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED:
-        # Only the person can fix the host's setup, and the message says how.
-        message = exc.message
     elif IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
         # Give the client an actionable message instead of a log pointer.

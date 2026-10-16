@@ -389,14 +389,7 @@ def test_gemini_key_cannot_claim_pi_scope_at_parse() -> None:
 
 
 def test_databricks_does_not_serve_gemini_surface() -> None:
-    """Databricks routes anthropic/openai + pi, NOT the Gemini surface.
-
-    The antigravity-native harness drives Gemini via the Google SDK + a
-    GEMINI_API_KEY / OAuth, not an OpenAI-compatible gateway, so a databricks
-    profile cannot supply the Gemini surface. Were it gemini-capable, a
-    ``default: true`` databricks profile would auto-become the gemini-surface
-    default and wedge its launch on a credential it cannot use.
-    """
+    """Existing Databricks providers require an explicit native Gemini opt-in."""
     config = {"providers": {"dbx": {"kind": "databricks", "profile": "ws", "default": True}}}
     entry = load_providers(config)["dbx"]
     assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
@@ -407,6 +400,30 @@ def test_databricks_does_not_serve_gemini_surface() -> None:
     bad = {"providers": {"dbx": {"kind": "databricks", "profile": "ws", "default": ["gemini"]}}}
     with pytest.raises(OmnigentError):
         load_providers(bad)
+
+
+@pytest.mark.parametrize("native_gemini", [False, True])
+def test_managed_databricks_connection_native_gemini_support(native_gemini: bool) -> None:
+    config = {
+        "providers": {
+            "dbx": {
+                "kind": "databricks",
+                "connection": "databricks",
+                "native_gemini": native_gemini,
+                "default": True,
+            }
+        }
+    }
+    if native_gemini:
+        with pytest.raises(
+            OmnigentError, match="native Gemini requires a local Databricks profile"
+        ):
+            load_providers(config)
+    else:
+        entry = load_providers(config)["dbx"]
+        assert entry.connection == "databricks"
+        assert entry.profile is None
+        assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
 
 
 @pytest.mark.parametrize("kind", ["gateway", "local"])

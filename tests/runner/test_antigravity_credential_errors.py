@@ -9,6 +9,7 @@ import httpx
 import pytest
 import yaml
 
+from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode
 from omnigent.runner.native.orchestration import (
     NativeLaunchContext,
@@ -88,4 +89,8 @@ async def test_saved_credentials_reach_runner_error_response(
         assert "runner log" not in error["message"]
         assert "private-malformed-secret" not in error["message"] + caplog.text
         assert not any(r.exc_info for r in caplog.records)
+        record = next(r for r in caplog.records if error["error_id"] in r.getMessage())
+        row = record_to_row(record, source="runner")
+        assert row["session_id"] == "credential-test"
+        assert row["attributes"]["code"] == ErrorCode.HARNESS_NOT_CONFIGURED
         registry.create_terminal.assert_not_called()

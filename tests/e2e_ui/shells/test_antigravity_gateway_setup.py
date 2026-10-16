@@ -24,6 +24,7 @@ import yaml
 
 from omnigent.harnesses.antigravity_native.bridge import bridge_dir_for_bridge_id
 from tests._helpers.https_server import enable_https
+from tests._helpers.native_session import create_native_session
 
 pytestmark = [
     pytest.mark.skipif(
@@ -163,6 +164,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             "OMNIGENT_AUTH_PROVIDER": "header",
             "OMNIGENT_LOCAL_SINGLE_USER": "1",
             "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
+            "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
             "NO_PROXY": "127.0.0.1,localhost",
         }
     )
@@ -269,20 +271,13 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                     pass
 
             host = _wait(online_host, "fresh host did not connect")
-            agents = client.get("/v1/agents")
-            agents.raise_for_status()
-            agent = next(a for a in agents.json()["data"] if a["name"] == "antigravity-native-ui")
-            response = client.post(
-                "/v1/sessions",
-                json={
-                    "agent_id": agent["id"],
-                    "host_id": host["host_id"],
-                    "workspace": str(workspace),
-                },
-                timeout=60,
+            created = create_native_session(
+                client,
+                str(client.base_url).rstrip("/"),
+                harness="antigravity",
+                metadata={"host_id": host["host_id"], "workspace": str(workspace)},
             )
-            response.raise_for_status()
-            session_id = response.json()["id"]
+            session_id = created["session_id"]
 
             def terminals():
                 response = client.get(f"/v1/sessions/{session_id}/resources/terminals")
@@ -350,7 +345,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
 
 @pytest.mark.parametrize("failure", ["missing-secret", "incompatible-url", "malformed-profile"])
 def test_saved_credential_error_visible_through_fresh_daemon(tmp_path, page, built_spa, failure):
-    """A real host rejects invalid saved credentials with visible recovery guidance."""
+    """A fresh host reports credentials invalidated after its readiness handshake."""
     from playwright.sync_api import expect
 
     config_dir = tmp_path / "config"
@@ -379,6 +374,7 @@ def test_saved_credential_error_visible_through_fresh_daemon(tmp_path, page, bui
             "OMNIGENT_AUTH_PROVIDER": "header",
             "OMNIGENT_LOCAL_SINGLE_USER": "1",
             "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
+            "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
             "DATABRICKS_CONFIG_FILE": str(profile_file),
         }
     )
@@ -401,9 +397,24 @@ def test_saved_credential_error_visible_through_fresh_daemon(tmp_path, page, bui
             "native_gemini": True,
             "default": ["gemini"],
         }
-        profile_file.write_text("token = private-malformed-secret\n")
         expected = "Repair ~/.databrickscfg"
-    (config_dir / "config.yaml").write_text(yaml.safe_dump({"providers": {"selected": entry}}))
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "selected": {
+                        "kind": "key",
+                        "default": ["gemini"],
+                        "gemini": {
+                            "base_url": "https://generativelanguage.googleapis.com",
+                            "api_key": "fake",
+                        },
+                    }
+                }
+            }
+        )
+    )
     session_id = None
     processes = []
 
@@ -435,20 +446,17 @@ def test_saved_credential_error_visible_through_fresh_daemon(tmp_path, page, bui
                 return next((h for h in response.json()["hosts"] if h["status"] == "online"), None)
 
             host = _wait(online_host, "fresh host did not connect")
-            agents = client.get("/v1/agents")
-            agents.raise_for_status()
-            agent = next(a for a in agents.json()["data"] if a["name"] == "antigravity-native-ui")
-            response = client.post(
-                "/v1/sessions",
-                json={
-                    "agent_id": agent["id"],
-                    "host_id": host["host_id"],
-                    "workspace": str(tmp_path),
-                },
-                timeout=60,
+            # Readiness is cached; launch must revalidate changed saved credentials.
+            config_path.write_text(yaml.safe_dump({"providers": {"selected": entry}}))
+            if failure == "malformed-profile":
+                profile_file.write_text("token = private-malformed-secret\n")
+            created = create_native_session(
+                client,
+                str(client.base_url).rstrip("/"),
+                harness="antigravity",
+                metadata={"host_id": host["host_id"], "workspace": str(tmp_path)},
             )
-            response.raise_for_status()
-            session_id = response.json()["id"]
+            session_id = created["session_id"]
             page.goto(f"{base_url}/c/{session_id}")
             page.get_by_role("textbox", name="Message the agent").fill("Hello")
             page.get_by_role("button", name="Send", exact=True).click()

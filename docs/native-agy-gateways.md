@@ -98,7 +98,9 @@ before claiming interoperability across implementations.
 
 Use **Databricks — profile** and enter your existing profile name, for example
 `work`. Do not paste a workspace URL or a token into the generic gateway option.
-The profile uses Databricks SDK authentication. For a CLI OAuth login:
+This path requires a local profile on the host; managed `connection: databricks`
+providers are not supported for native Gemini. The profile uses Databricks SDK
+authentication. For a CLI OAuth login:
 
 ```sh
 databricks auth login --profile work
