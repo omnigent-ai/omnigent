@@ -8,8 +8,9 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import click
@@ -1289,6 +1290,7 @@ def _seed_same_workspace_daemon(
     tmp_path: Path,
     *,
     vanity_org_id: str = "1",
+    age_s: int = 0,
 ) -> None:
     """
     Record a live daemon on the workspace host and log both URLs in.
@@ -1297,6 +1299,8 @@ def _seed_same_workspace_daemon(
     :param tmp_path: Test-scoped directory holding the token file.
     :param vanity_org_id: Workspace id the vanity URL's login records, e.g.
         ``"1"`` for the daemon's own workspace.
+    :param age_s: How long ago the daemon started, e.g. ``60``. ``0`` is
+        within the startup grace, so its host status isn't checked.
     """
     from omnigent.cli_auth import store_databricks_auth
 
@@ -1317,10 +1321,217 @@ def _seed_same_workspace_daemon(
             mode="server",
             server_url=_WORKSPACE_API,
             log_path=str(tmp_path / "existing.log"),
-            started_at=int(time.time()),
+            started_at=int(time.time()) - age_s,
             host_id="a" * 32,
         )
     )
+
+
+_HOST_ONLINE = cli_module._HostHttpResult(status_code=200, body={"status": "online"})
+_HOST_OFFLINE = cli_module._HostHttpResult(status_code=200, body={"status": "offline"})
+_HOST_NOT_FOUND = cli_module._HostHttpResult(status_code=404, body={"detail": "host not found"})
+_HOST_REJECTED = cli_module._HostHttpResult(status_code=401, body="unauthorized")
+_HOST_UNREACHABLE = cli_module._HostHttpResult(status_code=0, body="connection refused")
+_HOST_HTML_PAGE = cli_module._HostHttpResult(status_code=200, body="<html>Sign in</html>")
+_HOST_UNKNOWN_STATE = cli_module._HostHttpResult(status_code=200, body={"status": "draining"})
+_HOST_PROXY_NOT_FOUND = cli_module._HostHttpResult(status_code=404, body="<html>Not Found</html>")
+_ROUTE_NOT_FOUND = cli_module._HostHttpResult(status_code=404, body={"detail": "Not Found"})
+
+
+def _stub_host_status_by_url(
+    monkeypatch: pytest.MonkeyPatch, statuses: dict[str, cli_module._HostHttpResult]
+) -> None:
+    """
+    Answer host-status probes by the URL each one is sent through.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param statuses: Probe result per server URL, e.g.
+        ``{_VANITY_API: _HOST_ONLINE}``.
+    """
+    monkeypatch.setattr("omnigent.cli._DAEMON_RECONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(
+        "omnigent.cli._daemon_host_status_probe",
+        lambda record, **kwargs: statuses[record.server_url],
+    )
+
+
+@pytest.mark.parametrize(
+    ("age_s", "via_requested_url", "via_own_url", "reason"),
+    [
+        # Its own sign-in expired and the server has it offline.
+        (60, _HOST_OFFLINE, _HOST_REJECTED, "its server rejected its sign-in (HTTP 401)"),
+        (60, _HOST_OFFLINE, _HOST_UNREACHABLE, "it can't reach its server"),
+        (60, _HOST_OFFLINE, _HOST_OFFLINE, "its host is not connected to the server"),
+        # Only its own URL answers, and the server has it offline.
+        (60, _HOST_REJECTED, _HOST_OFFLINE, "its host is not connected to the server"),
+        # The server has no row for it: it never registered.
+        (60, _HOST_NOT_FOUND, _HOST_UNREACHABLE, "it can't reach its server"),
+        # Online through the requested URL even though its own credentials fail.
+        (60, _HOST_ONLINE, _HOST_REJECTED, None),
+        # The requested URL isn't signed in yet; its own URL says online.
+        (60, _HOST_REJECTED, _HOST_ONLINE, None),
+        # Neither URL can be asked, so its state is unknown: reuse it as before.
+        (60, _HOST_REJECTED, _HOST_REJECTED, None),
+        (60, _HOST_UNREACHABLE, _HOST_UNREACHABLE, None),
+        # A 200 or 404 that isn't the server's host answer proves nothing either.
+        (60, _HOST_HTML_PAGE, _HOST_REJECTED, None),
+        (60, _HOST_UNKNOWN_STATE, _HOST_REJECTED, None),
+        (60, _HOST_PROXY_NOT_FOUND, _HOST_UNREACHABLE, None),
+        (60, _ROUTE_NOT_FOUND, _HOST_UNREACHABLE, None),
+        # Just started and still connecting: no verdict yet.
+        (0, _HOST_OFFLINE, _HOST_OFFLINE, None),
+    ],
+)
+def test_same_workspace_daemon_offline_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    age_s: int,
+    via_requested_url: cli_module._HostHttpResult,
+    via_own_url: cli_module._HostHttpResult,
+    reason: str | None,
+) -> None:
+    _stub_host_status_by_url(
+        monkeypatch, {_VANITY_API: via_requested_url, _WORKSPACE_API: via_own_url}
+    )
+
+    assert (
+        cli_module._same_workspace_daemon_offline_reason(
+            _same_workspace_sibling(age_s=age_s), _VANITY_API
+        )
+        == reason
+    )
+
+
+@pytest.mark.parametrize(
+    ("requested_url_replies", "reason", "probe_rounds"),
+    [
+        # Back online on the second round, within the reconnect grace.
+        ([_HOST_OFFLINE, _HOST_ONLINE], None, 2),
+        # Still offline when the grace runs out.
+        ([_HOST_OFFLINE] * 11, "its server rejected its sign-in (HTTP 401)", 11),
+        # No verdict from either URL: reused at once, without waiting out the grace.
+        ([_HOST_REJECTED], None, 1),
+    ],
+)
+def test_same_workspace_daemon_offline_reason_waits_out_a_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_url_replies: list[cli_module._HostHttpResult],
+    reason: str | None,
+    probe_rounds: int,
+) -> None:
+    """A sibling mid-reconnect gets the grace window before it is judged offline."""
+    clock = [0.0]
+
+    def _advance(seconds: float) -> None:
+        clock[0] += seconds
+
+    monkeypatch.setattr(
+        cli_module,
+        "time",
+        SimpleNamespace(time=time.time, monotonic=lambda: clock[0], sleep=_advance),
+    )
+    monkeypatch.setattr("omnigent.cli._DAEMON_RECONNECT_GRACE_S", 5.0)
+    replies = iter(requested_url_replies)
+    probed: list[str | None] = []
+
+    def _probe(
+        record: cli_module._HostDaemonRecord, **kwargs: object
+    ) -> cli_module._HostHttpResult:
+        probed.append(record.server_url)
+        # The sibling's own sign-in stays rejected throughout.
+        return _HOST_REJECTED if record.server_url == _WORKSPACE_API else next(replies)
+
+    monkeypatch.setattr("omnigent.cli._daemon_host_status_probe", _probe)
+
+    assert (
+        cli_module._same_workspace_daemon_offline_reason(_same_workspace_sibling(), _VANITY_API)
+        == reason
+    )
+    assert probed.count(_VANITY_API) == probe_rounds
+
+
+def test_offline_same_workspace_daemon_error_drops_url_credentials() -> None:
+    """The refusal reaches terminal output and logs, so recorded userinfo is dropped."""
+    target = "https://user:secret-token@omnigent.example.com"
+    sibling = replace(_same_workspace_sibling(), target=target, server_url=target)
+
+    message = cli_module._offline_same_workspace_daemon_error(
+        sibling, "its host is not connected to the server"
+    ).format_message()
+
+    assert "secret-token" not in message
+    assert "user:" not in message
+    assert "login https://omnigent.example.com`" in message
+    assert "host stop --server https://omnigent.example.com`" in message
+
+
+def _same_workspace_sibling(*, age_s: int = 60) -> cli_module._HostDaemonRecord:
+    """
+    Build a live-looking daemon record on the workspace host.
+
+    :param age_s: How long ago it started, e.g. ``60``.
+    :returns: The record, as :func:`_same_workspace_daemon` would return it.
+    """
+    return cli_module._HostDaemonRecord(
+        pid=_SAME_WORKSPACE_PID,
+        target=_WORKSPACE_API,
+        mode="server",
+        server_url=_WORKSPACE_API,
+        log_path=None,
+        started_at=int(time.time()) - age_s,
+        host_id="a" * 32,
+    )
+
+
+@pytest.mark.parametrize(
+    ("via_requested_url", "via_own_url", "refusal"),
+    [
+        # Its own sign-in expired and the server has it offline.
+        (_HOST_OFFLINE, _HOST_REJECTED, "its server rejected its sign-in (HTTP 401)"),
+        # Only one URL can see it online; registration is confirmed through that one.
+        (_HOST_ONLINE, _HOST_REJECTED, None),
+        (_HOST_REJECTED, _HOST_ONLINE, None),
+    ],
+)
+def test_host_background_reuses_same_workspace_daemon_only_when_online(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    via_requested_url: cli_module._HostHttpResult,
+    via_own_url: cli_module._HostHttpResult,
+    refusal: str | None,
+) -> None:
+    """
+    A same-workspace daemon whose host is offline is neither reused nor joined.
+
+    Reusing it would wait for a host that never comes online, and a second
+    daemon would take over its connection once it reconnects, so the launch
+    stops and says how to fix the running daemon. It isn't stopped for the user.
+    """
+    spawned_args, _ = _patch_background_host_spawn(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "omnigent.cli._pid_alive", lambda checked: checked in {4242, _SAME_WORKSPACE_PID}
+    )
+    _seed_same_workspace_daemon(monkeypatch, tmp_path, age_s=60)
+    _stub_host_status_by_url(
+        monkeypatch, {_VANITY_API: via_requested_url, _WORKSPACE_API: via_own_url}
+    )
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        "omnigent.cli._terminate_daemon",
+        lambda record, *, force: terminated.append(record.pid),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "--background", "--server", _VANITY_API])
+
+    assert spawned_args == [], "the workspace's daemon must not get a second one"
+    assert terminated == []
+    if refusal is None:
+        assert result.exit_code == 0, result.output
+        assert f"already running (pid {_SAME_WORKSPACE_PID})" in result.output
+        return
+    assert result.exit_code == 1, result.output
+    assert refusal in result.output
+    assert "login https://dbc-1.cloud.databricks.com/omnigent?o=1" in result.output
+    assert "host stop --server https://dbc-1.cloud.databricks.com/omnigent?o=1" in result.output
 
 
 def test_host_background_reuses_daemon_on_another_url_for_the_workspace(
@@ -1399,6 +1610,41 @@ def test_foreground_host_refuses_another_url_for_the_workspace(
     # stale-host hint suggests stopping it.
     assert "stop" not in message
     assert suppresses_recovery_hint(result.exception)
+    assert runs == []
+    assert cli_module._find_daemon_record(_VANITY_API) is None
+
+
+def test_foreground_host_points_at_fixing_an_offline_daemon_for_the_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An offline same-workspace daemon is the thing to fix, so the refusal says how."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(
+        "omnigent.cli._pid_is_recorded_daemon",
+        lambda record: record.pid in {os.getpid(), _SAME_WORKSPACE_PID},
+    )
+    _seed_same_workspace_daemon(monkeypatch, tmp_path, age_s=60)
+    _stub_host_status_by_url(
+        monkeypatch, {_VANITY_API: _HOST_OFFLINE, _WORKSPACE_API: _HOST_REJECTED}
+    )
+    runs: list[str] = []
+
+    with patch(
+        "omnigent.host.connect.run_host_process",
+        lambda server_url, **kwargs: runs.append(server_url),
+    ):
+        result = CliRunner().invoke(
+            cli, ["host", "--server", _VANITY_API, "--no-open"], standalone_mode=False
+        )
+
+    assert isinstance(result.exception, click.ClickException)
+    message = result.exception.format_message()
+    assert "rejected its sign-in (HTTP 401)" in message
+    assert "nothing more to do" not in message
+    assert "host stop --server https://dbc-1.cloud.databricks.com/omnigent?o=1" in message
+    assert not suppresses_recovery_hint(result.exception)
     assert runs == []
     assert cli_module._find_daemon_record(_VANITY_API) is None
 
