@@ -348,12 +348,18 @@ async def test_agent_sandbox_wake_reconstructs_repo_workspaces(
     fake._on_host_start = _spawn_fake_host
 
     host_registry: HostRegistry = app.state.host_registry
-    # Stub the runner-connect rendezvous to succeed (no real runner process here).
-    monkeypatch.setattr(
-        app.state.tunnel_registry,
-        "wait_for_runner",
-        lambda _runner_id, *, timeout_s: asyncio.sleep(0, result=object()),
-    )
+    # Stub the runner-connect rendezvous to succeed (no real runner process here),
+    # recording the launch-tracker stage a parked message would be budgeted under.
+    launch_tracker = app.state.managed_launches
+    session_ids: list[str] = []
+    stages_while_connecting: list[str] = []
+
+    async def _fake_wait_for_runner(_runner_id: str, *, timeout_s: float) -> object:
+        launch = launch_tracker.get(session_ids[0]) if session_ids else None
+        stages_while_connecting.append(launch.progress[0] if launch is not None else "<settled>")
+        return object()
+
+    monkeypatch.setattr(app.state.tunnel_registry, "wait_for_runner", _fake_wait_for_runner)
 
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -374,6 +380,7 @@ async def test_agent_sandbox_wake_reconstructs_repo_workspaces(
         )
         assert resp.status_code == 201, resp.text
         session_id = resp.json()["id"]
+        session_ids.append(session_id)
 
         conv = await _wait_for_binding(conv_store, session_id)
         gen1_tunnel = await host_futures[0]
@@ -424,6 +431,9 @@ async def test_agent_sandbox_wake_reconstructs_repo_workspaces(
         )
         gen2_tunnel = await host_futures[1]
 
+        # The create launch and the wake both report "connecting" to the tracker
+        # before waiting on the runner tunnel.
+        assert stages_while_connecting == ["connecting", "connecting"]
         assert fake.resume_count == 1, "wake did not resume the sandbox in place"
         assert len(fake.provisioned_names) == 1, (
             "wake should resume the SAME sandbox in place, not provision a fresh "

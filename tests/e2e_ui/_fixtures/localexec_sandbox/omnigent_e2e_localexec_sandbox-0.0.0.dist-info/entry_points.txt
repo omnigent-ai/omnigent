@@ -1,0 +1,2 @@
+[omnigent.sandbox_providers]
+localexec = omnigent.community.sandbox.localexec:contribution

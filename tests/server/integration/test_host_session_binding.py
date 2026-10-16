@@ -849,6 +849,95 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
     assert "host startup failed" in sandbox_status["error"]
 
 
+async def test_parked_message_rides_out_a_clone_longer_than_the_rendezvous_budget(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message parked on a launch whose clone outlives the rendezvous budget waits for
+    the launch's own verdict instead of failing "still provisioning": the fake launcher
+    holds ``git clone`` for several budgets, then the launch fails at host start."""
+    import threading
+
+    env = managed_session_env
+    budget_s = 1.0
+    monkeypatch.setattr(
+        "omnigent.server.managed_hosts.MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S", budget_s
+    )
+    clone_gate = threading.Event()
+
+    def _hold_clone(command: str) -> None:
+        if "git clone" in command and not clone_gate.wait(timeout=30):
+            raise TimeoutError("test never released the clone gate")
+
+    fake = FakeSandboxLauncher(on_command=_hold_clone, fail_on_host_start=True)
+    install_fake_modal_launcher(monkeypatch, fake)
+
+    agent = await create_test_agent(env.client, name="managed-monorepo-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "workspace": "https://github.com/org/monorepo.git",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    async def _wait_for_cloning_stage() -> None:
+        while True:
+            snapshot = await env.client.get(f"/v1/sessions/{session_id}")
+            if (snapshot.json().get("sandbox_status") or {}).get("stage") == "cloning":
+                return
+            await asyncio.sleep(0.05)
+
+    # Park the message once the launch is cloning, so the bounded provisioning
+    # stage cannot time it out on a slow runner.
+    await asyncio.wait_for(_wait_for_cloning_stage(), timeout=10.0)
+
+    message_task = asyncio.create_task(
+        env.client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "summarize the repo"}],
+                },
+            },
+        )
+    )
+    parked = False
+    try:
+        # Several budgets pass with the clone still held: the message must stay
+        # parked on the cloning stage rather than time out.
+        done, _ = await asyncio.wait({message_task}, timeout=4 * budget_s)
+        if done:
+            exc = message_task.exception()
+            detail = (
+                repr(exc)
+                if exc is not None
+                else f"{message_task.result().status_code} {message_task.result().text}"
+            )
+            pytest.fail(f"message POST gave up mid-clone: {detail}")
+        snapshot = await env.client.get(f"/v1/sessions/{session_id}")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["sandbox_status"] == {"stage": "cloning", "error": None}
+        parked = True
+    finally:
+        # Release the launcher thread even when an assertion above fails.
+        clone_gate.set()
+        if not parked:
+            message_task.cancel()
+
+    message_resp = await asyncio.wait_for(message_task, timeout=15.0)
+    assert message_resp.status_code == 503, message_resp.text
+    assert "still provisioning" not in message_resp.text
+    assert "managed sandbox failed to launch" in message_resp.text
+    assert "host startup failed" in message_resp.text
+    assert fake.terminated == ["sb-fake-1"]
+
+
 async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
@@ -873,14 +962,19 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
 
     env = managed_session_env
     monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
-    # This test asserts the happy-path "ready" progress edge; fake the
-    # runner tunnel connect so settlement is driven by progress ordering,
-    # not by the runner WebSocket harness.
-    monkeypatch.setattr(
-        env.app.state.tunnel_registry,
-        "wait_for_runner",
-        lambda _runner_id, *, timeout_s: asyncio.sleep(0, result=object()),
-    )
+    # Fake the runner tunnel connect so settlement is driven by progress ordering,
+    # not the runner WebSocket harness; the fake also records the tracker stage
+    # during the pending connect, which must be "connecting", not "starting".
+    tracker = env.app.state.managed_launches
+    session_ids: list[str] = []
+    stages_while_connecting: list[str] = []
+
+    async def _fake_wait_for_runner(_runner_id: str, *, timeout_s: float) -> object:
+        launch = tracker.get(session_ids[0]) if session_ids else None
+        stages_while_connecting.append(launch.progress[0] if launch is not None else "<settled>")
+        return object()
+
+    monkeypatch.setattr(env.app.state.tunnel_registry, "wait_for_runner", _fake_wait_for_runner)
     loop = asyncio.get_running_loop()
     gate = threading.Event()
     host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
@@ -909,6 +1003,7 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     )
     assert resp.status_code == 201, resp.text
     session_id = resp.json()["id"]
+    session_ids.append(session_id)
 
     # The create route seeds the progress cache before scheduling the
     # background task, so the snapshot a navigating client cold-loads
@@ -959,6 +1054,7 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     # means the background task stopped reporting after the host
     # bound; "failed" here means the launch itself broke.
     assert stages == ["cloning", "starting", "connecting", "ready"]
+    assert stages_while_connecting == ["connecting"]
 
     # A settled launch clears the snapshot field — from here the
     # session looks like any host-bound session and a reloading

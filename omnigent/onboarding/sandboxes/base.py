@@ -955,8 +955,9 @@ class SandboxHostLauncher(SandboxLifecycle):
             workspace root that parents them all.
         :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
             content installed into the sandbox's config BEFORE the host starts.
-        :param on_stage: Progress observer invoked with ``"cloning"`` and
-            ``"starting"``.
+        :param on_stage: Progress observer invoked with ``"cloning"`` (at least
+            once when repositories are cloned; the exec-model launcher reports it
+            once per repository) and ``"starting"``.
         :returns: The absolute in-sandbox workspace path — the working
             directory the host starts the agent in.
         """
@@ -1021,12 +1022,13 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         workspace = f"{home}/workspace"
         self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
         if repos:
-            if on_stage is not None:
-                on_stage("cloning")
             # Distinct URLs can derive the same repo_name (e.g. two orgs' "api");
             # disambiguate so they don't clone into one colliding directory.
             clone_dirs = []
             for repo, dirname in zip(repos, _sandbox_types.clone_dir_names(repos), strict=True):
+                # Reported per repository so each clone gets its own rendezvous budget.
+                if on_stage is not None:
+                    on_stage("cloning")
                 materialize = self.materialize_workspace
                 # Preserve the old override signature when no policy was configured.
                 if repo.git_clone != _sandbox_types.GitCloneOptions():

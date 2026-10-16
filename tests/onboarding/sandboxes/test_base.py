@@ -244,9 +244,11 @@ def test_start_host_clones_multiple_repos_into_sibling_dirs() -> None:
     """
     Several repos → the exec-model default clones each into
     ``<workspace>/<repo_name>`` and returns the parent workspace (the working
-    directory that holds them all), matching the entrypoint (k8s) rule.
+    directory that holds them all), matching the entrypoint (k8s) rule. The
+    ``cloning`` stage is reported once per repository.
     """
     launcher = _RecordingLauncher()
+    stages: list[str] = []
 
     workspace = launcher.start_host(
         "sb-1",
@@ -258,9 +260,11 @@ def test_start_host_clones_multiple_repos_into_sibling_dirs() -> None:
             RepoWorkspace(url="https://github.com/org/api", branch=None, repo_name="api"),
             RepoWorkspace(url="https://github.com/org/web", branch="dev", repo_name="web"),
         ],
+        on_stage=stages.append,
     )
 
     assert workspace == "/root/workspace"
+    assert stages == ["cloning", "cloning", "starting"]
     assert "git clone -- https://github.com/org/api /root/workspace/api" in launcher.commands
     assert (
         "git clone --branch dev --single-branch -- https://github.com/org/web /root/workspace/web"

@@ -161,6 +161,10 @@ class FakeSandboxLauncher(SandboxLauncher):
         runs on an ``asyncio.to_thread`` worker, so a
         ``threading.Event`` is the correct primitive). ``None``
         provisions immediately.
+    :param on_command: Callback invoked with every ``run`` command before
+        it is answered, e.g. to hold the ``git clone`` step so a launch
+        sits in its cloning stage for as long as the test needs. ``None``
+        disables.
     """
 
     provider: ClassVar[str] = "modal"
@@ -175,8 +179,10 @@ class FakeSandboxLauncher(SandboxLauncher):
         can_resume: bool = False,
         fail_on_resume: bool = False,
         provision_gate: threading.Event | None = None,
+        on_command: Callable[[str], None] | None = None,
     ) -> None:
         self._on_host_start = on_host_start
+        self._on_command = on_command
         # Public + mutable: relaunch tests flip the failure mode between
         # the first launch and the relaunch under test.
         self.fail_on_host_start = fail_on_host_start
@@ -264,6 +270,8 @@ class FakeSandboxLauncher(SandboxLauncher):
     def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
         """Record the command and answer the managed flow's probes."""
         self.commands.append(command)
+        if self._on_command is not None:
+            self._on_command(command)
         if self._fail_on_command is not None and self._fail_on_command in command:
             raise click.ClickException(f"simulated failure of: {command}")
         if 'printf %s "$HOME"' in command:
