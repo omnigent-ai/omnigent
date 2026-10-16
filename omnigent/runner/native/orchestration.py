@@ -232,19 +232,25 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
     Cancelling the forwarder closes the app-server via the forwarder's own
     ``finally`` (see :func:`_codex_discover_thread_and_forward`). The captured
     server is also closed if no forwarder adopted it; a replacement registered
-    during cancellation keeps its ownership. No-op for a session without a
-    registered codex app-server, so other harnesses can share this teardown path.
+    during cancellation keeps its ownership. Without a registered backend, only
+    the remembered launch directory is retired.
 
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :returns: None.
     """
     app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+    bridge_dir = _AUTO_CODEX_BRIDGE_DIRS.get(session_id)
     if app_server is None:
         _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
         return
     await _cancel_auto_forwarder_task(session_id)
-    if _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
+    registered_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+    if registered_server is app_server:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+    # Forwarder cleanup can retire its own backend; a newer launch can reuse its path.
+    if (registered_server is None or registered_server is app_server) and (
+        _AUTO_CODEX_BRIDGE_DIRS.get(session_id) is bridge_dir
+    ):
         _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
     with contextlib.suppress(Exception):
         await app_server.close()

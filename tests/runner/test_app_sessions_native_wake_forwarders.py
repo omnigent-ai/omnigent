@@ -381,10 +381,21 @@ async def test_cancel_auto_forwarder_task_cancels_and_awaits_registered_task() -
         await _drain_forwarder_runs([run])
 
 
-@pytest.mark.parametrize("replaced", [False, True])
+@pytest.mark.parametrize(
+    ("scenario", "same_path"),
+    [
+        ("registered-owner", False),
+        ("self-evicted-owner", False),
+        ("live-replacement", False),
+        ("live-replacement", True),
+        ("ended-replacement", False),
+        ("ended-replacement", True),
+    ],
+)
 @pytest.mark.asyncio
 async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_server(
-    replaced: bool,
+    scenario: str,
+    same_path: bool,
     tmp_path: Path,
 ) -> None:
     """
@@ -399,7 +410,9 @@ async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_ser
     from omnigent.runner.native import orchestration
 
     original_dir = tmp_path / "original"
-    replacement_dir = tmp_path / "replacement"
+    replacement_dir = Path(str(original_dir)) if same_path else tmp_path / "replacement"
+    assert replacement_dir is not original_dir
+    replaced = scenario in {"live-replacement", "ended-replacement"}
     run = _ForwarderRun()
     replacement_run = _ForwarderRun()
 
@@ -409,11 +422,16 @@ async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_ser
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             state.cancelled = True
+            if state is run and scenario != "registered-owner":
+                if runner_app_mod._AUTO_CODEX_APP_SERVERS.get(session_id) is original_server:
+                    runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id)
             if state is run and replaced:
                 successor = asyncio.create_task(_parked(replacement_run))
                 runner_app_mod._register_auto_forwarder_task(session_id, successor)
                 runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] = replacement_server
                 orchestration._AUTO_CODEX_BRIDGE_DIRS[session_id] = replacement_dir
+                if scenario == "ended-replacement":
+                    runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id)
             raise
 
     class _FakeAppServer:
@@ -439,8 +457,11 @@ async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_ser
         assert replacement_server.closed is False
         assert original_server.closed is True, "registered codex app-server must be closed"
         if replaced:
-            assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is replacement_server
-            assert orchestration._AUTO_CODEX_BRIDGE_DIRS[session_id] == replacement_dir
+            if scenario == "live-replacement":
+                assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is replacement_server
+            else:
+                assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+            assert orchestration._AUTO_CODEX_BRIDGE_DIRS[session_id] is replacement_dir
             assert runner_app_mod._AUTO_FORWARDER_TASKS[session_id] is replacement_run.task
             assert replacement_run.task is not None and not replacement_run.task.done()
         else:
