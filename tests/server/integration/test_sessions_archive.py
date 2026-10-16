@@ -17,13 +17,15 @@ import dataclasses
 import gzip
 import io
 import tarfile
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
 
 from omnigent.server.routes import sessions as _sessions_facade
 from omnigent.server.routes._sessions import common as _sessions_common
+from omnigent.server.routes._sessions import helpers as _sessions_helpers
 from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -298,6 +300,184 @@ async def test_archive_tears_down_host_spawned_runner(
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
         _sessions_common._intentional_stop_sessions.pop(session_id, None)
+
+
+@pytest.mark.parametrize("unbind_first", [False, True], ids=["bound", "unbind-then-heal"])
+async def test_archive_sub_agent_keeps_parent_runner(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    unbind_first: bool,
+) -> None:
+    """
+    Archiving a sub-agent on its parent's runner leaves that runner running.
+
+    A child created with a ``host_id`` and a ``parent_session_id`` inherits
+    the parent's runner and carries the host id too. Archiving it used to
+    stop that runner, taking the parent down with it; now only the child's
+    session is released on the runner. Unbinding the child first
+    (``runner_id: ""``) doesn't change that: its turn-end ``idle`` heals the
+    binding back to the parent's runner before the deferred stop reads it.
+    """
+    host_id = "a1b2c3d4e5f61234567890abcdef0123"
+    runner_id = "b1b2c3d4e5f61234567890abcdef0123"
+    parent = await create_test_session(client, name="archive-shared-runner-parent")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_host_id(parent["id"], host_id, workspace="/tmp/archive-ws")
+    conv_store.set_runner_id(parent["id"], runner_id)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="worker:task",
+        parent_conversation_id=parent["id"],
+        agent_id=parent["agent_id"],
+    )
+    conv_store.set_host_id(child.id, host_id, workspace="/tmp/archive-ws")
+    conv_store.set_runner_id(child.id, runner_id)
+
+    mock_teardown = AsyncMock(return_value=True)
+    runner_client = AsyncMock()
+    runner_client.post.return_value = httpx.Response(
+        204, request=httpx.Request("POST", "http://runner")
+    )
+    runner_client.delete.return_value = httpx.Response(
+        200, request=httpx.Request("DELETE", "http://runner")
+    )
+
+    async def _client_for_binding(session_id: str, *_args: object, **_kwargs: object) -> object:
+        row = conv_store.get_conversation(session_id)
+        return runner_client if row is not None and row.runner_id == runner_id else None
+
+    with (
+        patch.object(
+            _sessions_orchestration, "_stop_session_via_runner", AsyncMock(return_value=True)
+        ),
+        patch.object(_sessions_orchestration, "_get_runner_client", _client_for_binding),
+        patch.object(_sessions_facade, "_get_runner_client", _client_for_binding),
+        patch.object(_sessions_facade, "_wait_for_runner_client", _client_for_binding),
+        patch.object(_sessions_facade, "_stop_session_host_runner", mock_teardown),
+    ):
+        if unbind_first:
+            unbind = await client.patch(f"/v1/sessions/{child.id}", json={"runner_id": ""})
+            assert unbind.status_code == 200, unbind.text
+            idle = await client.post(
+                f"/v1/sessions/{child.id}/events",
+                json={"type": "external_session_status", "data": {"status": "idle"}},
+            )
+            assert idle.status_code < 300, idle.text
+            healed = conv_store.get_conversation(child.id)
+            assert healed is not None and healed.runner_id == runner_id
+        resp = await client.patch(f"/v1/sessions/{child.id}", json={"archived": True})
+        await _drain_detached_stops()
+    assert resp.status_code == 200
+    mock_teardown.assert_not_awaited()
+    runner_client.delete.assert_awaited_once()
+    assert runner_client.delete.await_args is not None
+    assert runner_client.delete.await_args.args[0] == f"/v1/sessions/{child.id}"
+
+
+@pytest.mark.parametrize("sharer", ["parent", "grandparent"])
+async def test_stop_host_runner_spares_ancestor_runner(db_uri: str, sharer: str) -> None:
+    """
+    The explicit Stop path doesn't stop a runner any ancestor runs on.
+
+    ``grandparent``: root on runner A, grandparent G on the child's runner B,
+    and the parent relaunched onto runner C. Neither the parent nor the root
+    is on B, but stopping B still takes G down.
+    """
+    runner_id = "b1b2c3d4e5f61234567890abcdef0123"
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root = conv_store.create_conversation(title="root")
+    if sharer == "parent":
+        parent = root
+    else:
+        conv_store.set_runner_id(root.id, "runner-A")
+        grandparent = conv_store.create_conversation(
+            kind="sub_agent", title="lead:task", parent_conversation_id=root.id
+        )
+        conv_store.set_runner_id(grandparent.id, runner_id)
+        parent = conv_store.create_conversation(
+            kind="sub_agent", title="mid:task", parent_conversation_id=grandparent.id
+        )
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="worker:task", parent_conversation_id=parent.id
+    )
+    for conv_id in (parent.id, child.id):
+        conv_store.set_host_id(conv_id, "a1b2c3d4e5f61234567890abcdef0123", workspace="/tmp/ws")
+        conv_store.set_runner_id(conv_id, runner_id)
+    if sharer == "grandparent":
+        conv_store.replace_runner_id(parent.id, "runner-C")
+        child_row = conv_store.get_conversation(child.id)
+        assert child_row is not None and child_row.root_conversation_id == root.id
+
+    mock_teardown = AsyncMock(return_value=True)
+    with patch.object(_sessions_facade, "_stop_session_host_runner", mock_teardown):
+        stopped = await _sessions_orchestration._stop_host_runner_intentionally(
+            child.id,
+            "a1b2c3d4e5f61234567890abcdef0123",
+            "b1b2c3d4e5f61234567890abcdef0123",
+            None,
+            conv_store,
+        )
+    assert stopped is True
+    mock_teardown.assert_not_awaited()
+    assert child.id not in _sessions_common._intentional_stop_sessions
+
+
+async def test_ancestor_check_stops_on_a_parent_cycle() -> None:
+    """A corrupt parent cycle ends the ancestor walk instead of looping."""
+    rows = {
+        "a": SimpleNamespace(
+            parent_conversation_id="b", root_conversation_id=None, runner_id="r1"
+        ),
+        "b": SimpleNamespace(
+            parent_conversation_id="a", root_conversation_id=None, runner_id="r1"
+        ),
+    }
+    store = SimpleNamespace(get_conversation=rows.get)
+    assert await _sessions_helpers._ancestor_shares_runner("a", "r2", store) is False  # type: ignore[arg-type]
+    assert await _sessions_helpers._ancestor_shares_runner("a", "r1", store) is True  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("parent_shares", [True, False], ids=["parent-shares", "own-runner"])
+async def test_child_relaunch_spares_ancestor_runner(db_uri: str, parent_shares: bool) -> None:
+    """
+    Relaunching a sub-agent reaps its old runner only when no ancestor still uses it.
+
+    The relaunch stops the runner it supersedes so it doesn't idle on the
+    host; for a child that rode its parent's runner, that runner is the
+    parent's, and stopping it kills the parent and every sibling.
+    """
+    host_id = "a1b2c3d4e5f61234567890abcdef0123"
+    runner_id = "b1b2c3d4e5f61234567890abcdef0123"
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    parent = conv_store.create_conversation(title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="worker:task", parent_conversation_id=parent.id
+    )
+    conv_store.set_host_id(child.id, host_id, workspace="/tmp/ws")
+    conv_store.set_runner_id(child.id, runner_id)
+    if parent_shares:
+        conv_store.set_runner_id(parent.id, runner_id)
+    child_row = conv_store.get_conversation(child.id)
+    assert child_row is not None
+
+    host_registry = SimpleNamespace(
+        admit_launch=AsyncMock(),
+        send_text=Mock(side_effect=ConnectionError("host gone")),
+    )
+    host_conn = SimpleNamespace(pending_launches={})
+    stop = Mock()
+    with patch.object(_sessions_helpers, "_spawn_superseded_runner_stop", stop):
+        await _sessions_helpers._launch_runner_on_host_locked(
+            child_row,
+            conv_store,
+            host_registry,
+            host_conn,  # type: ignore[arg-type]
+        )
+
+    if parent_shares:
+        stop.assert_not_called()
+    else:
+        stop.assert_called_once_with(child.id, host_id, runner_id, host_registry)
 
 
 async def test_failed_archive_leaves_session_running(
