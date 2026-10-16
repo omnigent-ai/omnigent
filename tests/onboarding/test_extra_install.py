@@ -15,6 +15,7 @@ from omnigent.onboarding.cursor_auth import CURSOR_EXTRA
 from omnigent.onboarding.extra_install import (
     _installed_vcs_url,
     _is_uv_tool_install,
+    _recorded_uv_tool_extras,
     extra_install_command,
     extra_install_display,
 )
@@ -67,32 +68,55 @@ def test_installed_vcs_url_none(monkeypatch: pytest.MonkeyPatch, info: object) -
     assert _installed_vcs_url() is None
 
 
+# -- _recorded_uv_tool_extras() ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "recorded, expected",
+    [(None, []), ([], []), (["databricks"], ["databricks"])],
+    ids=["no-receipt", "no-extras", "extras"],
+)
+def test_recorded_uv_tool_extras(
+    monkeypatch: pytest.MonkeyPatch, recorded: list[str] | None, expected: list[str]
+) -> None:
+    """Surfaces the receipt's extras; a missing receipt reads as none."""
+    monkeypatch.setattr("omnigent.update_check._read_uv_tool_extras", lambda: recorded)
+    assert _recorded_uv_tool_extras() == expected
+
+
 # -- extra_install_command() -------------------------------------------------
 
 
-def test_extra_install_command_uv_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A registry uv tool venv produces the ``uv tool install --with`` argv."""
+@pytest.mark.parametrize(
+    "recorded, expected",
+    [
+        ([], "omnigent[copilot]"),
+        (["databricks"], "omnigent[copilot,databricks]"),
+        (["copilot", "databricks"], "omnigent[copilot,databricks]"),
+    ],
+    ids=["no-recorded-extras", "adds-to-recorded", "already-recorded"],
+)
+def test_extra_install_command_uv_tool(
+    monkeypatch: pytest.MonkeyPatch, recorded: list[str], expected: str
+) -> None:
+    """A registry uv tool venv reinstalls the tool with the receipt's extras plus
+    the new one: ``uv tool install --force`` replaces the tool's requirements, so an
+    ``omnigent[databricks]`` install gains ``copilot`` without losing ``databricks``."""
     monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: True)
     monkeypatch.setattr(extra_install, "_installed_vcs_url", lambda: None)
-    cmd = extra_install_command("cursor")
-    assert cmd == [
-        "uv",
-        "tool",
-        "install",
-        "--with",
-        "omnigent[cursor]",
-        "omnigent",
-        "--force",
-    ]
+    monkeypatch.setattr(extra_install, "_recorded_uv_tool_extras", lambda: recorded)
+    assert extra_install_command("copilot") == ["uv", "tool", "install", "--force", expected]
 
 
 def test_extra_install_command_uv_tool_git_source(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A git-source uv tool install reinstalls from that source, not PyPI."""
+    """A git-source uv tool install reinstalls from that source, not PyPI,
+    keeping its recorded extras."""
     url = "git+https://github.com/omnigent-ai/omnigent.git"
     monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: True)
     monkeypatch.setattr(extra_install, "_installed_vcs_url", lambda: url)
+    monkeypatch.setattr(extra_install, "_recorded_uv_tool_extras", lambda: ["databricks"])
     cmd = extra_install_command("cursor")
-    assert cmd == ["uv", "tool", "install", "--force", f"omnigent[cursor] @ {url}"]
+    assert cmd == ["uv", "tool", "install", "--force", f"omnigent[cursor,databricks] @ {url}"]
 
 
 def test_extra_install_command_uv_on_path(monkeypatch: pytest.MonkeyPatch) -> None:

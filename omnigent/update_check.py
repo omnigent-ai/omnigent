@@ -1300,6 +1300,9 @@ def _uv_tool_receipt_path() -> Path | None:
 def _read_uv_tool_extras() -> list[str] | None:
     """Read requested extras from the uv tool receipt.
 
+    ``uv tool install --with "omnigent[x]" omnigent`` records two ``omnigent``
+    requirements, so extras are collected across every entry for the package.
+
     :returns: A list of extras when a receipt for ``omnigent`` is found.
         An empty list means the receipt exists but no extras were
         requested. ``None`` means no receipt was found or it could not
@@ -1320,16 +1323,17 @@ def _read_uv_tool_extras() -> list[str] | None:
     requirements = tool.get("requirements")
     if not isinstance(requirements, list):
         return None
+    extras: list[str] = []
     for req in requirements:
         if not isinstance(req, dict) or req.get("name") != _DIST_NAME:
             continue
         raw_extras = req.get("extras")
         if not isinstance(raw_extras, list):
-            return []
-        return [
-            str(extra).strip() for extra in raw_extras if isinstance(extra, str) and extra.strip()
-        ]
-    return []
+            continue
+        for extra in raw_extras:
+            if isinstance(extra, str) and extra.strip() and extra.strip() not in extras:
+                extras.append(extra.strip())
+    return extras
 
 
 def _pipx_metadata_path() -> Path | None:

@@ -308,19 +308,12 @@ def test_copilot_install_command_falls_back_to_pip(monkeypatch: pytest.MonkeyPat
 
 
 def test_copilot_install_command_uv_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Inside a ``uv tool`` venv, the install uses ``uv tool install --with``."""
+    """Inside a ``uv tool`` venv, the install reinstalls the tool with the extra."""
     monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: True)
     monkeypatch.setattr(extra_install, "_installed_vcs_url", lambda: None)
+    monkeypatch.setattr(extra_install, "_recorded_uv_tool_extras", list)
     cmd = copilot_install_command()
-    assert cmd == [
-        "uv",
-        "tool",
-        "install",
-        "--with",
-        "omnigent[copilot]",
-        "omnigent",
-        "--force",
-    ]
+    assert cmd == ["uv", "tool", "install", "--force", "omnigent[copilot]"]
 
 
 def test_install_copilot_sdk_runs_command_then_rechecks(
