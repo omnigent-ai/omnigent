@@ -262,7 +262,11 @@ chats** reopens it. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
-without choosing a workspace.
+without choosing a workspace. The side-chat composer opens the same `/` menu
+affordance as the main composer but with a narrower set — `/help` and the
+session's skills: `/help` is answered locally and a recognised skill runs
+in-process through `slash_command`; a native terminal side chat shows no menu
+and forwards slash text to the vendor TUI.
 
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
