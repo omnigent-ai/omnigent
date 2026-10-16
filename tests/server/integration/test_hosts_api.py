@@ -127,6 +127,7 @@ async def _connect_host(
     registry: HostRegistry,
     host_id: str = _HOST_ID,
     name: str = "test-laptop",
+    token: str | None = None,
     configured_harnesses: dict[str, bool | str] | None = None,
     gateway_inference: dict[str, bool] | None = None,
 ) -> ApplicationCommunicator:
@@ -143,7 +144,10 @@ async def _connect_host(
     :returns: Connected ASGI communicator.
     """
     path = f"/v1/hosts/{host_id}/tunnel"
-    comm = ApplicationCommunicator(app, _websocket_scope(path))
+    scope = _websocket_scope(path)
+    if token is not None:
+        scope["headers"] = [(b"x-omnigent-host-token", token.encode())]
+    comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
     accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
@@ -1507,3 +1511,161 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
     assert received == [(_HOST_ID, "runner_x", "exited with code 1")]
     # The callback owns the event; the tunnel must not log a session-less duplicate.
     assert not [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]
+
+
+async def test_attach_api_reuses_one_tunnel_for_two_session_launches(host_api_app):
+    from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from tests.server.helpers import FakeSandboxLauncher
+
+    app, registry, store, conversations = host_api_app
+    loop = asyncio.get_running_loop()
+    connections = []
+
+    def connect(start):
+        connections.append(
+            asyncio.run_coroutine_threadsafe(
+                _connect_host(
+                    app, registry, host_id=start.host_id, name=start.host_name, token=start.token
+                ),
+                loop,
+            ).result(timeout=10)
+        )
+
+    fake = FakeSandboxLauncher(
+        can_resume=True,
+        attachments={"devbox": "local"},
+        on_host_start=connect,
+    )
+    app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="http://test",
+            token_ttl_s=3600,
+            provider="modal",
+            launcher_factory=lambda: fake,
+        )
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        payload = {"provider": "modal", "sandbox_id": "devbox", "name": "My devbox"}
+        attached = await client.post("/v1/hosts/attach", json=payload)
+        assert attached.status_code == 200, attached.text
+        host_id = attached.json()["host_id"]
+        retry = await client.post("/v1/hosts/attach", json=payload)
+        assert retry.json() == attached.json()
+        hosts = (await client.get("/v1/hosts")).json()["hosts"]
+        assert len(hosts) == 1 and hosts[0]["sandbox_attached"] is True
+        assert len(connections) == 1
+        comm = connections[0]
+        try:
+
+            async def respond():
+                while True:
+                    output = await comm.receive_output(timeout=10)
+                    if output["type"] != "websocket.send":
+                        continue
+                    frame = decode_host_frame(output["text"])
+                    if isinstance(frame, HostLaunchRunnerFrame):
+                        await comm.send_input(
+                            {
+                                "type": "websocket.receive",
+                                "text": encode_host_frame(
+                                    HostLaunchRunnerResultFrame(
+                                        request_id=frame.request_id, status="launched"
+                                    )
+                                ),
+                            }
+                        )
+                        return
+
+            runner_ids = []
+            for _ in range(2):
+                conv = conversations.create_conversation(agent_id=None)
+                responder = asyncio.create_task(respond())
+                response = await client.post(
+                    f"/v1/hosts/{host_id}/runners",
+                    json={
+                        "session_id": conv.id,
+                        "workspace": "/tmp/test-workspace",
+                    },
+                )
+                await responder
+                assert response.status_code == 200, response.text
+                assert conversations.get_conversation(conv.id).host_id == host_id
+                runner_ids.append(response.json()["runner_id"])
+            assert len(set(runner_ids)) == 2
+            assert (await client.delete(f"/v1/hosts/{host_id}")).status_code == 200
+            assert store.get_host(host_id) is None
+            start = fake.host_starts[0]
+            assert store.resolve_launch_token(host_id, start.token) is None
+            assert not fake.provisioned_names and not fake.terminated
+        finally:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=10)
+
+
+@pytest.mark.parametrize(
+    "owner,box,status,opted_in",
+    [
+        (None, "devbox", 401, True),
+        ("bob", "devbox", 403, True),
+        ("alice", "foreign", 403, True),
+        ("alice", "devbox", 400, False),
+    ],
+)
+async def test_attach_api_requires_provider_authorization(
+    multi_user_app, owner, box, status, opted_in
+):
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from tests.server.helpers import FakeSandboxLauncher
+
+    app, _, store, _ = multi_user_app
+    fake = FakeSandboxLauncher(
+        can_resume=True, attachments={"devbox": "alice"} if opted_in else None
+    )
+    app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="http://test",
+            token_ttl_s=3600,
+            provider="modal",
+            launcher_factory=lambda: fake,
+        )
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        if owner is None:
+            with pytest.raises(OmnigentError) as denied:
+                await client.post(
+                    "/v1/hosts/attach",
+                    json={
+                        "provider": "modal",
+                        "sandbox_id": box,
+                        "name": "Devbox",
+                    },
+                )
+            assert denied.value.http_status == status
+            return
+        response = await client.post(
+            "/v1/hosts/attach",
+            headers={"x-test-user": owner} if owner else {},
+            json={"provider": "modal", "sandbox_id": box, "name": "Devbox"},
+        )
+    assert response.status_code == status
+    assert store.list_hosts(owner or "local") == []
+    assert fake.host_starts == []
+
+
+@pytest.mark.parametrize("method,action", [("POST", "/wake"), ("DELETE", "")])
+async def test_attached_host_actions_require_host_owner(multi_user_app, method, action):
+    app, _, store, _ = multi_user_app
+    host = store.reserve_sandbox_host(
+        host_id=_HOST_ID,
+        name="Devbox",
+        user_id="alice",
+        provider="modal",
+        attached_sandbox_id="devbox",
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.request(
+            method, f"/v1/hosts/{host.host_id}{action}", headers={"x-test-user": "bob"}
+        )
+    assert response.status_code == 404
+    assert store.get_host(host.host_id) == host

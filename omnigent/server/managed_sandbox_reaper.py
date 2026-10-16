@@ -269,6 +269,8 @@ class ManagedSandboxReaper:
 
     @staticmethod
     def _is_reap_candidate(host: Host, *, cutoff: int, now: int) -> bool:
+        if host.sandbox_attached:
+            return False
         return host.sandbox_provider is not None and (
             (
                 host.deleted_at is not None

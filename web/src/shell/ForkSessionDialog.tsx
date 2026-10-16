@@ -1553,7 +1553,14 @@ function SupportedForkSessionForm({
                         >
                           <span className="flex items-center gap-2">
                             <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                            <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                            <span className="text-sm">
+                              {sandboxOptionLabel(
+                                provider,
+                                provider !== null &&
+                                  info.sandbox_provider_capabilities?.[provider]?.reusable_hosts ===
+                                    true,
+                              )}
+                            </span>
                           </span>
                         </SelectItem>
                       ))}

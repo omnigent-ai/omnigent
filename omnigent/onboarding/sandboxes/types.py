@@ -110,6 +110,8 @@ class SandboxCapabilities:
     snapshot_restore: bool = False
     multi_repo: bool = False
     git_clone_options: bool = False
+    # Provisioned hosts are reusable; the provider retains lifecycle ownership.
+    reusable_hosts: bool = False
 
 
 @dataclass(frozen=True)

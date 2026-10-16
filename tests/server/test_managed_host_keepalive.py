@@ -50,15 +50,18 @@ def _wire(
     monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", deployment)
 
 
-def test_extends_the_hosts_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("attached", [False, True])
+def test_extends_the_hosts_sandbox(monkeypatch: pytest.MonkeyPatch, attached: bool) -> None:
     launcher = _Launcher()
     _wire(
         monkeypatch,
         launcher=launcher,
-        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="modal"),
+        host=SimpleNamespace(
+            user_id="alice", sandbox_attached=attached, sandbox_id="sbx1", sandbox_provider="modal"
+        ),
     )
     managed_host_keepalive._keep_alive_for_runner("r1")
-    assert launcher.calls == ["sbx1"]
+    assert launcher.calls == ([] if attached else ["sbx1"])
 
 
 def test_provider_without_keep_alive_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -67,7 +70,9 @@ def test_provider_without_keep_alive_is_skipped(monkeypatch: pytest.MonkeyPatch)
     _wire(
         monkeypatch,
         launcher=launcher,
-        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="kubernetes"),
+        host=SimpleNamespace(
+            user_id="alice", sandbox_attached=False, sandbox_id="sbx1", sandbox_provider="kubernetes"
+        ),
     )
     managed_host_keepalive._keep_alive_for_runner("r1")
     assert launcher.calls == ["sbx1"]  # attempted, error swallowed
@@ -96,7 +101,7 @@ def test_cli_host_without_a_sandbox_is_skipped(monkeypatch: pytest.MonkeyPatch) 
     _wire(
         monkeypatch,
         launcher=launcher,
-        host=SimpleNamespace(sandbox_id=None, sandbox_provider=None),
+        host=SimpleNamespace(sandbox_attached=False, sandbox_id=None, sandbox_provider=None),
     )
     managed_host_keepalive._keep_alive_for_runner("r1")
     assert launcher.calls == []
@@ -181,7 +186,7 @@ def test_a_host_on_an_unoffered_provider_is_skipped(
     )
     hosts = SimpleNamespace(
         get_host=lambda _hid: SimpleNamespace(
-            user_id="alice", sandbox_id="sbx1", sandbox_provider="modal"
+            user_id="alice", sandbox_attached=False, sandbox_id="sbx1", sandbox_provider="modal"
         )
     )
     # Deployment no longer offers 'modal'. A default-returning resolver would
@@ -230,7 +235,7 @@ def test_inflight_is_released_even_when_the_provider_raises(
     _wire(
         monkeypatch,
         launcher=launcher,
-        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="modal"),
+        host=SimpleNamespace(user_id="alice", sandbox_attached=False, sandbox_id="sbx1", sandbox_provider="modal"),
     )
     monkeypatch.setattr(managed_host_keepalive, "_inflight", {"r1"})
     managed_host_keepalive._keep_alive_for_runner("r1")
@@ -269,7 +274,9 @@ def test_successful_keepalive_logs_at_info_on_the_server_logger(
     _wire(
         monkeypatch,
         launcher=launcher,
-        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="agent_sandbox"),
+        host=SimpleNamespace(
+            user_id="alice", sandbox_attached=False, sandbox_id="sbx1", sandbox_provider="agent_sandbox"
+        ),
     )
     with caplog.at_level(logging.INFO, logger="omnigent.server.managed_host_keepalive"):
         managed_host_keepalive._keep_alive_for_runner("r1")
@@ -288,7 +295,9 @@ def test_soft_failed_keepalive_suppresses_the_success_info(
     _wire(
         monkeypatch,
         launcher=launcher,
-        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="agent_sandbox"),
+        host=SimpleNamespace(
+            user_id="alice", sandbox_attached=False, sandbox_id="sbx1", sandbox_provider="agent_sandbox"
+        ),
     )
     with caplog.at_level(logging.INFO, logger="omnigent.server.managed_host_keepalive"):
         managed_host_keepalive._keep_alive_for_runner("r1")
@@ -310,7 +319,7 @@ def test_keepalive_interval_caches_the_runners_provider(monkeypatch: pytest.Monk
     _wire(
         monkeypatch,
         launcher=_Launcher(),
-        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="modal"),
+        host=SimpleNamespace(user_id="alice", sandbox_attached=False, sandbox_id="sbx1", sandbox_provider="modal"),
     )
     managed_host_keepalive._keep_alive_for_runner("r1")
     # now cached at modal's slower cadence

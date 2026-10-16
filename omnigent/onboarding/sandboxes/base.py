@@ -593,6 +593,18 @@ class SandboxLifecycle(ABC):
         """
         raise self._capability_error("attach to an existing sandbox")
 
+    def attach_for_user(self, sandbox_id: str, *, owner: str) -> None:
+        """Authorize server attachment of an existing box for this caller.
+
+        Opt-in, unlike CLI ``attach`` which uses the invoking user's credentials.
+        Implementations must verify the caller may control this exact box, reject
+        missing/foreign boxes, and never provision a replacement. Raise
+        ``PermissionError`` on denial. The server records the binding, then uses
+        the existing ``resume`` and ``start_host`` methods with fresh launchers.
+        Customer authorization and HTTP transport belong in the provider plugin.
+        """
+        raise self._capability_error("attach an existing sandbox for a user")
+
     def keep_alive(self, sandbox_id: str) -> bool | None:
         """
         Keep the sandbox from being reclaimed while it is still in use,

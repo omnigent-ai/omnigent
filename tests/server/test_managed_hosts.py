@@ -5959,3 +5959,133 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
         await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=hosts)
     assert len(fake.terminated) == 1
     assert fake.host_starts == []
+
+
+@pytest.mark.parametrize("failure", ["none", "startup", "gone", "delete-during-wake"])
+async def test_attached_sandbox_reuses_host_and_never_provisions_or_terminates(db_uri, failure):
+    from omnigent.server.managed_hosts import attach_sandbox_host
+
+    store = HostStore(db_uri)
+    box = f"devbox-{failure}"
+
+    def connect(start):
+        assert store.resolve_launch_token(start.host_id, start.token) is not None
+        store.upsert_on_connect(start.host_id, start.host_name, _OWNER)
+
+    fake = FakeSandboxLauncher(
+        can_resume=True,
+        attachments={box: _OWNER},
+        on_host_start=connect,
+        fail_on_host_start=failure == "startup",
+    )
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://srv.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+            provider="modal",
+        )
+    )
+    kwargs = {
+        "config": config,
+        "owner": _OWNER,
+        "host_store": store,
+        "provider": "modal",
+        "sandbox_id": box,
+        "name": "My devbox",
+    }
+    if failure == "startup":
+        with pytest.raises(HTTPException, match="wake failed"):
+            await attach_sandbox_host(**kwargs)
+        assert len(store.list_hosts(_OWNER)) == 1
+        fake.fail_on_host_start = False
+    first, second = await asyncio.gather(
+        attach_sandbox_host(**kwargs), attach_sandbox_host(**kwargs)
+    )
+    assert first == second
+    host = store.get_host(first)
+    assert host is not None and host.sandbox_attached
+    assert len(store.list_hosts(_OWNER)) == 1
+    assert len(fake.host_starts) == 1
+    # Session deletion/failed session startup cannot remove a shared host.
+    await terminate_managed_host(host, store, config)
+    assert store.get_host(first) == host
+    with pytest.raises(HTTPException, match="cannot be replaced"):
+        await relaunch_managed_host(config=config, host=host, host_store=store)
+    store.set_offline(first)
+    if failure == "gone":
+
+        def gone(sandbox_id):
+            raise SandboxGoneError("gone")
+
+        fake.resume = gone
+        with pytest.raises(HTTPException, match="restore it"):
+            await resume_managed_host(first, store, config)
+    elif failure == "delete-during-wake":
+        fake.resume = lambda sandbox_id: store.delete_host(first)
+        with pytest.raises(HTTPException, match="attachment changed"):
+            await resume_managed_host(first, store, config)
+        assert store.get_host(first) is None
+    else:
+        await resume_managed_host(first, store, config)
+        assert store.is_online(first)
+    assert fake.provisioned_names == []
+    assert fake.terminated == []
+
+
+@pytest.mark.parametrize("reusable", [False, True])
+@pytest.mark.parametrize("startup_fails", [False, True])
+async def test_new_sandbox_records_provider_ownership_policy(db_uri, reusable, startup_fails):
+    from omnigent.server.managed_hosts import attach_sandbox_host
+
+    store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(
+        can_resume=True,
+        reusable_hosts=reusable,
+        fail_on_host_start=startup_fails,
+        on_host_start=lambda start: store.upsert_on_connect(
+            start.host_id, start.host_name, _OWNER
+        ),
+    )
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="http://test",
+            provider="modal",
+            token_ttl_s=3600,
+            launcher_factory=lambda: fake,
+        )
+    )
+    assert config.provider_ui_capabilities()["modal"].get("reusable_hosts", False) == reusable
+    if startup_fails:
+        with pytest.raises(HTTPException, match="startup failed"):
+            await launch_managed_host(config=config, owner=_OWNER, host_store=store)
+    else:
+        launched = await launch_managed_host(config=config, owner=_OWNER, host_store=store)
+        host = store.get_host(launched.host_id)
+        assert host.sandbox_attached == reusable
+        # Later configuration changes must not change a saved box's ownership.
+        fake.reusable_hosts = not reusable
+        await terminate_managed_host(host, store, config)
+    hosts = store.list_hosts(_OWNER)
+    assert len(hosts) == (1 if reusable else 0)
+    assert fake.terminated == ([] if reusable else ["sb-fake-1"])
+    if reusable:
+        assert hosts[0].sandbox_attached
+        assert store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
+        fake.fail_on_host_start = False
+        fake.reusable_hosts = False
+        await resume_managed_host(hosts[0].host_id, store, config)
+        assert store.is_online(hosts[0].host_id)
+        fake.attachments = {"sb-fake-1": _OWNER}
+        assert (
+            await attach_sandbox_host(
+                config=config,
+                owner=_OWNER,
+                host_store=store,
+                provider="modal",
+                sandbox_id="sb-fake-1",
+                name="My devbox",
+            )
+            == hosts[0].host_id
+        )
+        assert len(store.list_hosts(_OWNER)) == 1

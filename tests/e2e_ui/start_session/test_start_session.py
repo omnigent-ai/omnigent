@@ -3467,3 +3467,109 @@ async def _drive_agy_default_permissions(base_url: str, session_id: str) -> None
             assert not body.get("terminal_launch_args"), body
         finally:
             await browser.close()
+
+
+def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(built_spa, tmp_path):
+    """The browser keeps reusable boxes visible while per-session sandboxes stay hidden."""
+
+    import httpx
+
+    from tests._helpers.live_server import isolated_local_server
+    from tests._helpers.native_session import create_native_session
+
+    async def drive(base_url, session_id):
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch()
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            creates = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=creates
+            )
+            attached = {
+                "host_id": "host_devbox",
+                "name": "My devbox",
+                "owner": "e2e",
+                "status": "offline",
+                "sandbox_provider": "acme",
+                "sandbox_attached": True,
+                "configured_harnesses": {"claude-native": True},
+            }
+            hosts = [
+                attached,
+                {
+                    **attached,
+                    "host_id": "host_adhoc",
+                    "name": "Per-session sandbox",
+                    "sandbox_attached": False,
+                    "status": "online",
+                },
+            ]
+            wake_calls = []
+
+            async def wake(route):
+                wake_calls.append(route.request.method)
+                attached["status"] = "online"
+                await route.fulfill(json={"host_id": attached["host_id"]})
+
+            info = json.loads(_managed_info_body())
+            info.update(
+                sandbox_provider="acme",
+                sandbox_providers=["acme"],
+                sandbox_provider_capabilities={"acme": {"reusable_hosts": True}},
+            )
+            await page.route("**/v1/info", lambda route: route.fulfill(json=info))
+            await page.route("**/v1/hosts", lambda route: route.fulfill(json={"hosts": hosts}))
+            await page.route("**/v1/hosts/host_devbox/wake", wake)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"),
+                lambda route: route.fulfill(json={"data": []}),
+            )
+            await page.add_init_script(
+                'window.localStorage.setItem("omnigent:recent-workspaces",'
+                'JSON.stringify({host_devbox:["/work/repo"]}));'
+            )
+            try:
+                await page.goto(f"{base_url}/")
+                chip = page.get_by_test_id("new-chat-landing-host-chip")
+                await chip.click()
+                create_static = page.get_by_role(
+                    "menuitem", name="New Acme static sandbox", exact=True
+                )
+                await expect(create_static).to_be_visible()
+                await create_static.click()
+                await expect(chip).to_have_attribute(
+                    "aria-label", re.compile("New Acme static sandbox")
+                )
+                await expect(create_static).to_be_hidden()
+                await chip.click()
+                row = page.get_by_test_id("new-chat-landing-host-host_devbox")
+                await expect(row).to_be_visible()
+                await expect(row).to_contain_text("Asleep")
+                await expect(
+                    page.get_by_test_id("new-chat-landing-host-host_adhoc")
+                ).to_have_count(0)
+                await page.screenshot(
+                    path=str(tmp_path / "attached-sandbox-picker.png"), animations="disabled"
+                )
+                await row.click()
+                await expect(chip).to_have_attribute("aria-label", "Host: My devbox, Online")
+                assert wake_calls == ["POST"]
+                for number in range(2):
+                    if number:
+                        await page.goto(f"{base_url}/")
+                    await page.get_by_test_id("new-chat-landing-input").fill(
+                        "Explain this project"
+                    )
+                    await page.get_by_test_id("new-chat-landing-submit").click()
+                    await _wait_until(lambda expected=number + 1: len(creates) == expected)
+                    await expect(page).to_have_url(re.compile(rf"/c/{session_id}$"))
+                assert [body["host_id"] for body in creates] == ["host_devbox", "host_devbox"]
+                assert all(body.get("host_type") != "managed" for body in creates)
+            finally:
+                await browser.close()
+
+    # This picker scenario needs a rendered session, but never an agent process.
+    with isolated_local_server(tmp_path / "server") as base_url:
+        with httpx.Client() as client:
+            seeded = create_native_session(client, base_url, harness="codex")
+        _run_in_fresh_loop(drive(base_url, seeded["session_id"]))

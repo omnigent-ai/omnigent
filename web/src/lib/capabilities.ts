@@ -135,7 +135,12 @@ export interface ServerInfo {
    */
   sandbox_provider_capabilities?: Record<
     string,
-    { multi_repo?: boolean; inference_models?: boolean; default_models?: boolean }
+    {
+      multi_repo?: boolean;
+      inference_models?: boolean;
+      default_models?: boolean;
+      reusable_hosts?: boolean;
+    }
   >;
   /**
    * Connection providers this deploy has wired (config + store present),
@@ -493,11 +498,11 @@ const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
  * names none (``null``) — the same wording the UI used before
  * providers were surfaced.
  */
-export function sandboxOptionLabel(provider: string | null): string {
+export function sandboxOptionLabel(provider: string | null, reusable = false): string {
   if (!provider) return "New Sandbox";
   const name =
     SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
-  return `${name} Sandbox`;
+  return reusable ? `New ${name} static sandbox` : `${name} Sandbox`;
 }
 
 /**
