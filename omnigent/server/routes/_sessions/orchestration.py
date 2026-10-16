@@ -147,6 +147,7 @@ from omnigent.server.creation_logging import creation_metadata, creation_stage, 
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
+    REQUESTED_HOST_ID_LABEL_KEY,
     ManagedHostLaunch,
     ManagedLaunchTracker,
     ManagedSandboxDeployment,
@@ -4146,6 +4147,7 @@ async def _run_managed_launch(
     provider: str | None = None,
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
+    host_id: str | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -4210,9 +4212,12 @@ async def _run_managed_launch(
     :param agent_id: Agent the session is bound to, resolved through the
         built-in gate into the runner Pod's ``omnigent.ai/agent``
         classifier, or ``None`` to leave it unstamped.
+    :param host_id: Host id a managed create asked for, or
+        ``None`` to mint one. Ignored on a relaunch.
     """
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
+        host_slice_key_enabled,
         resolve_managed_agent_label,
     )
 
@@ -4242,6 +4247,12 @@ async def _run_managed_launch(
             relaunch_host=relaunch_host,
             provider=provider,
             agent_name=agent_name,
+            host_id=host_id,
+            relaunch_slice_key_enabled=(
+                relaunch_host is not None
+                and saved_conversation is not None
+                and host_slice_key_enabled(saved_conversation.labels, relaunch_host.host_id)
+            ),
         )
         if managed is None:
             return
@@ -5091,6 +5102,7 @@ async def _run_managed_wake(
     from omnigent.onboarding.sandboxes.base import SandboxGoneError
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
+        host_slice_key_enabled,
         resolve_managed_agent_label,
         resume_managed_host,
     )
@@ -5144,6 +5156,7 @@ async def _run_managed_wake(
                 force=True,
                 on_stage=_on_stage,
                 agent_name=agent_name,
+                slice_key_enabled=host_slice_key_enabled(conv.labels, host_id),
             )
         except SandboxGoneError:
             _logger.info(
@@ -11247,6 +11260,11 @@ async def _create_session_from_existing_agent(
         from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
 
         initial_labels[AUTO_HARNESS_LABEL_KEY] = "1"
+    # A managed create's chosen sandbox host id is born with the row: the caller
+    # routes the session by it until the host binds, and a sidebar list read
+    # racing the create must never return the row without it.
+    if body.host_type == "managed" and body.requested_host_id is not None:
+        initial_labels[REQUESTED_HOST_ID_LABEL_KEY] = body.requested_host_id
 
     snapshot_kwargs: dict[str, Any] = (
         {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
