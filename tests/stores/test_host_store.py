@@ -472,6 +472,69 @@ def test_set_offline_noop_for_unknown_host(
     host_store.set_offline("aababcc3941edb738172734a9ab7bb8c")
 
 
+def test_reconnect_waits_for_offline_transaction(
+    host_store: HostStore, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reconnect must read the status after a pending offline write commits."""
+    now = now_epoch()
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: now)
+    host_id = uuid.uuid4().hex
+    workspace_id = current_workspace_id()
+    host_store.upsert_on_connect(host_id, "laptop", "alice@example.test")
+    offline_written = threading.Event()
+    release_offline = threading.Event()
+    reconnect_started = threading.Event()
+    reconnect_finished = threading.Event()
+    worker_ids: dict[str, int] = {}
+    engine = get_or_create_engine(db_uri)
+
+    def delay_offline_commit(_session, _flush_context) -> None:
+        if threading.get_ident() == worker_ids.get("offline"):
+            offline_written.set()
+            assert release_offline.wait(timeout=10)
+
+    def observe_reconnect(_connection, _cursor, statement, _parameters, _context, _many) -> None:
+        if threading.get_ident() == worker_ids.get("reconnect"):
+            sql = statement.upper()
+            if "FROM HOSTS" in sql or sql.startswith("BEGIN IMMEDIATE"):
+                reconnect_started.set()
+
+    def disconnect() -> None:
+        worker_ids["offline"] = threading.get_ident()
+        with workspace_scope(workspace_id):
+            host_store.set_offline(host_id)
+
+    def reconnect() -> Host:
+        worker_ids["reconnect"] = threading.get_ident()
+        with workspace_scope(workspace_id):
+            try:
+                return host_store.upsert_on_connect(host_id, "laptop", "alice@example.test")
+            finally:
+                reconnect_finished.set()
+
+    event.listen(Session, "after_flush", delay_offline_commit)
+    event.listen(engine, "before_cursor_execute", observe_reconnect)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            disconnected = executor.submit(disconnect)
+            try:
+                assert offline_written.wait(timeout=10)
+                connected = executor.submit(reconnect)
+                assert reconnect_started.wait(timeout=10)
+                returned_before_commit = reconnect_finished.wait(timeout=0.5)
+            finally:
+                release_offline.set()
+            disconnected.result(timeout=10)
+            assert connected.result(timeout=10).status == "online"
+    finally:
+        release_offline.set()
+        event.remove(Session, "after_flush", delay_offline_commit)
+        event.remove(engine, "before_cursor_execute", observe_reconnect)
+
+    assert host_store.is_online(host_id)
+    assert not returned_before_commit
+
+
 def test_heartbeat_advances_updated_at_without_changing_status(
     host_store: HostStore,
     db_uri: str,

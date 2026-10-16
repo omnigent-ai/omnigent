@@ -624,6 +624,7 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
     offline_started = threading.Event()
     offline_release = threading.Event()
     offline_finished = threading.Event()
+    offline_errors: list[Exception] = []
     real_set_offline = store.set_offline
     if offline_result in {"failure", "blocked"}:
 
@@ -635,6 +636,9 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
             try:
                 assert offline_release.wait(timeout=budget(5.0))
                 real_set_offline(host_id, **kwargs)
+            except Exception as exc:
+                offline_errors.append(exc)
+                raise
             finally:
                 offline_finished.set()
 
@@ -722,6 +726,7 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
             assert store.is_online(_HOST_ID)
             offline_release.set()
             assert await asyncio.to_thread(offline_finished.wait, budget(2.0))
+            assert not offline_errors, f"Offline worker failed: {offline_errors}"
             assert store.is_online(_HOST_ID), "A timed-out write must not retire the reconnect"
         if offline_result == "diagnostics_failure":
             assert "test diagnostics finalization failure" in caplog.text

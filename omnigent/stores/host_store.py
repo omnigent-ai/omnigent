@@ -353,8 +353,8 @@ class HostStore:
                     raise ValueError("managed host registration disappeared")
                 return _row_to_host(managed_row)
 
-            # Primary lookup: by (workspace_id, host_id) — the new PK.
-            row = session.get(SqlHost, (current_workspace_id(), host_id))
+            # Read after any pending disconnect so the ORM restores online status.
+            row = session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
             if row is not None:
                 if row.deleted_at is not None:
                     raise ValueError("host has been deleted")
