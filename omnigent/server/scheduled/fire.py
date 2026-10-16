@@ -49,8 +49,8 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -95,8 +95,30 @@ _PENDING_FIRES: set[asyncio.Task[None]] = set()
 # Fire path overlap guard keyed by tenant + task. The scheduler's job.running
 # only covers its short on_fire callback; this covers the background
 # create/grant/dispatch work that continues after on_fire returns.
+# A run started with an idempotency key is keyed by (workspace_id, task_id, key)
+# instead, so runs for different external events can be in flight together.
 # custom-lint: disable-next=workspace-scoped-cache -- already keyed by (workspace_id, task_id)
-_IN_FLIGHT_TASKS: set[tuple[int, str]] = set()
+_IN_FLIGHT_TASKS: set[tuple[int, str] | tuple[int, str, str]] = set()
+
+
+@dataclass(frozen=True)
+class RunRequest:
+    """What one manually triggered run works on, from the run-now request body.
+
+    :param run_id: The run's ID, allocated by the caller so it can be returned
+        before the run is recorded.
+    :param input: Text sent to the agent after the task's stored prompt, e.g.
+        the external event that started the run. ``None`` sends the prompt alone.
+    :param labels: Labels merged into the fired session's labels, so the caller
+        can find the session, e.g. ``{"app.thread": "18c2f0a9"}``.
+    :param idempotency_key: Replaces the task as the in-flight key, e.g.
+        ``"mail:18c2f0a9:4"``. ``None`` keeps one fire per task in flight.
+    """
+
+    run_id: str
+    input: str | None = None
+    labels: Mapping[str, str] = field(default_factory=dict)
+    idempotency_key: str | None = None
 
 
 # ``launch_dispatch(conv, task)`` — launch the runner for a freshly created
@@ -166,6 +188,11 @@ class _FireDispatch:
     managed: LaunchDispatch
 
 
+def _prompt_with_input(prompt: str, run_input: str) -> str:
+    """The stored prompt, then one run's input, delimited so the agent can tell them apart."""
+    return f"{prompt}\n\n<run_input>\n{run_input}\n</run_input>"
+
+
 def _prompt_event(prompt: str) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
     return SessionEventInput(
@@ -224,19 +251,23 @@ def build_run_now(
     accepted. The caller (the ``POST /run`` route) therefore returns ``202
     Accepted`` rather than the finished run.
 
-    :returns: ``async run_now(workspace_id, scheduled_task_id) -> bool`` that
-        returns ``True`` if a fire was started, ``False`` if it was skipped
-        (row gone, or a fire for that task is already in flight).
+    :returns: ``async run_now(workspace_id, scheduled_task_id, run=None) -> bool``
+        that returns ``True`` if a fire was started, ``False`` if it was skipped
+        (row gone, or a fire with the same in-flight key is already running).
+        ``run`` carries the run's ID, input, labels, and idempotency key.
     """
     fire_dispatch = _build_fire_dispatch(deps, launch_dispatch)
 
-    async def run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+    async def run_now(
+        workspace_id: int, scheduled_task_id: str, run: RunRequest | None = None
+    ) -> bool:
         result = await _trigger_fire(
             deps,
             workspace_id,
             scheduled_task_id,
             fire_dispatch,
             require_active=False,
+            run=run,
         )
         return result is _FireResult.STARTED
 
@@ -271,6 +302,7 @@ async def _trigger_fire(
     fire_dispatch: _FireDispatch,
     *,
     require_active: bool,
+    run: RunRequest | None = None,
 ) -> _FireResult:
     """Synchronously guard a fire, then dispatch the run in the background.
 
@@ -298,7 +330,9 @@ async def _trigger_fire(
             )
             return _FireResult.INACTIVE
 
-    key = (workspace_id, scheduled_task_id)
+    key: tuple[int, str] | tuple[int, str, str] = (workspace_id, scheduled_task_id)
+    if run is not None and run.idempotency_key is not None:
+        key = (workspace_id, scheduled_task_id, run.idempotency_key)
     if key in _IN_FLIGHT_TASKS:
         _logger.info("scheduled fire: task %s already in flight — skipping", scheduled_task_id)
         return _FireResult.IN_FLIGHT
@@ -308,7 +342,7 @@ async def _trigger_fire(
     # caller returns immediately (the scheduler re-arms the timer now; the route
     # returns 202).
     fire_task = asyncio.create_task(
-        _run_fire(deps, workspace_id, scheduled_task_id, fire_dispatch, require_active),
+        _run_fire(deps, workspace_id, scheduled_task_id, fire_dispatch, require_active, run),
         name=f"scheduled-fire-{scheduled_task_id}",
     )
     _PENDING_FIRES.add(fire_task)
@@ -323,6 +357,7 @@ async def _run_fire(
     scheduled_task_id: str,
     fire_dispatch: _FireDispatch,
     require_active: bool = True,
+    run: RunRequest | None = None,
 ) -> None:
     """Background body of a firing: create session, grant, launch, record run.
 
@@ -349,7 +384,7 @@ async def _run_fire(
                 account_authority_scope(task.user_id, task.account_generation),
                 host_owner_scope(task.user_id, task.account_generation),
             ):
-                await _run_fire_for_task(deps, task, fire_dispatch, scheduled_at)
+                await _run_fire_for_task(deps, task, fire_dispatch, scheduled_at, run)
         except Exception:
             _logger.exception("scheduled fire: task %s failed", task.id)
 
@@ -359,6 +394,7 @@ async def _run_fire_for_task(
     task: ScheduledTask,
     fire_dispatch: _FireDispatch,
     scheduled_at: int,
+    run: RunRequest | None = None,
 ) -> None:
     """Run a freshly re-read active task, routed by ``execution_target``.
 
@@ -366,6 +402,7 @@ async def _run_fire_for_task(
     existing one); ``connected_host`` runs the resolve/validate/launch flow
     below. Any other target records a skipped run.
     """
+    run_id = run.run_id if run is not None else None
     try:
         # A deleted / rotated owner registration fires nothing — managed or
         # connected — and disables the task.
@@ -384,6 +421,7 @@ async def _run_fire_for_task(
                 status="failed",
                 error=f"owner {task.user_id!r} registration is no longer active; task disabled",
                 error_code="owner_deleted",
+                run_id=run_id,
             )
             return
         managed = task.execution_target == "managed_sandbox"
@@ -402,6 +440,7 @@ async def _run_fire_for_task(
                 "skipped",
                 error=f"execution_target {task.execution_target!r} not supported yet",
                 error_code="unsupported_target",
+                run_id=run_id,
             )
             return
 
@@ -422,6 +461,7 @@ async def _run_fire_for_task(
                 status="failed",
                 error=str(exc),
                 error_code=exc.error_code,
+                run_id=run_id,
             )
             return
 
@@ -437,6 +477,7 @@ async def _run_fire_for_task(
                 status="failed",
                 error=error,
                 error_code=error_code,
+                run_id=run_id,
             )
             return
 
@@ -453,6 +494,7 @@ async def _run_fire_for_task(
                     status="failed",
                     error=str(exc),
                     error_code=exc.error_code,
+                    run_id=run_id,
                 )
                 return
 
@@ -473,12 +515,18 @@ async def _run_fire_for_task(
                 status="failed",
                 error=error,
                 error_code=error_code,
+                run_id=run_id,
             )
             return
 
         try:
             effective = await _own_task_agent(deps, effective)
-            conv = await _create_session(deps, effective)
+            if run is not None and run.input is not None:
+                # The dispatch seams send ``task.prompt``; this run's copy carries the input.
+                effective = replace(
+                    effective, prompt=_prompt_with_input(effective.prompt, run.input)
+                )
+            conv = await _create_session(deps, effective, run.labels if run is not None else None)
         except Exception:
             _logger.exception("scheduled fire: failed to create session for task %s", task.id)
             await _record_run(
@@ -489,6 +537,7 @@ async def _run_fire_for_task(
                 status="failed",
                 error="session creation failed",
                 error_code="session_create_failed",
+                run_id=run_id,
             )
             return
 
@@ -510,6 +559,7 @@ async def _run_fire_for_task(
                 status="failed",
                 error="owner grant failed",
                 error_code="owner_grant_failed",
+                run_id=run_id,
             )
             return
 
@@ -544,10 +594,11 @@ async def _run_fire_for_task(
                 status="failed",
                 error="runner launch/dispatch failed",
                 error_code="launch_failed",
+                run_id=run_id,
             )
             return
 
-        await _record_run(deps, task, conv.id, scheduled_at, status="running")
+        await _record_run(deps, task, conv.id, scheduled_at, status="running", run_id=run_id)
         _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
     except Exception:
         _logger.exception("scheduled fire: task %s failed", task.id)
@@ -848,8 +899,14 @@ async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
     )
 
 
-async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
-    """Create a conversation bound to the task's agent, carrying the stored spec."""
+async def _create_session(
+    deps: FireDeps, task: ScheduledTask, run_labels: Mapping[str, str] | None = None
+) -> Conversation:
+    """Create a conversation bound to the task's agent, carrying the stored spec.
+
+    ``run_labels`` come from a run-now request; the presentation labels are
+    stamped over them, so a caller cannot change how the session renders.
+    """
     conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
@@ -875,7 +932,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     # Chat/Terminal switcher instead of rendering Chat-only. Stamped last (after
     # the override reload above) so the labels land on the conversation returned
     # to the launch/dispatch caller, not a stale pre-label reload of it.
-    labels = await _presentation_labels(deps, task)
+    labels = {**(run_labels or {}), **await _presentation_labels(deps, task)}
     if labels:
         await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)
         conv.labels.update(labels)
@@ -965,8 +1022,12 @@ async def _record_run(
     status: str,
     error: str | None = None,
     error_code: str | None = None,
+    run_id: str | None = None,
 ) -> None:
-    """Stamp last_run_* on the task and write a scheduled_task_runs row."""
+    """Stamp last_run_* on the task and write a scheduled_task_runs row.
+
+    ``run_id`` is the ID a run-now caller already holds; ``None`` allocates one.
+    """
     await asyncio.to_thread(
         _record_run_sync,
         deps,
@@ -976,6 +1037,7 @@ async def _record_run(
         status,
         error=error,
         error_code=error_code,
+        run_id=run_id,
     )
 
 
@@ -988,6 +1050,7 @@ def _record_run_sync(
     *,
     error: str | None = None,
     error_code: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = int(time.time())
@@ -996,7 +1059,7 @@ def _record_run_sync(
         update_fields["last_run_conversation_id"] = conversation_id
     deps.scheduled_task_store.update(task.id, **update_fields)
     deps.scheduled_task_store.create_run(
-        _new_id(),
+        run_id or _new_id(),
         task.id,
         status,
         scheduled_at,

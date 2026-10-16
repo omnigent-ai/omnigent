@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import httpx
@@ -1685,7 +1686,7 @@ async def test_run_now_triggers_and_records_a_run(
     calls: list[tuple[int, str]] = []
     now = int(time.time())
 
-    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str, run: Any = None) -> bool:
         calls.append((workspace_id, scheduled_task_id))
         # Use a current-time fire so the LIST endpoint's stale backstop (6h age
         # from fired_at) does NOT reap this fresh in-flight run to ``failed``.
@@ -1703,7 +1704,8 @@ async def test_run_now_triggers_and_records_a_run(
 
     resp = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
     assert resp.status_code == 202, resp.text
-    assert resp.json() == {"triggered": True, "id": task_id}
+    assert resp.json() == {"triggered": True, "id": task_id, "run_id": resp.json()["run_id"]}
+    assert len(resp.json()["run_id"]) == 32
     # The trigger was invoked with the task's workspace + id.
     assert calls == [(0, task_id)]
 
@@ -1733,7 +1735,7 @@ async def test_run_now_allows_paused_task(
 
     triggered: list[str] = []
 
-    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str, run: Any = None) -> bool:
         triggered.append(scheduled_task_id)
         return True
 
@@ -1753,12 +1755,85 @@ async def test_run_now_conflict_when_already_in_flight(
     ).json()
     task_id = created["id"]
 
-    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str, run: Any = None) -> bool:
         return False  # already in flight
 
     auth_app.state.scheduled_task_run_now = _fake_run_now
     resp = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
     assert resp.status_code == 409, resp.text
+
+
+async def test_run_now_body_reaches_the_trigger_and_returns_its_run_id(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """The optional body becomes the run's input, labels, and idempotency key."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    seen: list[Any] = []
+
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str, run: Any = None) -> bool:
+        seen.append(run)
+        return True
+
+    auth_app.state.scheduled_task_run_now = _fake_run_now
+    body = {
+        "input": "Subject: Pricing",
+        "labels": {"app.thread": "t1"},
+        "idempotency_key": "mail:t1:4",
+    }
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{task_id}/run", json=body, headers=_headers()
+    )
+    assert resp.status_code == 202, resp.text
+    (run,) = seen
+    assert (run.input, dict(run.labels), run.idempotency_key) == (
+        "Subject: Pricing",
+        {"app.thread": "t1"},
+        "mail:t1:4",
+    )
+    assert resp.json()["run_id"] == run.run_id
+
+
+@pytest.mark.parametrize(
+    ("body", "status"),
+    [
+        ({"labels": {"omnigent.ui": "terminal"}}, 422),
+        # Policy-owned labels hit the same guard as session create.
+        ({"labels": {"cost_control.spent": "0"}}, 400),
+        ({"labels": {"": "x"}}, 422),
+        ({"idempotency_key": ""}, 422),
+        ({"input": "x" * 100_001}, 422),
+        ({"unknown": True}, 422),
+    ],
+)
+async def test_run_now_rejects_an_invalid_body(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    body: dict[str, Any],
+    status: int,
+) -> None:
+    """Reserved or malformed labels, oversized input, and unknown fields start nothing."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    started: list[Any] = []
+
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str, run: Any = None) -> bool:
+        started.append(run)
+        return True
+
+    auth_app.state.scheduled_task_run_now = _fake_run_now
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{task_id}/run", json=body, headers=_headers()
+    )
+    assert resp.status_code == status, resp.text
+    assert started == []
 
 
 async def test_run_now_404_for_nonowned_task(
