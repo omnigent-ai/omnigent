@@ -503,9 +503,14 @@ def _clock_advanced_by_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     async def _sleep(delay: float) -> None:
         sleeps.append(delay)
         now[0] += delay
+        await asyncio.sleep(0)
 
-    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
-    monkeypatch.setattr(serve_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        serve_module, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": _sleep})
+    )
+    monkeypatch.setattr(
+        serve_module, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: now[0]})
+    )
     return sleeps
 
 
@@ -538,6 +543,81 @@ async def test_serve_tunnel_waits_for_a_pending_sign_in_then_connects(
     # No unauthenticated upgrade while pending: the first one carries the new token.
     assert upgrades == ["tok-after-sign-in"]
     assert len(sleeps) == 4
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_refreshes_when_sign_in_finishes_after_the_token_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolved sign-in supplies its new token before the first upgrade."""
+
+    class _ResolvingSignIn:
+        calls = 0
+
+        def __call__(self) -> str | None:
+            self.calls += 1
+            return None if self.calls <= 2 else "tok-after-sign-in"
+
+        @property
+        def sign_in_pending(self) -> bool:
+            return self.calls < 2
+
+    upgrades: list[str | None] = []
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        del app
+        upgrades.append(auth_token)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://server.example.test",
+            runner_id="runner_sign_in_resolves",
+            runner_version="0.1.0",
+            auth_token_factory=_ResolvingSignIn(),
+        )
+
+    assert upgrades == ["tok-after-sign-in"]
+    assert len(sleeps) == 1
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_keeps_a_token_when_the_sign_in_flag_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A broken optional status accessor must not prevent an authenticated upgrade."""
+
+    class _BrokenSignInFlag:
+        def __call__(self) -> str | None:
+            return "tok-live"
+
+        @property
+        def sign_in_pending(self) -> bool:
+            raise RuntimeError("credential source unavailable")
+
+    upgrades: list[str | None] = []
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        del app
+        upgrades.append(auth_token)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://server.example.test",
+            runner_id="runner_sign_in_flag_broken",
+            runner_version="0.1.0",
+            auth_token_factory=_BrokenSignInFlag(),
+        )
+
+    assert upgrades == ["tok-live"]
+    assert "sign_in_pending read failed" in caplog.text
 
 
 @pytest.mark.asyncio

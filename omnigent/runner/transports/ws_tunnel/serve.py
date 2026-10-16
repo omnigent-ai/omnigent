@@ -193,10 +193,9 @@ _AUTH_REDIRECT_SCHEMES = {"http", "https"}
 # mirrors the host tunnel's ``_LOGIN_REDIRECT_FATAL_ATTEMPTS`` posture.
 _LOGIN_REDIRECT_FATAL_ATTEMPTS = 3
 
-# A never-connected runner whose token factory reports ``sign_in_pending`` (e.g. a
-# host credential service reopened its browser login) polls instead of upgrading
-# without a credential. 150 s covers the ~105 s median re-sign-in after an expired
-# grant; an abandoned sign-in still fails within the five-minute launch triage window.
+# A never-connected runner with a pending host sign-in polls before upgrading.
+# Keep this wait below the host connect watchdog's deadline so a runner waiting
+# for credentials is not reported as hung.
 _SIGN_IN_PENDING_WAIT_S = 150.0
 _SIGN_IN_PENDING_POLL_INTERVAL_S = 2.0
 
@@ -429,6 +428,7 @@ async def serve_tunnel(
     disconnected_monotonic: float | None = None
     # When this never-connected runner started waiting for a pending sign-in.
     sign_in_wait_started: float | None = None
+    # A repeated sign-in cannot extend this launch's bounded wait.
     sign_in_wait_ended = False
 
     def _mark_connected() -> None:
@@ -499,6 +499,9 @@ async def serve_tunnel(
                     await asyncio.sleep(_SIGN_IN_PENDING_POLL_INTERVAL_S)
                     continue
                 sign_in_wait_ended = True
+                if not pending:
+                    # Sign-in can finish between the token call and the flag read.
+                    auth_token = await _refresh_auth_token(auth_token, auth_token_factory)
                 _logger.info(
                     "Runner tunnel stopped waiting for the host sign-in after %.0fs: %s",
                     waited_s,
@@ -819,7 +822,15 @@ async def _sign_in_pending(factory: Callable[[], str | None] | None) -> bool:
     """
     if factory is None:
         return False
-    return bool(await asyncio.to_thread(getattr, factory, "sign_in_pending", False))
+    try:
+        return bool(await asyncio.to_thread(getattr, factory, "sign_in_pending", False))
+    except Exception:  # noqa: BLE001 - optional status cannot prevent a tunnel upgrade.
+        _logger.warning(
+            "sign_in_pending read failed; continuing with the available credential",
+            exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return False
 
 
 def _prepare_auth_retry(factory: Callable[[], str | None] | None) -> None:
