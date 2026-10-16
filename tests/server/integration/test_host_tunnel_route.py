@@ -589,7 +589,9 @@ async def test_host_replacement_names_retirement_without_inventing_close_code(
 
 
 @pytest.mark.parametrize("cancellation", ["task", "scope"])
-@pytest.mark.parametrize("offline_result", ["success", "failure", "blocked"])
+@pytest.mark.parametrize(
+    "offline_result", ["success", "failure", "blocked", "diagnostics_failure"]
+)
 async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -615,22 +617,24 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
             # Observe finalization at a cancellation checkpoint, retaining the real monitor.
             await anyio.lowlevel.checkpoint()
             cleanup_completed.set()
+            if offline_result == "diagnostics_failure":
+                raise RuntimeError("test diagnostics finalization failure")
 
     monkeypatch.setattr(TunnelDiagnostics, "monitoring", observed_monitoring)
     offline_started = threading.Event()
     offline_release = threading.Event()
     offline_finished = threading.Event()
     real_set_offline = store.set_offline
-    if offline_result != "success":
+    if offline_result in {"failure", "blocked"}:
 
-        def interrupted_offline(host_id: str) -> None:
+        def interrupted_offline(host_id: str, **kwargs) -> None:
             assert host_id == _HOST_ID
             if offline_result == "failure":
                 raise RuntimeError("test offline persistence failure")
             offline_started.set()
             try:
                 assert offline_release.wait(timeout=budget(5.0))
-                real_set_offline(host_id)
+                real_set_offline(host_id, **kwargs)
             finally:
                 offline_finished.set()
 
@@ -638,8 +642,11 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
         monkeypatch.setattr(store, "set_offline", interrupted_offline)
     if offline_result == "blocked":
         monkeypatch.setattr(
-            host_tunnel, "_DISCONNECT_CLEANUP_TIMEOUT_S", budget(0.1), raising=False
+            host_tunnel, "_DISCONNECT_CLEANUP_TIMEOUT_S", budget(0.5), raising=False
         )
+        # Reconnects within one timestamp tick still need protection from a stale write.
+        frozen_time = now_epoch()
+        monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: frozen_time)
 
     async def on_connect(_host_id: str, _owner: str | None) -> None:
         entered.set()
@@ -680,6 +687,7 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
         }
     ]
     assert len(helpers) == 5
+    replacement = None
     try:
         if cancellation == "task":
             comm.future.cancel()
@@ -699,19 +707,33 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
         assert registry.get(_HOST_ID) is None
         persisted = HostStore(db_uri).get_host(_HOST_ID)
         assert persisted is not None
-        assert persisted.status == ("offline" if offline_result == "success" else "online")
+        assert persisted.status == (
+            "online" if offline_result in {"failure", "blocked"} else "offline"
+        )
         if offline_result == "failure":
             assert "test offline persistence failure" in caplog.text
         if offline_result == "blocked":
-            assert offline_started.is_set()
+            assert await asyncio.to_thread(offline_started.wait, budget(2.0))
             assert not offline_release.is_set()
             assert "Timed out cleaning up host" in caplog.text
+            monkeypatch.setattr(store, "set_offline", real_set_offline)
+            replacement = await _connect_route(cancellable_app, _TUNNEL_PATH)
+            await _send_hello_and_wait(replacement, registry, connection_id="replacement")
+            assert store.is_online(_HOST_ID)
+            offline_release.set()
+            assert await asyncio.to_thread(offline_finished.wait, budget(2.0))
+            assert store.is_online(_HOST_ID), "A timed-out write must not retire the reconnect"
+        if offline_result == "diagnostics_failure":
+            assert "test diagnostics finalization failure" in caplog.text
     finally:
         offline_release.set()
         if offline_started.is_set():
             assert await asyncio.to_thread(offline_finished.wait, budget(2.0))
         comm.stop(exceptions=False)
         await asyncio.gather(comm.future, return_exceptions=True)
+        if replacement is not None:
+            replacement.stop(exceptions=False)
+            await asyncio.gather(replacement.future, return_exceptions=True)
         for task in helpers:
             task.cancel()
         await asyncio.gather(*helpers, return_exceptions=True)

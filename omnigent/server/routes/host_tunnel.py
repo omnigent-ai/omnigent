@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -87,6 +88,7 @@ SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 _HEARTBEAT_FAILURE_LOG_INTERVAL_S = 60.0
+# Per phase: persistence/workers, diagnostics and notification total at most 15s.
 _DISCONNECT_CLEANUP_TIMEOUT_S = 5.0
 
 RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
@@ -504,13 +506,20 @@ def create_host_tunnel_router(
                             finally:
                                 # A replaced connection must not mark its successor offline.
                                 if host_registry.deregister(host_id, conn=conn):
+                                    offline_cancelled = threading.Event()
                                     try:
-                                        await asyncio.to_thread(host_store.set_offline, host_id)
+                                        await asyncio.to_thread(
+                                            host_store.set_offline,
+                                            host_id,
+                                            cancelled=offline_cancelled.is_set,
+                                        )
                                     except Exception:
                                         _logger.exception(
                                             "Failed to mark host %s offline after disconnect",
                                             host_id,
                                         )
+                                    finally:
+                                        offline_cancelled.set()
                         if cleanup_scope.cancel_called:
                             # The row ages out via its liveness TTL if persistence stalls.
                             _logger.warning("Timed out cleaning up host %s", host_id)
@@ -518,7 +527,10 @@ def create_host_tunnel_router(
                         with anyio.move_on_after(
                             _DISCONNECT_CLEANUP_TIMEOUT_S, shield=True
                         ) as diagnostics_scope:
-                            await diagnostics_cleanup.aclose()
+                            try:
+                                await diagnostics_cleanup.aclose()
+                            except Exception:
+                                _logger.exception("Failed to close host %s diagnostics", host_id)
                         if diagnostics_scope.cancel_called:
                             _logger.warning("Timed out closing host %s diagnostics", host_id)
                     if on_host_disconnect is not None:

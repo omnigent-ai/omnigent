@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -616,7 +617,7 @@ class HostStore:
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
         )
 
-    def set_offline(self, host_id: str) -> None:
+    def set_offline(self, host_id: str, *, cancelled: Callable[[], bool] | None = None) -> None:
         """
         Mark a host as offline when its WebSocket disconnects.
 
@@ -625,18 +626,23 @@ class HostStore:
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param cancelled: Optional abandonment check after acquiring the row lock.
         """
         updated_at = now_epoch()
 
         def write(session: Session) -> None:
             row = session.execute(
-                select(SqlHost).where(
+                select(SqlHost)
+                .where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
                     SqlHost.deleted_at.is_(None),
                 )
+                .with_for_update()
             ).scalar_one_or_none()
-            if row is not None:
+            # A timed-out worker must not write after a reconnect. Once locked,
+            # any later reconnect waits for this transaction to finish.
+            if row is not None and not (cancelled is not None and cancelled()):
                 row.status = encode_host_status("offline")
                 row.updated_at = updated_at
 
@@ -948,11 +954,12 @@ class HostStore:
             return run_write_transaction(self._lifecycle_session, "reserve_sandbox_host", write)
 
     def bind_sandbox(self, host_id: str, *, provider: str, sandbox_id: str) -> Host | None:
-        """Attach a provider's sandbox ID without changing credentials or liveness.
+        """Attach a provider's sandbox ID without changing credentials or reviving a host.
 
         Call after provisioning, before waiting for a self-registering host.
-        Missing, deleted or conflicting bindings fail closed. Metadata writes
-        must not refresh a disconnected host's heartbeat.
+        Missing, deleted or conflicting bindings fail closed. A new sandbox on
+        a non-live row starts its reaping grace explicitly offline; live hosts
+        and repeated bindings keep their existing liveness and timestamps.
         """
 
         def write(session: Session) -> Host | None:
@@ -984,10 +991,12 @@ class HostStore:
                 return None
             if row.sandbox_id not in {None, sandbox_id}:
                 return None
+            now = now_epoch()
+            if row.sandbox_id is None and not host_is_live(_row_to_host(row), now=now):
+                row.status = encode_host_status("offline")
+                row.updated_at = now
             row.sandbox_provider = provider
             row.sandbox_id = sandbox_id
-            # Binding metadata is not a heartbeat: a crashed host whose status
-            # still says online must remain stale until it actually reconnects.
             return _row_to_host(row)
 
         return run_write_transaction(self._lifecycle_session, "bind_host_sandbox", write)

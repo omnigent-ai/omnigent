@@ -984,17 +984,18 @@ def test_insert_conflict_retry_adopts_the_competing_row(
     assert host_store.get_host(_RESERVED_HOST_ID) == host
 
 
-@pytest.mark.parametrize("connect_first", [False, True])
+@pytest.mark.parametrize("connection_state", ["offline", "stale", "live"])
 @pytest.mark.parametrize("retry_dialect", [None, "mysql", "cockroachdb"])
 def test_binding_preserves_connection_liveness(
     host_store: HostStore,
     db_uri: str,
-    connect_first: bool,
+    connection_state: str,
     retry_dialect: str | None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if connect_first:
+    if connection_state != "offline":
         host_store.upsert_on_connect(_RESERVED_HOST_ID, "managed-host", "alice@example.test")
+    if connection_state == "stale":
         _set_updated_at(db_uri, _RESERVED_HOST_ID, 1)
     reserved = _reserve(host_store)
     assert reserved is not None
@@ -1027,9 +1028,13 @@ def test_binding_preserves_connection_liveness(
                 event.remove(Session, "after_flush", fail_first_flush)
     assert attempts == (0 if retry_dialect is None else 2)
     assert bound is not None
-    assert bound.updated_at == reserved.updated_at
-    assert bound.status == reserved.status
-    assert not host_store.is_online(_RESERVED_HOST_ID)
+    if connection_state == "live":
+        assert bound.updated_at == reserved.updated_at
+        assert bound.status == "online"
+    else:
+        assert bound.updated_at >= reserved.updated_at
+        assert bound.status == "offline"
+    assert host_store.is_online(_RESERVED_HOST_ID) == (connection_state == "live")
     connected = host_store.upsert_on_connect(
         _RESERVED_HOST_ID, "managed-host", "alice@example.test"
     )
