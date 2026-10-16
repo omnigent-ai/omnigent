@@ -309,7 +309,7 @@ jobs:
           repositories: omnigent
 
       - name: Checkout base
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Existing branch: its head. New branch: the resolved base commit.
           ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}

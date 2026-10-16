@@ -73,7 +73,7 @@ jobs:
       UV_PYTHON_PREFERENCE: only-system
     steps:
       - name: Checkout PR branch
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # No persisted credentials anywhere in this job: it runs PR-chosen code
           # and must never have a push token on disk.
@@ -171,7 +171,7 @@ jobs:
     steps:
       - name: Checkout PR branch
         if: needs.render.result == 'success'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # PR files land on disk but are never executed in this job; the push
           # token authenticates inline at the push step (not via .git/config).
