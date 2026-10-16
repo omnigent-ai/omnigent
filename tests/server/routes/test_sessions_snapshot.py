@@ -23,6 +23,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.schemas import SessionResponse
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.stores.conversation_store import CompactionStats
 
 
 async def _drain_model_options(session_id: str) -> None:
@@ -133,6 +134,9 @@ class _ConversationStore:
             root_conversation_id=conversation_id,
             agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         )
+
+    def get_compaction_stats(self, conversation_id: str) -> CompactionStats:
+        return CompactionStats(count=0, last_compaction_at=None)
 
     def list_conversations(
         self,

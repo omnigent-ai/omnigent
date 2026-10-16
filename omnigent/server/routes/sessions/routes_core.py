@@ -3874,11 +3874,17 @@ def register_core_routes(
             order="desc",
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
+        # Carried history can include compaction items; keep the fork's
+        # first snapshot consistent with the GET projection.
+        fork_compaction_stats = await asyncio.to_thread(
+            conversation_store.get_compaction_stats, new_conv.id
+        )
         return _build_session_response(
             new_conv,
             list(reversed(fork_items.data)),
             "idle",
             permission_level=level,
+            compaction_stats=fork_compaction_stats,
             last_task_error=None,
             agent_name=base_agent.name,
         )
