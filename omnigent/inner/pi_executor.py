@@ -51,6 +51,7 @@ import time
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from importlib.resources import files
 from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
@@ -151,29 +152,16 @@ async def _fetch_shell_command_token(command: str) -> str:
 
 
 def _write_gateway_auth_client(tmp_dir: str, port: int, token: str) -> pathlib.Path:
-    """Write Pi's request-time credential client; resolution stays in the parent."""
+    """Copy Pi's credential client and write its private connection settings."""
     client_path = pathlib.Path(tmp_dir) / "gateway-auth.cjs"
-    client_path.write_text(
-        "const net = require('node:net');\n"
-        f"const request = {json.dumps({'kind': 'gateway_auth', 'token': token})};\n"
-        f"const socket = net.connect({port}, '127.0.0.1');\n"
-        "const fail = () => { socket.destroy(); process.exitCode = 1; };\n"
-        "const deadline = setTimeout(fail, 9000);\n"
-        "let buffer = '';\n"
-        "socket.on('connect', () => socket.write(JSON.stringify(request) + '\\n'));\n"
-        "socket.on('data', data => {\n"
-        "  buffer += data;\n"
-        "  if (!buffer.includes('\\n')) return;\n"
-        "  try {\n"
-        "    const response = JSON.parse(buffer.split('\\n')[0]);\n"
-        "    if (typeof response.token !== 'string' || !response.token) { fail(); return; }\n"
-        "    process.stdout.write(response.token);\n"
-        "    socket.end();\n"
-        "  } catch { fail(); }\n"
-        "});\n"
-        "socket.on('error', fail);\n"
-        "socket.on('close', () => clearTimeout(deadline));\n"
+    config_path = client_path.with_suffix(".json")
+    config_path.write_text(
+        json.dumps({"port": port, "token": token}),
+        encoding="utf-8",
     )
+    config_path.chmod(0o600)
+    resource = files("omnigent.resources.pi").joinpath("gateway_auth.cjs")
+    client_path.write_bytes(resource.read_bytes())
     client_path.chmod(0o600)
     return client_path
 
