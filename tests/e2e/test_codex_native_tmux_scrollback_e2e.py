@@ -21,6 +21,12 @@ Both routes are now open: ``mouse on`` for the wheel and a root-table Page Up
 binding for the keyboard. The wheel must still be *forwarded* to a pane that
 tracks the mouse, so a full-screen TUI keeps its own wheel handling.
 
+``mouse on`` also turns a plain click-drag on such a pane into a tmux copy-mode
+selection instead of the terminal's own. The managed bindings keep that
+selection after the button is released (still exporting it to the terminal's
+clipboard) and let a click dismiss it, so the highlight no longer vanishes the
+moment the user lets go.
+
 This test drives the real product path end-to-end, with no LLM and no codex
 binary (codex-native needs an interactive OAuth login, so the inner CLI is a
 stand-in that fills the pane the way a Codex conversation does — the tmux
@@ -48,7 +54,10 @@ Runs with only ``tmux`` and ``pexpect``::
 
 from __future__ import annotations
 
+import base64
+import io
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -71,6 +80,110 @@ PAGE_UP = "\x1b[5~"
 # SGR-encoded mouse wheel-up at column 40, row 12 (what a wheel notch sends
 # when mouse reporting is active; harmless pass-through bytes when it is not).
 WHEEL_UP = "\x1b[<64;40;12M"
+
+# DECSET private modes that ask the attached terminal to report the mouse
+# (X10/normal, button-event and any-event tracking).
+_MOUSE_TRACKING_MODES = {"1000", "1002", "1003"}
+_DECSET_RE = re.compile(rb"\x1b\[\?([\d;]+)h")
+# OSC 52: how tmux's ``set-clipboard`` hands a copied selection to the terminal.
+_OSC52_RE = re.compile(rb"\x1b\]52;[^;]*;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\\\)")
+
+# Where the drag tests select text: a viewport row and a column span inside it.
+SELECTION_ROW = 12
+SELECTION_START_COL = 5
+SELECTION_END_COL = 45
+
+
+def _sgr_mouse(button: int, col: int, row: int, *, release: bool = False) -> str:
+    """Encode one SGR mouse report as a tracking terminal sends it.
+
+    :param button: Button code, ``0`` for the left button or ``32`` for
+        motion with the left button held.
+    :param col: 1-based column of the pointer.
+    :param row: 1-based row of the pointer.
+    :param release: Whether this is the button-release report.
+    :returns: The escape sequence, e.g. ``"\\x1b[<0;5;12M"``.
+    """
+    return f"\x1b[<{button};{col};{row}{'m' if release else 'M'}"
+
+
+def _requests_mouse_tracking(output: bytes) -> bool:
+    """Report whether *output* switched the attached terminal into mouse tracking.
+
+    :param output: Raw bytes the attached client received so far.
+    :returns: ``True`` when any DECSET in *output* enables a tracking mode.
+    """
+    return any(
+        mode in _MOUSE_TRACKING_MODES
+        for match in _DECSET_RE.finditer(output)
+        for mode in match.group(1).decode().split(";")
+    )
+
+
+def _clipboard_exports(output: bytes) -> list[bytes]:
+    """Decode the OSC 52 clipboard payloads tmux wrote to the attached client.
+
+    :param output: Raw bytes the attached client received so far.
+    :returns: The decoded payloads in the order they were written.
+    """
+    return [base64.b64decode(match.group(1)) for match in _OSC52_RE.finditer(output)]
+
+
+def _drain(child: pexpect.spawn, seconds: float) -> None:
+    """Read whatever the attached client prints for *seconds*.
+
+    :param child: The attached client PTY.
+    :param seconds: How long to keep draining.
+    """
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            child.read_nonblocking(65536, timeout=0.2)
+        except pexpect.TIMEOUT:
+            continue
+        except pexpect.EOF:
+            return
+
+
+def _drag_select(child: pexpect.spawn) -> None:
+    """Press, drag and release the left button across one row of the pane.
+
+    Sent as the SGR reports a tracking terminal produces for the gesture.
+
+    :param child: The attached client PTY.
+    """
+    child.send(_sgr_mouse(0, SELECTION_START_COL, SELECTION_ROW))
+    for col in range(SELECTION_START_COL + 10, SELECTION_END_COL + 1, 10):
+        child.send(_sgr_mouse(32, col, SELECTION_ROW))
+        time.sleep(0.2)
+    child.send(_sgr_mouse(0, SELECTION_END_COL, SELECTION_ROW, release=True))
+
+
+def _click(child: pexpect.spawn) -> None:
+    """Click the left button once, away from the selected row.
+
+    :param child: The attached client PTY.
+    """
+    child.send(_sgr_mouse(0, 2, 20) + _sgr_mouse(0, 2, 20, release=True))
+
+
+def _attach_tracking_client(socket_path: str) -> tuple[pexpect.spawn, io.BytesIO] | None:
+    """Attach a native client and confirm tmux switched it into mouse tracking.
+
+    :param socket_path: The managed terminal's private socket path.
+    :returns: The attached client and the buffer collecting everything it
+        receives, or ``None`` when the attach requested no mouse tracking — the
+        terminal then owns selection and tmux never sees a drag.
+    """
+    child = _attach_native_client(socket_path)
+    received = io.BytesIO()
+    child.logfile_read = received
+    child.expect("CODEX OUTPUT LINE", timeout=10)
+    _drain(child, 1.0)
+    if not _requests_mouse_tracking(received.getvalue()):
+        child.close(force=True)
+        return None
+    return child, received
 
 
 def _tmux_out(socket_path: str, *args: str) -> str:
@@ -105,6 +218,18 @@ def _scrolled_state(socket_path: str) -> tuple[bool, str]:
     detail = f"pane_in_mode={in_mode!r} scroll_position={scroll_pos!r}"
     scrolled = in_mode == "1" and scroll_pos.isdigit() and int(scroll_pos) > 0
     return scrolled, detail
+
+
+def _selection_state(socket_path: str) -> tuple[str, str]:
+    """Report whether the pane currently shows a copy-mode selection.
+
+    :param socket_path: The managed terminal's private socket path.
+    :returns: ``(pane_in_mode, selection_present)`` as tmux formats them:
+        ``("1", "1")`` while a selection is highlighted.
+    """
+    in_mode = _tmux_out(socket_path, "display-message", "-p", "-t", "main", "#{pane_in_mode}")
+    present = _tmux_out(socket_path, "display-message", "-p", "-t", "main", "#{selection_present}")
+    return in_mode, present
 
 
 def _filler_pane_spec(cwd: Path) -> TerminalEnvSpec:
@@ -329,6 +454,119 @@ async def test_native_attach_wheel_reaches_a_mouse_tracking_pane(
             f"(pane_in_mode={in_mode!r}). The wheel belongs to the pane "
             "program whenever it tracks the mouse, or a full-screen TUI's own "
             "scrolling stops working under a managed terminal."
+        )
+    finally:
+        if child is not None:
+            child.close(force=True)
+        await reg.shutdown()
+
+
+async def test_native_attach_plain_drag_selection_survives_mouse_release(
+    tmp_path: Path,
+) -> None:
+    """A plain click-drag over a native attach leaves text selected after release.
+
+    ``mouse on`` makes the attached client switch its terminal into mouse
+    tracking, so a terminal such as Cursor's hands an unmodified drag to tmux
+    instead of selecting natively, and tmux takes the pane into copy mode for
+    it. The selection must still be shown after the button goes up, the copied
+    text must reach the terminal's clipboard, and a click must return the pane
+    to the live program.
+
+    :param tmp_path: Working directory for the managed terminal.
+    """
+    reg = TerminalRegistry()
+    child: pexpect.spawn | None = None
+    try:
+        instance = await reg.launch("conv_select", "codex", "s1", _filler_pane_spec(tmp_path))
+        socket_path = str(instance.socket_path)
+        _await_filled_history(socket_path)
+
+        attached = _attach_tracking_client(socket_path)
+        if attached is None:
+            return
+        child, received = attached
+
+        _drag_select(child)
+        time.sleep(1.0)
+        after = _selection_state(socket_path)
+        assert after == ("1", "1"), (
+            "the plain drag selection did not survive the mouse release "
+            f"(pane_in_mode/selection_present after release {after}). tmux took "
+            "the drag into copy mode and cancelled the selection on "
+            "MouseDragEnd1Pane, so the user ends up with nothing selected."
+        )
+
+        _drain(child, 1.0)
+        exports = _clipboard_exports(received.getvalue())
+        assert any(b"OUTPUT LINE" in payload for payload in exports), (
+            "releasing the drag did not export the selected text to the attached "
+            f"terminal's clipboard via OSC 52 (payloads={exports!r})"
+        )
+
+        _click(child)
+        time.sleep(1.0)
+        dismissed = _selection_state(socket_path)
+        assert dismissed == ("0", ""), (
+            "a click did not dismiss the selection and leave copy mode "
+            f"(pane_in_mode/selection_present after click {dismissed}), so "
+            "keystrokes would keep going to copy mode instead of the program."
+        )
+    finally:
+        if child is not None:
+            child.close(force=True)
+        await reg.shutdown()
+
+
+async def test_native_attach_click_dismisses_selection_without_leaving_history(
+    tmp_path: Path,
+) -> None:
+    """A click while scrolled into history clears the selection but keeps the place.
+
+    Selecting text found by scrolling back is why the user is in history, so
+    dismissing that selection with a click must not yank the view back to the
+    live bottom: the pane stays in copy mode at the same scroll position and
+    only the highlight goes.
+
+    :param tmp_path: Working directory for the managed terminal.
+    """
+    reg = TerminalRegistry()
+    child: pexpect.spawn | None = None
+    try:
+        instance = await reg.launch("conv_history", "codex", "s1", _filler_pane_spec(tmp_path))
+        socket_path = str(instance.socket_path)
+        _await_filled_history(socket_path)
+
+        attached = _attach_tracking_client(socket_path)
+        if attached is None:
+            return
+        child, _received = attached
+
+        child.send(WHEEL_UP * 4)
+        time.sleep(1.0)
+        scrolled, detail = _scrolled_state(socket_path)
+        assert scrolled, f"wheel-up did not scroll into history ({detail})"
+        scroll_before = _tmux_out(
+            socket_path, "display-message", "-p", "-t", "main", "#{scroll_position}"
+        )
+
+        _drag_select(child)
+        time.sleep(1.0)
+        selected = _selection_state(socket_path)
+        assert selected == ("1", "1"), (
+            f"the drag in scrolled history left no selection ({selected})"
+        )
+
+        _click(child)
+        time.sleep(1.0)
+        in_mode, present = _selection_state(socket_path)
+        scroll_after = _tmux_out(
+            socket_path, "display-message", "-p", "-t", "main", "#{scroll_position}"
+        )
+        assert (in_mode, present, scroll_after) == ("1", "0", scroll_before), (
+            "a click in scrolled history must only clear the selection "
+            f"(pane_in_mode={in_mode!r} selection_present={present!r} "
+            f"scroll_position {scroll_before!r} -> {scroll_after!r})"
         )
     finally:
         if child is not None:
