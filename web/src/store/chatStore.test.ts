@@ -6790,19 +6790,51 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   describe("session.sandbox_status", () => {
     it("advances the provisioning indicator through launch stages", () => {
       useChatStore.setState({ sandboxStatus: { stage: "provisioning", error: null } });
+      client.setQueryData(["session", "conv_abc"], { id: "conv_abc" });
+      client.setQueryData(["session", "conv_other"], { id: "conv_other", sandboxStatus: null });
       handleSessionEvent({
         type: "session_sandbox_status",
         conversationId: "conv_abc",
         stage: "cloning",
+        provider: "arclet",
         error: null,
       });
-      expect(useChatStore.getState().sandboxStatus).toEqual({ stage: "cloning", error: null });
+      const expected = { stage: "cloning", error: null, provider: "arclet" };
+      expect(useChatStore.getState().sandboxStatus).toEqual(expected);
+      expect(client.getQueryData(["session", "conv_abc"])).toMatchObject({
+        sandboxStatus: expected,
+      });
+      expect(client.getQueryData(["session", "conv_other"])).toMatchObject({ sandboxStatus: null });
+
+      // A side chat's event on its parent's stream updates only the named query.
+      handleSessionEvent(
+        {
+          type: "session_sandbox_status",
+          conversationId: "conv_other",
+          stage: "starting",
+          provider: "modal",
+          error: null,
+        },
+        "conv_abc",
+      );
+      expect(useChatStore.getState().sandboxStatus).toEqual(expected);
+      expect(client.getQueryData(["session", "conv_abc"])).toMatchObject({
+        sandboxStatus: expected,
+      });
+      expect(client.getQueryData(["session", "conv_other"])).toMatchObject({
+        sandboxStatus: { stage: "starting", provider: "modal", error: null },
+      });
     });
 
     it("clears the indicator on ready", () => {
       // `ready` means the session now looks like any host-bound
       // session — retaining the status would strand the banner on.
       useChatStore.setState({ sandboxStatus: { stage: "connecting", error: null } });
+      client.setQueryData(["session", "conv_abc"], {
+        id: "conv_abc",
+        sandboxStatus: { stage: "connecting", provider: "arclet" },
+      });
+      const invalidate = vi.spyOn(client, "invalidateQueries");
       handleSessionEvent({
         type: "session_sandbox_status",
         conversationId: "conv_abc",
@@ -6810,6 +6842,10 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         error: null,
       });
       expect(useChatStore.getState().sandboxStatus).toBeNull();
+      expect(client.getQueryData(["session", "conv_abc"])).toMatchObject({ sandboxStatus: null });
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", "conv_abc"], exact: true });
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["hosts"] });
+      invalidate.mockRestore();
     });
 
     it("retains the failure reason on failed", () => {
@@ -6826,6 +6862,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().sandboxStatus).toEqual({
         stage: "failed",
         error: "managed sandbox launch failed: boom",
+        provider: null,
       });
     });
   });

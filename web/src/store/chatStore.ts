@@ -7190,15 +7190,30 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         mcpStartupLaunch: updateMcpStartupLaunch(s.mcpStartupLaunch, event.pending),
       }));
       return;
-    case "session_sandbox_status":
+    case "session_sandbox_status": {
       // Advance the managed-sandbox provisioning indicator. `ready`
       // clears it — from then on the session looks like any
       // host-bound session; `failed` retains the reason so the page
       // explains why the sandbox never came up.
-      applyToConversation({
-        sandboxStatus: event.stage === "ready" ? null : { stage: event.stage, error: event.error },
-      });
+      const sandboxStatus =
+        event.stage === "ready"
+          ? null
+          : { stage: event.stage, error: event.error, provider: event.provider ?? null };
+      applyToNamedConversation(event.conversationId, { sandboxStatus });
+      // The host composer reads the shared session snapshot, including in side chats.
+      queryClient?.setQueryData<Session>(["session", event.conversationId], (session) =>
+        session ? { ...session, sandboxStatus } : session,
+      );
+      if (event.stage === "ready") {
+        // Refresh the binding and the pre-launch host list, which may still be empty.
+        void queryClient?.invalidateQueries({
+          queryKey: ["session", event.conversationId],
+          exact: true,
+        });
+        void queryClient?.invalidateQueries({ queryKey: ["hosts"] });
+      }
       return;
+    }
     case "session_mcp_startup": {
       // Mirror the harness's per-MCP-server startup map while the round
       // is in flight; cleared once no server is still `starting`.

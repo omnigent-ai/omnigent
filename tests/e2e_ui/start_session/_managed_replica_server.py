@@ -20,6 +20,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
+import click
 import httpx
 import uvicorn
 from fastapi import APIRouter, FastAPI, Request
@@ -53,6 +54,7 @@ class LocalManagedHost(SandboxHostLauncher):
         self.root = root
         self.gate = threading.Event()
         self.provisioning = threading.Event()
+        self.failure: str | None = None
         self.process: subprocess.Popen[bytes] | None = None
 
     def prepare(self) -> None:
@@ -61,6 +63,8 @@ class LocalManagedHost(SandboxHostLauncher):
     def provision(self, name: str) -> str:
         self.provisioning.set()
         assert self.gate.wait(timeout=120), "browser never released sandbox provisioning"
+        if self.failure:
+            raise click.ClickException(self.failure)
         return name
 
     def start_host(
@@ -141,6 +145,12 @@ def replica_app(root: Path, replica: str, runner_url: str) -> tuple[FastAPI, Loc
     async def release() -> dict[str, bool]:
         launcher.gate.set()
         return {"released": True}
+
+    @control.post("/provision/fail")
+    async def fail() -> dict[str, bool]:
+        launcher.failure = "Sandbox quota exhausted"
+        launcher.gate.set()
+        return {"failed": True}
 
     @control.post("/host/stop")
     async def stop_host() -> dict[str, bool]:

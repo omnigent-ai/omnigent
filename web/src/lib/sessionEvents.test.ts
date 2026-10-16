@@ -1398,11 +1398,12 @@ describe("session.terminal_pending (FLAT envelope)", () => {
 });
 
 describe("session.sandbox_status (FLAT envelope)", () => {
-  it("lifts conversation_id, stage, and error", () => {
+  it("lifts conversation_id, stage, provider, and error", () => {
     const out = parse("session.sandbox_status", {
       type: "session.sandbox_status",
       conversation_id: "conv_abc",
       stage: "cloning",
+      provider: "arclet",
       error: null,
     });
     expect(out).toHaveLength(1);
@@ -1410,6 +1411,7 @@ describe("session.sandbox_status (FLAT envelope)", () => {
     expect(ev.type).toBe("session_sandbox_status");
     expect(ev.conversationId).toBe("conv_abc");
     expect(ev.stage).toBe("cloning");
+    expect(ev.provider).toBe("arclet");
     expect(ev.error).toBeNull();
   });
 
@@ -1423,6 +1425,7 @@ describe("session.sandbox_status (FLAT envelope)", () => {
     expect(out).toHaveLength(1);
     const ev = out[0] as SessionSandboxStatusEvent;
     expect(ev.stage).toBe("failed");
+    expect(ev.provider).toBeNull();
     expect(ev.error).toBe("managed sandbox launch failed: spend limit reached");
   });
 

@@ -717,6 +717,7 @@ export interface SessionSandboxStatusEvent {
   stage: SandboxLaunchStage;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error: string | null;
+  provider?: string | null;
 }
 
 /** Startup state of one harness MCP server (Codex's `McpServerStartupState`). */

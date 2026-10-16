@@ -23,7 +23,7 @@ from typing import Any
 
 import httpx
 import pytest
-from playwright.async_api import async_playwright, expect
+from playwright.async_api import Page, async_playwright, expect
 
 from tests.e2e_ui.conftest import _find_free_port, configure_mock_llm, set_fallback_mock_llm
 from tests.e2e_ui.start_session._managed_replica_server import terminate
@@ -249,6 +249,7 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
                 lambda rows: streams(rows)[0]["body"].count("event: session.heartbeat") >= 2,
             )
             await page.screenshot(path=str(rig.logs / "provisioning.png"))
+            await _assert_launch_composer(page, rig.logs, "Provisioning sandbox", "provisioning")
             (await client.post(f"{rig.a}/__test/provision/release")).raise_for_status()
             rows = await _poll(
                 client,
@@ -300,6 +301,12 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             (await client.post(f"{model_url}/gate/release")).raise_for_status()
             await expect(assistant.filter(has_text=_FOLLOWUP_REPLY)).to_be_visible(timeout=20_000)
             await expect(page.get_by_test_id("runner-starting-indicator")).to_have_count(0)
+            badge = page.get_by_test_id("composer-host-select")
+            await expect(badge).to_have_attribute(
+                "aria-label", "Host Modal Sandbox, online", timeout=20_000
+            )
+            await expect(badge.locator(".lucide-monitor-cloud")).to_be_visible()
+            await expect(page.get_by_test_id("composer-host-status")).to_be_visible()
             rows = (await client.get(network_url)).json()
             assert len(streams(rows)) == stream_count
             assert len(posts(rows)) == 3
@@ -329,4 +336,100 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             await page.context.tracing.stop(path=str(rig.logs / "trace.zip"))
             await client.post(f"{rig.a}/__test/provision/release")
             await client.post(f"{model_url}/gate/release")
+            await browser.close()
+
+
+async def _assert_launch_composer(
+    page: Page, evidence: Path, status: str, capture: str, *, error: str | None = None
+) -> None:
+    badge = page.get_by_test_id("composer-host-select")
+    await expect(badge).to_be_visible()
+    await badge.click()
+    menu = page.get_by_test_id("composer-host-menu")
+    await expect(menu).to_be_visible()
+    await page.screenshot(path=str(evidence / f"{capture}-composer.png"), animations="disabled")
+    await expect(badge).to_have_attribute("aria-label", f"Host Modal Sandbox, {status}")
+    await expect(badge.locator(".lucide-monitor-cloud")).to_be_visible()
+    await expect(page.get_by_test_id("composer-host-status")).to_have_count(0)
+    await expect(menu).to_contain_text("Cloud")
+    await expect(menu).to_contain_text("Modal Sandbox")
+    await expect(menu).to_contain_text(status)
+    await expect(menu).not_to_contain_text("My machines")
+    await expect(menu).not_to_contain_text("No host bound")
+    await expect(menu).not_to_contain_text("This session has no host binding")
+    await expect(menu.get_by_role("menuitem", name="Reconnect host")).to_have_count(0)
+    if error:
+        await expect(menu).to_contain_text(error)
+    await page.keyboard.press("Escape")
+    # Closing a composer menu suppresses its tooltip until the pointer leaves.
+    await page.mouse.move(0, 0)
+    await badge.hover()
+    tooltip = page.get_by_test_id("composer-host-tooltip")
+    await expect(tooltip).to_contain_text("Host: Modal Sandbox")
+    await expect(tooltip).to_contain_text(f"Status: {status}")
+    await page.mouse.move(0, 0)
+
+
+@pytest.mark.timeout(300)
+def test_managed_launch_composer_survives_reload_and_failure(
+    managed_replicas: ManagedReplicas,
+) -> None:
+    """The real unbound launch and its provider error keep sandbox identity after reload."""
+    _run_in_fresh_loop(_drive_failed_launch(managed_replicas))
+
+
+async def _drive_failed_launch(rig: ManagedReplicas) -> None:
+    async with (
+        async_playwright() as playwright,
+        httpx.AsyncClient(timeout=10, trust_env=False) as client,
+    ):
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        await page.context.tracing.start(screenshots=True, snapshots=True, sources=True)
+        try:
+            await page.goto(rig.ui)
+            agents = (await client.get(f"{rig.a}/v1/agents")).json()["data"]
+            agent_id = next(agent["id"] for agent in agents if agent["name"] == "routing_probe")
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
+            await page.get_by_test_id("new-chat-landing-input").fill("Start my sandbox session.")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            await expect(page).to_have_url(re.compile(r"/c/[a-f0-9]+"), timeout=30_000)
+            session_id = page.url.rsplit("/", 1)[-1]
+            session_url = f"{rig.a}/v1/sessions/{session_id}"
+            snapshot = (await client.get(session_url)).json()
+            assert snapshot["host_id"] is None and snapshot["runner_id"] is None
+            assert snapshot["sandbox_status"]["stage"] == "provisioning"
+            await _assert_launch_composer(page, rig.logs, "Provisioning sandbox", "initial")
+
+            # A cold page must recover identity from the server, not navigation state.
+            await page.reload()
+            await _assert_launch_composer(page, rig.logs, "Provisioning sandbox", "reloaded")
+            (await client.post(f"{rig.a}/__test/provision/fail")).raise_for_status()
+            await expect(page.get_by_test_id("sandbox-failed-indicator")).to_be_visible(
+                timeout=20_000
+            )
+            await _assert_launch_composer(
+                page,
+                rig.logs,
+                "Sandbox launch failed",
+                "failed",
+                error="Sandbox quota exhausted",
+            )
+            snapshot = (await client.get(session_url)).json()
+            assert snapshot["host_id"] is None and snapshot["runner_id"] is None
+            assert snapshot["sandbox_status"]["stage"] == "failed"
+            (rig.logs / "failed-snapshot.json").write_text(json.dumps(snapshot, indent=2))
+            await page.reload()
+            await _assert_launch_composer(
+                page,
+                rig.logs,
+                "Sandbox launch failed",
+                "failed-reloaded",
+                error="Sandbox quota exhausted",
+            )
+        finally:
+            await page.screenshot(path=str(rig.logs / "failure-final.png"))
+            await page.context.tracing.stop(path=str(rig.logs / "failure-trace.zip"))
+            await client.post(f"{rig.a}/__test/provision/fail")
             await browser.close()

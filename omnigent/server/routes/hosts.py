@@ -1198,6 +1198,19 @@ def create_hosts_router(
         # path); the middleware promotes a bag session_id to the audit row's
         # session_id column. Host is an attribute.
         add_audit_attrs(session_id=body.session_id, host_id=host_id, runner_id=runner_id)
+        # An explicit successful bind can recover a failed managed launch.
+        # Keep its failure visible until this replacement launch is accepted.
+        from omnigent.server.routes.sessions import (
+            _publish_sandbox_status,
+            _session_sandbox_status_cache,
+        )
+
+        sandbox_status = _session_sandbox_status_cache.get(body.session_id)
+        if sandbox_status is not None and sandbox_status.stage == "failed":
+            _publish_sandbox_status(body.session_id, "ready")
+            managed_launches = getattr(request.app.state, "managed_launches", None)
+            if managed_launches is not None:
+                managed_launches.finish(body.session_id)
         return {
             "runner_id": runner_id,
             "status": "launching",

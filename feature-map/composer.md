@@ -23,6 +23,10 @@ and steers messages while the agent is busy.
   with Host and Status rows, hidden while the host menu is open. States:
   connected, disconnected, asleep (resumable managed host), unknown, no host;
   before launch also a selected sandbox and connecting.
+- `sandbox-launch-host`: the in-session host chip keeps the selected sandbox's
+  cloud icon and provider during provisioning, through reloads and launch failures.
+  Its tooltip and menu show the current stage or failure reason; a successful
+  launch hands over to the bound sandbox's normal connection status.
 - `model-picker`: lists the host's live model catalog, highlights the current
   model, and keeps the selection. Ctrl+Shift+M opens it in both composers.
   States: catalog loading, delayed catalog,
@@ -188,6 +192,15 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_composer_tooltips.py::test_host_chip_tooltip_names_the_host_and_matches_the_pill`
   (connected, menu suppression, same surface as the pill); disconnected and
   asleep in `tests/e2e_ui/sessions/test_host_badge.py`.
+- **`sandbox-launch-host`, in-session (own environment):**
+  `tests/e2e_ui/start_session/test_managed_first_message_routing.py::test_managed_first_message_rebinds_live_stream_across_replicas`
+  covers browser creation, provisioning, and the connected sandbox with a real
+  host and runner. In the same module,
+  `test_managed_launch_composer_survives_reload_and_failure` covers cold reloads
+  before binding and after a provider failure. Both use production session APIs
+  and progress streams; only cloud allocation and model replies are local test
+  equivalents. Provider names and all launch stages have component coverage in
+  `web/src/components/HostBadge.test.tsx`.
 - **`host-tooltip`, new-session composer:** no browser-level coverage; the web
   unit tests for the new-session dialog cover it. Manually: open the landing
   page, hover the host chip, and expect the same card as the pill's tooltip

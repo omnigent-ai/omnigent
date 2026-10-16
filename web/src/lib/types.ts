@@ -560,10 +560,12 @@ export type SandboxLaunchStage =
  * background.
  */
 export interface SandboxStatus {
-  /** Current launch stage, e.g. `"provisioning"`. */
-  stage: SandboxLaunchStage;
+  /** Current launch stage; newer servers may add stages beyond SandboxLaunchStage. */
+  stage: string;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error?: string | null;
+  /** Selected provider while the sandbox has no host record yet. */
+  provider?: string | null;
 }
 
 /** Host-discovered menu metadata. Invocation resolves the full skill on the runner. */

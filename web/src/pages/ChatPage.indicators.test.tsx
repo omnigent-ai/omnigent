@@ -129,14 +129,13 @@ describe("ConnectionIndicator", () => {
 });
 
 describe("RunnerStartingIndicator", () => {
-  it("shows the stage-specific copy for an in-flight sandbox launch", () => {
-    // WHY: the band names the current pipeline stage so the wait is legible;
-    // "cloning" must map to the repo-clone copy.
-    useChatStore.setState({ sandboxStatus: { stage: "cloning" } });
+  it.each([
+    ["cloning", "Cloning repository"],
+    ["future_stage", "Launching sandbox"],
+  ])("shows launch progress for stage %s", (stage, label) => {
+    useChatStore.setState({ sandboxStatus: { stage } });
     render(<RunnerStartingIndicator variant="row" />);
-    expect(screen.getByTestId("runner-starting-indicator")).toHaveTextContent(
-      "Cloning repository…",
-    );
+    expect(screen.getByTestId("runner-starting-indicator")).toHaveTextContent(`${label}…`);
   });
 
   it("renders the hero variant with the stage title for an empty-state launch", () => {
