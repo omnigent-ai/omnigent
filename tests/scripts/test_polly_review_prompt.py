@@ -50,7 +50,7 @@ def prompt_workspace(tmp_path: Path) -> Path:
         json.dumps({"markdown": "Computed diff statistics", "test_files": []})
     )
     (artifacts / "lockfile_pins.txt").write_text("")
-    (artifacts / "linked_issues.json").write_text("[]")
+    (artifacts / "linked_issues.json").write_text('{"issues": [], "omitted": 0}')
     (artifacts / "gh_response").write_bytes(b"Unexpected fetch")
     (artifacts / "gh_exit_code").write_text("99")
     bin_directory = checkout / "bin"
@@ -237,22 +237,26 @@ def test_feature_map_note_is_requested_only_for_user_facing_changes(
 
 
 _LINKED_ISSUE = {"issue": "o/r#7", "title": "Stale turn", "state": "OPEN", "body": "Keep it."}
+_LINKED_ISSUE_JSON = (
+    '[{"issue": "o/r#7", "title": "Stale turn", "state": "OPEN", "body": "Keep it."}]'
+)
 
 
 @pytest.mark.parametrize(
     ("linked_issues", "expected"),
     [
+        ({"issues": [_LINKED_ISSUE], "omitted": 0}, _LINKED_ISSUE_JSON),
         (
-            [_LINKED_ISSUE],
-            '[{"issue": "o/r#7", "title": "Stale turn", "state": "OPEN", "body": "Keep it."}]',
+            {"issues": [_LINKED_ISSUE], "omitted": 2},
+            f"{_LINKED_ISSUE_JSON}\n(2 more linked issues not shown)",
         ),
-        ([], "(none)"),
+        ({"issues": [], "omitted": 0}, "(none)"),
         (None, "(lookup unavailable)"),
     ],
-    ids=["linked", "unlinked", "unavailable"],
+    ids=["linked", "omitted", "unlinked", "unavailable"],
 )
 def test_prompt_bounds_scope_by_linked_issues(
-    prompt_workspace: Path, linked_issues: list[dict[str, str]] | None, expected: str
+    prompt_workspace: Path, linked_issues: dict | None, expected: str
 ) -> None:
     (prompt_workspace / "docs/DATABASE_BEST_PRACTICES.md").write_text("# Database practices\n")
     (prompt_workspace / "artifacts/linked_issues.json").write_text(json.dumps(linked_issues))

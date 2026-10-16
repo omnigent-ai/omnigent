@@ -350,3 +350,97 @@ def test_workflow_inserts_computed_summary_before_secret_scan_and_publication(
     assert receipt["with"]["name"] == (
         "polly-completed-${{ steps.pr.outputs.pr_number }}-${{ steps.ctx.outputs.head_sha }}"
     )
+
+
+def _fake_gh(directory: Path, script: str) -> dict[str, str]:
+    gh = directory / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport json, pathlib, sys\n{script}")
+    gh.chmod(0o755)
+    return {**os.environ, "PATH": f"{directory}{os.pathsep}{os.environ['PATH']}"}
+
+
+def _run_linked_issues(directory: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    destination = directory / "linked_issues.json"
+    return subprocess.run(
+        [sys.executable, str(_SCRIPT), "linked-issues", "test/repo#12", str(destination)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+
+
+def test_linked_issues_marks_truncated_bodies_and_omitted_issues(tmp_path: Path) -> None:
+    limit = _HELPERS["LINKED_ISSUE_BODY_LIMIT"]
+    nodes = [
+        {
+            "number": 7,
+            "title": "Short",
+            "state": "OPEN",
+            "body": None,
+            "repository": {"nameWithOwner": "test/repo"},
+        },
+        {
+            "number": 8,
+            "title": "Long",
+            "state": "CLOSED",
+            "body": "x" * (limit + 1),
+            "repository": {"nameWithOwner": "other/repo"},
+        },
+        None,
+    ]
+    response = {
+        "data": {
+            "repository": {
+                "pullRequest": {"closingIssuesReferences": {"totalCount": 4, "nodes": nodes}}
+            }
+        }
+    }
+    env = _fake_gh(
+        tmp_path,
+        "pathlib.Path(sys.argv[0]).with_name('args.json').write_text(json.dumps(sys.argv[1:]))\n"
+        f"print({json.dumps(json.dumps(response))})\n",
+    )
+
+    result = _run_linked_issues(tmp_path, env)
+
+    assert result.stdout == ""
+    args = json.loads((tmp_path / "args.json").read_text())
+    assert args[:2] == ["api", "graphql"]
+    assert {"owner=test", "name=repo", "number=12"} <= set(args)
+    assert json.loads((tmp_path / "linked_issues.json").read_text()) == {
+        "issues": [
+            {
+                "issue": "test/repo#7",
+                "title": "Short",
+                "state": "OPEN",
+                "body": "",
+                "body_truncated": False,
+            },
+            {
+                "issue": "other/repo#8",
+                "title": "Long",
+                "state": "CLOSED",
+                "body": "x" * limit,
+                "body_truncated": True,
+            },
+        ],
+        "omitted": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    "gh_script",
+    [
+        "sys.exit(1)\n",
+        "print('not json')\n",
+        "print(json.dumps({'data': {'repository': None}}))\n",
+    ],
+    ids=["command-failure", "invalid-json", "missing-pull-request"],
+)
+def test_linked_issues_lookup_failure_records_unavailable(tmp_path: Path, gh_script: str) -> None:
+    result = _run_linked_issues(tmp_path, _fake_gh(tmp_path, gh_script))
+
+    assert "::warning::Could not read linked issues" in result.stdout
+    assert json.loads((tmp_path / "linked_issues.json").read_text()) is None

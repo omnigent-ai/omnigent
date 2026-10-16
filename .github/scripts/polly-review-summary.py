@@ -10,6 +10,14 @@ from pathlib import Path, PurePosixPath
 
 TESTS = "Tests and test support"
 CATEGORIES = (TESTS, "Documentation", "Dependencies and lockfiles", "Implementation / other")
+LINKED_ISSUE_BODY_LIMIT = 4096
+LINKED_ISSUES_QUERY = """query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    closingIssuesReferences(first: 5) {
+      totalCount nodes { number title state body repository { nameWithOwner } }
+    }
+  } }
+}"""
 
 
 def category(filename: str) -> str:
@@ -176,10 +184,59 @@ def compose_review(review: str, stats: dict) -> str:
     return result
 
 
+def linked_issues(pull_request: str) -> dict | None:
+    """Return the issues a PR closes, or None when GitHub cannot be read."""
+    repository, number = pull_request.rsplit("#", 1)
+    owner, name = repository.split("/", 1)
+    try:
+        response = subprocess.run(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+                "-F",
+                f"number={number}",
+                "-f",
+                f"query={LINKED_ISSUES_QUERY}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        references = json.loads(response.stdout)["data"]["repository"]["pullRequest"][
+            "closingIssuesReferences"
+        ]
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        print(
+            "::warning::Could not read linked issues; scope is reviewed from the PR description."
+        )
+        return None
+    issues = []
+    for node in filter(None, references["nodes"]):
+        body = node.get("body") or ""
+        issues.append(
+            {
+                "issue": f"{node['repository']['nameWithOwner']}#{node['number']}",
+                "title": node["title"],
+                "state": node["state"],
+                "body": body[:LINKED_ISSUE_BODY_LIMIT],
+                "body_truncated": len(body) > LINKED_ISSUE_BODY_LIMIT,
+            }
+        )
+    return {"issues": issues, "omitted": max(references["totalCount"] - len(issues), 0)}
+
+
 def main() -> None:
     mode, source, destination = sys.argv[1:]
     if mode == "stats":
         Path(destination).write_text(json.dumps(diff_stats(Path(source))), encoding="utf-8")
+    elif mode == "linked-issues":
+        Path(destination).write_text(json.dumps(linked_issues(source)), encoding="utf-8")
     elif mode == "compose":
         stats = json.loads(Path(source).read_text(encoding="utf-8"))
         review = Path(destination)
