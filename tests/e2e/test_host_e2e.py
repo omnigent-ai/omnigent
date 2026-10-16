@@ -27,6 +27,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -38,10 +39,14 @@ from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_ex
 from tests.e2e.conftest import (
     POLL_INTERVAL_S,
     configure_mock_llm,
+    get_mock_requests,
     lookup_agent_id,
     poll_session_until_terminal,
+    release_mock_gate,
+    reset_mock_llm,
     send_user_message_to_session,
     upload_agent,
+    wait_for_mock_gate_pending,
 )
 from tests.e2e.helpers import final_assistant_text
 
@@ -234,6 +239,40 @@ def _wait_for_host_online(
             pass
         time.sleep(POLL_INTERVAL_S)
     raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
+
+
+def _wait_for_runner_online(client: httpx.Client, runner_id: str, timeout: float = 30.0) -> None:
+    """Poll the runner status until the server reports its tunnel online.
+
+    :param client: HTTP client pointed at the server.
+    :param runner_id: Runner to poll.
+    :param timeout: Max seconds to wait.
+    :raises AssertionError: If the runner never comes online.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sr = client.get(f"/v1/runners/{runner_id}/status")
+        if sr.status_code == 200 and sr.json().get("online"):
+            return
+        time.sleep(0.5)
+    raise AssertionError(f"Runner {runner_id} never came online within {timeout}s")
+
+
+def _wait_for_runner_offline(client: httpx.Client, runner_id: str, timeout: float = 15.0) -> None:
+    """Poll the runner status until the server observes its tunnel gone.
+
+    :param client: HTTP client pointed at the server.
+    :param runner_id: Runner to poll.
+    :param timeout: Max seconds to wait.
+    :raises AssertionError: If the runner stays online.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sr = client.get(f"/v1/runners/{runner_id}/status")
+        if sr.status_code == 200 and not sr.json().get("online"):
+            return
+        time.sleep(0.5)
+    raise AssertionError(f"Runner {runner_id} still online after {timeout}s")
 
 
 def test_host_connect_and_list(
@@ -1247,15 +1286,7 @@ def test_host_retry_session_recovers_killed_runner(
         assert launch_resp.status_code == 200
         runner_id = launch_resp.json()["runner_id"]
 
-        deadline = time.monotonic() + 30.0
-        runner_online = False
-        while time.monotonic() < deadline:
-            sr = http_client.get(f"/v1/runners/{runner_id}/status")
-            if sr.status_code == 200 and sr.json().get("online"):
-                runner_online = True
-                break
-            time.sleep(0.5)
-        assert runner_online, f"Runner {runner_id} never came online"
+        _wait_for_runner_online(http_client, runner_id, timeout=30.0)
         http_client.patch(
             f"/v1/sessions/{session_id}",
             json={"runner_id": runner_id},
@@ -1287,15 +1318,7 @@ def test_host_retry_session_recovers_killed_runner(
 
         # Wait until the server observes the runner tunnel gone, so retry_session
         # exercises the relaunch path rather than the already-connected fast path.
-        deadline = time.monotonic() + 15.0
-        runner_offline = False
-        while time.monotonic() < deadline:
-            sr = http_client.get(f"/v1/runners/{runner_id}/status")
-            if sr.status_code == 200 and not sr.json().get("online"):
-                runner_offline = True
-                break
-            time.sleep(0.5)
-        assert runner_offline, f"Runner {runner_id} still online after SIGKILL"
+        _wait_for_runner_offline(http_client, runner_id, timeout=15.0)
 
         # Precondition for host-relaunch: the host itself is still online.
         hosts = http_client.get("/v1/hosts").json().get("hosts", [])
@@ -1316,6 +1339,164 @@ def test_host_retry_session_recovers_killed_runner(
 
         # The relaunched runner is usable: a follow-up turn round-trips without
         # a manual reconnect, proving recovery attached the forwarder + runner.
+        rid_post = send_user_message_to_session(
+            http_client,
+            session_id=session_id,
+            content=f"Reply with exactly {marker_post} and nothing else.",
+        )
+        body_post = poll_session_until_terminal(
+            http_client,
+            session_id=session_id,
+            response_id=rid_post,
+            timeout=120,
+        )
+        assert body_post["status"] == "completed"
+        assert marker_post in final_assistant_text(body_post)
+
+    finally:
+        if host_proc.poll() is None:
+            host_proc.send_signal(signal.SIGTERM)
+            try:
+                host_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                host_proc.kill()
+                host_proc.wait()
+
+
+def _session_messages(client: httpx.Client, session_id: str, role: str) -> list[dict[str, Any]]:
+    """Return the session's persisted message items with *role*, oldest first.
+
+    :param client: HTTP client pointed at the server.
+    :param session_id: Session to read.
+    :param role: ``"user"`` or ``"assistant"``.
+    :returns: Matching ``message`` items.
+    """
+    resp = client.get(f"/v1/sessions/{session_id}/items", params={"order": "asc", "limit": 1000})
+    resp.raise_for_status()
+    return [
+        item
+        for item in resp.json()["data"]
+        if item.get("type") == "message" and item.get("role") == role
+    ]
+
+
+def test_host_retry_session_does_not_resend_cancelled_prompt(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """``retry_session`` after a cancel reconnects only; the cancelled prompt stays cancelled.
+
+    Stop persists a ``[System: interrupted]`` role=user marker as the session's
+    trailing item. When the runner then drops and the web "Resume session"
+    button POSTs ``retry_session``, the relaunched runner loads that history
+    without ``suppress_recovery_turn``. It must not read the marker as an
+    unanswered prompt: no model request and no assistant reply may appear
+    until the user sends something new, and that next message must still work.
+    """
+    marker_post = "RETRY_AFTER_CANCEL"
+    reset_mock_llm(mock_llm_server_url)
+    # The first response blocks so the turn can be cancelled in flight. The
+    # single follow-up reply is also what a re-run of the cancelled prompt
+    # would consume, so an unnoticed re-run leaves the real follow-up unanswered.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "A long blocked essay...", "block": True},
+            {"text": marker_post},
+        ],
+    )
+
+    daemon = _spawn_host_daemon(
+        tmp_path=tmp_path,
+        live_server=live_server,
+        mock_llm_server_url=mock_llm_server_url,
+    )
+    host_proc = daemon.proc
+    host_id = daemon.host_id
+
+    try:
+        _wait_for_host_online(http_client, host_id, timeout=30.0)
+
+        agent_name = upload_agent(http_client, _write_smoke_agent_yaml(tmp_path))
+        agent_id = lookup_agent_id(http_client, agent_name)
+        session_resp = http_client.post("/v1/sessions", json={"agent_id": agent_id})
+        session_resp.raise_for_status()
+        session_id = session_resp.json()["id"]
+
+        launch_resp = http_client.post(
+            f"/v1/hosts/{host_id}/runners",
+            json={"session_id": session_id, "workspace": str(tmp_path)},
+            timeout=60.0,
+        )
+        assert launch_resp.status_code == 200, launch_resp.text
+        runner_id = launch_resp.json()["runner_id"]
+
+        _wait_for_runner_online(http_client, runner_id, timeout=30.0)
+        http_client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"runner_id": runner_id},
+        ).raise_for_status()
+
+        # Send a prompt the mock holds in flight, then Stop it.
+        send_user_message_to_session(
+            http_client,
+            session_id=session_id,
+            content="Write a detailed 2000-word essay about the Byzantine Empire.",
+        )
+        wait_for_mock_gate_pending(mock_llm_server_url)
+        http_client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
+        ).raise_for_status()
+        release_mock_gate(mock_llm_server_url)
+
+        # The cancel persists its marker as a second user message.
+        user_items: list[dict[str, Any]] = []
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            user_items = _session_messages(http_client, session_id, "user")
+            if len(user_items) == 2 and "interrupted" in json.dumps(user_items[-1]):
+                break
+            time.sleep(POLL_INTERVAL_S)
+        else:
+            raise AssertionError(f"No cancellation marker persisted within 30s: {user_items}")
+
+        # Drop the runner while the host stays up: the state behind the web
+        # "Resume session" button.
+        runner_pid = _runner_pid_from_daemon_log(daemon.daemon_log)
+        assert runner_pid is not None, daemon.daemon_log.read_text()
+        os.kill(runner_pid, signal.SIGKILL)
+        _wait_for_runner_offline(http_client, runner_id, timeout=15.0)
+
+        requests_before = len(get_mock_requests(mock_llm_server_url))
+        assistant_before = len(_session_messages(http_client, session_id, "assistant"))
+
+        retry_resp = http_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "retry_session", "data": {}},
+            timeout=120.0,
+        )
+        assert retry_resp.status_code in (200, 202), retry_resp.text
+        recovery = retry_resp.json()
+        assert recovery.get("recovered") is True, recovery
+        assert recovery.get("recovery") == "runner_relaunched", recovery
+
+        # A re-run starts during the relaunch itself and reached the mock about
+        # 2 s after retry_session returned on the unfixed build; 10 s is ample.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            requests_now = len(get_mock_requests(mock_llm_server_url))
+            assert requests_now == requests_before, (
+                "retry_session re-sent the cancelled prompt: "
+                f"{requests_now - requests_before} new model request(s) with no new user input"
+            )
+            time.sleep(POLL_INTERVAL_S)
+        assert len(_session_messages(http_client, session_id, "user")) == 2
+        assistant_items = _session_messages(http_client, session_id, "assistant")
+        assert len(assistant_items) == assistant_before, assistant_items
+
+        # The relaunched runner still serves the user's next real message.
         rid_post = send_user_message_to_session(
             http_client,
             session_id=session_id,

@@ -21,6 +21,57 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger("omnigent.runner.app")
 
+_CANCELLATION_TOOL_OUTPUT = "[Cancelled — tool execution was interrupted.]"
+# The marker's first line; older persisted transcripts share it even where the
+# explanatory wording below has since changed.
+_CANCELLATION_MARKER_PREFIX = "[System: interrupted]"
+CANCELLATION_MARKER_TEXT = (
+    f"{_CANCELLATION_MARKER_PREFIX}\n"
+    "The user interrupted and abandoned their previous request (the user "
+    "message immediately before this one). Do not resume or act on that "
+    "interrupted request unless the user asks for it again; treat the next "
+    "user message as the current instruction. The preceding assistant "
+    "message may be incomplete."
+)
+
+
+def is_cancellation_marker(item: _JsonObject) -> bool:
+    """Report whether *item* is the synthetic user message a cancel persists.
+
+    The marker is a single ``input_text`` block whose first line is the
+    sentinel. A real prompt in exactly that shape is treated the same way: it
+    stays in the transcript, but a relaunch will not answer it on its own.
+
+    :param item: A history item in harness-input shape.
+    :returns: ``True`` for the single-block marker message.
+    """
+    if item.get("type") != "message" or item.get("role") != "user":
+        return False
+    content = item.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        return False
+    block = content[0]
+    if not isinstance(block, dict) or block.get("type") != "input_text":
+        return False
+    text = block.get("text")
+    return isinstance(text, str) and text.split("\n", 1)[0] == _CANCELLATION_MARKER_PREFIX
+
+
+def is_pending_user_prompt(item: _JsonObject) -> bool:
+    """Report whether a trailing *item* is a user prompt still owed a turn.
+
+    The cancellation marker is also a ``role=user`` message, but it records a
+    turn the user abandoned, so a relaunch or reconnect must not restart it.
+
+    :param item: The last history item in harness-input shape.
+    :returns: ``True`` for an unanswered user message that is not the marker.
+    """
+    return (
+        item.get("type") == "message"
+        and item.get("role") == "user"
+        and not is_cancellation_marker(item)
+    )
+
 
 class _LoadHistoryAsInputFn(Protocol):
     async def __call__(
@@ -365,16 +416,6 @@ def build_session_history(
                 },
             ]
 
-    _CANCELLATION_TOOL_OUTPUT = "[Cancelled — tool execution was interrupted.]"
-    _CANCELLATION_MARKER_TEXT = (
-        "[System: interrupted]\n"
-        "The user interrupted and abandoned their previous request (the user "
-        "message immediately before this one). Do not resume or act on that "
-        "interrupted request unless the user asks for it again; treat the next "
-        "user message as the current instruction. The preceding assistant "
-        "message may be incomplete."
-    )
-
     def _append_cancellation_items(conv_id: str) -> None:
         history = _session_histories.get(conv_id, [])
 
@@ -416,7 +457,7 @@ def build_session_history(
             "content": [
                 {
                     "type": "input_text",
-                    "text": _CANCELLATION_MARKER_TEXT,
+                    "text": CANCELLATION_MARKER_TEXT,
                 }
             ],
         }

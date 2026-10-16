@@ -507,6 +507,25 @@ def release_mock_gate(mock_llm_server_url: str | None) -> None:
     resp.raise_for_status()
 
 
+def wait_for_mock_gate_pending(mock_llm_server_url: str | None, timeout: float = 30.0) -> None:
+    """
+    Poll until a response is blocked on the mock LLM server's gate.
+
+    :param mock_llm_server_url: Mock server URL; gate waits need the mock.
+    :param timeout: Max seconds to wait.
+    :raises AssertionError: If no request blocks within *timeout*.
+    """
+    assert mock_llm_server_url is not None, "mock gate waits need the mock LLM server"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = httpx.get(f"{mock_llm_server_url}/gate/pending", timeout=2.0, trust_env=False)
+        resp.raise_for_status()
+        if resp.json().get("pending"):
+            return
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"No mock-LLM request blocked on the gate within {timeout}s")
+
+
 def get_mock_requests(
     mock_llm_server_url: str | None,
     *,
