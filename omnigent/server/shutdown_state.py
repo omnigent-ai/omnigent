@@ -108,11 +108,8 @@ def server_shutting_down(now: float | None = None) -> bool:
     return current - _marked_at < SHUTDOWN_WINDOW_S
 
 
-# runner_id -> (monotonic mark time, reason). Entries older than
-# SHUTDOWN_WINDOW_S are pruned on every mark, so the map stays bounded by the
-# tunnels one window of handoffs can touch. A marker may run outside any
-# workspace scope (a background rebalancing loop) while the readers run in
-# tunnel request scopes, so the key must be the bare runner id.
+# runner_id -> (monotonic mark time, reason); entries past SHUTDOWN_WINDOW_S are pruned on write.
+# Markers may run outside any workspace scope, so the key must be the bare runner id.
 # custom-lint: disable-next=workspace-scoped-cache -- runner_id is globally unique
 _handed_off: dict[str, tuple[float, str]] = {}
 
@@ -130,11 +127,13 @@ def mark_runner_handed_off(runner_id: str, *, reason: str, **attributes: object)
     :param attributes: Extra debug-event attributes, e.g. ``slice_key="123"``.
     """
     now = time.monotonic()
-    for stale_id in [rid for rid, (at, _) in _handed_off.items() if now - at >= SHUTDOWN_WINDOW_S]:
-        del _handed_off[stale_id]
+    _prune_handoffs(now)
     _handed_off[runner_id] = (now, reason)
-    extra = debug_event("runner_tunnel_handed_off", runner_id=runner_id, handoff_reason=reason)
-    cast("dict[str, object]", extra["attributes"]).update(attributes)
+    extra = debug_event("runner_tunnel_handed_off")
+    # The core fields win over a colliding caller attribute.
+    cast("dict[str, object]", extra["attributes"]).update(
+        attributes, runner_id=runner_id, handoff_reason=reason
+    )
     _logger.info(
         "Runner %s tunnel handed off to another replica (%s)",
         runner_id,
@@ -152,6 +151,12 @@ def clear_runner_handoff(runner_id: str) -> None:
     :param runner_id: Runner that just connected, e.g. ``"runner_0123456789abcdef"``.
     """
     _handed_off.pop(runner_id, None)
+    _prune_handoffs(time.monotonic())
+
+
+def _prune_handoffs(now: float) -> None:
+    for stale_id in [rid for rid, (at, _) in _handed_off.items() if now - at >= SHUTDOWN_WINDOW_S]:
+        del _handed_off[stale_id]
 
 
 def note_runner_tunnel_retired(runner_id: str) -> None:

@@ -3683,9 +3683,8 @@ def create_app(
         # one we wrote ourselves (the clear itself never erases this record).
         reference_stamp = session_live_state.last_liveness_stamp(runner_id)
         # Graceful disconnect: clear the persisted liveness stamp so other replicas
-        # flip offline at once. Not on our own shutdown: the runner is alive and
-        # re-tunnels to the replacement, which must not settle its turns to idle.
-        # A handed-off runner is alive too.
+        # flip offline at once. Not on our own shutdown or a handoff: the runner is
+        # alive and re-tunnels elsewhere, which must not settle its turns to idle.
         if (
             shutdown_state.server_shutting_down()
             or shutdown_state.runner_handoff_reason(runner_id) is not None

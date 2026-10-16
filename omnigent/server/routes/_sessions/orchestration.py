@@ -4533,7 +4533,8 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     if host_registry is not None:
         host_registry.deregister(conv.host_id)
     if tunnel_registry is not None and conv.runner_id is not None:
-        tunnel_registry.deregister(conv.runner_id)
+        # A stale tunnel is torn down, not handed to another replica.
+        tunnel_registry.deregister(conv.runner_id, retire=False)
 
     _logger.info(
         "Managed host %s for session %s needs wake before reusing tunnels "
