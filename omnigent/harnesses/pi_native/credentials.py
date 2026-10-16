@@ -156,6 +156,21 @@ def _split_pi_native_model_selection(selection: str | None) -> tuple[str, str] |
     return None
 
 
+def _bound_model_selection(model: str | None, allowed: tuple[str, ...] | None) -> str | None:
+    """Map a managed ``provider/model`` picker row to the literal id a binding knows.
+
+    A listed literal wins over splitting, so an allowlisted id that spells a
+    managed provider prefix (``omnigent/claude-example``) stays verbatim.
+    """
+    if model is None or (allowed is not None and model in allowed):
+        return model
+    split = _split_pi_native_model_selection(model)
+    if split is None:
+        return model
+    literal = split[1]
+    return literal if allowed is None or literal in allowed else model
+
+
 class _PiProviderCompat(TypedDict, total=False):
     supportsDeveloperRole: bool
     supportsStore: bool
@@ -1734,7 +1749,9 @@ def resolve_pi_native_provider(
     binding = binding_for_harness(config, "pi-native")
     if binding is not None:
         entry = resolve_bound_provider(config, "pi-native", auth)
-        selected = resolve_bound_model(config, "pi-native", model)
+        selected = resolve_bound_model(
+            config, "pi-native", _bound_model_selection(model, binding.model_allowlist)
+        )
         if entry is None:
             raise ValueError("The Pi inference binding has no configured provider.")
         resolved = _inline_family_pi_provider(entry, model=selected, preserve_model_ids=True)
