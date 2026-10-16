@@ -633,9 +633,9 @@ class UploadEngine:
         }
 
     def _complete(self, upload: _Upload, offset: int, publication: object) -> dict[str, object]:
-        """Return a checksum for staging bytes verified immediately before publication.
-
-        Other workspace writers can still edit the published inode afterward.
+        """SHA-256 covers bytes read during the final pre-publication re-check.
+        A session writer can change bytes during that read or after publication, so
+        the returned checksum can be stale.
         """
         plan = publication if isinstance(publication, dict) else self._plan(upload, offset)
         name = str(plan["final_name"])
