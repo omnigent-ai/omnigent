@@ -90,6 +90,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   codex_thread_reset:
     "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
   codex_turn_error: "Codex ran into an error during this turn.",
+  codex_provider_auth_failed:
+    "Codex couldn't get a model credential from the configured provider's auth command on the host.",
   databricks_sign_in_pending: "The agent is waiting for a Databricks sign-in.",
   agent_startup_pending: "The agent is still starting in the session terminal.",
   databricks_sign_in_completed: "The Databricks sign-in completed and the agent is ready.",

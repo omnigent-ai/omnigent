@@ -323,6 +323,10 @@ def diagnose_codex_model_rejection(message: str) -> FailureDiagnosis | None:
     )
 
 
+# The code a Codex-native forwarder sends when the provider's bearer helper failed.
+CODEX_PROVIDER_AUTH_FAILED_CODE = "codex_provider_auth_failed"
+
+
 # --- failure-code English fallbacks -------------------------------------------
 # Every server-emitted failure code, mapped to a one-line human sentence, so
 # even an unclassified failure reads as English instead of a raw enum. Terminal
@@ -348,6 +352,10 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "Codex hit an error reloading the earlier transcript, so it started a fresh thread."
     ),
     "codex_turn_error": "Codex ran into an error during this turn.",
+    CODEX_PROVIDER_AUTH_FAILED_CODE: (
+        "Codex couldn't get a model credential from the configured provider's auth command "
+        "on the host."
+    ),
     "databricks_sign_in_pending": "The agent is waiting for a Databricks sign-in.",
     "agent_startup_pending": "The agent is still starting in the session terminal.",
     "databricks_sign_in_completed": "The Databricks sign-in completed and the agent is ready.",
@@ -368,6 +376,11 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     ),
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
+
+
+# Codes a Codex-native forwarder may diagnose itself and send on a failed status
+# edge (``error_code``); the server classifies every other failure.
+FORWARDED_TURN_ERROR_CODES = frozenset({CODEX_PROVIDER_AUTH_FAILED_CODE})
 
 
 def describe_failure_code(code: str | None) -> str | None:

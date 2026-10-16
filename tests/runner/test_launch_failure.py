@@ -466,6 +466,7 @@ def test_codex_model_rejection_ignores_unrelated_errors(message: str) -> None:
         ("databricks_sign_in_pending", "Databricks sign-in"),
         ("agent_startup_pending", "still starting"),
         ("codex_thread_not_started", "never ran"),
+        ("codex_provider_auth_failed", "provider's auth command"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:
