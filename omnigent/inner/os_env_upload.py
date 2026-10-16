@@ -300,16 +300,24 @@ class UploadEngine:
         os.umask(mask)
         self.mode = 0o666 & ~mask
 
-    def _grant(self, directory: str, name: str, staging: str) -> None:
+    def _grant_staging(self, directory: str, staging: str) -> None:
         if re.search(r"[\x00-\x1f\x7f]", directory):
             raise UploadError("invalid_path", "Upload path contains control characters")
-        for basename in (name, staging):
-            path = (self.cwd / directory / basename).resolve()
-            _assert_within_reach(self.cwd, self.sandbox, path, need_write=True)
-            _assert_write_allowed(self.sandbox, path)
+        path = (self.cwd / directory / staging).resolve()
+        _assert_within_reach(self.cwd, self.sandbox, path, need_write=True)
+        _assert_write_allowed(self.sandbox, path)
 
-    def _check(self, upload: _Upload) -> None:
-        self._grant(upload.directory, upload.name, upload.staging)
+    def _grant(self, directory: str, name: str, staging: str) -> None:
+        self._grant_staging(directory, staging)
+        path = (self.cwd / directory / name).resolve()
+        _assert_within_reach(self.cwd, self.sandbox, path, need_write=True)
+        _assert_write_allowed(self.sandbox, path)
+
+    def _check(self, upload: _Upload, *, destination: bool = True) -> None:
+        if destination:
+            self._grant(upload.directory, upload.name, upload.staging)
+        else:
+            self._grant_staging(upload.directory, upload.staging)
         parent = _parent(self.cwd, upload.directory)
         try:
             if _identity(parent) != upload.parent_identity:
@@ -374,7 +382,7 @@ class UploadEngine:
         upload = self.uploads.get(uid)
         if upload is None:
             raise UploadError("gone", "Unknown upload")
-        self._check(upload)
+        self._check(upload, destination=op != "abort")
         if upload.result is not None:
             return upload.result
         offset = os.fstat(upload.fd).st_size
@@ -685,7 +693,7 @@ class UploadEngine:
         if not valid_name(name):
             raise UploadError("invalid_name", "Invalid basename")
         staging = staging_basename(name, uid)
-        self._grant(directory, name, staging)
+        self._grant_staging(directory, staging)
         try:
             parent = _parent(self.cwd, directory)
         except (FileNotFoundError, NotADirectoryError) as exc:
