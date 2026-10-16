@@ -531,6 +531,7 @@ def test_model_unavailable_ignores_unrelated_errors(message: str) -> None:
         ("databricks_sign_in_pending", "Databricks sign-in"),
         ("agent_startup_pending", "still starting"),
         ("codex_thread_not_started", "never ran"),
+        ("runner_failed_to_start", "runner failed to start on the host"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:
