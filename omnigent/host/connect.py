@@ -161,6 +161,7 @@ from omnigent.process_logging import (
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
+    RUNNER_AUTH_REJECTED_EXIT_CODE,
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
@@ -2517,9 +2518,18 @@ class HostProcess:
             return
         disk_full = _host_disk_full(handle.log_path)
         error = _runner_exit_error(handle.proc.returncode, handle.log_path, disk_full=disk_full)
-        # A non-zero runner exit is a runner-process fault (or a full host
-        # disk) that blocks the session; the specific cause lives in the
-        # unparsed log tail (lifecycle stage unknown).
+        # A credential refusal before connecting needs renewed sign-in. Other
+        # exits are runner faults, or the host's when its disk is full; the
+        # log tail carries the cause.
+        auth_rejected = (
+            handle.proc.returncode == RUNNER_AUTH_REJECTED_EXIT_CODE and had_connected is not True
+        )
+        if auth_rejected:
+            error = (
+                "The server rejected this host's credentials, so the runner could not "
+                f"connect. Sign in again with `{cli_invocation()} login {self._login_hint_url()}` "
+                f"on this host, then retry. Details: {error}"
+            )
         _logger.warning(
             "Runner %s died unexpectedly: %s",
             runner_id,
@@ -2529,9 +2539,13 @@ class HostProcess:
                 session_id=handle.session_id,
                 stage="runner_process",
                 runner_id=runner_id,
-                error_category=_runner_exit_category(disk_full).value,
+                error_category=(
+                    ErrorCategory.CONFIG if auth_rejected else _runner_exit_category(disk_full)
+                ).value,
                 error_impact=ErrorImpact.BLOCKING.value,
-                error_phase=ErrorPhase.UNKNOWN.value,
+                error_phase=(
+                    ErrorPhase.RUNNER_LAUNCH if auth_rejected else ErrorPhase.UNKNOWN
+                ).value,
             ),
         )
         await self._report_runner_exit(runner_id, error, had_connected=had_connected)

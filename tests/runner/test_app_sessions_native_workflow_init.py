@@ -377,7 +377,27 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
         (
             "kiro-native",
             "_auto_create_kiro_terminal",
-            {"server_client", "ensure_comment_relay"},
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "goose-native",
+            "_auto_create_goose_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "hermes-native",
+            "_auto_create_hermes_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "qwen-native",
+            "_auto_create_qwen_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "devin-native",
+            "_auto_create_devin_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
         ),
         (
             "kimi-native",
