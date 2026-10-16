@@ -582,9 +582,9 @@ async def test_child_sessions_busy_reflects_relay_status_cache(
     ``busy`` mirrors ``_session_status_cache`` when it has data —
     matching the same precedence the single GET uses for ``status``.
 
-    The tasks table is gone, so the cache is the exclusive source of
-    busy state. Asserts each of the four cached values the live relay
-    can produce maps to the expected ``busy``.
+    The cache takes precedence over the persisted ``live_status`` mirror.
+    Asserts each of the four cached values the live relay can produce maps
+    to the expected ``busy``.
 
     :param client: The test HTTP client.
     :param db_uri: Per-test SQLite database URI.
@@ -612,6 +612,51 @@ async def test_child_sessions_busy_reflects_relay_status_cache(
         assert row["busy"] is expected_busy
     finally:
         sessions_module._session_status_cache.pop(child.id, None)
+
+
+@pytest.mark.parametrize(
+    "live_status,expected_busy",
+    [("running", True), ("waiting", True), ("idle", False), (None, False)],
+)
+async def test_child_sessions_busy_falls_back_to_persisted_live_status(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_status: str | None,
+    expected_busy: bool,
+) -> None:
+    """
+    Without a cache entry, ``busy`` follows the row's persisted ``live_status``.
+
+    The relay cache lives only on the replica holding the runner tunnel, so
+    a replica without it (or a restarted server) must still report a child
+    whose last persisted status is in flight as busy — the same fallback the
+    sidebar and the fork's running-sub-agent notice use.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    :param live_status: Persisted status written to the child's row, or
+        ``None`` for a child that never reported one.
+    :param expected_busy: Expected ``busy`` field value in the summary.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:auth",
+        agent_id=session["agent_id"],
+    )
+    if live_status is not None:
+        conv_store.set_session_live_status(child.id, live_status)
+    sessions_module._session_status_cache.pop(child.id, None)
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    assert resp.status_code == 200
+    row = resp.json()["data"][0]
+    assert row["busy"] is expected_busy
 
 
 @pytest.mark.parametrize(

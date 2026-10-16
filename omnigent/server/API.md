@@ -1240,6 +1240,30 @@ shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
 copied items in chronological order. Clients must bind a runner
 before opening the fork's SSE stream or posting events.
 
+A fork never adopts the source's sub-agent (child) sessions. Children
+whose turn is still in flight when the copy begins keep running under
+the source: their results and wake notices land in the source's inbox,
+and the fork's `sys_cancel_task` cannot stop them. The fork's copied
+history then ends with two items that say so: a hidden `is_meta`
+user-role `[System: forked while N sub-agents were still running — …]`
+note that harnesses replaying the fork's items feed the agent on its
+first turn, and an info-level `error` item
+(`code: "fork_source_subagents_running"`, `level: "info"`) whose title,
+cause and remediation name those children and the source session id for
+the user. A native CLI (Claude Code, Codex) whose first launch resumes a
+copy of the source's own transcript — a same-family full fork — does not
+see the hidden note until its transcript is rebuilt from the fork's items
+(a truncated or cross-family fork, or a later cold resume); its user
+still sees the notice card. The notice is the last item so the fork does
+not look like an unanswered turn when it binds a runner. Only children
+created no later than the fork's newest copied item are named — a fork
+truncated with `up_to_response_id` omits later dispatches, and so does a
+child dispatched after the copy finished — since the fork holds no
+dispatch receipt for them. A child that is dispatched and finishes
+entirely while the history is being copied is not named either; its
+result still reaches the source. A source with no in-flight children
+gets neither item.
+
 ### Stream Session
 
 ```

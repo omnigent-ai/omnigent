@@ -10841,7 +10841,8 @@ def _child_session_summary_from_conversation(
     uniqueness keys built from opaque runtime ids, so Codex and Claude
     rows take ``tool`` from their labels instead of the title.
 
-    ``busy`` is derived from the relay-fed ``_session_status_cache``
+    ``busy`` is derived from the relay-fed ``_session_status_cache``, falling
+    back to the row's persisted ``live_status`` on a cache miss
     (the tasks table has been removed). ``agent_id`` and ``agent_name``
     are read from the conversation row directly.
 
@@ -10906,9 +10907,10 @@ def _child_session_summary_from_conversation(
         tool = display_title or None
         session_name = None
 
-    # Derive busy from the relay-fed cache; tasks table is gone.
+    # Derive busy from the relay-fed cache, falling back to the persisted
+    # mirror so a replica without the runner tunnel agrees with the sidebar.
     if cached_status is None:
-        cached_status = _session_status_cache.get(conv.id)
+        cached_status = _session_status_cache.get(conv.id, conv.live_status)
     if cached_status in ("running", "waiting"):
         busy = True
     else:
