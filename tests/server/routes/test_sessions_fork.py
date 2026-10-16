@@ -28,6 +28,7 @@ from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, OmnigentError
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
+    REQUESTED_HOST_ID_LABEL_KEY,
     ManagedLaunchTracker,
     parse_sandbox_config,
     resolve_managed_agent_label,
@@ -1922,6 +1923,63 @@ async def test_fork_managed_schedules_sandbox_launch(
     # No repository on either side, so the clone gets an empty sandbox.
     assert launch["repos"] == []
     assert conv_store.label_writes == []
+
+
+class _HostIdentityStore:
+    """Host store answering only the requested-host-id collision check."""
+
+    def __init__(self, *, taken: bool) -> None:
+        """
+        :param taken: What ``host_identity_taken`` reports for every lookup.
+        """
+        self.taken = taken
+        self.lookups: list[dict[str, str]] = []
+
+    def host_identity_taken(self, *, host_id: str, user_id: str, name: str) -> bool:
+        """Record the lookup and report the configured answer."""
+        self.lookups.append({"host_id": host_id, "user_id": user_id, "name": name})
+        return self.taken
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("taken", [False, True])
+async def test_fork_managed_launches_its_requested_host_id(
+    monkeypatch: pytest.MonkeyPatch, taken: bool
+) -> None:
+    """A managed fork's ``host_id`` names its sandbox host, as on a managed create.
+
+    The label lets the caller route the fork by that id before the host binds;
+    a taken id 409s before the fork exists.
+    """
+    host_id = "0123456789abcdef0123456789abcdef"
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)
+    app.state.host_store = host_store = _HostIdentityStore(taken=taken)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed", "host_id": host_id},
+    )
+
+    assert host_store.lookups == [
+        {"host_id": host_id, "user_id": "local", "name": "managed-01234567"}
+    ]
+    if taken:
+        assert resp.status_code == 409, f"got {resp.status_code}: {resp.text}"
+        assert conv_store.fork_calls == []
+        assert launches == []
+        return
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert launches[0]["host_id"] == host_id
+    assert body["labels"][REQUESTED_HOST_ID_LABEL_KEY] == host_id
+    # Born with the row (not patched onto the response): a list read racing the
+    # fork can't return the row without the id the caller routes it by.
+    assert conv_store.fork_calls[0]["extra_labels"] == {REQUESTED_HOST_ID_LABEL_KEY: host_id}
+    assert conv_store.label_writes == [(body["id"], {REQUESTED_HOST_ID_LABEL_KEY: host_id})]
 
 
 @pytest.mark.asyncio

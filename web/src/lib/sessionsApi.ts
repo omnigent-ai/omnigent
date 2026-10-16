@@ -15,7 +15,7 @@ import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
-import { setSessionHost, setSessionParent } from "./sessionHost";
+import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import type {
@@ -317,7 +317,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   // Record the session's host so slice-key routing (turn dispatch, terminal
   // attach) can pin to the replica holding that host's runner tunnel; a
   // sub-agent child inherits its parent's through the recorded parent link.
-  setSessionHost(wire.id, wire.host_id);
+  setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels));
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
@@ -809,7 +809,8 @@ export async function createBundledSession(
  *   (`null` takes its first). `workspace` is a `<url>[#<branch>]`
  *   repository the server clones into the sandbox; `null` gives the fork an
  *   empty sandbox, and leaving the key off inherits the repository the
- *   source session recorded.
+ *   source session recorded. `hostId` names the new sandbox host, as on a
+ *   managed create; omitted, the server mints one.
  */
 export async function forkSession(
   sourceId: string,
@@ -823,7 +824,7 @@ export async function forkSession(
       terminalLaunchArgs?: string[];
       codexBypassSandbox?: boolean;
     };
-    sandbox?: { provider?: string | null; workspace?: string | null };
+    sandbox?: { provider?: string | null; workspace?: string | null; hostId?: string };
     /** Mark the fork as a side chat (hidden from the left sidebar). */
     sideChat?: boolean;
   } = {},
@@ -839,6 +840,7 @@ export async function forkSession(
     codex_bypass_sandbox?: boolean;
     host_type?: "managed";
     sandbox_provider?: string;
+    host_id?: string;
     workspace?: string | null;
     side_chat?: boolean;
   } = {};
@@ -878,6 +880,9 @@ export async function forkSession(
     // sandbox", while omitting it inherits the source's repository.
     if (sandbox.workspace !== undefined) {
       body.workspace = sandbox.workspace;
+    }
+    if (sandbox.hostId !== undefined) {
+      body.host_id = sandbox.hostId;
     }
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
