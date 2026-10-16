@@ -25,6 +25,7 @@ import {
   useDeleteCustomAgent,
   type ManagedAgent,
 } from "@/hooks/useCustomAgents";
+import { EditCustomAgentDialog } from "./EditCustomAgentDialog";
 import { BackButton } from "./HarnessCatalog";
 import { ApiError } from "@/lib/sessionsApi";
 
@@ -118,6 +119,7 @@ export function SettingsCustomAgentsSection() {
             key={detail.data.id}
             agent={detail.data}
             owned={detail.data.user_owned}
+            editable={info.agent_config_edit === true}
             harness={labels[detail.data.harness ?? ""] ?? detail.data.harness ?? "Unknown"}
             onDeleted={() => navigate(BASE)}
           />
@@ -306,15 +308,18 @@ function ListStatus({
 function AgentDetail({
   agent,
   owned,
+  editable,
   harness,
   onDeleted,
 }: {
   agent: ManagedAgent;
   owned: boolean | undefined;
+  editable: boolean;
   harness: string;
   onDeleted: () => void;
 }) {
   const remove = useDeleteCustomAgent();
+  const [editing, setEditing] = useState(false);
   const [confirm, setConfirm] = useState(false);
   const [inUse, setInUse] = useState<string | null>(null);
   async function onRemove() {
@@ -330,6 +335,11 @@ function AgentDetail({
     <>
       <div className="flex items-start justify-between gap-4">
         <h1 className="min-w-0 break-words text-2xl font-semibold">{agent.name}</h1>
+        {owned === true && editable && (
+          <Button variant="outline" onClick={() => setEditing(true)}>
+            Edit
+          </Button>
+        )}
         {owned === true && (
           <Button
             variant="ghost"
@@ -403,11 +413,16 @@ function AgentDetail({
       </section>
       <p className="text-xs text-muted-foreground">
         {owned === true
-          ? "Configuration editing is not available here yet."
+          ? editable
+            ? "Changes apply to sessions on their next turn."
+            : "Update the server to enable configuration editing."
           : owned === false
             ? "Server-provided agents are read-only."
             : "Update the server to enable agent deletion. Ownership information is unavailable."}
       </p>
+      {editing && editable && owned === true && (
+        <EditCustomAgentDialog id={agent.id} name={agent.name} onClose={() => setEditing(false)} />
+      )}
       <Dialog
         open={confirm}
         onOpenChange={(open) => {

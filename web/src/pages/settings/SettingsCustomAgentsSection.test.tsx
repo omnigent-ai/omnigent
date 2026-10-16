@@ -5,18 +5,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SettingsCustomAgentsSection } from "./SettingsCustomAgentsSection";
 import { authenticatedFetch } from "@/lib/identity";
 import { buildAgentBundle } from "@/lib/agentBundle";
+import type { AgentConfig } from "@/lib/agentsApi";
 import type { ManagedAgent } from "@/hooks/useCustomAgents";
 
 const flags = vi.hoisted(() => ({
   feature: true,
   install: true,
   detail: true as boolean | undefined,
+  edit: true as boolean | undefined,
 }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     features: { custom_agents_settings_ui: flags.feature },
     agent_install: flags.install,
     agent_detail: flags.detail,
+    agent_config_edit: flags.edit,
   }),
 }));
 vi.mock("@/lib/agentLabels", () => ({
@@ -74,11 +77,14 @@ beforeEach(() => {
   flags.feature = true;
   flags.install = true;
   flags.detail = true;
+  flags.edit = true;
   failSave = false;
   failDelete = false;
   inUse = false;
   users = [agent("a1", "research"), agent("a2", "research")];
-  vi.mocked(buildAgentBundle).mockResolvedValue(new File(["bundle"], "agent.tar.gz"));
+  vi.mocked(buildAgentBundle)
+    .mockReset()
+    .mockResolvedValue(new File(["bundle"], "agent.tar.gz"));
   vi.mocked(authenticatedFetch).mockReset();
   vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
     const url = new URL(String(input), "http://localhost");
@@ -314,5 +320,116 @@ describe("Custom agents settings", () => {
     flags.install = install;
     mount();
     expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+});
+
+const editableConfig: AgentConfig = {
+  id: "a1",
+  name: "research",
+  version: 1,
+  description: "Original",
+  instructions: " literal\n",
+  model: null,
+  harness: "claude-sdk",
+  mcp_servers: {},
+};
+
+function configResponses({ fail = 0, etag = true }: { fail?: number; etag?: boolean } = {}) {
+  const previous = vi.mocked(authenticatedFetch).getMockImplementation()!;
+  let current = { ...editableConfig };
+  let patchStatus = fail;
+  vi.mocked(authenticatedFetch).mockImplementation(async (url, init) => {
+    if (init?.method === "PATCH") {
+      if (patchStatus)
+        return response(
+          { error: { code: "precondition_failed", message: "Save failed" } },
+          patchStatus,
+        );
+      const patch = JSON.parse(init.body as string);
+      current = { ...current, ...patch, version: current.version + 1 };
+      users[0] = { ...users[0], description: current.description, version: current.version };
+      return new Response(JSON.stringify(current), { headers: { ETag: '"new"' } });
+    }
+    if (String(url).endsWith("/config"))
+      return new Response(JSON.stringify(current), { headers: etag ? { ETag: '"original"' } : {} });
+    return previous(url, init);
+  });
+  return {
+    recover: () => {
+      patchStatus = 0;
+      current = { ...current, description: "Concurrent winner" };
+    },
+  };
+}
+
+async function openEditor() {
+  mount("/settings/custom-agents/a1");
+  fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+  await screen.findByDisplayValue("Original");
+}
+
+describe("editing custom agents", () => {
+  it.each([false, undefined])("keeps old servers read-only for edits: %s", async (edit) => {
+    flags.edit = edit;
+    mount("/settings/custom-agents/a1");
+    await screen.findByRole("button", { name: "Delete agent" });
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(authenticatedFetch).not.toHaveBeenCalledWith(
+      expect.stringContaining("/config"),
+      expect.anything(),
+    );
+  });
+  it("saves only changed fields, updates the summary, and never builds a replacement bundle", async () => {
+    configResponses();
+    await openEditor();
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Updated" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(await screen.findByText("Updated")).toBeVisible();
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/agents/a1",
+      expect.objectContaining({
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "If-Match": '"original"' },
+        body: '{"description":"Updated"}',
+      }),
+    );
+    expect(buildAgentBundle).not.toHaveBeenCalled();
+  });
+  it("retains a failed draft and confirms cancellation", async () => {
+    configResponses({ fail: 500 });
+    await openEditor();
+    fireEvent.change(screen.getByLabelText("Instructions"), { target: { value: "keep me" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Save failed");
+    expect(screen.getByLabelText("Instructions")).toHaveValue("keep me");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep editing" }));
+    expect(screen.getByLabelText("Instructions")).toHaveValue("keep me");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+  it("keeps a conflicted draft until explicit reload, then allows editing the latest revision", async () => {
+    const server = configResponses({ fail: 412 });
+    await openEditor();
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "My draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Your draft is still here");
+    expect(screen.getByLabelText("Description")).toHaveValue("My draft");
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    server.recover();
+    fireEvent.click(screen.getByRole("button", { name: "Reload latest" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
+    expect(await screen.findByDisplayValue("Concurrent winner")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  });
+  it("never saves without a revision", async () => {
+    configResponses({ etag: false });
+    await openEditor();
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "New" } });
+    expect(screen.getByRole("alert")).toHaveTextContent("did not provide");
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
   });
 });
