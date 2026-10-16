@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections import deque
@@ -67,33 +68,6 @@ async def test_observer_emits_one_content_free_terminal_interactive_event(
     assert "composer ready" not in record.getMessage()
 
 
-@pytest.mark.asyncio
-async def test_observer_records_unobserved_without_raising(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A stopped pane produces diagnostics without failing session creation."""
-    terminal = _FakeTerminal(["starting"], running=False)
-
-    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
-        await _observe_terminal_interactive(
-            session_id="conv_stopped",
-            terminal_id="terminal_codex_main",
-            harness="codex-native",
-            readiness_signal="codex_composer",
-            instance=terminal,  # type: ignore[arg-type]
-            is_interactive=lambda _pane: False,
-            timeout_s=1.0,
-            poll_interval_s=0.0,
-        )
-
-    record = next(
-        record
-        for record in caplog.records
-        if record.event_name == "terminal_interactive_unobserved"
-    )
-    assert record.attributes["reason"] == "RuntimeError"
-
-
 # A launcher wrapper still running its own startup step, with a token on screen.
 _SCREEN_TOKEN = "dapi" + "Test1234567890abcd"
 _STALLED_SCREEN = f"launcher: refreshing workspace login\nusing token {_SCREEN_TOKEN}\n"
@@ -135,20 +109,27 @@ async def test_observer_records_the_redacted_pane_of_a_stalled_terminal(
         tail = record.attributes["terminal_last_output"]
         assert "refreshing workspace login" in tail
         assert _SCREEN_TOKEN not in tail
+        # The local runner log renders only the message, so the tail rides on it too.
+        assert "refreshing workspace login" in record.getMessage()
         assert _SCREEN_TOKEN not in record.getMessage()
+
+
+_SIGN_IN_PROMPT = "Sign in to continue:\n  https://signin.example.com/device\n  code: HQ7M-2KPD\n"
 
 
 @pytest.mark.parametrize(
     ("capture", "screen", "expected"),
     [
         ("0", _STALLED_SCREEN, {"sign_in_prompt_detected": False}),
+        ("1", _SIGN_IN_PROMPT, {"sign_in_prompt_detected": True}),
+        # The launcher moved past its prompt, but the code and address are still on screen.
         (
             "1",
-            "Sign in to continue:\n  https://signin.example.com/device\n  code: HQ7M-2KPD\n",
-            {"sign_in_prompt_detected": True},
+            _SIGN_IN_PROMPT + "See https://docs.example.com/oauth/troubleshooting\n",
+            {"sign_in_prompt_detected": False},
         ),
     ],
-    ids=["capture-disabled", "sign-in-prompt"],
+    ids=["capture-disabled", "sign-in-prompt", "sign-in-material-after-prompt"],
 )
 @pytest.mark.asyncio
 async def test_observer_keeps_pane_text_out_unless_captured_and_not_a_sign_in(
@@ -158,7 +139,7 @@ async def test_observer_keeps_pane_text_out_unless_captured_and_not_a_sign_in(
     screen: str,
     expected: dict[str, object],
 ) -> None:
-    """Pane text needs the capture opt-in, and a sign-in prompt is only flagged."""
+    """Pane text needs the capture opt-in and stays out while sign-in material is on screen."""
     monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", capture)
     terminal = _FakeTerminal([screen])
 
@@ -182,6 +163,85 @@ async def test_observer_keeps_pane_text_out_unless_captured_and_not_a_sign_in(
     pane_keys = {"terminal_last_output", "sign_in_prompt_detected"}
     pane = {k: v for k, v in record.attributes.items() if k in pane_keys and v is not None}
     assert pane == expected
+    logged = record.getMessage() + "\n".join(map(str, record.attributes.values()))
+    assert "HQ7M-2KPD" not in logged
+    assert "signin.example.com" not in logged
+
+
+@pytest.mark.asyncio
+async def test_observer_cancelled_after_the_slow_mark_keeps_its_record(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner lost before the deadline has already described the stalled pane.
+
+    The default slow mark shrinks with a short deadline, so the record lands well
+    before the cancellation that stands in for the runner going away.
+    """
+    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
+    terminal = _FakeTerminal([_STALLED_SCREEN])
+
+    def slow_records() -> list[logging.LogRecord]:
+        return [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "terminal_interactive_slow"
+        ]
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        task = asyncio.create_task(
+            _observe_terminal_interactive(
+                session_id="conv_lost",
+                terminal_id="terminal_claude_main",
+                harness="claude-native",
+                readiness_signal="claude_composer",
+                instance=terminal,  # type: ignore[arg-type]
+                is_interactive=lambda _pane: False,
+                timeout_s=1.5,
+                poll_interval_s=0.01,
+            )
+        )
+        while not slow_records() and not task.done():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    (record,) = slow_records()
+    assert "refreshing workspace login" in record.attributes["terminal_last_output"]
+    assert "refreshing workspace login" in record.getMessage()
+    assert not any(
+        getattr(record, "event_name", None)
+        in {"terminal_interactive", "terminal_interactive_unobserved"}
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_observer_records_unobserved_without_raising(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stopped pane produces diagnostics without failing session creation."""
+    terminal = _FakeTerminal(["starting"], running=False)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        await _observe_terminal_interactive(
+            session_id="conv_stopped",
+            terminal_id="terminal_codex_main",
+            harness="codex-native",
+            readiness_signal="codex_composer",
+            instance=terminal,  # type: ignore[arg-type]
+            is_interactive=lambda _pane: False,
+            timeout_s=1.0,
+            poll_interval_s=0.0,
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.event_name == "terminal_interactive_unobserved"
+    )
+    assert record.attributes["reason"] == "RuntimeError"
 
 
 _DIALOG_SCREEN = "Settings Error\n❯ 1. Fix it\nEnter to confirm · Esc to cancel\n"

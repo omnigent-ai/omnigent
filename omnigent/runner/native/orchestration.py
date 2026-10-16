@@ -352,8 +352,9 @@ _COST_POPUP_REPOP_TASKS: set[asyncio.Task[object]] = set()
 # references keep the tasks alive after session creation returns.
 _TERMINAL_INTERACTIVE_TASKS: set[asyncio.Task[None]] = set()
 _TERMINAL_INTERACTIVE_TIMEOUT_S = 180.0
-# Past p99 startup; a runner lost before the deadline still leaves the pane on record.
-_TERMINAL_INTERACTIVE_SLOW_S = 60.0
+# First record of a pane that is not interactive yet, early enough that a runner
+# lost before the deadline (a host restart) still leaves what it showed on record.
+_TERMINAL_INTERACTIVE_SLOW_S = 20.0
 _TERMINAL_INTERACTIVE_POLL_INTERVAL_S = 0.15
 # A startup dialog still up after this long is waiting on the person, not a repaint.
 _STARTUP_DIALOG_NOTICE_AFTER_S = 3.0
@@ -451,11 +452,15 @@ async def _observe_terminal_interactive(
     instance: TerminalInstance,
     is_interactive: Callable[[str], bool],
     timeout_s: float = _TERMINAL_INTERACTIVE_TIMEOUT_S,
-    slow_after_s: float = _TERMINAL_INTERACTIVE_SLOW_S,
+    slow_after_s: float | None = None,
     poll_interval_s: float = _TERMINAL_INTERACTIVE_POLL_INTERVAL_S,
     startup_dialog: _StartupDialogWatch | None = None,
 ) -> None:
     """Emit one semantic event when a native TUI can accept a message.
+
+    A pane still not interactive at *slow_after_s* (``_TERMINAL_INTERACTIVE_SLOW_S``
+    or a third of *timeout_s*, whichever is shorter) is described once with its
+    redacted tail, so a runner lost before the deadline still leaves a record.
 
     With ``startup_dialog``, a dialog that holds the pane for
     :data:`_STARTUP_DIALOG_NOTICE_AFTER_S` is reported once, so the person
@@ -464,6 +469,8 @@ async def _observe_terminal_interactive(
     loop = asyncio.get_running_loop()
     started_at = loop.time()
     deadline = started_at + timeout_s
+    if slow_after_s is None:
+        slow_after_s = min(_TERMINAL_INTERACTIVE_SLOW_S, timeout_s / 3)
     slow_logged = False
     dialog_headline: str | None = None
     dialog_since = started_at
@@ -514,11 +521,12 @@ async def _observe_terminal_interactive(
                 tail, sign_in_prompt = await _stalled_pane_diagnostics(instance)
                 _logger.warning(
                     "Native terminal is not interactive yet: session=%s harness=%s "
-                    "terminal_id=%s waited_s=%.0f",
+                    "terminal_id=%s waited_s=%.0f%s",
                     session_id,
                     harness,
                     terminal_id,
                     loop.time() - started_at,
+                    _pane_tail_message(tail),
                     extra=debug_event(
                         "terminal_interactive_slow",
                         session_id=session_id,
@@ -542,11 +550,12 @@ async def _observe_terminal_interactive(
         )
         _logger.warning(
             "Native terminal interactivity was not observed: session=%s harness=%s "
-            "terminal_id=%s reason=%s",
+            "terminal_id=%s reason=%s%s",
             session_id,
             harness,
             terminal_id,
             str(exc),
+            _pane_tail_message(tail),
             extra=debug_event(
                 "terminal_interactive_unobserved",
                 session_id=session_id,
@@ -5794,6 +5803,11 @@ def _redacted_terminal_text(text: str) -> str | None:
     return trim_terminal_output(sanitize_diagnostic_text(text))
 
 
+def _pane_tail_message(tail: str | None) -> str:
+    """Append a captured pane to a log message; the local runner log renders only messages."""
+    return f"\nTerminal output:\n{tail}" if tail else ""
+
+
 def _startup_terminal_output(instance: TerminalInstance) -> str | None:
     """Apply the same capture gate and bounds to both startup-error paths."""
     from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
@@ -5808,13 +5822,16 @@ def _startup_terminal_output(instance: TerminalInstance) -> str | None:
 async def _stalled_pane_diagnostics(instance: TerminalInstance) -> tuple[str | None, bool]:
     """Return a live pane's redacted tail and whether it shows a sign-in prompt.
 
-    A sign-in prompt is reported only as the flag, keeping its one-time code out of logs.
+    The flag reports an actionable prompt. The tail is withheld whenever any
+    sign-in material is on screen, including a prompt the launcher has already
+    moved past, so a one-time code or address never reaches a log.
     """
-    from omnigent.harnesses.diagnostics import detect_sign_in_prompt
+    from omnigent.harnesses.diagnostics import contains_sign_in_material, detect_sign_in_prompt
 
     screen = await _read_pane_screen(instance)
-    if detect_sign_in_prompt(screen) is not None:
-        return None, True
+    prompt = detect_sign_in_prompt(screen) is not None
+    if contains_sign_in_material(screen):
+        return None, prompt
     return _redacted_terminal_text(screen), False
 
 
@@ -5930,7 +5947,11 @@ async def _record_agent_startup_pending(
     :param waited_seconds: How long discovery has waited for the thread so far.
     """
     from omnigent.harnesses.codex_native.bridge import write_bridge_startup_error
-    from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
+    from omnigent.harnesses.diagnostics import (
+        contains_sign_in_material,
+        detect_sign_in_prompt,
+        sign_in_next_step,
+    )
 
     screen = await _read_pane_screen(terminal_instance)
     prompt = detect_sign_in_prompt(screen)
@@ -5964,17 +5985,19 @@ async def _record_agent_startup_pending(
         "sign_in_prompt_detected": prompt is not None,
         "code": code,
     }
-    # Without a sign-in prompt, the pane is the only record of what is holding startup.
-    if prompt is None and (tail := _redacted_terminal_text(screen)):
+    # The pane is the only record of what holds startup, unless sign-in material is on it.
+    tail = None if contains_sign_in_material(screen) else _redacted_terminal_text(screen)
+    if tail:
         attributes["terminal_last_output"] = tail
     pending_event["attributes"] = attributes
     _logger.warning(
         "Codex TUI for %s has not started a thread after %.0fs but its pane is alive; "
-        "recorded %s and waiting without a deadline%s",
+        "recorded %s and waiting without a deadline%s%s",
         session_id,
         waited_seconds,
         code,
         " (a sign-in prompt is on screen)" if prompt is not None else "",
+        _pane_tail_message(tail),
         extra=pending_event,
     )
 
