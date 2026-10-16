@@ -1131,6 +1131,44 @@ async def test_handle_event_fails_retrying_turn_on_launcher_certificate_failure(
 
 
 @pytest.mark.asyncio
+async def test_handle_event_retry_after_mcp_certificate_line_is_left_to_codex(
+    tmp_path: Path,
+) -> None:
+    """An MCP server's expired certificate on stderr does not kill a reconnecting turn."""
+    client = _RecordingClient()
+    codex_client = _InterruptRecordingCodexClient()
+    _seed_active_turn(tmp_path, "turn_123")
+    mcp_line = (
+        "2026-10-16T12:00:00.000000Z  WARN codex_mcp::rmcp_client: failed to connect MCP "
+        "server `docs`: error sending request: invalid peer certificate: Expired"
+    )
+    failure = detect_certificate_failure(mcp_line)
+    if failure is not None:
+        record_certificate_failure(tmp_path, failure)
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={"method": "error", "params": _connection_retry_params()},
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        codex_client=codex_client,  # type: ignore[arg-type]
+        forwarder_state=fwd._CodexForwarderState(
+            parent_session_id="conv_x",
+            codex_client=codex_client,  # type: ignore[arg-type]
+            model="gpt-5",
+        ),
+    )
+
+    assert codex_client.requests == []
+    assert all(body["data"].get("status") != "failed" for _url, body in client.posts)
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_123"
+
+
+@pytest.mark.asyncio
 async def test_handle_event_retry_with_http_status_is_not_blamed_on_certificate(
     tmp_path: Path,
 ) -> None:
