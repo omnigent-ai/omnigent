@@ -18,7 +18,6 @@ The managed config dir is per-session (like codex-native's managed
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -50,13 +49,12 @@ from omnigent.models.databricks_model_discovery import preferred_served_claude_m
 from omnigent.models.model_metadata import ModelWireAPI
 from omnigent.models.model_override import normalize_model_for_provider
 from omnigent.models.pi_model_compatibility import (
-    PI_CLAUDE_THINKING_MODEL_FRAGMENTS,
     SYSTEM_AI_RESPONSES_KEYWORDS,
     DatabricksPiSurface,
     PiModelEntry,
     databricks_pi_surface_for_model,
     enrich_databricks_model_catalog,
-    pi_model_is_reasoning,
+    pi_generic_model_json_entry,
     pi_model_json_entry,
     unsupported_in_pi,
 )
@@ -1223,7 +1221,7 @@ def _databricks_gateway_pi_provider(
         return _with_configured_default_limits(config, **limits)
     # The listing came back but omitted the configured default; keep it on the
     # surface its provider entry declares instead of guessing one from its name.
-    entry = _gateway_pi_model_entry(config.model, **limits)
+    entry = pi_generic_model_json_entry(config.model, **limits)
     if declared_surface is DatabricksPiSurface.ANTHROPIC:
         return replace(config, extra_models=[*config.extra_models, {**entry, "reasoning": True}])
     if declared_surface not in config.databricks_surfaces:
@@ -1405,97 +1403,6 @@ def _cross_family_routing_warning(
     )
 
 
-def _gateway_pi_model_entry(
-    model_id: str,
-    *,
-    configured_context_window: int | None = None,
-    configured_max_output_tokens: int | None = None,
-) -> _PiModelEntry:
-    """Build a Pi models.json entry for a generic gateway model.
-
-    Pi defaults a model entry with no ``contextWindow``/``maxTokens`` to
-    128k/16k, silently truncating large-context gateway models (e.g. a 1M-
-    context GLM).  This helper enriches the entry with real limits.
-
-    Resolution order (first value found wins per field):
-    1. Provider-config-supplied ``context_window``/``max_output_tokens``.
-    2. Best-effort catalog fuzzy match by normalised model id fragment
-       (``glm-5.2`` → ``databricks-glm-5-2`` carries 1M context/65k output).
-    3. No ``contextWindow``/``maxTokens`` key — Pi uses its own defaults;
-       still better than a completely bare entry because ``reasoning`` and
-       ``input`` are set correctly.
-
-    ``reasoning`` is set via :func:`pi_model_is_reasoning` so that DeepSeek
-    and similar chain-of-thought models surface their thinking channel in Pi.
-
-    :param model_id: The gateway model id as configured by the user,
-        e.g. ``"glm-5.2"`` or ``"deepseek-r2"``.
-    :param configured_context_window: User-supplied context limit from the
-        provider config's ``context_window`` field, or ``None``.
-    :param configured_max_output_tokens: User-supplied output limit from the
-        provider config's ``max_output_tokens`` field, or ``None``.
-    :returns: A Pi model entry with as many fields populated as possible.
-    """
-    entry: _PiModelEntry = {"id": model_id, "input": ["text", "image"]}
-    # Set reasoning for DeepSeek (reads reasoning_content channel) and for
-    # Claude (enables Pi's thinking level controls).
-    if pi_model_is_reasoning(model_id) or any(
-        fragment in model_id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS
-    ):
-        entry["reasoning"] = True
-
-    # Determine context window and max output tokens.
-    context_window = configured_context_window
-    max_output_tokens = configured_max_output_tokens
-
-    # Fall back to a catalog fuzzy match when the user hasn't configured limits.
-    if context_window is None or max_output_tokens is None:
-        catalog_entry = _catalog_entry_for_model(model_id)
-        if catalog_entry is not None:
-            if context_window is None and catalog_entry.metadata.context_window is not None:
-                context_window = catalog_entry.metadata.context_window
-            if max_output_tokens is None and catalog_entry.metadata.max_output_tokens is not None:
-                max_output_tokens = catalog_entry.metadata.max_output_tokens
-
-    if context_window is not None:
-        entry["contextWindow"] = context_window
-    if max_output_tokens is not None:
-        entry["maxTokens"] = max_output_tokens
-    return entry
-
-
-def _catalog_entry_for_model(model_id: str) -> model_catalog.ModelEntry | None:
-    """Find the best catalog entry for *model_id* by normalised id fragment.
-
-    Tries an exact match first, then a prefix-aware substring match so that
-    user-facing ids like ``glm-5.2`` resolve against catalog entries like
-    ``databricks-glm-5-2``.  Normalises dots to dashes for version numbers.
-
-    :param model_id: A model id, e.g. ``"glm-5.2"`` or ``"gpt-4o-mini"``.
-    :returns: The best matching catalog :class:`ModelEntry`, or ``None``.
-    """
-    lower = model_id.lower()
-    # Normalise dots to dashes so "glm-5.2" matches "databricks-glm-5-2".
-    normalised = lower.replace(".", "-")
-
-    all_entries: list[model_catalog.ModelEntry] = []
-    for provider in ("openai", "anthropic", "databricks", "google"):
-        with contextlib.suppress(Exception):  # catalog failure must not break launch
-            all_entries.extend(model_catalog.catalog_model_entries(provider))
-
-    # 1. Exact match (covers common ids like "gpt-4o-mini").
-    for entry in all_entries:
-        if entry.id.lower() == lower:
-            return entry
-
-    # 2. Normalised substring match (covers "glm-5.2" → "databricks-glm-5-2").
-    for entry in all_entries:
-        if normalised in entry.id.lower().replace(".", "-"):
-            return entry
-
-    return None
-
-
 def _live_family_model_entries(
     provider: PiProviderConfig,
     *,
@@ -1545,7 +1452,7 @@ def _live_family_model_entries(
         if model_entry.id in seen:
             continue
         seen.add(model_entry.id)
-        entries.append(_gateway_pi_model_entry(model_entry.id))
+        entries.append(pi_generic_model_json_entry(model_entry.id))
     return entries
 
 
@@ -1645,7 +1552,7 @@ def _inline_family_pi_provider(
             # Catalog access) keeps the configured model on its own surface.
             if enumerated.extra_models or enumerated.additional_providers:
                 return enumerated
-        model_entry = _gateway_pi_model_entry(
+        model_entry = pi_generic_model_json_entry(
             resolved_model,
             configured_context_window=family.context_window,
             configured_max_output_tokens=family.max_output_tokens,
@@ -1657,7 +1564,7 @@ def _inline_family_pi_provider(
                 if tier_id == resolved_model:
                     continue
                 shortlist.append(
-                    _gateway_pi_model_entry(
+                    pi_generic_model_json_entry(
                         tier_id,
                         configured_context_window=family.context_window,
                         configured_max_output_tokens=family.max_output_tokens,
