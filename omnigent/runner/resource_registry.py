@@ -476,7 +476,7 @@ class SessionResourceRegistry:
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
-        self._is_alive_cache: TTLCache[str, bool] = TTLCache(
+        self._is_alive_cache: TTLCache[str, TerminalInstance] = TTLCache(
             maxsize=_IS_ALIVE_CACHE_MAX,
             ttl=_IS_ALIVE_CACHE_TTL_S,
         )
@@ -866,7 +866,8 @@ class SessionResourceRegistry:
 
         The ``is_alive()`` subprocess probe is cached for a short TTL
         so rapid polling from web clients does not fork a ``tmux
-        has-session`` process on every request.
+        has-session`` process on every request. The result belongs to the
+        probed instance; a replacement at the same resource id needs its own probe.
 
         :param session_id: Session/conversation identifier.
         :param terminal_id: Opaque terminal resource id,
@@ -887,12 +888,12 @@ class SessionResourceRegistry:
 
             cache_key = f"{session_id}:{terminal_id}"
             cached = self._is_alive_cache.get(cache_key)
-            if cached is not None:
-                return terminal_resource_view(session_id, entry) if cached else None
+            if cached is entry.instance:
+                return terminal_resource_view(session_id, entry)
 
             alive = await entry.instance.is_alive()
             if alive:
-                self._is_alive_cache[cache_key] = True
+                self._is_alive_cache[cache_key] = entry.instance
             else:
                 self._is_alive_cache.pop(cache_key, None)
                 return None

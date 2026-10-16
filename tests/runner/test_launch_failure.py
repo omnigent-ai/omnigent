@@ -12,6 +12,7 @@ from omnigent.runner.launch_failure import (
     describe_failure_code,
     diagnose_client_update_required,
     diagnose_codex_model_rejection,
+    diagnose_model_unavailable,
 )
 
 # The tail Claude Code prints when refusing --dangerously-skip-permissions as
@@ -448,6 +449,70 @@ def test_codex_model_rejection_explains_how_to_fix_configuration(model: str) -> 
 )
 def test_codex_model_rejection_ignores_unrelated_errors(message: str) -> None:
     assert diagnose_codex_model_rejection(message) is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "There's an issue with the selected model (anthropic/claude-opus-4-8). "
+        "It may not exist or you may not have access to it.",
+        "inner executor error: There's an issue with the selected model "
+        "(openai/example-model). It may not exist or you may not have access to it.",
+        "There's an issue with the selected model. It may not exist.",
+        # Anthropic's not-found body, forwarded verbatim by Pi.
+        'Pi model error: 404 {"type":"error","error":{"type":"not_found_error",'
+        '"message":"model: anthropic/claude-opus-4-8"}}',
+        '404 {"type":"error","error":{"type":"invalid_request_error",'
+        '"message": "model: claude-opus-4-8"}}',
+        # OpenAI's rejection of an unknown or inaccessible model id.
+        '404 {"error":{"message":"The model `gpt-5-nano` does not exist or you do not have '
+        'access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}',
+        '{"error":{"message":"unknown model","code":"model_not_found"}}',
+        "The model `gpt-5-nano` does not exist or you do not have access to it.",
+    ],
+)
+def test_model_unavailable_explains_how_to_recover(message: str) -> None:
+    diagnosis = diagnose_model_unavailable(message)
+
+    assert diagnosis is not None
+    assert diagnosis.title == "Model unavailable"
+    assert diagnosis.cause == message.strip()
+    assert diagnosis.remediation is not None
+    assert "model picker" in diagnosis.remediation
+    assert "/model" in diagnosis.remediation
+    assert "different model" in diagnosis.remediation
+    assert "access this model" in diagnosis.remediation
+    assert diagnosis.category is ErrorCategory.CONFIG
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "",
+        # A plain 404 is not necessarily a model mismatch; leave it unlabeled.
+        "API Error: Request rejected (404) · model not found",
+        "API Error: Request rejected (401) · UNAUTHENTICATED",
+        "API Error: Request rejected (403) · PERMISSION_DENIED",
+        "API Error: 429 rate limit exceeded",
+        "The AI gateway refused this turn because a spending budget is exhausted.",
+        "The 'future-model' model is not supported when using Codex with a ChatGPT account.",
+        _CLIENT_UPDATE_OUTPUT,
+        # A 404 that does not name a model (e.g. a wrong base URL path).
+        'Pi model error: 404 {"type":"error","error":{"type":"not_found_error",'
+        '"message":"Not Found"}}',
+        # Other provider statuses mentioning the model stay unlabeled.
+        'Pi model error: 401 {"type":"error","error":{"type":"authentication_error",'
+        '"message":"invalid x-api-key"}}',
+        'Pi model error: 400 {"type":"error","error":{"type":"invalid_request_error",'
+        '"message":"model: claude-opus-4-8 does not support the messages API"}}',
+        'Pi model error: 429 {"type":"error","error":{"type":"rate_limit_error",'
+        '"message":"model: claude-opus-4-8 is rate limited"}}',
+        # The same prose about another resource is not a model mismatch.
+        "Project abc does not exist or you do not have access to it.",
+    ],
+)
+def test_model_unavailable_ignores_unrelated_errors(message: str) -> None:
+    assert diagnose_model_unavailable(message) is None
 
 
 @pytest.mark.parametrize(

@@ -3146,6 +3146,65 @@ def test_list_child_conversation_ids_by_parent_groups_direct_subagents(
     nested_result = conversation_store.list_child_conversation_ids_by_parent([child_a1.id])
     assert nested_result[child_a1.id] == [nested.id]
 
+    pages: list[tuple[str, int]] = []
+    while True:
+        cursor = (pages[-1][1], pages[-1][0]) if pages else None
+        page = conversation_store.list_child_conversation_ids_page(
+            parent_a.id, after=cursor, limit=1
+        )
+        if not page:
+            break
+        pages.extend(page)
+    assert pages == sorted(
+        [(child_a1.id, child_a1.created_at), (child_a2.id, child_a2.created_at)],
+        key=lambda row: (row[1], row[0]),
+        reverse=True,
+    )
+    assert conversation_store.list_child_conversation_ids_page(parent_b.id) == [
+        (child_b.id, child_b.created_at)
+    ]
+    assert conversation_store.list_child_conversation_ids_page(child_a1.id) == [
+        (nested.id, nested.created_at)
+    ]
+
+
+def test_child_conversation_page_uses_parent_index_for_first_and_next_page(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    if conversation_store._engine.dialect.name != "sqlite":
+        pytest.skip("SQLite query-plan assertion")
+    parent = conversation_store.create_conversation()
+    children = [
+        conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+        for _ in range(3)
+    ]
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(conversation_store._engine, "before_cursor_execute", capture)
+    try:
+        first = conversation_store.list_child_conversation_ids_page(parent.id, limit=1)
+        following = conversation_store.list_child_conversation_ids_page(
+            parent.id, after=(first[0][1], first[0][0]), limit=1
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", capture)
+    assert len(first) == len(following) == 1
+    assert {first[0][0], following[0][0]} <= {child.id for child in children}
+    assert len(queries) == 2
+    with conversation_store._engine.connect() as conn:
+        plans = [
+            str(conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+            for statement, parameters in queries
+        ]
+    for plan in plans:
+        assert "idx_conversations_parent" in plan, plan
+        assert "TEMP B-TREE" not in plan, plan
+    assert "(created_at,id)<(?,?)" in "".join(plans[1].split()), plans[1]
+
 
 # ── agent_id filter on list_conversations ──────────────
 

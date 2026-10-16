@@ -28,6 +28,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from omnigent.terminals.pane_reaper import NativePaneReaper
 from omnigent.terminals.registry import TerminalRegistry
+from tests.budgets import budget
 from tests.runner.conftest import _build_app_for_spec, _runner_client
 from tests.runner.helpers import make_test_terminal_instance
 from tests.runner.native_helpers import _harness_spec
@@ -712,11 +713,11 @@ async def test_codex_settings_forward_outlasts_tui_budget_during_startup(
         settings["reasoning_effort"] = "low"
     change = asyncio.create_task(client.patch(f"/v1/sessions/{session.session_id}", json=settings))
     try:
-        await asyncio.wait_for(missing.wait(), timeout=2)
+        await asyncio.wait_for(missing.wait(), timeout=budget(2))
         await asyncio.sleep(0.1)
         assert not change.done()
         session.codex.ready_gate.set()
-        response = await asyncio.wait_for(change, timeout=2)
+        response = await asyncio.wait_for(change, timeout=budget(2))
     finally:
         session.codex.ready_gate.set()
         change.cancel()

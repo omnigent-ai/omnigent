@@ -421,7 +421,7 @@ def create_session_mcp_servers_router(
                     raise OmnigentError("MCP server not found", code=ErrorCode.NOT_FOUND)
                 _delete_mcp_server(location, target_name)
 
-            new_bundle = _tar_gz_dir(root)
+            new_bundle = _tar_gz_dir(root, original_bundle=bundle_bytes)
             new_spec = validate_agent_bundle(
                 new_bundle,
                 enforce_handler_allowlist=not local_single_user_enabled(),
@@ -438,7 +438,17 @@ def create_session_mcp_servers_router(
         # segment (physical artifact key); only the sha encodes content.
         if new_location.rsplit("/", 1)[-1] != agent.bundle_location.rsplit("/", 1)[-1]:
             artifact_store.put(new_location, new_bundle)
-            updated = agent_store.update(agent.id, new_location, created_by)
+            if agent_store.supports_config_edit:
+                updated = agent_store.update_configuration(
+                    agent, new_location, description=agent.description, created_by=created_by
+                )
+                if updated is None:
+                    raise OmnigentError(
+                        "Agent changed during MCP edit; reload before saving",
+                        code=ErrorCode.CONFLICT,
+                    )
+            else:
+                updated = agent_store.update(agent.id, new_location, created_by)
             if updated is None:
                 raise OmnigentError("Agent not found", code=ErrorCode.NOT_FOUND)
             agent_cache.replace(
@@ -729,12 +739,19 @@ def _normalize_tarinfo(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo:
     tarinfo.gid = 0
     tarinfo.uname = ""
     tarinfo.gname = ""
-    tarinfo.mode = 0o755 if tarinfo.isdir() else 0o644
+    tarinfo.mode = 0o755 if tarinfo.isdir() or tarinfo.mode & 0o111 else 0o644
     return tarinfo
 
 
-def _tar_gz_dir(bundle_dir: Path) -> bytes:
+def _tar_gz_dir(bundle_dir: Path, *, original_bundle: bytes | None = None) -> bytes:
     """Pack a bundle directory into deterministic ``.tar.gz`` bytes."""
+    # extract_safe drops attributes; restore only executable bits from the validated archive.
+    if original_bundle is not None:
+        with tarfile.open(fileobj=io.BytesIO(original_bundle), mode="r:*") as archive:
+            for member in archive:
+                path = bundle_dir / member.name
+                if member.isfile() and path.is_file():
+                    path.chmod(0o644 | (member.mode & 0o111))
     buf = io.BytesIO()
     with (
         gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz,

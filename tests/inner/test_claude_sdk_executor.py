@@ -2337,6 +2337,64 @@ class TestSkillsFilterTranslation(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Tests: Bundle plugin gating (skill-less bundles emit no --plugin-dir)
+# ---------------------------------------------------------------------------
+
+
+class TestBundlePluginGating(unittest.TestCase):
+    def _plugins_for_bundle(self, bundle_dir):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        executor = ClaudeSDKExecutor(
+            gateway=True,
+            gateway_host="https://gateway.example.com",
+            base_url_override="https://gateway.example.com/v1",
+            gateway_auth_command="printf token",
+            bundle_dir=bundle_dir,
+            agent_name="my-agent",
+        )
+
+        captured: dict[str, object] = {}
+
+        async def fake_get_or_create_client(sdk, *, session_key, options, model):
+            captured["plugins"] = getattr(options, "plugins", None)
+            raise RuntimeError("stop after options built")
+
+        async def _t():
+            with patch.object(
+                executor,
+                "_get_or_create_client",
+                side_effect=fake_get_or_create_client,
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+        _run(_t())
+        return captured["plugins"]
+
+    def test_skill_less_bundle_emits_no_plugin(self):
+        # No `skills/` directory -> empty `plugins` and no manifest written
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            self.assertEqual(self._plugins_for_bundle(bundle), [])
+            self.assertFalse((bundle / ".claude-plugin" / "plugin.json").exists())
+
+    def test_bundle_with_skills_registers_plugin(self):
+        # `skills/` directory -> local plugin for bundle and manifest written
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            skill_dir = bundle / "skills" / "demo"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# demo\n")
+            self.assertEqual(
+                self._plugins_for_bundle(bundle),
+                [{"type": "local", "path": str(bundle)}],
+            )
+            self.assertTrue((bundle / ".claude-plugin" / "plugin.json").exists())
+
+
+# ---------------------------------------------------------------------------
 # Tests: StreamEvent-based streaming
 # ---------------------------------------------------------------------------
 

@@ -84,6 +84,17 @@ async def test_owner_can_update_bundle_and_mcp(auth_client: httpx.AsyncClient) -
     session_id = agent["_session_id"]
     headers = {"X-Forwarded-Email": ALICE}
 
+    config_path = f"/v1/agents/{agent['id']}/config"
+    config = await auth_client.get(config_path, headers=headers)
+    assert config.status_code == 200, config.text
+    patched = await auth_client.patch(
+        f"/v1/agents/{agent['id']}",
+        json={"description": "PATCH override"},
+        headers={**headers, "If-Match": config.headers["etag"]},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["description"] == "PATCH override"
+
     put = await auth_client.put(
         f"/v1/sessions/{session_id}/agent",
         files={
@@ -96,6 +107,10 @@ async def test_owner_can_update_bundle_and_mcp(auth_client: httpx.AsyncClient) -
         headers=headers,
     )
     assert put.status_code == 200, put.text
+    assert put.json()["description"] == "v2"
+    saved = await auth_client.get(config_path, headers=headers)
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["description"] == "v2"
 
     mcp = await auth_client.post(
         f"/v1/sessions/{session_id}/agent/mcp-servers",

@@ -521,6 +521,27 @@ function saveRecording(recordDir, name) {
   return saved;
 }
 
+/** Main-process test setup; this capability is never exposed to a renderer. */
+async function execInBrowserView(window, conversationId, js) {
+  const electronApp = applicationsByWindow.get(window);
+  if (!electronApp) throw new Error("Unknown desktop test window");
+  return electronApp.evaluate(
+    async (_electron, { conversationId: viewId, js: script }) => {
+      const entry = global.omnigentTestBrowserRegistries
+        .map((registry) => registry.get(viewId))
+        .find(Boolean);
+      if (!entry) return { ok: false, error: "No browser view" };
+      try {
+        const result = await entry.view.webContents.executeJavaScript(script, false);
+        return { ok: true, result };
+      } catch (error) {
+        return { ok: false, error: String(error) };
+      }
+    },
+    { conversationId, js },
+  );
+}
+
 /** Create a local fixture through main's test driver, outside renderer IPC. */
 async function openBrowserFixture(window, conversationId, url) {
   const application = applicationsByWindow.get(window);
@@ -541,6 +562,7 @@ async function openBrowserFixture(window, conversationId, url) {
 }
 
 module.exports = {
+  execInBrowserView,
   openBrowserFixture,
   APP_ROOT,
   REPO_ROOT,
