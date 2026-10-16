@@ -25,7 +25,7 @@ import {
 } from "@/components/chat/chatBubbleParts";
 import { ChatComposer, ComposerSendButton } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
-import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { ComposerMicButton, type ComposerMicButtonHandle } from "@/components/ComposerMicButton";
 import { isSlashCommandText } from "@/components/SlashCommandMenu";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
@@ -391,6 +391,9 @@ function SideChatComposer({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const voiceSnapshotRef = useRef("");
+  // Lets a Send end a live voice take: a live side chat stays enabled while
+  // busy, so sending alone never disables the mic to auto-stop it.
+  const micRef = useRef<ComposerMicButtonHandle>(null);
   const dictation = useDictationInsert(text, setText, textareaRef);
   useAutoGrowTextarea(textareaRef, text);
 
@@ -444,16 +447,26 @@ function SideChatComposer({
       .finally(() => setInterrupting(false));
   };
 
+  // End a live voice take on an accepted send, pinning any pending dictation
+  // first so a draft kept for a failed-fork retry isn't clobbered by the next
+  // take's partial. No-op when idle.
+  const endVoiceTake = () => {
+    dictation.commitPending();
+    micRef.current?.endTake();
+  };
+
   const submit = () => {
     const trimmed = isSlashCommandText(text) ? text.trim() : text.trimEnd();
     if (pending) {
       if (trimmed.length === 0 || starting || !onStart) return;
+      endVoiceTake();
       // Keep the text so a failed fork can be retried without re-typing.
       void onStart(serializeReplyDraft({ quotes, text: trimmed }));
       return;
     }
     if (busy || (trimmed.length === 0 && files.length === 0) || agentId === null) return;
     const outgoing = files;
+    endVoiceTake();
     clearComposer(childId);
     void send(
       serializeReplyDraft({ quotes, text: trimmed }),
@@ -540,6 +553,7 @@ function SideChatComposer({
           trailing: (
             <>
               <ComposerMicButton
+                ref={micRef}
                 className="size-8 md:size-7"
                 disabled={!ready}
                 onVoiceStart={() => {
