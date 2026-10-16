@@ -6828,6 +6828,30 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         error: "managed sandbox launch failed: boom",
       });
     });
+
+    it.each([
+      ["provisioning", false],
+      ["connecting", true],
+      ["ready", true],
+    ] as const)("refetches the host binding on %s: %s", (stage, refetches) => {
+      // The server binds the sandbox host before announcing `connecting`.
+      const spy = vi.spyOn(client, "invalidateQueries");
+      handleSessionEvent({
+        type: "session_sandbox_status",
+        conversationId: "conv_abc",
+        stage,
+        error: null,
+      });
+      const sessionRefetch = { queryKey: ["session", "conv_abc"], exact: true };
+      const hostsRefetch = { queryKey: ["hosts"] };
+      if (refetches) {
+        expect(spy).toHaveBeenCalledWith(sessionRefetch);
+        expect(spy).toHaveBeenCalledWith(hostsRefetch);
+      } else {
+        expect(spy).not.toHaveBeenCalled();
+      }
+      spy.mockRestore();
+    });
   });
 
   describe("session.mcp_startup", () => {
