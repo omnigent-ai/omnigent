@@ -719,6 +719,24 @@ def create_hosts_router(
     flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
 
+    @router.get("/hosts/sandboxes")
+    async def discover_sandboxes(
+        request: Request, provider: str = Query(min_length=1, max_length=32)
+    ) -> dict[str, list[dict[str, str]]]:
+        """List the caller's reusable boxes, including those not registered as hosts."""
+        from omnigent.server.managed_hosts import discover_sandbox_hosts
+
+        owner = require_user(request, auth_provider) or "local"
+        config = getattr(request.app.state, "sandbox_config", None)
+        if config is None:
+            raise HTTPException(400, "sandbox providers are not configured")
+        boxes = await discover_sandbox_hosts(config=config, owner=owner, provider=provider)
+        return {
+            "sandboxes": [
+                {"sandbox_id": box.sandbox_id, "name": box.name or box.sandbox_id} for box in boxes
+            ]
+        }
+
     @router.post("/hosts/attach")
     async def attach_host(request: Request, body: AttachSandboxRequest) -> dict[str, str]:
         """Attach a caller-authorized existing sandbox as a reusable host."""

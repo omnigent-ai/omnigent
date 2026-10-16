@@ -6582,7 +6582,7 @@
                 "type": "null"
               }
             ],
-            "description": "Id for the fork's new sandbox host, with the same shape, capability gate, label and `409` as a managed create's `host_id`. A reusable provider may select an existing sandbox instead; use the fork's bound `host_id` once available. `None` lets the server mint one. Only valid with `host_type: \"managed\"`.",
+            "description": "Id for the fork's new sandbox host, with the same shape, capability gate, label and `409` as a managed create's `host_id`. `None` lets the server mint one. Only valid with `host_type: \"managed\"`.",
             "title": "Host Id"
           },
           "host_type": {
@@ -11097,6 +11097,61 @@
           }
         },
         "summary": "Attach Host",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/sandboxes": {
+      "get": {
+        "description": "List the caller's reusable boxes, including those not registered as hosts.",
+        "operationId": "discover_sandboxes_v1_hosts_sandboxes_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "maxLength": 32,
+              "minLength": 1,
+              "title": "Provider",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response Discover Sandboxes V1 Hosts Sandboxes Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Discover Sandboxes",
         "tags": [
           "hosts"
         ]

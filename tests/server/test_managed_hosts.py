@@ -5961,14 +5961,10 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
     assert fake.host_starts == []
 
 
-@pytest.mark.parametrize(
-    ("attach", "reusable", "ensure"),
-    [(False, False, False), (False, True, False), (True, True, False), (False, True, True)],
-)
+@pytest.mark.parametrize(("attach", "reusable"), [(False, False), (False, True), (True, True)])
 async def test_provider_operations_keep_the_host_owner_across_fresh_launchers(
-    db_uri, monkeypatch, attach, reusable, ensure
+    db_uri, monkeypatch, attach, reusable
 ):
-    from omnigent.onboarding.sandboxes.types import SandboxInfo
     from omnigent.server.managed_hosts import attach_sandbox_host, host_sandbox_is_running
 
     store = HostStore(db_uri)
@@ -5997,17 +5993,8 @@ async def test_provider_operations_keep_the_host_owner_across_fresh_launchers(
 
         monkeypatch.setattr(fake, "bind_principal", bind)
         monkeypatch.setattr(fake, "provision", provision)
-        if ensure:
-            monkeypatch.setattr(
-                fake,
-                "get_or_create_for_user",
-                lambda *, repos: SandboxInfo(
-                    f"existing-{owners.index(bound[0])}", workspace_path="/existing"
-                ),
-            )
         for method in (
             "prepare_for_launch",
-            "get_or_create_for_user",
             "prepare",
             "provision",
             "attach_for_user",
@@ -6020,12 +6007,7 @@ async def test_provider_operations_keep_the_host_owner_across_fresh_launchers(
 
             def checked(*args, method=method, original=original, **kwargs):
                 assert len(bound) == 1, f"{method} called without an authenticated owner"
-                if method not in {
-                    "prepare_for_launch",
-                    "prepare",
-                    "provision",
-                    "get_or_create_for_user",
-                }:
+                if method not in {"prepare_for_launch", "prepare", "provision"}:
                     assert bound[0] == box_owners[args[0]], "controller received the wrong owner"
                 calls.append((method, bound[0]))
                 return original(*args, **kwargs)
@@ -6069,11 +6051,7 @@ async def test_provider_operations_keep_the_host_owner_across_fresh_launchers(
 
     await asyncio.gather(*(use_box(index, owner) for index, owner in enumerate(owners)))
     required = {"prepare_for_launch", "start_host", "resume", "is_running"}
-    required |= (
-        {"attach_for_user"}
-        if attach
-        else {"prepare", "get_or_create_for_user" if ensure else "provision"}
-    )
+    required |= {"attach_for_user"} if attach else {"prepare", "provision"}
     if not reusable:
         required.add("terminate")
     for owner in owners:
@@ -6081,15 +6059,11 @@ async def test_provider_operations_keep_the_host_owner_across_fresh_launchers(
 
 
 @pytest.mark.parametrize("failure", ["none", "startup", "gone", "delete-during-wake"])
-@pytest.mark.parametrize("via_provider", [False, True])
-async def test_attached_sandbox_reuses_host_and_never_provisions_or_terminates(
-    db_uri, monkeypatch, failure, via_provider
-):
-    from omnigent.onboarding.sandboxes.types import SandboxInfo
+async def test_attached_sandbox_reuses_host_and_never_provisions_or_terminates(db_uri, failure):
     from omnigent.server.managed_hosts import attach_sandbox_host
 
     store = HostStore(db_uri)
-    box = f"devbox-{via_provider}-{failure}"
+    box = f"devbox-{failure}"
 
     def connect(start):
         assert store.resolve_launch_token(start.host_id, start.token) is not None
@@ -6097,7 +6071,6 @@ async def test_attached_sandbox_reuses_host_and_never_provisions_or_terminates(
 
     fake = FakeSandboxLauncher(
         can_resume=True,
-        reusable_hosts=via_provider,
         attachments={box: _OWNER},
         on_host_start=connect,
         fail_on_host_start=failure == "startup",
@@ -6118,38 +6091,17 @@ async def test_attached_sandbox_reuses_host_and_never_provisions_or_terminates(
         "sandbox_id": box,
         "name": "My devbox",
     }
-
-    def select(*, repos):
-        assert len(repos) == 1 and repos[0].url == "https://github.com/example/repo"
-        return SandboxInfo(box, workspace_path=f"/worktrees/{repos[0].branch}")
-
-    monkeypatch.setattr(fake, "get_or_create_for_user", select)
-
-    async def connect_box():
-        if via_provider:
-            request_id = uuid.uuid4().hex
-            launched = await launch_managed_host(
-                config=config,
-                owner=_OWNER,
-                host_store=store,
-                host_id=request_id,
-                repos=(RepoWorkspace("https://github.com/example/repo", request_id, "repo"),),
-            )
-            assert launched.workspace == f"/worktrees/{request_id}"
-            return launched.host_id
-        return await attach_sandbox_host(**kwargs)
-
     if failure == "startup":
         with pytest.raises(HTTPException, match="wake failed"):
-            await connect_box()
+            await attach_sandbox_host(**kwargs)
         assert len(store.list_hosts(_OWNER)) == 1
         fake.fail_on_host_start = False
-    first, second = await asyncio.gather(connect_box(), connect_box())
+    first, second = await asyncio.gather(
+        attach_sandbox_host(**kwargs), attach_sandbox_host(**kwargs)
+    )
     assert first == second
     host = store.get_host(first)
     assert host is not None and host.sandbox_attached
-    assert await attach_sandbox_host(**kwargs) == first
-    assert store.get_host(first) == host
     assert len(store.list_hosts(_OWNER)) == 1
     assert len(fake.host_starts) == 1
     # Session deletion/failed session startup cannot remove a shared host.
@@ -6172,53 +6124,36 @@ async def test_attached_sandbox_reuses_host_and_never_provisions_or_terminates(
             await resume_managed_host(first, store, config)
         assert store.get_host(first) is None
     else:
-        assert await connect_box() == first
+        await resume_managed_host(first, store, config)
         assert store.is_online(first)
     assert fake.provisioned_names == []
     assert fake.terminated == []
 
 
-@pytest.mark.parametrize("failure", ["denied", "bad-id", "missing-workspace", "foreign-host"])
-async def test_controller_selected_sandbox_failure_never_falls_back_to_provision(
-    db_uri, monkeypatch, failure
-):
-    from omnigent.onboarding.sandboxes.types import SandboxInfo
-
+async def test_new_static_sandbox_always_creates_another_box(db_uri):
     store = HostStore(db_uri)
-    fake = FakeSandboxLauncher(can_resume=True, reusable_hosts=True)
-    if failure == "foreign-host":
-        store.reserve_sandbox_host(
-            host_id=uuid.uuid4().hex,
-            name="Another owner's box",
-            user_id="other-user",
-            provider="modal",
-            attached_sandbox_id="shared-id",
-        )
-
-    def select(*, repos):
-        if failure == "denied":
-            raise PermissionError("controller rejected access")
-        return SandboxInfo(
-            "" if failure == "bad-id" else "shared-id",
-            workspace_path=None if failure == "missing-workspace" else "/workspace",
-        )
-
-    monkeypatch.setattr(fake, "get_or_create_for_user", select)
-    with pytest.raises(HTTPException) as error:
-        await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=store)
-    assert (
-        error.value.status_code
-        == {
-            "denied": 403,
-            "bad-id": 502,
-            "missing-workspace": 502,
-            "foreign-host": 409,
-        }[failure]
+    fake = FakeSandboxLauncher(
+        can_resume=True,
+        reusable_hosts=True,
+        on_host_start=lambda start: store.upsert_on_connect(
+            start.host_id, start.host_name, _OWNER
+        ),
     )
-    assert fake.provisioned_names == []
-    assert fake.host_starts == []
-    assert fake.terminated == []
-    assert store.list_hosts(_OWNER) == []
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="http://test",
+            provider="modal",
+            token_ttl_s=3600,
+            launcher_factory=lambda: fake,
+        )
+    )
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=store)
+    second = await launch_managed_host(config=config, owner=_OWNER, host_store=store)
+    assert first.host_id != second.host_id
+    hosts = store.list_hosts(_OWNER)
+    assert {host.sandbox_id for host in hosts} == {"sb-fake-1", "sb-fake-2"}
+    assert all(host.sandbox_attached for host in hosts)
+    assert len(fake.provisioned_names) == 2
 
 
 @pytest.mark.parametrize("reusable", [False, True])

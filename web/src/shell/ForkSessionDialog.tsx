@@ -83,6 +83,7 @@ import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+import { StaticSandboxPicker } from "./StaticSandboxPicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
@@ -807,6 +808,7 @@ function SupportedForkSessionForm({
   const [sandboxSelected, setSandboxSelected] = useState(false);
   // Provider the sandbox pick launches on; null for a server that names none.
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(null);
+  const [discoveryProvider, setDiscoveryProvider] = useState<string | null>(null);
   // Repository cloned into the sandbox, split across two inputs and
   // recomposed into the request's `<url>[#<branch>]` workspace.
   const [sandboxRepoUrl, setSandboxRepoUrl] = useState("");
@@ -1586,6 +1588,28 @@ function SupportedForkSessionForm({
                     ))}
                   </SelectContent>
                 </Select>
+                {managedSandboxesEnabled &&
+                  sandboxProviderRows.map((provider) =>
+                    provider !== null &&
+                    info.sandbox_provider_capabilities?.[provider]?.reusable_hosts ? (
+                      <Button
+                        key={`discover-${provider}`}
+                        variant="ghost"
+                        className="self-start"
+                        onClick={() => setDiscoveryProvider(provider)}
+                      >
+                        Choose existing static sandbox…
+                        {sandboxProviderRows.length > 1 && ` (${provider})`}
+                      </Button>
+                    ) : null,
+                  )}
+                {discoveryProvider !== null && (
+                  <StaticSandboxPicker
+                    provider={discoveryProvider}
+                    onClose={() => setDiscoveryProvider(null)}
+                    onSelect={selectHost}
+                  />
+                )}
                 {/* A sandbox is a usable target, so no dead-end even with no
                     host online: offer connecting one as a collapsed, optional
                     step rather than an alarming "no hosts connected" banner. */}

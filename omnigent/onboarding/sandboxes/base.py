@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
     from pathlib import Path
 
-    from omnigent.onboarding.sandboxes.types import RepoWorkspace, SandboxInfo
+    from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 
 DEFAULT_HOST_IMAGE: str = "ghcr.io/omnigent-ai/omnigent-host:latest"
@@ -580,10 +580,8 @@ class SandboxLifecycle(ABC):
         Validate / refresh access to an existing sandbox so subsequent
         primitives can resolve it.
 
-        CLI-bootstrap capability — the server's managed-host flow never
-        attaches to pre-existing sandboxes, so launchers that exist
-        only for managed launches (e.g. a deployment-injected custom
-        launcher) need not override the raising default.
+        CLI-bootstrap capability. Managed attachment uses ``attach_for_user``
+        instead so the provider explicitly authorizes the server's caller.
 
         :param sandbox_id: The sandbox to attach to, e.g.
             ``"lovable-wattlebird-1530"``.
@@ -592,6 +590,15 @@ class SandboxLifecycle(ABC):
         :raises click.ClickException: If the sandbox cannot be resolved.
         """
         raise self._capability_error("attach to an existing sandbox")
+
+    def list_for_user(self, *, owner: str) -> Sequence[_sandbox_types.SandboxInfo]:
+        """Discover reusable boxes this caller may attach, without changing them.
+
+        Include boxes created outside Omnigent. Do not provision, wake, or start
+        hosts here. The default offers no discovery. Selection still requires
+        ``attach_for_user`` authorization, even for a previously listed box.
+        """
+        return ()
 
     def attach_for_user(self, sandbox_id: str, *, owner: str) -> None:
         """Authorize server attachment of an existing box for this caller.
@@ -948,20 +955,6 @@ class SandboxHostLauncher(SandboxLifecycle):
         here; deployment-wide capability discovery remains unbound. The default
         does nothing for providers using only deployment credentials.
         """
-
-    def get_or_create_for_user(self, *, repos: Sequence[RepoWorkspace] = ()) -> SandboxInfo | None:
-        """Select or create the bound user's reusable sandbox and prepare its workspace.
-
-        Called for each new managed session when ``reusable_hosts`` is enabled.
-        Return the canonical sandbox ID and a nonempty ``workspace_path`` for
-        this session. The controller must authorize the bound principal and
-        make concurrent create-or-get calls idempotent. Omnigent reuses the
-        box's host registration and never calls ``provision`` on this path.
-
-        Return ``None`` to use normal fresh provisioning (the default). Raise
-        on errors; they must not fall back to creating a different box.
-        """
-        return None
 
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         """Set request context before provider preparation, allocation, or resume.

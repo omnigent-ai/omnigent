@@ -423,12 +423,10 @@ async def _wait_for_managed_binding(
 
 
 @pytest.mark.parametrize("requested_host_id", [None, "0123456789abcdef0123456789abcdef"])
-@pytest.mark.parametrize("controller_selected", [False, True])
 async def test_managed_session_create_end_to_end(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
     requested_host_id: str | None,
-    controller_selected: bool,
 ) -> None:
     """
     ``POST /v1/sessions`` with ``host_type="managed"`` returns
@@ -471,19 +469,7 @@ async def test_managed_session_create_end_to_end(
         )
         host_futures.append(asyncio.wrap_future(future, loop=loop))
 
-    fake = FakeSandboxLauncher(
-        on_host_start=_start_fake_sandbox_host,
-        reusable_hosts=controller_selected,
-        can_resume=controller_selected,
-    )
-    if controller_selected:
-        from omnigent.onboarding.sandboxes.types import SandboxInfo
-
-        monkeypatch.setattr(
-            fake,
-            "get_or_create_for_user",
-            lambda *, repos: SandboxInfo("sb-fake-1", workspace_path="/controller/workspace"),
-        )
+    fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
     install_fake_modal_launcher(monkeypatch, fake)
 
     # A tab that lists the row on the create's ``session_added`` push routes
@@ -543,12 +529,10 @@ async def test_managed_session_create_end_to_end(
     tunnels = [await future for future in host_futures]
     assert len(tunnels) == 1
     assert conv.host_id is not None
-    if requested_host_id is not None and not controller_selected:
+    if requested_host_id is not None:
         assert conv.host_id == requested_host_id
     assert conv.labels.get("omnigent.sandbox.requested_host_id") == requested_host_id
-    assert conv.workspace == (
-        "/controller/workspace" if controller_selected else "/root/workspace"
-    )
+    assert conv.workspace == "/root/workspace"
     assert conv.runner_id is not None
     assert conv.runner_id.startswith("runner_token_")
 
@@ -562,12 +546,6 @@ async def test_managed_session_create_end_to_end(
     assert host.sandbox_provider == "modal"
     assert host.sandbox_id == "sb-fake-1"
     assert host.name == f"managed-{conv.host_id[:8]}"
-    assert host.sandbox_attached == controller_selected
-    if controller_selected:
-        assert fake.provisioned_names == []
-        assert render_host_config_write_command({"host": {"slice_key_enabled": True}}) in (
-            fake.commands
-        )
 
     # Deleting the managed session tears the sandbox down: the
     # provider terminate fires and the host row is deleted — which
@@ -579,14 +557,9 @@ async def test_managed_session_create_end_to_end(
     # connecting here, the background launch's failure teardown can race the
     # delete's teardown and both fire it. Assert the sandbox (and only it) was
     # torn down, not the number of best-effort attempts.
-    if controller_selected:
-        assert fake.terminated == []
-        assert env.host_store.get_host(conv.host_id) is not None
-        assert len(env.host_store.list_hosts(RESERVED_USER_LOCAL)) == 1
-    else:
-        assert set(fake.terminated) == {"sb-fake-1"}
-        assert env.host_store.get_host(conv.host_id) is None
-        assert env.host_store.list_hosts(RESERVED_USER_LOCAL) == []
+    assert set(fake.terminated) == {"sb-fake-1"}
+    assert env.host_store.get_host(conv.host_id) is None
+    assert env.host_store.list_hosts(RESERVED_USER_LOCAL) == []
     # The tunnels list holds the fake hosts open through the delete;
     # release them only now.
     del tunnels

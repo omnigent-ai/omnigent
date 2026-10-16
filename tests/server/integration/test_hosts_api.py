@@ -1515,6 +1515,7 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
 
 async def test_attach_api_reuses_one_tunnel_for_two_session_launches(host_api_app):
     from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
+    from omnigent.onboarding.sandboxes.types import SandboxInfo
     from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
     from tests.server.helpers import FakeSandboxLauncher
 
@@ -1534,9 +1535,11 @@ async def test_attach_api_reuses_one_tunnel_for_two_session_launches(host_api_ap
 
     fake = FakeSandboxLauncher(
         can_resume=True,
+        reusable_hosts=True,
         attachments={"devbox": "local"},
         on_host_start=connect,
     )
+    fake.list_for_user = lambda *, owner: [SandboxInfo("devbox", name="My devbox")]
     app.state.sandbox_config = ManagedSandboxDeployment.single(
         ManagedSandboxConfig(
             server_url="http://test",
@@ -1546,12 +1549,19 @@ async def test_attach_api_reuses_one_tunnel_for_two_session_launches(host_api_ap
         )
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        inventory = await client.get("/v1/hosts/sandboxes?provider=modal")
+        assert inventory.json() == {"sandboxes": [{"sandbox_id": "devbox", "name": "My devbox"}]}
+        assert store.list_hosts("local") == []
+        assert not fake.host_starts and not fake.provisioned_names
         payload = {"provider": "modal", "sandbox_id": "devbox", "name": "My devbox"}
         attached = await client.post("/v1/hosts/attach", json=payload)
         assert attached.status_code == 200, attached.text
         host_id = attached.json()["host_id"]
         retry = await client.post("/v1/hosts/attach", json=payload)
         assert retry.json() == attached.json()
+        fake.attachments.clear()
+        denied = await client.post("/v1/hosts/attach", json=payload)
+        assert denied.status_code == 403  # Listing or prior attachment never grants access.
         hosts = (await client.get("/v1/hosts")).json()["hosts"]
         assert len(hosts) == 1 and hosts[0]["sandbox_attached"] is True
         assert len(connections) == 1
@@ -1651,6 +1661,62 @@ async def test_attach_api_requires_provider_authorization(
     assert response.status_code == status
     assert store.list_hosts(owner or "local") == []
     assert fake.host_starts == []
+
+
+async def test_discovery_is_owner_scoped_and_read_only(multi_user_app):
+    import click
+
+    from omnigent.onboarding.sandboxes.types import SandboxInfo
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from tests.server.helpers import FakeSandboxLauncher
+
+    app, _, store, _ = multi_user_app
+    calls = []
+
+    class Discoverable(FakeSandboxLauncher):
+        def bind_principal(self, principal):
+            self.principal = principal
+
+        def list_for_user(self, *, owner):
+            assert self.principal == owner
+            calls.append(owner)
+            if owner == "denied":
+                raise PermissionError("no access")
+            if owner == "unavailable":
+                raise click.ClickException("controller unavailable")
+            return [SandboxInfo(f"{owner}-{i}", name=f"Box {i}") for i in range(2)]
+
+    app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="http://test",
+            token_ttl_s=3600,
+            provider="modal",
+            launcher_factory=lambda: Discoverable(can_resume=True, reusable_hosts=True),
+        )
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        url = "/v1/hosts/sandboxes?provider=modal"
+        with pytest.raises(OmnigentError) as denied:
+            await client.get(url)
+        assert denied.value.http_status == 401 and not calls
+        for owner in ("alice", "bob"):
+            response = await client.get(url, headers={"x-test-user": owner})
+            assert response.status_code == 200
+            assert response.json() == {
+                "sandboxes": [{"sandbox_id": f"{owner}-{i}", "name": f"Box {i}"} for i in range(2)]
+            }
+            assert store.list_hosts(owner) == []
+        for owner, status in (("denied", 403), ("unavailable", 502)):
+            response = await client.get(url, headers={"x-test-user": owner})
+            assert response.status_code == status
+        app.state.sandbox_config.configs[0].launcher_factory = lambda: FakeSandboxLauncher(
+            can_resume=True, reusable_hosts=True
+        )
+        response = await client.get(url, headers={"x-test-user": "alice"})
+        assert response.json() == {"sandboxes": []}
+        app.state.sandbox_config.configs[0].launcher_factory = FakeSandboxLauncher
+        response = await client.get(url, headers={"x-test-user": "alice"})
+        assert response.status_code == 400
 
 
 @pytest.mark.parametrize("method,action", [("POST", "/wake"), ("DELETE", "")])

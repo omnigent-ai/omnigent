@@ -129,11 +129,12 @@ class SandboxSpec:
 
 @dataclass(frozen=True)
 class SandboxInfo:
-    """Result of a successful provision or attach."""
+    """A provider's sandbox, including boxes discovered before attachment."""
 
     sandbox_id: str
     workspace_path: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    name: str | None = None
 
 
 @dataclass(frozen=True)

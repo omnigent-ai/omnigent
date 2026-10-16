@@ -1434,6 +1434,50 @@ describe("ForkSessionDialog", () => {
       fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
     }
 
+    it("discovers and attaches an existing static sandbox as a clone target", async () => {
+      const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        if (String(input).includes("/v1/hosts/sandboxes?provider=static")) {
+          return new Response(
+            JSON.stringify({ sandboxes: [{ sandbox_id: "existing-box", name: "Existing box" }] }),
+          );
+        }
+        if (String(input).endsWith("/v1/hosts/attach")) {
+          expect(JSON.parse(init?.body as string)).toEqual({
+            provider: "static",
+            sandbox_id: "existing-box",
+            name: "Existing box",
+          });
+          setHosts([
+            host(),
+            host({ host_id: "host_existing", name: "Existing box", sandbox_attached: true }),
+          ]);
+          return new Response(JSON.stringify({ host_id: "host_existing" }));
+        }
+        throw new Error(`Unexpected request: ${input}`);
+      });
+      try {
+        renderDialog({
+          ...CODING,
+          info: {
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "static",
+            sandbox_provider_capabilities: { static: { reusable_hosts: true } },
+          },
+        });
+        fireEvent.click(screen.getByRole("button", { name: "Choose existing static sandbox…" }));
+        fireEvent.click(await screen.findByRole("button", { name: /Existing box/ }));
+        await waitFor(() =>
+          expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Existing box"),
+        );
+        expect(
+          screen.queryByRole("dialog", { name: "Choose existing static sandbox" }),
+        ).not.toBeInTheDocument();
+        expect(forkSessionMock).not.toHaveBeenCalled();
+      } finally {
+        fetchMock.mockRestore();
+      }
+    });
+
     it("hides the sandbox option on a server that can't provision one", () => {
       // Fails closed, mirroring the new-session picker: a server with no
       // launch-capable sandbox config must not offer a target it will reject.

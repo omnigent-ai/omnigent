@@ -1547,16 +1547,14 @@ class _SessionCreateRequestBase(BaseModel):
         send launch frame). ``None`` for CLI-initiated sessions.
         With ``host_type: "managed"`` it instead names the NEW sandbox
         host: 32 lowercase hex characters (the shape of
-        ``uuid.uuid4().hex``), so the caller can route the create and
-        initial follow-up requests by that id. Send it only
+        ``uuid.uuid4().hex``), so the caller can route the create, and
+        every request after it, by that id from the start. Send it only
         when ``GET /v1/info`` reports ``request_managed_sandbox_host_id``;
         older servers reject it. The server
-        normally registers the host under it and records it in the
+        registers the host under it and records it in the
         ``omnigent.sandbox.requested_host_id`` label, since the
-        session's ``host_id`` stays null until the host binds. A reusable
-        provider may select an existing sandbox with a different host ID;
-        clients must route by the session's bound ``host_id`` once available.
-        ``None`` lets the server mint one. JSON creates only, and not with
+        session's ``host_id`` stays null until the host binds. ``None``
+        lets the server mint one. JSON creates only, and not with
         ``parent_session_id`` (a child runs on its parent's host). An id
         naming an existing host, or sharing its ``managed-<first 8 hex>``
         name with one of the caller's hosts, fails with ``409``.
@@ -2802,8 +2800,6 @@ class SessionForkRequest(BaseModel):
         valid with ``host_type: "managed"``.
     :param host_id: Id for the fork's new sandbox host, with the same shape,
         capability gate, label and ``409`` as a managed create's ``host_id``.
-        A reusable provider may select an existing sandbox instead; use the
-        fork's bound ``host_id`` once available.
         ``None`` lets the server mint one. Only valid with
         ``host_type: "managed"``.
     :param workspace: Git repository URL (optionally ``#<branch>``) the

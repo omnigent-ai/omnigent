@@ -11,7 +11,8 @@ flowchart LR
     P --> H[Existing host and session machinery]
     P --> O[Save lifecycle ownership on host]
     O --> K[Static hosts appear in picker for reuse]
-    B[Attach existing devbox] --> C[Provider: authorize caller]
+    B[Choose existing static sandbox] --> D[Provider: list caller's boxes]
+    D --> C[Select box and authorize caller]
     C --> R[Existing provider: resume and start_host]
     R --> H
     H --> S[Runner for each session]
@@ -37,50 +38,50 @@ def capabilities(self):
 ```
 
 The regular new-session provider option becomes **New static sandbox**.
-By default it calls the existing `provision` and `start_host` methods, including
-repository setup. The resulting host is saved with the same ownership marker
-and appears in host pickers for later sessions. No separate Add static sandbox dialog or creation
-API is needed. The capability only selects the initial policy: changing provider
+It calls the existing `provision` and `start_host` methods, including repository
+setup. The resulting host is saved with the same ownership marker and appears in
+host pickers for later sessions. Each new session submitted with this option
+creates another box. No new creation API is needed. The capability only selects the initial policy: changing provider
 configuration later cannot turn a saved static box into an ad hoc one.
 
-`provision` must create a fresh box. For a controller that finds the user's box
-and creates it only when absent, implement this optional method on the same
-provider instead:
+`provision` must create a fresh box. To adopt an existing or per-user box, use the
+attachment action below. Providers may expose separate static/ad hoc entries in
+the existing registry, backed by their own controller.
 
-```python
-from omnigent.onboarding.sandboxes.types import SandboxInfo
+## Discover and reuse existing boxes
 
-def get_or_create_for_user(self, *, repos=()):
-    # The client already carries the identity supplied to bind_principal.
-    box = self.controller.get_or_create(repos=repos)
-    return SandboxInfo(sandbox_id=box.id, workspace_path=box.workspace)
-```
+**Choose existing static sandbox…** in New session and Clone session lists the
+controller's inventory for the authenticated caller. Users can have several
+boxes, including ones created before they used Omnigent. Opening or refreshing
+the list does not register, wake, or create anything. Selecting a box uses the
+existing attachment action, which checks access again, reuses its host
+registration if present, and connects it. Later sessions can select that host
+directly from the ordinary host picker.
 
-With `reusable_hosts=True`, the normal provider option calls this hook for each
-new managed session, including forks. The controller authorizes the bound user,
-finds or creates the box, and prepares the requested repositories/workspace.
-It must return a stable, canonical sandbox ID and a usable workspace path, and
-make concurrent create-or-get requests idempotent. Its HTTP endpoints and policy
-stay in the provider plugin/controller.
-
-Omnigent uses the existing attachment registration and wake path. An already
-online host keeps its ID and credential, with no second host process. Sleeping
-boxes wake under the same registration. Explicit attachment and controller
-selection of the same box converge on that registration; another user's host
-or an ad hoc allocation cannot be adopted. A failure never deletes the box or
-falls back to `provision`. The default hook returns `None`, preserving fresh
-creation for providers that do not implement create-or-get.
-
-No discovery dialog or new REST endpoint is needed for this flow. Users can
-choose the provider option again or select the resulting host in the picker.
-Discovery is a separate feature if users must choose among several existing
-boxes. The existing registry can still expose separate static/ad hoc providers.
+There is no get-or-create operation or assumption of one box per user. Creation
+always goes through `provision`; reuse goes through explicit selection.
 
 ## Provider contract
 
 Keep the customer controller and HTTP client in the existing
 [provider plugin](sandbox_providers.md). No generic HTTP adapter, second provider
-interface, discovery service or external provider store is required upstream.
+interface or external provider store is required upstream. Discovery adds one
+optional method to the existing provider contract, defaulting to an empty list:
+
+```python
+from omnigent.onboarding.sandboxes.types import SandboxInfo
+
+def list_for_user(self, *, owner: str):
+    # Only return stable IDs for reusable boxes this caller may control.
+    return [
+        SandboxInfo(sandbox_id=box.id, name=box.name)
+        for box in self.controller.list_boxes(owner)
+    ]
+```
+
+`SandboxInfo.name` is optional and falls back to the ID. Other metadata is not
+sent to the browser. The controller supplies the current inventory; Omnigent
+only saves a host registration after selection, not a copy of that inventory.
 
 The attachment authorization hook is optional and rejects requests by default:
 
@@ -95,7 +96,7 @@ def attach_for_user(self, sandbox_id: str, *, owner: str) -> None:
 The server also calls the optional `bind_principal(principal)` hook before any
 user-scoped provider operation. It defaults to a no-op for existing providers.
 An HTTP provider can use it to configure its controller client's user header.
-Creation and attachment use the authenticated account identity; later wake,
+Creation, discovery and attachment use the authenticated account identity; later wake,
 startup, status, relaunch, termination, keepalive and background cleanup use the
 saved host owner. The value is an opaque account identifier, not necessarily an
 email address, and never an owner supplied in the request body. It is identity
@@ -112,10 +113,9 @@ Existing lifecycle methods handle the rest:
 
 | Method | Customer implementation |
 | --- | --- |
-| `get_or_create_for_user(repos=...)` | Optionally authorize/select/create the user's box and return `SandboxInfo` with its ID and prepared workspace. Called only for reusable providers. |
 | `resume(sandbox_id)` | Wake that existing box; never silently allocate a replacement. |
 | `start_host(sandbox_id, token=..., host_id=..., ...)` | Ask the controller to start/reconnect `omnigent host` with the supplied identity and token; return its workspace path. |
-| `provision` | Create a fresh box when `get_or_create_for_user` returns `None`. Attachment and successful controller selection never call this method. |
+| `provision` | Create a fresh box through the normal New sandbox flow; `reusable_hosts` opts its host into reuse. Attachment never calls this method. |
 | `terminate` | Used for ad hoc sandboxes. Never called for a saved reusable box, including when startup fails. |
 
 Declare the existing `resume_stopped` capability. The default `attach_for_user`
@@ -129,21 +129,48 @@ earlier attachment call's in-memory state.
 HTTP is only the customer's control channel. Agents still run through the
 existing outbound host/runner connections. The controller must honor the supplied
 host identity and token; returning an HTTP endpoint alone is insufficient.
-Reusable hosts route by their canonical host ID on creation and every wake.
-A controller-selected box can override a create's requested host ID; clients
-must use the session's bound `host_id` once it is available.
+
+## HTTP surface
+
+These additions under `/v1/hosts` are sandbox-specific. Ordinary host listing
+and session launch APIs keep their existing purpose.
+
+| API | Purpose |
+| --- | --- |
+| `GET /v1/hosts/sandboxes?provider=…` | New: read the caller's controller inventory as `{sandboxes: [{sandbox_id, name}]}`. Requires `reusable_hosts`. |
+| `POST /v1/hosts/attach` | Authorize `{provider, sandbox_id, name}`, register or reuse the host, wake/connect it, return `{host_id}`. |
+| `POST /v1/hosts/{host_id}/wake` | Wake a saved reusable host before selecting a working directory. |
+| `DELETE /v1/hosts/{host_id}` | Remove a reusable registration and its credentials, without deleting the box. |
+| Existing session creation | A provider choice creates a fresh box. A host choice reuses that host. |
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant O as Omnigent
+    participant P as Existing provider plugin
+    participant C as Customer controller
+    U->>O: Choose existing static sandbox
+    O->>P: Bind caller, list_for_user
+    P->>C: List caller's reusable boxes
+    C-->>U: Available boxes via Omnigent
+    U->>O: Select a box
+    O->>P: attach_for_user with selected ID
+    P->>C: Recheck caller access
+    O->>O: Register or reuse host identity
+    O->>P: resume and start_host if offline
+    P->>C: Connect host with supplied identity and token
+    O-->>U: Select connected host for this session
+```
 
 ## Workspace policy
 
 The controller can choose an existing checkout, a per-session worktree, or
 another directory. Omnigent only needs the chosen path to start the session's
 runner there; being a static sandbox does not require a particular policy.
-The create-or-get hook can return a different prepared directory for every
-session started through the provider option, even when the host is already
-online. Direct selection of a saved host still uses existing directory/worktree
-settings and does not call this hook. Enforcing controller workspace policy on
-that path remains a separate integration. `start_host` alone cannot provide
-per-session preparation: a running host can serve many sessions without restarting.
+Today users can choose directories and use the existing worktree settings.
+A controller-driven per-session workspace policy still needs an integration at
+session startup that requests and uses that path. `start_host` alone cannot
+provide this: a running host can serve many new sessions without starting again.
 
 ## Try it
 
@@ -153,13 +180,6 @@ and configure an opt-in provider on an isolated server. Open New session, select
 New session again: the created host should now be available to select. Create
 a second session on that host, then delete the first; the second must stay bound
 and the provider must not delete the box.
-
-For a provider with `get_or_create_for_user`, select **New static sandbox** for
-both sessions. They must have the same `host_id`, distinct runner IDs, and the
-controller's returned workspace paths. Only the first request should create the
-box/start its host. Repeat after sleeping the box and confirm it wakes with the
-same host ID. Test a controller refusal too: the session must fail without
-calling fresh provisioning or deleting the box.
 
 To attach a pre-existing box instead, authenticate as its owner and call:
 
@@ -185,12 +205,17 @@ the same host. Sleep the box through the controller, then click its **Asleep**
 entry to wake it. Ordinary ad hoc sandbox hosts must never appear in that menu.
 Use separate directories or the existing worktree option for concurrent edits.
 
+Create another session with **New static sandbox** and verify it gets a different
+box. Have the controller create a box independently, then choose **Choose existing
+static sandbox…**, select it and start a session. Refreshing the list must not
+start any boxes. Repeat selection and verify the same host registration is reused.
+
 ## Prototype limits
 
-Creating a static box uses the normal provider option. Attaching a pre-existing
-box and detaching a host use the API; there is no discovery or Add dialog. The
-new-session picker has the wake action; other pickers reuse an
-attachment once it is online. Automations retain their existing sandbox
+Discovery and attachment are available in New session and Clone session.
+Detaching still uses the API. The new-session picker has the direct wake action;
+other pickers reuse an attachment once it is online, or connect through discovery.
+Automations retain their existing sandbox
 restrictions. Cross-replica wake coordination retains the existing resume
 implementation's limits; it is not a new distributed lease mechanism.
 

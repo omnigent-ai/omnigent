@@ -3774,6 +3774,22 @@ class SandboxStageObserver(Protocol):
         """
 
 
+async def discover_sandbox_hosts(
+    *, config: ManagedSandboxDeployment, owner: str, provider: str
+) -> Sequence[SandboxInfo]:
+    """Read the caller's controller inventory without registering or waking hosts."""
+    entry = _select_provider_config(config, provider)
+    launcher = _launcher_for_owner(entry, owner)
+    if launcher.provider != provider or not launcher.capabilities.reusable_hosts:
+        raise HTTPException(400, "discovery requires a reusable sandbox provider")
+    try:
+        return await asyncio.to_thread(launcher.list_for_user, owner=owner)
+    except PermissionError as exc:
+        raise HTTPException(403, "sandbox discovery not authorized") from exc
+    except click.ClickException as exc:
+        raise HTTPException(502, "sandbox discovery failed") from exc
+
+
 async def attach_sandbox_host(
     *,
     config: ManagedSandboxDeployment,
@@ -3800,28 +3816,6 @@ async def attach_sandbox_host(
         raise HTTPException(403, "sandbox attachment not authorized") from exc
     except click.ClickException as exc:
         raise HTTPException(502, "sandbox attachment failed") from exc
-    return await _attach_authorized_sandbox_host(
-        config=config,
-        owner=owner,
-        host_store=host_store,
-        provider=provider,
-        sandbox_id=sandbox_id,
-        name=name,
-    )
-
-
-async def _attach_authorized_sandbox_host(
-    *,
-    config: ManagedSandboxDeployment,
-    owner: str,
-    host_store: HostStore,
-    provider: str,
-    sandbox_id: str,
-    name: str | None = None,
-    agent_name: str | None = None,
-    on_stage: Callable[[str], None] | None = None,
-) -> str:
-    """Register a provider-authorized box once, then wake it only if offline."""
     host_id = uuid.uuid5(
         uuid.NAMESPACE_URL,
         repr(("omnigent-attachment", current_workspace_id(), provider, sandbox_id)),
@@ -3830,7 +3824,7 @@ async def _attach_authorized_sandbox_host(
         host = await asyncio.to_thread(
             host_store.reserve_sandbox_host,
             host_id=host_id,
-            name=name or managed_host_name(host_id),
+            name=name,
             user_id=owner,
             provider=provider,
             attached_sandbox_id=sandbox_id,
@@ -3839,9 +3833,7 @@ async def _attach_authorized_sandbox_host(
         raise HTTPException(409, "sandbox is already attached to another host owner") from exc
     if host is None:
         raise HTTPException(409, "host name or sandbox attachment conflicts with an existing host")
-    await resume_managed_host(
-        host.host_id, host_store, config, agent_name=agent_name, on_stage=on_stage
-    )
+    await resume_managed_host(host.host_id, host_store, config)
     return host.host_id
 
 
@@ -3865,10 +3857,7 @@ async def launch_managed_host(
     ``omnigent host`` inside the sandbox with the token + identity in its
     environment → poll the hosts table until the host is online. Any
     failure after provisioning an ad hoc sandbox terminates it and deletes
-    the host row (which revokes the token) before re-raising. Reusable boxes
-    survive failures. A reusable provider may select an existing box through
-    ``get_or_create_for_user``; that path reuses its registration and wakes it
-    only when offline.
+    its host row. Reusable boxes and their registrations survive failures.
 
     :param config: The deployment's offered providers (YAML-parsed or
         wrapped around a directly-constructed embedding config).
@@ -3901,9 +3890,8 @@ async def launch_managed_host(
         (the sandbox exec steps run via ``asyncio.to_thread``), so it
         must be thread-safe. ``None`` disables progress reporting.
     :param host_id: Id to register the host under — a create's
-        ``host_id`` — or ``None`` to mint one. A controller-selected reusable
-        sandbox uses its canonical registration instead. A requested id also
-        makes the host route by it (see :func:`host_slice_key_enabled`).
+        ``host_id`` — or ``None`` to mint one. A requested id also makes the
+        host route by it (see :func:`host_slice_key_enabled`).
     :returns: The registered host id + in-sandbox workspace path
         (the cloned repository directory when *repo* is set).
     :raises HTTPException: 400 when *provider* is not configured or the
@@ -3922,31 +3910,6 @@ async def launch_managed_host(
     try:
         await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
-        selected = (
-            await asyncio.to_thread(launcher.get_or_create_for_user, repos=repos)
-            if reusable
-            else None
-        )
-        if selected is not None:
-            if (
-                not isinstance(selected, SandboxInfo)
-                or not isinstance(selected.sandbox_id, str)
-                or not selected.sandbox_id.strip()
-                or len(selected.sandbox_id) > 256
-                or not isinstance(selected.workspace_path, str)
-                or not selected.workspace_path.strip()
-            ):
-                raise HTTPException(502, "provider must return a sandbox ID and workspace path")
-            attached_host_id = await _attach_authorized_sandbox_host(
-                config=config,
-                owner=owner,
-                host_store=host_store,
-                provider=launcher.provider,
-                sandbox_id=selected.sandbox_id,
-                agent_name=agent_name,
-                on_stage=on_stage,
-            )
-            return ManagedHostLaunch(host_id=attached_host_id, workspace=selected.workspace_path)
         sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
     except OwnerCredentialMissingError as exc:
         # The user must act (connect the provider); not a backend failure.
