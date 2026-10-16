@@ -50,6 +50,13 @@ class FrameKind(str, Enum):
     EVENT_ACK = "event.ack"
 
 
+# Header the server sets on a ``request`` frame that only reads state on a
+# viewer's behalf (e.g. the session-stream snapshot). The runner does not count
+# such a request as activity for its idle watchdog, so a browser tab that keeps
+# reconnecting its streams cannot hold an idle runner open.
+PASSIVE_REQUEST_HEADER = "x-omnigent-passive-request"
+
+
 # ── Frame dataclasses ────────────────────────────────────
 
 

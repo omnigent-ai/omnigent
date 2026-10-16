@@ -59,6 +59,7 @@ from omnigent.runner.launch_failure import (
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.transports.ws_tunnel.frames import (
+    PASSIVE_REQUEST_HEADER,
     EventAckFrame,
     EventBatchFrame,
     encode_frame,
@@ -650,6 +651,47 @@ async def _retry_session_single_flight(
                 lambda completed_task: _evict_retry_recovery_task(session_id, completed_task)
             )
     return await asyncio.shield(task)
+
+
+async def _snapshot_terminal_events(
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    """Fetch a session's terminals from its runner as snapshot events.
+
+    Best-effort and time-boxed: a slow or failing runner yields no events.
+    The request is marked passive (:data:`PASSIVE_REQUEST_HEADER`) because a
+    viewer opening or reconnecting its stream is not runner work and must not
+    reset the runner's idle watchdog.
+
+    :param runner_client: Client bound to the session's runner.
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :returns: One ``session.resource.created`` event per terminal, oldest first.
+    """
+    try:
+        resp = await asyncio.wait_for(
+            # order=asc: the web cache appends each replayed ``created``
+            # event, so the replay must arrive in creation order or the
+            # session's own terminal (always created first) lands behind
+            # later agent-launched ones. limit=1000 (the runner endpoint max)
+            # keeps the oldest-first window from dropping the newest
+            # terminals past the default page of 20.
+            runner_client.get(
+                f"/v1/sessions/{session_id}/resources/terminals",
+                params={"order": "asc", "limit": "1000"},
+                headers={PASSIVE_REQUEST_HEADER: "1"},
+            ),
+            timeout=_SNAPSHOT_RUNNER_TIMEOUT_S,
+        )
+        if resp.status_code != 200:
+            return []
+        return [
+            {"type": "session.resource.created", "resource": item}
+            for item in resp.json().get("data", [])
+        ]
+    except Exception:
+        _logger.debug("snapshot: terminals failed for %s", session_id, exc_info=True)
+        return []
 
 
 class _RunnerNotBoundError(OmnigentError):
@@ -3106,26 +3148,7 @@ def register_events_routes(
             except Exception:
                 _logger.debug("snapshot: child sessions failed for %s", session_id, exc_info=True)
             if runner_client is not None:
-                try:
-                    resp = await asyncio.wait_for(
-                        # order=asc: the web cache appends each replayed
-                        # ``created`` event, so the replay must arrive in
-                        # creation order or the session's own terminal (always
-                        # created first) lands behind later agent-launched
-                        # ones. limit=1000 (the runner endpoint max) keeps the
-                        # oldest-first window from dropping the newest
-                        # terminals past the default page of 20.
-                        runner_client.get(
-                            f"/v1/sessions/{session_id}/resources/terminals",
-                            params={"order": "asc", "limit": "1000"},
-                        ),
-                        timeout=_SNAPSHOT_RUNNER_TIMEOUT_S,
-                    )
-                    if resp.status_code == 200:
-                        for item in resp.json().get("data", []):
-                            events.append({"type": "session.resource.created", "resource": item})
-                except Exception:
-                    _logger.debug("snapshot: terminals failed for %s", session_id, exc_info=True)
+                events.extend(await _snapshot_terminal_events(runner_client, session_id))
             # Tell the client to (re)fetch the changed-files list rather
             # than fetching it here (avoids a second runner round-trip).
             events.append(

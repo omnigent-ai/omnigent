@@ -31,6 +31,7 @@ from omnigent.runner.identity import (
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
 from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
+    PASSIVE_REQUEST_HEADER,
     PingFrame,
     RequestCancelFrame,
     RequestFrame,
@@ -1754,6 +1755,52 @@ async def test_handle_tunnel_frame_marks_request_activity() -> None:
     assert task is not None
     await asyncio.gather(task, return_exceptions=True)
     assert activities == ["activity"]
+
+
+@pytest.mark.asyncio
+async def test_handle_tunnel_frame_does_not_mark_passive_request_activity() -> None:
+    """A request the server marked passive is dispatched but not counted as work.
+
+    The session-stream snapshot fetches a session's terminals on every
+    viewer (re)connect. Counting that as activity kept idle runners alive
+    for as long as a browser tab stayed open. The header name is matched
+    case-insensitively.
+
+    :returns: None.
+    """
+    activities: list[str] = []
+
+    async def _send_text(text: str) -> None:
+        """Ignore response frames from the dispatched request.
+
+        :param text: Encoded tunnel frame.
+        :returns: None.
+        """
+        del text
+
+    dispatch_tasks: dict[str, asyncio.Task[None]] = {}
+    raw = encode_frame(
+        RequestFrame(
+            id="req-passive",
+            method="GET",
+            path="/health",
+            headers=[[PASSIVE_REQUEST_HEADER.upper(), "1"]],
+        )
+    )
+
+    await _handle_tunnel_frame(
+        _noop_app,
+        raw,
+        _send_text,
+        dispatch_tasks,
+        {},
+        on_activity=lambda: activities.append("activity"),
+    )
+
+    task = dispatch_tasks.get("req-passive")
+    assert task is not None
+    await asyncio.gather(task, return_exceptions=True)
+    assert activities == []
 
 
 @pytest.mark.asyncio

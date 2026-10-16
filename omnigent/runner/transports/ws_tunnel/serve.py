@@ -47,6 +47,7 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runner.transports.ws_tunnel.frames import (
     EVENT_INGEST_CAPABILITY,
+    PASSIVE_REQUEST_HEADER,
     EventAckFrame,
     EventReadyFrame,
     HelloFrame,
@@ -1383,6 +1384,15 @@ async def _send_hello(
     )
 
 
+def _is_passive_request(frame: RequestFrame) -> bool:
+    """Return whether the server marked a request frame as passive.
+
+    :param frame: Decoded request frame.
+    :returns: ``True`` when :data:`PASSIVE_REQUEST_HEADER` is present.
+    """
+    return any(name.lower() == PASSIVE_REQUEST_HEADER for name, _value in frame.headers)
+
+
 async def _handle_tunnel_frame(
     app: _ASGIApp,
     raw: str | bytes,
@@ -1406,7 +1416,9 @@ async def _handle_tunnel_frame(
     :param ws_channels: Mutable channel-id to runner-side WS channel
         state map.
     :param on_activity: Optional sync callback fired for non-ping
-        frames that represent real runner work.
+        frames that represent real runner work. Request frames the
+        server marked passive (:data:`PASSIVE_REQUEST_HEADER`) do not
+        fire it.
     :param diagnostics: Connection-local application frame and heartbeat observations.
     :returns: None.
     """
@@ -1435,7 +1447,7 @@ async def _handle_tunnel_frame(
         if diagnostics is not None:
             diagnostics.app_pong_sent()
     elif isinstance(frame, RequestFrame):
-        if on_activity is not None:
+        if on_activity is not None and not _is_passive_request(frame):
             on_activity()
         task = asyncio.create_task(
             dispatch_via_asgi(app, frame, send_text),
