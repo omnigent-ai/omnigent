@@ -211,11 +211,30 @@ def test_grouping_and_show_toggles_persist_across_reload(
 
 
 def test_tooltip_fetches_repo_and_pr_only_when_opened(
-    page: Page, request: pytest.FixtureRequest
+    page: Page, request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Hovering a workspace session loads its repo and PR into the tooltip on demand."""
+    """Branch resolves without hovering; repo and PR still load only on hover."""
     base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
     github_requests: list[str] = []
+    worktree_requests: list[str] = []
+    monkeypatch.setitem(_ROWS[2], "git_branch", None)
+    monkeypatch.setitem(_ROWS[2], "host_id", "sidebar-host")
+
+    def serve_worktrees(route: Route) -> None:
+        worktree_requests.append(route.request.url)
+        route.fulfill(
+            json={
+                "object": "list",
+                "data": [
+                    {
+                        "path": "/tmp/sidebar-view-options",
+                        "branch": "fix/payment-retries",
+                        "is_main": True,
+                        "detached": False,
+                    }
+                ],
+            }
+        )
 
     def serve_github(route: Route) -> None:
         github_requests.append(route.request.url)
@@ -235,9 +254,20 @@ def test_tooltip_fetches_repo_and_pr_only_when_opened(
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", _serve_sessions)
     page.route("**/v1/sessions/*/resources/github*", serve_github)
+    page.route("**/v1/hosts/sidebar-host/worktrees?*", serve_worktrees)
     page.goto(base_url)
     expect(page.get_by_text("Idle session", exact=True)).to_be_visible(timeout=30_000)
     page.wait_for_load_state("networkidle")
+    assert github_requests == []
+    assert worktree_requests == []
+
+    _open_view_submenu(page, "session-show-menu")
+    page.get_by_test_id("session-show-branch").click()
+    page.keyboard.press("Escape")
+    row = page.locator("li").filter(has=page.locator(f'a[href="/c/{_IDLE}"]'))
+    expect(row.get_by_test_id("session-row-meta")).to_have_text("fix/payment-retries")
+    assert worktree_requests
+    assert parse_qs(urlparse(worktree_requests[0]).query)["path"] == ["/tmp/sidebar-view-options"]
     assert github_requests == []
 
     page.locator(f'a[href="/c/{_IDLE}"]').hover()

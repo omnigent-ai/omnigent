@@ -104,7 +104,9 @@ the header menu), and each place is a separate entry point.
   Created and Updated group by their respective date, independently of ordering,
   with the Created/Updated prefix only on the first date section, followed by
   headings such as “Yesterday” and “Earlier”. Environment metadata shows an icon
-  with its label available to screen readers. All groupings replace
+  with its label available to screen readers. Branch also resolves the workspace's
+  checked-out branch when none was recorded at session creation, without hovering.
+  All groupings replace
   Projects, Shared and Sessions with titled groups; the first group's header takes
   the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
   the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
