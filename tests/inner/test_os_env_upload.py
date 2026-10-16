@@ -109,6 +109,57 @@ def test_no_clobber_publish_race(helper: UploadHelperClient, tmp_path: Path) -> 
     assert result["code"] == "file_exists"
 
 
+@pytest.mark.parametrize("conflict", ["fail", "replace"])
+def test_publication_rechecks_staging_bytes(
+    helper: UploadHelperClient, tmp_path: Path, conflict: str
+) -> None:
+    payload = b"abc"
+    digest = hashlib.sha256(payload).hexdigest()
+    changed_id = "b" * 32
+    changed_target = tmp_path / "changed.bin"
+    if conflict == "replace":
+        changed_target.write_bytes(b"old")
+    assert "error" not in begin(
+        helper,
+        id=changed_id,
+        name="changed.bin",
+        size=len(payload),
+        sha256=digest,
+        on_conflict=conflict,
+    )
+    assert helper.call({"op": "append", "id": changed_id, "offset": 0}, payload)["offset"] == 3
+    publication = helper.call({"op": "plan", "id": changed_id})
+    assert "error" not in publication
+
+    staging = tmp_path / f"changed.bin.omnigent-upload-{changed_id}.part"
+    staging.write_bytes(b"xyz")
+    rejected = helper.call({"op": "complete", "id": changed_id, "publication": publication})
+    assert rejected["code"] == "checksum_mismatch"
+    if conflict == "replace":
+        assert changed_target.read_bytes() == b"old"
+    else:
+        assert not changed_target.exists()
+    assert helper.call({"op": "abort", "id": changed_id})["aborted"] is True
+    assert not staging.exists()
+
+    unchanged_id = "c" * 32
+    assert "error" not in begin(
+        helper,
+        id=unchanged_id,
+        name="unchanged.bin",
+        size=len(payload),
+        sha256=digest,
+        on_conflict=conflict,
+    )
+    assert helper.call({"op": "append", "id": unchanged_id, "offset": 0}, payload)[
+        "offset"
+    ] == len(payload)
+    publication = helper.call({"op": "plan", "id": unchanged_id})
+    result = helper.call({"op": "complete", "id": unchanged_id, "publication": publication})
+    assert result["sha256"] == digest
+    assert (tmp_path / "unchanged.bin").read_bytes() == payload
+
+
 def test_replace_atomic(helper: UploadHelperClient, tmp_path: Path) -> None:
     target = tmp_path / "model.3mf"
     old, new = b"a" * 500_000, b"b" * 500_000
