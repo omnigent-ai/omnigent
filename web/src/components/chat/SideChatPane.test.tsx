@@ -19,13 +19,33 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 vi.mock("@/components/composer/ComposerAddMenu", () => ({ ComposerAddMenu: () => null }));
 vi.mock("@/components/ComposerMicButton", () => ({ ComposerMicButton: () => null }));
 const sessionLabels = vi.hoisted(() => ({ current: {} as Record<string, string> }));
+// A conversation id whose snapshot the mock should report as still loading.
+const loadingSession = vi.hoisted(() => ({ id: null as string | null }));
 vi.mock("@/hooks/useSession", () => ({
-  useSession: () => ({ session: { labels: sessionLabels.current }, isLoading: false, error: null }),
+  useSession: (id?: string | null) => ({
+    session: { labels: sessionLabels.current },
+    isLoading: id != null && id === loadingSession.id,
+    error: null,
+  }),
 }));
 vi.mock("@/hooks/useWorkingLabelTick", () => ({ useWorkingLabelTick: () => 0 }));
+const skillsFixture = vi.hoisted(() => ({
+  current: {
+    skills: [] as { name: string; description: string }[],
+    skillsStatus: null as string | null,
+  },
+  lastOptions: null as { target: unknown; enabled?: boolean; starting?: boolean } | null,
+}));
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: (options: { target: unknown; enabled?: boolean; starting?: boolean }) => {
+    skillsFixture.lastOptions = options;
+    return { ...skillsFixture.current, refetch: vi.fn() };
+  },
+}));
 
 const initialStoreState = useChatStore.getState();
 const send = vi.fn<ChatState["send"]>();
+const sendSlashCommand = vi.fn<ChatState["sendSlashCommand"]>();
 const childId = "conv_side_child";
 const queryClient = new QueryClient();
 const renderPane = (ui: ReactNode) =>
@@ -37,8 +57,12 @@ const renderPane = (ui: ReactNode) =>
 
 beforeEach(() => {
   sessionLabels.current = {};
+  loadingSession.id = null;
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
+  sendSlashCommand.mockReset().mockResolvedValue(undefined);
+  skillsFixture.current = { skills: [], skillsStatus: null };
+  skillsFixture.lastOptions = null;
   vi.spyOn(sessionsApi, "interrupt").mockResolvedValue({ queued: true });
   vi.spyOn(sessionsApi, "stopSession").mockResolvedValue({ queued: true });
   vi.spyOn(toast, "error").mockReturnValue("interrupt_error");
@@ -52,6 +76,7 @@ beforeEach(() => {
     sideChatDrafts: {},
     sideChatComposers: {},
     send,
+    sendSlashCommand,
   });
   conversationRegistry.acquire(childId).setState({
     sessionHarness: "codex-native",
@@ -585,5 +610,206 @@ describe("side-chat composer auto-grow", () => {
     // when scrollHeight is 0 (jsdom has no layout). A textarea that doesn't
     // have auto-grow wired up keeps style.height="" (the browser default).
     expect(input.style.height).toBe("auto");
+  });
+});
+
+describe("side-chat slash commands", () => {
+  const review = { name: "review", description: "Review code" };
+
+  function typeSlash(value: string) {
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value } });
+    return input as HTMLTextAreaElement;
+  }
+
+  it("offers the child's skills when typing / in a live side chat", () => {
+    conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
+    skillsFixture.current = { skills: [review], skillsStatus: "ready" };
+    renderPane(<SideChatPane childId={childId} />);
+    const input = typeSlash("/");
+    const row = screen.getByTestId("slash-menu-item-review");
+    expect(row).toBeVisible();
+    // The menu lists the local /help built-in alongside the session's skills.
+    expect(screen.getByTestId("slash-menu-item-help")).toBeVisible();
+    // Choosing a row completes the command into the draft instead of sending.
+    fireEvent.click(row);
+    expect(input.value.startsWith("/review")).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("routes a known skill through the slash_command path on an in-process harness", () => {
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
+    skillsFixture.current = { skills: [review], skillsStatus: "ready" };
+    renderPane(<SideChatPane childId={childId} />);
+    typeSlash("/review 123");
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    expect(sendSlashCommand).toHaveBeenCalledExactlyOnceWith("review", "123", "agent_side", {
+      pinnedConversationId: childId,
+    });
+    expect(send).not.toHaveBeenCalled();
+    expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
+  });
+
+  it("prefers a multi-word skill over a built-in matching only its first word", () => {
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
+    const helpDesk = { name: "help desk", description: "Open a help-desk ticket" };
+    skillsFixture.current = { skills: [helpDesk], skillsStatus: "ready" };
+    renderPane(<SideChatPane childId={childId} />);
+    typeSlash("/help desk summarize");
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    // "/help desk" is a catalog skill whose first word collides with the /help
+    // built-in; the multi-word skill wins and dispatches instead of showing help.
+    expect(sendSlashCommand).toHaveBeenCalledExactlyOnceWith(
+      "help desk",
+      "summarize",
+      "agent_side",
+      { pinnedConversationId: childId },
+    );
+    expect(send).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Show available slash commands/)).toBeNull();
+  });
+
+  it("shows the built-in /help, not a skill that collides with its exact name", () => {
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
+    // A catalog skill literally named "help" can never run — the built-in wins —
+    // so the menu must advertise the built-in, not the skill's description.
+    skillsFixture.current = {
+      skills: [{ name: "help", description: "Run the help skill" }],
+      skillsStatus: "ready",
+    };
+    renderPane(<SideChatPane childId={childId} />);
+    typeSlash("/");
+    expect(screen.getByTestId("slash-menu-item-help")).toHaveTextContent(
+      "Show available slash commands",
+    );
+    expect(screen.queryByText(/Run the help skill/)).toBeNull();
+    // Submitting /help runs the built-in locally; the skill is never dispatched.
+    typeSlash("/help");
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(screen.getByText(/Show available slash commands/)).toBeInTheDocument();
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("treats a still-loading parent lookup as skill discovery in flight", () => {
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
+    // The child names its parent, but that snapshot is still loading, so the skill
+    // target is unresolved. Reporting discovery as in-flight (not "unavailable")
+    // is what later gates a quickly typed /skill from going out as plaintext.
+    sessionLabels.current = { "omnigent.side_chat.source_id": "conv_parent" };
+    loadingSession.id = "conv_parent";
+    skillsFixture.current = { skills: [], skillsStatus: "loading" };
+    renderPane(<SideChatPane childId={childId} />);
+    expect(skillsFixture.lastOptions?.starting).toBe(true);
+    // Submitting a lone command while discovery is in flight holds it locally
+    // instead of leaking "/review" to the agent as plaintext.
+    typeSlash("/review");
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).not.toHaveBeenCalled();
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("sends a lone command with a quote even while skill discovery loads", () => {
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: {
+        [childId]: { text: "", files: [], quotes: ["a selection"] },
+      },
+    });
+    skillsFixture.current = { skills: [], skillsStatus: "loading" };
+    renderPane(<SideChatPane childId={childId} selectionParentId="conv_main" />);
+    typeSlash("/review");
+    // A quote always routes as an ordinary message, so the discovery hold must
+    // not swallow it: the command goes out with the quote instead of stalling.
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      "> a selection\n\n/review",
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId },
+    );
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: "a typed skill", input: "/review 123", menuTestId: "slash-menu-item-review" },
+    { label: "/help", input: "/help", menuTestId: "slash-menu-item-help" },
+  ])("sends $label as plaintext on a native terminal harness", ({ input, menuTestId }) => {
+    // beforeEach binds the child to codex-native: the vendor TUI reads the typed
+    // text itself, so no menu opens and neither local path runs.
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    skillsFixture.current = { skills: [review], skillsStatus: "ready" };
+    renderPane(<SideChatPane childId={childId} />);
+    typeSlash(input);
+    expect(screen.queryByTestId(menuTestId)).toBeNull();
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(input, "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("handles /help locally instead of forwarding it to the agent", () => {
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
+    skillsFixture.current = { skills: [review], skillsStatus: "ready" };
+    renderPane(<SideChatPane childId={childId} />);
+    typeSlash("/help");
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).not.toHaveBeenCalled();
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+    expect(screen.getByText(/Show available slash commands/)).toBeInTheDocument();
+  });
+
+  it("runs /help locally when its menu row is chosen, without sending", () => {
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
+    skillsFixture.current = { skills: [review], skillsStatus: "ready" };
+    renderPane(<SideChatPane childId={childId} />);
+    typeSlash("/help");
+    fireEvent.click(screen.getByTestId("slash-menu-item-help"));
+    // Choosing the built-in row runs it in place: the menu closes to the local
+    // notice and neither send path is used.
+    expect(screen.queryByTestId("slash-menu-item-help")).toBeNull();
+    expect(screen.getByText(/Show available slash commands/)).toBeInTheDocument();
+    expect(send).not.toHaveBeenCalled();
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("fills the draft with a built-in on Tab instead of running it", () => {
+    conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
+    skillsFixture.current = { skills: [review], skillsStatus: "ready" };
+    renderPane(<SideChatPane childId={childId} />);
+    const input = typeSlash("/help");
+    expect(screen.getByTestId("slash-menu-item-help")).toBeVisible();
+    fireEvent.keyDown(input, { key: "Tab" });
+    // Running /help would clear the draft; Tab instead leaves the completed
+    // command text so the user can edit it before sending.
+    expect(input.value.startsWith("/help")).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("keeps the menu closed on a pending tab that has no session yet", () => {
+    skillsFixture.current = { skills: [review], skillsStatus: "ready" };
+    renderPane(
+      <SideChatPane childId="pending:side" onStart={vi.fn().mockResolvedValue(undefined)} />,
+    );
+    typeSlash("/");
+    expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
   });
 });

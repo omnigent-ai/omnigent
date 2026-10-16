@@ -70,7 +70,11 @@ from omnigent.host.frames import (
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
-from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
+from omnigent.native.failure_telemetry import (
+    FailureContext,
+    normalize_failure_context,
+    provider_error_context_from_text,
+)
 from omnigent.native.input_diagnostics import (
     input_attributes,
     log_input_event,
@@ -3515,6 +3519,11 @@ async def _enrich_terminal_status_with_subagent_output(
     if status == "failed":
         context = normalize_failure_context(data.get("failure_context"))
         context.setdefault("failure_source", "external_status")
+        wire_detail = data.get("output")
+        if not isinstance(wire_detail, str) or not wire_detail.strip():
+            wire_detail = data.get("failure_detail")
+        for key, value in provider_error_context_from_text(wire_detail).items():
+            context.setdefault(key, value)
         data = {**data, "failure_context": context}
     current_turn_only = status == "failed" or data.get("turn_outcome") == "cancelled"
     existing = data.get("output")
