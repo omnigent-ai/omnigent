@@ -359,10 +359,12 @@ def _fake_gh(directory: Path, script: str) -> dict[str, str]:
     return {**os.environ, "PATH": f"{directory}{os.pathsep}{os.environ['PATH']}"}
 
 
-def _run_linked_issues(directory: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run_linked_issues(
+    directory: Path, env: dict[str, str], pull_request: str = "test/repo#12"
+) -> subprocess.CompletedProcess[str]:
     destination = directory / "linked_issues.json"
     return subprocess.run(
-        [sys.executable, str(_SCRIPT), "linked-issues", "test/repo#12", str(destination)],
+        [sys.executable, str(_SCRIPT), "linked-issues", pull_request, str(destination)],
         env=env,
         capture_output=True,
         text=True,
@@ -449,39 +451,36 @@ _PARTIAL_NODE = {
 
 
 @pytest.mark.parametrize(
-    ("gh_script", "detail"),
+    ("pull_request", "gh_script", "detail"),
     [
+        ("test-repo-12", "sys.exit(1)\n", "ValueError"),
         (
+            "test/repo#12",
             "sys.stderr.write('HTTP 401: Bad credentials\\n'); sys.exit(1)\n",
             "CalledProcessError: HTTP 401: Bad credentials",
         ),
-        ("print('not json')\n", "JSONDecodeError"),
-        ("print(json.dumps({'data': {'repository': None}}))\n", "TypeError"),
-        (f"print({json.dumps(json.dumps(_PARTIAL_NODE))})\n", "KeyError: 'title'"),
+        ("test/repo#12", "print('not json')\n", "JSONDecodeError"),
+        ("test/repo#12", "print(json.dumps({'data': {'repository': None}}))\n", "TypeError"),
+        (
+            "test/repo#12",
+            f"print({json.dumps(json.dumps(_PARTIAL_NODE))})\n",
+            "KeyError: 'title'",
+        ),
     ],
-    ids=["command-failure", "invalid-json", "missing-pull-request", "partial-node"],
+    ids=[
+        "malformed-reference",
+        "command-failure",
+        "invalid-json",
+        "missing-pull-request",
+        "partial-node",
+    ],
 )
 def test_linked_issues_lookup_failure_records_unavailable(
-    tmp_path: Path, gh_script: str, detail: str
+    tmp_path: Path, pull_request: str, gh_script: str, detail: str
 ) -> None:
-    result = _run_linked_issues(tmp_path, _fake_gh(tmp_path, gh_script))
+    result = _run_linked_issues(tmp_path, _fake_gh(tmp_path, gh_script), pull_request)
 
     assert result.stdout.startswith("::warning::Could not read linked issues")
     assert detail in result.stdout
     assert result.stdout.count("\n") == 1
     assert json.loads((tmp_path / "linked_issues.json").read_text()) is None
-
-
-def test_linked_issues_malformed_pull_request_records_unavailable(tmp_path: Path) -> None:
-    destination = tmp_path / "linked_issues.json"
-    result = subprocess.run(
-        [sys.executable, str(_SCRIPT), "linked-issues", "test-repo-12", str(destination)],
-        env=_fake_gh(tmp_path, "sys.exit(1)\n"),
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=True,
-    )
-
-    assert result.stdout.startswith("::warning::Could not read linked issues")
-    assert json.loads(destination.read_text()) is None

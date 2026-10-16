@@ -276,3 +276,15 @@ def test_review_job_can_read_linked_issues() -> None:
         "pull-requests": "write",
     }
     assert "issues" not in workflow["permissions"]
+
+
+def test_linked_issue_lookup_writes_the_artifact_the_prompt_reads() -> None:
+    workflow = yaml.safe_load(_WORKFLOW.read_text())
+    step = next(s for s in workflow["jobs"]["review"]["steps"] if s.get("id") == "ctx")
+    lookup = (
+        "python3 .github/scripts/polly-review-summary.py linked-issues "
+        '"${REPO}#${PR_NUMBER}" /tmp/linked_issues.json'
+    )
+    prompt_read = 'json.loads(pathlib.Path("/tmp/linked_issues.json").read_text())'
+    assert step["run"].index(lookup) < step["run"].index("python3 -u <<'PYEOF'")
+    assert prompt_read in step["run"].split("python3 -u <<'PYEOF'", 1)[1]
