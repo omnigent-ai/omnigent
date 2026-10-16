@@ -1791,6 +1791,72 @@ async def test_watch_runner_reports_unexpected_exit(
     assert maintenance_reasons == ["runner_exited"]
 
 
+@pytest.mark.parametrize("connected", [False, True])
+async def test_watch_runner_reports_refused_credentials_as_sign_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    connected: bool,
+) -> None:
+    """A runner refused on credentials before connecting asks for a new sign-in.
+
+    The exit is a setup problem the person must fix, so it is categorized as
+    config at launch; any other exit stays a runner fault.
+    """
+    from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    original_popen = subprocess.Popen
+    script = (
+        f"echo 'tunnel rejected (HTTP 401)' >&2; sleep 0.2; exit {RUNNER_AUTH_REJECTED_EXIT_CODE}"
+    )
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Spawn a runner that exits with the credential-rejection code."""
+        return original_popen(
+            ["sh", "-c", script],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_auth", binding_token="tok_auth", workspace=str(workspace)
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+    assert result.status == "launched", result.error
+    handle = host._runners[token_bound_runner_id("tok_auth")]
+    assert handle.connect_marker is not None
+    if connected:
+        handle.connect_marker.touch()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    [report] = [decode_host_frame(sent) for sent in tunnel.sent]
+    assert isinstance(report, HostRunnerExitedFrame)
+    died = next(
+        record for record in caplog.records if getattr(record, "event_name", None) == "runner_died"
+    )
+    assert "tunnel rejected (HTTP 401)" in report.error
+    if connected:
+        assert not report.error.startswith("The server rejected")
+        assert died.attributes["error_category"] == "runner"
+        assert died.attributes["error_phase"] == "unknown"
+    else:
+        assert report.error.startswith("The server rejected this host's credentials")
+        assert " login " in report.error
+        assert died.attributes["error_category"] == "config"
+        assert died.attributes["error_phase"] == "runner_launch"
+
+
 def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     """Redact credentials before exit reports reach the server or SPA."""
     log = tmp_path / "runner-x.log"

@@ -32,9 +32,11 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
+from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
 from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
     RUNNER_TUNNEL_REJECTION_PREFIX,
+    RunnerTunnelAuthRejectedError,
 )
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
@@ -1284,6 +1286,11 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     return dest
 
 
+# The server waits 10s for session init, so throttled spec fetches retry well inside that.
+_SPEC_FETCH_429_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
+_SPEC_FETCH_MAX_RETRY_AFTER_S = 2.0
+
+
 async def _resolve_agent_spec_from_server(
     server_client: httpx.AsyncClient,
     spec_cache_root: Path,
@@ -1307,9 +1314,10 @@ async def _resolve_agent_spec_from_server(
         directory, or ``None`` when the server returns 404 for the
         requested agent.
     :raises RuntimeError: If the server returns a non-200 status
-        other than 404.
+        other than 404, including a 429 that outlasts the retries.
     """
     from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
+    from omnigent.native.native_terminal import request_with_429_retry
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
 
@@ -1321,7 +1329,13 @@ async def _resolve_agent_spec_from_server(
         )
         return None
     path = f"/v1/sessions/{session_id}/agent/contents"
-    resp = await server_client.get(path, headers={MCP_SELECTION_HEADER: "1"})
+    # Every runner re-initializes its sessions when the server restarts, and the
+    # resulting burst gets throttled; a failed fetch here fails the session's init.
+    resp = await request_with_429_retry(
+        lambda: server_client.get(path, headers={MCP_SELECTION_HEADER: "1"}),
+        delays_s=_SPEC_FETCH_429_RETRY_DELAYS_S,
+        max_retry_after_s=_SPEC_FETCH_MAX_RETRY_AFTER_S,
+    )
     if resp.status_code == 404:
         _logger.info(
             "spec_resolver: GET %s returned 404 for missing agent",
@@ -2162,7 +2176,9 @@ def main() -> None:
         # reason but keep stderr to the concise message (no traceback).
         _logger.error("runner exiting: %s", exc, extra={"session_id": runner_primary_session_id()})
         print(f"error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from None
+        # A refused credential gets its own code so the host reports a sign-in problem.
+        auth_rejected = isinstance(exc, RunnerTunnelAuthRejectedError)
+        raise SystemExit(RUNNER_AUTH_REJECTED_EXIT_CODE if auth_rejected else 1) from None
 
 
 if __name__ == "__main__":

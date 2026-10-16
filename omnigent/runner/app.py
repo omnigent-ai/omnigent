@@ -2901,6 +2901,10 @@ def create_runner_app(
                 "opencode-native",
                 "kimi-native",
                 "devin-native",
+                "goose-native",
+                "hermes-native",
+                "kiro-native",
+                "qwen-native",
             ):
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
                     session_id
