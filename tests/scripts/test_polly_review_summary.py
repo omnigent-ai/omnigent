@@ -409,6 +409,8 @@ def test_linked_issues_marks_truncated_bodies_and_omitted_issues(tmp_path: Path)
     args = json.loads((tmp_path / "args.json").read_text())
     assert args[:2] == ["api", "graphql"]
     assert {"owner=test", "name=repo", "number=12"} <= set(args)
+    # -F sends the PR number as the Int the query declares; -f would send a string.
+    assert args[args.index("number=12") - 1] == "-F"
     assert json.loads((tmp_path / "linked_issues.json").read_text()) == {
         "issues": [
             {
@@ -466,3 +468,18 @@ def test_linked_issues_lookup_failure_records_unavailable(
     assert detail in result.stdout
     assert result.stdout.count("\n") == 1
     assert json.loads((tmp_path / "linked_issues.json").read_text()) is None
+
+
+def test_linked_issues_malformed_pull_request_records_unavailable(tmp_path: Path) -> None:
+    destination = tmp_path / "linked_issues.json"
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT), "linked-issues", "test-repo-12", str(destination)],
+        env=_fake_gh(tmp_path, "sys.exit(1)\n"),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+
+    assert result.stdout.startswith("::warning::Could not read linked issues")
+    assert json.loads(destination.read_text()) is None

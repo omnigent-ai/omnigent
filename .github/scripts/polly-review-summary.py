@@ -186,9 +186,9 @@ def compose_review(review: str, stats: dict) -> str:
 
 def linked_issues(pull_request: str) -> dict | None:
     """Return the issues a PR closes, or None when GitHub cannot be read."""
-    repository, number = pull_request.rsplit("#", 1)
-    owner, name = repository.split("/", 1)
     try:
+        repository, number = pull_request.rsplit("#", 1)
+        owner, name = repository.split("/", 1)
         response = subprocess.run(
             [
                 "gh",
@@ -211,16 +211,18 @@ def linked_issues(pull_request: str) -> dict | None:
         references = json.loads(response.stdout)["data"]["repository"]["pullRequest"][
             "closingIssuesReferences"
         ]
-        issues = [
-            {
-                "issue": f"{node['repository']['nameWithOwner']}#{node['number']}",
-                "title": node["title"],
-                "state": node["state"],
-                "body": (node.get("body") or "")[:LINKED_ISSUE_BODY_LIMIT],
-                "body_truncated": len(node.get("body") or "") > LINKED_ISSUE_BODY_LIMIT,
-            }
-            for node in filter(None, references["nodes"])
-        ]
+        issues = []
+        for node in filter(None, references["nodes"]):
+            body = node.get("body") or ""
+            issues.append(
+                {
+                    "issue": f"{node['repository']['nameWithOwner']}#{node['number']}",
+                    "title": node["title"],
+                    "state": node["state"],
+                    "body": body[:LINKED_ISSUE_BODY_LIMIT],
+                    "body_truncated": len(body) > LINKED_ISSUE_BODY_LIMIT,
+                }
+            )
         omitted = max(references["totalCount"] - len(issues), 0)
     except (
         OSError,

@@ -248,10 +248,11 @@ _LINKED_ISSUE_JSON = json.dumps([_LINKED_ISSUE], ensure_ascii=False)
             {"issues": [_LINKED_ISSUE], "omitted": 2},
             f"{_LINKED_ISSUE_JSON}\n(2 more linked issues not shown)",
         ),
+        ({"issues": [], "omitted": 2}, "(2 linked issues not shown)"),
         ({"issues": [], "omitted": 0}, "(none)"),
         (None, "(lookup unavailable)"),
     ],
-    ids=["linked", "omitted", "unlinked", "unavailable"],
+    ids=["linked", "omitted", "omitted-only", "unlinked", "unavailable"],
 )
 def test_prompt_bounds_scope_by_linked_issues(
     prompt_workspace: Path, linked_issues: dict | None, expected: str

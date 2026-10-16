@@ -390,12 +390,12 @@ jobs:
           linked_issues = json.loads(pathlib.Path("/tmp/linked_issues.json").read_text())
           if linked_issues is None:
               linked_issues_section = "(lookup unavailable)"
-          elif not linked_issues["issues"]:
-              linked_issues_section = "(none)"
           else:
-              linked_issues_section = json.dumps(linked_issues["issues"], ensure_ascii=False)
-              if linked_issues["omitted"]:
-                  linked_issues_section += f"\n({linked_issues['omitted']} more linked issues not shown)"
+              shown, omitted = linked_issues["issues"], linked_issues["omitted"]
+              lines = [json.dumps(shown, ensure_ascii=False)] if shown else []
+              if omitted:
+                  lines.append(f"({omitted} {'more ' if shown else ''}linked issues not shown)")
+              linked_issues_section = "\n".join(lines) or "(none)"
           database_guidance_path = pathlib.Path("docs/DATABASE_BEST_PRACTICES.md").resolve()
           try:
               database_guidance = database_guidance_path.read_text(encoding="utf-8")
