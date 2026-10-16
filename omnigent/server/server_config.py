@@ -317,12 +317,19 @@ class BrandingAsset:
 
 @dataclass(frozen=True)
 class BrandingSnapshot:
-    """Immutable branding metadata and validated assets for one app instance."""
+    """Immutable branding metadata and validated assets for one app instance.
+
+    ``server_name`` names this deployment for clients that list several
+    servers (the desktop's server list). It is published in the
+    ``/.well-known/omnigent.json`` manifest, not in the ``/v1/info``
+    branding block, and has no fallback to ``app_name``.
+    """
 
     app_name: str | None
     heading: str | None
     logo_assets: Mapping[str, BrandingAsset]
     powered_by: bool
+    server_name: str | None = None
 
     def config(self) -> dict[str, Any]:
         """Return the public branding block surfaced by ``GET /v1/info``."""
@@ -694,6 +701,7 @@ def load_branding_snapshot(config: Mapping[str, Any] | None = None) -> BrandingS
         heading=_branding_heading(section),
         logo_assets=MappingProxyType(logo_assets),
         powered_by=_branding_powered_by(section),
+        server_name=_branding_str(section, "server_name"),
     )
 
 

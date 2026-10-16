@@ -84,6 +84,17 @@ async def test_owner_can_update_bundle_and_mcp(auth_client: httpx.AsyncClient) -
     session_id = agent["_session_id"]
     headers = {"X-Forwarded-Email": ALICE}
 
+    config_path = f"/v1/agents/{agent['id']}/config"
+    config = await auth_client.get(config_path, headers=headers)
+    assert config.status_code == 200, config.text
+    patched = await auth_client.patch(
+        f"/v1/agents/{agent['id']}",
+        json={"description": "PATCH override"},
+        headers={**headers, "If-Match": config.headers["etag"]},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["description"] == "PATCH override"
+
     put = await auth_client.put(
         f"/v1/sessions/{session_id}/agent",
         files={
@@ -96,6 +107,10 @@ async def test_owner_can_update_bundle_and_mcp(auth_client: httpx.AsyncClient) -
         headers=headers,
     )
     assert put.status_code == 200, put.text
+    assert put.json()["description"] == "v2"
+    saved = await auth_client.get(config_path, headers=headers)
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["description"] == "v2"
 
     mcp = await auth_client.post(
         f"/v1/sessions/{session_id}/agent/mcp-servers",
@@ -139,12 +154,15 @@ async def test_shared_editor_cannot_edit_mcp_servers(auth_client: httpx.AsyncCli
     assert resp.status_code == 403, resp.text
 
 
-async def test_reuse_then_patch_forbidden(auth_client: httpx.AsyncClient) -> None:
+async def test_reuse_then_patch_never_reaches_the_owners_agent(
+    auth_client: httpx.AsyncClient,
+) -> None:
     """Binding the owner's agent into your own session does not let you patch it.
 
     This is the core exploit: BOB is shared ALICE's session, reuses her
-    session-scoped agent in a brand-new session of his own (becoming its
-    owner), then tries to replace the shared agent's code.
+    agent in a brand-new session of his own (becoming its owner), then tries
+    to replace the shared agent's code. His session runs on his own copy, so
+    the patch changes only that copy.
     """
     agent = await create_test_agent(auth_client, name="reused-agent", user=ALICE)
     alice_session = agent["_session_id"]
@@ -158,8 +176,8 @@ async def test_reuse_then_patch_forbidden(auth_client: httpx.AsyncClient) -> Non
     )
     assert reuse.status_code == 201, reuse.text
     bob_session = reuse.json()["id"]
+    assert reuse.json()["agent_id"] != agent["id"], "BOB runs on his own copy"
 
-    # BOB owns his session, but not the agent — the patch must be refused.
     put = await auth_client.put(
         f"/v1/sessions/{bob_session}/agent",
         files={
@@ -171,7 +189,12 @@ async def test_reuse_then_patch_forbidden(auth_client: httpx.AsyncClient) -> Non
         },
         headers={"X-Forwarded-Email": BOB},
     )
-    assert put.status_code == 403, put.text
+    assert put.status_code == 200, put.text
+    alices_agent = await auth_client.get(
+        f"/v1/sessions/{alice_session}/agent", headers={"X-Forwarded-Email": ALICE}
+    )
+    assert alices_agent.json()["id"] == agent["id"]
+    assert alices_agent.json()["description"] != "pwn"
 
 
 async def test_legacy_null_owner_is_admin_only(
@@ -180,10 +203,11 @@ async def test_legacy_null_owner_is_admin_only(
 ) -> None:
     """A legacy (NULL created_by) agent is admin-only to mutate.
 
-    Simulates a pre-migration agent by clearing created_by. Neither a reuser
-    (BOB) nor even the original session owner (ALICE) may mutate it — only an
-    admin. The original owner regains a mutable agent by re-uploading (which
-    creates a fresh owned row), which the other tests already cover.
+    Simulates a pre-migration agent by clearing created_by. Not even the
+    original session owner (ALICE) may mutate it, only an admin; a reuser
+    (BOB) runs on his own copy, so his edits never reach it. The original
+    owner regains a mutable agent by re-uploading (which creates a fresh
+    owned row), which the other tests already cover.
     """
     import sqlalchemy as sa
 
@@ -215,13 +239,14 @@ async def test_legacy_null_owner_is_admin_only(
         )
     }
 
-    # BOB (reuser) is refused.
+    # BOB (reuser) edits only his own copy.
+    assert reuse.json()["agent_id"] != agent["id"]
     bob_put = await auth_client.put(
         f"/v1/sessions/{bob_session}/agent",
         files=bundle_files,
         headers={"X-Forwarded-Email": BOB},
     )
-    assert bob_put.status_code == 403, bob_put.text
+    assert bob_put.status_code == 200, bob_put.text
 
     # Even ALICE (owning-session owner) is refused: a NULL row is admin-only.
     alice_put = await auth_client.put(

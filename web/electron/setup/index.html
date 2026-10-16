@@ -233,20 +233,6 @@
       .recent-copy:hover {
         background: color-mix(in srgb, var(--foreground) 5%, transparent);
       }
-      #other-account {
-        margin-top: 8px;
-        padding: 0;
-        border: none;
-        background: none;
-        color: var(--muted-foreground);
-        font: inherit;
-        font-size: 12px;
-        text-decoration: underline;
-        cursor: pointer;
-      }
-      #other-account[hidden] {
-        display: none;
-      }
       .err {
         margin-top: 12px;
         color: var(--destructive);
@@ -359,17 +345,12 @@
         margin: 0 0 4px;
       }
       .modal-switch-to-new-experience {
+        margin-top: 12px;
         padding: 9px 12px;
         font-weight: 500;
         border: 1px solid var(--border);
         background: var(--background);
         color: var(--foreground);
-        /* Alt/Option-only affordance: reserves its space always so the modal
-           doesn't reflow, but stays invisible until revealed (see .is-visible). */
-        visibility: hidden;
-      }
-      .modal-switch-to-new-experience.is-visible {
-        visibility: visible;
       }
       .modal-switch-to-new-experience:hover {
         color: color-mix(in srgb, var(--foreground) 80%, transparent);
@@ -430,7 +411,7 @@
         top: 0;
         left: 0;
         right: 0;
-        height: 36px;
+        height: 48px;
         -webkit-app-region: drag;
       }
     </style>
@@ -502,7 +483,6 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg>
         </button>
       </div>
-      <button id="other-account" type="button" hidden>Sign in with a different account</button>
       <div class="err" id="err"></div>
 
       <div class="recents" id="managed" hidden>
@@ -558,8 +538,7 @@
     <script>
       // Shared URL helpers (electron/src/url.js), exposed as window.omnigentUrl
       // — the same module the main process uses, so the two never drift.
-      const { isPlainHttpRemote, serverDisplayLabel, normalizeUrl, isDatabricksOAuthServerUrl } =
-        window.omnigentUrl;
+      const { isPlainHttpRemote, serverDisplayLabel } = window.omnigentUrl;
       // Uses the Electron preload bridge (electron/src/preload.js).
       const setup = window.omnigentSetup;
       const input = document.getElementById("url");
@@ -568,7 +547,6 @@
       const connectLabel = document.getElementById("connect-label");
       const connectSpinner = document.getElementById("connect-spinner");
       const cancelConnectButton = document.getElementById("cancel-connect");
-      const otherAccountButton = document.getElementById("other-account");
       let activeConnect = null;
       const err = document.getElementById("err");
 
@@ -596,7 +574,6 @@
       // where the whole point is a *different* server than the saved one.
       if (failedUrl) {
         input.value = failedUrl;
-        renderOtherAccount();
       } else if (!isEphemeral) {
         setup
           .getServerUrl()
@@ -605,19 +582,26 @@
           })
           .catch(() => {
             if (!activeConnect && !input.value) input.value = "http://localhost:6767";
-          })
-          .finally(renderOtherAccount);
+          });
       }
 
       // Organization-provided and recent servers share one rendering path.
       // Managed choices are read-only offers: selecting one uses the ordinary
       // explicit Connect flow and never auto-connects the app.
-      function renderServerList(urls, sectionId, listId, sourceLabel) {
+      function renderServerList(urls, sectionId, listId, sourceLabel, names = {}) {
         if (!Array.isArray(urls) || urls.length === 0) return;
         const section = document.getElementById(sectionId);
         const list = document.getElementById(listId);
         for (const url of urls) {
-          const label = serverDisplayLabel(url);
+          // A server's own name is display only, so its host always shows too.
+          let name = null;
+          try {
+            name = names[new URL(url).origin] ?? null;
+          } catch {
+            // Unparseable entries keep their plain label.
+          }
+          const host = serverDisplayLabel(url);
+          const label = typeof name === "string" && name ? `${name} (${host})` : host;
           const row = document.createElement("div");
           row.className = "recent-row";
 
@@ -677,9 +661,16 @@
           renderServerList(servers, "managed", "managed-list", "organization-provided"),
         )
         .catch(() => {});
+      // Names are cosmetic: a shell without them, or a failed read, lists hosts.
+      const serverNames =
+        typeof setup.getServerNames === "function"
+          ? setup.getServerNames().catch(() => ({}))
+          : Promise.resolve({});
       setup
         .getRecentServers()
-        .then((servers) => renderServerList(servers, "recents", "recents-list", "recent"))
+        .then(async (servers) =>
+          renderServerList(servers, "recents", "recents-list", "recent", (await serverNames) ?? {}),
+        )
         .catch(() => {});
 
       // The exact URL value the user has already been warned about — a
@@ -713,19 +704,6 @@
         });
         document.getElementById("start-local").disabled = busy;
         document.getElementById("cli-gear").disabled = busy;
-        otherAccountButton.disabled = busy;
-        renderOtherAccount();
-      }
-
-      // Connect reuses the saved Databricks sign-in; this offers a fresh browser sign-in.
-      function renderOtherAccount() {
-        let databricks = false;
-        try {
-          databricks = isDatabricksOAuthServerUrl(normalizeUrl(input.value));
-        } catch {
-          // Not a URL yet.
-        }
-        otherAccountButton.hidden = !databricks;
       }
 
       const unsubscribeProgress = setup.onConnectionProgress?.((progress) => {
@@ -766,7 +744,7 @@
         }
       });
 
-      async function connect({ browserSignIn = false } = {}) {
+      async function connect() {
         if (activeConnect || document.getElementById("start-local").disabled) return;
         err.textContent = "";
         const value = input.value;
@@ -781,9 +759,7 @@
         activeConnect = attempt;
         renderConnectState();
         try {
-          const options = { requestId: attempt.requestId };
-          if (browserSignIn) options.browserSignIn = true;
-          const result = await setup.setServerUrl(value, options);
+          const result = await setup.setServerUrl(value, { requestId: attempt.requestId });
           if (activeConnect === attempt && result?.error) err.textContent = result.error;
         } catch (e) {
           if (activeConnect === attempt) err.textContent = String(e && e.message ? e.message : e);
@@ -795,9 +771,7 @@
         }
       }
 
-      button.addEventListener("click", () => connect());
-      otherAccountButton.addEventListener("click", () => connect({ browserSignIn: true }));
-      input.addEventListener("input", renderOtherAccount);
+      button.addEventListener("click", connect);
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter") connect();
       });
@@ -897,33 +871,12 @@
         return false;
       }
 
-      // The "Switch to new experience" button is an Alt/Option-only affordance:
-      // hidden until the user holds Alt while the CLI modal is open. Listeners
-      // are scoped to the modal being open so nothing lingers globally.
-      // visibility (not the `hidden` attribute): reserves layout space so the
-      // modal doesn't reflow when it toggles, and — being visibility:hidden —
-      // it's non-interactive (no clicks, no pointer/cursor) while concealed.
-      const setNewUxVisible = (visible) => {
-        cliModalNewUX.classList.toggle("is-visible", visible);
-      };
-      const onAltKey = (e) => {
-        if (e.key === "Alt") setNewUxVisible(e.type === "keydown");
-      };
       function openCliModal() {
         cliModal.hidden = false;
-        setNewUxVisible(false); // reset: revealed only while Alt is held
-        window.addEventListener("keydown", onAltKey);
-        window.addEventListener("keyup", onAltKey);
-        // Releasing Alt outside the window (focus loss) never fires keyup, so
-        // re-hide when the window is blurred to avoid a stuck-visible button.
-        window.addEventListener("blur", () => setNewUxVisible(false), { once: true });
         void refreshCliStatus();
       }
       function closeCliModal() {
         cliModal.hidden = true;
-        window.removeEventListener("keydown", onAltKey);
-        window.removeEventListener("keyup", onAltKey);
-        setNewUxVisible(false);
       }
 
       if (setup.getCliStatus) {

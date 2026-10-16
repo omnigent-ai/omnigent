@@ -160,6 +160,53 @@ async def test_lost_ack_replays_without_duplicate_item(
     assert [item["content"][0]["text"] for item in items] == ["recovered after restart"]
 
 
+async def test_events_from_a_runner_the_session_moved_off_are_dropped_and_acknowledged(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A superseded runner's late item is acknowledged, so its forwarder posts no failure."""
+    agent = await create_test_agent(client)
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert created.status_code == 201
+    session_id = created.json()["id"]
+    # The session now belongs to a replacement runner; the tunnel below is the old one.
+    assert SqlAlchemyConversationStore(db_uri).set_runner_id(session_id, "runner-replacement")
+
+    dispatcher = RunnerEventDispatcher()
+    comm = await _connect(app)
+    posting: asyncio.Task[httpx.Response] | None = None
+    try:
+
+        async def send(text: str) -> None:
+            await comm.send_input({"type": "websocket.receive", "text": text})
+
+        dispatcher.ready(send)
+        async with TunnelEventClient(
+            base_url="http://server",
+            event_dispatcher=dispatcher,
+            transport=httpx.MockTransport(lambda _: httpx.Response(599)),
+        ) as forwarder:
+            posting = asyncio.create_task(
+                forwarder.post(f"/v1/sessions/{session_id}/events", json=_ITEM)
+            )
+            ack = await _read_ack(comm)
+            assert ack == EventAckFrame(ack.id, 1)
+            dispatcher.acknowledge(ack)
+            response = await asyncio.wait_for(posting, timeout=budget(3.0))
+            assert response.status_code == 202
+    finally:
+        dispatcher.disconnected()
+        if posting is not None:
+            if not posting.done():
+                posting.cancel()
+            await asyncio.gather(posting, return_exceptions=True)
+        await _close(comm)
+
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    assert items == []
+
+
 @pytest.mark.timeout(180)
 async def test_numbered_items_survive_tunnel_disconnect_stages(
     app: FastAPI,

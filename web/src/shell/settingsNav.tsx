@@ -11,10 +11,12 @@ import {
   ArchiveIcon,
   ArrowLeftIcon,
   BlocksIcon,
+  BotIcon,
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
   PaletteIcon,
+  PlugIcon,
   SettingsIcon,
   Share2Icon,
   ShieldCheckIcon,
@@ -26,7 +28,7 @@ import {
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
+import { customAgentsSettingsEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -35,9 +37,11 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 export type SettingsSectionId =
   | "appearance"
   | "harnesses"
+  | "custom-agents"
   | "general"
   | "git"
   | "integrations"
+  | "mcp"
   | "shortcuts"
   | "import"
   | "account"
@@ -51,9 +55,11 @@ export type SettingsSectionId =
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "harnesses",
+  "custom-agents",
   "general",
   "git",
   "integrations",
+  "mcp",
   "shortcuts",
   "import",
   "account",
@@ -93,8 +99,14 @@ export function settingsNavGroups(
   isAdmin = false,
   isSingleUser = false,
   integrationsEnabled = false,
-  harnessesEnabled = false,
+  customAgentsEnabled = false,
+  mcpEnabled = false,
 ): SettingsNavGroup[] {
+  const harnesses: SettingsNavItem = {
+    id: "harnesses",
+    label: "Harnesses",
+    icon: VectorSquareIcon,
+  };
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
@@ -102,12 +114,8 @@ export function settingsNavGroups(
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
-  // WIP: gated behind the `harness_settings_ui` release feature. Slots after Appearance.
-  if (harnessesEnabled) {
-    general.splice(2, 0, { id: "harnesses", label: "Harnesses", icon: VectorSquareIcon });
-  }
-  // Sandbox Integrations appears once any connection provider is wired
-  // (enabled_connections non-empty). Slots right after Git.
+  if (!customAgentsEnabled) general.splice(2, 0, harnesses);
+  // Provider credentials and MCP accounts have separate settings pages.
   if (integrationsEnabled) {
     general.splice(2, 0, {
       id: "integrations",
@@ -115,12 +123,21 @@ export function settingsNavGroups(
       icon: BlocksIcon,
     });
   }
+  if (mcpEnabled) {
+    general.splice(2, 0, { id: "mcp", label: "MCP", icon: PlugIcon });
+  }
   if (hasAuthSession) {
     // Account leads the group when present — it's the most-visited section
     // on a deploy with sign-in.
     general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
   }
   const groups: SettingsNavGroup[] = [{ title: "General", items: general }];
+  if (customAgentsEnabled) {
+    groups.push({
+      title: "Customize",
+      items: [harnesses, { id: "custom-agents", label: "Custom agents", icon: BotIcon }],
+    });
+  }
   // Keep shell-specific settings directly after the cross-platform preferences.
   if (isDesktop) {
     groups.push({
@@ -168,6 +185,7 @@ export function useSettingsRoute(): {
   inSettings: boolean;
   section: SettingsSectionId;
   harness?: string;
+  agentId?: string;
 } {
   const info = useServerInfo();
   const defaultSection: SettingsSectionId = "general";
@@ -185,12 +203,17 @@ export function useSettingsRoute(): {
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
     !(singleUser && (next === "members" || next === "sharing")) &&
-    // Harnesses is WIP behind the `harness_settings_ui` release feature; a deep link to
-    // it while disabled falls back to the default section rather than an empty
-    // page. Keeps content, nav, and header in agreement on availability.
-    !(next === "harnesses" && !isFeatureEnabled(info, "harness_settings_ui"));
+    !(next === "custom-agents" && !customAgentsSettingsEnabled(info));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
+  if (section === "custom-agents" && segments[idx + 2]) {
+    try {
+      return { inSettings: true, section, agentId: decodeURIComponent(segments[idx + 2]) };
+    } catch {
+      // Malformed escapes in a bookmarked URL should not crash Settings.
+      return { inSettings: true, section };
+    }
+  }
   return harness ? { inSettings: true, section, harness } : { inSettings: true, section };
 }
 
@@ -231,8 +254,9 @@ export function SettingsSidebarBody({
   // `/v1/me` (mode-agnostic) so the group appears for admins under OIDC too,
   // not just accounts deploys. Non-admins never see it.
   const isAdmin = useIsAdmin();
-  const integrationsEnabled = info !== "loading" && (info.enabled_connections ?? []).length > 0;
-  const harnessesEnabled = isFeatureEnabled(info, "harness_settings_ui");
+  const integrationsEnabled =
+    info !== "loading" && (info.enabled_connections ?? []).some((provider) => provider !== "mcp");
+  const mcpEnabled = info !== "loading" && (info.enabled_connections ?? []).includes("mcp");
   const { section } = useSettingsRoute();
   const groups = settingsNavGroups(
     hasAuthSession,
@@ -240,7 +264,8 @@ export function SettingsSidebarBody({
     isAdmin,
     isSingleUserMode(info),
     integrationsEnabled,
-    harnessesEnabled,
+    customAgentsSettingsEnabled(info),
+    mcpEnabled,
   );
 
   return (

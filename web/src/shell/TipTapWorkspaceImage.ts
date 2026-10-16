@@ -18,6 +18,7 @@ import { Image } from "@tiptap/extension-image";
 import { Link } from "@tiptap/extension-link";
 import type { AnyExtension } from "@tiptap/core";
 import { fetchFileContent, fileContentToBlob } from "@/hooks/useFileContent";
+import { escapeHtmlAttr } from "@/lib/html";
 
 /**
  * Link extension that survives image-only links (GitHub badge pattern).
@@ -97,16 +98,6 @@ export function resolveWorkspacePath(filePath: string, src: string): string {
     else segments.push(segment);
   }
   return segments.join("/");
-}
-
-/**
- * Minimal HTML attribute-value escaping for serialised ``<img>`` tags.
- *
- * :param value: Raw attribute value, e.g. an image alt text.
- * :returns: Value safe to embed inside a double-quoted HTML attribute.
- */
-function escapeHtmlAttr(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 }
 
 /**

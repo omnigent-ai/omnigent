@@ -1,16 +1,19 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
 import { clearImportReviewRequest, requestImportReview } from "@/lib/importReviewState";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 
 const authenticatedFetchMock = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: authenticatedFetchMock }));
 vi.mock("@/lib/nativeBridge", () => ({ isIOSShell: () => false }));
 
-import { ImportReviewGate, ReviewImportsPanel } from "./HostImportReview";
+import { ImportReviewGate } from "./HostImportReview";
 
 function host(id: string, overrides: Partial<Host> = {}): Host {
   return {
@@ -46,9 +49,25 @@ function serve(
   });
 }
 
-function renderWithClient(ui: ReactNode) {
+// The import modal is gated behind the `import_review` release feature, so the
+// gate renders only when the server advertises it.
+const IMPORT_REVIEW_ON: ServerInfo = {
+  ...FALLBACK_SERVER_INFO,
+  features: { import_review: true },
+};
+
+function renderWithClient(ui: ReactNode, info: ServerInfo | "loading" = IMPORT_REVIEW_ON) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return { client, ...render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>) };
+  return {
+    client,
+    ...render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <CapabilitiesContext.Provider value={info}>{ui}</CapabilitiesContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    ),
+  };
 }
 
 function skillRequestsFor(hostId: string) {
@@ -70,19 +89,19 @@ describe("ImportReviewGate", () => {
     serve([host("a")], { a: ["review"] });
     renderWithClient(<ImportReviewGate />);
 
-    expect(await screen.findByText("Your imports are ready")).toBeTruthy();
+    expect(await screen.findByText("Your setup is ready")).toBeTruthy();
     expect(screen.getByText("/review")).toBeTruthy();
     // A single host isn't named.
     expect(screen.queryByText(/on a-machine/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
 
-    await waitFor(() => expect(screen.queryByText("Your imports are ready")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("Your setup is ready")).toBeNull());
     expect(window.localStorage.getItem("omnigent:imports-reviewed:a")).not.toBeNull();
 
     cleanup();
     renderWithClient(<ImportReviewGate />);
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalled());
-    expect(screen.queryByText("Your imports are ready")).toBeNull();
+    expect(screen.queryByText("Your setup is ready")).toBeNull();
   });
 
   it("skips offline, reviewed, and empty hosts, and names the host among several", async () => {
@@ -96,9 +115,18 @@ describe("ImportReviewGate", () => {
     expect(await screen.findByText(/Found in your harnesses on fresh-machine\./)).toBeTruthy();
     expect(screen.getByText("/c")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    await waitFor(() => expect(screen.queryByText("Your imports are ready")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("Your setup is ready")).toBeNull());
     expect(window.localStorage.getItem("omnigent:imports-reviewed:fresh")).not.toBeNull();
     expect(window.localStorage.getItem("omnigent:imports-reviewed:empty")).toBeNull();
+  });
+
+  it("stays closed when the import_review feature is disabled", () => {
+    serve([host("a")], { a: ["review"] });
+    renderWithClient(<ImportReviewGate />, { ...FALLBACK_SERVER_INFO, features: {} });
+
+    // Flag off: no modal auto-opens, and the gate never even probes for hosts.
+    expect(screen.queryByText("Your imports are ready")).toBeNull();
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
   });
 });
 
@@ -174,22 +202,5 @@ describe("ImportReviewGate with a requested host", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     // With the request cleared, the gate falls back to unreviewed hosts.
     expect(await screen.findByText("/o")).toBeTruthy();
-  });
-});
-
-describe("ReviewImportsPanel", () => {
-  it("reopens the modal for a reviewed host", async () => {
-    window.localStorage.setItem("omnigent:imports-reviewed:a", "x");
-    serve([host("a")], { a: ["review"] });
-    renderWithClient(<ReviewImportsPanel />);
-
-    fireEvent.click(await screen.findByRole("button", { name: "Review imports on a-machine" }));
-    expect(await screen.findByText("/review")).toBeTruthy();
-  });
-
-  it("explains when no machine is online", async () => {
-    serve([host("a", { status: "offline" })], {});
-    renderWithClient(<ReviewImportsPanel />);
-    expect(await screen.findByText(/None of your machines are online/)).toBeTruthy();
   });
 });

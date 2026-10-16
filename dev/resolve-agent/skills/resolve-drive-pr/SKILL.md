@@ -1,6 +1,6 @@
 ---
 name: resolve-drive-pr
-description: Drive an open PR through current CI, independent Polly and OCR reviews, preview, and maintainer handoff.
+description: Drive an open PR through Polly/OCR, validation, and maintainer handoff.
 ---
 
 # Drive an open PR
@@ -9,13 +9,13 @@ Read each resource when reaching its substep, preserving the publication mode:
 
 | Substep | Resource |
 | --- | --- |
-| 4.2, current CI and mergeability | [ci.md](ci.md) |
-| 4.3, independent Polly and OCR reviews | [polly.md](polly.md) |
-| 4.1, preview after CI and both reviews are clean | [preview.md](preview.md) |
+| 4.2, current CI and mergeability | `ci.md` in the shared `otto-drive-pr` skill (load it) |
+| 4.3, independent Polly and OCR reviews | the shared `otto-pr-review-loop` skill (load it) |
+| 4.1, preview after CI and both reviews are clean | `preview.md` in the shared `otto-drive-pr` skill (load it) |
 | 4.4, live-validation instructions | [validation-prompt.md](validation-prompt.md) |
 | 4.5, final review and maintainer handoff | [final-review.md](final-review.md) |
 
-Use `read_skill_file` with this skill name and the relative filename, or read
+Use `read_skill_file` with the owning skill's name and the relative filename, or read
 relative to the directory supplied by the native Skill tool. Workflow-owned
 author runs read only `validation-prompt.md` for deferred body preparation;
 local-only author runs skip this skill. Review-remediation follows its mode's
@@ -24,6 +24,11 @@ exemptions. Load `resolve-handoff` before any interim or final handoff.
 A draft proposal with an unresolved design choice follows `resolve-publish`'s
 incomplete handoff exception. Do not enter this readiness loop or promote the
 draft just to satisfy `review_cycle.py`.
+
+When `.omnigent/pr-gate.json` exists, use the checked-publication commands in
+`resolve-publish` for all PR writes, including replies to findings. CI's
+instructions govern reviewer outages and review budgets. Do not use the direct
+write, approval, fork takeover, or token-recovery recipes in this mode.
 
 ## Step 4 — Land the PR: preview, green CI, clean review, hand it to the maintainer
 
@@ -100,8 +105,8 @@ can land a fix depends on where its branch lives:
     is a bot indicator — the maintainer's approval still merges it.)
 
 Throughout, address the PR you're landing by its number `<pr>`. Continue until
-current CI and both independent reviews are settled; there is **no fixed
-review-round cap**. After every push, request both Polly and OCR for the new head
+current CI and both independent reviews are settled; follow the workflow-provided review budget when present; otherwise there is no fixed
+review-round cap. After every push, request both Polly and OCR for the new head
 (Step 4.3), including pushes for CI or conflict repairs. A fork takeover starts
 this loop on the replacement PR. If a concrete blocker or actual execution
 deadline prevents completion, leave a resumable checkpoint and report

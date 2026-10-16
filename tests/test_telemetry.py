@@ -970,3 +970,18 @@ def test_parse_installation_id_header_rejects_junk(raw: str | None) -> None:
     from omnigent.telemetry.request_headers import parse_installation_id_header
 
     assert parse_installation_id_header(raw) is None
+
+
+def test_isolated_test_runtime_disables_usage_telemetry_without_ci_markers(tmp_path: Path) -> None:
+    """Sanitized test environments suppress analytics before spawning a server."""
+    import omnigent.telemetry.client as telemetry
+    from tests._helpers.live_server import isolated_process_env
+
+    env = isolated_process_env(tmp_path, {}, {"PATH": "/usr/bin"})
+    with (
+        patch.dict("os.environ", env, clear=True),
+        patch.object(telemetry, "TelemetryClient") as client,
+    ):
+        telemetry.init_client()
+        assert telemetry.get_client() is None
+        client.assert_not_called()

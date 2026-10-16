@@ -51,6 +51,8 @@ import uuid
 import httpx
 from playwright.sync_api import Browser, Page, expect
 
+from tests._helpers.browser import user_page
+
 # Unique per test run to avoid cross-test pollution in a long-lived
 # server process.
 _RUN_TAG = uuid.uuid4().hex[:8]
@@ -183,9 +185,7 @@ def test_author_badge_skips_own_messages_and_marks_peers(
     _grant_edit(base_url, session_id, _BOB)
 
     marker = f"shared-author-{uuid.uuid4().hex[:8]}"
-    alice_ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": _ALICE})
-    try:
-        alice = alice_ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": _ALICE}) as alice:
         alice.goto(f"{base_url}/c/{session_id}")
         _send(alice, f"Say 'ack' in one word. {marker}")
 
@@ -201,12 +201,8 @@ def test_author_badge_skips_own_messages_and_marks_peers(
 
         # Still no badge on Alice's own committed bubble.
         expect(_user_bubble(alice, marker).get_by_test_id("message-author")).to_have_count(0)
-    finally:
-        alice_ctx.close()
 
-    bob_ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": _BOB})
-    try:
-        bob = bob_ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": _BOB}) as bob:
         bob.goto(f"{base_url}/c/{session_id}")
 
         # KEY ASSERTION: Bob (a different authenticated viewer) sees the
@@ -216,8 +212,6 @@ def test_author_badge_skips_own_messages_and_marks_peers(
         badge = _user_bubble(bob, marker).get_by_test_id("message-author")
         expect(badge).to_be_visible(timeout=15_000)
         expect(badge).to_have_attribute("aria-label", _ALICE)
-    finally:
-        bob_ctx.close()
 
 
 def test_terminal_typed_message_shows_author_badge_to_peers(
@@ -265,9 +259,7 @@ def test_terminal_typed_message_shows_author_badge_to_peers(
         timeout=10.0,
     ).raise_for_status()
 
-    bob_ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": _BOB})
-    try:
-        bob = bob_ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": _BOB}) as bob:
         # Attribution must work even while the Shared list is inactive.
         bob.route(
             "**/v1/sessions?*",
@@ -287,5 +279,3 @@ def test_terminal_typed_message_shows_author_badge_to_peers(
         badge = bubble.get_by_test_id("message-author")
         expect(badge).to_be_visible()
         expect(badge).to_have_attribute("aria-label", _ALICE)
-    finally:
-        bob_ctx.close()

@@ -801,11 +801,27 @@ def test_device_authorize_refuses_reserved_login_client_id(app: TestClient) -> N
     assert "device_code" not in r.text
 
 
+def _exchange_device_code(client: TestClient, device_code: str):
+    """Exchange an approved *device_code*, waiting out the server's poll interval."""
+    import time
+
+    for _ in range(4):
+        response = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_code,
+            },
+        )
+        if response.json().get("error") != "slow_down":
+            break
+        time.sleep(1.2)
+    return response
+
+
 def test_device_grant_refresh_stays_scope_restricted(app: TestClient) -> None:
     """Third-party device grants keep the delegated scope AND keep rotating —
     the login-grant carve-out must not leak to them."""
-    import time as _time
-
     r = app.post("/oauth/device/authorize", json={"client_id": "slack"})
     data = r.json()
     _login_admin(app)
@@ -814,17 +830,7 @@ def test_device_grant_refresh_stays_scope_restricted(app: TestClient) -> None:
         data={"user_code": data["user_code"]},
         headers={"Origin": "http://localhost:8000"},
     )
-    for _ in range(4):
-        r = app.post(
-            "/oauth/token",
-            data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                "device_code": data["device_code"],
-            },
-        )
-        if r.status_code == 200:
-            break
-        _time.sleep(1.2)
+    r = _exchange_device_code(app, data["device_code"])
     assert r.status_code == 200, r.text
     body = r.json()
     claims = jwt.decode(body["access_token"], options={"verify_signature": False})
@@ -837,6 +843,27 @@ def test_device_grant_refresh_stays_scope_restricted(app: TestClient) -> None:
     )
     assert r2.status_code == 200, r2.text
     assert r2.json()["refresh_token"] != body["refresh_token"]
+
+
+def test_device_code_approved_before_password_change_is_refused(app: TestClient) -> None:
+    """A grant approved before the approver changes their password cannot be
+    exchanged afterwards, even though the device code itself is still valid."""
+    data = app.post("/oauth/device/authorize", json={"client_id": "slack"}).json()
+    _login_admin(app)
+    r = app.post(
+        "/oauth/device/approve",
+        data={"user_code": data["user_code"]},
+        headers={"Origin": "http://localhost:8000"},
+    )
+    assert r.status_code == 200 and "Connected" in r.text
+    r = app.post(
+        "/auth/users/me/password",
+        json={"old_password": "admin-pw-12345", "new_password": "admin-new-pw-12345"},
+    )
+    assert r.status_code == 204, r.text
+    r = _exchange_device_code(app, data["device_code"])
+    assert r.status_code == 400 and r.json()["error"] == "invalid_grant", r.text
+    assert "access_token" not in r.json()
 
 
 def test_web_login_never_issues_refresh(disabled_app: TestClient) -> None:

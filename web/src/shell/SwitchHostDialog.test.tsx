@@ -1,11 +1,13 @@
 import type { ReactNode } from "react";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { SwitchHostDialog } from "./SwitchHostDialog";
 import { useHosts } from "@/hooks/useHosts";
+import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
@@ -56,6 +58,7 @@ vi.mock("./HostLabel", () => ({
   HostLabel: ({ host }: { host: { name: string } }) => <span>{host.name}</span>,
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
 vi.mock("@/hooks/useRecentWorkspaces", () => ({
   useRecentWorkspaces: () => ({ recent: ["/Users/alice/repo"], addRecent: vi.fn() }),
@@ -115,6 +118,7 @@ function renderDialog() {
 }
 
 beforeEach(() => {
+  vi.mocked(useSession).mockReturnValue({ session: null, isLoading: false, error: null });
   useHostsMock.mockReset();
   useHostFilesystemMock.mockReset();
   launchRunnerMock.mockReset();
@@ -136,6 +140,104 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("SwitchHostDialog", () => {
+  it("shows a loading status before exposing a supported host-switch form", async () => {
+    vi.mocked(useSession).mockReturnValue({ session: null, isLoading: true, error: null });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const content = () => (
+      <QueryClientProvider client={client}>
+        <SwitchHostDialog
+          open
+          onOpenChange={() => {}}
+          sessionId="conv_1"
+          currentHostId="host_old"
+        />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(content());
+    expect(screen.getByRole("status")).toHaveTextContent("Checking session capabilities…");
+    expect(screen.queryByTestId("switch-host-button")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("mock-workspace-input")).not.toBeInTheDocument();
+    expect(updateSessionMock).not.toHaveBeenCalled();
+    expect(launchRunnerMock).not.toHaveBeenCalled();
+
+    vi.mocked(useSession).mockReturnValue({
+      session: null,
+      isLoading: false,
+      error: new Error("Session unavailable"),
+    });
+    rerender(content());
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Unable to check session capabilities. Reload to try again.",
+    );
+    expect(screen.getByTestId("switch-host-button")).toBeDisabled();
+
+    vi.mocked(useSession).mockReturnValue({ session: null, isLoading: false, error: null });
+    rerender(content());
+    await waitFor(() => expect(screen.getByTestId("mock-host-select")).toHaveFocus());
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByTestId("switch-host-button")).toBeEnabled();
+  });
+
+  it.each([
+    ["managed snapshot", null],
+    ["Arclet host", "arclet"],
+    ["Databricks Sandbox host", "lakebox"],
+  ])("blocks a directly opened %s dialog before releasing its runner", async (source, provider) => {
+    vi.mocked(useSession).mockReturnValue({
+      session: {
+        id: "conv_1",
+        agentId: "agent_1",
+        agentName: null,
+        status: "idle",
+        title: null,
+        createdAt: 0,
+        items: [],
+        permissionLevel: null,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+        hostId: "host_old",
+        labels: source === "managed snapshot" ? { "omnigent.host_type": "managed" } : {},
+      },
+      isLoading: false,
+      error: null,
+    });
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_old",
+          name: "source-host",
+          owner: "alice",
+          status: "online",
+          sandbox_provider: provider,
+        },
+      ],
+    } as ReturnType<typeof useHosts>);
+    renderDialog();
+    expect(
+      screen.getByText("Switching hosts is not supported for this sandbox session yet."),
+    ).toBeVisible();
+    expect(screen.getByTestId("switch-host-button")).toBeDisabled();
+    expect(screen.queryByTestId("mock-workspace-input")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("switch-host-button"));
+    const user = userEvent.setup();
+    const target = screen.getByRole("group", { name: "Switch host" });
+    expect(target).toHaveAttribute("tabindex", "0");
+    act(() => target.focus());
+    expect(target).toHaveFocus();
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent(
+        "Switching hosts is not supported for this sandbox session yet.",
+      ),
+    );
+    expect(target).toHaveAccessibleDescription(
+      "Switching hosts is not supported for this sandbox session yet.",
+    );
+    await user.keyboard("{Enter} ");
+    expect(updateSessionMock).not.toHaveBeenCalled();
+    expect(launchRunnerMock).not.toHaveBeenCalled();
+  });
+
   it("releases the runner and the model override before launching on the new host", async () => {
     const client = renderDialog();
     const invalidate = vi.spyOn(client, "invalidateQueries");

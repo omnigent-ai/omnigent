@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import contextlib
+import errno
 import json
 import os
 import stat
@@ -42,6 +43,7 @@ from omnigent.inner.codex_goal_command import (
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
+    ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
     TextChunk,
@@ -869,121 +871,196 @@ class TestCodexExecutor(unittest.TestCase):
         _run(_t())
 
     def test_app_server_run_turn_applies_effort_via_thread_settings_update(self):
-        """Reasoning effort rides thread/settings/update, not turn/start.
-
-        Codex's ``TurnStartParams`` has no ``effort`` field, so an effort set
-        on ``turn/start`` is silently dropped by serde and never takes effect.
-        It must go through ``thread/settings/update`` (whose
-        ``ThreadSettingsUpdateParams`` carries ``effort``) — the same path the
-        TUI ``/model`` picker uses.
-        """
-
-        async def _t():
-            session = _CodexAppServerSession(
-                codex_path="/bin/echo",
-                cwd="/tmp/workspace",
-                env={},
-                tool_executor=None,
-            )
-            session.start = AsyncMock()
-            session._proc = _FakeProcess()
-            session._request = AsyncMock(
-                side_effect=[
-                    {"result": {"thread": {"id": "thread-1"}}},  # thread/start
-                    {"result": {}},  # thread/settings/update
-                    {"result": {"turn": {"id": "turn-1"}}},  # turn/start
-                ]
-            )
-
-            async def _inject_turn_completed() -> None:
-                await asyncio.sleep(0.01)
-                session._events.put_nowait(
-                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
-                )
-
-            inject_task = asyncio.create_task(_inject_turn_completed())
-            # Drive the turn to completion (consume the event stream for its
-            # side effects — the RPCs we assert on below).
-            async for _event in session.run_turn(
-                messages=[{"role": "user", "content": "hi"}],
-                tools=[],
-                system_prompt="",
-                model="gpt-5.4-mini",
-                cwd=".",
-                sandbox="workspace-write",
-                reasoning_effort="high",
-            ):
-                pass
-            await inject_task
-
-            methods = [call.args[0] for call in session._request.await_args_list]
-            # Settings update lands BEFORE the turn starts so the effort applies
-            # to this turn, and turn/start carries no (dropped) effort field.
-            self.assertEqual(methods, ["thread/start", "thread/settings/update", "turn/start"])
-            settings_params = session._request.await_args_list[1].args[1]
-            self.assertEqual(
-                settings_params,
-                {
-                    "threadId": "thread-1",
-                    "effort": "high",
-                    "summary": "detailed",
-                },
-            )
-            turn_params = session._request.await_args_list[2].args[1]
-            self.assertNotIn("effort", turn_params)
-
-        _run(_t())
+        """Explicit effort and Default both update the existing thread."""
+        for configured_default in (None, "xhigh"):
+            with self.subTest(configured_default=configured_default):
+                _run(self._assert_app_server_effort_transitions(configured_default))
 
     def test_app_server_run_turn_falls_back_when_settings_update_is_unsupported(self):
         """Older app-server builds accept effort only on ``turn/start``."""
+        for configured_default in (None, "xhigh"):
+            with self.subTest(configured_default=configured_default):
+                _run(
+                    self._assert_app_server_effort_transitions(
+                        configured_default, supports_settings=False
+                    )
+                )
 
-        async def _t():
+    async def _assert_app_server_effort_transitions(
+        self, configured_default: str | None, *, supports_settings: bool = True
+    ):
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+        )
+        session.start = AsyncMock()
+        session._proc = _FakeProcess()
+        default_effort = configured_default or "low"
+        server_effort = default_effort
+        applied_efforts = []
+        turn_count = 0
+
+        async def request(method, params):
+            nonlocal server_effort, turn_count
+            if method == "thread/start":
+                self.assertEqual(params["developerInstructions"], "Keep the passphrase.")
+                self.assertEqual(params["dynamicTools"][0]["name"], "remember")
+                return {
+                    "result": {
+                        "thread": {"id": "thread-1"},
+                        "model": "resolved-model",
+                        "reasoningEffort": configured_default,
+                    }
+                }
+            if method == "model/list":
+                self.assertTrue(params["includeHidden"])
+                if not params.get("cursor"):
+                    return {
+                        "result": {
+                            "data": [{"model": "other-model", "defaultReasoningEffort": "high"}],
+                            "nextCursor": "next-page",
+                        }
+                    }
+                self.assertEqual(params["cursor"], "next-page")
+                return {
+                    "result": {
+                        "data": [{"model": "resolved-model", "defaultReasoningEffort": "low"}],
+                        "nextCursor": None,
+                    }
+                }
+            self.assertEqual(params["threadId"], "thread-1")
+            if method == "thread/settings/update":
+                if not supports_settings:
+                    raise RuntimeError(
+                        "{'code': -32600, 'message': 'Invalid request: unknown variant "
+                        "`thread/settings/update`'}"
+                    )
+                self.assertEqual(params["summary"], "detailed")
+                # Codex maps effort with Option::map(Some): null is a no-op.
+                if params.get("effort") is not None:
+                    server_effort = params["effort"]
+                return {"result": {}}
+            self.assertEqual(method, "turn/start")
+            turn_count += 1
+            self.assertEqual(params["input"], [{"type": "text", "text": f"message-{turn_count}"}])
+            if supports_settings:
+                self.assertNotIn("effort", params)
+            elif params.get("effort") is not None:
+                self.assertEqual(params["summary"], "detailed")
+                server_effort = params["effort"]
+            applied_efforts.append(server_effort)
+            turn = {"id": f"turn-{turn_count}"}
+            asyncio.get_running_loop().call_soon(
+                session._events.put_nowait, {"method": "turn/completed", "params": {"turn": turn}}
+            )
+            return {"result": {"turn": turn}}
+
+        session._request = AsyncMock(side_effect=request)
+        messages = []
+        for index, effort in enumerate((None, "high", "high", None, None, "medium", None), 1):
+            messages.append({"role": "user", "content": f"message-{index}"})
+            async for _ in session.run_turn(
+                messages=messages,
+                tools=[
+                    {
+                        "name": "remember",
+                        "description": "Remember",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+                system_prompt="Keep the passphrase.",
+                model=None,
+                cwd=".",
+                sandbox="workspace-write",
+                reasoning_effort=effort,
+            ):
+                pass
+            messages.append({"role": "assistant", "content": "remembered"})
+            self.assertEqual(server_effort, effort or default_effort, f"turn {index}: {effort=}")
+
+        self.assertEqual(
+            applied_efforts,
+            [
+                default_effort,
+                "high",
+                "high",
+                default_effort,
+                default_effort,
+                "medium",
+                default_effort,
+            ],
+        )
+        methods = [call.args[0] for call in session._request.await_args_list]
+        self.assertEqual(methods.count("thread/start"), 1)
+        self.assertEqual(methods.count("thread/settings/update"), 4)
+        self.assertEqual(methods.count("model/list"), 0 if configured_default else 2)
+        self.assertIsNone(session._applied_effort)
+
+    def test_app_server_run_turn_retries_failed_effort_reset(self):
+        """Failed resets must not start with stale effort or mark Default applied."""
+
+        async def _t(failure):
             session = _CodexAppServerSession(
-                codex_path="/bin/echo",
-                cwd="/tmp/workspace",
-                env={},
-                tool_executor=None,
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
             )
             session.start = AsyncMock()
             session._proc = _FakeProcess()
-            session._request = AsyncMock(
-                side_effect=[
-                    {"result": {"thread": {"id": "thread-1"}}},
-                    RuntimeError(
-                        "{'code': -32600, 'message': 'Invalid request: unknown variant "
-                        "`thread/settings/update`'}"
-                    ),
-                    {"result": {"turn": {"id": "turn-1"}}},
-                ]
-            )
+            session.thread_id = "thread-1"
+            session._thread_model = "resolved-model"
+            session._applied_effort = "high"
+            session._default_effort = None if failure == "catalog" else "low"
+            failing = True
 
-            async def _inject_turn_completed() -> None:
-                await asyncio.sleep(0.01)
-                session._events.put_nowait(
-                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+            async def request(method, params):
+                if method == "model/list":
+                    if failing:
+                        return {"result": {"data": [], "nextCursor": "repeated-cursor"}}
+                    return {
+                        "result": {
+                            "data": [{"model": "resolved-model", "defaultReasoningEffort": "low"}]
+                        }
+                    }
+                if method == "thread/settings/update":
+                    self.assertEqual(params["effort"], "low")
+                    if failure == "legacy turn":
+                        raise RuntimeError("unknown variant `thread/settings/update`")
+                    if failing:
+                        raise RuntimeError("settings rejected")
+                    return {"result": {}}
+                self.assertEqual(method, "turn/start")
+                if failing:
+                    raise RuntimeError("turn rejected")
+                if failure == "legacy turn":
+                    self.assertEqual(params["effort"], "low")
+                asyncio.get_running_loop().call_soon(
+                    session._events.put_nowait,
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}},
                 )
+                return {"result": {"turn": {"id": "turn-1"}}}
 
-            inject_task = asyncio.create_task(_inject_turn_completed())
-            async for _event in session.run_turn(
-                messages=[{"role": "user", "content": "hi"}],
-                tools=[],
-                system_prompt="",
-                model="gpt-5.4-mini",
-                cwd=".",
-                sandbox="workspace-write",
-                reasoning_effort="low",
-            ):
-                pass
-            await inject_task
+            session._request = AsyncMock(side_effect=request)
+            turn_args = {
+                "messages": [{"role": "user", "content": "retry"}],
+                "tools": [],
+                "system_prompt": "",
+                "model": None,
+                "cwd": ".",
+                "sandbox": "workspace-write",
+            }
+            with self.assertRaisesRegex(RuntimeError, "Cannot restore|rejected"):
+                _ = [event async for event in session.run_turn(**turn_args)]
+            self.assertEqual(session._applied_effort, "high")
+            self.assertEqual(session.thread_id, "thread-1")
+            if failure != "legacy turn":
+                self.assertNotIn(
+                    "turn/start", [call.args[0] for call in session._request.await_args_list]
+                )
+            failing = False
+            _ = [event async for event in session.run_turn(**turn_args)]
+            self.assertIsNone(session._applied_effort)
 
-            methods = [call.args[0] for call in session._request.await_args_list]
-            self.assertEqual(methods, ["thread/start", "thread/settings/update", "turn/start"])
-            turn_params = session._request.await_args_list[2].args[1]
-            self.assertEqual(turn_params["effort"], "low")
-            self.assertEqual(turn_params["summary"], "detailed")
-            self.assertEqual(session._applied_effort, "low")
-
-        _run(_t())
+        for failure in ("catalog", "settings", "legacy turn"):
+            with self.subTest(failure=failure):
+                _run(_t(failure))
 
     def test_app_server_run_turn_dedupes_unchanged_effort(self):
         """An unchanged effort is not re-sent on a later turn of one thread.
@@ -1166,7 +1243,7 @@ class TestCodexExecutor(unittest.TestCase):
         _run(_t())
 
     def test_signature_change_recreates_app_session(self):
-        async def _t():
+        async def _t(change_model):
             first = _FakeAppSession([[TurnComplete(response="one")]])
             second = _FakeAppSession([[TurnComplete(response="two")]])
             sessions = [first, second]
@@ -1182,13 +1259,16 @@ class TestCodexExecutor(unittest.TestCase):
                     [{"role": "user", "content": "hi", "session_id": "s1"}],
                     [],
                     "",
+                    config=ExecutorConfig(model="first-model", extra={"reasoning_effort": "high"}),
                 )
             ]
             second_events = [
                 e
                 async for e in executor.run_turn(
                     [{"role": "user", "content": "hi", "session_id": "s1"}],
-                    [
+                    []
+                    if change_model
+                    else [
                         {
                             "name": "sleep",
                             "description": "Sleep",
@@ -1196,6 +1276,7 @@ class TestCodexExecutor(unittest.TestCase):
                         }
                     ],
                     "",
+                    config=ExecutorConfig(model="second-model" if change_model else "first-model"),
                 )
             ]
 
@@ -1203,8 +1284,15 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertEqual(second_events[-1].response, "two")
             self.assertTrue(first.closed)
             self.assertFalse(second.closed)
+            self.assertEqual(first.calls[0]["reasoning_effort"], "high")
+            self.assertIsNone(second.calls[0]["reasoning_effort"])
+            self.assertEqual(
+                second.calls[0]["model"], "second-model" if change_model else "first-model"
+            )
 
-        _run(_t())
+        for change_model in (False, True):
+            with self.subTest(change_model=change_model):
+                _run(_t(change_model))
 
     def test_signature_change_cannot_replace_incompletely_cleaned_session(self):
         async def _t():
@@ -3699,13 +3787,13 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
-def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) -> None:
-    """``.credentials.json`` and its lock dir are symlinked, not left behind.
+def test_populate_codex_home_config_hard_links_remote_mcp_oauth(tmp_path: Path) -> None:
+    """``.credentials.json`` is hard-linked and its lock dir symlinked.
 
     Codex keeps OAuth tokens for remote (``url =``) MCP servers in
-    ``.credentials.json``, guarded across processes by
-    ``mcp-oauth-locks/``. A private home missing them starts those servers
-    unauthenticated while ``command =`` (stdio) servers still work.
+    ``.credentials.json``, guarded across processes by ``mcp-oauth-locks/``,
+    and rewrites it through an ``O_NOFOLLOW`` open that fails on a symlink
+    with ELOOP, so those servers never start.
     """
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
@@ -3720,11 +3808,64 @@ def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) ->
 
     _populate_codex_home_config(target, source)
 
-    # Symlinked (not copied) so a refresh in either direction is shared.
-    assert (target / ".credentials.json").is_symlink()
-    assert (target / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+    bridged = target / ".credentials.json"
+    assert not bridged.is_symlink()
+    assert bridged.samefile(source / ".credentials.json")
+    # Codex's in-place rewrite succeeds and the refresh reaches the real home.
+    fd = os.open(bridged, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, b'{"linear|abc": {"access_token": "t2"}}')
+    finally:
+        os.close(fd)
+    assert (source / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t2"}}'
     assert (target / "mcp-oauth-locks").is_symlink()
     assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
+
+
+def test_populate_codex_home_config_copies_remote_mcp_oauth_across_filesystems(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the store cannot be hard-linked, it is bridged as a private copy."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    def _cross_device_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", _cross_device_link)
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    (source / ".credentials.json").chmod(0o600)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    bridged = target / ".credentials.json"
+    assert not bridged.is_symlink()
+    assert not bridged.samefile(source / ".credentials.json")
+    assert bridged.read_text() == '{"linear|abc": {"access_token": "t"}}'
+    assert stat.S_IMODE(bridged.stat().st_mode) == 0o600
+    bridged.write_text('{"linear|abc": {"access_token": "t2"}}')
+    assert (source / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+
+
+def test_populate_codex_home_config_replaces_legacy_credentials_symlink(tmp_path: Path) -> None:
+    """A native session home reused from before hard-linking drops its symlink."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "reused_codex_home"
+    target.mkdir()
+    (target / ".credentials.json").symlink_to(source / ".credentials.json")
+
+    _populate_codex_home_config(target, source)
+
+    assert not (target / ".credentials.json").is_symlink()
+    assert (target / ".credentials.json").samefile(source / ".credentials.json")
 
 
 def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
@@ -4280,6 +4421,29 @@ def test_app_server_start_preserves_custom_home_from_inherited_private_symlink(
     _run(_t())
 
 
+def test_codex_home_source_preserves_custom_home_from_inherited_credentials_hardlink(
+    tmp_path: Path,
+) -> None:
+    """A nested launch resolves a custom home with no ``auth.json`` or memories symlink."""
+    from omnigent.inner.codex_executor import (
+        _populate_codex_home_config,
+        _resolve_codex_home_config_source,
+    )
+
+    custom_home = tmp_path / "custom-codex-home"
+    custom_home.mkdir()
+    (custom_home / "config.toml").write_text('model_provider = "custom"')
+    (custom_home / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    inherited = tmp_path / "home" / ".omnigent" / "codex-native" / "abc123" / "codex-home"
+    inherited.mkdir(parents=True)
+
+    _populate_codex_home_config(inherited, custom_home)
+
+    assert not (inherited / ".credentials.json").is_symlink()
+    default_home = tmp_path / "home" / ".codex"
+    assert _resolve_codex_home_config_source(inherited, default_home) == custom_home.resolve()
+
+
 def test_populate_codex_home_config_does_not_overwrite_existing(tmp_path: Path) -> None:
     """If a config file already exists in the target (e.g. from a
     previous partial start), it is not replaced.
@@ -4735,13 +4899,15 @@ async def test_codex_cli_version_times_out_and_kills_proc(
         b"codex-cli 0.140.0-alpha.19\n",
         b"codex-cli 0.140.0\n",
         b"codex-cli 0.141.0\n",
+        b"codex-cli 0.145.9\n",
         b"codex-cli 0.146.1-alpha.1\n",
-        b"codex-cli 0.146.1\n",
-        b"codex-cli 1.0.0\n",
+        b"codex-cli 0.159.2-alpha.1\n",
+        b"codex-cli 0.159.2-dev.1\n",
+        b"codex-cli 0.146.0.post1\n",
         b"dependency 0.146.0 codex-cli 0.146.0\n",
     ],
 )
-async def test_brokered_codex_version_gate_rejects_unknown_wire_versions_before_launch(
+async def test_brokered_codex_version_gate_rejects_old_and_unstable_versions_before_launch(
     monkeypatch: pytest.MonkeyPatch,
     output: bytes,
 ) -> None:
@@ -4754,11 +4920,22 @@ async def test_brokered_codex_version_gate_rejects_unknown_wire_versions_before_
         await _require_brokered_codex_version("/usr/local/bin/codex")
 
 
-async def test_brokered_codex_version_gate_accepts_tested_1460(
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"codex-cli 0.146.0\n",
+        b"codex-cli 0.146.1\n",
+        b"codex-cli 0.154.0\n",
+        b"codex-cli 0.159.2\n",
+        b"codex-cli 1.0.0\n",
+    ],
+)
+async def test_brokered_codex_version_gate_accepts_stable_releases_from_0146(
     monkeypatch: pytest.MonkeyPatch,
+    output: bytes,
 ) -> None:
     async def _fake_exec(*_args: Any, **_kwargs: Any) -> _FakeVersionProcess:
-        return _FakeVersionProcess(stdout=b"codex-cli 0.146.0\n")
+        return _FakeVersionProcess(stdout=output)
 
     monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
 
@@ -4870,16 +5047,18 @@ def test_select_codex_skill_dirs_none_and_list(tmp_path: Path) -> None:
 
 
 def test_codex_skill_sources_order_bundle_then_host(tmp_path: Path) -> None:
-    """codex_skill_sources lists <bundle>/skills before <home>/.codex/skills."""
+    """Bundle and Codex-specific skills take precedence over shared skills."""
     from omnigent.inner.codex_executor import codex_skill_sources
 
     bundle = tmp_path / "bundle"
     (bundle / "skills").mkdir(parents=True)
     home = tmp_path / "home"
     (home / ".codex" / "skills").mkdir(parents=True)
+    (home / ".agents" / "skills").mkdir(parents=True)
     assert codex_skill_sources(bundle, home) == [
         bundle / "skills",
         home / ".codex" / "skills",
+        home / ".agents" / "skills",
     ]
 
 
@@ -5501,5 +5680,246 @@ def test_run_turn_clears_stale_gateway_error_at_turn_start():
         # normally rather than fast-failing on it.
         assert any(isinstance(e, TurnComplete) for e in events), events
         assert not any(isinstance(e, ExecutorError) for e in events), events
+
+    _run(_t())
+
+
+# A launcher certificate error plus a connection retry must fail the turn promptly.
+
+_CERTIFICATE_STDERR_LINE = (
+    "Failed to fetch safe flags from proxy: [SSL: SSLV3_ALERT_CERTIFICATE_EXPIRED] "
+    "ssl/tls alert certificate expired (_ssl.c:2580)"
+)
+
+
+def _connection_retry_event(*, http_status: int | None = None) -> dict:
+    """The ``error``/``willRetry`` notification codex-cli 0.154 emits per reconnect."""
+    return {
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "Reconnecting... waiting for network",
+                "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": http_status}},
+                "additionalDetails": "Connection failed: error sending request",
+            },
+            "willRetry": True,
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+        },
+    }
+
+
+def _completed_turn_event() -> dict:
+    return {
+        "method": "turn/completed",
+        "params": {"turn": {"id": "turn-1", "status": "completed"}},
+    }
+
+
+def _session_with_scripted_turn() -> _CodexAppServerSession:
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session._request = AsyncMock(
+        side_effect=[
+            {"result": {"thread": {"id": "thread-1"}}},
+            {"result": {"turn": {"id": "turn-1"}}},
+            {"result": {}},
+        ]
+    )
+    return session
+
+
+async def _run_turn_with_events(session: _CodexAppServerSession, events: list[dict]) -> list:
+    async def _inject() -> None:
+        for event in events:
+            await asyncio.sleep(0.01)
+            session._events.put_nowait(event)
+
+    inject_task = asyncio.create_task(_inject())
+    # Bounded so a head that keeps waiting on Codex's reconnect loop fails
+    # here instead of hanging the suite.
+    async with asyncio.timeout(10):
+        collected = [
+            event
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="Be helpful.",
+                model="gpt-5",
+                cwd=".",
+                sandbox="workspace-write",
+            )
+        ]
+    await inject_task
+    return collected
+
+
+def test_certificate_failure_on_stderr_fails_fast_on_connection_retry():
+    """The launcher's certificate line plus Codex's first reconnect ends the turn."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        try:
+            session = _session_with_scripted_turn()
+            session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+            events = await _run_turn_with_events(session, [_connection_retry_event()])
+
+            errors = [event for event in events if isinstance(event, ExecutorError)]
+            assert len(errors) == 1, events
+            error = errors[0]
+            assert error.retryable is False
+            assert "could not connect to its model endpoint for gpt-5" in error.message
+            assert "the TLS certificate has expired" in error.message
+            assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in error.message
+            assert "wedged LLM" not in error.message
+            assert error.code == "model_endpoint_certificate_rejected"
+            assert error.title == "Codex can't reach its model endpoint"
+            assert error.remediation is not None and "run dbcert" in error.remediation
+            session._request.assert_any_await(
+                "turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}
+            )
+        finally:
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def test_connection_retry_without_certificate_evidence_keeps_waiting():
+    """Codex reconnecting on its own stays a retry; only the idle-watchdog cause is recorded."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        try:
+            session = _session_with_scripted_turn()
+
+            events = await _run_turn_with_events(
+                session, [_connection_retry_event(), _completed_turn_event()]
+            )
+
+            assert not any(isinstance(event, ExecutorError) for event in events), events
+            detail = native_forwarder_health.recent_post_failure(60.0)
+            assert detail is not None
+            assert "reconnecting to its model endpoint" in detail
+            assert "Connection failed: error sending request" in detail
+        finally:
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def test_retry_with_http_status_is_not_blamed_on_certificate():
+    """A retry that got an HTTP response reached the endpoint over TLS, so the turn continues."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        try:
+            session = _session_with_scripted_turn()
+            session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+            events = await _run_turn_with_events(
+                session, [_connection_retry_event(http_status=503), _completed_turn_event()]
+            )
+
+            assert not any(isinstance(event, ExecutorError) for event in events), events
+        finally:
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def _failed_turn_event(message: str) -> dict:
+    return {"method": "turn/failed", "params": {"turn": {"id": "turn-1"}, "message": message}}
+
+
+def test_turn_failed_on_connection_names_certificate_cause():
+    """A connection-level turn failure after the certificate line names the certificate."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+        events = await _run_turn_with_events(
+            session, [_failed_turn_event("stream disconnected: error sending request")]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is False
+        assert "the TLS certificate has expired" in errors[0].message
+        assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in errors[0].message
+        assert "Codex reported: stream disconnected: error sending request" in errors[0].message
+
+    _run(_t())
+
+
+def test_turn_failed_after_connection_retry_names_certificate_cause():
+    """A retry that got no response, then a bare failure, is still the certificate's doing."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+        # Interrupting is best-effort; a failed interrupt must not mask the cause.
+        session._interrupt_failed_turn = AsyncMock()
+
+        events = await _run_turn_with_events(
+            session, [_connection_retry_event(), _failed_turn_event("turn failed")]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is False
+        assert "the TLS certificate has expired" in errors[0].message
+
+    _run(_t())
+
+
+def test_turn_failed_for_unrelated_reason_keeps_its_own_error():
+    """A tool or provider failure keeps Codex's text and stays retryable despite the line."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+        events = await _run_turn_with_events(
+            session, [_failed_turn_event("command exited with code 1")]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is True
+        assert errors[0].message == "command exited with code 1"
+
+    _run(_t())
+
+
+@pytest.mark.parametrize(
+    "turn",
+    [{"id": "turn-1", "status": "completed"}, {"id": "turn-1"}],
+    ids=["status-completed", "legacy-no-status"],
+)
+def test_completed_turn_clears_certificate_evidence(turn: dict):
+    """A turn that reaches the model proves the egress works; the launch-time line is forgotten."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+        assert session._certificate_failure is not None
+
+        events = await _run_turn_with_events(
+            session, [{"method": "turn/completed", "params": {"turn": turn}}]
+        )
+
+        assert not any(isinstance(event, ExecutorError) for event in events), events
+        assert session._certificate_failure is None
 
     _run(_t())

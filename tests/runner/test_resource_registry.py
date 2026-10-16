@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -1265,6 +1266,68 @@ async def test_cleanup_session_closes_primary_env(
         assert not reg.has_primary_env("conv_1")
     finally:
         os.environ.pop("OMNIGENT_RUNNER_OS_ENV_ROOT", None)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe() -> None:
+    """Primary environment cleanup finishes after repeated cancellation."""
+    reg = SessionResourceRegistry()
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    heartbeat_ran_while_blocked = asyncio.Event()
+
+    class _BlockingEnvironment(_FakeOSEnvironment):
+        def close(self) -> None:
+            started.set()
+            assert release.wait(timeout=2.0)
+            self._closed = True
+            finished.set()
+
+    environment = _BlockingEnvironment(
+        spec=OSEnvSpec(type="caller_process", cwd="/tmp", sandbox=OSEnvSandboxSpec(type="none")),
+        cwd=Path("/tmp"),
+    )
+    reg._primary_envs["conv_blocked_cleanup"] = environment
+
+    async def heartbeat() -> None:
+        while not finished.is_set():
+            if started.is_set():
+                heartbeat_ran_while_blocked.set()
+                return
+            await asyncio.sleep(0.01)
+
+    heartbeat_task: asyncio.Task[None] | None = None
+    cleanup_task: asyncio.Task[None] | None = None
+    watchdog = threading.Thread(
+        target=lambda: (release.wait(timeout=2.0), release.set()),
+        name="test-resource-cleanup-watchdog",
+        daemon=True,
+    )
+    watchdog.start()
+    try:
+        heartbeat_task = asyncio.create_task(heartbeat())
+        cleanup_task = asyncio.create_task(reg.cleanup_session("conv_blocked_cleanup"))
+        await asyncio.wait_for(heartbeat_ran_while_blocked.wait(), timeout=1.0)
+        cleanup_task.cancel()
+        await asyncio.sleep(0)
+        cleanup_task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup_task
+    finally:
+        release.set()
+        if cleanup_task is not None and not cleanup_task.done():
+            cleanup_task.cancel()
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+        await asyncio.gather(cleanup_task, heartbeat_task, return_exceptions=True)
+        watchdog.join(timeout=1.0)
+
+    assert finished.is_set()
+    assert environment._closed
+    assert not reg.has_primary_env("conv_blocked_cleanup")
+    assert heartbeat_ran_while_blocked.is_set()
 
 
 # ── Phase 4: cleanup endpoint tests ─────────────────────────────

@@ -28,6 +28,8 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 
+const applicationsByWindow = new WeakMap();
+
 /** Repo root: web/electron/e2e → ../../.. */
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 /** The Electron app package root (its package.json `main` is src/main.js). */
@@ -151,9 +153,12 @@ async function waitForHealthy(url, label, logPath) {
  * not a blank window.
  *
  * @param {string} tmpDir A scratch dir for the db, artifacts, agent, and logs.
+ * @param {{ env?: (serverUrl: string) => Record<string, string> }} [options]
+ *   `env` adds server environment derived from the server's URL (e.g. an OIDC
+ *   redirect URI), since the port is chosen here.
  * @returns {Promise<{ serverUrl: string, close: () => Promise<void> }>}
  */
-async function spawnServer(tmpDir) {
+async function spawnServer(tmpDir, { env: extraEnv } = {}) {
   if (!fs.existsSync(path.join(WEB_UI_DIST, "index.html"))) {
     throw new Error(
       `SPA bundle missing at ${WEB_UI_DIST}. Build it first:\n` +
@@ -197,6 +202,7 @@ async function spawnServer(tmpDir) {
   }
 
   const serverOut = fs.openSync(serverLog, "w");
+  const serverUrl = `http://127.0.0.1:${serverPort}`;
   // Strip ambient runner/host env so a nested runner (if the journey starts a
   // host) boots clean rather than taking the zygote-fork path and hanging —
   // the same leak the Python recorder guards against. Rebuild by filtering
@@ -231,6 +237,7 @@ async function spawnServer(tmpDir) {
         OPENAI_API_KEY: "mock-key",
         ANTHROPIC_API_KEY: "",
         OMNIGENT_WEB_UI_DIST: WEB_UI_DIST,
+        ...extraEnv?.(serverUrl),
       },
       stdio: ["ignore", serverOut, serverOut],
     },
@@ -239,7 +246,6 @@ async function spawnServer(tmpDir) {
   serverProc.on("error", (err) => {
     serverSpawnError = err;
   });
-  const serverUrl = `http://127.0.0.1:${serverPort}`;
 
   const close = async () => {
     for (const proc of [serverProc, mockProc]) {
@@ -358,6 +364,10 @@ function startDisplayCapture(recordDir, display) {
  *   this, so the shell auto-connects on launch.
  * @param {string} [opts.userDataDir] Override the isolated userData dir
  *   (defaults to a fresh temp dir).
+ * @param {Record<string, string>} [opts.env] Extra environment for the app,
+ *   e.g. a scratch `HOME` so credential files stay out of the real one.
+ * @param {string[]} [opts.preload] Modules the main process requires before
+ *   `main.js`, e.g. a stand-in system browser that must exist from launch.
  * @returns {Promise<{ electronApp: import("playwright").ElectronApplication,
  *   window: import("playwright").Page, userDataDir: string,
  *   stopDisplayCapture: () => Promise<void> }>} `stopDisplayCapture` must be
@@ -385,9 +395,14 @@ async function launchDesktop(opts) {
   const profileBootstrap = path.join(userDataDir, "isolate-profile.cjs");
   fs.writeFileSync(
     profileBootstrap,
-    `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n`,
+    `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n` +
+      `const mod = require(${JSON.stringify(path.join(APP_ROOT, "src/browserViewRegistry.js"))});\n` +
+      `const create = mod.createBrowserViewRegistry;\n` +
+      `global.omnigentTestBrowserRegistries = [];\n` +
+      `mod.createBrowserViewRegistry = (...args) => { const registry = create(...args); global.omnigentTestBrowserRegistries.push(registry); return registry; };\n`,
   );
-  const args = ["-r", profileBootstrap, APP_ROOT, `--user-data-dir=${userDataDir}`];
+  const preloads = (opts.preload ?? []).flatMap((file) => ["-r", file]);
+  const args = ["-r", profileBootstrap, ...preloads, APP_ROOT, `--user-data-dir=${userDataDir}`];
   // Headless-Linux / CI hardening, gated on the same env var the Python e2e_ui
   // suite uses (conftest.browser_type_launch_args). Under xvfb — and especially
   // as root or in a container — Electron's Chromium refuses to start without
@@ -416,7 +431,7 @@ async function launchDesktop(opts) {
       recordVideo: { dir: opts.recordDir },
       // Dev builds read dev-app-update.yml and would try to reach the update
       // endpoint; a version override keeps the app off the update path.
-      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0" },
+      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0", ...opts.env },
     });
   } catch (err) {
     await stopDisplayCapture();
@@ -451,6 +466,7 @@ async function launchDesktop(opts) {
     await stopDisplayCapture();
     throw err;
   }
+  applicationsByWindow.set(window, electronApp);
   return { electronApp, window, userDataDir, stopDisplayCapture };
 }
 
@@ -505,7 +521,49 @@ function saveRecording(recordDir, name) {
   return saved;
 }
 
+/** Main-process test setup; this capability is never exposed to a renderer. */
+async function execInBrowserView(window, conversationId, js) {
+  const electronApp = applicationsByWindow.get(window);
+  if (!electronApp) throw new Error("Unknown desktop test window");
+  return electronApp.evaluate(
+    async (_electron, { conversationId: viewId, js: script }) => {
+      const entry = global.omnigentTestBrowserRegistries
+        .map((registry) => registry.get(viewId))
+        .find(Boolean);
+      if (!entry) return { ok: false, error: "No browser view" };
+      try {
+        const result = await entry.view.webContents.executeJavaScript(script, false);
+        return { ok: true, result };
+      } catch (error) {
+        return { ok: false, error: String(error) };
+      }
+    },
+    { conversationId, js },
+  );
+}
+
+/** Create a local fixture through main's test driver, outside renderer IPC. */
+async function openBrowserFixture(window, conversationId, url) {
+  const application = applicationsByWindow.get(window);
+  if (!application) throw new Error("Unknown desktop test window");
+  return application.evaluate(
+    (_electron, { conversationId: viewId, url: target }) => {
+      const registry = global.omnigentTestBrowserRegistries[0];
+      const { ok, error } = registry.openOrNavigate(viewId, target, {
+        x: 40,
+        y: 80,
+        width: 900,
+        height: 520,
+      });
+      return { ok, error };
+    },
+    { conversationId, url },
+  );
+}
+
 module.exports = {
+  execInBrowserView,
+  openBrowserFixture,
   APP_ROOT,
   REPO_ROOT,
   WEB_UI_DIST,

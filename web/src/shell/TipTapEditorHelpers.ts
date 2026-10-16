@@ -18,6 +18,33 @@ import type { Comment } from "@/hooks/useComments";
 const SEP = "\n";
 
 /**
+ * Returns the occurrence of `needle` whose start is closest to `hint`.
+ *
+ * A fixed forward search window is not enough for short selections: another
+ * copy of the same text can sit well within that window, and `indexOf`
+ * returns the first one rather than the one the user selected.
+ */
+function nearestOccurrence(haystack: string, needle: string, hint: number): number {
+  if (!needle) return -1;
+  let best = -1;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  let from = 0;
+  while (from <= haystack.length) {
+    const found = haystack.indexOf(needle, from);
+    if (found === -1) break;
+    const distance = Math.abs(found - hint);
+    if (distance < bestDistance) {
+      best = found;
+      bestDistance = distance;
+    } else if (found > hint) {
+      break;
+    }
+    from = found + 1;
+  }
+  return best;
+}
+
+/**
  * Returns the smallest PM position p where
  * doc.textBetween(0, p, SEP).length >= offset.
  *
@@ -63,12 +90,7 @@ export function findPmRangeForComment(
   const hint =
     rawContent.length > 0 ? Math.round((start_index * textContent.length) / rawContent.length) : 0;
 
-  const WINDOW = 500;
-  const searchFrom = Math.max(0, hint - WINDOW);
-  let textFrom = textContent.indexOf(anchor_content, searchFrom);
-  if (textFrom === -1 || textFrom > hint + WINDOW) {
-    textFrom = textContent.indexOf(anchor_content); // global fallback
-  }
+  const textFrom = nearestOccurrence(textContent, anchor_content, hint);
   if (textFrom === -1) return null;
 
   const from = textOffsetToPmPos(doc, textFrom);
@@ -107,12 +129,7 @@ export function computeSelectionData(
   const hint =
     textContent.length > 0 ? Math.round((textFrom * rawContent.length) / textContent.length) : 0;
 
-  const WINDOW = 500;
-  const searchFrom = Math.max(0, hint - WINDOW);
-  let idx = rawContent.indexOf(anchor_content, searchFrom);
-  if (idx === -1 || idx > hint + WINDOW) {
-    idx = rawContent.indexOf(anchor_content);
-  }
+  const idx = nearestOccurrence(rawContent, anchor_content, hint);
 
   // Fall back to proportional indices when the anchor text isn't found
   // verbatim (multi-line, table, code block selections).

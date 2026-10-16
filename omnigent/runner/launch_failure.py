@@ -20,14 +20,22 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.errors import ErrorCategory
+from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
+from omnigent.llms.errors import detect_request_size_overflow
 
 __all__ = [
     "FailureDiagnosis",
     "classify_native_turn_error",
     "classify_terminal_failure",
     "describe_failure_code",
+    "diagnose_client_update_required",
+    "diagnose_codex_compaction_model_failure",
+    "diagnose_codex_model_rejection",
+    "diagnose_model_unavailable",
 ]
+
+# A Codex turn failed while compacting on the thread's previous model, not the selected one.
+CODEX_COMPACTION_MODEL_FAILED = "codex_compaction_model_failed"
 
 
 @dataclass(frozen=True)
@@ -229,15 +237,28 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "connection lost mid-response",
     "overloaded",
 )
-_TRANSIENT_UPSTREAM_STATUSES = {"500", "502", "503", "504", "529"}
+# 499 is the gateway reporting its own cancelled upstream call, which Claude Code never retries.
+_TRANSIENT_UPSTREAM_STATUSES = {"499", "500", "502", "503", "504", "529"}
+# The gateway's CANCELLED error envelope, which can arrive without a parseable status.
+_UPSTREAM_CANCELLED_ENVELOPE = re.compile(r'"error_code"\s*:\s*"CANCELLED"', re.IGNORECASE)
+# Claude Code's refusal when its installed version predates the selected model, e.g.
+# "Claude Code 2.1.217 does not support this model; version 2.1.280 or newer is required".
+_CLIENT_UPDATE_REQUIRED = re.compile(
+    r"(?:Claude Code\s+(?P<installed>\S+)\s+)?does not support this model;"
+    r"\s+version\s+(?P<required>\S+)\s+or newer is required",
+    re.IGNORECASE,
+)
 
 
 def classify_native_turn_error(code: str, message: str) -> str:
     """Refine a native turn's generic code when its text identifies the cause.
 
     Recognizes rate limits and transient upstream model-gateway failures so
-    the web UI can offer a one-click retry instead of a terminal error. Also
-    corrects ``codex_reauth_required`` when the message reveals that the real
+    the web UI can offer a one-click retry instead of a terminal error, a
+    Claude Code too old for the selected model, and a content-length cap
+    rejection (a request carrying an oversized transcript, refused by the
+    deployment's byte cap before the model sees it). Also corrects
+    ``codex_reauth_required`` when the message reveals that the real
     cause is a budget/usage-limit exhaustion (older runners misclassify the
     gateway's 403 as auth; the server fixes it on deploy).
 
@@ -245,22 +266,175 @@ def classify_native_turn_error(code: str, message: str) -> str:
     :param message: Native harness error text, from its status or transcript.
     :returns: The semantic error code, or the existing code if unrecognized.
     """
+    if code == CODEX_COMPACTION_MODEL_FAILED:
+        # Its budget text names the previous model's limit; the card explains it.
+        return code
     lowered = message.lower()
     if any(fragment in lowered for fragment in _BUDGET_EXHAUSTED_FRAGMENTS):
         return "budget_exhausted"
     if code not in {"native_turn_error", "codex_turn_error"}:
         return code
+    if _CLIENT_UPDATE_REQUIRED.search(message):
+        return "client_update_required"
+    if detect_request_size_overflow(message) is not None:
+        return "context_length_exceeded"
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
     status = status_match.group(1) if status_match else None
     if status in {"401", "403"}:
         return code
     if status == "429" or _RATE_LIMIT_ERROR.search(message):
         return "rate_limit_exceeded"
-    if status in _TRANSIENT_UPSTREAM_STATUSES or any(
-        fragment in lowered for fragment in _TRANSIENT_UPSTREAM_FRAGMENTS
+    if (
+        status in _TRANSIENT_UPSTREAM_STATUSES
+        or _UPSTREAM_CANCELLED_ENVELOPE.search(message)
+        or any(fragment in lowered for fragment in _TRANSIENT_UPSTREAM_FRAGMENTS)
     ):
         return "transient_upstream_error"
     return code
+
+
+def diagnose_client_update_required(message: str) -> FailureDiagnosis | None:
+    """Explain Claude Code's refusal of a model its installed version predates.
+
+    :param message: Turn error text, e.g. ``"API Error: 400 ... Claude Code
+        2.1.217 does not support this model; version 2.1.280 or newer is required"``.
+    :returns: A diagnosis naming the installed and required versions and the
+        update command, or ``None`` when *message* is not that refusal.
+    """
+    match = _CLIENT_UPDATE_REQUIRED.search(message)
+    if match is None:
+        return None
+    installed = match.group("installed")
+    client = f"Claude Code {installed}" if installed else "Claude Code"
+    return FailureDiagnosis(
+        title="Claude Code needs an update",
+        cause=(
+            f"{client} on the host doesn't support this model; "
+            f"version {match.group('required')} or newer is required."
+        ),
+        remediation="Run `claude update` on the host, then start a new session.",
+    )
+
+
+def diagnose_codex_model_rejection(message: str) -> FailureDiagnosis | None:
+    """Explain Codex's explicit refusal of a model on a ChatGPT account."""
+    if "model is not supported when using codex with a chatgpt account" not in message.lower():
+        return None
+    return FailureDiagnosis(
+        title="Model unavailable with ChatGPT login",
+        cause=message.strip(),
+        remediation=(
+            "Choose a model supported by your ChatGPT account using the model picker or /model. "
+            f"To use another provider, configure it for Codex with `{cli_invocation()} setup` "
+            "on the host, then start a new session."
+        ),
+    )
+
+
+# Provider model-not-found shapes, matched narrowly so unrelated 404s, auth,
+# rate-limit, and budget failures keep their own handling.
+# Claude Code: "There's an issue with the selected model (<id>). It may not exist..."
+_MODEL_UNAVAILABLE_MARKER = "issue with the selected model"
+# Anthropic's not-found body for an unknown model id, as a harness forwards it:
+# `404 {"type":"error","error":{"type":"not_found_error","message":"model: <id>"}}`.
+_ANTHROPIC_MODEL_NOT_FOUND = re.compile(r'"message"\s*:\s*"model:\s*[^"\s]+"', re.IGNORECASE)
+_NOT_FOUND_STATUS = re.compile(r"\b404\b|not_found_error", re.IGNORECASE)
+# OpenAI's rejection of an unknown or inaccessible model id; the prose form must
+# name the model so other "does not exist" resource errors stay unlabeled.
+_OPENAI_MODEL_NOT_FOUND = re.compile(
+    r'"code"\s*:\s*"model_not_found"'
+    r"|\bmodel\b[^\n]{0,120}?does not exist or you do not have access to it",
+    re.IGNORECASE,
+)
+
+
+def _is_model_unavailable(message: str) -> bool:
+    if _MODEL_UNAVAILABLE_MARKER in message.lower():
+        return True
+    if _OPENAI_MODEL_NOT_FOUND.search(message):
+        return True
+    return bool(_NOT_FOUND_STATUS.search(message) and _ANTHROPIC_MODEL_NOT_FOUND.search(message))
+
+
+def diagnose_model_unavailable(message: str) -> FailureDiagnosis | None:
+    """Explain a provider rejecting the selected model, with a recovery hint.
+
+    Applies where the harness forwards the provider's rejection without a next
+    step: the in-process SDK path and Pi's forwarded ``Pi model error: 404 …``
+    item. Claude Code appends its own ``/model`` hint. Returns ``None`` for
+    anything that is not a model-not-found rejection.
+    """
+    if not _is_model_unavailable(message):
+        return None
+    return FailureDiagnosis(
+        title="Model unavailable",
+        cause=message.strip(),
+        remediation=(
+            "Choose a different model with the model picker or /model, or check that the "
+            "provider is configured and your account can access this model."
+        ),
+    )
+
+
+def diagnose_codex_compaction_model_failure(
+    code: str, *, compaction_model: str, selected_model: str
+) -> FailureDiagnosis:
+    """Explain a turn that failed while Codex compacted on its previous model.
+
+    After a model switch, Codex compacts the conversation on the previous model
+    before the first turn on the new one, and retries that on every later turn.
+    A fork rebuilds the conversation from Omnigent's history without it.
+
+    :param code: Classified failure code, e.g. ``"budget_exhausted"``.
+    :param compaction_model: Model Codex compacted on, e.g.
+        ``"system.ai.gpt-6-astra"``.
+    :param selected_model: Model the session selected, e.g.
+        ``"system.ai.gpt-6-1-sol"``.
+    :returns: The failure diagnosis for the card.
+    """
+    from omnigent.models.codex_model_vocabulary import bare_model_id
+
+    previous = bare_model_id(compaction_model)
+    selected = bare_model_id(selected_model)
+    # Each cause is stored as a 256-character label, so it names each model once.
+    if code in {"rate_limit_exceeded", "transient_upstream_error"}:
+        return FailureDiagnosis(
+            title=f"Codex can't compact on {previous} right now",
+            cause=(
+                f"Codex compacts this conversation on the previous model, {previous}, "
+                f"before switching to {selected}, and that model is temporarily unavailable."
+            ),
+            # These keep their Retry action, so Fork is only in the session menu.
+            remediation=(
+                f"Retry later, or choose Fork in the session menu to continue on {selected}."
+            ),
+            category=ErrorCategory.UPSTREAM,
+        )
+    repeated = (
+        f"Codex retries it every turn before switching to {selected}, "
+        "so switching models doesn't help."
+    )
+    fork = (
+        f"Fork this session to continue on {selected}. The fork rebuilds the "
+        f"conversation from its history, so it doesn't need {previous}."
+    )
+    if code == "budget_exhausted":
+        # Lead with the gateway's refusal: the budget, not Codex, is the root cause.
+        return FailureDiagnosis(
+            title=f"{previous} is over its AI gateway budget",
+            cause=(
+                f"The AI gateway refused a compaction request on {previous}: its budget is "
+                f"exhausted. {repeated}"
+            ),
+            remediation=f"{fork} Or ask an admin to raise that budget.",
+            category=ErrorCategory.USER,
+        )
+    return FailureDiagnosis(
+        title=f"Codex can't compact on {previous}",
+        cause=f"{previous} rejected a compaction request. {repeated}",
+        remediation=fork,
+        category=ErrorCategory.UPSTREAM,
+    )
 
 
 # --- failure-code English fallbacks -------------------------------------------
@@ -288,6 +462,9 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "Codex hit an error reloading the earlier transcript, so it started a fresh thread."
     ),
     "codex_turn_error": "Codex ran into an error during this turn.",
+    CODEX_COMPACTION_MODEL_FAILED: (
+        "Codex couldn't compact the conversation on the previous model, so this turn didn't run."
+    ),
     "databricks_sign_in_pending": "The agent is waiting for a Databricks sign-in.",
     "agent_startup_pending": "The agent is still starting in the session terminal.",
     "databricks_sign_in_completed": "The Databricks sign-in completed and the agent is ready.",
@@ -302,6 +479,11 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "The AI gateway refused this turn because a spending budget or usage limit is "
         "exhausted. Contact an admin to raise it, or use a different budget."
     ),
+    "client_update_required": (
+        "The agent CLI on the host is too old for the selected model. Update it on the "
+        "host, then start a new session."
+    ),
+    "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 
 

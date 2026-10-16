@@ -357,11 +357,11 @@ def credential_label(
         databricks credential whose profile is unknown to the caller).
     :param display_name: The provider's own display name for a
         ``cli-config`` credential — the ``name`` field of its
-        ``[model_providers.X]`` table, e.g. ``"Databricks AI Gateway"``;
+        ``[model_providers.X]`` table, e.g. ``"Databricks Unity Gateway"``;
         ``None`` for other kinds (and when the table named none, falling
         back to *provider_name*).
     :returns: A human label, e.g. ``"Subscription"``, ``"Anthropic API
-        Key"``, ``"Databricks (oss)"``, ``"Databricks AI Gateway"``, or a
+        Key"``, ``"Databricks (oss)"``, ``"Databricks Unity Gateway"``, or a
         gateway's display name.
     """
     if kind == SUBSCRIPTION_KIND:
@@ -514,7 +514,7 @@ def add_menu_options() -> list[AddOption]:
         # selecting it aborts with the same hint (_configure_harness_add).
         _opt(
             "Databricks — workspace",
-            "Route harnesses through a Databricks workspace's Unity AI Gateway (via ucode)."
+            "Route harnesses through a Databricks workspace's Unity Gateway (via ucode)."
             if databricks_sdk_installed()
             # Markup-safe (rendered via Text.from_markup): no literal
             # brackets, so the extra is named in prose here and the exact
@@ -915,7 +915,7 @@ def build_cli_config_provider_entry(
     A cli-config provider pins a custom model provider defined in the
     harness CLI's own config file (today: a ``[model_providers.X]`` table
     in ``~/.codex/config.toml`` with self-contained auth, e.g. the
-    Databricks AI Gateway written by ``isaac configure codex``). The
+    Databricks Unity Gateway written by ``isaac configure codex``). The
     provider definition and credential stay in that file; this entry only
     records which provider the launch selects.
 
@@ -924,11 +924,11 @@ def build_cli_config_provider_entry(
     :param model_provider: The ``[model_providers.X]`` id to pin, e.g.
         ``"Databricks"``.
     :param display_name: The provider table's ``name`` field, snapshotted
-        for display, e.g. ``"Databricks AI Gateway"``; ``None`` omits it
+        for display, e.g. ``"Databricks Unity Gateway"``; ``None`` omits it
         (labels fall back to the entry name).
     :returns: A provider entry body, e.g. ``{"kind": "cli-config", "cli":
         "codex", "model_provider": "Databricks", "display_name":
-        "Databricks AI Gateway"}``.
+        "Databricks Unity Gateway"}``.
     """
     body: dict[str, object] = {
         "kind": CLI_CONFIG_KIND,

@@ -26,7 +26,7 @@ prompt: |
 # NOT in Omnigent's provider config — so this spec declares no ``executor.auth``
 # block.
 #
-# To route through a gateway (Databricks AI gateway / vendor-neutral proxy)
+# To route through a gateway (Databricks Unity Gateway / vendor-neutral proxy)
 # instead, either set ``HARNESS_KIMI_GATEWAY_BASE_URL`` +
 # ``HARNESS_KIMI_GATEWAY_API_KEY`` in the shell, or declare a
 # ``executor.auth: {type: databricks, profile: …}`` block and let Omnigent

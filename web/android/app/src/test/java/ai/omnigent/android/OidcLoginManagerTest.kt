@@ -2,8 +2,11 @@ package ai.omnigent.android
 
 import android.app.Activity
 import android.os.Looper
+import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
+import org.json.JSONObject
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -14,7 +17,10 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import java.net.InetSocketAddress
+import java.security.MessageDigest
+import java.util.Base64
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
@@ -167,23 +173,84 @@ class OidcLoginManagerTest {
         )
     }
 
+    @Test
+    fun `login sends a challenge and polls with its matching verifier header`() {
+        val loginRequests = LinkedBlockingQueue<Pair<String, String>>()
+        val pollRequests = LinkedBlockingQueue<Pair<String, String>>()
+        val (origin, _) =
+            startOrigin(
+                onLogin = { ex ->
+                    loginRequests.add(
+                        ex.requestMethod to ex.requestBody.bufferedReader().use { it.readText() },
+                    )
+                },
+                onPoll = { ex ->
+                    pollRequests.add(
+                        ex.requestURI.toString() to
+                            ex.requestHeaders.getFirst("X-Omnigent-Code-Verifier").orEmpty(),
+                    )
+                },
+                pollToken = "aaa.bbb.ccc",
+            )
+        val delivered = mutableListOf<String>()
+        assertTrue(manager.start(activity, origin, { delivered += it }))
+        val login = loginRequests.poll(10, TimeUnit.SECONDS)
+        assertTrue("ticket request was never received", login != null)
+        assertEquals("POST", login!!.first)
+        val body = JSONObject(login.second)
+        assertEquals("S256", body.getString("code_challenge_method"))
+        assertEquals(2, body.length())
+
+        val poll = pollRequests.poll(10, TimeUnit.SECONDS)
+        assertTrue("poll request was never received", poll != null)
+        assertEquals("/auth/cli-poll?ticket=t-1", poll!!.first)
+        val verifier = poll.second
+        assertTrue(verifier.matches(Regex("[A-Za-z0-9_-]{43}")))
+        val challenge =
+            Base64.getUrlEncoder().withoutPadding().encodeToString(
+                MessageDigest
+                    .getInstance(
+                        "SHA-256",
+                    ).digest(verifier.toByteArray(Charsets.US_ASCII)),
+            )
+        assertEquals(challenge, body.getString("code_challenge"))
+        val deadline = System.currentTimeMillis() + 10_000
+        while (delivered.isEmpty() && System.currentTimeMillis() < deadline) {
+            drainMainLooper()
+            if (delivered.isEmpty()) Thread.sleep(5)
+        }
+        assertEquals(listOf("aaa.bbb.ccc"), delivered)
+    }
+
     /**
      * Stand up a local origin whose `/auth/cli-login` immediately returns a
      * ticket (so the manager posts its browser launch) and whose
      * `/auth/cli-poll` stays pending forever. Returns the origin URL plus a
      * latch that fires once cli-login has been served.
      */
-    private fun startOrigin(): Pair<String, CountDownLatch> {
+    private fun startOrigin(
+        onLogin: (HttpExchange) -> Unit = {},
+        onPoll: (HttpExchange) -> Unit = {},
+        pollToken: String? = null,
+    ): Pair<String, CountDownLatch> {
         val loginServed = CountDownLatch(1)
         val s = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         s.createContext("/auth/cli-login") { ex ->
+            onLogin(ex)
             val bytes = """{"ticket":"t-1","login_url":"/login/oidc?ticket=t-1"}""".toByteArray()
             ex.sendResponseHeaders(200, bytes.size.toLong())
             ex.responseBody.use { it.write(bytes) }
             loginServed.countDown()
         }
         s.createContext("/auth/cli-poll") { ex ->
-            ex.sendResponseHeaders(202, -1) // still pending
+            onPoll(ex)
+            if (pollToken == null) {
+                ex.sendResponseHeaders(202, -1) // still pending
+            } else {
+                val bytes = JSONObject().put("token", pollToken).toString().toByteArray()
+                ex.sendResponseHeaders(200, bytes.size.toLong())
+                ex.responseBody.use { it.write(bytes) }
+            }
             ex.close()
         }
         s.start()

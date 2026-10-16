@@ -1,56 +1,9 @@
 import { useCallback } from "react";
 
-import { useGithubInfo } from "@/hooks/useGithub";
-import type { HostWorktree } from "@/hooks/useHostWorktrees";
+import { usePullRequestInfo } from "@/hooks/usePullRequests";
+import { matchWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
-
-/** Windows drive-letter absolute path, e.g. ``C:\repo`` / ``C:/repo``. */
-const WINDOWS_ABS_PATH = /^[A-Za-z]:[/\\]/;
-
-/**
- * Canonicalize a path for comparison, mirroring the backend boundary check in
- * `_workspace_validation._is_subpath_of`: when either side is a Windows
- * absolute path, treat ``\`` as a separator and drive-letter case as
- * insignificant; on POSIX keep case and treat ``\`` as a legal filename char.
- * Trailing separators are dropped so they never affect identity.
- */
-function canonicalizePath(path: string, windows: boolean): string {
-  const canon = windows ? path.replace(/\\/g, "/").toLowerCase() : path;
-  return canon.replace(/\/+$/, "");
-}
-
-type MatchKind = { kind: "exact" | "contains"; length: number } | { kind: "none" };
-
-/** How ``workspace`` relates to a worktree ``root``, platform-aware. */
-function matchKind(root: string, workspace: string): MatchKind {
-  const windows = WINDOWS_ABS_PATH.test(root) || WINDOWS_ABS_PATH.test(workspace);
-  const r = canonicalizePath(root, windows);
-  const w = canonicalizePath(workspace, windows);
-  if (w === r) return { kind: "exact", length: r.length };
-  // Boundary-aware containment: `/a/foo` is not under `/a/fo` (prefix collision).
-  if (w.startsWith(`${r}/`)) return { kind: "contains", length: r.length };
-  return { kind: "none" };
-}
-
-/**
- * The worktree whose root contains ``workspace`` — exact match, else the
- * deepest root ``workspace`` sits under (a workspace bound to a subdir of a
- * worktree). ``null`` when nothing contains it. Path comparison is
- * platform-aware (see {@link matchKind}).
- */
-function matchWorktree(worktrees: HostWorktree[], workspace: string): HostWorktree | null {
-  let best: HostWorktree | null = null;
-  let bestLength = -1;
-  for (const wt of worktrees) {
-    const match = matchKind(wt.path, workspace);
-    if (match.kind === "exact") return wt;
-    if (match.kind === "contains" && match.length > bestLength) {
-      best = wt;
-      bestLength = match.length;
-    }
-  }
-  return best;
-}
+import { gitProviderCopy } from "@/lib/gitProviders";
 
 /** How much we actually know about the session's checked-out branch. */
 export type ComposerBranchState =
@@ -80,6 +33,8 @@ export interface ComposerGitStatus {
   githubState: "loading" | "ready" | "unknown";
   prCount: number;
   prNumber: number | null;
+  /** Precedes `prNumber` in the PR's provider style: "#" for GitHub, "!" for Azure DevOps. */
+  prNumberPrefix: string;
   /** Re-read live worktree + PR state from the host. */
   refresh: () => void;
   refreshing: boolean;
@@ -90,7 +45,7 @@ export interface ComposerGitStatus {
  *
  * The branch comes from the host's `git worktree list` (via
  * {@link useSessionWorktrees}), matched to the session's workspace — the real
- * checked-out branch, distinct from a PR head. {@link useGithubInfo} supplies
+ * checked-out branch, distinct from a PR head. {@link usePullRequestInfo} supplies
  * only PR/repo metadata: its `branch` field can be a PR head ref, so it is not
  * trusted for the live branch. `not-git` is set only on explicit evidence;
  * offline / ambiguous / an empty list stay `unknown` rather than claiming the
@@ -113,7 +68,7 @@ export function useComposerGitStatus({
   creationBranch?: string | null;
 }): ComposerGitStatus {
   const worktrees = useSessionWorktrees(sessionId, hostId, workspace);
-  const github = useGithubInfo(sessionId ?? undefined);
+  const github = usePullRequestInfo(sessionId ?? undefined);
   const info = github.data;
   const result = worktrees.data;
 
@@ -152,6 +107,12 @@ export function useComposerGitStatus({
   const prs = info?.prs;
   const prNumber = prs?.[0]?.number ?? info?.pr?.number ?? null;
   const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
+  // The primary PR's own provider first, then the session's.
+  const prNumberPrefix = gitProviderCopy(
+    prs?.[0]?.provider ?? info?.provider,
+    undefined,
+    prs?.[0]?.provider_display ?? info?.provider_display,
+  ).prNumberPrefix;
 
   const worktreeRefetch = worktrees.refetch;
   const githubRefetch = github.refetch;
@@ -170,6 +131,7 @@ export function useComposerGitStatus({
     githubState: github.isLoading ? "loading" : github.isError || !info ? "unknown" : "ready",
     prCount,
     prNumber,
+    prNumberPrefix,
     refresh,
     refreshing: worktrees.isFetching || github.isFetching,
   };

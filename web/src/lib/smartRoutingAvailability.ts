@@ -5,7 +5,7 @@
 // conditions cause that, and they need different words: a server with routing
 // switched off is not a deployment whose only router is the built-in judge, is
 // not a deployment whose native wrapper agents aren't registered, and is not a
-// host whose CLI runs off something other than the workspace AI gateway.
+// host whose CLI runs off something other than the workspace Unity Gateway.
 
 import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
@@ -32,7 +32,7 @@ export type SmartRoutingUnavailableCause =
   /** Ready-to-run arms are missing on the selected host. */
   | { kind: "harnesses-unready"; harnesses: string[] }
   /**
-   * Arms whose family the host doesn't back with the workspace AI gateway. The
+   * Arms whose family the host doesn't back with the workspace Unity Gateway. The
    * external router's apply layer rewrites the model through the gateway, so a
    * CLI pointed anywhere else can't be routed by it even with the CLI
    * installed. The built-in judge does not cover for it here — the native-pane
@@ -52,7 +52,7 @@ export type RouterSource = "databricks-aigw" | "oss-llm";
  * built-in judge has no such requirement, so it covers the off-gateway arms.
  *
  * @param inputs - The server's two configured sources plus whether the host
- *   backs this family's inference with the workspace AI gateway.
+ *   backs this family's inference with the workspace Unity Gateway.
  * @returns The router that answers, or ``null`` when neither can.
  */
 export function smartRoutingSourceFor(inputs: {
@@ -106,7 +106,7 @@ export function smartRoutingUnavailableReason(inputs: {
 }
 
 /**
- * Whether *host* backs *harness*'s inference with the workspace AI gateway.
+ * Whether *host* backs *harness*'s inference with the workspace Unity Gateway.
  *
  * Unknown reads as backed: an older host build (or a server that predates the
  * field) reports nothing, and a sandbox has no host row at all. Gating those
@@ -151,12 +151,12 @@ export function smartRoutingDroppedMessage(
     case "routing-disabled":
       return `${SMART_ROUTING_LABEL} is turned off on this server — switched to ${to}.`;
     case "external-router-required":
-      return `${SMART_ROUTING_LABEL} across harnesses needs the workspace AI gateway router on this server — switched to ${to}.`;
+      return `${SMART_ROUTING_LABEL} across harnesses needs the workspace Unity Gateway router on this server — switched to ${to}.`;
     case "wrappers-missing":
       return `${SMART_ROUTING_LABEL} needs the ${armList(SMART_ROUTING_ARMS)} agents registered on this server — switched to ${to}.`;
     case "harnesses-unready":
       return `${SMART_ROUTING_LABEL} needs ${armList(cause.harnesses)} ready${on} — switched to ${to}.`;
     case "not-gateway-backed":
-      return `${SMART_ROUTING_LABEL} needs ${armList(cause.harnesses)} running on the workspace AI gateway${on} — switched to ${to}.`;
+      return `${SMART_ROUTING_LABEL} needs ${armList(cause.harnesses)} running on the workspace Unity Gateway${on} — switched to ${to}.`;
   }
 }

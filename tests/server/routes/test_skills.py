@@ -35,6 +35,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.budgets import budget
 from tests.server.helpers import build_agent_bundle
 
 
@@ -128,7 +129,9 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
         task = asyncio.create_task(
             client.get("/v1/skills", params={"session_id": conv.id}, headers={"x-test-user": user})
         )
-        frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
+        frame = decode_host_frame(
+            (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
+        )
         assert isinstance(frame, HostSkillsFrame)
         assert (
             frame.session_id,
@@ -148,7 +151,9 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
         response = await task
     assert response.status_code == (200 if acknowledged else 502)
     if acknowledged:
-        assert response.json()["skills"] == [{"name": "child-review", "description": "Review"}]
+        assert response.json()["skills"] == [
+            {"name": "child-review", "description": "Review", "display_name": None}
+        ]
     else:
         assert "update the host" in response.json()["detail"]
     assert not conn.pending_skills
@@ -251,7 +256,9 @@ async def test_presession_catalog_matches_filtered_invocations(
                 headers={"x-test-user": "owner"},
             )
         )
-        frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
+        frame = decode_host_frame(
+            (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
+        )
         assert isinstance(frame, HostSkillsFrame)
         assert frame.skills_filter == skill_filter
         assert frame.agent_version == str(agent.version)
@@ -268,7 +275,8 @@ async def test_presession_catalog_matches_filtered_invocations(
     assert response.status_code == 200
     expected = resolve_session_skills(spec, (tmp_path,), None)
     assert response.json()["skills"] == [
-        {"name": s.name, "description": s.description} for s in expected
+        {"name": s.name, "description": s.description, "display_name": s.display_name}
+        for s in expected
     ]
     assert "hidden" not in {s["name"] for s in response.json()["skills"]}
 
@@ -315,7 +323,9 @@ async def test_presession_discovery_requires_host_to_apply_agent_filter(presessi
                 headers={"x-test-user": "owner"},
             )
         )
-        frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
+        frame = decode_host_frame(
+            (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
+        )
         assert isinstance(frame, HostSkillsFrame)
         conn.pending_skills[frame.request_id].set_result(
             HostSkillsResultFrame(frame.request_id, "ok")

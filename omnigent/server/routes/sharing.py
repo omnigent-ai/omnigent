@@ -23,11 +23,13 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import AuthProvider, SharingMode
+from omnigent.server.auth import AuthProvider, SharingMode, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import get_user_id
 from omnigent.server.sharing_settings import (
     DefaultPublicSessions,
+    PublicSharingMaxLevel,
     write_default_public_sessions_override,
+    write_public_sharing_max_level_override,
     write_public_sharing_override,
     write_sharing_mode_override,
 )
@@ -51,6 +53,7 @@ class SetSharingRequest(BaseModel):
 
     sharing_mode: str | None = None
     public_sharing: bool | None = None
+    public_sharing_max_level: str | None = None
     default_public_sessions: str | None = None
 
 
@@ -66,6 +69,15 @@ def _state_response(request: Request) -> dict[str, Any]:
         "options": [tier.value for tier in _TIERS],
         "public_sharing_enabled": bool(state.public_sharing()),
         "public_sharing_editable": bool(getattr(state, "public_sharing_writable", False)),
+        "public_sharing_max_level": state.public_sharing_max_level().value,
+        "public_sharing_max_level_editable": bool(
+            getattr(state, "public_sharing_max_level_writable", False)
+        ),
+        "public_sharing_max_level_options": (
+            ["read", "edit"]
+            if state.public_edit_available and not local_single_user_enabled()
+            else ["read"]
+        ),
         "default_public_sessions": DefaultPublicSessions.coerce(
             getattr(state, "default_public_sessions", lambda: DefaultPublicSessions.OFF)()
         ).value,
@@ -126,6 +138,7 @@ def create_sharing_router(
         if (
             body.sharing_mode is None
             and body.public_sharing is None
+            and body.public_sharing_max_level is None
             and body.default_public_sessions is None
         ):
             raise OmnigentError(
@@ -158,6 +171,27 @@ def create_sharing_router(
                 "Public access is managed by this deployment and cannot be changed here.",
                 code=ErrorCode.FORBIDDEN,
             )
+        public_max: PublicSharingMaxLevel | None = None
+        if body.public_sharing_max_level is not None:
+            if not getattr(state, "public_sharing_max_level_writable", False):
+                raise OmnigentError(
+                    "Public permission ceiling is managed by this deployment.",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            try:
+                public_max = PublicSharingMaxLevel(body.public_sharing_max_level.strip().lower())
+            except ValueError as exc:
+                raise OmnigentError(
+                    "Public permission ceiling must be read or edit.",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+            if public_max is PublicSharingMaxLevel.EDIT and (
+                not state.public_edit_available or local_single_user_enabled()
+            ):
+                raise OmnigentError(
+                    "Public edit access requires authenticated multi-user access.",
+                    code=ErrorCode.FORBIDDEN,
+                )
         default_public: DefaultPublicSessions | None = None
         if body.default_public_sessions is not None:
             if not getattr(state, "default_public_sessions_writable", False):
@@ -181,6 +215,8 @@ def create_sharing_router(
             await asyncio.to_thread(write_sharing_mode_override, mode)
         if body.public_sharing is not None:
             await asyncio.to_thread(write_public_sharing_override, body.public_sharing)
+        if public_max is not None:
+            await asyncio.to_thread(write_public_sharing_max_level_override, public_max)
         if default_public is not None:
             await asyncio.to_thread(write_default_public_sessions_override, default_public)
         return _state_response(request)

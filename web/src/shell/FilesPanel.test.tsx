@@ -645,6 +645,10 @@ describe("FilesPanel changed files search", () => {
 
     render(<Harness />);
 
+    const drawer = screen.getByTestId("files-panel-drawer");
+    expect(drawer).toHaveClass("shadow-none");
+    expect(drawer).not.toHaveClass("shadow-lg");
+
     const srcFolder = screen.getByRole("button", { name: /src\//i });
     expect(srcFolder).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("App.tsx")).toBeInTheDocument();
@@ -656,6 +660,8 @@ describe("FilesPanel changed files search", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "open drawer" }));
 
+    expect(drawer).toHaveClass("shadow-lg");
+    expect(drawer).not.toHaveClass("shadow-none");
     const drawerSrcFolder = screen.getByRole("button", { name: /src\//i });
     expect(drawerSrcFolder).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByText("App.tsx")).toBeNull();
