@@ -40,6 +40,11 @@ from omnigent.onboarding.provider_config import load_config
 ACP_CONFIG_KEY = "acp"
 _AGENTS_FIELD = "agents"
 
+# Accepted ``permission_mode`` values. Mirrors the harness wrap's stance names
+# (see :class:`omnigent.inner.acp_executor.AcpAgentConfig`); anything else is a
+# typo that would silently fall back to prompting, so it is rejected loudly.
+PERMISSION_MODES = frozenset({"auto", "bypassPermissions"})
+
 
 @dataclass(frozen=True)
 class AcpAgentEntry:
@@ -59,6 +64,13 @@ class AcpAgentEntry:
         Pi forks like ``omp``) to prevent XML tool-call fragments from leaking
         into their responses when no MCP relay is active. See
         :attr:`omnigent.inner.acp_executor.AcpAgentConfig.inject_system_prompt`.
+    :param permission_mode: Approval stance for this agent's tool calls.
+        ``"auto"`` (default) surfaces an approval card for every call the agent
+        considers permission-worthy. ``"bypassPermissions"`` skips that card for
+        a call no TOOL_CALL policy had an opinion on — a policy DENY still
+        blocks and a policy ASK still prompts. Use it for an agent you already
+        run unattended in its own CLI (Cline's "Auto-approve all", Claude
+        Code's bypass mode), where a per-call card is pure friction.
     :param env_passthrough: Environment variable *names* the agent may read at
         spawn, e.g. ``("XAI_API_KEY",)``. The spawn env is deny-by-default and
         the executor cannot know which variable an arbitrary agent
@@ -75,6 +87,7 @@ class AcpAgentEntry:
     send_model: bool = False
     omnigent_mcp: bool = True
     inject_system_prompt: bool = True
+    permission_mode: str = "auto"
     env_passthrough: tuple[str, ...] = ()
 
 
@@ -168,6 +181,12 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
         inject_system_prompt = raw.get("inject_system_prompt", True)
         if not isinstance(inject_system_prompt, bool):
             raise ValueError("acp agent inject_system_prompt must be a boolean")
+        permission_mode = raw.get("permission_mode", "auto")
+        if permission_mode not in PERMISSION_MODES:
+            raise ValueError(
+                "acp agent permission_mode must be one of "
+                f"{', '.join(sorted(PERMISSION_MODES))}, got {permission_mode!r}"
+            )
         entries.append(
             AcpAgentEntry(
                 slug=slug,
@@ -178,6 +197,7 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
                 send_model=bool(raw.get("send_model", False)),
                 omnigent_mcp=omnigent_mcp,
                 inject_system_prompt=inject_system_prompt,
+                permission_mode=permission_mode,
                 env_passthrough=parse_env_passthrough(raw.get("env_passthrough")),
             )
         )
@@ -241,6 +261,8 @@ def acp_agents_settings(entries: list[AcpAgentEntry]) -> dict[str, object]:
             item["omnigent_mcp"] = False
         if not e.inject_system_prompt:
             item["inject_system_prompt"] = False
+        if e.permission_mode != "auto":
+            item["permission_mode"] = e.permission_mode
         if e.env_passthrough:
             item["env_passthrough"] = list(e.env_passthrough)
         agents.append(item)
