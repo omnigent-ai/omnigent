@@ -496,8 +496,25 @@ _PANE_TEXT = "example-repo"
             },
         ),
         (
+            "Traceback (most recent call last):\n"
+            '  File "/opt/launcher/settings.py", line 9, in load\n'
+            f"{_PANE_TEXT.replace('-', '_')}_internal: retrying workspace lookup\n"
+            "json.decoder.JSONDecodeError: Expecting value\n",
+            {"pane_state": "traceback", "pane_lines": 4, "pane_traceback_type": "JSONDecodeError"},
+        ),
+        (
+            "Traceback (most recent call last):\n"
+            '  File "/opt/launcher/auth.py", line 3, in wait\n'
+            "HQ7M2KPD\n",
+            {"pane_state": "traceback", "pane_lines": 3},
+        ),
+        (
             f"Checking {_PANE_TEXT} for updates...\nUpgrade the agent if available? (Y/n) ",
             {"pane_state": "yes_no_prompt", "pane_lines": 2},
+        ),
+        (
+            f"Overwrite {_PANE_TEXT}/settings.json (y/n)?",
+            {"pane_state": "yes_no_prompt", "pane_lines": 1},
         ),
         (
             f"────\n Settings Error\n /home/u/{_PANE_TEXT}/settings.json\n"
@@ -518,7 +535,10 @@ _PANE_TEXT = "example-repo"
         "traceback-own-exception-not-later-output",
         "traceback-unsuffixed-exception",
         "traceback-bare-exception",
+        "traceback-interleaved-output",
+        "traceback-without-exception-name",
         "yes-no-prompt",
+        "yes-no-question",
         "dialog",
         "tui",
         "text",
@@ -530,7 +550,9 @@ def test_describe_pane_shape_names_the_screen_without_its_text(
     """Each screen gets a fixed label; only an exception's class name leaves the pane."""
     shape = describe_pane_shape(screen)
     assert shape == expected
-    assert _PANE_TEXT not in repr(shape)
+    for leaked in (_PANE_TEXT, _PANE_TEXT.replace("-", "_"), "HQ7M2KPD"):
+        assert leaked not in repr(shape)
+        assert leaked not in pane_shape_summary(shape)
 
 
 @pytest.mark.parametrize(

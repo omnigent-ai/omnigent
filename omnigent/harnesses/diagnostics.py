@@ -288,12 +288,16 @@ _KEY_HINT = re.compile(
 )
 # A launcher question waiting on a typed answer, e.g. "Upgrade if available? (Y/n)".
 _YES_NO_PROMPT = re.compile(
-    r"[(\[](?:y/n|yes/no)[)\]][ \t]*:?[ \t]*$", re.IGNORECASE | re.MULTILINE
+    r"[(\[](?:y/n|yes/no)[)\]][ \t]*[:?]?[ \t]*$", re.IGNORECASE | re.MULTILINE
 )
 _TRACEBACK_HEADER = "Traceback (most recent call last):"
-# A traceback's frames are indented, so its exception ("pkg.FooError: …", "Abort") is
-# the first unindented line after the header.
-_EXCEPTION_LINE = re.compile(r"((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)(?::.*)?")
+# An unindented "pkg.FooError: …" line names a traceback's exception. Only names
+# shaped like an exception class count, so other output never becomes the label.
+_EXCEPTION_LINE = re.compile(r"(?:[A-Za-z_]\w*\.)*([A-Za-z_]\w*)(?::.*)?")
+_EXCEPTION_CLASS = re.compile(
+    r"(?:[A-Z]\w*)?(?:Error|Exception|Exit|Interrupt|Expired|Timeout|Failure|Abort|Warning)"
+    r"|StopIteration|StopAsyncIteration"
+)
 _BOX_DRAWING = frozenset("─━│┃╭╮╯╰┌┐└┘├┤┬┴┼═║╔╗╚╝")
 
 
@@ -308,8 +312,9 @@ def describe_pane_shape(screen: str | None) -> dict[str, str | int]:
     :param screen: ANSI-stripped screen text, or ``None`` when the pane could not be read.
     :returns: ``pane_state``, one of ``unreadable``, ``blank``, ``traceback``,
         ``yes_no_prompt``, ``dialog``, ``tui`` or ``text``, plus ``pane_lines`` (the
-        non-blank line count) for a readable pane. A traceback adds
-        ``pane_traceback_type``, the exception's class name, e.g. ``"JSONDecodeError"``.
+        non-blank line count) for a readable pane. A traceback whose exception
+        line is shaped like a class name adds ``pane_traceback_type``, e.g.
+        ``"JSONDecodeError"``; otherwise the field is left out.
     """
     if screen is None:
         return {"pane_state": "unreadable"}
@@ -320,11 +325,14 @@ def describe_pane_shape(screen: str | None) -> dict[str, str | int]:
     elif _TRACEBACK_HEADER in screen:
         shape["pane_state"] = "traceback"
         block = screen.rsplit(_TRACEBACK_HEADER, 1)[1].splitlines()
-        first = next((line for line in block if line.strip() and not line[0].isspace()), "")
-        raised = _EXCEPTION_LINE.fullmatch(first.rstrip())
-        if raised:
+        for line in block:
+            if not line.strip() or line[0].isspace():
+                continue
+            raised = _EXCEPTION_LINE.fullmatch(line.rstrip())
             # The class name alone: a module path can name the person's own code.
-            shape["pane_traceback_type"] = raised[1].rsplit(".", 1)[-1][:80]
+            if raised and _EXCEPTION_CLASS.fullmatch(raised[1]):
+                shape["pane_traceback_type"] = raised[1][:80]
+                break
     elif _YES_NO_PROMPT.search(screen):
         shape["pane_state"] = "yes_no_prompt"
     elif _KEY_HINT.search(screen):
