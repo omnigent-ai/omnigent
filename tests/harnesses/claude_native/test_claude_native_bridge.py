@@ -31,6 +31,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
+from omnigent.errors import ErrorCategory
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
@@ -11346,6 +11347,18 @@ _TRUST_DIALOG_PANE = """\
  Enter to confirm · Esc to cancel
 """
 
+_SETTINGS_ERROR_DIALOG_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+ Settings Error
+ /home/user/.claude/settings.json
+ └ Invalid or malformed JSON
+ Files with errors are skipped entirely, not just the invalid settings.
+ ❯ 1. Fix with Claude
+   2. Exit and fix manually
+   3. Continue without these settings
+ Enter to confirm · Esc to cancel
+"""
+
 # The same dialog text scrolled into the transcript above a live input box.
 _DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
 
@@ -11357,8 +11370,9 @@ _DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
         (_MCP_APPROVAL_CHECKLIST_PANE, "2 new MCP servers found in this project"),
         (_API_KEY_DIALOG_PANE, "Detected a custom API key in your environment"),
         (_TRUST_DIALOG_PANE, "Accessing workspace:"),
+        (_SETTINGS_ERROR_DIALOG_PANE, "Settings Error"),
     ],
-    ids=["mcp-single", "mcp-checklist", "api-key", "folder-trust"],
+    ids=["mcp-single", "mcp-checklist", "api-key", "folder-trust", "settings-error"],
 )
 def test_terminal_dialog_headline_names_startup_dialogs(pane: str, headline: str) -> None:
     """
@@ -11406,6 +11420,24 @@ def test_terminal_dialog_headline_ignores_other_panes(pane: str) -> None:
     stays on its own PermissionRequest path.
     """
     assert claude_native_bridge._terminal_dialog_headline(pane) is None
+
+
+@pytest.mark.parametrize(
+    ("pane", "category"),
+    [
+        (_SETTINGS_ERROR_DIALOG_PANE, ErrorCategory.CONFIG),
+        (_MCP_APPROVAL_DIALOG_PANE, None),
+        (_TRUST_DIALOG_PANE, None),
+    ],
+    ids=["settings-error", "mcp-single", "folder-trust"],
+)
+def test_startup_dialog_category_attributes_only_an_unreadable_settings_file(
+    pane: str, category: ErrorCategory | None
+) -> None:
+    """Only the invalid-settings dialog names a cause; the rest just wait on a choice."""
+    headline = claude_native_bridge._terminal_dialog_headline(pane)
+    assert headline is not None
+    assert claude_native_bridge.claude_startup_dialog_category(headline) is category
 
 
 def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
