@@ -440,3 +440,32 @@ async def test_launch_protects_child_until_spawn_worker_returns(
         finally:
             resume.set()
             await asyncio.wait_for(asyncio.gather(launch, return_exceptions=True), timeout=5.0)
+
+
+def test_hangup_signals_live_runners_but_not_the_zygote(
+    host: HostProcess, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    zygote_pid = 4000
+    monkeypatch.setattr(host, "_zygote", SimpleNamespace(unreaped_pid=zygote_pid))
+    for name, pid, code in (
+        ("live_a", 4001, None),
+        ("exited", 4002, 0),
+        ("live_b", 4003, None),
+        ("zygote_alias", zygote_pid, None),
+    ):
+        proc = SimpleNamespace(pid=pid, returncode=code)
+        host._runners[name] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")  # type: ignore[arg-type]
+    sent: list[tuple[int, int]] = []
+
+    def kill(pid: int, sig: int) -> None:
+        sent.append((pid, sig))
+        if pid == 4001:
+            raise ProcessLookupError(pid)  # a runner that just exited must not stop the sweep
+
+    host.signal_runners_finish_work(kill=kill)
+
+    assert sent == [(4001, RUNNER_FINISH_WORK_SIGNAL), (4003, RUNNER_FINISH_WORK_SIGNAL)]
