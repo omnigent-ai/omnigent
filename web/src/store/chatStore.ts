@@ -7196,8 +7196,20 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // host-bound session; `failed` retains the reason so the page
       // explains why the sandbox never came up.
       applyToConversation({
-        sandboxStatus: event.stage === "ready" ? null : { stage: event.stage, error: event.error },
+        sandboxStatus:
+          event.stage === "ready"
+            ? null
+            : { stage: event.stage, error: event.error, provider: event.provider },
       });
+      // The sandbox host is bound before its runner starts; refetch the binding and a
+      // host list cached before that host registered, so the composer can name it.
+      if (event.stage === "connecting" || event.stage === "ready") {
+        void queryClient?.invalidateQueries({
+          queryKey: ["session", event.conversationId],
+          exact: true,
+        });
+        void queryClient?.invalidateQueries({ queryKey: ["hosts"] });
+      }
       return;
     case "session_mcp_startup": {
       // Mirror the harness's per-MCP-server startup map while the round

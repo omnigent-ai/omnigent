@@ -878,7 +878,11 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
     # create returns — what the navigating Web UI cold-loads.
     snapshot = await env.client.get(f"/v1/sessions/{session_id}")
     assert snapshot.status_code == 200, snapshot.text
-    assert snapshot.json()["sandbox_status"] == {"stage": "provisioning", "error": None}
+    assert snapshot.json()["sandbox_status"] == {
+        "stage": "provisioning",
+        "error": None,
+        "provider": "modal",
+    }
 
     message_task = asyncio.create_task(
         env.client.post(
@@ -1005,12 +1009,17 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     # session page to a silent dead chat during provisioning.
     snapshot = await env.client.get(f"/v1/sessions/{session_id}")
     assert snapshot.status_code == 200, snapshot.text
-    assert snapshot.json()["sandbox_status"] == {"stage": "provisioning", "error": None}
+    assert snapshot.json()["sandbox_status"] == {
+        "stage": "provisioning",
+        "error": None,
+        "provider": "modal",
+    }
 
     # Tail live progress at the layer the SSE endpoint reads it from.
     # (The endpoint itself never terminates under the in-process ASGI
     # transport — see the stream test in test_sessions_permissions.)
     stages: list[str] = []
+    providers: set[str | None] = set()
     subscribed = asyncio.Event()
     settled = asyncio.Event()
 
@@ -1025,6 +1034,7 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
             if event.get("type") != "session.sandbox_status":
                 continue
             stages.append(event["stage"])
+            providers.add(event["provider"])
             if event["stage"] in ("ready", "failed"):
                 settled.set()
                 return
@@ -1048,6 +1058,8 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     # means the background task stopped reporting after the host
     # bound; "failed" here means the launch itself broke.
     assert stages == ["cloning", "starting", "connecting", "ready"]
+    # Later stages keep the provider seeded at create, so the web UI keeps naming it.
+    assert providers == {"modal"}
 
     # A settled launch clears the snapshot field — from here the
     # session looks like any host-bound session and a reloading

@@ -490,7 +490,9 @@ def create_runner_tunnel_router(
                     round(now - session.connected_at, 3) if session is not None else None
                 ),
                 "last_frame_age_s": (
-                    round(now - session.last_frame_at, 3) if session is not None else None
+                    round(time.monotonic() - session.last_frame_monotonic, 3)
+                    if session is not None
+                    else None
                 ),
             }
             if session is not None:
