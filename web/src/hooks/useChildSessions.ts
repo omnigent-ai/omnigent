@@ -200,8 +200,8 @@ interface UseChildSessionsResult {
 /**
  * Fetch child sessions for a parent session.
  *
- * Exported for unit testing of the HTTP-shape contract; production
- * code should call ``useChildSessions``.
+ * Exported for the side-chat tabs and for unit testing of the HTTP-shape
+ * contract; components should call ``useChildSessions``.
  */
 export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
   const res = await authenticatedFetch(

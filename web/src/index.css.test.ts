@@ -5,13 +5,15 @@ import { readFileSync } from "node:fs";
 // lightningcss is the minifier @tailwindcss/vite runs during `vite build`
 // (resolved from its dependency tree, so we test the version the build uses).
 import { transform } from "lightningcss";
-import { type ComponentProps, createElement } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { type ComponentProps, createElement, type PropsWithChildren } from "react";
 import { createPortal } from "react-dom";
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "./components/ui/tooltip";
 import type * as UseTerminalsModule from "./hooks/useTerminals";
+import type * as IdentityModule from "./lib/identity";
 import {
   UI_FONT_SIZE_DEFAULT,
   UI_FONT_SIZE_MAX,
@@ -34,6 +36,15 @@ vi.mock("./hooks/useTerminals", async (importOriginal) => ({
   useCreateTerminal: () => ({ mutate: () => {}, isPending: false, isError: false }),
 }));
 vi.mock("./hooks/useAgents", () => ({ useSessionAgent: () => ({ data: undefined }) }));
+// The side-chat tabs also list the parent's side chats from the server.
+vi.mock("./lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  authenticatedFetch: vi.fn(async () => new Response(JSON.stringify({ data: [] }))),
+}));
+
+function QueryWrapper({ children }: PropsWithChildren) {
+  return createElement(QueryClientProvider, { client: new QueryClient() }, children);
+}
 
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.
@@ -545,7 +556,7 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           onShowHiddenChange: () => {},
         }),
       ),
-      { container: shell },
+      { container: shell, wrapper: QueryWrapper },
     );
     const rail = shell.querySelector<HTMLElement>('aside[aria-label="Workspace"]');
     expect(rail, "the rail <aside> the CSS selector keys on is gone").not.toBeNull();

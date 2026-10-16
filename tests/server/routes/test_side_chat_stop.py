@@ -14,6 +14,7 @@ from omnigent.server.routes.sessions import routes_events
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 
 
 async def test_close_side_chat_preserves_shared_runner_and_transcript(
@@ -69,6 +70,8 @@ async def test_close_side_chat_preserves_shared_runner_and_transcript(
         for row in (parent, side, sibling):
             saved = store.get_conversation(row.id)
             assert saved is not None and saved.runner_id == "runner-shared"
+            # Closing persists so the user's other devices drop the tab too.
+            assert (CLOSED_LABEL_KEY in saved.labels) == (row is side)
 
         response = await client.post(
             f"/v1/sessions/{parent.id}/events", json={"type": "stop_session"}
@@ -133,4 +136,5 @@ async def test_side_chat_close_surfaces_runner_failure(
     messages = [item for item in store.list_items(side.id).data if item.type == "message"]
     assert bool(messages) == (failure == "stop")
     assert side.id not in routes_events._interrupt_fenced_sessions
-    assert store.get_conversation(side.id) is not None
+    saved = store.get_conversation(side.id)
+    assert saved is not None and CLOSED_LABEL_KEY not in saved.labels

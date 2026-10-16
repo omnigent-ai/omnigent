@@ -163,7 +163,6 @@ def test_side_chat_resume_conflict_refetches_metadata_and_seals_pane(
     page.evaluate(
         """state => {
           localStorage.setItem("omnigent:session-workspace-state", JSON.stringify([state]));
-          localStorage.setItem("omnigent.sideChatInherited:browser-side-child", "[]");
         }""",
         {
             "id": "browser-chat-session",

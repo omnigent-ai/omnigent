@@ -215,7 +215,9 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SIDE_CHAT_HISTORY_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_PARENT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     pinned_label_key,
@@ -1444,6 +1446,7 @@ def register_core_routes(
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
         visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
+        side_chat_parent_id: str | None = Query(default=None),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -1497,6 +1500,10 @@ def register_core_routes(
             owned. ``"archived"`` returns only archived sessions.
             ``"all"`` (default) returns all accessible non-archived
             sessions, matching the legacy behaviour.
+        :param side_chat_parent_id: When set, return only the side chats
+            listed in this session's Workspace rail, e.g. ``"conv_abc123"``.
+            Side chats are otherwise left out of the list. Codex side chats
+            are sub-agent children, listed by ``child_sessions``.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -1584,11 +1591,15 @@ def register_core_routes(
             pinned=pinned,
             # Pins are per-user: filter to the caller's own pin key.
             pinned_owner=user_id,
+            side_chat_parent_id=side_chat_parent_id,
         )
         # Side chats surface only as Workspace-rail tabs, so drop any
         # side-chat-labeled fork from the sidebar list (it is still a normal
         # session, just not listed as a top-level one here).
-        page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
+        if side_chat_parent_id is None:
+            page.data = [
+                conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})
+            ]
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
         conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
@@ -3556,6 +3567,7 @@ def register_core_routes(
         if body.side_chat:
             extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
             extra_labels[SIDE_CHAT_SOURCE_LABEL_KEY] = source_id
+            extra_labels[SIDE_CHAT_PARENT_LABEL_KEY] = source_id
 
         # When the fork binds a NATIVE target, the native CLI won't replay
         # the copied Omnigent transcript on its own — mark the fork so the
@@ -3767,6 +3779,16 @@ def register_core_routes(
         except Exception:
             await drop_unused_copy()
             raise
+
+        if body.side_chat:
+            # Read from the fork itself, so a parent turn racing the copy can't skew it.
+            copied = await asyncio.to_thread(
+                conversation_store.list_items, new_conv.id, limit=1, order="desc"
+            )
+            if copied.data and copied.data[0].response_id:
+                history_end = {SIDE_CHAT_HISTORY_LABEL_KEY: copied.data[0].response_id}
+                await asyncio.to_thread(conversation_store.set_labels, new_conv.id, history_end)
+                new_conv.labels = {**new_conv.labels, **history_end}
 
         # Create the fork-owned rows the rewritten items now reference —
         # before the fork is announced or returned, so no reader sees the ids

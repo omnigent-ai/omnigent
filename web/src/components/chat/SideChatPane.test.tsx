@@ -5,6 +5,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ConversationItem } from "@/lib/conversationItems";
+import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type * as ChatStoreModule from "@/store/chatStore";
 import { useChatStore, type ChatState } from "@/store/chatStore";
@@ -19,8 +21,13 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 vi.mock("@/components/composer/ComposerAddMenu", () => ({ ComposerAddMenu: () => null }));
 vi.mock("@/components/ComposerMicButton", () => ({ ComposerMicButton: () => null }));
 const sessionLabels = vi.hoisted(() => ({ current: {} as Record<string, string> }));
+const sessionCreatedAt = vi.hoisted(() => ({ current: 0 }));
 vi.mock("@/hooks/useSession", () => ({
-  useSession: () => ({ session: { labels: sessionLabels.current }, isLoading: false, error: null }),
+  useSession: () => ({
+    session: { labels: sessionLabels.current, createdAt: sessionCreatedAt.current },
+    isLoading: false,
+    error: null,
+  }),
 }));
 vi.mock("@/hooks/useWorkingLabelTick", () => ({ useWorkingLabelTick: () => 0 }));
 
@@ -37,6 +44,7 @@ const renderPane = (ui: ReactNode) =>
 
 beforeEach(() => {
   sessionLabels.current = {};
+  sessionCreatedAt.current = 0;
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
   vi.spyOn(sessionsApi, "interrupt").mockResolvedValue({ queued: true });
@@ -210,7 +218,8 @@ describe("side chat opened from a text selection", () => {
     expect(useChatStore.getState().sideChatSelectionTarget?.childId).toBe(childId);
     view.rerender(<SideChatPane childId={childId} />);
     expect(useChatStore.getState().sideChatSelectionTarget).toBeNull();
-    view.rerender(<SideChatPane childId={childId} selectionParentId="conv_main" readOnly />);
+    sessionLabels.current = { "omnigent.closed": "true" };
+    view.rerender(<SideChatPane childId={childId} selectionParentId="conv_main" />);
     expect(useChatStore.getState().sideChatSelectionTarget).toBeNull();
   });
 
@@ -264,7 +273,8 @@ describe("side-chat selection reply", () => {
   });
 
   it("does not offer Reply in a read-only side chat", () => {
-    renderPane(<SideChatPane childId={childId} readOnly />);
+    sessionLabels.current = { "omnigent.closed": "true" };
+    renderPane(<SideChatPane childId={childId} />);
     selectText(screen.getByText("This side chat has ended and can’t be continued."));
     expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
   });
@@ -412,14 +422,15 @@ describe("side-chat interrupt", () => {
   });
 
   it.each([
-    { name: "idle", id: childId, readOnly: false, sessionStatus: "idle" as const },
-    { name: "pending", id: "pending:side", readOnly: false, sessionStatus: "running" as const },
-    { name: "read-only", id: childId, readOnly: true, sessionStatus: "running" as const },
-  ])("has no interrupt button for a $name side chat", ({ id, readOnly, sessionStatus }) => {
+    { name: "idle", id: childId, closed: false, sessionStatus: "idle" as const },
+    { name: "pending", id: "pending:side", closed: false, sessionStatus: "running" as const },
+    { name: "read-only", id: childId, closed: true, sessionStatus: "running" as const },
+  ])("has no interrupt button for a $name side chat", ({ id, closed, sessionStatus }) => {
     conversationRegistry.acquire(childId).setState({ sessionStatus });
     useChatStore.setState({ sessionStatus: "running" });
+    if (closed) sessionLabels.current = { "omnigent.closed": "true" };
 
-    renderPane(<SideChatPane childId={id} readOnly={readOnly} />);
+    renderPane(<SideChatPane childId={id} />);
 
     expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
     expect(sessionsApi.interrupt).not.toHaveBeenCalled();
@@ -534,6 +545,53 @@ describe("unsent composer state survives the pane moving", () => {
     expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
     expect(screen.getByTestId("side-chat-input")).toHaveValue("");
   });
+});
+
+describe("generic side chat history", () => {
+  function userItem(id: string, text: string, createdAt: number): ConversationItem {
+    return {
+      id,
+      response_id: `resp_${id}`,
+      type: "message",
+      role: "user",
+      status: "completed",
+      created_at: createdAt,
+      content: [{ type: "input_text", text }],
+    };
+  }
+
+  it.each([
+    {
+      name: "through the copied response the server recorded",
+      labels: {
+        "omnigent.side_chat.parent_id": "conv_main",
+        "omnigent.side_chat.history_response_id": "resp_item_parent",
+      },
+      // The last copy can share a second with the side chat's first question.
+      copiedAt: 1_000,
+    },
+    { name: "by timestamp for an older side chat", labels: {}, copiedAt: 999 },
+  ] as { name: string; labels: Record<string, string>; copiedAt: number }[])(
+    "hides the parent history it copied $name",
+    ({ labels, copiedAt }) => {
+      sessionLabels.current = labels;
+      sessionCreatedAt.current = 1_000;
+      conversationRegistry.acquire(childId).setState({
+        sessionHarness: "openai-agents",
+        blocks: itemsToBlocks([
+          userItem("item_older", "Copied earlier", 990),
+          userItem("item_parent", "Copied from the parent", copiedAt),
+          userItem("item_side", "Asked in the side chat", 1_000),
+        ]),
+      });
+
+      renderPane(<SideChatPane childId={childId} />);
+
+      expect(screen.queryByText("Copied earlier")).toBeNull();
+      expect(screen.queryByText("Copied from the parent")).toBeNull();
+      expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
+    },
+  );
 });
 
 describe("side chat sealed by the server", () => {

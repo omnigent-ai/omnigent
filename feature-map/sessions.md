@@ -27,6 +27,8 @@ the header menu), and each place is a separate entry point.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
   closing one stops only that chat. Starting one from a stopped generic hosted
   parent relaunches the parent first, then shares its replacement runner.
+  A side chat opened on one device appears on the user's other devices, and
+  closing it closes it everywhere.
 - `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
   writable side chat; Reply on side-chat text quotes it in that chat. Both keep
   the existing draft and attachments, and quotes can be removed before sending.
@@ -237,9 +239,10 @@ tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
 side chats open in a drawer; the header's **Conversation actions → Side
 chats** reopens it. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Close a side
-chat with its tab's close button; the parent and sibling chats keep running. A
-chat-only side chat can also send messages from its direct `/c/<child_id>` URL
-without choosing a workspace.
+chat with its tab's close button; the parent and sibling chats keep running.
+Another device shows the parent's open side chats as tabs, or in the mobile
+drawer, once the app loads or regains focus. A chat-only side chat can also send
+messages from its direct `/c/<child_id>` URL without choosing a workspace.
 
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
@@ -471,6 +474,11 @@ plain `uv run pytest`, which starts a private server for the test.
   eligibility; `web/src/pages/ChatPage.composer.test.tsx` checks target routing
   and parent isolation. In an embedded app, repeat text selection in both the
   parent and side chat and check the popup's theme and button styling.
+- **`side-chat-lifecycle`, another device:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_follows_the_user_to_another_device`
+  starts a side chat in the desktop rail, opens it from a phone-sized browser
+  context with its own storage, closes it there, and checks the desktop tab is
+  gone after a reload.
 - **`side-chat-lifecycle`, direct chat-only URL (browser contract):**
   `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
   opens a runnerless child directly and sends a message without a directory

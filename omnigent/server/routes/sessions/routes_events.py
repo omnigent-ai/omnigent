@@ -947,7 +947,8 @@ def register_events_routes(
           kills its tmux pane) and 204s otherwise. Stop is non-sticky:
           it writes no persistent marker, so the next message
           auto-relaunches the session on its (still-online) host via
-          the normal message-dispatch relaunch path.
+          the normal message-dispatch relaunch path. A side chat is the
+          exception: stopping it closes it.
         - ``"retry_session"`` reconnects or relaunches the existing
           session runner without persisting or replaying user input.
         - ``"message"`` on an ``omnigent claude`` terminal session
@@ -1635,7 +1636,15 @@ def register_events_routes(
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
                     )
-            # Stop is non-sticky: no persistent marker is written. The
+            if (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY):
+                # Stopping a side chat closes its tab; persist that so other
+                # devices stop listing it, as for a Codex side chat.
+                await asyncio.to_thread(
+                    conversation_store.set_labels,
+                    session_id,
+                    {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                )
+            # Any other stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
             # honestly, and the next message auto-relaunches the session on
             # its (still-online) host via the normal message-dispatch

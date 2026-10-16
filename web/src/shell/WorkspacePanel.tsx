@@ -89,13 +89,6 @@ function WorkspaceMenuShortcut({
   return <CompactShortcutKeys keys={keys} className={className} />;
 }
 
-// Side-chat child ids opened in THIS app session. Module scope, so it resets on
-// reload/restart. A Codex side chat is an ephemeral thread-fork of the parent's
-// runner: one restored from localStorage after a restart points at a dead
-// process, so it must be read-only. This set distinguishes a live, this-session
-// child from a restored (dead) one.
-const sideChatsStartedThisSession = new Set<string>();
-
 function WorkspaceTabTooltip({
   label,
   shortcut,
@@ -848,8 +841,6 @@ function WorkspacePanelImpl({
       // the Codex awaiting queue. Its first send creates the fork.
       sideChats.open(childId);
     } else {
-      // Started this session → live (not a dead restored Codex fork).
-      sideChatsStartedThisSession.add(childId);
       const awaiting = awaitingPendingIdsRef.current.shift();
       if (awaiting !== undefined) {
         sideChats.rekey(awaiting, childId);
@@ -945,14 +936,6 @@ function WorkspacePanelImpl({
           (isMobile ? mobileSideChatsOpen : open && sideChatSelected) ? conversationId : undefined
         }
         onStart={(text) => startPendingSideChat(selectedSideChat, text)}
-        // A Codex side chat restored after a restart is a dead ephemeral
-        // fork: show it read-only rather than let the user
-        // send into a thread that no longer exists.
-        readOnly={
-          usesNativeSideChatFork(sideChatHarness) &&
-          !selectedSideChat.startsWith("pending:") &&
-          !sideChatsStartedThisSession.has(selectedSideChat)
-        }
       />
     );
   const closeSideChat = async (childId: string) => {

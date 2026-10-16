@@ -11,10 +11,11 @@ import json
 import re
 import time
 from collections.abc import Iterator
+from typing import Any
 
 import httpx
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Browser, Page, Route, expect
 
 from tests.e2e.conftest import get_mock_requests
 from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, open_right_rail
@@ -443,6 +444,70 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     page.get_by_role("menuitem", name="Side chats").click()
     expect(drawer).to_have_attribute("data-state", "open")
     expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible()
+
+
+def test_side_chat_follows_the_user_to_another_device(
+    page: Page,
+    browser: Browser,
+    browser_context_args: dict[str, Any],
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+) -> None:
+    """A side chat started on the desktop opens on a phone, and closing it there closes both."""
+    base_url, session_id = seeded_session
+    parent_reply = "The parent chat answered first."
+    side_reply = "Your phone can read this side-chat answer too."
+    question = f"devices-side-{session_id}: will my phone see this?"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": parent_reply}],
+        key=f"devices-main-{session_id}",
+        match=f"devices-main-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": side_reply}],
+        key=f"devices-side-{session_id}",
+        match=f"devices-side-{session_id}",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _send_parent(page, f"devices-main-{session_id}: start the parent", parent_reply)
+    _start_side_chat(page, "panel", question)
+    desktop_tab = page.get_by_role("tab", name="Side chat 1", exact=True)
+    expect(page.locator(".side-chat-backdrop").locator(_ASSISTANT)).to_contain_text(
+        side_reply, timeout=30_000
+    )
+    expect(desktop_tab).to_be_visible()
+    assert len(side_chat_forks) == 1
+
+    # A separate context has its own storage, like a second device.
+    phone_context = browser.new_context(
+        **{**browser_context_args, "viewport": {"width": 390, "height": 844}}
+    )
+    try:
+        phone = phone_context.new_page()
+        phone.goto(f"{base_url}/c/{session_id}")
+        phone.get_by_role("button", name="Conversation actions").click()
+        phone.get_by_role("menuitem", name="Side chats").click()
+        drawer = phone.get_by_test_id("side-chats-panel-drawer")
+        drawer.get_by_role("tab", name="Side chat 1", exact=True).click()
+        expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible()
+        # The parent history the fork copied stays hidden here too.
+        expect(drawer.locator(_ASSISTANT).filter(has_text=parent_reply)).to_have_count(0)
+        expect(drawer.get_by_test_id("side-chat-input")).to_be_visible()
+
+        with phone.expect_response(f"**/v1/sessions/{side_chat_forks[0]}/events") as stopped:
+            drawer.get_by_role("button", name="Close Side chat 1", exact=True).click()
+        assert stopped.value.ok
+        expect(drawer.get_by_role("tab", name="Side chat 1", exact=True)).to_have_count(0)
+    finally:
+        phone_context.close()
+
+    page.reload()
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+    expect(desktop_tab).to_have_count(0)
 
 
 def test_running_empty_side_chat_shows_working(

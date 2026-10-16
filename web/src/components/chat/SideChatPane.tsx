@@ -49,30 +49,6 @@ function isPendingSideChat(id: string): boolean {
   return id.startsWith("pending:");
 }
 
-// The forked-in item ids to hide are captured once per child and PERSISTED, so
-// leaving the tab (which unmounts this pane) or reloading doesn't recapture the
-// side chat's own completed turns as inherited history and blank the transcript.
-// ponytail: one small localStorage key per child; entries are tiny id lists,
-// orphaned on child deletion — prune only if this ever grows.
-function inheritedBoundaryKey(childId: string): string {
-  return `omnigent.sideChatInherited:${childId}`;
-}
-function readInheritedBoundary(childId: string): Set<string> | null {
-  try {
-    const raw = localStorage.getItem(inheritedBoundaryKey(childId));
-    return raw ? new Set(JSON.parse(raw) as string[]) : null;
-  } catch {
-    return null;
-  }
-}
-function writeInheritedBoundary(childId: string, ids: Set<string>): void {
-  try {
-    localStorage.setItem(inheritedBoundaryKey(childId), JSON.stringify([...ids]));
-  } catch {
-    // Storage disabled/full — the boundary just won't survive a reload.
-  }
-}
-
 // Accurate for every harness: a side chat is a fork that stays out of the main
 // thread. It is NOT reliably ephemeral — a non-Codex side chat is a persisted
 // fork (hidden from the sidebar), so the copy doesn't promise it disappears.
@@ -99,19 +75,16 @@ export function SideChatPane({
   childId,
   selectionParentId,
   onStart,
-  readOnly: restoredReadOnly = false,
 }: {
   childId: string;
   selectionParentId?: string;
   onStart?: (text: string) => Promise<void>;
-  /** A dead, restored Codex side chat: show the transcript without a composer. */
-  readOnly?: boolean;
 }) {
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
   // The server seals a side chat whose fork died with its runner.
   const { session } = useSession(pending ? null : childId);
-  const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
+  const readOnly = session?.labels?.["omnigent.closed"] === "true";
   useLayoutEffect(() => {
     if (!selectionParentId || readOnly || starting) return;
     const target = { childId, parentId: selectionParentId };
@@ -143,60 +116,30 @@ export function SideChatPane({
     conversationLoadError,
   } = state;
 
-  // Hide the forked-in history: snapshot the item ids present once hydration
-  // settles, then render only what arrives after (the side chat's own turns).
-  // GENERIC forks only — they copy the parent transcript. A native Codex child
-  // already holds only its own turns (context lives in the native thread), so
-  // filtering there would wrongly hide the side chat's first question.
+  // Hide the forked-in history. GENERIC forks only: they copy the parent
+  // transcript. A native Codex child holds only its own turns (context lives in
+  // the native thread), so it shows everything. The server records the last
+  // copied response; older side chats fall back to timestamps, which the copies
+  // keep from the parent.
   const filterHistory = !usesNativeSideChatFork(sessionHarness);
-  // Load the persisted boundary when the child changes (mount / rekey); the
-  // in-mount ref avoids re-reading storage every render and tracks whether we've
-  // actually observed a load run, so we don't capture a boundary on the initial
-  // pre-load render.
-  const boundaryRef = useRef<{
-    childId: string;
-    ids: Set<string> | null;
-    loadSeen: boolean;
-  } | null>(null);
-  if (boundaryRef.current === null || boundaryRef.current.childId !== childId) {
-    boundaryRef.current = {
-      childId,
-      ids: filterHistory && !pending ? readInheritedBoundary(childId) : null,
-      loadSeen: false,
-    };
-  }
-  if (loadingConversation) boundaryRef.current.loadSeen = true;
-  // Capture once, when the fork's load has actually completed — even if it is
-  // EMPTY (a parent with no history), so the side chat's first message isn't
-  // mistaken for inherited history and hidden. Snapshot the inherited item ids
-  // and persist so later mounts/reloads hide the same set, not new turns.
-  if (
-    boundaryRef.current.ids === null &&
-    !pending &&
-    filterHistory &&
-    boundaryRef.current.loadSeen &&
-    !loadingConversation &&
-    conversationLoadError === null
-  ) {
-    const ids = new Set(
-      blocks
-        .map((b) => (b as { ctx?: { itemId?: string | null } }).ctx?.itemId)
-        .filter((id): id is string => typeof id === "string"),
-    );
-    boundaryRef.current.ids = ids;
-    writeInheritedBoundary(childId, ids);
-  }
-  const inherited = boundaryRef.current.ids;
-  const visibleBlocks = useMemo(
-    () =>
-      inherited === null
-        ? blocks
-        : blocks.filter((b) => {
-            const id = (b as { ctx?: { itemId?: string | null } }).ctx?.itemId;
-            return !(typeof id === "string" && inherited.has(id));
-          }),
-    [blocks, inherited],
-  );
+  const labels = session?.labels;
+  const forkedAtS = session?.createdAt;
+  const visibleBlocks = useMemo(() => {
+    if (!filterHistory) return blocks;
+    const ctxOf = (b: (typeof blocks)[number]) =>
+      (b as { ctx?: { responseId?: string; createdAtS?: number } }).ctx;
+    if (labels?.["omnigent.side_chat.parent_id"] !== undefined) {
+      const historyResponseId = labels["omnigent.side_chat.history_response_id"];
+      const historyEnd = historyResponseId
+        ? blocks.findLastIndex((b) => ctxOf(b)?.responseId === historyResponseId)
+        : -1;
+      return blocks.slice(historyEnd + 1);
+    }
+    return blocks.filter((b) => {
+      const at = ctxOf(b)?.createdAtS;
+      return at === undefined || (forkedAtS !== undefined && at >= forkedAtS);
+    });
+  }, [blocks, filterHistory, labels, forkedAtS]);
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {

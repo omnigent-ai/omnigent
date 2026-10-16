@@ -127,6 +127,14 @@ SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
 # Server-owned routing ancestry; it does not require a workspace or own a runner.
 SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 
+# The conversation whose Workspace rail lists this side chat. Stamped on generic
+# and Codex side chats, so every device can list a parent's side chats.
+SIDE_CHAT_PARENT_LABEL_KEY = "omnigent.side_chat.parent_id"
+
+# Response id of the last item a generic side chat copied from its parent, so
+# the side-chat pane can hide that inherited history on any device.
+SIDE_CHAT_HISTORY_LABEL_KEY = "omnigent.side_chat.history_response_id"
+
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
 _PINNED_LABEL_LOCAL_USER = "local"
@@ -220,6 +228,8 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     ARCHIVED_AT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    SIDE_CHAT_PARENT_LABEL_KEY,
+    SIDE_CHAT_HISTORY_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
 }
 
@@ -785,6 +795,7 @@ class ConversationStore(ABC):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        side_chat_parent_id: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -896,6 +907,10 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
+        :param side_chat_parent_id: When set, only return the side chats
+            listed in this conversation's rail (their
+            ``omnigent.side_chat.parent_id`` label). ``None`` disables the
+            filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``

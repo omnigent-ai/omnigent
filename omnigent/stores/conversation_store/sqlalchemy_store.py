@@ -100,6 +100,7 @@ from omnigent.stores.conversation_store import (
     FORK_SOURCE_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    SIDE_CHAT_PARENT_LABEL_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -2771,6 +2772,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        side_chat_parent_id: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -2838,6 +2840,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             can access but does NOT own — i.e. sessions shared with them
             by another user. Requires ``accessible_by`` to be set.
             ``False`` (default) disables the filter.
+        :param side_chat_parent_id: When set, only return the side chats
+            listed in this conversation's rail (their
+            ``omnigent.side_chat.parent_id`` label). ``None`` disables the
+            filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -3145,6 +3151,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                         select(SqlConversationLabel.conversation_id).where(
                             SqlConversationLabel.workspace_id == current_workspace_id(),
                             SqlConversationLabel.key == pinned_label_key(pinned_owner),
+                        )
+                    )
+                )
+            if side_chat_parent_id is not None:
+                stmt = stmt.where(
+                    SqlConversation.id.in_(
+                        select(SqlConversationLabel.conversation_id).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.key == SIDE_CHAT_PARENT_LABEL_KEY,
+                            SqlConversationLabel.value == side_chat_parent_id,
                         )
                     )
                 )

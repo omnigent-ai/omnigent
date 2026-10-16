@@ -254,7 +254,6 @@ def test_continue_missing_workspace_in_another_directory(
         page.add_init_script(
             "localStorage.setItem('omnigent:session-workspace-state', "
             f"JSON.stringify([{json.dumps(state)}]));"
-            f"localStorage.setItem('omnigent.sideChatInherited:{chat.session_id}', '[]');"
         )
         page.goto(parent.url)
         if width < 768:

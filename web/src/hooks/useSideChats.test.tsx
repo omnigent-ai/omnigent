@@ -1,7 +1,36 @@
-import { act, cleanup, renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import type { PropsWithChildren } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { authenticatedFetch } from "@/lib/identity";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { useSideChats } from "./useSideChats";
+
+vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+
+let queryClient: QueryClient;
+function wrapper({ children }: PropsWithChildren) {
+  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+}
+
+interface Row {
+  id: string;
+  labels?: Record<string, string>;
+}
+
+/** Serve the parent's side chats from the server, newest first. */
+function serverSideChats(rows: Row[], children: Row[] = []) {
+  vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+    const url = typeof input === "string" ? input : input.toString();
+    const data = url.includes("/child_sessions") ? children : rows;
+    return new Response(JSON.stringify({ data }));
+  });
+}
+
+beforeEach(() => {
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  serverSideChats([]);
+});
 
 afterEach(() => {
   cleanup();
@@ -10,7 +39,7 @@ afterEach(() => {
 
 describe("side-chat soft tabs", () => {
   it("opens an empty pending tab, then rekeys it in place to the real child", () => {
-    const { result } = renderHook(() => useSideChats("session-a"));
+    const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
     let pendingId = "";
     act(() => {
       pendingId = result.current.openPending();
@@ -25,7 +54,7 @@ describe("side-chat soft tabs", () => {
   });
 
   it("rekey keeps a pending tab's slot among siblings", () => {
-    const { result } = renderHook(() => useSideChats("session-a"));
+    const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
     let pendingId = "";
     act(() => result.current.open("conv_first"));
     act(() => {
@@ -38,7 +67,7 @@ describe("side-chat soft tabs", () => {
   });
 
   it("rekey to an already-open id drops the pending tab", () => {
-    const { result } = renderHook(() => useSideChats("session-a"));
+    const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
     let pendingId = "";
     act(() => result.current.open("conv_real"));
     act(() => {
@@ -51,7 +80,7 @@ describe("side-chat soft tabs", () => {
   });
 
   it("opens child ids as tabs, selecting each, and is idempotent", () => {
-    const { result } = renderHook(() => useSideChats("session-a"));
+    const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
     expect(result.current.tabs).toEqual([]);
     act(() => result.current.open("conv_side1"));
     expect(result.current.tabs).toEqual(["conv_side1"]);
@@ -80,6 +109,7 @@ describe("side-chat soft tabs", () => {
     });
     const { result, rerender } = renderHook(({ id }) => useSideChats(id), {
       initialProps: { id: "session-a" },
+      wrapper,
     });
     expect(result.current.tabs).toEqual(["conv_a1"]);
     rerender({ id: "session-b" });
@@ -88,12 +118,12 @@ describe("side-chat soft tabs", () => {
   });
 
   it("persists tabs and selection across remount, isolated per session", () => {
-    const first = renderHook(() => useSideChats("session-a"));
+    const first = renderHook(() => useSideChats("session-a"), { wrapper });
     act(() => first.result.current.open("conv_a1"));
     act(() => first.result.current.open("conv_a2"));
     first.unmount();
 
-    const restored = renderHook(() => useSideChats("session-a"));
+    const restored = renderHook(() => useSideChats("session-a"), { wrapper });
     expect(restored.result.current.tabs).toEqual(["conv_a1", "conv_a2"]);
     expect(restored.result.current.selected).toBe("conv_a2");
     expect(readSessionWorkspaceState("session-a")).toEqual({
@@ -101,12 +131,12 @@ describe("side-chat soft tabs", () => {
       selectedSideChatId: "conv_a2",
     });
 
-    const other = renderHook(() => useSideChats("session-b"));
+    const other = renderHook(() => useSideChats("session-b"), { wrapper });
     expect(other.result.current.tabs).toEqual([]);
   });
 
   it("closes the target tab and selects a neighbor, then clears", () => {
-    const { result } = renderHook(() => useSideChats("session-a"));
+    const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
     act(() => result.current.open("conv_1"));
     act(() => result.current.open("conv_2"));
     act(() => result.current.close("conv_2"));
@@ -118,7 +148,7 @@ describe("side-chat soft tabs", () => {
   });
 
   it("keeps the selection when closing a background tab", () => {
-    const { result } = renderHook(() => useSideChats("session-a"));
+    const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
     act(() => result.current.open("conv_1"));
     act(() => result.current.open("conv_2"));
     // conv_2 is selected; closing the background conv_1 leaves it selected.
@@ -128,7 +158,7 @@ describe("side-chat soft tabs", () => {
   });
 
   it("select changes the active tab and can clear it", () => {
-    const { result } = renderHook(() => useSideChats("session-a"));
+    const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
     act(() => result.current.open("conv_1"));
     act(() => result.current.open("conv_2"));
     act(() => result.current.select("conv_1"));
@@ -137,5 +167,44 @@ describe("side-chat soft tabs", () => {
     expect(result.current.selected).toBeNull();
     // Tabs are untouched by selection changes.
     expect(result.current.tabs).toEqual(["conv_1", "conv_2"]);
+  });
+});
+
+describe("side chats opened on another device", () => {
+  it("adds them as tabs and drops ones closed elsewhere", async () => {
+    writeSessionWorkspaceState("session-a", {
+      openSideChats: ["conv_closed", "conv_local", "pending:draft"],
+      selectedSideChatId: "conv_closed",
+    });
+    const parent = { "omnigent.side_chat.parent_id": "session-a" };
+    serverSideChats(
+      [
+        { id: "conv_remote_2", labels: parent },
+        // An older server ignores the filter and returns sidebar rows.
+        { id: "conv_sidebar_row" },
+        { id: "conv_remote_1", labels: parent },
+        { id: "conv_closed", labels: { ...parent, "omnigent.closed": "true" } },
+      ],
+      // A Codex side chat is a sub-agent child; ordinary sub-agents stay out.
+      [{ id: "conv_codex_side", labels: parent }, { id: "conv_worker" }],
+    );
+
+    const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
+
+    // A tab the server doesn't list yet (just created here) stays open.
+    await waitFor(() =>
+      expect(result.current.tabs).toEqual([
+        "conv_local",
+        "pending:draft",
+        "conv_remote_1",
+        "conv_remote_2",
+        "conv_codex_side",
+      ]),
+    );
+    expect(result.current.selected).toBeNull();
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(result.current.tabs);
+    expect(vi.mocked(authenticatedFetch).mock.calls[0][0]).toContain(
+      "side_chat_parent_id=session-a",
+    );
   });
 });

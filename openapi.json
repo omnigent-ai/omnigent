@@ -12901,6 +12901,23 @@
               "title": "Visibility",
               "type": "string"
             }
+          },
+          {
+            "description": "When set, return only the side chats listed in this session's Workspace rail, e.g. `\"conv_abc123\"`. Side chats are otherwise left out of the list. Codex side chats are sub-agent children, listed by `child_sessions`.",
+            "in": "query",
+            "name": "side_chat_parent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Side Chat Parent Id"
+            }
           }
         ],
         "responses": {
