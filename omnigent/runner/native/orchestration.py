@@ -9713,7 +9713,8 @@ async def _resolve_native_spawn_env(
         if agent.key == "codex" and provider.bridge_id_label_key not in labels:
             from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_DIR_ENV_VAR
 
-            # When the label is unavailable, keep the executor on the directory this runner launched into.
+            # When the label is unavailable, keep the executor on the directory
+            # this runner launched into.
             env[CODEX_NATIVE_BRIDGE_DIR_ENV_VAR] = str(codex_native_bridge_dir(session_id))
         return env
 
