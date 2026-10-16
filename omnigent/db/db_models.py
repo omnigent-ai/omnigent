@@ -1323,6 +1323,8 @@ class SqlHost(OmnigentBase):
         host has never reported it (older host build) — unknown, not
         "nothing configured". Surfaced via ``GET /v1/hosts`` so the web
         agent picker can warn about unconfigured harnesses.
+    :param connect_generation: Per-connect token that guards the tunnel's
+        offline writes; ``NULL`` on legacy rows.
     """
 
     __tablename__ = "hosts"
@@ -1355,6 +1357,8 @@ class SqlHost(OmnigentBase):
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Random 63-bit connect token.
+    connect_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
