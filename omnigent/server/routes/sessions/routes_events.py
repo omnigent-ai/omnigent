@@ -94,7 +94,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
     schedule_background_child_task_summary,
 )
-from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -2428,6 +2428,7 @@ def register_events_routes(
         relaunch_refusal_reason: str | None = None
         relaunch_refusal_visible = False
         host_wait_started = time.monotonic()
+        _host_conn: HostConnection | None = None
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
             _grace_host_reg = cast(
@@ -2448,8 +2449,8 @@ def register_events_routes(
             # while one that was stopped, crashed, or lost to a host restart
             # reads "dead"/"unknown" and cuts the wait short so the relaunch
             # below runs at once. A host that is offline, too old to answer,
-            # or slow yields no verdict and the grace runs its normal
-            # course, so the query only ever speeds up the cold path.
+            # or slow yields no verdict and keeps the ordinary grace. An
+            # explicit pending sign-in retains this runner and the input.
             from omnigent.server.routes import sessions as _sf
 
             if conv.runner_id is not None and _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0:
@@ -2471,6 +2472,7 @@ def register_events_routes(
                         runner_exit_reports=runner_exit_reports,
                         host_conn=_grace_host_conn,
                         host_registry=_grace_host_reg,
+                        conversation_store=conversation_store,
                     )
                 else:
                     # Host tunnel absent: no one to query, so this is the
@@ -2593,13 +2595,17 @@ def register_events_routes(
                     conv.host_id,
                     session_id,
                 )
-                runner_client = await _wait_for_runner_client(
+                assert _host_conn is not None and _host_reg is not None
+                runner_client = await _wait_for_host_bound_runner_client(
                     session_id,
                     runner_router,
                     _tunnel_registry,
                     runner_id=relaunched_runner_id,
                     timeout_s=_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
                     runner_exit_reports=runner_exit_reports,
+                    host_conn=_host_conn,
+                    host_registry=_host_reg,
+                    conversation_store=conversation_store,
                 )
             if runner_client is None:
                 _runner_needs_session_init = False

@@ -295,6 +295,14 @@ Cross-harness journeys:
   retain their endpoint; history, model, effort and permissions survive.
   `tests/harnesses/codex_native/session/test_terminal_prepare.py::test_prepare_codex_terminal_resumes_with_launch_provider`
   covers the CLI resume call site with configured and unpinned launches.
+- **`resume`, Codex `/new` followed by Stop session and a new message:**
+  `tests/e2e/test_codex_rotated_bridge_relaunch_e2e.py::test_rotated_codex_session_relaunches_into_its_bridge_directory`
+  (own environment, real server, host, runner, Codex and tmux; local model replies)
+  starts a conversation, runs `/new` in the native terminal, and verifies the
+  rotated conversation before stopping its runner. A chat message relaunches
+  the session, then a terminal message verifies the reattached TUI. It covers
+  retained bridge state and an absent bridge directory. Machine-wide Codex
+  managed settings require an isolated container for the local model endpoint.
 - **`chat-render`, `steer`, per harness:** use the matrix.
 - **`chat-render`, Claude shell commands from the web composer:**
   `tests/browser_ui/chat/test_native_shell_settlement.py::test_shell_mirror_settles_its_bubble_before_the_next_prompt`

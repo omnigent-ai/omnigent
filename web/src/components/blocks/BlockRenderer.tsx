@@ -447,7 +447,12 @@ function partitionTurn(items: RenderItem[]): TurnPartition {
   const segments: TurnSegment[] = [];
   for (let i = 0; i < end; i += 1) {
     const item = items[i]!;
-    if (isPendingElicitation(item) || isPersistentToolCard(item) || isInProgressTool(item)) {
+    if (
+      isPendingElicitation(item) ||
+      isPersistentToolCard(item) ||
+      isInProgressTool(item) ||
+      isSlashCommandCard(item)
+    ) {
       segments.push({ kind: "exempt", item, index: i });
       continue;
     }
@@ -466,6 +471,11 @@ function partitionTurn(items: RenderItem[]): TurnPartition {
 
 function isPendingElicitation(item: RenderItem): boolean {
   return item.kind === "elicitation" && item.status === "pending";
+}
+
+/** A slash-command receipt is a durable record of the user's invocation. */
+function isSlashCommandCard(item: RenderItem): boolean {
+  return item.kind === "slash_command";
 }
 
 /**
