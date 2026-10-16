@@ -238,12 +238,13 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :returns: None.
     """
-    # Forget the launch dir even when the app-server already exited on its own.
-    _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
     if session_id not in _AUTO_CODEX_APP_SERVERS:
+        # Forget the launch dir even when the app-server already exited on its own.
+        _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
         return
     await _cancel_auto_forwarder_task(session_id)
     leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+    _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
     if leftover_app_server is not None:
         with contextlib.suppress(Exception):
             await leftover_app_server.close()
@@ -9632,8 +9633,7 @@ async def _resolve_native_spawn_env(
         if agent.key == "codex" and provider.bridge_id_label_key not in labels:
             from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_DIR_ENV_VAR
 
-            # A label read that timed out must not point the executor away from
-            # the directory this runner launched the terminal into.
+            # When the label is unavailable, keep the executor on the directory this runner launched into.
             env[CODEX_NATIVE_BRIDGE_DIR_ENV_VAR] = str(codex_native_bridge_dir(session_id))
         return env
 
