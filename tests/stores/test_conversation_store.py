@@ -3477,6 +3477,24 @@ def test_list_runner_session_statuses_pages(
             conversation_store.list_runner_session_statuses("runner-target", limit=invalid_limit)
 
 
+def test_stamped_live_status_write_is_newest_wins(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    conversation_store.set_session_live_status(conv.id, "running", observed_at=2_000)
+    # A delayed write observed earlier must not overwrite the newer status.
+    conversation_store.set_session_live_status(conv.id, "idle", observed_at=1_000)
+    row = conversation_store.get_conversation(conv.id)
+    assert (row.live_status, row.live_status_at) == ("running", 2_000)
+    conversation_store.set_session_live_status(conv.id, "idle", observed_at=3_000)
+    row = conversation_store.get_conversation(conv.id)
+    assert (row.live_status, row.live_status_at) == ("idle", 3_000)
+    # An unstamped write applies unconditionally and keeps the stamp.
+    conversation_store.set_session_live_status(conv.id, "running")
+    row = conversation_store.get_conversation(conv.id)
+    assert (row.live_status, row.live_status_at) == ("running", 3_000)
+
+
 @pytest.mark.parametrize("status", [None, "idle", "running", "waiting", "failed"])
 def test_settle_intentionally_stopped_session_requires_current_runner(
     conversation_store: SqlAlchemyConversationStore,
