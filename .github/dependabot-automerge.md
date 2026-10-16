@@ -101,10 +101,10 @@ a queued native auto-merge request. GitHub still enforces branch requirements.
 
 ## Enable, observe and stop
 
-Set `DEPENDABOT_AUTOMERGE_MODE=merge` to enable merging. After a scan-policy
-change, rerun Security Scan once for existing PRs that
-failed under the old policy, or let Dependabot rebase them. New PR events use
-the current policy. For eligible candidates in merge mode, the worker refreshes
+Set `DEPENDABOT_AUTOMERGE_MODE=merge` to enable merging. After changing workflow
+definitions, let Dependabot rebase or recreate existing PRs so fresh PR events
+load the new definitions. A rerun keeps the original workflow YAML and may
+retain the old scan behavior even though the scripts load from `main`. For eligible candidates in merge mode, the worker refreshes
 failed Maintainer Approval checks after cooldown expiry, mode changes or hold
 removal. Once Security Scan is green, it also reruns workflows whose only failed
 jobs are Security Gate jobs. Both refresh paths stop at three total run attempts;
