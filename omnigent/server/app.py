@@ -12,7 +12,6 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from functools import partial
 from importlib import import_module
 from itertools import batched, groupby
 from pathlib import Path
@@ -92,6 +91,7 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
+from omnigent.server.mcp_gateway import McpGatewayBackend
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -200,11 +200,16 @@ class ServerInfoResponse(BaseModel):
     dictation_available: bool
     # The archive PATCH accepts ``delete_worktree``; older servers reject it.
     archive_worktree_cleanup: bool = True
+    # A managed create or fork accepts ``host_id`` naming its new sandbox host;
+    # older servers reject it.
+    request_managed_sandbox_host_id: bool = True
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
     # GET /v1/agents/{id}; absent on older servers, which clients treat as unsupported.
     agent_detail: bool = False
+    # Owner configuration reads and conditional PATCH updates.
+    agent_config_edit: bool = False
     branding: BrandingInfo
 
 
@@ -1338,6 +1343,8 @@ def create_app(
     github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
     databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
     databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
+    mcp_registry: Any | None = None,
+    mcp_gateway_backend: McpGatewayBackend | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     public_sharing_max_level: str | Callable[[], str] | None = None,
@@ -1346,6 +1353,7 @@ def create_app(
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
     base_path: str | None = None,
+    host_sharded: bool = False,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1482,6 +1490,13 @@ def create_app(
         reverse proxy, e.g. ``"/proxy/6767"`` (code-server port proxy).
         ``None`` reads ``OMNIGENT_WEB_BASE_PATH``; empty/``"/"`` is a normal
         root deployment.
+    :param host_sharded: Whether replicas sit behind a router that keys host
+        and runner tunnels by host_id. When ``True``, a host-scoped request
+        for a live host whose tunnel is on another replica returns 400
+        ``wrong_replica``; otherwise it returns 409 "host is offline". The
+        400 recovers only for a client that sent the slice-key header and
+        retries without it, which the web client does only for requests it
+        keyed itself.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -1542,9 +1557,12 @@ def create_app(
             )
 
     from omnigent.runner.routing import RunnerRouter
+    from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
     from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
     from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+    from omnigent.server.routes._host_launch import configure_host_sharding
 
+    configure_host_sharding(host_sharded)
     tunnel_registry = TunnelRegistry()
     host_registry = HostRegistry()
     runner_router = RunnerRouter(
@@ -1557,6 +1575,8 @@ def create_app(
         # is the latter, not a false wrong-replica.
         host_registry=host_registry,
         host_store=host_store,
+        agent_store=agent_store,
+        agent_cache=agent_cache,
     )
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
@@ -1564,6 +1584,7 @@ def create_app(
         conversation_store=conversation_store,
         file_store=file_store,
         agent_store=agent_store,
+        agent_cache=agent_cache,
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
@@ -1857,10 +1878,46 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
-    if host_store is not None:
-        host_registry.launch_authorizer = partial(
-            host_store.admit_launch, require_account_owner=runner_account_store is not None
-        )
+    app.state.mcp_gateway_backend = mcp_gateway_backend
+    app.state.mcp_registry = mcp_registry
+    app.state.mcp_registry_auth = auth_provider
+    app.state.runner_tunnel_tokens = runner_tunnel_tokens
+
+    def _admit_host_launch(
+        host_id: str,
+        session_id: str,
+        owner: str | None,
+        generation: str | None,
+        allow_unbound: bool,
+        transfer_from_host_id: str | None,
+    ) -> None:
+        """Authorize the launch and validate its host against the saved agent."""
+        if host_store is not None:
+            host_store.admit_launch(
+                host_id,
+                session_id,
+                owner,
+                generation,
+                allow_unbound,
+                transfer_from_host_id,
+                require_account_owner=runner_account_store is not None,
+            )
+        from omnigent.host.frames import CAP_MCP_REGISTRY
+        from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+
+        connection = host_registry.get(host_id)
+        if connection is not None and CAP_MCP_REGISTRY not in connection.hello.capabilities:
+            conv = conversation_store.get_conversation(session_id)
+            if conv is not None:
+                require_session_registry_mcp_support(
+                    conv,
+                    connection.hello.capabilities,
+                    component="host",
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
+                )
+
+    host_registry.launch_authorizer = _admit_host_launch
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
@@ -2872,11 +2929,12 @@ def create_app(
            (``/auth/login`` native parameters + ``POST /auth/native-token``).
            ``session_cookie`` names the session cookie for ``oidc`` and
            ``accounts`` and is ``null`` otherwise. ``native_redirect_uris``
-           lists the private-use-scheme redirects (e.g. the iOS app's
-           ``ai.omnigent.ios:/oauth/callback``) the native sign-in accepts
-           besides loopback, sorted, for ``oidc``; ``null`` otherwise. The
-           iOS app gates on its URI being listed, because servers that only
-           support loopback answer the custom scheme with 400. A missing
+           lists the private-use-scheme redirects (the iOS and Android apps'
+           ``ai.omnigent.ios:/oauth/callback`` and
+           ``ai.omnigent.android:/oauth/callback``) the native sign-in accepts
+           besides loopback, sorted, for ``oidc``; ``null`` otherwise. Each
+           app gates on its own URI being listed, because servers that don't
+           accept it answer that redirect with 400. A missing
            ``auth`` (older servers) means "sign in as before".
         6. ``server_name`` (str | null) is the operator's display name for
            this deployment (``branding.server_name``), for clients that list
@@ -3017,6 +3075,8 @@ def create_app(
             if getattr(app.state, f"{provider}_config", None) is not None
             and getattr(app.state, f"{provider}_store", None) is not None
         ]
+        if mcp_registry is not None:
+            enabled_connections.append("mcp")
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -3093,8 +3153,11 @@ def create_app(
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,
+                "request_managed_sandbox_host_id": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
+                "agent_config_edit": agent_store.supports_config_edit
+                and artifact_store is not None,
                 "branding": branding_snapshot.config(),
             }
         )
@@ -3221,6 +3284,16 @@ def create_app(
         ),
         prefix="/v1",
         tags=["sessions"],
+    )
+    from omnigent.server.mcp_policy_adapter import McpPolicyAdapter
+    from omnigent.server.routes.mcp_gateway import create_mcp_gateway_router
+
+    app.include_router(
+        create_mcp_gateway_router(
+            McpPolicyAdapter(conversation_store, agent_store, auth_provider, permission_store)
+        ),
+        prefix="/v1",
+        tags=["mcp_gateway"],
     )
     app.include_router(
         create_imports_router(
@@ -3415,7 +3488,7 @@ def create_app(
             pending.cancel()
 
     async def _mark_disconnected_runner_failed(
-        runner_id: str, reference_stamp: int | None
+        runner_id: str, reference_stamp: int | None, *, idle_shutdown: bool = False
     ) -> None:
         """Reconcile a dropped runner's sessions once the liveness lease expires.
 
@@ -3449,10 +3522,14 @@ def create_app(
             *runner_id*, captured in :func:`_on_runner_disconnect` before
             the clear — the reference the cross-replica check compares
             against.
+        :param idle_shutdown: Whether the runner closed with
+            ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``. Its idle watchdog found no
+            active work, so a stale mid-turn status is settled like a Stop.
         """
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
+            _note_runner_idle_shutdown,
             _relinquish_session_live_state,
             _runner_live_on_another_replica_from_conversations,
         )
@@ -3503,11 +3580,25 @@ def create_app(
                 runner_id,
             )
             return
-        _logger.warning(
-            "Runner %s disconnected; reconciling %d bound session(s)",
-            runner_id,
-            len(affected),
-        )
+        if idle_shutdown:
+            # The sweep's stop path settles these to idle instead of failing them.
+            _note_runner_idle_shutdown(runner_id, affected)
+            _logger.info(
+                "Runner %s shut down with no active work; settling %d bound session(s)",
+                runner_id,
+                len(affected),
+                extra=debug_event(
+                    "runner_idle_shutdown",
+                    runner_id=runner_id,
+                    session_count=len(affected),
+                ),
+            )
+        else:
+            _logger.warning(
+                "Runner %s disconnected; reconciling %d bound session(s)",
+                runner_id,
+                len(affected),
+            )
         await _mark_runner_sessions_offline(
             affected,
             ErrorDetail(
@@ -3563,10 +3654,22 @@ def create_app(
                 runner_id,
             )
             return
+        from omnigent.server.routes.sessions import _note_runner_idle_shutdown
+
+        idle_shutdown = connection.peer_close_reason == RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
         _logger.info(
             "Runner disconnected",
-            extra=debug_event("runner_disconnected", runner_id=runner_id),
+            extra=debug_event(
+                "runner_disconnected",
+                runner_id=runner_id,
+                peer_close_reason=connection.peer_close_reason,
+                idle_shutdown=idle_shutdown,
+            ),
         )
+        if idle_shutdown:
+            # Relays decide at the same deadline as the grace timer below and
+            # would fail a stale mid-turn status first; mark them now.
+            _note_runner_idle_shutdown(runner_id)
         # Capture this replica's own last stamp before clearing, so the grace
         # timer can tell a fresher stamp another replica writes later from
         # one we wrote ourselves (the clear itself never erases this record).
@@ -3583,7 +3686,11 @@ def create_app(
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
         task = asyncio.create_task(
-            _mark_disconnected_runner_failed(runner_id, reference_stamp),
+            _mark_disconnected_runner_failed(
+                runner_id,
+                reference_stamp,
+                idle_shutdown=idle_shutdown,
+            ),
             name=f"runner-disconnect-grace-{runner_id}",
         )
         _disconnect_grace_tasks[runner_id] = task
@@ -3651,12 +3758,19 @@ def create_app(
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:
         """Attach bound streams, then recover independent session trees concurrently."""
         from omnigent.entities import Conversation
+        from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
         from omnigent.server.child_session_recovery import (
             RECOVERY_STORE_CONCURRENCY,
+            _interrupted,
+            _restorable,
             is_parent_owned_subagent,
             restore_active_children,
         )
-        from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+        from omnigent.server.routes._sessions.common import (
+            _session_sandbox_status_cache,
+            _session_status_cache,
+        )
+        from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
@@ -3684,6 +3798,44 @@ def create_app(
                 is_parent_owned_subagent(conv)
                 or (conv.parent_conversation_id in bound_ids and conv.host_id is None)
             )
+
+        def needs_eager_recovery(conv: Conversation) -> bool:
+            if conv.archived:
+                return False
+            # Idle runtimes are recreated on their next interaction. Unknown,
+            # in-flight, failed, and approval-blocked sessions recover now.
+            status = _session_status_cache.get(conv.id, conv.live_status)
+            pending = max(
+                conv.pending_elicitation_count or 0,
+                pending_elicitations.count_for(conv.id),
+            )
+            return (
+                status != "idle"
+                or pending > 0
+                or _last_task_error_from_labels(conv.labels) is not None
+            )
+
+        by_id = {conv.id: conv for conv in convs}
+
+        def independent_root_id(conv: Conversation) -> str | None:
+            seen: set[str] = set()
+            while not is_independent(conv):
+                if conv.id in seen or conv.parent_conversation_id is None:
+                    return None
+                seen.add(conv.id)
+                parent = by_id.get(conv.parent_conversation_id)
+                if parent is None:
+                    return None
+                conv = parent
+            return conv.id
+
+        eager_root_ids: set[str] = set()
+        for conv in convs:
+            if not needs_eager_recovery(conv):
+                continue
+            root_id = independent_root_id(conv)
+            if root_id is not None and not by_id[root_id].archived:
+                eager_root_ids.add(root_id)
 
         # Attach independent roots first; their recovery restores dependent sessions.
         convs.sort(key=lambda conv: not is_independent(conv))
@@ -3759,6 +3911,64 @@ def create_app(
                         if cached_sandbox is not None and cached_sandbox.stage == "failed":
                             _publish_sandbox_status(conv.id, "ready")
 
+        # Descendants on an offline runner are absent from the bound-session lookup.
+        # Scan attached idle trees in bounded pages before recovering their roots.
+        frontier = {
+            conv.id: conv.id
+            for conv, _ in roots
+            if conv.agent_id is not None and _restorable(conv) and conv.id not in eager_root_ids
+        }
+        idle_root_ids = set(frontier.values())
+        try:
+            while frontier:
+                next_frontier: dict[str, str] = {}
+                for parent_id, root_id in frontier.items():
+                    if root_id in eager_root_ids:
+                        continue
+                    cursor: tuple[int, str] | None = None
+                    while True:
+                        async with store_slots:
+                            pairs = await asyncio.to_thread(
+                                conversation_store.list_child_conversation_ids_page,
+                                parent_id,
+                                after=cursor,
+                                limit=_RECONNECT_BINDING_BATCH_SIZE,
+                            )
+                        if not pairs:
+                            break
+                        child_id, created_at = pairs[-1]
+                        cursor = (created_at, child_id)
+                        async with store_slots:
+                            rows = await asyncio.to_thread(
+                                conversation_store.get_conversations,
+                                [child_id for child_id, _ in pairs],
+                            )
+                        for child_id, _ in pairs:
+                            row = rows.get(child_id)
+                            if (
+                                row is None
+                                or row.host_id is not None
+                                or row.runner_id is None
+                                or not _restorable(row)
+                                or is_side_chat_child(row.labels)
+                            ):
+                                continue
+                            if row.runner_id != runner_id and runner_router.runner_is_online(
+                                row.runner_id
+                            ):
+                                continue
+                            if row.runner_id != runner_id and _interrupted(row):
+                                eager_root_ids.add(root_id)
+                                break
+                            next_frontier[row.id] = root_id
+                        if root_id in eager_root_ids or len(pairs) < _RECONNECT_BINDING_BATCH_SIZE:
+                            break
+                frontier = next_frontier
+        except Exception:
+            # A failed classification must not prevent eager recovery.
+            _logger.exception("Failed to classify child recovery for runner %s", runner_id)
+            eager_root_ids.update(idle_root_ids)
+
         async def recover_root(conv: Conversation, client: httpx.AsyncClient) -> None:
             with runner_log_scope(conv.id, runner_id):
                 try:
@@ -3772,8 +3982,13 @@ def create_app(
                     runner_session_initializer.require_generation(
                         runner_id, client, connection.generation
                     )
-                    # Sessions without an agent have no runner runtime to initialize.
-                    if conv.agent_id:
+                    initialize_runtime = (
+                        conv.agent_id is not None
+                        and not conv.archived
+                        and (conv.id in eager_root_ids or needs_eager_recovery(conv))
+                    )
+                    # Idle trees reinitialize on demand; active trees recover now.
+                    if initialize_runtime:
                         response = await runner_session_initializer.initialize(
                             conv,
                             client,
@@ -3792,7 +4007,7 @@ def create_app(
                         await _publish_runner_recovered_status(
                             conv.id, conversation_store, require_disconnect_code=True
                         )
-                    if conv.agent_id:
+                    if initialize_runtime:
                         await restore_active_children(
                             conv,
                             client,
@@ -3995,6 +4210,15 @@ def create_app(
             create_host_credentials_router(host_store),
             prefix="/v1",
             tags=["hosts"],
+        )
+
+    if mcp_registry is not None:
+        from omnigent.server.routes.mcp_registry import create_mcp_registry_router
+
+        app.include_router(
+            create_mcp_registry_router(mcp_registry, auth_provider),
+            prefix="/v1",
+            tags=["mcp_registry"],
         )
 
     # Per-user connection routes (/v1/connections/{provider}/*): connect /

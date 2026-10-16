@@ -357,9 +357,9 @@ def register_resource_routes(
         ):
             # Each native harness contributes only the ensure hooks that differ
             # from the uniform base; a single _ensure_native_terminal call runs
-            # them. The 4 uniform harnesses (goose/kiro/hermes/qwen) need only the
-            # base context; pi/opencode/cursor/kimi/claude resolve an agent spec
-            # via build_context; codex/antigravity add an ownership check (and
+            # them. pi/opencode/cursor/kimi/devin/goose/hermes/kiro/qwen/claude
+            # resolve an agent spec via build_context (its os_env carries the
+            # terminal sandbox); codex/antigravity add an ownership check (and
             # codex a one-shot policy-notice response wrap).
             _ensure_locks = _require_full_native_lock_coverage(
                 {
@@ -477,7 +477,15 @@ def register_resource_routes(
 
                 _ensure_build = _spec_ensure_build
 
-            elif terminal_name in ("cursor", "kimi", "devin"):
+            elif terminal_name in (
+                "cursor",
+                "kimi",
+                "devin",
+                "goose",
+                "hermes",
+                "kiro",
+                "qwen",
+            ):
 
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,
@@ -918,6 +926,7 @@ def register_resource_routes(
                         _publish_event,
                         server_client=server_client,
                         ensure_comment_relay=_ensure_comment_relay_started,
+                        agent_spec=await _resolve_session_agent_spec_or_none(session_id),
                     )
                 except Exception:
                     _logger.exception(
@@ -1534,7 +1543,7 @@ def register_resource_routes(
         )
         fs = CallerProcessFilesystem(env)
         result = await fs.delete(relative_path, recursive=recursive)
-        if filesystem_registry is not None and result.type == "file":
+        if filesystem_registry is not None and result.type in ("file", "symlink"):
             filesystem_registry.record_change(relative_path, "deleted", session_id)
         return JSONResponse(
             status_code=200,

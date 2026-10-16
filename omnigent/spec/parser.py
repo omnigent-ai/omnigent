@@ -2809,6 +2809,9 @@ def _parse_inline_mcp_servers(
         if str(val.get("type", "")) != "mcp":
             continue
         name = str(key)
+        if val.get("transport") == "registry":
+            servers.append(_parse_registry_mcp_server(name, val, "inline MCP server"))
+            continue
         command = val.get("command")
         url = val.get("url")
         if command is not None:
@@ -2948,6 +2951,12 @@ def _discover_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
         transport_str = str(transport)
+        if transport_str == "registry":
+            raise OmnigentError(
+                "Managed MCP references must be inline in config.yaml tools, "
+                "where older servers can ignore them; registry sidecars are unsupported",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if transport_str == "http":
             servers.append(_parse_http_mcp_server(name, raw, yaml_file, expand_env=expand_env))
         elif transport_str == "stdio":
@@ -2959,6 +2968,33 @@ def _discover_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
     return servers
+
+
+def _parse_registry_mcp_server(name: str, raw: dict, source: str) -> MCPServerConfig:
+    """Keep only a catalog reference in agent bundles and runner configuration."""
+    if any(
+        key in raw
+        for key in (
+            "url",
+            "headers",
+            "command",
+            "args",
+            "env",
+            "auth",
+            "profile",
+            "databricks_server",
+        )
+    ):
+        raise OmnigentError(
+            f"Registry MCP {name!r} cannot override its server configuration: {source}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return MCPServerConfig(
+        name=name,
+        transport="registry",
+        description=raw.get("description"),
+        tools=[] if raw.get("tools") == [] else _parse_mcp_tool_allowlist(name, raw, source),
+    )
 
 
 def _parse_http_mcp_server(

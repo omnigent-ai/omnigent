@@ -26,8 +26,9 @@ from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SO
 if TYPE_CHECKING:
     from omnigent.entities import Conversation
     from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
+    from omnigent.runtime.agent_cache import AgentCache
     from omnigent.server.host_registry import HostRegistry
-    from omnigent.stores import ConversationStore
+    from omnigent.stores import AgentStore, ConversationStore
     from omnigent.stores.host_store import HostStore
 
 
@@ -169,11 +170,15 @@ class RunnerRouter:
         conversation_store: ConversationStore,
         host_registry: HostRegistry | None = None,
         host_store: HostStore | None = None,
+        agent_store: AgentStore | None = None,
+        agent_cache: AgentCache | None = None,
     ) -> None:
         self._registry = registry
         self._conversation_store = conversation_store
         self._host_registry = host_registry
         self._host_store = host_store
+        self._agent_store = agent_store
+        self._agent_cache = agent_cache
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._lock = threading.RLock()
 
@@ -294,6 +299,28 @@ class RunnerRouter:
         :returns: ``True`` when the registry has a live session.
         """
         return self._registry.get(runner_id) is not None
+
+    def require_mcp_registry_support(self, conversation: Conversation) -> None:
+        """Validate the connected runner before sending it a registry-backed agent."""
+        from omnigent.host.frames import CAP_MCP_REGISTRY
+
+        connection = self._registry.get(conversation.runner_id) if conversation.runner_id else None
+        if (
+            connection is None
+            or CAP_MCP_REGISTRY in connection.hello.capabilities
+            or self._agent_store is None
+            or self._agent_cache is None
+        ):
+            return
+        from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+
+        require_session_registry_mcp_support(
+            conversation,
+            connection.hello.capabilities,
+            component="runner",
+            agent_store=self._agent_store,
+            agent_cache=self._agent_cache,
+        )
 
     async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:
         """

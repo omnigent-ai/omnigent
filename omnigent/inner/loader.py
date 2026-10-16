@@ -457,6 +457,12 @@ def _parse_tool(name: str, data: str | YamlData, *, allow_dynamic_tools: bool) -
         )
 
     if tool_type == "mcp":
+        if data.get("transport") == "registry":
+            raise ValueError(
+                "Managed MCP references require native config.yaml (spec_version: 1) "
+                "with inline tools, or the session MCP picker/API; "
+                "older servers cannot read them in legacy agent YAML"
+            )
         # ``profile`` can be declared directly (``profile: myprof``)
         # or inside an ``auth:`` block (``auth: {type: databricks,
         # profile: myprof}``). The ``auth:`` block is the preferred

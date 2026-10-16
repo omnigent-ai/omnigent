@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import posixpath
 import tarfile
 import tempfile
@@ -15,7 +16,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import generate_agent_id, uploaded_agent_id
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec import AgentSpec, ExtractionError, ToolRuntime, load
 
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
     from omnigent.entities import Agent
     from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.artifact_store import ArtifactStore
+
+_logger = logging.getLogger(__name__)
 
 
 def _is_dotted_callable_path(path: str) -> bool:
@@ -144,6 +147,10 @@ def validate_agent_bundle(
         raise
     except ExtractionError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    except OSError:
+        raise OmnigentError(
+            "Agent bundle validation failed", code=ErrorCode.INTERNAL_ERROR
+        ) from None
     except Exception as exc:
         # Catch YAML parse errors and other unexpected failures
         # during spec loading so they surface as 400, not 500.
@@ -188,7 +195,15 @@ def agent_needs_own_copy(agent: Agent, user_id: str | None) -> bool:
 
 def copy_agent_bundle(artifact_store: ArtifactStore, location: str, new_agent_id: str) -> str:
     """Store a copy of the bundle at *location* under *new_agent_id*; return its location."""
-    data = artifact_store.get(location)
+    try:
+        data = artifact_store.get(location)
+    except KeyError as exc:
+        _logger.warning(
+            "agent bundle %s is missing from the artifact store; cannot copy it", location
+        )
+        raise OmnigentError(
+            SESSION_AGENT_BUNDLE_MISSING_MESSAGE, code=ErrorCode.SESSION_AGENT_MISSING
+        ) from exc
     new_location = bundle_location(new_agent_id, data)
     artifact_store.put(new_location, data)
     return new_location

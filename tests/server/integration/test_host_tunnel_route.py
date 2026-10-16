@@ -7,7 +7,9 @@ import contextlib
 import logging
 import threading
 import time
+from types import SimpleNamespace
 
+import anyio
 import pytest
 from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
@@ -423,12 +425,15 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
     assert not store.is_online(_HOST_ID)
 
 
+@pytest.mark.parametrize("wall_clock_step", [-3600.0, 0.0, 3600.0])
 async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    wall_clock_step: float,
 ) -> None:
     import omnigent.server.routes.host_tunnel as tunnel_mod
+    from omnigent.server import host_registry
 
     monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 3)
@@ -441,13 +446,19 @@ async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
     monkeypatch.setattr(store, "heartbeat", fail_heartbeat)
     comm = await _connect_route(app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry, connection_id="host-silent")
+    shifted_clock = SimpleNamespace(
+        time=lambda: time.time() + wall_clock_step, monotonic=time.monotonic
+    )
+    monkeypatch.setattr(tunnel_mod, "time", shifted_clock)
+    monkeypatch.setattr(host_registry, "time", shifted_clock)
     try:
-        while True:
-            message = await comm.receive_output(timeout=budget(2.0))
-            if message["type"] == "websocket.close":
-                assert message["code"] == 4003
-                assert message["reason"] == "ping timeout"
-                break
+        async with asyncio.timeout(budget(2.0)):
+            while True:
+                message = await comm.receive_output(timeout=budget(2.0))
+                if message["type"] == "websocket.close":
+                    assert message["code"] == 4003
+                    assert message["reason"] == "ping timeout"
+                    break
         await comm.wait(timeout=budget(2.0))
         assert registry.get(_HOST_ID) is None
         assert not store.is_online(_HOST_ID)
@@ -587,21 +598,110 @@ async def test_host_replacement_names_retirement_without_inventing_close_code(
         await asyncio.gather(old.future, return_exceptions=True)
 
 
-async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(db_uri: str) -> None:
+@pytest.mark.parametrize(
+    ("offline_result", "cancellation"),
+    [
+        ("success", "task"),
+        ("success", "scope"),
+        ("failure", "task"),
+        ("failure", "scope"),
+        ("blocked", "task"),
+        ("blocked", "scope"),
+        ("diagnostics_failure", "task"),
+        ("diagnostics_failure", "scope"),
+        ("diagnostics_blocked", "scope"),
+        ("callback_blocked", "scope"),
+    ],
+)
+async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cancellation: str,
+    offline_result: str,
+) -> None:
+    from omnigent.server.routes import host_tunnel
+
     registry = HostRegistry()
     store = HostStore(db_uri)
     app = FastAPI()
     entered = asyncio.Event()
+    cleanup_completed = asyncio.Event()
+    real_monitoring = TunnelDiagnostics.monitoring
+
+    @contextlib.asynccontextmanager
+    async def observed_monitoring(*args, **kwargs):
+        try:
+            async with real_monitoring(*args, **kwargs):
+                yield
+        finally:
+            # Observe finalization at a cancellation checkpoint, retaining the real monitor.
+            await anyio.lowlevel.checkpoint()
+            if offline_result == "diagnostics_blocked":
+                await asyncio.Event().wait()
+            cleanup_completed.set()
+            if offline_result == "diagnostics_failure":
+                raise RuntimeError("test diagnostics finalization failure")
+
+    monkeypatch.setattr(TunnelDiagnostics, "monitoring", observed_monitoring)
+    offline_started = threading.Event()
+    offline_release = threading.Event()
+    offline_finished = threading.Event()
+    offline_errors: list[Exception] = []
+    real_set_offline = store.set_offline
+    if offline_result in {"failure", "blocked"}:
+
+        def interrupted_offline(host_id: str, **kwargs) -> None:
+            assert host_id == _HOST_ID
+            if offline_result == "failure":
+                raise RuntimeError("test offline persistence failure")
+            offline_started.set()
+            try:
+                assert offline_release.wait(timeout=budget(5.0))
+                real_set_offline(host_id, **kwargs)
+            except Exception as exc:
+                offline_errors.append(exc)
+                raise
+            finally:
+                offline_finished.set()
+
+        # Hold only the persistence boundary; registration and reads remain real.
+        monkeypatch.setattr(store, "set_offline", interrupted_offline)
+    if offline_result in {"blocked", "diagnostics_blocked", "callback_blocked"}:
+        monkeypatch.setattr(
+            host_tunnel, "_DISCONNECT_CLEANUP_TIMEOUT_S", budget(0.5), raising=False
+        )
+    if offline_result == "blocked":
+        # Reconnects within one timestamp tick still need protection from a stale write.
+        frozen_time = now_epoch()
+        monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: frozen_time)
 
     async def on_connect(_host_id: str, _owner: str | None) -> None:
         entered.set()
         await asyncio.Event().wait()
 
+    disconnected: list[str] = []
+
+    async def on_disconnect(host_id: str, _owner: str | None) -> None:
+        await anyio.lowlevel.checkpoint()
+        disconnected.append(host_id)
+        if offline_result == "callback_blocked":
+            await asyncio.Event().wait()
+
     app.include_router(
-        create_host_tunnel_router(registry, store, on_host_connect=on_connect),
+        create_host_tunnel_router(
+            registry, store, on_host_connect=on_connect, on_host_disconnect=on_disconnect
+        ),
         prefix="/v1",
     )
-    comm = await _connect_route(app, _TUNNEL_PATH)
+    cancel_scopes: list[anyio.CancelScope] = []
+
+    async def cancellable_app(scope, receive, send):
+        with anyio.CancelScope() as cancel_scope:
+            cancel_scopes.append(cancel_scope)
+            await app(scope, receive, send)
+
+    comm = await _connect_route(cancellable_app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry)
     await asyncio.wait_for(entered.wait(), timeout=budget(1.0))
     helpers = [
@@ -613,17 +713,62 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(db_u
             f"host-ping:{_HOST_ID}",
             f"host-receive:{_HOST_ID}",
             f"host-heartbeat:{_HOST_ID}",
+            "tunnel-diagnostics",
         }
     ]
-    assert len(helpers) == 4
+    assert len(helpers) == 5
+    replacement = None
     try:
-        comm.future.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await comm.future
+        if cancellation == "task":
+            comm.future.cancel()
+        else:
+            # ASGI middleware can keep cancelling at every await during teardown.
+            cancel_scopes[0].cancel()
+        done, _ = await asyncio.wait({comm.future}, timeout=budget(2.0))
+        assert done
+        if cancellation == "task":
+            with pytest.raises(asyncio.CancelledError):
+                comm.future.result()
+        else:
+            comm.future.result()
+        assert cleanup_completed.is_set() == (offline_result != "diagnostics_blocked")
+        assert disconnected == [_HOST_ID]
         assert all(task.done() for task in helpers)
         assert registry.get(_HOST_ID) is None
-        assert not store.is_online(_HOST_ID)
+        persisted = HostStore(db_uri).get_host(_HOST_ID)
+        assert persisted is not None
+        assert persisted.status == (
+            "online" if offline_result in {"failure", "blocked"} else "offline"
+        )
+        if offline_result == "failure":
+            assert "test offline persistence failure" in caplog.text
+        if offline_result == "blocked":
+            assert await asyncio.to_thread(offline_started.wait, budget(2.0))
+            assert not offline_release.is_set()
+            assert "Timed out cleaning up host" in caplog.text
+            monkeypatch.setattr(store, "set_offline", real_set_offline)
+            replacement = await _connect_route(cancellable_app, _TUNNEL_PATH)
+            await _send_hello_and_wait(replacement, registry, connection_id="replacement")
+            assert store.is_online(_HOST_ID)
+            offline_release.set()
+            assert await asyncio.to_thread(offline_finished.wait, budget(2.0))
+            assert not offline_errors, f"Offline worker failed: {offline_errors}"
+            assert store.is_online(_HOST_ID), "A timed-out write must not retire the reconnect"
+        if offline_result == "diagnostics_failure":
+            assert "test diagnostics finalization failure" in caplog.text
+        if offline_result == "diagnostics_blocked":
+            assert "Timed out closing host" in caplog.text
+        if offline_result == "callback_blocked":
+            assert "on_host_disconnect callback timed out" in caplog.text
     finally:
+        offline_release.set()
+        if offline_started.is_set():
+            assert await asyncio.to_thread(offline_finished.wait, budget(2.0))
+        comm.stop(exceptions=False)
+        await asyncio.gather(comm.future, return_exceptions=True)
+        if replacement is not None:
+            replacement.stop(exceptions=False)
+            await asyncio.gather(replacement.future, return_exceptions=True)
         for task in helpers:
             task.cancel()
         await asyncio.gather(*helpers, return_exceptions=True)

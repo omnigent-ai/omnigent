@@ -32,7 +32,32 @@ To provision a fresh sandbox per firing, set `execution_target: "managed_sandbox
 
 **Agent tools.** An agent can manage automations itself with `sys_scheduled_task_create`, `sys_scheduled_task_list`, `sys_scheduled_task_update`, and `sys_scheduled_task_delete` -- so an agent can schedule its own follow-up work. The create and update tools expose the same `permission_mode`, `max_cost_usd`, and `execution_target` controls.
 
+Agent calls to `sys_scheduled_task_create` and `sys_scheduled_task_update`
+require interactive approval before persisting future work. Review the agent,
+prompt, host and permission settings in that request. This also applies when
+the call inherits defaults. Direct changes you make in the UI or REST API keep
+their existing authorization rules.
+
 ## Schedules are RRULEs, not cron
+
+Persisted RRULEs have a 512-character storage limit. The parser also applies a
+4096-character safety ceiling; that ceiling does not increase storage capacity.
+Use a single RRULE with at most 24 combinations of
+`BYHOUR`, `BYMINUTE`, and `BYSECOND`. `INTERVAL` is limited to 1–366 periods;
+for minute and second frequencies the equivalent maximum is 366 hours.
+Hourly-equivalent rules such as `FREQ=MINUTELY;INTERVAL=60` and
+`FREQ=SECONDLY;INTERVAL=3600` remain valid, including when loaded from storage.
+Validation and next-fire lookup have an eight-year occurrence horizon and a
+100,000-step search budget that counts calendar candidates, position selections,
+and inner time-filter searches. Each search also has a 250 ms monotonic deadline.
+Every `BY*` list is deduplicated and limited to 24 distinct values before parsing.
+Create and update validation runs off the HTTP event loop. Exhausting
+the budget raises a validation error. If this happens while re-arming a task,
+the scheduler logs the reason and clears its next-run time instead of leaving
+an expired timestamp. Update the rule to resume scheduling.
+An empty search stops at the horizon even when filters yield no candidates.
+Schedules with no occurrence in the window are not armed; validation requires
+at least two occurrences and an hourly minimum.
 
 A schedule is an [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545) recurrence rule evaluated in the task's IANA timezone.
 

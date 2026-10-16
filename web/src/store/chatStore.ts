@@ -130,6 +130,7 @@ import { uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
@@ -150,7 +151,10 @@ import {
   isSystemUserContent,
   taskNotificationMarkerContent,
 } from "@/lib/systemMessage";
-import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
+import {
+  isNativeTerminalSession as isNativeTerminalSessionFn,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 import { toast } from "sonner";
 
@@ -542,6 +546,13 @@ export interface PendingUserMessage {
    * receipt names. Snapshot-replayed entries carry that id as `tempId`.
    */
   pendingId?: string;
+  /**
+   * Sent to a native-terminal session while its turn was running. The vendor
+   * agent reads such a message only after its current step (e.g. a running
+   * tool call), so the bubble says so until `session.input.consumed` promotes
+   * it. Unset on snapshot-replayed entries.
+   */
+  sentMidTurn?: boolean;
 }
 
 /**
@@ -1859,6 +1870,53 @@ export function consumePendingInitialPrompt(conversationId: string): PendingInit
   return prompt;
 }
 
+const HARNESS_CATALOG_QUERY = {
+  queryKey: ["harness-labels"] as const,
+  queryFn: fetchHarnessCatalog,
+  staleTime: 30_000,
+};
+
+/**
+ * Resolve the SDK harness's declared family from the same catalog as the picker.
+ * Use cached data immediately and refresh stale entries in the background.
+ * Native harnesses keep their wrapper-label gate; no cache still awaits discovery.
+ */
+async function effortFamilyForSession(
+  session: { harness?: string | null } | null | undefined,
+): Promise<string | null> {
+  if (queryClient === null || !session?.harness) return null;
+  if (nativeCodingAgentForHarness(session.harness)) return null;
+  let catalog: HarnessCatalog | undefined;
+  try {
+    catalog = await queryClient.ensureQueryData({
+      ...HARNESS_CATALOG_QUERY,
+      revalidateIfStale: true,
+    });
+  } catch {
+    catalog = queryClient.getQueryData<HarnessCatalog>(HARNESS_CATALOG_QUERY.queryKey);
+  }
+  return catalog?.effortFamilies[session.harness] ?? null;
+}
+
+/**
+ * Synchronous variant for the hydration path: the declared family from the
+ * catalog already in cache, or ``undefined`` when no catalog has loaded yet.
+ * Never awaits — the transcript must not wait on ``/v1/harnesses``. When the
+ * catalog is absent it is prefetched in the background for the next lookup.
+ */
+function cachedEffortFamilyForSession(
+  session: { harness?: string | null } | null | undefined,
+): string | null | undefined {
+  if (queryClient === null || !session?.harness) return null;
+  if (nativeCodingAgentForHarness(session.harness)) return null;
+  const catalog = queryClient.getQueryData<HarnessCatalog>(HARNESS_CATALOG_QUERY.queryKey);
+  if (catalog === undefined) {
+    void queryClient.prefetchQuery(HARNESS_CATALOG_QUERY);
+    return undefined;
+  }
+  return catalog.effortFamilies[session.harness] ?? null;
+}
+
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
   conversationId: null,
   redirectToConversationId: null,
@@ -2325,6 +2383,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               (targetState.sessionModelSeeded && targetState.sessionHarness === null))
           ? { text, files: files ?? [] }
           : undefined;
+    // Non-native sends persist at POST time, so only a native session leaves
+    // the bubble pending until the agent actually reads it.
+    const sentMidTurn =
+      targetState?.isNativeTerminalSession === true && targetState.sessionStatus === "running";
     const alreadyStreaming =
       opts?.reusePendingTempId != null
         ? false
@@ -2383,6 +2445,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+                ...(sentMidTurn ? { sentMidTurn } : {}),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -3111,7 +3174,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         });
         // Harness has no effort control: undo the optimistic session-scoped write
         // so this conversation doesn't claim an effort the server will never hold.
-        if (!supportsEffortControl(session)) {
+        // SDK harnesses carry no wrapper label, so resolve their declared effort
+        // family to recognize that they do take a ``reasoning_effort`` override.
+        if (!supportsEffortControl(session, await effortFamilyForSession(session))) {
           setterFor(conversationId)({ sessionReasoningEffort: null });
           return;
         }
@@ -4345,7 +4410,13 @@ async function bindStream(
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 
-    const canApplyEffort = supportsEffortControl(session);
+    // The session row's reasoning_effort is the server's truth; the harness
+    // catalog only gates whether a control is shown. Read the family from cache
+    // so hydration never waits on /v1/harnesses, and keep the server's value
+    // when no catalog has loaded yet rather than blanking a real setting.
+    const cachedFamily = cachedEffortFamilyForSession(session);
+    const canApplyEffort =
+      cachedFamily === undefined ? true : supportsEffortControl(session, cachedFamily);
     const effectiveEffort = canApplyEffort ? (session.reasoningEffort ?? null) : null;
 
     const snapshotBlocks = itemsToBlocks(items);
@@ -7125,8 +7196,20 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // host-bound session; `failed` retains the reason so the page
       // explains why the sandbox never came up.
       applyToConversation({
-        sandboxStatus: event.stage === "ready" ? null : { stage: event.stage, error: event.error },
+        sandboxStatus:
+          event.stage === "ready"
+            ? null
+            : { stage: event.stage, error: event.error, provider: event.provider },
       });
+      // The sandbox host is bound before its runner starts; refetch the binding and a
+      // host list cached before that host registered, so the composer can name it.
+      if (event.stage === "connecting" || event.stage === "ready") {
+        void queryClient?.invalidateQueries({
+          queryKey: ["session", event.conversationId],
+          exact: true,
+        });
+        void queryClient?.invalidateQueries({ queryKey: ["hosts"] });
+      }
       return;
     case "session_mcp_startup": {
       // Mirror the harness's per-MCP-server startup map while the round

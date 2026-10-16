@@ -560,7 +560,7 @@ function renderShell(
               Settings button and the sidebar's Back row, both of which live in
               components mocked out here. */}
       <Route
-        path="settings"
+        path="settings/*"
         element={
           <>
             <div>settings</div>
@@ -1931,15 +1931,23 @@ describe("Workspace rail maximize", () => {
     expect(shell).toHaveAttribute("data-sidebar-open", "true");
   });
 
-  it("pins the sidebar open on /settings so the Back row is reachable", () => {
-    // The settings nav replaces the session list INSIDE the sidebar, and its
-    // Back row is the only way off the page. Collapsed, that row is clipped and
-    // inert — the user is stranded with no visible exit. Entering /settings must
-    // therefore force the sidebar open.
+  it.each([
+    ["desktop", "/settings", true],
+    ["desktop", "/settings/import", true],
+    ["mobile", "/settings", true],
+    ["mobile", "/settings/import", false],
+    ["mobile", "/settings/harnesses/codex", false],
+  ] as const)("opens the appropriate settings surface on %s at %s", (viewport, path, open) => {
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: query === "(min-width: 768px)" ? viewport === "desktop" : false,
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
     mockConversations([]);
-    renderShell("/settings");
+    renderShell(path);
 
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", String(open));
   });
 
   it("refuses to collapse the sidebar while on /settings", () => {

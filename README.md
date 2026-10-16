@@ -70,19 +70,25 @@ One command installs Omnigent and everything it needs:
 curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh
 ```
 
+The installer includes Databricks support and installs the Databricks CLI
+alongside Omnigent, or reuses an existing CLI that supports workspace login.
+Pass `--no-databricks` to omit them.
+
 <details>
 <summary>Optional integrations and extras</summary>
 
 Need an optional integration? Pass one or more extras to the installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh -s -- --extra databricks
 curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh -s -- --extra modal,e2b
 ```
 
+The Antigravity SDK extra conflicts with Databricks dependencies. Install it
+with `--no-databricks --extra antigravity`.
+
 Available user-facing extras include:
 
-- **Model providers:** `databricks`, `bedrock`, `vertex`
+- **Model providers:** `databricks` (included by default), `bedrock`, `vertex`
 - **Sandbox providers:** `modal`, `daytona`, `blaxel`, `boxlite`, `microsandbox`,
   `cwsandbox`, `e2b`, `openshell`, `kubernetes`
 - **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
@@ -163,11 +169,12 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   missing `bwrap` binary makes those terminals fail to start
   (`apt install bubblewrap`; the installer offers to install it for you). macOS
   uses the built-in `seatbelt` sandbox and needs nothing extra.
-- **Databricks** (optional). To use a Databricks workspace as your model
-  provider, install Omnigent with the `databricks` extra:
-  `uv tool install "omnigent[databricks]"` — or pass it to the bootstrap
-  installer with `... | sh -s -- --extra databricks`. Signing in to the
-  workspace also uses the [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install).
+- **Databricks.** The bootstrap installer includes the `databricks` extra
+  and the Databricks CLI. If installing with uv directly, use
+  `uv tool install "omnigent[databricks]"` and install the
+  [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install)
+  separately. Sign in to a workspace-hosted server with
+  `omnigent login <workspace-url>/omnigent`.
 
 </details>
 
@@ -588,6 +595,14 @@ See the [policy guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/PO
 ---
 
 ## Write your own agent
+
+For centrally managed remote tools, reusable account connections, and a gateway
+with session policies around built-in or external backends, see the
+[MCP registry and gateway prototype](examples/mcp-registry/README.md).
+Direct MCP requests use the caller's connected account. A shared session's runner
+uses its authenticated account (normally the owner), while policies evaluate the
+turn's initiating user. Databricks connections ask for a workspace URL before
+OAuth. KMS limits serialized grants to 4096 bytes; use Vault for larger grants.
 
 An agent is a short YAML file: your prompt, your tools — local Python
 functions, MCP servers, and sub-agents a supervisor can delegate to. You don't

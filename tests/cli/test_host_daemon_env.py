@@ -35,17 +35,19 @@ _PROXY_ENV: Final = {
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
-@pytest.mark.parametrize("codex_path", [None, "/selected install/bin/codex"])
-def test_codex_executable_selection_survives_daemon_and_runner_boundaries(
+@pytest.mark.parametrize("path_env", ["OMNIGENT_CODEX_PATH", "OMNIGENT_PI_PATH"])
+@pytest.mark.parametrize("executable_path", [None, "/selected install/bin/harness"])
+def test_executable_selection_survives_daemon_and_runner_boundaries(
     monkeypatch: pytest.MonkeyPatch,
     server_url: str | None,
-    codex_path: str | None,
+    path_env: str,
+    executable_path: str | None,
 ) -> None:
     """Keep an explicit executable choice without widening secret forwarding."""
-    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.delenv(path_env, raising=False)
     monkeypatch.delenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, raising=False)
-    if codex_path is not None:
-        monkeypatch.setenv("OMNIGENT_CODEX_PATH", codex_path)
+    if executable_path is not None:
+        monkeypatch.setenv(path_env, executable_path)
     monkeypatch.setenv("OMNIGENT_UNRELATED_SECRET", "synthetic-secret")
     monkeypatch.setenv("UNRELATED_SECRET", "synthetic-secret")
     monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
@@ -54,7 +56,7 @@ def test_codex_executable_selection_survives_daemon_and_runner_boundaries(
     runner_env = _build_runner_env(
         daemon_env,
         server_url=server_url or "http://localhost:6767",
-        runner_id="runner_codex_path",
+        runner_id="runner_harness_path",
         binding_token="synthetic-binding-token",
         workspace="/tmp/workspace",
         parent_pid=12345,
@@ -62,7 +64,7 @@ def test_codex_executable_selection_survives_daemon_and_runner_boundaries(
     terminal_env = strip_runner_auth_secrets(runner_env)
 
     for env in (daemon_env, runner_env, terminal_env):
-        assert env.get("OMNIGENT_CODEX_PATH") == codex_path
+        assert env.get(path_env) == executable_path
         assert "UNRELATED_SECRET" not in env
     assert "OMNIGENT_UNRELATED_SECRET" not in runner_env
     if server_url:
@@ -519,3 +521,21 @@ def test_ci_detection_stays_on_the_local_server(
     )
     assert "CI" not in runner_env
     assert "OMNIGENT_DISABLE_TELEMETRY" not in runner_env
+
+
+def test_gemini_gateway_survives_local_daemon_and_runner(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-gateway-key")
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://gateway.example/gemini")
+    daemon = _build_host_daemon_env(server_url=None)
+    runner = _build_runner_env(
+        daemon,
+        server_url="http://localhost:6767",
+        runner_id="test-gemini",
+        binding_token="fake-binding",
+        workspace=str(tmp_path),
+        parent_pid=os.getpid(),
+    )
+    for env in (daemon, runner):
+        assert env["GEMINI_API_KEY"] == "fake-gateway-key"
+        assert env["GOOGLE_GEMINI_BASE_URL"] == "https://gateway.example/gemini"

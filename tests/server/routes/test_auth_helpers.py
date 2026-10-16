@@ -20,6 +20,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
+    delegated_path_allowed,
 )
 from omnigent.server.routes import _auth_helpers
 from omnigent.server.routes._auth_helpers import (
@@ -431,3 +432,8 @@ def test_agent_owner_legacy_null_is_admin_only(
     perm_store.ensure_user(BOB)
     perm_store.set_admin(BOB, True)
     require_agent_owner(BOB, agent, perm_store)
+
+
+def test_delegated_runner_credentials_allow_gateway_only():
+    assert delegated_path_allowed("/v1/mcp/tracker")
+    assert not delegated_path_allowed("/v1/mcp-registry/services/tracker/connection")
