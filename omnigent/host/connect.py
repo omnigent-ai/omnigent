@@ -63,6 +63,7 @@ from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
+    RUNNER_LOG_TAIL_HEADING,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -394,7 +395,7 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     tail = _read_log_tail(log_path)
     if tail.strip():
         lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
-        message += "\n--- runner log tail ---\n" + _redact_log_tail("\n".join(lines))
+        message += f"\n{RUNNER_LOG_TAIL_HEADING}\n" + _redact_log_tail("\n".join(lines))
     return message
 
 
