@@ -37,6 +37,7 @@ unaffected.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 import time
@@ -196,6 +197,31 @@ def persist_live_status(session_id: str, status: str) -> None:
 def forget_live_status(session_id: str) -> None:
     """Drop this process's dedupe state for a session handed to another replica."""
     _last_status.pop(session_id, None)
+
+
+def last_persisted_live_status(session_id: str, store: ConversationStore) -> str | None:
+    """
+    Return the live status THIS process last queued to *store* for *session_id*.
+
+    A row holding a different status was written by another replica, or by an
+    explicit settle, after this process's last write.
+
+    :param session_id: Session/conversation identifier.
+    :param store: Store the caller reads the row from; writes go elsewhere
+        unless it is the configured one.
+    :returns: The status, e.g. ``"running"``, or ``None`` when *store* is not
+        the configured one, the write failed, or the session was handed off.
+    """
+    if _store is None or store is not _store:
+        return None
+    status = _last_status.get(session_id)
+    return status if status in _KNOWN_LIVE_STATUSES else None
+
+
+async def wait_for_queued_writes() -> None:
+    """Wait until every live-state write queued before this call has run."""
+    if _executor is not None:
+        await asyncio.wrap_future(_executor.submit(lambda: None))
 
 
 def persist_scheduled_run_completion(

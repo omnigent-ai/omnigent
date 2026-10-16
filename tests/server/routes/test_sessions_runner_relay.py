@@ -2885,6 +2885,69 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_status", "own_write", "decision"),
+    [
+        ("idle", True, "handed_off"),
+        ("running", True, "failed_mid_turn"),
+        ("idle", False, "failed_mid_turn"),
+    ],
+    ids=["settled-elsewhere", "still-running", "no-own-write"],
+)
+async def test_offline_sweep_defers_to_a_status_settled_on_another_replica(
+    db_uri: str, row_status: str, own_write: bool, decision: str
+) -> None:
+    """A stale mid-turn cache loses to a settled status another replica wrote later.
+
+    After a session moves replicas, its new owner persists the turn's ``idle``
+    while the old replica's cache still reads ``running``. Without a record of
+    this replica's own write, the row cannot be proven newer, so the cache wins.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-moved-replicas")
+    session_live_state.configure(store)
+    sessions_module._session_status_cache[conv.id] = "running"
+    if own_write:
+        session_live_state.persist_live_status(conv.id, "running")
+        await session_live_state.wait_for_queued_writes()
+    snapshot = store.get_conversation(conv.id)
+    assert snapshot is not None
+    # The other replica's write lands after this replica's own.
+    store.set_session_live_status(conv.id, row_status)
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [snapshot],
+                ErrorDetail(code="runner_disconnected", message="Synthetic runner drop"),
+                store,
+            )
+        logged = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert logged["attributes"]["decision"] == decision
+        assert logged["attributes"]["cached_session_status"] == "running"
+        failed = [row for row in rows if row["event_name"] == "session_turn_failed"]
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        if decision == "handed_off":
+            assert logged["attributes"]["persisted_session_status"] == "idle"
+            assert failed == []
+            assert refreshed.live_status == "idle"
+            assert conv.id not in sessions_module._session_status_cache
+            assert session_live_state.last_persisted_live_status(conv.id, store) is None
+        else:
+            assert len(failed) == 1
+            assert sessions_module._session_status_cache[conv.id] == "failed"
+    finally:
+        session_live_state.configure(None)
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cached", [False, True], ids=["persisted", "cached"])
 @pytest.mark.parametrize("fail_idle_top_level", [False, True])
 async def test_offline_sweep_preserves_existing_failure(
