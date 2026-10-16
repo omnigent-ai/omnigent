@@ -18,6 +18,31 @@ from playwright.sync_api import Page, WebSocketRoute, expect
 from tests.e2e_ui.conftest import open_right_rail
 
 _ATTACH_WS = re.compile(r"/resources/terminals/.*/attach")
+_OSC11_RGB_RESPONSE = re.compile(
+    r"\x1b\]11;rgb:[0-9a-fA-F]{1,4}/[0-9a-fA-F]{1,4}/[0-9a-fA-F]{1,4}(?:\x07|\x1b\\)"
+)
+
+
+def _input_contains_probe(raw: str, probe: str) -> bool:
+    """Ignore only complete OSC11 color replies interleaved with the typed probe."""
+    return probe in _OSC11_RGB_RESPONSE.sub("", raw)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("re\x1b]11;rgb:ffff/ffff/ffff\x1b\\connect-1", True, id="captured-st"),
+        pytest.param("re\x1b]11;rgb:ffff/ffff/ffff\x07connect-1", True, id="color-bel"),
+        pytest.param("r\x1b]11;rgb:ffff/ffff/ffff\x1b\\connect-1", False, id="missing-key"),
+        pytest.param("re\x1b]11;rgb:ffff/ffff/ffffconnect-1", False, id="partial-response"),
+        pytest.param("re\x1b]11;rgb:ffff/gggg/ffff\x1b\\connect-1", False, id="invalid-hex"),
+        pytest.param("re\x1b]12;rgb:ffff/ffff/ffff\x1b\\connect-1", False, id="other-osc"),
+        pytest.param("re\x1b]11;rgb:fffff/ffff/ffff\x1b\\connect-1", False, id="wide-channel"),
+        pytest.param("re\x1b]11;rgb:ffff/ffff\x1b\\connect-1", False, id="missing-channel"),
+    ],
+)
+def test_input_probe_ignores_only_complete_color_replies(raw: str, expected: bool) -> None:
+    assert _input_contains_probe(raw, "reconnect-1") is expected
 
 
 def _open_new_shell(page: Page) -> None:
@@ -88,7 +113,9 @@ def test_embedded_terminal_reconnects_after_transport_close(
         terminal_view.locator("textarea.xterm-helper-textarea").focus()
         page.keyboard.type(probe)
         deadline = time.monotonic() + 10
-        while probe not in str(live["input"]) and time.monotonic() < deadline:
+        while not _input_contains_probe(str(live["input"]), probe) and time.monotonic() < deadline:
             page.wait_for_timeout(50)
-        assert probe in str(live["input"]), "terminal did not forward input after reconnecting"
+        assert _input_contains_probe(str(live["input"]), probe), (
+            f"terminal did not forward input after reconnecting: {live['input']!r}"
+        )
         page.keyboard.press("Control+U")
