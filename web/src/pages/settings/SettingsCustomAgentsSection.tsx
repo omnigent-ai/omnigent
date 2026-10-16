@@ -109,7 +109,15 @@ export function SettingsCustomAgentsSection() {
     return (
       <div className="@container">
         {!detail.data && back}
-        {detail.isError ? (
+        {detail.isError && detail.data && (
+          <p role="alert" className="mb-4 text-ui">
+            Could not refresh this agent.{" "}
+            <Button variant="link" onClick={() => void detail.refetch()}>
+              Retry
+            </Button>
+          </p>
+        )}
+        {detail.isError && !detail.data ? (
           detail.error instanceof ApiError && [405, 501].includes(detail.error.status) ? (
             <UnsupportedServer />
           ) : (

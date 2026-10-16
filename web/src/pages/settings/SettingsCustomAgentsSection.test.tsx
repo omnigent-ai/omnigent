@@ -175,7 +175,7 @@ describe("Custom agents settings", () => {
 
   it("shows loading while the detail request is pending", async () => {
     let resolve!: (value: Response) => void;
-    vi.mocked(authenticatedFetch).mockReturnValue(
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
       new Promise((done) => {
         resolve = done;
       }),
@@ -184,6 +184,7 @@ describe("Custom agents settings", () => {
     expect(screen.getByText("Loading agent…")).toBeVisible();
     resolve(response({ ...agent("a1"), user_owned: true }));
     expect(await screen.findByRole("heading", { name: "a1" })).toBeVisible();
+    expect(await screen.findByLabelText("Instructions")).toHaveValue(" literal\n");
   });
 
   it("reports a missing bookmark without fetching lists or retrying 404", async () => {
@@ -438,6 +439,41 @@ describe("editing custom agents", () => {
       }),
     );
     expect(buildAgentBundle).not.toHaveBeenCalled();
+  });
+  it("preserves new edits when the detail refresh after saving fails and is retried", async () => {
+    configResponses();
+    await openEditor();
+    const previous = vi.mocked(authenticatedFetch).getMockImplementation()!;
+    let finishRefresh!: (value: Response) => void;
+    const pendingDetail = new Promise<Response>((resolve) => {
+      finishRefresh = resolve;
+    });
+    vi.mocked(authenticatedFetch).mockImplementation((url, init) =>
+      String(url) === "/v1/agents/a1" && init?.method !== "PATCH"
+        ? pendingDetail
+        : previous(url, init),
+    );
+    const description = screen.getByLabelText("Description");
+    fireEvent.change(description, { target: { value: "Saved change" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    fireEvent.change(description, { target: { value: "Unsaved second draft" } });
+
+    vi.mocked(authenticatedFetch).mockImplementation(previous);
+    finishRefresh(response({ error: { message: "Unavailable" } }, 500));
+    const warning = await screen.findByRole("alert");
+    expect(screen.getByLabelText("Description")).toBe(description);
+    expect(description).toHaveValue("Unsaved second draft");
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Custom agents" })).toBeVisible();
+    expect(warning).toHaveTextContent("Could not refresh this agent");
+
+    fireEvent.click(within(warning).getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(screen.getByLabelText("Description")).toBe(description);
+    expect(description).toHaveValue("Unsaved second draft");
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
   });
   it("retains a failed draft and confirms cancellation", async () => {
     configResponses({ fail: 500 });
