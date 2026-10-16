@@ -295,7 +295,7 @@ class TunnelEventClient(httpx.AsyncClient):
                 ack = await submit
         except TunnelIngestUnsupported:
             return await super().post(*args, **kwargs)
-        except (ConnectionError, TimeoutError):
+        except (ConnectionClosed, OSError):
             # Preview is best-effort. Final transcript items retain their
             # source cursor and will be retried after the tunnel returns.
             _logger.debug("Native event preview could not reach the server")
