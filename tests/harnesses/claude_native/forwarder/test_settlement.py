@@ -260,8 +260,11 @@ def test_promote_pending_settle_waits_for_turn_quiescence(tmp_path: Path) -> Non
     )
 
 
+@pytest.mark.parametrize("retry_mode", ["none", "same_process", "restart"])
 @pytest.mark.asyncio
-async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(tmp_path: Path) -> None:
+async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
+    tmp_path: Path, retry_mode: str
+) -> None:
     """
     The full wake pipeline: settle → quiet-poll promote → marked new turn.
 
@@ -295,8 +298,10 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(tmp_path: Path
         cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
     )
     requests: list[dict[str, Any]] = []
+    failed_marker = False
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
+        nonlocal failed_marker
         """
         Accept every forwarder POST, recording its payload.
 
@@ -306,6 +311,13 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(tmp_path: Path
         payload = json.loads(request.content.decode("utf-8"))
         assert isinstance(payload, dict)
         requests.append(payload)
+        if (
+            retry_mode != "none"
+            and not failed_marker
+            and payload["data"]["item_data"].get("role") == "user"
+        ):
+            failed_marker = True
+            return httpx.Response(503)
         return httpx.Response(202, json={})
 
     transport = httpx.MockTransport(_handle_request)
@@ -353,7 +365,7 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(tmp_path: Path
                 + "\n"
             )
         requests.clear()
-        await forwarder._forward_available_items(
+        after_wake = await forwarder._forward_available_items(
             client=client,
             session_id="conv_abc",
             bridge_dir=bridge_dir,
@@ -362,6 +374,24 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(tmp_path: Path
             retry_tracker=forwarder._PostRetryTracker(),
             dedupe=dedupe,
         )
+        if retry_mode != "none":
+            persisted = forwarder._read_forward_state(bridge_dir)
+            assert persisted is not None
+            assert persisted.current_response_id == turn_one_id
+            assert persisted.line_cursor == quiet.line_cursor
+            assert after_wake.current_response_id == turn_one_id
+            if retry_mode == "restart":
+                dedupe = forwarder._ForwardDedupeState()
+                after_wake = persisted
+            await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=after_wake,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
 
     # No status POST: the transcript path publishes none (Claude's status file
     # owns the badge). The wake is observable entirely in the items — a fresh
@@ -370,6 +400,9 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(tmp_path: Path
         requests
     )
     items = [r["data"] for r in requests if r["type"] == "external_conversation_item"]
+    if retry_mode != "none":
+        assert items[0]["source_id"] == items[1]["source_id"]
+        items = items[1:]
     wake_turn_id = items[0]["response_id"]
     assert wake_turn_id != turn_one_id
     assert [item["item_data"]["role"] for item in items] == ["user", "assistant"]

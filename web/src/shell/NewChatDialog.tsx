@@ -19,6 +19,7 @@ import {
   ComposerHostTrigger,
   ComposerPermissionPicker,
   ComposerConfigTooltipRows,
+  ComposerMenuTooltip,
 } from "@/components/composer/ComposerControls";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import {
@@ -28,7 +29,11 @@ import {
 } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import { buildFusionSections } from "@/components/composer/fusionSections";
-import { compactModelTriggerLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
+import {
+  compactModelTriggerLabel,
+  nativeModelTooltip,
+  normalizeEffortLabel,
+} from "@/lib/composerModelLabel";
 import {
   codexCreateApprovalOptions,
   applyCodexApprovalSelection,
@@ -2424,6 +2429,7 @@ export function NewChatLandingScreen() {
   // Applied (or given up) once, after the first prefill; later resets use the usual defaults.
   const onboardingHostSettled = useRef(false);
   const [connectingThisMachine, setConnectingThisMachine] = useState(false);
+  const [hostMenuOpen, setHostMenuOpen] = useState(false);
   // Error surfaced when "Run on this machine" fails (sign-in needed, enrollment
   // declined, server unreachable). Rendered in the composer body with a retry,
   // so the failure isn't silently swallowed and the user isn't stranded on the
@@ -2620,6 +2626,7 @@ export function NewChatLandingScreen() {
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
+  const [offlineHostLimit, setOfflineHostLimit] = useState(0);
   // Harness "Set up" dialog target, opened from the composer notice or a picker
   // row; null when closed. One dialog serves every entry point.
   const [setupTarget, setSetupTarget] = useState<{
@@ -3937,7 +3944,7 @@ export function NewChatLandingScreen() {
                                 option.isDefault ? MODEL_SELECT_DEFAULT : option.id,
                               ),
                         testId: `new-chat-landing-agent-model-${option.id}`,
-                        title: nativeModelLabel(option),
+                        title: nativeModelTooltip(option),
                         className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
                       })),
                   ],
@@ -5039,6 +5046,29 @@ export function NewChatLandingScreen() {
       : sandboxSelected
         ? selectedSandboxLabel
         : (selectedHostDisplayName ?? "No host selected");
+  const hostTooltipRows =
+    connectingThisMachine || connectingArca
+      ? [
+          {
+            label: "Host",
+            value: connectingArca ? "Arca" : localMachineLabel(navigator.userAgent),
+          },
+          { label: "Status", value: "Connecting…" },
+        ]
+      : sandboxSelected
+        ? [
+            { label: "Host", value: selectedSandboxLabel },
+            { label: "Status", value: "Starts when you send" },
+          ]
+        : selectedHostDisplayName !== null
+          ? [
+              { label: "Host", value: selectedHostDisplayName },
+              {
+                label: "Status",
+                value: selectedHost?.status === "online" ? "Connected" : "Disconnected",
+              },
+            ]
+          : [{ label: "Host", value: "None" }];
   const worktreeControlAvailable =
     !sandboxSelected &&
     workspaceIsGit &&
@@ -5902,17 +5932,33 @@ export function NewChatLandingScreen() {
     host.host_id === arcaHostId ||
     !!host.sandbox_provider ||
     host.name.toLowerCase().includes("cloud");
-  const orderedHosts = [...onlineHosts, ...offlineHosts];
-  const cloudHosts = orderedHosts.filter(isCloudHostEntry);
-  const localHosts = orderedHosts.filter((host) => !isCloudHostEntry(host));
+  const isReconnectRow = (host: Host) =>
+    host.status === "offline" && host.host_id === thisMachineHostId && canConnectThisMachine;
+  // Keep the selected host and this machine's reconnect action above the fold.
+  const listedHosts = [
+    ...onlineHosts,
+    ...offlineHosts.filter((host) => host.host_id === selectedHostId || isReconnectRow(host)),
+  ];
+  // Preserve /v1/hosts order: most recently updated first.
+  const otherOfflineHosts = offlineHosts.filter(
+    (host) => host.host_id !== selectedHostId && !isReconnectRow(host),
+  );
+  const cloudHosts = listedHosts.filter(isCloudHostEntry);
+  const localHosts = listedHosts.filter((host) => !isCloudHostEntry(host));
+  const myMachines = allHosts.filter((host) => !isCloudHostEntry(host));
+  let myMachinesEmptyText: string | null = null;
+  if (myMachines.length === 0) {
+    myMachinesEmptyText = "No hosts connected yet.";
+  } else if (!myMachines.some((host) => host.status === "online")) {
+    myMachinesEmptyText = "No hosts online.";
+  }
   const hasCloudOptions =
     managedSandboxesEnabled ||
     showDisabledSandboxWithDocs ||
     cloudHosts.length > 0 ||
     showArcaOption;
   const renderHostMenuItem = (host: Host) => {
-    const reconnect =
-      host.status === "offline" && host.host_id === thisMachineHostId && canConnectThisMachine;
+    const reconnect = isReconnectRow(host);
     return (
       <DropdownMenuItem
         key={host.host_id}
@@ -6698,6 +6744,8 @@ export function NewChatLandingScreen() {
                     {/* Host chip */}
                     <DropdownMenu
                       onOpenChange={(open) => {
+                        setHostMenuOpen(open);
+                        if (!open) setOfflineHostLimit(0);
                         // Run a requested "connect this machine" only once the menu
                         // has closed.
                         if (!open && pendingConnectRef.current) {
@@ -6710,23 +6758,35 @@ export function NewChatLandingScreen() {
                         }
                       }}
                     >
-                      <DropdownMenuTrigger asChild>
-                        <ComposerHostTrigger
-                          label={`Host: ${hostLabel}, ${selectedHost?.status === "online" && !sandboxSelected ? "Online" : "Offline"}`}
-                          status={
-                            selectedHost?.status === "online" && !sandboxSelected
-                              ? "online"
-                              : "offline"
-                          }
-                          cloud={isCloudHost}
-                          className={cn(
-                            connectingThisMachine &&
-                              "w-auto gap-1 pr-2 after:animate-pulse after:text-xs after:font-normal after:content-['Connecting…']",
-                          )}
-                          testIdPrefix="new-chat-landing"
-                          data-testid="new-chat-landing-host-chip"
-                        />
-                      </DropdownMenuTrigger>
+                      <ComposerMenuTooltip
+                        menuOpen={hostMenuOpen}
+                        content={<ComposerConfigTooltipRows rows={hostTooltipRows} />}
+                        variant="session-info"
+                        testId="new-chat-landing-host-tooltip"
+                        className="shrink-0"
+                        // Two short rows: size to the text, wrapping at the pill's width.
+                        contentClassName="w-max max-w-64"
+                      >
+                        <DropdownMenuTrigger asChild>
+                          <ComposerHostTrigger
+                            label={
+                              sandboxSelected
+                                ? `Host: ${hostLabel}`
+                                : `Host: ${hostLabel}, ${selectedHost?.status === "online" ? "Online" : "Offline"}`
+                            }
+                            status={
+                              sandboxSelected ? undefined : (selectedHost?.status ?? "offline")
+                            }
+                            cloud={isCloudHost}
+                            className={cn(
+                              connectingThisMachine &&
+                                "w-auto gap-1 pr-2 after:animate-pulse after:text-xs after:font-normal after:content-['Connecting…']",
+                            )}
+                            testIdPrefix="new-chat-landing"
+                            data-testid="new-chat-landing-host-chip"
+                          />
+                        </DropdownMenuTrigger>
+                      </ComposerMenuTooltip>
                       <DropdownMenuContent
                         align="start"
                         sideOffset={6}
@@ -6821,11 +6881,13 @@ export function NewChatLandingScreen() {
                         <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
                           My machines
                         </div>
-                        {allHosts.length === 0 && !showConnectThisMachine && (
-                          <div className="px-2 py-1.5 text-sm text-muted-foreground">
-                            No hosts connected yet.
-                          </div>
-                        )}
+                        {localHosts.length === 0 &&
+                          !showConnectThisMachine &&
+                          myMachinesEmptyText && (
+                            <div className="px-2 py-1.5 text-sm text-muted-foreground">
+                              {myMachinesEmptyText}
+                            </div>
+                          )}
                         {localHosts.map(renderHostMenuItem)}
                         {/* Desktop shell, no active host and machine not listed:
                     show the disconnected local-machine state inline. */}
@@ -6854,6 +6916,51 @@ export function NewChatLandingScreen() {
                               {connectingThisMachine ? <ConnectingText /> : "Use this machine"}
                             </span>
                           </DropdownMenuItem>
+                        )}
+                        {otherOfflineHosts.length > 0 && (
+                          <>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              aria-expanded={offlineHostLimit > 0}
+                              onSelect={(event) => {
+                                event.preventDefault();
+                                setOfflineHostLimit((limit) => (limit > 0 ? 0 : 5));
+                              }}
+                              className="text-muted-foreground"
+                            >
+                              {offlineHostLimit > 0 ? (
+                                <ChevronDownIcon className="size-4" />
+                              ) : (
+                                <ChevronRightIcon className="size-4" />
+                              )}
+                              Offline hosts ({otherOfflineHosts.length})
+                            </DropdownMenuItem>
+                            {offlineHostLimit > 0 && (
+                              <>
+                                <div
+                                  role="group"
+                                  aria-label="Offline hosts"
+                                  className="max-h-48 overflow-y-auto"
+                                >
+                                  {otherOfflineHosts
+                                    .slice(0, offlineHostLimit)
+                                    .map(renderHostMenuItem)}
+                                </div>
+                                {offlineHostLimit < otherOfflineHosts.length && (
+                                  <DropdownMenuItem
+                                    onSelect={(event) => {
+                                      event.preventDefault();
+                                      setOfflineHostLimit((limit) => limit + 5);
+                                    }}
+                                    className="text-muted-foreground"
+                                  >
+                                    Show more ({otherOfflineHosts.length - offlineHostLimit}{" "}
+                                    remaining)
+                                  </DropdownMenuItem>
+                                )}
+                              </>
+                            )}
+                          </>
                         )}
                         <DropdownMenuSeparator />
                         {/* Persistent escape hatch: open the connect-a-host

@@ -336,6 +336,12 @@ outcome in the caption. Check each claimed moment, especially claims that text
 or controls are absent. If the frames contradict the caption, correct it or
 re-record.
 
+Verify that each captioned element is in the recorded viewport and unobstructed.
+Quote only text the viewer can see: DOM attributes and hidden accessibility
+labels do not establish what the screen displayed. Describe icon-only controls
+by their visible appearance. If frame inspection is unavailable, disclose that
+and limit claims to states the recording driver actually verified.
+
 ### Timed captions inside the video
 
 For every newly captured clip, **burn in step-by-step captions before declaring

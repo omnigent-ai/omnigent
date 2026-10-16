@@ -6,7 +6,8 @@ reads the MR; agent CLI and MCP writes associate it with the session.
 
 ## Sub-features
 
-- `summary`: MR identity, nested project, description, comments, and checks.
+- `summary`: MR identity, nested project, description, and checks.
+- `comments`: MR comments on their own tab, whose label shows the count.
 - `changes`: changed files and diff, with exact-revision expanded context.
 - `associations`: link, select, and unlink MRs across projects.
 - `partial`: incomplete comments, checks, files, and omitted diff explanations.
@@ -32,9 +33,9 @@ responses; they exercise the actual shared UI without contacting GitLab.
 
 - `desktop-rail`, `desktop-composer`, and `mobile-composer`:
   `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_panel_summary_and_diff`
-  shows `!7`, comments and checks, then opens a readable diff beside an empty
-  file's no-text-diff notice and expands unchanged context with the pinned MR
-  revisions. Record every variant.
+  shows `!7` and checks, opens Comments, then opens a readable diff beside an
+  empty file's no-text-diff notice and expands unchanged context with the pinned
+  MR revisions. Record every variant.
 - Associations:
   `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_link_select_unlink`
   attaches a second project, changes selection, and removes it.
@@ -45,7 +46,7 @@ responses; they exercise the actual shared UI without contacting GitLab.
   an older host's stale selected URL with an empty association list.
 - Partial responses:
   `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_partial_data_is_visible`
-  checks visible summary and diff limitations.
+  checks visible summary, comment, and diff limitations.
 - `canvas`:
   `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_canvas_link_uses_merge_request_identity`
   checks the MR number and the exact external destination.
