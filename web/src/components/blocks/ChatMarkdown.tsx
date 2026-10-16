@@ -177,7 +177,8 @@ function WorkspacePathInlineCode({
         // rendering, so repeat the chip base (rounded/bg/padding) that plain
         // inline code gets below, then add the openable-path affordance.
         className={cn(
-          "rounded bg-muted px-1.5 py-0.5 font-mono text-ui underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer",
+          STREAMDOWN_INLINE_CODE_CLASS,
+          "underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer",
           className,
         )}
         onClick={openWorkspaceFile}
@@ -197,7 +198,7 @@ function WorkspacePathInlineCode({
   // looks unchanged.
   return (
     <code
-      className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-ui", className)}
+      className={cn(STREAMDOWN_INLINE_CODE_CLASS, className)}
       data-streamdown="inline-code"
       {...codeProps}
     >
@@ -211,6 +212,7 @@ function WorkspacePathInlineCode({
 // index.css keys the pointer cursor and the table-cell `overflow-wrap` rule
 // (which stops a link-only table column collapsing to ~2ch) on the attribute.
 const STREAMDOWN_LINK_CLASS = "wrap-anywhere font-medium text-link underline";
+const STREAMDOWN_INLINE_CODE_CLASS = "rounded bg-muted px-1.5 py-0.5 font-mono text-ui";
 
 function githubPullRequest(href: string | undefined): string | null {
   if (!href) return null;
