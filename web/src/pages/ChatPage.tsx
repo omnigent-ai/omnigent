@@ -255,7 +255,7 @@ import {
   isClaudeNativeSession,
 } from "@/lib/claudePermissionMode";
 import {
-  CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+  CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS,
   codexApprovalModeLabel,
 } from "@/lib/codexApprovalMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
@@ -2490,7 +2490,7 @@ function ComposerImpl(
     ? devinPermissionControl
       ? DEVIN_NATIVE_PERMISSION_MODES
       : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
-    : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
+    : CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS;
   const permissionLabel = showClaudePermissionMode
     ? devinPermissionControl
       ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??

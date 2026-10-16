@@ -10,8 +10,13 @@ then confirm the sub-dialog for the ones that ask.
 These presets use the popup's labels. Menu digits are discovered from the
 rendered popup because row positions vary by platform and configuration.
 
-Read Only is absent from the default macOS/Linux popup, but appears on Windows
-and with permission profiles. The full-bypass launch flag has no popup row.
+Version caveat: the popup's contents are codex-version-dependent. 0.146.0 offers
+the first three (Ask for approval / Approve for me / Full Access); newer builds
+add Read Only as a 4th option. This list is the superset in popup order — Read
+Only is absent from the default macOS/Linux popup, but appears on Windows and
+with permission profiles. The full-bypass launch flag has no ``/permissions``
+row of its own; a live bypass switch is delivered through the Full Access row
+(see :func:`codex_permission_switch_delivery`).
 
 Kept dependency-free so the server routes, the runner, and the web contract can
 all agree on the same list.
@@ -76,6 +81,13 @@ CODEX_NATIVE_PERMISSION_VALUES: frozenset[str] = frozenset(
     preset.value for preset in CODEX_NATIVE_PERMISSION_PRESETS
 )
 
+# Omnigent's DANGEROUS full-bypass stance. Codex accepts its launch flag only
+# at start, so a live switch rides the Full Access row (same runtime settings)
+# while the ``omnigent.codex_native.bypass_sandbox`` conversation label keeps
+# relaunches on the real flag.
+CODEX_NATIVE_BYPASS_APPROVAL_VALUE = "bypass"
+CODEX_NATIVE_BYPASS_APPROVAL_LABEL = "Bypass approvals & sandbox"
+
 
 def codex_permission_preset(value: str) -> CodexPermissionPreset | None:
     """:returns: The preset for *value*, or ``None`` when it is not a preset."""
@@ -115,6 +127,19 @@ def codex_permission_switch_confirmed(pane_text: str, label: str) -> bool:
     ]
     return bool(confirmations) and confirmations[-1] == label
 
+
+def codex_permission_switch_delivery(value: str) -> CodexPermissionPreset | None:
+    """The ``/permissions`` row that applies *value* to a live thread.
+
+    Presets deliver as themselves. The bypass stance has no popup row; its
+    runtime settings equal Full Access's, so that row delivers it.
+
+    :param value: A preset value or :data:`CODEX_NATIVE_BYPASS_APPROVAL_VALUE`.
+    :returns: The popup row to key, or ``None`` when *value* is unknown.
+    """
+    if value == CODEX_NATIVE_BYPASS_APPROVAL_VALUE:
+        return codex_permission_preset("full-access")
+    return codex_permission_preset(value)
 
 # Sandbox ``type`` spellings Codex uses (the app-server ``thread/settings/updated``
 # notification uses camelCase; other paths hyphenate).
