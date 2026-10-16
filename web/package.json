@@ -29,7 +29,7 @@
     "@emoji-mart/react": "^1.1.1",
     "@fontsource-variable/geist-mono": "^5.2.7",
     "@lobehub/fluent-emoji": "^4.1.0",
-    "@lobehub/icons": "^5.6.0",
+    "@lobehub/icons": "^5.23.0",
     "@monaco-editor/react": "^4.7.0",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/context-zone": "^2.8.0",
