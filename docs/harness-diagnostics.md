@@ -301,6 +301,20 @@ output, it records `detail_source=missing`.
 | `gateway_request_id`, `provider_request_id` | Only populated when the source explicitly names that ownership |
 | `failure_context_missing_fields` | Comma-separated list of unavailable source fields, including IDs, versions, and inference details |
 
+The server also retains typed provider fields from explicit failed-status
+`output` or `failure_detail`, including gateway JSON whose message contains
+another JSON error. Parsing is limited to 16,384 characters and three envelopes; malformed
+or unmarked text adds no inferred facts. Stored assistant prose and idle or
+cancelled status edges are not parsed for provider facts.
+
+`provider_error_type`, `provider_error_code`, `provider_error_param`, available
+HTTP status and explicitly named request IDs reach the existing failure record
+with `inference_detail_source=provider_error_json`. An unqualified error-body
+`request_id` remains separate from the session event's transport request ID.
+Existing structured evidence takes precedence. Values use the shared bounds
+and credential redaction; raw messages, unrelated fields and request bodies
+are not copied into this metadata. Status policy and display text stay the same.
+
 Claude forwarding failures retain the rejected delivery's `http_status` and,
 when recognized, `forwarder_rejection_reason`. The reason is restricted to
 known tunnel rejection messages and error codes; arbitrary response text and
