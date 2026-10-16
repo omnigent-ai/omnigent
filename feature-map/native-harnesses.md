@@ -194,6 +194,18 @@ the extra fields. Resolver and raw-tunnel checks:
 `tests/host/test_harness_startup.py`,
 `tests/server/integration/test_host_tunnel_route.py::test_startup_http_through_real_tunnel`.
 
+**Native agy gateways (own environment):** `omni setup` → Antigravity →
+Configure native agy API key / gateway → Add a credential offers a native Gemini
+URL/key or a local Databricks profile. The gateway must speak native Gemini;
+OpenAI Responses and Chat Completions endpoints are not supported.
+`tests/e2e_ui/shells/test_antigravity_gateway_setup.py` owns fresh daemon/host
+processes and a fake Gemini upstream. With agy and tmux installed, run
+`OMNIGENT_E2E_ANTIGRAVITY=mock uv run pytest tests/e2e_ui/shells/test_antigravity_gateway_setup.py --ui-skip-build`.
+The journeys check setup, streaming, a file tool, and browser repair guidance
+when saved credentials become invalid after host connection. They do not prove
+compatibility with a live external gateway. See [the gateway guide](../docs/native-agy-gateways.md)
+for live setup, tool, and resume smoke steps.
+
 Cross-harness journeys:
 
 - **`working-status`, Claude (component and real-process checks):** run with

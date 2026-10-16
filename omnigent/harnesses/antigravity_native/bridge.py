@@ -766,7 +766,9 @@ _AGY_FEEDBACK_SURVEY_SETTING = "showFeedbackSurvey"
 _AGY_MODEL_PROVIDER_SETTING = "modelProvider"
 
 
-def ensure_agy_feedback_survey_disabled(home: Path) -> None:
+def ensure_agy_feedback_survey_disabled(
+    home: Path, *, launch_env: dict[str, str] | None = None
+) -> None:
     """
     Disable agy's feedback survey in the launch HOME's ``settings.json``.
 
@@ -788,6 +790,7 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
     :param home: The HOME agy launches under (the per-session isolated home, or
         the real home when the harness runs agy under it). Settings live at
         ``<home>/.gemini/antigravity-cli/settings.json``.
+    :param launch_env: Resolved child environment; None uses the current process.
     :returns: None.
     """
     # resolve() follows a symlinked settings.json (e.g. a dotfiles-managed file) to
@@ -838,7 +841,8 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
             return
         data = loaded
     desired: dict[str, object] = {_AGY_FEEDBACK_SURVEY_SETTING: False}
-    if (os.environ.get("GEMINI_API_KEY") or "").strip():
+    environment = os.environ if launch_env is None else launch_env
+    if (environment.get("GEMINI_API_KEY") or "").strip():
         desired[_AGY_MODEL_PROVIDER_SETTING] = "gemini"
     provider_removed = False
     current_provider = data.get(_AGY_MODEL_PROVIDER_SETTING)

@@ -6648,7 +6648,8 @@ async def _auto_create_antigravity_terminal(
     # ``--gemini_dir``; seeding the real ``~/.gemini`` marker as well would write
     # the user's tree for a file this launch never reads.
 
-    argv, env_overrides = build_agy_launch(
+    argv, env_overrides = await asyncio.to_thread(
+        build_agy_launch,
         conversation_id=external_session_id if resume else None,
         model=model,
         resume=resume,
@@ -6690,8 +6691,15 @@ async def _auto_create_antigravity_terminal(
     # written into that isolated dir (ensure_agy_feedback_survey_disabled appends
     # /.gemini/antigravity-cli/settings.json to its arg), NOT the user's real
     # HOME — env_overrides no longer carries a HOME key.
-    await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
+    await asyncio.to_thread(
+        ensure_agy_feedback_survey_disabled,
+        agy_home_dir(bridge_dir),
+        launch_env={**os.environ, **env_overrides},
+    )
     argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
+    from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
+
+    argv = wrap_agy_gateway_launch(argv, env_overrides)
     # Start the shared comment/sys_* relay against THIS session's bridge dir before
     # launch so its tool_relay.json is on disk when agy first scans the MCP server.
     # ``await_notify=False``: agy starts its MCP client lazily, so awaiting the
