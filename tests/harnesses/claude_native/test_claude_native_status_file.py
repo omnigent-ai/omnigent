@@ -24,6 +24,7 @@ from omnigent.harnesses.claude_native.status_file import (
     find_background_holder,
     read_session_status,
     resolve_status_file,
+    session_has_live_process,
     sessions_dir,
 )
 
@@ -532,18 +533,19 @@ def _proc_start(pid: int) -> str:
     return stat.rsplit(")", 1)[-1].split()[19]
 
 
-def test_find_background_holder_reports_a_live_background_job(tmp_path: Path) -> None:
-    """A live non-interactive record for the session is the job Claude defers to."""
+@pytest.mark.parametrize("kind", ["bg", "daemon", "daemon-worker"])
+def test_find_background_holder_reports_a_live_background_job(tmp_path: Path, kind: str) -> None:
+    """A live record of a kind Claude defers to is the session's background holder."""
     holder_pid = os.getppid()
     _write_registry_record(
         tmp_path / "sessions",
         str(holder_pid),
-        {"pid": holder_pid, "sessionId": "SID-1", "kind": "bg", "jobId": "ab12cd34"},
+        {"pid": holder_pid, "sessionId": "SID-1", "kind": kind, "jobId": "ab12cd34"},
     )
 
     holder = find_background_holder("sid-1", config_dir=tmp_path)
 
-    assert holder == BackgroundHolder(pid=holder_pid, kind="bg", job_id="ab12cd34")
+    assert holder == BackgroundHolder(pid=holder_pid, kind=kind, job_id="ab12cd34")
 
 
 @pytest.mark.parametrize(
@@ -552,7 +554,13 @@ def test_find_background_holder_reports_a_live_background_job(tmp_path: Path) ->
         pytest.param("{pid}", {"sessionId": "sid-1", "kind": "interactive"}, id="interactive"),
         pytest.param("{pid}", {"sessionId": "sid-2", "kind": "bg"}, id="other-session"),
         pytest.param("{pid}", {"sessionId": "sid-1"}, id="no-kind"),
+        pytest.param("{pid}", {"sessionId": "sid-1", "kind": "worker"}, id="unrecognized-kind"),
+        pytest.param("{pid}", {"sessionId": "sid-1", "kind": ["bg"]}, id="malformed-kind"),
         pytest.param("renamed", {"sessionId": "sid-1", "kind": "bg"}, id="not-a-pid-file"),
+        # Unicode digits Claude would not read as a pid name.
+        pytest.param("\u00b2\u00b3", {"sessionId": "sid-1", "kind": "bg"}, id="superscript-name"),
+        pytest.param("\u0663\u0664", {"sessionId": "sid-1", "kind": "bg"}, id="arabic-indic-name"),
+        pytest.param("9" * 20, {"sessionId": "sid-1", "kind": "bg"}, id="oversized-pid"),
         pytest.param("{self}", {"sessionId": "sid-1", "kind": "bg"}, id="own-process"),
         pytest.param("999999999", {"sessionId": "sid-1", "kind": "bg"}, id="dead-process"),
     ],
@@ -565,6 +573,41 @@ def test_find_background_holder_ignores_records_claude_would_ignore(
     _write_registry_record(tmp_path / "sessions", file_name, record)
 
     assert find_background_holder("sid-1", config_dir=tmp_path) is None
+
+
+def test_find_background_holder_falls_back_to_liveness_without_procfs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the start time cannot be read (no procfs), a live pid is the holder."""
+    holder_pid = os.getppid()
+    _write_registry_record(
+        tmp_path / "sessions",
+        str(holder_pid),
+        {"sessionId": "sid-1", "kind": "bg", "procStart": "12345"},
+    )
+    real_read_text = Path.read_text
+
+    def read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if str(path).startswith("/proc/"):
+            raise OSError("no procfs")
+        return real_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+
+    assert find_background_holder("sid-1", config_dir=tmp_path) is not None
+
+
+def test_session_has_live_process_counts_interactive_holders(tmp_path: Path) -> None:
+    """Any live record naming a session counts, interactive or not."""
+    sessions = tmp_path / "sessions"
+    _write_registry_record(
+        sessions, str(os.getppid()), {"sessionId": "sid-1", "kind": "interactive"}
+    )
+    _write_registry_record(sessions, "999999999", {"sessionId": "sid-2", "kind": "interactive"})
+
+    assert session_has_live_process("SID-1", config_dir=tmp_path) is True
+    assert session_has_live_process("sid-2", config_dir=tmp_path) is False
+    assert session_has_live_process("sid-3", config_dir=tmp_path) is False
 
 
 @pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs procfs")

@@ -110,7 +110,10 @@ from omnigent.harnesses.claude_native.state import (
     redirect_launch_state,
     write_launch_state,
 )
-from omnigent.harnesses.claude_native.status_file import find_background_holder
+from omnigent.harnesses.claude_native.status_file import (
+    find_background_holder,
+    session_has_live_process,
+)
 from omnigent.host.daemon_launch import (
     daemon_poll_intervals,
     error_text,
@@ -5371,27 +5374,51 @@ async def _resolve_cold_resume_args(
     return ("--resume", resume_session_id)
 
 
+# Namespace for the stable id a held Claude session's resume copy gets.
+_CLAUDE_RESUME_COPY_NAMESPACE = uuid.UUID("6f2b0d5e-3c41-4a8e-9b7d-2e5f1a9c4d60")
+
+
 def _claude_resume_session_id(external_session_id: str, *, session_id: str) -> str:
     """
     Pick the Claude session id a cold resume passes to ``--resume``.
 
     Claude Code refuses to resume a session one of its background jobs still
     runs, and rebuilding that session's transcript would rewrite the file the
-    job appends to. Such a session resumes on a copy under a fresh id instead,
-    rebuilt from the same Omnigent history. The Omnigent session keeps its
-    ``external_session_id``, so a later resume checks the original again.
+    job appends to. Such a session resumes on a copy instead, rebuilt from the
+    same Omnigent history. The copy id is stable per Omnigent session, so
+    repeated resumes reuse one copy transcript, unless a live Claude still has
+    that copy open. The Omnigent session keeps its ``external_session_id``, so
+    a later resume checks the original again.
 
     :param external_session_id: The session's Claude id, e.g.
         ``"02857840-6362-408f-b41f-309e396ed7c6"``.
     :param session_id: Omnigent conversation id the resume is for, e.g.
-        ``"conv_abc123"``; attributes the log line.
-    :returns: *external_session_id*, or a fresh uuid when a background job
+        ``"conv_abc123"``.
+    :returns: *external_session_id*, or a copy id when a background job
         holds it.
     """
-    holder = find_background_holder(external_session_id)
+    try:
+        holder = find_background_holder(external_session_id)
+    except Exception:  # noqa: BLE001 — a registry probe must not change how a resume launches
+        _logger.warning(
+            "Could not check Claude's session registry for %s; resuming it in place",
+            external_session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return external_session_id
     if holder is None:
         return external_session_id
-    copy_session_id = str(uuid.uuid4())
+    copy_session_id = str(
+        uuid.uuid5(_CLAUDE_RESUME_COPY_NAMESPACE, f"{session_id}:{external_session_id.lower()}")
+    )
+    try:
+        copy_in_use = session_has_live_process(copy_session_id)
+    except Exception:  # noqa: BLE001 — unknown means the copy may be live
+        copy_in_use = True
+    if copy_in_use:
+        # Rebuilding that transcript would swap the file under the live Claude.
+        copy_session_id = str(uuid.uuid4())
     _logger.info(
         "Claude session %s is running in a background job (pid=%s kind=%s job=%s); "
         "resuming a copy as %s",

@@ -34,7 +34,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -273,6 +273,45 @@ class BackgroundHolder:
     job_id: str | None
 
 
+# Registry kinds whose live record makes Claude Code refuse ``--resume`` of the
+# session; it ignores interactive and unrecognized kinds.
+_BACKGROUND_SESSION_KINDS = frozenset({"bg", "daemon", "daemon-worker"})
+# Larger record names are not pids, and probing them overflows.
+_MAX_PID = 2**31 - 1
+
+
+def _live_session_records(
+    session_id: str, config_dir: Path | None
+) -> Iterator[tuple[int, dict[str, object]]]:
+    """Yield ``(pid, record)`` for every live registry record naming *session_id*.
+
+    Unreadable or malformed records are skipped, never raised.
+    """
+    wanted = session_id.lower()
+    try:
+        entries = list(sessions_dir(config_dir).glob("*.json"))
+    except OSError:
+        return
+    for entry in entries:
+        # Claude reads only records named after an ASCII pid.
+        stem = entry.stem
+        if not (stem.isascii() and stem.isdigit()) or not 0 < int(stem) <= _MAX_PID:
+            continue
+        record = _read_json_file(entry)
+        if record is None:
+            continue
+        record_session_id = record.get("sessionId")
+        if not isinstance(record_session_id, str) or record_session_id.lower() != wanted:
+            continue
+        pid = int(stem)
+        try:
+            alive = _is_recorded_process(pid, record.get("procStart"))
+        except (OSError, OverflowError, psutil.Error):
+            continue
+        if alive:
+            yield pid, record
+
+
 def find_background_holder(
     session_id: str,
     *,
@@ -280,10 +319,8 @@ def find_background_holder(
 ) -> BackgroundHolder | None:
     """Find a live background Claude process that runs *session_id*.
 
-    Claude Code refuses ``--resume <session_id>`` ("That session is running
-    in the background") while a registry record that is not ``interactive``
-    names the session and its process is still alive. This applies the same
-    test, so a caller can resume a copy instead of launching into that refusal.
+    Matches Claude's background-resume guard using registry kind, session ID,
+    and process identity.
 
     :param session_id: Claude session uuid, matched case-insensitively, e.g.
         ``"02857840-6362-408f-b41f-309e396ed7c6"``.
@@ -291,26 +328,9 @@ def find_background_holder(
     :returns: The holder, or ``None`` when no live background process runs
         the session or the registry cannot be read.
     """
-    wanted = session_id.lower()
-    try:
-        entries = list(sessions_dir(config_dir).glob("*.json"))
-    except OSError:
-        return None
-    for entry in entries:
-        # Claude names each record after its pid and ignores other files.
-        if not entry.stem.isdigit():
-            continue
-        record = _read_json_file(entry)
-        if record is None:
-            continue
+    for pid, record in _live_session_records(session_id, config_dir):
         kind = record.get("kind")
-        record_session_id = record.get("sessionId")
-        if not isinstance(kind, str) or not kind or kind == "interactive":
-            continue
-        if not isinstance(record_session_id, str) or record_session_id.lower() != wanted:
-            continue
-        pid = int(entry.stem)
-        if not _is_recorded_process(pid, record.get("procStart")):
+        if not isinstance(kind, str) or kind not in _BACKGROUND_SESSION_KINDS:
             continue
         job_id = record.get("jobId")
         return BackgroundHolder(
@@ -319,6 +339,16 @@ def find_background_holder(
             job_id=job_id if isinstance(job_id, str) and job_id else None,
         )
     return None
+
+
+def session_has_live_process(session_id: str, *, config_dir: Path | None = None) -> bool:
+    """Whether any live Claude process, interactive or not, has *session_id* open.
+
+    :param session_id: Claude session uuid, matched case-insensitively.
+    :param config_dir: Explicit Claude config dir override (tests).
+    :returns: ``True`` when a live registry record names the session.
+    """
+    return next(_live_session_records(session_id, config_dir), None) is not None
 
 
 def _is_recorded_process(pid: int, proc_start: object) -> bool:
