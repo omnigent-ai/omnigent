@@ -349,10 +349,70 @@ def test_build_host_daemon_env_local_forwards_bedrock_skip_auth(
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
 
 
+@pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
+def test_build_host_daemon_env_forwards_codex_config_declared_env_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server_url: str | None
+) -> None:
+    """The variable Codex's own config.toml names via ``env_key`` survives the daemon hop.
+
+    The daemon spawns the runner that launches Codex, so a provider credential
+    the user declared in ``~/.codex/config.toml`` must cross this hop in both
+    modes or ``omnigent codex`` fails on a config a bare ``codex`` runs fine
+    with. Only the declared name crosses; an unrelated shell secret still does not.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        'model_provider = "myproxy"\n'
+        "[model_providers.myproxy]\n"
+        'base_url = "https://myproxy.example.com/v1"\n'
+        'env_key = "MYPROXY_API_KEY"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
+    monkeypatch.setenv("UNLISTED_SECRET", "nope")
+
+    env = _build_host_daemon_env(server_url=server_url)
+
+    assert env["MYPROXY_API_KEY"] == "populated-proxy-token"
+    assert "UNLISTED_SECRET" not in env
+
+
+@pytest.mark.parametrize("env_key", ["OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "OPENAI_API_KEY"])
+def test_build_host_daemon_env_remote_declared_env_key_cannot_forward_protected_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_key: str
+) -> None:
+    """Remote mode: a config.toml ``env_key`` naming a runner token or a Codex-denied
+    variable does not forward it; the remote daemon stays free of both."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        'model_provider = "myproxy"\n'
+        "[model_providers.myproxy]\n"
+        'base_url = "https://myproxy.example.com/v1"\n'
+        f'env_key = "{env_key}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv(env_key, "protected-secret")
+
+    env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
+
+    assert env_key not in env
+
+
 def test_build_host_daemon_env_remote_strips_provider_credentials(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Remote daemon env remains allowlisted and does not carry LLM keys."""
+    # A developer's own ~/.codex/config.toml must not add a declared env_key here.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://example.databricks.com/serving-endpoints")
