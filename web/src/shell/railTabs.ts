@@ -4,11 +4,17 @@
  * truth without importing back through `AppShell` (a cycle).
  */
 
-/** The selectable tabs in the right workspace rail, in display order.
- *  "browser" and "sidechat" are dynamic-tab modes (a browser tab / a side-chat
- *  tab is selected), not fixed nav tabs — the nav strip renders the first four.
- *  "github" is a stable stored id for the Pull Requests tab; renaming it drops saved choices. */
-export type RightRailTab = "files" | "changes" | "github" | "subagents" | "browser" | "sidechat";
+/**
+ * The fixed-order workspace-rail tabs used for iteration/fallback. The
+ * runtime list is the single source of truth for the static tab ids, so
+ * consumers that validate or iterate them can't drift behind a newly added
+ * tab. "sidechat" is a dynamic-tab mode (a side-chat tab is selected), not a
+ * fixed tab in this list. "github" is the stable stored id for the Pull
+ * Requests tab; renaming it drops saved choices.
+ */
+export const RIGHT_RAIL_TABS = ["files", "changes", "github", "subagents", "browser"] as const;
+
+export type RightRailTab = (typeof RIGHT_RAIL_TABS)[number] | "sidechat";
 
 /**
  * Count/status badge geometry. Fixed height with min-width == height keeps a
