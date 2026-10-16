@@ -965,6 +965,55 @@ def test_to_models_config_shape() -> None:
     assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6", "reasoning": True}]
 
 
+def test_claude_models_rejecting_disabled_thinking_mark_off_unsupported() -> None:
+    """Map only measured Claude 5.x endpoints; preserve behavior for others."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://x/ai-gateway/anthropic",
+        api="anthropic-messages",
+        model="system.ai.claude-opus-5-5",
+        api_key="!get-token",
+        auth_header=True,
+        extra_models=[
+            {"id": "system.ai.claude-opus-5", "reasoning": True},
+            {"id": "system.ai.claude-opus-5-5", "reasoning": True, "contextWindow": 1000000},
+            {"id": "system.ai.claude-sonnet-5-5", "reasoning": True},
+            {"id": "system.ai.claude-fable-5-1", "reasoning": True},
+            {"id": "system.ai.claude-haiku-5-5", "reasoning": True},
+        ],
+    )
+    models = provider.to_models_config()["providers"]["omnigent"]["models"]
+    assert [model["id"] for model in models] == [
+        "system.ai.claude-opus-5",
+        "system.ai.claude-opus-5-5",
+        "system.ai.claude-sonnet-5-5",
+        "system.ai.claude-fable-5-1",
+        "system.ai.claude-haiku-5-5",
+    ]
+    assert "thinkingLevelMap" not in models[0]  # unprobed version unchanged
+    assert models[1]["thinkingLevelMap"] == {"off": None}
+    assert models[2]["thinkingLevelMap"] == {"off": None}
+    assert models[3]["thinkingLevelMap"] == {"off": None}
+    assert "thinkingLevelMap" not in models[4]  # Haiku accepts disabled
+    # Limits and reasoning flags from the catalog are preserved.
+    assert models[1]["contextWindow"] == 1000000
+    assert models[1]["reasoning"] is True
+
+
+def test_claude_entry_keeps_an_explicit_thinking_map() -> None:
+    """A model that already declares its thinking map is left untouched."""
+    entry = creds._claude_entry_with_supported_thinking_off(
+        {"id": "claude-sonnet-5-5", "thinkingLevelMap": {"off": "minimal"}}
+    )
+    assert entry == {"id": "claude-sonnet-5-5", "thinkingLevelMap": {"off": "minimal"}}
+
+
+def test_non_claude_entry_is_left_untouched() -> None:
+    """The Anthropic protocol alone is not enough to classify a model as Claude."""
+    entry = {"id": "some-anthropic-compatible-model", "reasoning": True}
+    assert creds._claude_entry_with_supported_thinking_off(entry) is entry
+
+
 def test_to_models_config_attributes_unity_gateway_providers() -> None:
     """Gateway providers name Pi and Omnigent (plus ug for ug's own headers)."""
     ug_provider: creds._PiProviderPayload = {

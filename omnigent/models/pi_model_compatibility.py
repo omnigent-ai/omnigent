@@ -88,6 +88,9 @@ class PiModelEntry(TypedDict):
     id: str
     input: NotRequired[list[str]]
     reasoning: NotRequired[bool]
+    # Maps Pi thinking levels to provider values; a ``None`` value marks that
+    # level unsupported, so Pi clamps to the nearest supported level.
+    thinkingLevelMap: NotRequired[dict[str, str | None]]
     # Omitted when the catalog reports no limit; Pi then applies its own
     # defaults (128000 / 16384).
     contextWindow: NotRequired[int]

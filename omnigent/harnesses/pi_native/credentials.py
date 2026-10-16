@@ -223,6 +223,36 @@ def _databricks_workspace_url_for_gateway(
         return None
 
 
+# Claude endpoints that reject ``thinking.type: "disabled"`` (measured against
+# the Databricks Anthropic gateway). Older Claude models accept it.
+_CLAUDE_MODELS_WITHOUT_DISABLED_THINKING = (
+    "claude-opus-5-5",
+    "claude-fable-5-1",
+    "claude-sonnet-5-5",
+)
+
+
+def _claude_entry_with_supported_thinking_off(entry: _PiModelEntry) -> _PiModelEntry:
+    """Mark Pi's ``off`` level unsupported for Claude models that reject it.
+
+    pi-native launches with ``--thinking off``, and Pi sends
+    ``thinking.type: "disabled"`` for that level. These endpoints reject that
+    shape with a 400. ``thinkingLevelMap.off = None`` makes Pi treat ``off`` as
+    unsupported and clamp it to ``minimal``, the lightest thinking these models
+    accept. Other models keep Pi's default mapping.
+
+    :param entry: A Pi model entry, e.g. ``{"id": "system.ai.claude-opus-5-5"}``.
+    :returns: The entry with ``{"off": None}``, unless it already declares a map.
+    """
+    model_id = entry.get("id")
+    if not isinstance(model_id, str) or "thinkingLevelMap" in entry:
+        return entry
+    model_id = model_id.lower()
+    if not any(fragment in model_id for fragment in _CLAUDE_MODELS_WITHOUT_DISABLED_THINKING):
+        return entry
+    return {**entry, "thinkingLevelMap": {"off": None}}
+
+
 @dataclass(frozen=True)
 class PiProviderConfig:
     """A resolved native-Pi provider, ready to render into ``models.json``.
@@ -386,6 +416,8 @@ class PiProviderConfig:
         }
         if self.auth_header:
             provider["authHeader"] = True
+        if self.api == "anthropic-messages":
+            provider["models"] = [_claude_entry_with_supported_thinking_off(m) for m in models]
         # Claude 4+ / Claude 5 models require thinking.type.adaptive (not
         # thinking.type.enabled). Pi 0.84.2+ sends adaptive when forceAdaptiveThinking
         # is set in the compat block; reasoning:true on the model entry enables Pi's
