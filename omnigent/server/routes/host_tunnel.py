@@ -87,6 +87,7 @@ SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 _HEARTBEAT_FAILURE_LOG_INTERVAL_S = 60.0
+_DISCONNECT_CLEANUP_TIMEOUT_S = 5.0
 
 RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
 """Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
@@ -484,39 +485,56 @@ def create_host_tunnel_router(
                 finally:
                     conn.diagnostics.freeze()
                     disconnect_attrs = connection_attrs()
-                    # ASGI cancellation must not interrupt offline persistence
-                    # or leave the diagnostics monitor running after disconnect.
-                    with anyio.CancelScope(shield=True):
+                    # Shield teardown from ASGI cancellation, but do not let a
+                    # stalled dependency hold shutdown indefinitely.
+                    try:
                         for task in (sender_task, ping_task, receive_task, heartbeat_task):
                             task.cancel()
-                        await asyncio.gather(
-                            sender_task,
-                            ping_task,
-                            receive_task,
-                            heartbeat_task,
-                            return_exceptions=True,
-                        )
-                        # If the host already reconnected, this handler's connection
-                        # was replaced; only the current one may mark it offline.
-                        try:
-                            if host_registry.deregister(host_id, conn=conn):
-                                try:
-                                    await asyncio.to_thread(host_store.set_offline, host_id)
-                                except Exception:
-                                    # A failed write must not swallow cancellation or skip the
-                                    # disconnect callback; the row ages out via the liveness TTL.
-                                    _logger.exception(
-                                        "Failed to mark host %s offline after disconnect", host_id
-                                    )
-                        finally:
+                        with anyio.move_on_after(
+                            _DISCONNECT_CLEANUP_TIMEOUT_S, shield=True
+                        ) as cleanup_scope:
+                            try:
+                                await asyncio.gather(
+                                    sender_task,
+                                    ping_task,
+                                    receive_task,
+                                    heartbeat_task,
+                                    return_exceptions=True,
+                                )
+                            finally:
+                                # A replaced connection must not mark its successor offline.
+                                if host_registry.deregister(host_id, conn=conn):
+                                    try:
+                                        await asyncio.to_thread(host_store.set_offline, host_id)
+                                    except Exception:
+                                        _logger.exception(
+                                            "Failed to mark host %s offline after disconnect",
+                                            host_id,
+                                        )
+                        if cleanup_scope.cancel_called:
+                            # The row ages out via its liveness TTL if persistence stalls.
+                            _logger.warning("Timed out cleaning up host %s", host_id)
+                    finally:
+                        with anyio.move_on_after(
+                            _DISCONNECT_CLEANUP_TIMEOUT_S, shield=True
+                        ) as diagnostics_scope:
                             await diagnostics_cleanup.aclose()
+                        if diagnostics_scope.cancel_called:
+                            _logger.warning("Timed out closing host %s diagnostics", host_id)
                     if on_host_disconnect is not None:
-                        try:
-                            await on_host_disconnect(host_id, tunnel_owner)
-                        except Exception:
-                            _logger.exception(
-                                "on_host_disconnect callback failed for %s",
-                                host_id,
+                        with anyio.move_on_after(
+                            _DISCONNECT_CLEANUP_TIMEOUT_S, shield=True
+                        ) as callback_scope:
+                            try:
+                                await on_host_disconnect(host_id, tunnel_owner)
+                            except Exception:
+                                _logger.exception(
+                                    "on_host_disconnect callback failed for %s",
+                                    host_id,
+                                )
+                        if callback_scope.cancel_called:
+                            _logger.warning(
+                                "on_host_disconnect callback timed out for %s", host_id
                             )
 
         except asyncio.CancelledError as exc:

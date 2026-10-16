@@ -589,14 +589,16 @@ async def test_host_replacement_names_retirement_without_inventing_close_code(
 
 
 @pytest.mark.parametrize("cancellation", ["task", "scope"])
-@pytest.mark.parametrize("offline_fails", [False, True])
+@pytest.mark.parametrize("offline_result", ["success", "failure", "blocked"])
 async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     cancellation: str,
-    offline_fails: bool,
+    offline_result: str,
 ) -> None:
+    from omnigent.server.routes import host_tunnel
+
     registry = HostRegistry()
     store = HostStore(db_uri)
     app = FastAPI()
@@ -615,14 +617,29 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
             cleanup_completed.set()
 
     monkeypatch.setattr(TunnelDiagnostics, "monitoring", observed_monitoring)
-    if offline_fails:
+    offline_started = threading.Event()
+    offline_release = threading.Event()
+    offline_finished = threading.Event()
+    real_set_offline = store.set_offline
+    if offline_result != "success":
 
-        def fail_offline(host_id: str) -> None:
+        def interrupted_offline(host_id: str) -> None:
             assert host_id == _HOST_ID
-            raise RuntimeError("test offline persistence failure")
+            if offline_result == "failure":
+                raise RuntimeError("test offline persistence failure")
+            offline_started.set()
+            try:
+                assert offline_release.wait(timeout=budget(5.0))
+                real_set_offline(host_id)
+            finally:
+                offline_finished.set()
 
-        # Inject only the failed persistence boundary; registration and reads remain real.
-        monkeypatch.setattr(store, "set_offline", fail_offline)
+        # Hold only the persistence boundary; registration and reads remain real.
+        monkeypatch.setattr(store, "set_offline", interrupted_offline)
+    if offline_result == "blocked":
+        monkeypatch.setattr(
+            host_tunnel, "_DISCONNECT_CLEANUP_TIMEOUT_S", budget(0.1), raising=False
+        )
 
     async def on_connect(_host_id: str, _owner: str | None) -> None:
         entered.set()
@@ -631,6 +648,7 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
     disconnected: list[str] = []
 
     async def on_disconnect(host_id: str, _owner: str | None) -> None:
+        await anyio.lowlevel.checkpoint()
         disconnected.append(host_id)
 
     app.include_router(
@@ -681,10 +699,17 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
         assert registry.get(_HOST_ID) is None
         persisted = HostStore(db_uri).get_host(_HOST_ID)
         assert persisted is not None
-        assert persisted.status == ("online" if offline_fails else "offline")
-        if offline_fails:
+        assert persisted.status == ("offline" if offline_result == "success" else "online")
+        if offline_result == "failure":
             assert "test offline persistence failure" in caplog.text
+        if offline_result == "blocked":
+            assert offline_started.is_set()
+            assert not offline_release.is_set()
+            assert "Timed out cleaning up host" in caplog.text
     finally:
+        offline_release.set()
+        if offline_started.is_set():
+            assert await asyncio.to_thread(offline_finished.wait, budget(2.0))
         comm.stop(exceptions=False)
         await asyncio.gather(comm.future, return_exceptions=True)
         for task in helpers:

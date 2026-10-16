@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from sqlalchemy import event, insert, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import account_authority_scope
@@ -401,6 +401,7 @@ def test_reown_host_id_across_owner_change_preserves_conversation_binding(
 
 def test_reown_disabled_rejects_foreign_owner_claiming_host_id(
     host_store: HostStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Without reown opt-in, a different owner cannot claim a host_id.
 
@@ -416,6 +417,14 @@ def test_reown_disabled_rejects_foreign_owner_claiming_host_id(
     host_store.upsert_on_connect(
         host_id="5d23e459b50e20479abf5d3fa8e2f936", name="alice-box", user_id="alice@example.com"
     )
+    attempts = 0
+
+    def count_attempts(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return run_write_transaction(*args, **kwargs)
+
+    monkeypatch.setattr("omnigent.stores.host_store.run_write_transaction", count_attempts)
 
     with pytest.raises(IntegrityError):
         host_store.upsert_on_connect(
@@ -423,6 +432,7 @@ def test_reown_disabled_rejects_foreign_owner_claiming_host_id(
             name="bob-box",
             user_id="bob@example.com",
         )
+    assert attempts == 1
 
     # Alice still owns host_x; Bob got nothing.
     assert [h.user_id for h in host_store.list_hosts(user_id="alice@example.com")] == [
@@ -800,6 +810,22 @@ def test_reservation_rejects_another_owner(host_store: HostStore) -> None:
     assert host_store.get_host(_RESERVED_HOST_ID) == connected
 
 
+@pytest.mark.parametrize("existing_kind", ["external", "managed", "deleted"])
+def test_reservation_refuses_name_owned_by_another_identity(
+    host_store: HostStore, existing_kind: str
+) -> None:
+    other_id = "cd" * 16
+    original = host_store.upsert_on_connect(other_id, "managed-host", "alice@example.test")
+    if existing_kind != "external":
+        original = host_store.bind_sandbox(other_id, provider="modal", sandbox_id="other")
+    if existing_kind == "deleted":
+        host_store.delete_host(other_id)
+        original = None
+    assert _reserve(host_store) is None
+    assert host_store.get_host(_RESERVED_HOST_ID) is None
+    assert host_store.get_host(other_id) == original
+
+
 def test_reservation_is_workspace_scoped(host_store: HostStore) -> None:
     first = _reserve(host_store)
     with workspace_scope(current_workspace_id() + 1):
@@ -959,15 +985,47 @@ def test_insert_conflict_retry_adopts_the_competing_row(
 
 
 @pytest.mark.parametrize("connect_first", [False, True])
+@pytest.mark.parametrize("retry_dialect", [None, "mysql", "cockroachdb"])
 def test_binding_preserves_connection_liveness(
-    host_store: HostStore, db_uri: str, connect_first: bool
+    host_store: HostStore,
+    db_uri: str,
+    connect_first: bool,
+    retry_dialect: str | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if connect_first:
         host_store.upsert_on_connect(_RESERVED_HOST_ID, "managed-host", "alice@example.test")
         _set_updated_at(db_uri, _RESERVED_HOST_ID, 1)
     reserved = _reserve(host_store)
     assert reserved is not None
-    bound = host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="environment")
+    attempts = 0
+
+    class ConcurrencyFailure(Exception):
+        sqlstate = "40001"
+
+    def fail_first_flush(session, _context):
+        nonlocal attempts
+        if any(
+            isinstance(row, SqlHost) and row.sandbox_id == "environment" for row in session.dirty
+        ):
+            attempts += 1
+            if attempts == 1:
+                raise DBAPIError("UPDATE hosts", {}, ConcurrencyFailure(1213, "deadlock"), False)
+
+    # Inject the server's concurrency error after a real write, retaining rollback and retry.
+    engine = get_or_create_engine(db_uri)
+    with monkeypatch.context() as patch:
+        if retry_dialect is not None:
+            patch.setattr(engine.dialect, "name", retry_dialect)
+            event.listen(Session, "after_flush", fail_first_flush)
+        try:
+            bound = host_store.bind_sandbox(
+                _RESERVED_HOST_ID, provider="modal", sandbox_id="environment"
+            )
+        finally:
+            if retry_dialect is not None:
+                event.remove(Session, "after_flush", fail_first_flush)
+    assert attempts == (0 if retry_dialect is None else 2)
     assert bound is not None
     assert bound.updated_at == reserved.updated_at
     assert bound.status == reserved.status

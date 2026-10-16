@@ -53,6 +53,10 @@ from omnigent.harness_availability import HarnessAvailability, is_harness_availa
 HOST_LIVENESS_TTL_S = 90
 
 
+class _HostOwnershipError(IntegrityError):
+    """An ownership refusal, not a retryable insert conflict."""
+
+
 @dataclass
 class Host:
     """
@@ -357,7 +361,7 @@ class HostStore:
                 # user's host_id. Raise the same IntegrityError the old UNIQUE
                 # constraint produced so the tunnel handler rejects the hijack.
                 if row.user_id != user_id and not allow_host_id_reown:
-                    raise IntegrityError(
+                    raise _HostOwnershipError(
                         "host_id already owned by a different user",
                         params={"host_id": host_id, "user_id": user_id},
                         orig=Exception("UNIQUE constraint failed: hosts.host_id"),
@@ -428,6 +432,8 @@ class HostStore:
 
         try:
             return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
+        except _HostOwnershipError:
+            raise
         except IntegrityError:
             # A concurrent reservation or connection can win the first insert.
             # Retry in a fresh transaction, rechecking ownership and deletion.
@@ -884,7 +890,8 @@ class HostStore:
         New reservations are offline and have no launch token. A connection
         arriving after a launch timeout retains this classification. Existing
         rows keep their liveness, credentials, identity and sandbox binding.
-        Returns None for a deleted host or a conflicting provider.
+        Returns None for a deleted host, a conflicting provider or a name
+        already held by another identity for this owner.
         """
 
         def write(session: Session) -> Host | None:
@@ -898,6 +905,15 @@ class HostStore:
                 .with_for_update()
             ).scalar_one_or_none()
             if row is None:
+                name_owner = session.execute(
+                    select(SqlHost.host_id).where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.user_id == user_id,
+                        SqlHost.name == name,
+                    )
+                ).scalar_one_or_none()
+                if name_owner is not None and name_owner != host_id:
+                    return None
                 now = now_epoch()
                 row = SqlHost(
                     account_generation=generation,
@@ -938,7 +954,8 @@ class HostStore:
         Missing, deleted or conflicting bindings fail closed. Metadata writes
         must not refresh a disconnected host's heartbeat.
         """
-        with self._lifecycle_session("bind_host_sandbox") as session:
+
+        def write(session: Session) -> Host | None:
             owner = session.execute(
                 select(SqlHost.user_id, SqlHost.account_generation).where(
                     SqlHost.workspace_id == current_workspace_id(),
@@ -972,6 +989,8 @@ class HostStore:
             # Binding metadata is not a heartbeat: a crashed host whose status
             # still says online must remain stale until it actually reconnects.
             return _row_to_host(row)
+
+        return run_write_transaction(self._lifecycle_session, "bind_host_sandbox", write)
 
     def register_managed_host(
         self,
