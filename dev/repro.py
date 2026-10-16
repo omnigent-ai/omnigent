@@ -52,6 +52,7 @@ def _die(msg: str) -> NoReturn:
 
 def _copy_prepared_agent(source: Path, worktree: Path) -> None:
     target = worktree / _AGENT_REL
+    target.mkdir(parents=True, exist_ok=True)
     for name in _PREPARED_AGENT_FILES:
         shutil.copy2(source / name, target / name)
 
@@ -208,7 +209,10 @@ def main() -> None:
     except WorktreeError as exc:
         _die(f"could not create worktree: {exc}")
     worktree = Path(created.worktree_path)
-    _copy_prepared_agent(agent_dir, worktree)
+    try:
+        _copy_prepared_agent(agent_dir, worktree)
+    except OSError as exc:
+        _die(f"could not prepare agent in worktree: {exc}")
     print(f"→ worktree: {worktree}  (branch {created.branch})")
 
     # Run the agent FROM the worktree so the worktree is its workspace (local
