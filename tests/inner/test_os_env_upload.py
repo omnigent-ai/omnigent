@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import zipfile
@@ -15,8 +17,14 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner.datamodel import GitSshBinding, OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import CallerProcessOSEnvironment, create_os_environment
+from omnigent.inner.os_env import (
+    CallerProcessOSEnvironment,
+    build_helper_env,
+    create_os_environment,
+    set_sandbox_env,
+)
 from omnigent.inner.os_env_upload import UploadHelperClient, read_frame, write_frame
+from omnigent.inner.sandbox import get_backend, with_additional_write_roots
 
 UID = "a" * 32
 
@@ -392,7 +400,11 @@ def test_upload_helper_has_no_network_or_credentials(tmp_path: Path, sandbox_typ
     env = create_os_environment(
         OSEnvSpec(
             cwd=str(workspace),
-            sandbox=OSEnvSandboxSpec(type=sandbox_type, write_paths=["."], git_ssh=[binding]),
+            sandbox=OSEnvSandboxSpec(
+                type=sandbox_type,
+                write_paths=["."],
+                git_ssh=[binding],
+            ),
         ),
         additional_read_roots=[Path(__file__).resolve().parents[2]],
     )
@@ -408,6 +420,118 @@ def test_upload_helper_has_no_network_or_credentials(tmp_path: Path, sandbox_typ
         assert helper.call({"op": "probe"})["raw_upload"] is True
         assert helper._git_ssh_broker is None
     finally:
+        helper.close()
+        env.close()
+
+
+@pytest.mark.parametrize(
+    "sandbox_type",
+    [
+        pytest.param(
+            "linux_bwrap",
+            marks=pytest.mark.skipif(
+                not (sys.platform.startswith("linux") and shutil.which("bwrap")),
+                reason="linux_bwrap requires Linux + bwrap on PATH",
+            ),
+        ),
+        pytest.param(
+            "darwin_seatbelt",
+            marks=pytest.mark.skipif(
+                not (sys.platform == "darwin" and shutil.which("sandbox-exec")),
+                reason="darwin_seatbelt requires macOS + sandbox-exec",
+            ),
+        ),
+    ],
+)
+def test_upload_helper_drops_passthrough_credentials(
+    tmp_path: Path, sandbox_type: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credential_name = "OMNIGENT_UPLOAD_TEST_CREDENTIAL"
+    credential_value = "upload-helper-test-secret"
+    monkeypatch.setenv(credential_name, credential_value)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    env = create_os_environment(
+        OSEnvSpec(
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(
+                type=sandbox_type,
+                write_paths=["."],
+                env_passthrough=[credential_name],
+            ),
+        ),
+        additional_read_roots=[Path(__file__).resolve().parents[2]],
+    )
+    assert isinstance(env, CallerProcessOSEnvironment)
+    assert env.sandbox.env_passthrough == [credential_name]
+    helper = UploadHelperClient(env)
+    scratch = tmp_path / "helper-scratch"
+    scratch.mkdir()
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        sandbox = with_additional_write_roots(helper.sandbox, [scratch])
+        helper_env = build_helper_env(os.environ, sandbox)
+        set_sandbox_env(helper_env, scratch)
+        project_root = str(Path(__file__).resolve().parents[2])
+        current_pythonpath = helper_env.get("PYTHONPATH")
+        helper_env["PYTHONPATH"] = (
+            f"{project_root}{os.pathsep}{current_pythonpath}"
+            if current_pythonpath
+            else project_root
+        )
+        config = {
+            "cwd": str(env.cwd),
+            "shell_path": env.shell_path,
+            "sandbox": sandbox.to_jsonable(),
+            "upload_raw": True,
+        }
+        config_path = scratch / "helper-config.json"
+        config_path.write_text(json.dumps(config, separators=(",", ":")))
+        helper_argv = [
+            sys.executable,
+            "-P",
+            "-m",
+            "omnigent.inner.os_env",
+            "helper",
+            "--config-file",
+            str(config_path),
+        ]
+        spawn_argv = get_backend(sandbox.backend_type).wrap_launcher_argv(
+            helper_argv, sandbox, env.cwd
+        )
+        process = subprocess.Popen(
+            spawn_argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(env.cwd),
+            env=helper_env,
+        )
+        assert process.stdin is not None and process.stdout is not None
+        write_frame(process.stdin, {"op": "probe"})
+        result, _ = read_frame(process.stdout)
+        assert result["raw_upload"] is True
+        if sys.platform.startswith("linux"):
+            process_env = (Path("/proc") / str(process.pid) / "environ").read_bytes()
+            assert f"{credential_name}={credential_value}".encode() not in process_env
+        else:
+            process_env = subprocess.run(
+                ["ps", "eww", "-p", str(process.pid)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            assert f"{credential_name}={credential_value}" not in process_env
+        assert helper.sandbox.env_passthrough is None
+    finally:
+        if process is not None:
+            if process.stdin is not None:
+                process.stdin.close()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
         helper.close()
         env.close()
 
