@@ -46,6 +46,10 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
+# Separates the summary of ``HostRunnerExitedFrame.error`` from the runner's log
+# tail, whose last line the server keeps when it shortens the report for storage.
+RUNNER_LOG_TAIL_HEADING = "--- runner log tail ---"
+
 # Capability tokens a host advertises in ``HostHelloFrame.capabilities``. A token
 # is present only in builds that have the feature, so the server gates on
 # presence — no host-version table to maintain, and a build that lacks the
@@ -363,7 +367,8 @@ class HostRunnerExitedFrame:
         ``"runner_abc123..."``.
     :param error: Human-readable cause, e.g.
         ``"runner process exited with code 1 (log: ~/...) ..."``,
-        including the trailing lines of the runner's log.
+        followed by :data:`RUNNER_LOG_TAIL_HEADING` and the trailing
+        lines of the runner's log.
     :param had_connected: Whether the runner touched its first-connect marker.
         ``None`` when unavailable or reported by an older host.
     """
@@ -404,6 +409,8 @@ class HostRunnerStatusResultFrame:
 
         * ``"alive"`` — the host has this runner and its process is
           running (booting or serving). The runner is coming; wait.
+        * ``"sign_in_pending"`` — this live, unconnected runner is waiting
+          within its bounded host sign-in window. Keep the original input.
         * ``"dead"`` — the host has this runner but its process has
           exited. It will never connect; relaunch now.
         * ``"unknown"`` — the host has no record of this runner (it was

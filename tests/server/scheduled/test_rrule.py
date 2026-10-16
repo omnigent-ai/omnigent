@@ -171,3 +171,180 @@ def test_validate_floor_is_deterministic() -> None:
 
 def test_min_interval_constant() -> None:
     assert MIN_INTERVAL_SECONDS == 3600
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "FREQ=DAILY;INTERVAL=367",
+        "FREQ=MINUTELY;INTERVAL=21961",
+        "FREQ=SECONDLY;INTERVAL=1317601",
+        "FREQ=DAILY;INTERVAL=0",
+        "FREQ=DAILY;COUNT=-1",
+        "FREQ=DAILY;COUNT=0",
+        "FREQ=DAILY;COUNT=2147483648",
+        "FREQ=DAILY;FREQ=WEEKLY",
+        "FREQ=DAILY\nRRULE:FREQ=WEEKLY",
+        "FREQ=DAILY;BYHOUR=0,1,2,3,4;BYMINUTE=0,1,2,3,4",
+    ],
+)
+def test_rule_limits_apply_to_validation_and_next_fire(rule: str) -> None:
+    with pytest.raises(RRuleValidationError):
+        validate_rrule(rule)
+    with pytest.raises(RRuleValidationError):
+        get_next_fire_time(rule, _dt(2026, 1, 1), UTC)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "BYMONTH",
+        "BYWEEKNO",
+        "BYYEARDAY",
+        "BYMONTHDAY",
+        "BYDAY",
+        "BYHOUR",
+        "BYMINUTE",
+        "BYSECOND",
+        "BYSETPOS",
+        "BYEASTER",
+    ],
+)
+def test_by_lists_have_a_distinct_value_limit(field: str) -> None:
+    values = [f"{i}MO" if field == "BYDAY" else str(i) for i in range(1, 26)]
+    rule = f"FREQ=YEARLY;{field}=" + ",".join(values)
+    for evaluate in (
+        validate_rrule,
+        lambda value: get_next_fire_time(value, _dt(2026, 1, 1), UTC),
+    ):
+        with pytest.raises(RRuleValidationError, match=f"{field} supports at most 24"):
+            evaluate(rule)
+
+
+def test_duplicate_by_values_preserve_occurrences() -> None:
+    rule = "FREQ=MONTHLY;BYDAY=+1MO,01MO,1MO;BYHOUR=" + ",".join(["09", "+9", "9"] * 10)
+    rule += ";BYSETPOS=01,+1,1"
+    validate_rrule(rule)
+    assert get_next_fire_time(rule, _dt(2026, 1, 1), UTC) == _dt(2026, 1, 5, 9)
+
+
+def test_position_selection_consumes_work() -> None:
+    from dateutil.rrule import rrulestr
+
+    from omnigent.server.scheduled._bounded_rrule import iter_bounded
+
+    parsed = rrulestr("FREQ=DAILY;BYHOUR=9,11,13;BYSETPOS=1,2,3", dtstart=_dt(2026, 1, 1))
+    # The first period and day leave only two position selections available.
+    with pytest.raises(ValueError, match="work limit"):
+        next(iter_bounded(parsed, max_steps=4, max_seconds=1))
+
+
+def test_search_stops_at_elapsed_time_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from itertools import count
+
+    for evaluate in (
+        validate_rrule,
+        lambda value: get_next_fire_time(value, _dt(2026, 1, 1), UTC),
+    ):
+        # Advance only the recurrence clock; no real delay or costly input is needed.
+        ticks = count()
+        monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", ticks.__next__)
+        with pytest.raises(RRuleValidationError, match="time limit"):
+            evaluate("FREQ=DAILY")
+
+
+def test_yearly_leap_day_rule_is_supported() -> None:
+    rule = "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29"
+    validate_rrule(rule)
+    assert get_next_fire_time(rule, _dt(2026, 1, 1), UTC) == _dt(2028, 2, 29)
+
+
+def test_next_fire_search_has_a_finite_horizon() -> None:
+    assert get_next_fire_time("FREQ=YEARLY;INTERVAL=10", _dt(2026, 1, 1), UTC) is None
+
+
+@pytest.mark.parametrize(
+    "rule,expected",
+    [
+        ("FREQ=DAILY;INTERVAL=366", _dt(2027, 1, 2)),
+        ("FREQ=DAILY;COUNT=2147483647", _dt(2026, 1, 2)),
+        ("FREQ=DAILY;BYHOUR=" + ",".join(map(str, range(24))), _dt(2026, 1, 1, 1)),
+        ("FREQ=MINUTELY;INTERVAL=60", _dt(2026, 1, 1, 1)),
+        ("FREQ=MINUTELY;INTERVAL=90", _dt(2026, 1, 1, 1, 30)),
+        ("FREQ=SECONDLY;INTERVAL=3600", _dt(2026, 1, 1, 1)),
+        ("FREQ=MINUTELY;INTERVAL=21960", _dt(2026, 1, 16, 6)),
+        ("FREQ=SECONDLY;INTERVAL=1317600", _dt(2026, 1, 16, 6)),
+    ],
+)
+def test_supported_limits_and_persisted_frequencies(rule: str, expected: datetime) -> None:
+    trigger = validate_rrule(rule)
+    assert trigger.next_fire_after(_dt(2026, 1, 1), UTC) == expected
+
+
+def test_rule_length_limit_precedes_parsing() -> None:
+    rule = "FREQ=DAILY".ljust(4097)
+    with pytest.raises(RRuleValidationError, match="at most 4096 characters"):
+        validate_rrule(rule)
+    with pytest.raises(RRuleValidationError, match="at most 4096 characters"):
+        get_next_fire_time(rule, _dt(2026, 1, 1), UTC)
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "FREQ=HOURLY;BYMONTH=2;BYMONTHDAY=30",
+        "FREQ=DAILY;BYHOUR=9;BYSETPOS=2",
+        "FREQ=MINUTELY;INTERVAL=60;BYHOUR=9",
+        "FREQ=SECONDLY;INTERVAL=3600;BYHOUR=9",
+    ],
+)
+def test_search_stops_at_work_budget(monkeypatch: pytest.MonkeyPatch, rule: str) -> None:
+    # A tiny budget checks outer and inner search limits without a long search.
+    monkeypatch.setattr("omnigent.server.scheduled.rrule._MAX_SEARCH_STEPS", 2)
+    with pytest.raises(RRuleValidationError, match="work limit"):
+        validate_rrule(rule)
+    with pytest.raises(RRuleValidationError, match="work limit"):
+        get_next_fire_time(rule, _dt(2026, 1, 1), UTC)
+
+
+def test_empty_periods_stop_at_horizon() -> None:
+    from dateutil.rrule import rrulestr
+
+    from omnigent.server.scheduled._bounded_rrule import iter_bounded
+
+    parsed = rrulestr(
+        "FREQ=DAILY;BYHOUR=9;BYSETPOS=2;UNTIL=20260102T000000Z",
+        dtstart=_dt(2026, 1, 1),
+    )
+    assert list(iter_bounded(parsed, max_steps=7, max_seconds=1)) == []
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29",
+        "FREQ=MONTHLY;BYDAY=MO;BYSETPOS=-1",
+        "FREQ=WEEKLY;BYDAY=MO,FR;BYHOUR=9",
+        "FREQ=DAILY;BYHOUR=9;BYMINUTE=15",
+        "FREQ=HOURLY;INTERVAL=3;BYMINUTE=30",
+        "FREQ=MINUTELY;INTERVAL=90;BYSECOND=15",
+        "FREQ=SECONDLY;INTERVAL=3600",
+        "FREQ=DAILY;BYHOUR=0;UNTIL=20260101T120000Z",
+    ],
+)
+@pytest.mark.parametrize("zone", ["UTC", "Pacific/Kiritimati"])
+def test_bounded_iterator_preserves_dateutil_occurrences(rule: str, zone: str) -> None:
+    from itertools import islice
+
+    from dateutil.rrule import rrulestr
+
+    from omnigent.server.scheduled._bounded_rrule import iter_bounded
+
+    tz = ZoneInfo(zone)
+    start = datetime(2026, 1, 1, 23, tzinfo=tz)
+    parsed = rrulestr(rule, dtstart=start)
+    assert list(islice(iter_bounded(parsed, max_steps=100_000, max_seconds=1), 5)) == list(
+        islice(parsed, 5)
+    )
+    midnight = start.replace(hour=0)
+    assert get_next_fire_time(rule, start, tz) == rrulestr(rule, dtstart=midnight).after(start)

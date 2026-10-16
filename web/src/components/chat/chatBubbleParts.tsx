@@ -15,6 +15,7 @@ import {
 import {
   ArrowUpIcon,
   CheckIcon,
+  ClockIcon,
   CopyIcon,
   FileTextIcon,
   FolderIcon,
@@ -218,6 +219,7 @@ export function buildPendingBubbles(
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
       pending: true,
+      ...(p.sentMidTurn ? { awaitingAgent: true } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -908,6 +910,16 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </MessageContent>
         </div>
+        {/* Always visible: a mid-turn message can wait minutes behind a long tool call. */}
+        {bubble.pending && bubble.awaitingAgent && (
+          <div
+            className="flex items-center gap-1 pt-1 text-[11px] leading-4 text-muted-foreground"
+            data-testid="message-awaiting-agent"
+          >
+            <ClockIcon size={12} aria-hidden />
+            The agent will read this after its current step
+          </div>
+        )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
         <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
           {ts && (
