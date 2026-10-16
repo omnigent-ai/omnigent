@@ -139,7 +139,7 @@ def test_webfonts_is_a_frontend_visible_feature() -> None:
 
     assert flags.enabled(Feature.WEBFONTS)
     assert flags.frontend_dict()["webfonts"] is True
-    assert flags.enabled_names() == ("harness_settings_ui", "webfonts")
+    assert flags.enabled_names() == ("webfonts",)
 
 
 def test_arca_shutdown_warnings_are_frontend_visible() -> None:
