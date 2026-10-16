@@ -1357,11 +1357,18 @@ async def test_auto_create_claude_terminal_passes_session_effort(
 
     workspace = tmp_path / "workspace"
     (workspace / ".omnigent").mkdir(parents=True)
+    # A project may select the default harness, but a project command override
+    # must not reach the launch; the user-owned executable wins.
     (workspace / ".omnigent" / "config.yaml").write_text(
-        "harness:\n  claude-native:\n    command: workspace-claude\n"
+        "harness:\n  default: claude-native\n  claude-native:\n    command: project-claude\n"
+    )
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    command: user-claude\n"
     )
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
     monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
 
     def missing_cwd() -> Path:
@@ -1373,6 +1380,17 @@ async def test_auto_create_claude_terminal_passes_session_effort(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _no_op_forwarder,
     )
+
+    import omnigent.config as _config_module
+
+    real_load_effective_config = _config_module.load_effective_config
+    loader_workspaces: list[Any] = []
+
+    def _recording_load_effective_config(*, workspace: Any = None) -> Any:
+        loader_workspaces.append(workspace)
+        return real_load_effective_config(workspace=workspace)
+
+    monkeypatch.setattr(_config_module, "load_effective_config", _recording_load_effective_config)
 
     captured: dict[str, Any] = {}
 
@@ -1422,7 +1440,10 @@ async def test_auto_create_claude_terminal_passes_session_effort(
 
     args = captured["spec"].args
     assert captured["spec"].os_env.cwd == str(workspace)
-    assert captured["spec"].command == "workspace-claude"
+    assert captured["spec"].command == "user-claude"
+    # The user command would win even if project config were never read, so
+    # prove the merge saw the session workspace, not the removed process cwd.
+    assert any(w is not None and Path(w) == workspace for w in loader_workspaces)
     assert "--effort" in args
     effort_idx = args.index("--effort")
     assert args[effort_idx + 1] == "high"
@@ -4561,11 +4582,13 @@ class _RecordingCodexRegistry:
 
 
 @pytest.mark.asyncio
-async def test_codex_tui_launch_reads_project_config_from_session_workspace(
+async def test_codex_tui_launch_prefers_user_command_over_project_from_session_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Codex TUI relaunch reads the session workspace's config after the runner cwd is gone."""
+    """A Codex TUI relaunch takes its executable and args from user config,
+    ignoring the project launch override, and resolves the terminal cwd to the
+    session workspace even after the runner process cwd is removed."""
     from omnigent.runner.native.orchestration import (
         _CodexNativeLaunchConfig,
         _launch_codex_native_tui,
@@ -4573,15 +4596,34 @@ async def test_codex_tui_launch_reads_project_config_from_session_workspace(
 
     workspace = tmp_path / "workspace"
     (workspace / ".omnigent").mkdir(parents=True)
+    # A project may select the default harness, but command and args overrides
+    # are ignored; they come from user configuration.
     (workspace / ".omnigent" / "config.yaml").write_text(
-        "harness:\n  codex-native:\n    command: workspace-codex\n    args: [--workspace-arg]\n"
+        "harness:\n  default: codex-native\n"
+        "  codex-native:\n    command: project-codex\n    args: [--project-arg]\n"
     )
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "harness:\n  codex-native:\n    command: user-codex\n    args: [--user-arg]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
 
     def missing_cwd() -> Path:
         raise FileNotFoundError("process cwd was removed")
 
     monkeypatch.setattr(Path, "cwd", missing_cwd)
+
+    import omnigent.config as _config_module
+
+    real_load_effective_config = _config_module.load_effective_config
+    loader_workspaces: list[Any] = []
+
+    def _recording_load_effective_config(*, workspace: Any = None) -> Any:
+        loader_workspaces.append(workspace)
+        return real_load_effective_config(workspace=workspace)
+
+    monkeypatch.setattr(_config_module, "load_effective_config", _recording_load_effective_config)
 
     captured: dict[str, Any] = {}
     app_server = SimpleNamespace(
@@ -4614,9 +4656,13 @@ async def test_codex_tui_launch_reads_project_config_from_session_workspace(
     )
 
     spec = captured["spec"]
-    assert spec.command == "workspace-codex"
-    assert spec.args[0] == "--workspace-arg"
+    assert spec.command == "user-codex"
+    assert spec.args[0] == "--user-arg"
+    assert "--project-arg" not in spec.args
     assert spec.os_env.cwd == str(workspace)
+    # The user command would win even if project config were never read, so
+    # prove the merge saw the session workspace, not the removed process cwd.
+    assert any(w is not None and Path(w) == workspace for w in loader_workspaces)
 
 
 @pytest.mark.asyncio
