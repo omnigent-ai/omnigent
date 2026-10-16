@@ -484,6 +484,10 @@ class _HelperProcessClient:
 
     def _start_on_owner_thread_locked(self) -> None:
         """Keep Linux's parent-death signal bound to an environment-owned thread."""
+        # Stop and join any stale owner thread before creating a replacement.
+        if self._owner_stop is not None or self._owner_thread is not None:
+            self._stop_locked()
+
         ready = threading.Event()
         stop = threading.Event()
         failures: list[BaseException] = []

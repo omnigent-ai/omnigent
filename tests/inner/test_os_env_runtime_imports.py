@@ -114,11 +114,18 @@ def test_tools_repair_broken_checkout_with_normal_shell_imports(
             module.write_text(broken_source)
             proc = env._helper._proc
             assert proc is not None
+            # Capture the original owner thread before killing the helper.
+            original_owner = env._helper._owner_thread
             proc.kill()
             proc.wait(timeout=10)
 
         source = await env.read("omnigent/__init__.py")
         assert source.get("content") == broken_source, source
+        # After restarting, the original owner thread should have exited (linux_bwrap only).
+        if scenario == "restart" and backend == "linux_bwrap":
+            assert original_owner is not None
+            original_owner.join(timeout=1)
+            assert not original_owner.is_alive()
         helper = env._helper._proc
         assert helper is not None
         with pytest.raises(subprocess.TimeoutExpired):
