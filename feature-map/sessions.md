@@ -262,7 +262,11 @@ chats** reopens it. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
-without choosing a workspace.
+without choosing a workspace. The side-chat composer opens the same `/` menu
+affordance as the main composer but with a narrower set — `/help` and the
+session's skills: `/help` is answered locally and a recognised skill runs
+in-process through `slash_command`; a native terminal side chat shows no menu
+and forwards slash text to the vendor TUI.
 
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
@@ -537,6 +541,12 @@ plain `uv run pytest`, which starts a private server for the test.
   distinguishes a replacement live on another replica from a failed launch
   with an old heartbeat or a local heartbeat. This controls liveness evidence;
   it does not drive an actual cross-replica host migration.
+- **`message-recovery`, rotated Codex session (own environment):**
+  `tests/e2e/test_codex_rotated_bridge_relaunch_e2e.py::test_rotated_codex_session_relaunches_into_its_bridge_directory`
+  drives `/new` in real Codex, stops that session's host-launched runner, then
+  sends a chat message to relaunch it. Chat and terminal replies must both
+  reach the rotated conversation with retained or missing bridge state. Only
+  model replies are scripted; no browser interaction is claimed.
 - **`message-recovery`, SDK sub-agent (server integration, plain `uv run pytest`):**
   `tests/server/integration/test_sessions_child_sessions.py::test_sdk_subagent_recovery_skips_session_init`
   covers recovery during ancestor healing and during the final binding refresh,
