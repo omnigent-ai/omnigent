@@ -26,7 +26,7 @@ delete a key and write the result wholesale.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.databricks_config import databricks_sdk_installed
@@ -116,7 +116,7 @@ _FAMILY_LABEL: dict[str, str] = {
 _FAMILY_HARNESS_IDS: dict[str, str] = {
     ANTHROPIC_FAMILY: "claude-sdk, native-claude",
     OPENAI_FAMILY: "codex, native-codex, openai-agents",
-    GEMINI_FAMILY: "antigravity, antigravity-native",
+    GEMINI_FAMILY: "antigravity-native (agy)",
     PI_SURFACE: "pi",
 }
 
@@ -150,9 +150,7 @@ def family_harness_ids(family: str) -> str:
 _FAMILY_DEFAULT_BASE_URL: dict[str, str] = {
     ANTHROPIC_FAMILY: "https://api.anthropic.com",
     OPENAI_FAMILY: "https://api.openai.com/v1",
-    # Gemini's OpenAI-compatible endpoint, used as the listing base URL for a
-    # ``key``-kind gemini provider (the antigravity harness drives the SDK
-    # directly with the key, so this only feeds model enumeration).
+    # Gemini's model-listing endpoint; native agy resolves it to the API root.
     GEMINI_FAMILY: "https://generativelanguage.googleapis.com/v1beta/openai",
 }
 
@@ -277,8 +275,7 @@ def provider_display_name(provider: str) -> str:
 
     :param provider: A provider id, e.g. ``"openai"`` or ``"together_ai"``.
     :returns: A friendly name, e.g. ``"OpenAI"`` or ``"Together AI"``.
-        Falls back to a title-cased form for ids not in the map (e.g. a
-        user-named gateway ``"my-proxy"`` → ``"My-Proxy"``).
+        Falls back to a title-cased form for ids not in the map.
     """
     return _PROVIDER_DISPLAY_NAME.get(provider, provider.replace("_", " ").title())
 
@@ -345,8 +342,9 @@ def credential_label(
     surface — the ``configure harness`` menus/listing and the ``/model``
     REPL readout — so a subscription always reads as ``"Subscription"``
     (never the raw ``"claude"`` / brand name), a vendor key names the
-    vendor + ``"API Key"``, and Databricks names its profile. Pair with
-    :func:`kind_glyph` for the glyph prefix.
+    vendor + ``"API Key"``, and Databricks names its profile. Custom gateway
+    labels keep their original spelling. Pair with :func:`kind_glyph` for
+    the glyph prefix.
 
     :param kind: The provider kind, e.g. ``"key"``, ``"subscription"``,
         ``"gateway"``, ``"local"``, ``"databricks"``, or ``"cli-config"``.
@@ -370,6 +368,8 @@ def credential_label(
         return "Subscription"
     if kind == DATABRICKS_KIND:
         return f"Databricks ({profile})" if profile else "Databricks"
+    if kind == GATEWAY_KIND:
+        return provider_name
     if kind == CLI_CONFIG_KIND:
         # Use the entry name (e.g. "isaac-databricks-codex" → "Isaac-Databricks-Codex")
         # so cli-config providers show consistently alongside other provider kinds.
@@ -474,7 +474,7 @@ def add_menu_options() -> list[AddOption]:
         ),
         _opt(
             "Gemini — API key",
-            "Use a Google Gemini API key (aistudio.google.com) for the antigravity harness.",
+            "Use a Google Gemini API key (aistudio.google.com) for native agy.",
             KEY_KIND,
             provider="gemini",
         ),
@@ -499,7 +499,7 @@ def add_menu_options() -> list[AddOption]:
         # Cross-vendor extras, alphabetical (Gateway before OpenRouter).
         _opt(
             "Gateway — custom base URL + key",
-            "An OpenAI/Anthropic-compatible proxy: LiteLLM, Ollama, vLLM, …",
+            "A gateway serving OpenAI, Anthropic, or the native Gemini API.",
             GATEWAY_KIND,
         ),
         _opt(
@@ -546,19 +546,17 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
     Used to scope the add menu to the harness the user drilled into
     (``configure harness`` → Claude / Codex / Gemini / Pi → "Add a
     provider"): a Claude add should not offer an OpenAI-only key, and vice
-    versa. Gateways and Databricks serve the anthropic / openai / pi surfaces —
-    but NOT Gemini, which is key-only (the antigravity harness needs a real
-    GEMINI_API_KEY, not a proxy). An anthropic / openai API key can also drive
-    pi (it consumes both model families); a gemini key serves ONLY the Gemini
-    surface; subscriptions never drive pi (a CLI login is unusable outside its
-    own CLI).
+    versa. Gemini gateways and Gemini-scoped Databricks profiles drive native
+    agy. Gemini credentials never drive Pi.
 
     :param opt: One add-menu option.
     :returns: The surfaces this option can configure — a subset of
         ``{"anthropic", "openai", "gemini", "pi"}``.
     """
-    if opt.kind == GATEWAY_KIND or opt.kind == DATABRICKS_KIND:
-        return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
+    if opt.kind == GATEWAY_KIND:
+        return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE})
+    if opt.kind == DATABRICKS_KIND:
+        return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE})
     if opt.kind == BEDROCK_KIND:
         # Bedrock mode drives only the native Claude terminal (anthropic
         # family); codex/pi reject it, so it never serves their surfaces.
@@ -599,7 +597,29 @@ def add_menu_options_for_family(family: str) -> list[AddOption]:
         ``"pi"`` (Pi).
     :returns: The subset of :func:`add_menu_options` serving *family*.
     """
-    return [opt for opt in add_menu_options() if family in _add_option_families(opt)]
+    options = [opt for opt in add_menu_options() if family in _add_option_families(opt)]
+    if family == GEMINI_FAMILY:
+        for index, opt in enumerate(options):
+            if opt.kind == DATABRICKS_KIND:
+                options[index] = replace(
+                    opt,
+                    label=f"{kind_glyph(DATABRICKS_KIND)} Databricks — profile",
+                    description=(
+                        "Use a Databricks CLI profile with the workspace's native Gemini API."
+                        if databricks_sdk_installed()
+                        else opt.description
+                    ),
+                )
+            elif opt.kind == GATEWAY_KIND:
+                options[index] = replace(
+                    opt,
+                    label=f"{kind_glyph(GATEWAY_KIND)} Gemini API gateway — URL + key",
+                    description=(
+                        "Requires native Gemini requests and x-goog-api-key authentication. "
+                        "OpenAI Responses / Chat Completions gateways are not supported."
+                    ),
+                )
+    return options
 
 
 def other_key_providers() -> list[str]:
@@ -950,17 +970,15 @@ def build_gateway_provider_entry(
 ) -> dict[str, object]:
     """Build a ``kind: gateway`` provider entry body (config shape).
 
-    A gateway is an OpenAI/Anthropic-compatible proxy reached at a custom
-    ``base_url`` (OpenRouter, LiteLLM, a local Ollama). It may serve the
-    ``openai`` family, the ``anthropic`` family, or both — each family
-    gets its own block pointing at the same base_url + key.
+    Each requested protocol family gets a block with the supplied URL and key.
+    Gemini uses an API root; agy appends /v1beta/models/... at request time.
 
     :param base_url: The gateway base URL, e.g.
         ``"https://openrouter.ai/api/v1"``.
     :param api_key_ref: The secret reference, e.g.
         ``"keychain:openrouter"`` or ``"env:OPENROUTER_API_KEY"``.
     :param families: The families the gateway serves, a non-empty subset
-        of ``["openai", "anthropic"]``.
+        of ``["openai", "anthropic", "gemini"]``.
     :param wire_api: Wire protocol for the **openai** family —
         ``"responses"`` (OpenAI / LiteLLM) or ``"chat"`` (OpenRouter and
         most OSS-model gateways, which don't implement the Responses API).
@@ -982,6 +1000,10 @@ def build_gateway_provider_entry(
     """
     if not families:
         raise ValueError("a gateway must serve at least one family")
+    if GEMINI_FAMILY in families:
+        from omnigent.onboarding.gemini_gateway import validate_gemini_base_url
+
+        base_url = validate_gemini_base_url(base_url)
     models = models or {}
     body: dict[str, object] = {"kind": GATEWAY_KIND}
     for family in families:
