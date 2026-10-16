@@ -2080,6 +2080,93 @@ async def test_expired_receipt_forgotten_by_pinned_helper(
 
 
 @pytest.mark.asyncio
+async def test_abort_removes_staging_after_destination_becomes_out_of_grant_symlink(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    manager = client._transport.app.state.workspace_uploads
+    created = await create(client, name="abort.bin", size=1)
+    uid = created.json()["upload_id"]
+    record = manager.records[uid]
+    staging = Path(record.staging_path)
+    url = BASE + "/" + uid + "?created_by=alice"
+    assert (await client.patch(url, headers=HEADERS, content=b"x")).status_code == 204
+
+    target = tmp_path / "outside.bin"
+    target.write_bytes(b"keep")
+    (tmp_path / "workspace" / "abort.bin").symlink_to(target)
+    response = await client.delete(url)
+
+    assert response.status_code == 204
+    assert not staging.exists()
+    assert (tmp_path / "workspace" / "abort.bin").is_symlink()
+    assert target.read_bytes() == b"keep"
+    assert uid not in manager.records
+    assert not manager._pinned(("session", DEFAULT_ENVIRONMENT_ID))
+    assert (await create(client, name="quota-one", size=1)).status_code == 201
+    assert (await create(client, name="quota-two", size=1)).status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_indexed_cleanup_removes_staging_after_destination_becomes_out_of_grant_symlink(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    import omnigent.runner.workspace_upload as upload
+
+    manager = client._transport.app.state.workspace_uploads
+    created = await create(client, name="cleanup.bin", size=1)
+    uid = created.json()["upload_id"]
+    record = manager.records[uid]
+    staging = Path(record.staging_path)
+    url = BASE + "/" + uid + "?created_by=alice"
+    assert (await client.patch(url, headers=HEADERS, content=b"x")).status_code == 204
+
+    target = tmp_path / "outside.bin"
+    target.write_bytes(b"keep")
+    (tmp_path / "workspace" / "cleanup.bin").symlink_to(target)
+    record.last_activity = upload._now() - manager.limits.idle_ttl_s - 1
+    await manager.sweep()
+
+    assert uid not in manager.records
+    assert not staging.exists()
+    assert (tmp_path / "workspace" / "cleanup.bin").is_symlink()
+    assert target.read_bytes() == b"keep"
+    assert not manager._pinned(("session", DEFAULT_ENVIRONMENT_ID))
+    assert (await create(client, name="quota-one", size=1)).status_code == 201
+    assert (await create(client, name="quota-two", size=1)).status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_completed_receipts_are_bounded_and_recent_completion_replays(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omnigent.runner.workspace_upload as upload
+
+    retention_limit = 4
+    monkeypatch.setattr(upload, "COMPLETED_RECEIPTS_MAX", retention_limit, raising=False)
+    manager = client._transport.app.state.workspace_uploads
+    recent_url = ""
+    recent_receipt: dict[str, object] = {}
+    oldest_url = ""
+    for index in range(retention_limit + 3):
+        created = await create(client, name=f"receipt-{index}.bin", size=0)
+        uid = created.json()["upload_id"]
+        url = BASE + "/" + uid + "/complete?created_by=alice"
+        completed = await client.post(url)
+        assert completed.status_code == 200
+        if index == 0:
+            oldest_url = url
+        if index == retention_limit + 2:
+            recent_url = url
+            recent_receipt = completed.json()
+
+    persisted = json.loads(manager.state_path.read_text())
+    assert len(manager.records) <= retention_limit
+    assert len(persisted) <= retention_limit
+    assert (await client.post(recent_url)).json() == recent_receipt
+    assert (await client.post(oldest_url)).status_code == 410
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("parent_change", ["deleted", "renamed", "replaced", "file"])
 @pytest.mark.parametrize("cleanup", ["sweep", "request", "restart"])
 async def test_expiry_drops_upload_with_gone_parent(
