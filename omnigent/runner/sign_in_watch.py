@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine, Mapping
 from typing import Any
 
 import httpx
@@ -25,12 +25,14 @@ class SignInWatch:
 
     native_pane_names: Callable[[str], set[str]]
     start_sign_in_watch: Callable[[str], None]
+    post_sign_in_hold_notice: Callable[[str, Mapping[str, Any]], Coroutine[Any, Any, None]]
 
 
 def build_sign_in_watch(
     *,
     _background_tasks: set[asyncio.Task[Any]],
     _session_harness_name: Callable[[str], str | None],
+    _release_sign_in_hold: Callable[[str], bool],
     _sign_in_watchers: dict[str, asyncio.Task[None]],
     resource_registry: SessionResourceRegistry,
     server_client: httpx.AsyncClient,
@@ -75,7 +77,8 @@ def build_sign_in_watch(
         prompt. This reads the session's running panes until no prompt is on
         screen and the agent can take a message, then posts the notice. It ends
         silently when no pane is running any more: the launcher exited, which
-        the next send reports on its own.
+        the next send reports on its own. Either way it releases a message held
+        for the sign-in, so the session's queue sends it.
 
         :param conv_id: Session whose turn failed with ``databricks_sign_in_pending``.
         """
@@ -95,11 +98,13 @@ def build_sign_in_watch(
                 screen = result.get("screen") if isinstance(result, dict) else None
                 screens.append(screen if isinstance(screen, str) else "")
             if not screens:
+                _release_sign_in_hold(conv_id)
                 return
             if any(detect_sign_in_prompt(screen) is not None for screen in screens):
                 continue
             if _sign_in_agent_ready(conv_id, harness, screens):
-                await _post_sign_in_completed_notice(conv_id, harness)
+                held = _release_sign_in_hold(conv_id)
+                await _post_sign_in_completed_notice(conv_id, harness, held=held)
                 return
 
     def _sign_in_agent_ready(conv_id: str, harness: str | None, screens: list[str]) -> bool:
@@ -118,30 +123,27 @@ def build_sign_in_watch(
             return any(_claude_prompt_rendered(screen) for screen in screens)
         return True
 
-    async def _post_sign_in_completed_notice(conv_id: str, harness: str | None) -> None:
-        """Append the neutral "Signed in to Databricks" notice to the session transcript."""
-        agent = {"codex-native": "Codex", "claude-native": "Claude Code"}.get(
-            harness or "", "The agent"
-        )
+    async def _post_sign_in_completed_notice(
+        conv_id: str, harness: str | None, *, held: bool = False
+    ) -> None:
+        """
+        Append the neutral "Signed in to Databricks" notice to the session transcript.
+
+        :param conv_id: Session whose sign-in completed.
+        :param harness: The session's harness, e.g. ``"claude-native"``.
+        :param held: Whether a message waited for this sign-in and is being sent now.
+        """
+        agent = _agent_name(harness)
+        next_step = "Sending your message now." if held else "Send your message again."
         try:
-            resp = await server_client.post(
-                f"/v1/sessions/{conv_id}/events",
-                json={
-                    "type": "external_conversation_item",
-                    "data": {
-                        "item_type": "error",
-                        "item_data": {
-                            "source": "harness",
-                            "code": "databricks_sign_in_completed",
-                            "title": "Signed in to Databricks",
-                            "message": f"{agent} is ready. Send your message again.",
-                            "level": "info",
-                        },
-                    },
+            await _post_sign_in_item(
+                conv_id,
+                {
+                    "code": "databricks_sign_in_completed",
+                    "title": "Signed in to Databricks",
+                    "message": f"{agent} is ready. {next_step}",
                 },
-                timeout=10.0,
             )
-            resp.raise_for_status()
         except (httpx.HTTPError, RuntimeError):
             _logger.warning(
                 "Failed to post the sign-in completed notice for %s", conv_id, exc_info=True
@@ -154,7 +156,56 @@ def build_sign_in_watch(
             extra={"session_id": conv_id},
         )
 
+    async def _post_sign_in_hold_notice(conv_id: str, error: Mapping[str, Any]) -> None:
+        """
+        Tell the chat its message waits for a launcher sign-in instead of failing.
+
+        :param conv_id: Session whose message is held.
+        :param error: The harness refusal, carrying the sign-in ``title`` and the
+            link to open as ``remediation``.
+        """
+        agent = _agent_name(_session_harness_name(conv_id))
+        item: dict[str, Any] = {
+            "code": "databricks_sign_in_pending",
+            "title": error.get("title") or f"{agent} is waiting for a Databricks sign-in",
+            "message": (
+                f"{agent} is waiting for a sign-in in this session's terminal. "
+                "Your message will be sent once you sign in."
+            ),
+        }
+        if isinstance(error.get("remediation"), str):
+            item["remediation"] = error["remediation"]
+        try:
+            await _post_sign_in_item(conv_id, item)
+        except (httpx.HTTPError, RuntimeError):
+            _logger.warning(
+                "Failed to post the sign-in hold notice for %s", conv_id, exc_info=True
+            )
+
+    async def _post_sign_in_item(conv_id: str, item: Mapping[str, Any]) -> None:
+        """Append one neutral sign-in notice item to the session transcript."""
+        resp = await server_client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {"source": "harness", **item, "level": "info"},
+                },
+            },
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+
     return SignInWatch(
         native_pane_names=_native_pane_names,
         start_sign_in_watch=_start_sign_in_watch,
+        post_sign_in_hold_notice=_post_sign_in_hold_notice,
+    )
+
+
+def _agent_name(harness: str | None) -> str:
+    """Name the native agent in a sign-in notice, e.g. ``"Claude Code"``."""
+    return {"codex-native": "Codex", "claude-native": "Claude Code"}.get(
+        harness or "", "The agent"
     )
