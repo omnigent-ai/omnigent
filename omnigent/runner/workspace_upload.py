@@ -58,7 +58,6 @@ HELPER_CACHE_MAX = 32
 HELPER_IDLE_S = 300
 STARTUP_SWEEP_BUDGET_S = 0.5
 GONE_MAX = 4096
-COMPLETED_RECEIPTS_MAX = 256
 PUBLICATION_ATTEMPTS = 3
 T = TypeVar("T")
 _sweep_active = ContextVar("upload_sweep_active", default=False)
@@ -248,8 +247,13 @@ class UploadManager:
         self.resolve_environment = resolve_environment
         self.resolve_registry = resolve_registry
         self.state_path = state_path
+        self.receipt_path = state_path.with_name("receipts.jsonl")
         self.limits = limits
         self.records: dict[str, UploadRecord] = {}
+        self.open_records: dict[str, UploadRecord] = {}
+        self.receipt_ids: set[str] = set()
+        self.pending_receipts: set[str] = set()
+        self.receipts_dirty = False
         self.helpers: dict[tuple[str, str], HelperBinding] = {}
         self.lock = asyncio.Lock()
         self.index_dirty = False
@@ -267,24 +271,67 @@ class UploadManager:
             try:
                 values = json.loads(state_path.read_text())
                 for uid, value in values.items():
-                    self.records[uid] = UploadRecord.model_validate(value)
+                    record = UploadRecord.model_validate(value)
+                    self.records[uid] = record
+                    if record.result is None:
+                        self.open_records[uid] = record
+                    else:
+                        self.index_dirty = True
             except (OSError, ValueError, AttributeError, TypeError):
                 logger.exception("Unreadable upload index; starting with an empty index")
                 self.records.clear()
+                self.open_records.clear()
                 try:
                     state_path.rename(
                         state_path.with_name(f"index.corrupt-{uuid.uuid4().hex}.json")
                     )
                 except OSError:
                     logger.exception("Unable to move unreadable upload index aside")
+        self._load_receipts()
+        self.pending_receipts = {
+            uid
+            for uid, record in self.records.items()
+            if record.result is not None and uid not in self.receipt_ids
+        }
         self.restored = set(self.records)
-        if self._prune_completed_receipts():
-            self.index_dirty = True
+
+    def _load_receipts(self) -> None:
+        try:
+            lines = self.receipt_path.read_text().splitlines()
+        except FileNotFoundError:
+            lines = []
+        except (OSError, UnicodeError):
+            logger.exception("Unable to read upload receipts")
+            self.receipts_dirty = True
+            return
+
+        for line in lines:
+            try:
+                entry = json.loads(line)
+                if not isinstance(entry, dict) or len(entry) != 1:
+                    raise ValueError("Invalid receipt entry")
+                uid, value = next(iter(entry.items()))
+                record = UploadRecord.model_validate(value)
+                if record.result is None:
+                    raise ValueError("Receipt has no completion result")
+            except (ValueError, TypeError, StopIteration):
+                self.receipts_dirty = True
+                continue
+            if uid in self.records:
+                self.index_dirty = True
+            self.records[uid] = record
+            self.open_records.pop(uid, None)
+            self.receipt_ids.add(uid)
+
+        now = _now()
+        for uid, record in list(self.records.items()):
+            if record.result is not None and self._expired(record, now):
+                self._drop(uid, record)
 
     def _pinned(self, key: tuple[str, str]) -> bool:
         return any(
             (record.session_id, record.environment_id) == key and record.result is None
-            for record in self.records.values()
+            for record in self.open_records.values()
         )
 
     async def _evict_helpers(self) -> None:
@@ -434,12 +481,7 @@ class UploadManager:
         try:
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "w") as stream:
-                values = {
-                    uid: record.model_dump(
-                        exclude={"snapshot"} if record.result is not None else set()
-                    )
-                    for uid, record in self.records.items()
-                }
+                values = {uid: record.model_dump() for uid, record in self.open_records.items()}
                 json.dump(values, stream)
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -454,7 +496,15 @@ class UploadManager:
 
     async def _save_settled(self) -> None:
         # The index lock must outlive its save thread, even during shutdown.
-        self._prune_completed_receipts()
+        pending = [
+            (uid, self.records[uid])
+            for uid in self.pending_receipts
+            if uid in self.records and self.records[uid].result is not None
+        ]
+        await asyncio.to_thread(self._append_receipts, pending)
+        for uid, _ in pending:
+            self.receipt_ids.add(uid)
+            self.pending_receipts.discard(uid)
         self.index_dirty = True
         task = asyncio.create_task(asyncio.to_thread(self._save))
         try:
@@ -494,22 +544,83 @@ class UploadManager:
         )
         self._prune_gone()
         self.records.pop(uid, None)
+        self.open_records.pop(uid, None)
+        self.pending_receipts.discard(uid)
+        if record.result is not None:
+            self.receipt_ids.discard(uid)
+            self.receipts_dirty = True
         self.restored.discard(uid)
         self.upload_locks.pop(uid, None)
 
-    def _prune_completed_receipts(self) -> bool:
-        completed = sorted(
-            (
-                (record.last_activity, uid, record)
-                for uid, record in self.records.items()
-                if record.result is not None
-            ),
-            key=lambda item: item[0],
-        )
-        excess = len(completed) - COMPLETED_RECEIPTS_MAX
-        for _, uid, record in completed[: max(0, excess)]:
-            self._drop(uid, record)
-        return excess > 0
+    def _append_receipts(self, pending: list[tuple[str, UploadRecord]]) -> None:
+        if not pending:
+            return
+        self.receipt_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for uid, record in pending:
+            line = (
+                json.dumps(
+                    {uid: record.model_dump(exclude={"snapshot"})}, separators=(",", ":")
+                ).encode()
+                + b"\n"
+            )
+            fd = os.open(
+                self.receipt_path,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                offset = 0
+                while offset < len(line):
+                    written = os.write(fd, line[offset:])
+                    if written == 0:
+                        raise OSError(errno.EIO, "No receipt write progress")
+                    offset += written
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            parent = os.open(self.receipt_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+
+    def _compact_receipts(self, now: float) -> None:
+        retained = {
+            uid: record
+            for uid, record in self.records.items()
+            if record.result is not None and not self._expired(record, now)
+        }
+        temporary = self.receipt_path.with_name(f".receipts-{uuid.uuid4().hex}")
+        try:
+            if retained:
+                self.receipt_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                fd = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+                with os.fdopen(fd, "wb") as stream:
+                    for uid, record in retained.items():
+                        line = json.dumps(
+                            {uid: record.model_dump(exclude={"snapshot"})},
+                            separators=(",", ":"),
+                        ).encode()
+                        stream.write(line + b"\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.receipt_path)
+                parent = os.open(self.receipt_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(parent)
+                finally:
+                    os.close(parent)
+            else:
+                self.receipt_path.unlink(missing_ok=True)
+        finally:
+            temporary.unlink(missing_ok=True)
+        self.receipt_ids = set(retained)
+        self.pending_receipts.difference_update(retained)
+        self.receipts_dirty = False
 
     async def _remove(self, uid: str, record: UploadRecord) -> None:
         try:
@@ -540,6 +651,8 @@ class UploadManager:
                     self._drop(uid, record)
                     await self._save_settled()
             raise
+        self.pending_receipts.add(uid)
+        self.open_records.pop(uid, None)
         record.offset = record.size
         record.finalizing = False
         self.restored.discard(uid)
@@ -634,6 +747,12 @@ class UploadManager:
                             await self._save_settled()
                 finally:
                     _sweep_active.reset(token)
+        if self.receipts_dirty:
+            async with self.lock:
+                try:
+                    await asyncio.to_thread(self._compact_receipts, instant)
+                except OSError:
+                    logger.exception("Unable to compact expired upload receipts")
         async with self.helper_lock:
             await self._evict_helpers()
 
@@ -778,11 +897,7 @@ class UploadManager:
             creation_lock = asyncio.Lock()
             async with creation_lock:
                 async with self.lock:
-                    opened = [
-                        r
-                        for r in self.records.values()
-                        if r.session_id == session_id and r.result is None
-                    ]
+                    opened = [r for r in self.open_records.values() if r.session_id == session_id]
                     if (
                         len(opened) >= self.limits.max_open_uploads
                         or sum(r.size for r in opened) + declaration.size
@@ -791,12 +906,14 @@ class UploadManager:
                         raise RouteError(429, "upload_limit", "Session upload limit reached")
                     self.upload_locks[uid] = creation_lock
                     self.records[uid] = record
+                    self.open_records[uid] = record
                     try:
                         await self._save_settled()
                     except OSError as exc:
                         logger.exception("Unable to save new upload intent")
                         # Begin has not run, so there is no allocation to preserve.
                         del self.records[uid]
+                        del self.open_records[uid]
                         del self.upload_locks[uid]
                         try:
                             await self._save_settled()
@@ -960,6 +1077,8 @@ class UploadManager:
                     return record.result
                 raise
             record.result = result
+            self.pending_receipts.add(uid)
+            self.open_records.pop(uid, None)
             record.offset = record.size
             record.finalizing = False
             record.last_activity = _now()
