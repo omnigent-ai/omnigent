@@ -611,7 +611,7 @@ it("keeps one empty live region mounted and announces each tree drop destination
   expect(liveRegion).toBeEmptyDOMElement();
 });
 
-it("swaps the folder icon and glows its name, then freezes the DROP row despite stale hover", async () => {
+it("swaps the folder icon and tints its row, then freezes the DROP row despite stale hover", async () => {
   view("src", tree());
   await screen.findByRole("button", { name: "Upload files" });
   const assets = screen.getByText("assets/");
@@ -619,11 +619,10 @@ it("swaps the folder icon and glows its name, then freezes the DROP row despite 
   fireEvent.dragOver(assets, { dataTransfer: transfer });
   const folder = assets.closest("[data-drop-folder]") as HTMLElement;
   expect(folder).toHaveAttribute("data-upload-hover");
+  expect(folder).toHaveClass("w-full", "bg-info/10");
   expect(folder.querySelector("svg.lucide-upload")).toBeTruthy();
   expect(folder.querySelector("svg.lucide-folder, svg.lucide-folder-open")).toBeNull();
-  expect(assets).toHaveAttribute("data-upload-glow");
   expect(assets).toHaveClass("text-foreground");
-  expect(assets.style.textShadow).toContain("var(--info)");
   expect(folder).not.toHaveClass("ring-2");
   expect(screen.getByRole("status")).toHaveTextContent("Upload to src/assets");
   expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
@@ -641,7 +640,6 @@ it("swaps the folder icon and glows its name, then freezes the DROP row despite 
   expect(assets.closest("[data-upload-hover]")).toBeNull();
   expect(folder).not.toHaveClass("bg-info/10");
   expect(folder.querySelector("svg.lucide-upload")).toBeNull();
-  expect(assets).not.toHaveAttribute("data-upload-glow");
 });
 
 it("shows the dashed root zone while a root-level file row is the drop target", async () => {
@@ -877,13 +875,11 @@ it("highlights the parent folder when hovering its file and restores it on drag 
   expect(folder).toHaveAttribute("data-upload-hover");
   expect(folder).toHaveClass("w-full", "bg-info/10");
   expect(folder.querySelector("svg.lucide-upload")).toBeTruthy();
-  expect(screen.getByText("assets/")).toHaveAttribute("data-upload-glow");
   expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
   fireEvent.dragEnd(screen.getByText("existing.txt"), { dataTransfer: transfer });
   expect(folder).not.toHaveAttribute("data-upload-hover");
   expect(folder).not.toHaveClass("bg-info/10");
   expect(folder.querySelector("svg.lucide-upload")).toBeNull();
-  expect(screen.getByText("assets/")).not.toHaveAttribute("data-upload-glow");
 });
 
 it("names an offscreen parent folder in the dashed fallback zone", async () => {
