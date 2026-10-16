@@ -12435,6 +12435,9 @@ async def _load_acp_model_options(
 # production probes finish inside 5 s), and the runner's own launch-config
 # read of this snapshot has a 10 s budget the bound must leave room for.
 _RUNNER_STATUS_PROBE_TIMEOUT_S: float = 5.0
+# The binding re-read after the request has its own bound so a stalled store
+# cannot hold the probe's waiters; an unconfirmed binding discards the probe.
+_RUNNER_STATUS_PROBE_BINDING_READ_S: float = 1.0
 # A non-200 that arrives within this is a prompt answer from a responsive
 # runner (a freshly bound one answers 404 until session init lands) and is
 # asked again next snapshot; a slower one counts as a slow probe.
@@ -12461,104 +12464,173 @@ def _runner_status_probe_window_s(failures: int) -> float:
 
 
 async def _probe_runner_live_status(
-    runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None = None
+    conv_store: ConversationStore,
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+    runner_id: str | None = None,
 ) -> str | None:
     """
     Ask a session's bound runner for its live status, bounded, shared, and backed off.
 
-    Concurrent snapshots of one session await the same in-flight probe. A 200
-    records the status in ``_session_status_cache``; a probe that timed out,
-    failed in transport, or answered slowly without a status puts the session
-    in a skip window that doubles per consecutive slow probe.
+    Concurrent snapshots bound to the same runner await one in-flight probe; a
+    snapshot bound to a different runner starts its own. A 200 records the
+    status in ``_session_status_cache`` only while the session is still bound
+    to the probed runner, so a rebind during the request discards that runner's
+    answer instead of caching it. A probe that timed out, failed in transport,
+    or answered slowly without a status puts the session in a skip window that
+    doubles per consecutive slow probe.
 
+    :param conv_store: Store holding the session's current runner binding.
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-    :param runner_id: The session's bound runner, e.g.
+    :param runner_id: The runner the caller's conversation row is bound to, e.g.
         ``"runner_0123456789abcdef"``. A skip window recorded against a
-        different runner is discarded so a rebound session is probed at once.
+        different runner does not silence this probe.
     :returns: The runner's raw status, e.g. ``"running"``, or ``None`` when the
-        probe is in backoff, timed out, failed, or returned a non-200.
+        probe is in backoff, timed out, failed, returned a non-200, or the
+        session was no longer bound to *runner_id* when it finished.
     """
-    probe = _runner_status_probe_inflight.get(session_id)
+    probe = _runner_status_probe_inflight.get((session_id, runner_id))
     if probe is None:
         backoff = _runner_status_probe_backoff.get(session_id)
-        if backoff is not None and backoff.runner_id != runner_id:
-            _runner_status_probe_backoff.pop(session_id, None)
-        elif backoff is not None and time.monotonic() < backoff.skip_until:
+        if (
+            backoff is not None
+            and backoff.runner_id == runner_id
+            and time.monotonic() < backoff.skip_until
+        ):
             return None
-        probe = asyncio.create_task(_run_runner_status_probe(runner_client, session_id, runner_id))
-        _runner_status_probe_inflight[session_id] = probe
+        probe = asyncio.create_task(
+            _run_runner_status_probe(conv_store, runner_client, session_id, runner_id)
+        )
+        _runner_status_probe_inflight[(session_id, runner_id)] = probe
     # Shielded so one cancelled snapshot request does not abort the probe the
     # other waiters share.
     return await asyncio.shield(probe)
 
 
+async def _fetch_runner_status(
+    runner_client: httpx.AsyncClient, session_id: str
+) -> httpx.Response | str:
+    """
+    Make one bounded status request to a runner.
+
+    :param runner_client: HTTP client pointed at the session's runner.
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :returns: The runner's response, or why none arrived, e.g. ``"no answer within 5s"``.
+    """
+    try:
+        return await asyncio.wait_for(
+            runner_client.get(
+                f"/v1/sessions/{session_id}", timeout=_RUNNER_STATUS_PROBE_TIMEOUT_S
+            ),
+            timeout=_RUNNER_STATUS_PROBE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        return f"no answer within {_RUNNER_STATUS_PROBE_TIMEOUT_S:g}s"
+    except (httpx.HTTPError, ConnectionError) as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _skip_runner_status_probe(session_id: str, runner_id: str | None, failure: str) -> None:
+    """
+    Record a skip window for a session's probe after it failed, and warn once.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param runner_id: The runner that was probed. A window left by another
+        runner does not lengthen this runner's streak.
+    :param failure: Why the probe failed, e.g. ``"no answer within 5s"``.
+    """
+    previous = _runner_status_probe_backoff.get(session_id)
+    if previous is not None and previous.runner_id == runner_id:
+        failures = previous.failures + 1
+    else:
+        failures = 1
+    window = _runner_status_probe_window_s(failures)
+    _runner_status_probe_backoff[session_id] = _RunnerStatusProbeBackoff(
+        skip_until=time.monotonic() + window, failures=failures, runner_id=runner_id
+    )
+    _logger.warning(
+        "Runner status probe for session=%s failed (%s); skipping it for %.0fs",
+        session_id,
+        failure,
+        window,
+        extra={"session_id": session_id},
+    )
+
+
 async def _run_runner_status_probe(
-    runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None
+    conv_store: ConversationStore,
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+    runner_id: str | None,
 ) -> str | None:
     """
     Run one bounded runner status probe and record its outcome.
 
+    :param conv_store: Store holding the session's current runner binding.
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-    :param runner_id: The session's bound runner, recorded with any skip window.
+    :param runner_id: The runner being probed, recorded with any skip window.
     :returns: The runner's raw status on a 200, else ``None``.
     """
     started = time.monotonic()
     try:
+        answer = await _fetch_runner_status(runner_client, session_id)
+        elapsed = time.monotonic() - started
+        # The row is the authority on the binding: the caller's row may predate a
+        # rebind, and the session may have rebound while this request was pending.
         try:
-            resp = await asyncio.wait_for(
-                runner_client.get(
-                    f"/v1/sessions/{session_id}", timeout=_RUNNER_STATUS_PROBE_TIMEOUT_S
-                ),
-                timeout=_RUNNER_STATUS_PROBE_TIMEOUT_S,
+            binding = await asyncio.wait_for(
+                asyncio.to_thread(conv_store.get_runner_liveness, session_id),
+                timeout=_RUNNER_STATUS_PROBE_BINDING_READ_S,
             )
-        except asyncio.TimeoutError:
-            failure = f"no answer within {_RUNNER_STATUS_PROBE_TIMEOUT_S:g}s"
-        except (httpx.HTTPError, ConnectionError) as exc:
-            failure = f"{type(exc).__name__}: {exc}"
-        else:
-            elapsed = time.monotonic() - started
-            if resp.status_code == 200:
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    payload = None
-                if isinstance(payload, dict):
-                    raw = str(payload.get("status", "idle"))
-                    _session_status_cache[session_id] = raw
-                    if raw in ("idle", "running", "waiting", "failed"):
-                        session_live_state.persist_live_status(session_id, raw)
-                    _runner_status_probe_backoff.pop(session_id, None)
-                    return raw
-                failure = "HTTP 200 with a malformed body"
-            elif elapsed < _RUNNER_STATUS_PROBE_SLOW_S:
+        except Exception as exc:  # noqa: BLE001
+            detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            failure = f"could not confirm the runner binding, {detail}"
+            # Back off even though the binding is unconfirmed: otherwise a store
+            # outage costs a probe and a stranded reader thread per snapshot. If
+            # this caller is stale, the bound runner is probed once more at most.
+            _skip_runner_status_probe(session_id, runner_id, failure)
+            return None
+        if (binding[0] if binding is not None else None) != runner_id:
+            _logger.debug(
+                "Runner status probe for session=%s finished after a rebind away from "
+                "runner=%s; discarded",
+                session_id,
+                runner_id,
+                extra={"session_id": session_id},
+            )
+            return None
+        if isinstance(answer, str):
+            failure = answer
+        elif answer.status_code == 200:
+            try:
+                payload = answer.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                raw = str(payload.get("status", "idle"))
+                _session_status_cache[session_id] = raw
+                if raw in ("idle", "running", "waiting", "failed"):
+                    session_live_state.persist_live_status(session_id, raw)
                 _runner_status_probe_backoff.pop(session_id, None)
-                _logger.debug(
-                    "Runner status probe for session=%s answered HTTP %s",
-                    session_id,
-                    resp.status_code,
-                    extra={"session_id": session_id},
-                )
-                return None
-            else:
-                failure = f"HTTP {resp.status_code} after {elapsed:.1f}s"
-        previous = _runner_status_probe_backoff.get(session_id)
-        failures = (previous.failures if previous is not None else 0) + 1
-        window = _runner_status_probe_window_s(failures)
-        _runner_status_probe_backoff[session_id] = _RunnerStatusProbeBackoff(
-            skip_until=time.monotonic() + window, failures=failures, runner_id=runner_id
-        )
-        _logger.warning(
-            "Runner status probe for session=%s failed (%s); skipping it for %.0fs",
-            session_id,
-            failure,
-            window,
-            extra={"session_id": session_id},
-        )
+                return raw
+            failure = "HTTP 200 with a malformed body"
+        elif elapsed < _RUNNER_STATUS_PROBE_SLOW_S:
+            _runner_status_probe_backoff.pop(session_id, None)
+            _logger.debug(
+                "Runner status probe for session=%s answered HTTP %s",
+                session_id,
+                answer.status_code,
+                extra={"session_id": session_id},
+            )
+            return None
+        else:
+            failure = f"HTTP {answer.status_code} after {elapsed:.1f}s"
+        _skip_runner_status_probe(session_id, runner_id, failure)
         return None
     finally:
-        _runner_status_probe_inflight.pop(session_id, None)
+        _runner_status_probe_inflight.pop((session_id, runner_id), None)
 
 
 async def _get_session_snapshot(
@@ -12706,7 +12778,9 @@ async def _get_session_snapshot(
             and runner_client is not None
         ):
             if (
-                await _probe_runner_live_status(runner_client, session_id, conv.runner_id)
+                await _probe_runner_live_status(
+                    conv_store, runner_client, session_id, conv.runner_id
+                )
                 is not None
             ):
                 status = _session_status_from_cache(session_id)
