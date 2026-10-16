@@ -60,7 +60,7 @@ from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
-from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.host_registry import HostConnection, HostLaunchResult, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
@@ -1121,7 +1121,7 @@ def create_hosts_router(
             ),
         )
         request_id = secrets.token_hex(8)
-        future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[HostLaunchResult] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
 
         launch_frame = encode_host_frame(

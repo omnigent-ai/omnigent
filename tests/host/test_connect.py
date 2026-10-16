@@ -906,28 +906,183 @@ async def test_handle_launch_spawns_subprocess(
         "runner subprocess must be spawned with cwd=<session workspace>"
     )
 
+    # An existing workspace was not touched, so the server has nothing to report.
+    assert result.workspace_recreated is False
+
     # Clean up the spawned sleep process (and its exit watcher).
+    _cleanup_host(host)
+
+
+async def test_handle_launch_recreates_missing_workspace(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Verify that a launch whose workspace directory has been deleted recreates
+    the leaf and spawns the runner there instead of refusing.
+
+    A worktree tool or the agent itself can remove the directory between
+    turns; refusing would block the session until someone recreates it by
+    hand. The result flags the recreation so the server can tell the user.
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    # The pruned-worktree case: the container survives, only the leaf is gone.
+    workspace = tmp_path / "worktrees" / "feature-x"
+    workspace.parent.mkdir(parents=True)
+    assert not workspace.exists()
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_003",
+        binding_token="test_token_abc",
+        workspace=str(workspace),
+        session_id="session_recreated_workspace",
+    )
+
+    spawned_kwargs: dict[str, object] = {}
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Capture the spawn kwargs and start a no-op process.
+
+        :param args: Command args (ignored — we spawn a real sleep).
+        :param kwargs: Popen kwargs including cwd.
+        :returns: A real subprocess handle.
+        """
+        spawned_kwargs.update(kwargs)
+        return original_popen(
+            ["sleep", "10"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="omnigent.host.connect"),
+        patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen),
+    ):
+        result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "launched", (
+        f"a deleted workspace must be recreated, not refused; got {result.status!r}: "
+        f"{result.error}"
+    )
+    assert workspace.is_dir(), "the missing workspace directory should have been recreated"
+    assert spawned_kwargs.get("cwd") == str(workspace)
+    assert result.runner_id == token_bound_runner_id("test_token_abc")
+    assert result.error is None
+    assert result.error_code is None
+    assert result.workspace_recreated is True
+    assert str(workspace) in caplog.text, "the host should log which directory it recreated"
+
+    _cleanup_host(host)
+
+
+async def test_handle_launch_refuses_when_workspace_parent_missing(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Verify that a workspace whose parent chain is gone is refused, not rebuilt.
+
+    Only the leaf is recreated. A missing parent signals a stale path or an
+    unmounted volume rather than a pruned worktree, so the host must refuse
+    with ``workspace_missing`` instead of creating a fresh tree on the wrong
+    filesystem.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "gone" / "feature-x"
+    assert not workspace.parent.exists()
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_004",
+        binding_token="test_token_def",
+        workspace=str(workspace),
+        session_id="session_missing_parent",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed", "a missing parent chain must be refused, not rebuilt"
+    assert result.error_code == WORKSPACE_MISSING_ERROR_CODE
+    assert result.workspace_recreated is False
+    assert not workspace.exists(), "the host must not create a workspace under a missing parent"
+
+    _cleanup_host(host)
+
+
+async def test_handle_launch_refuses_when_workspace_mkdir_denied(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Verify that a workspace the host cannot recreate is refused, not launched.
+
+    The leaf is gone and its parent exists, so recreation is attempted, but
+    the host lacks permission to create it (for example a read-only mount).
+    The refusal must report ``workspace_missing`` and spawn no runner. Raising
+    the error keeps the test deterministic regardless of CI privileges.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "worktrees" / "feature-x"
+    workspace.parent.mkdir(parents=True)
+    assert not workspace.exists()
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_005",
+        binding_token="test_token_ghi",
+        workspace=str(workspace),
+        session_id="session_mkdir_denied",
+    )
+
+    def _deny_mkdir(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(errno.EACCES, "Permission denied", str(workspace))
+
+    def _unexpected_popen(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a workspace that cannot be recreated must not spawn a runner")
+
+    with (
+        caplog.at_level(logging.WARNING, logger="omnigent.host.connect"),
+        patch("omnigent.host.connect.subprocess.Popen", side_effect=_unexpected_popen),
+        patch.object(Path, "mkdir", _deny_mkdir),
+    ):
+        result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed", "a workspace that cannot be recreated must be refused"
+    assert result.error_code == WORKSPACE_MISSING_ERROR_CODE
+    assert result.workspace_recreated is False
+    assert result.runner_id is None
+    assert not workspace.exists(), "a denied mkdir must leave no workspace behind"
+
     _cleanup_host(host)
 
 
 @pytest.mark.parametrize("binding_token", ["token_xyz", "", "   "])
 async def test_handle_launch_fails_for_bad_workspace(
+    tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
     binding_token: str,
 ) -> None:
     """
     Verify that _handle_launch returns status='failed' when the
-    workspace path does not exist.
+    workspace path does not exist and cannot be recreated.
 
     If it returns 'launched', the path validation is missing and
     the runner would start in a nonexistent directory.
     """
     host = _make_host_process()
+    # A regular file where a parent directory should be: mkdir cannot help.
+    (tmp_path / "not-a-dir").write_text("")
+    missing_workspace = tmp_path / "not-a-dir" / "workspace"
     frame = HostLaunchRunnerFrame(
         request_id="req_002",
         binding_token=binding_token,
-        workspace="/nonexistent/path/that/does/not/exist",
+        workspace=str(missing_workspace),
         session_id="session_missing_workspace",
     )
 
@@ -956,11 +1111,11 @@ async def test_handle_launch_fails_for_bad_workspace(
     assert failure.attributes["error_impact"] == "blocking"
     assert failure.attributes["error_phase"] == "harness_setup"
     assert "session_missing_workspace" in caplog.text
-    assert "/nonexistent/path/that/does/not/exist" in caplog.text
+    assert str(missing_workspace) in caplog.text
     output = capsys.readouterr().out
     assert "Runner launch failed" in output
     assert "session_missing_workspace" in output
-    assert "/nonexistent/path/that/does/not/exist" in output
+    assert str(missing_workspace) in output
 
 
 async def test_host_boot_skips_managed_gateway_with_malformed_profile(

@@ -116,7 +116,12 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
 )
-from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
+from omnigent.server.host_registry import (
+    HostConnection,
+    HostLaunchResult,
+    HostRegistry,
+    RunnerExitReports,
+)
 from omnigent.server.managed_hosts import (
     MANAGED_SANDBOX_LABEL_NAMESPACE,
     ManagedHostLaunch,
@@ -6073,6 +6078,54 @@ def _spawn_superseded_runner_stop(
     task.add_done_callback(_detached_supersede_stops.discard)
 
 
+#: Code of the info-level transcript notice left when a relaunch found the
+#: session workspace deleted and the host recreated it empty.
+_WORKSPACE_RECREATED_NOTICE_CODE = "workspace_recreated"
+
+
+async def _note_workspace_recreated_on_host(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist and publish the notice that the host recreated the session workspace.
+
+    Runs once per launch, under the relaunch lock, so riders of the same
+    flight never duplicate it. A persistence failure is logged, not raised:
+    the runner is already starting and the turn should proceed.
+
+    :param conv: The relaunched session row (supplies ``workspace``).
+    :param conversation_store: Store used for the durable append.
+    """
+    item = NewConversationItem(
+        type="error",
+        response_id=generate_task_id(),
+        data=ErrorData(
+            source="execution",
+            code=_WORKSPACE_RECREATED_NOTICE_CODE,
+            message=(
+                f"The session workspace {conv.workspace} no longer existed on the "
+                "host, so it was recreated as an empty directory. Anything it used "
+                "to contain is gone; restore the checkout or worktree if the agent "
+                "needs it."
+            ),
+            level="info",
+        ),
+    )
+    try:
+        persisted = await asyncio.to_thread(conversation_store.append, conv.id, [item])
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Failed to persist workspace-recreated notice for session %s",
+            conv.id,
+            exc_info=True,
+            extra={"session_id": conv.id},
+        )
+        return
+    if persisted:
+        _publish_external_conversation_item(conv.id, persisted[0])
+
+
 async def _launch_runner_on_host_impl(
     conv: Conversation,
     conversation_store: ConversationStore,
@@ -6203,7 +6256,7 @@ async def _launch_runner_on_host_locked(
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
         request_id = secrets.token_hex(8)
-        launch_future: asyncio.Future[dict[str, str | None]] = (
+        launch_future: asyncio.Future[HostLaunchResult] = (
             asyncio.get_running_loop().create_future()
         )
         host_conn.pending_launches[request_id] = launch_future
@@ -6284,6 +6337,19 @@ async def _launch_runner_on_host_locked(
                 error_code=result.get("error_code"),
                 error=result.get("error"),
             )
+        if result.get("workspace_recreated"):
+            _logger.warning(
+                "Host recreated the missing workspace for session %s",
+                conv.id,
+                extra=debug_event(
+                    "workspace_recreated",
+                    session_id=conv.id,
+                    runner_id=new_runner_id,
+                    stage="runner_launch",
+                    workspace=conv.workspace,
+                ),
+            )
+            await _note_workspace_recreated_on_host(conv, conversation_store)
         return _HostLaunchAttempt(runner_id=new_runner_id, acknowledged=True)
 
 
