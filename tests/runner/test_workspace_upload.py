@@ -1021,6 +1021,7 @@ async def test_startup_recovers_publish_before_receipt(
     assert result.status_code == 200
     assert before_publish[uid]["finalizing"] is True
     manager.state_path.write_text(json.dumps(before_publish))
+    manager.receipt_path.unlink(missing_ok=True)
     staging = Path(before_publish[uid]["staging_path"])
     staging.hardlink_to(workspace / "payload.bin")
     (workspace / "payload.bin").chmod(0o600)
@@ -2136,34 +2137,124 @@ async def test_indexed_cleanup_removes_staging_after_destination_becomes_out_of_
 
 
 @pytest.mark.asyncio
-async def test_completed_receipts_are_bounded_and_recent_completion_replays(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("restart_manager", [False, True])
+async def test_first_completion_receipt_replays_after_capacity_pressure(
+    client: httpx.AsyncClient, restart_manager: bool
 ) -> None:
-    import omnigent.runner.workspace_upload as upload
-
-    retention_limit = 4
-    monkeypatch.setattr(upload, "COMPLETED_RECEIPTS_MAX", retention_limit, raising=False)
+    old_receipt_limit = 256
     manager = client._transport.app.state.workspace_uploads
-    recent_url = ""
-    recent_receipt: dict[str, object] = {}
-    oldest_url = ""
-    for index in range(retention_limit + 3):
+    first = await create(client, name="receipt-first.bin", size=0)
+    first_uid = first.json()["upload_id"]
+    first_url = BASE + "/" + first_uid + "/complete?created_by=alice"
+    first_receipt = await client.post(first_url)
+    assert first_receipt.status_code == 200
+
+    for index in range(old_receipt_limit):
         created = await create(client, name=f"receipt-{index}.bin", size=0)
         uid = created.json()["upload_id"]
         url = BASE + "/" + uid + "/complete?created_by=alice"
         completed = await client.post(url)
         assert completed.status_code == 200
-        if index == 0:
-            oldest_url = url
-        if index == retention_limit + 2:
-            recent_url = url
-            recent_receipt = completed.json()
 
-    persisted = json.loads(manager.state_path.read_text())
-    assert len(manager.records) <= retention_limit
-    assert len(persisted) <= retention_limit
-    assert (await client.post(recent_url)).json() == recent_receipt
-    assert (await client.post(oldest_url)).status_code == 410
+    if restart_manager:
+        await manager.stop()
+        app = FastAPI()
+        fresh = register_upload_routes(
+            app,
+            resolve_environment=manager.resolve_environment,
+            resolve_registry=manager.resolve_registry,
+            state_path=manager.state_path,
+        )
+        try:
+            await fresh.start()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            ) as restarted_client:
+                replay = await restarted_client.post(first_url)
+        finally:
+            await fresh.stop()
+    else:
+        replay = await client.post(first_url)
+
+    assert replay.status_code == 200
+    assert replay.json() == first_receipt.json()
+
+
+@pytest.mark.asyncio
+async def test_expired_receipt_returns_gone_after_capacity_pressure_and_restart(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omnigent.runner.workspace_upload as upload
+
+    old_receipt_limit = 256
+    manager = client._transport.app.state.workspace_uploads
+    first = await create(client, name="expired-first.bin", size=0)
+    uid = first.json()["upload_id"]
+    url = BASE + "/" + uid + "/complete?created_by=alice"
+    assert (await client.post(url)).status_code == 200
+    expired_at = manager.records[uid].created_at + manager.limits.max_age_s + 1
+    for index in range(old_receipt_limit):
+        created = await create(client, name=f"expired-{index}.bin", size=0)
+        completed_url = BASE + "/" + created.json()["upload_id"] + "/complete?created_by=alice"
+        assert (await client.post(completed_url)).status_code == 200
+
+    await manager.stop()
+    monkeypatch.setattr(upload, "_now", lambda: expired_at)
+    app = FastAPI()
+    fresh = register_upload_routes(
+        app,
+        resolve_environment=manager.resolve_environment,
+        resolve_registry=manager.resolve_registry,
+        state_path=manager.state_path,
+    )
+    try:
+        await fresh.start()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as restarted_client:
+            expired = await restarted_client.post(url)
+        assert expired.status_code == 410
+    finally:
+        await fresh.stop()
+
+
+@pytest.mark.asyncio
+async def test_index_save_size_does_not_grow_with_completed_receipts(
+    client: httpx.AsyncClient,
+) -> None:
+    from omnigent.runner.workspace_upload import UploadRecord
+
+    manager = client._transport.app.state.workspace_uploads
+    result = {
+        "path": "receipt.bin",
+        "final_name": "receipt.bin",
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "created",
+    }
+    for index in range(257):
+        uid = f"{index:032x}"
+        manager.records[uid] = UploadRecord(
+            session_id="session",
+            environment_id=DEFAULT_ENVIRONMENT_ID,
+            dir="",
+            name="receipt.bin",
+            size=0,
+            on_conflict="fail",
+            created_by="alice",
+            created_at=1,
+            last_activity=1,
+            staging_path=f"/workspace/.receipt-{index}.part",
+            parent_dev=1,
+            parent_ino=1,
+            result=result,
+        )
+        if index == 0:
+            manager._save()
+            one_receipt_index = manager.state_path.read_bytes()
+
+    manager._save()
+    assert manager.state_path.read_bytes() == one_receipt_index
 
 
 @pytest.mark.asyncio
