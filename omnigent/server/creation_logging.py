@@ -15,6 +15,7 @@ from omnigent.debug_logging import (
     set_current_runner_id,
     set_current_session_id,
 )
+from omnigent.server.session_metadata_logging import harness_attributes
 
 _logger = logging.getLogger("omnigent.server.creation")
 
@@ -58,6 +59,9 @@ def session_created(
     session_id: str,
     runner_id: str | None = None,
     parent_session_id: str | None = None,
+    *,
+    agent_id: str | None = None,
+    harness: str | None = None,
 ) -> None:
     """Publish the request-to-session link immediately after persistence.
 
@@ -74,7 +78,10 @@ def session_created(
             "session_created",
             session_id=session_id,
             runner_id=runner_id,
+            agent_id=agent_id,
+            session_kind="sub_agent" if parent_session_id else "default",
             parent_session_id=parent_session_id,
             creation_kind=current_request_audit_attrs().get("creation_kind", "unknown"),
+            **harness_attributes(harness, source="create_selection"),
         ),
     )

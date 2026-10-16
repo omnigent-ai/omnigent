@@ -30,6 +30,7 @@ def test_resolve_procedures_survive_transport_outside_target_checkout(
     bundle = tmp_path / "runner-agent"
     spec = load(payload, dest=bundle)
     assert not (workspace / "dev" / "resolve-agent").exists()
+    assert "resolve-investigate" in {skill.name for skill in spec.skills}
 
     for skill in spec.skills:
         assert skill.skill_dir is not None and skill.skill_dir.is_relative_to(bundle)
@@ -74,7 +75,13 @@ def test_resolve_startup_prompt_routes_to_procedures_without_inlining_them() -> 
 def test_resolve_markdown_links_resolve_from_their_own_directory() -> None:
     # Moving procedures into nested skills must keep relative links pointing at real files.
     broken = []
-    for document in sorted(_AGENT.rglob("*.md")):
+    # rglob does not descend into the symlinked shared skills, so list them explicitly.
+    shared = [
+        _AGENT / "skills" / name for name in ("otto-pr-review-loop", "otto-review-remediation")
+    ]
+    assert all(skill.is_dir() for skill in shared)
+    documents = {*_AGENT.rglob("*.md"), *(doc for skill in shared for doc in skill.rglob("*.md"))}
+    for document in sorted(documents):
         for target in re.findall(r"\]\(([^)\s]+)\)", document.read_text()):
             if re.match(r"[a-z][a-z0-9+.-]*:|#|/", target):
                 continue

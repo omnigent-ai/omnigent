@@ -38,6 +38,9 @@ export const PROJECT_LABEL_KEY = "omni_project";
  */
 export const PINNED_LABEL_KEY = "omnigent.pinned";
 
+/** Mutation key shared by every pin, unpin, and pinned-reorder write. */
+export const PIN_WRITE_MUTATION_KEY = ["pin-write"] as const;
+
 /**
  * The reserved `conversation_labels` key holding the epoch-SECONDS time a
  * session was archived. Written by the server on the archive transition and
@@ -135,7 +138,8 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
  * - 4 elements: `[..., project]` — the Archived settings picker's project filter.
  * - 5 elements: `[..., project|null, visibility]` — the sidebar's mine/shared
  *   tab-scoped query (project is `null` here since it's always unset for those
- *   tabs). All lengths are accepted so the rename overlay and push-delta merge
+ *   tabs). A sixth `created_at` element selects creation-time ordering.
+ *   These variants are accepted so the rename overlay and push-delta merge
  *   — which iterate *every* cached `["conversations", ...]` query — never throw
  *   on unknown variants. Query membership decisions depend on these dimensions,
  *   so malformed keys fail loudly instead of being guessed.
@@ -145,7 +149,10 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
  * @throws Error if the key is not a conversations list key.
  */
 export function filtersFromConversationQueryKey(key: readonly unknown[]): ConversationListFilters {
-  if (key.length < 3 || key.length > 5 || key[0] !== "conversations") {
+  if (key.length < 3 || key.length > 6 || key[0] !== "conversations") {
+    throw new Error("Invalid conversations query key");
+  }
+  if (key.length === 6 && key[5] !== "created_at") {
     throw new Error("Invalid conversations query key");
   }
   const [, searchQuery, includeArchived, project] = key;

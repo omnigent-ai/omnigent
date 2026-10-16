@@ -25,7 +25,7 @@ Env vars read at startup:
   Claude SDK's own default.
 - ``HARNESS_CLAUDE_SDK_GATEWAY``: ``"1"`` / ``"true"`` to route
   through a vendor-neutral gateway (base URL + bearer-token
-  command + model). The Databricks AI gateway is one producer of
+  command + model). The Databricks Unity Gateway is one producer of
   this transport; generic ``key`` / ``gateway`` providers are
   another. Otherwise the SDK uses its built-in API path.
 - ``HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE``: Databricks-specific

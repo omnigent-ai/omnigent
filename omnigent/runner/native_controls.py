@@ -12,12 +12,14 @@ import dataclasses
 import logging
 import time
 import urllib.parse
+import weakref
 from collections.abc import Callable, Coroutine, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
 
 import httpx
@@ -25,6 +27,7 @@ from fastapi.responses import JSONResponse, Response
 
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.runner.app_support import (
     _client_safe_error_detail,
     _SpecEntry,
@@ -38,7 +41,7 @@ from omnigent.runner.native import (
     _CodexNativeModelOptionsNotReady,
     _resolve_opencode_compact_model,
 )
-from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.resource_registry import CODEX_NATIVE_TERMINAL_ROLE, SessionResourceRegistry
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -101,12 +104,26 @@ _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 # (Read Only appears only with a read-only permission profile), so the digit is
 # read from the live popup when possible rather than hardcoded.
 _CODEX_PERMISSION_MENU_BUDGET_S = 5.0
+# Runtime recovery and bridge publication precede any settings RPC. Keep this
+# below the server's Codex settings forward budget, including confirmation.
+_CODEX_SETTINGS_READY_TIMEOUT_S = 15.0
+_CODEX_SETTINGS_READY_POLL_S = 0.1
+_CODEX_SETTINGS_CLOSE_TIMEOUT_S = 1.0
+# Older servers read any reply as a confirmed result, so outlast their
+# 20-second forward instead of reporting an unconfirmed timeout.
+_LEGACY_SERVER_UPDATE_TIMEOUT_S = 30.0
 
 
 class _CodexNativeBridgeStateForSessionFn(Protocol):
     async def __call__(
         self, conv_id: str, *, action: str, missing_state_log_level: int = logging.WARNING
     ) -> CodexNativeBridgeState | None: ...
+
+
+class _CodexNativeBridgeStateAndDirForSessionFn(Protocol):
+    async def __call__(
+        self, conv_id: str, *, action: str, missing_state_log_level: int = logging.WARNING
+    ) -> tuple[CodexNativeBridgeState | None, Path]: ...
 
 
 class _EnsureCommentRelayStartedFn(Protocol):
@@ -155,6 +172,12 @@ class _HandleCodexNativePlanModeChangeFn(Protocol):
     async def __call__(self, conv_id: str, *, enabled: bool) -> Response: ...
 
 
+class _HandleCodexNativeSettingsUpdateFn(Protocol):
+    async def __call__(
+        self, conv_id: str, settings: _JsonObject, *, legacy_server: bool = False
+    ) -> Response: ...
+
+
 class _HandleOpencodeNativeBlockedNoticeFn(Protocol):
     async def __call__(
         self, conv_id: str, message: str, policy_name: str | None = None
@@ -185,9 +208,7 @@ class NativeControls:
     handle_codex_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_cost_popup: _HandleCodexNativeCostPopupFn
     handle_codex_native_plan_mode_change: _HandleCodexNativePlanModeChangeFn
-    handle_codex_native_settings_update: Callable[
-        [str, _JsonObject], Coroutine[Any, Any, Response]
-    ]
+    handle_codex_native_settings_update: _HandleCodexNativeSettingsUpdateFn
     handle_cursor_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_cursor_native_model_change: Callable[[str, str | None], Coroutine[Any, Any, Response]]
     handle_devin_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
@@ -219,6 +240,8 @@ def build_native_controls(
     _begin_turn_slot: Callable[[str], None],
     _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]],
     _codex_native_bridge_state_for_session: _CodexNativeBridgeStateForSessionFn,
+    _codex_native_bridge_state_and_dir_for_session: _CodexNativeBridgeStateAndDirForSessionFn,
+    _codex_terminal_ensure_locks: dict[str, asyncio.Lock],
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
     _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]],
     _fetch_session_model_override: Callable[[str], Coroutine[Any, Any, str | None]],
@@ -250,16 +273,157 @@ def build_native_controls(
 
     The keyword arguments are the runner app's shared session state and helpers.
     """
+    # Weak values drop idle sessions, so a holder must keep its lock in a local.
+    _codex_settings_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+        weakref.WeakValueDictionary()
+    )
 
     async def _handle_codex_native_settings_update(
         conv_id: str,
         settings: _JsonObject,
+        *,
+        legacy_server: bool = False,
     ) -> Response:
-        from omnigent.harnesses.codex_native.app_server import client_for_transport
-
         if not settings:
             return Response(status_code=204)
-        state = await _codex_native_bridge_state_for_session(conv_id, action="settings update")
+        lock = _codex_settings_locks.get(conv_id)
+        if lock is None:
+            lock = _codex_settings_locks[conv_id] = asyncio.Lock()
+        # The lock also covers the public mirror so the server sees efforts in apply order.
+        async with lock:
+            response, resolved = await _apply_codex_native_settings_update(
+                conv_id, settings, legacy_server=legacy_server
+            )
+            if "effort" in settings and (
+                response.status_code == 504 or (legacy_server and response.status_code == 503)
+            ):
+                # The server keeps this selection, so the next turn applies it; a
+                # resolved Default must stay explicit, as Codex reads null as unchanged.
+                effort = resolved.get("effort", settings["effort"])
+                if isinstance(effort, str) and effort:
+                    _session_reasoning_effort[conv_id] = effort
+                else:
+                    _session_reasoning_effort.pop(conv_id, None)
+            return response
+
+    def _unmirrored_codex_settings(bridge_dir: Path) -> dict[str, str]:
+        """Return applied settings the config still lacks, retrying their writes."""
+        from omnigent.harnesses.codex_native.bridge import (
+            mirror_applied_codex_settings,
+            read_unmirrored_codex_settings,
+        )
+
+        # Any later rewrite, such as a terminal switch, makes the config current.
+        pending = read_unmirrored_codex_settings(bridge_dir)
+        if pending:
+            for key in mirror_applied_codex_settings(bridge_dir, pending):
+                _logger.warning("Could not mirror pending Codex %s in %s", key, bridge_dir)
+        return pending
+
+    async def _ready_codex_bridge_for_settings(conv_id: str) -> CodexNativeBridgeState | None:
+        """Recover a reaped pane and wait for startup to publish its owned bridge."""
+        from omnigent.harnesses.codex_native.bridge import read_bridge_state
+
+        terminal_registry = resource_registry.terminal_registry
+        if terminal_registry is not None:
+            await _ensure_native_terminal_for_turn(conv_id, "codex-native")
+            if terminal_registry.get(conv_id, "codex", "main") is None:
+                return None
+        state, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+            conv_id, action="settings update", missing_state_log_level=logging.DEBUG
+        )
+        if state is not None or terminal_registry is None:
+            return state
+        # Fresh launches publish asynchronously. Poll the resolved directory so
+        # waiting never repeats the server label lookup or starts another pane.
+        while terminal_registry.get(conv_id, "codex", "main") is not None:
+            state = read_bridge_state(bridge_dir)
+            if state is not None:
+                return state if state.session_id == conv_id else None
+            await asyncio.sleep(_CODEX_SETTINGS_READY_POLL_S)
+        return None
+
+    async def _close_unreachable_owned_codex(
+        conv_id: str,
+        state: CodexNativeBridgeState,
+        bridge_dir: Path,
+        failed_backend: CodexNativeAppServer | None,
+    ) -> bool:
+        """Retire the same stopped, owned launch whose listener refused this connection."""
+        from omnigent.entities.session_resources import terminal_resource_id
+        from omnigent.harnesses.codex_native.bridge import read_bridge_state
+        from omnigent.runner.native.orchestration import (
+            _AUTO_CODEX_APP_SERVERS,
+            teardown_codex_native_app_server,
+        )
+
+        registry = resource_registry.terminal_registry
+        if registry is None:
+            return False
+        lock = _codex_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
+        async with lock:
+            if (
+                resource_registry.terminal_resource_role(
+                    conv_id, terminal_resource_id("codex", "main")
+                )
+                != CODEX_NATIVE_TERMINAL_ROLE
+                or read_bridge_state(bridge_dir) != state
+            ):
+                return False
+            backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+            if backend is None or backend is not failed_backend:
+                return False
+            if backend.bridge_dir != bridge_dir or (
+                backend.proc is not None and backend.proc.returncode is None
+            ):
+                return False
+            _logger.info(
+                "Recreating unreachable owned Codex backend before settings update for session=%s",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            await teardown_codex_native_app_server(conv_id)
+            await registry.close(conv_id, "codex", "main")
+            return True
+
+    async def _apply_codex_native_settings_update(
+        conv_id: str,
+        settings: _JsonObject,
+        *,
+        legacy_server: bool,
+        ready_deadline: float | None = None,
+        retry_unreachable: bool = True,
+    ) -> tuple[Response, _JsonObject]:
+        """Apply *settings* and return the response with the settings as resolved."""
+        from omnigent.harnesses.codex_native.app_server import (
+            CodexAppServerResponseError,
+            client_for_transport,
+            resolve_codex_effort_for_model,
+        )
+        from omnigent.harnesses.codex_native.bridge import (
+            bridge_dir_for_codex_home,
+            mirror_applied_codex_settings,
+            read_codex_config_effort,
+            read_codex_config_model,
+        )
+        from omnigent.runner.native.orchestration import _AUTO_CODEX_APP_SERVERS
+        from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
+        from omnigent.util.reasoning_effort import effort_for_model_switch
+
+        if ready_deadline is None:
+            ready_deadline = asyncio.get_running_loop().time() + _CODEX_SETTINGS_READY_TIMEOUT_S
+        try:
+            state = await asyncio.wait_for(
+                _ready_codex_bridge_for_settings(conv_id),
+                timeout=ready_deadline - asyncio.get_running_loop().time(),
+            )
+        except TimeoutError:
+            _logger.warning(
+                "Codex-native runtime was not ready for settings update for session=%s",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            state = None
         if state is None:
             # No loaded Codex bridge means nothing applied the settings; a
             # silent 204 here would let the caller claim a switch the
@@ -270,21 +434,126 @@ def build_native_controls(
                     "error": "codex_native_settings_update_failed",
                     "detail": "Codex-native settings update requires a loaded Codex bridge.",
                 },
-            )
+            ), settings
 
+        bridge_dir = bridge_dir_for_codex_home(Path(state.codex_home))
+        settings = dict(settings)
+        model = None
+        unmirrored: dict[str, str] = {}
+        if "model" in settings or "effort" in settings:
+            # A failed config write must not make the stale value the next update's base.
+            # The record takes a cross-process file lock, so keep it off the event loop.
+            unmirrored = await asyncio.to_thread(_unmirrored_codex_settings, bridge_dir)
+            model = (
+                settings.get("model")
+                or unmirrored.get("model")
+                or read_codex_config_model(bridge_dir)
+            )
+        if "effort" in settings and settings["effort"] is None and not isinstance(model, str):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_input",
+                    "detail": "Codex effort reset requires a current model",
+                },
+            ), settings
+        if isinstance(settings.get("effort"), str) and not isinstance(model, str):
+            _logger.warning(
+                "Codex-native effort change without a known model skips validation for session=%s",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
         codex_client = client_for_transport(
             state.socket_path,
             client_name="omnigent-codex-native-runner",
         )
+        failed_backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
         try:
-            await codex_client.connect()
-            await codex_client.request(
-                "thread/settings/update",
-                {
-                    "threadId": state.thread_id,
-                    **settings,
-                },
-            )
+            try:
+                await asyncio.wait_for(
+                    codex_client.connect(),
+                    timeout=SETTINGS_UPDATE_TIMEOUT_S,
+                )
+            except (ConnectionRefusedError, FileNotFoundError):
+                if not retry_unreachable:
+                    raise
+                # No settings request was sent. Recreate this owned launch once,
+                # sharing the original readiness budget with cleanup and startup.
+                retired = await asyncio.wait_for(
+                    _close_unreachable_owned_codex(conv_id, state, bridge_dir, failed_backend),
+                    timeout=ready_deadline - asyncio.get_running_loop().time(),
+                )
+                if not retired:
+                    raise
+                return await _apply_codex_native_settings_update(
+                    conv_id,
+                    settings,
+                    legacy_server=legacy_server,
+                    ready_deadline=ready_deadline,
+                    retry_unreachable=False,
+                )
+            if "model" in settings or "effort" in settings:
+                # Only an absent key inherits config; null selects the model's default.
+                effort = (
+                    settings["effort"]
+                    if "effort" in settings
+                    else unmirrored.get("effort") or read_codex_config_effort(bridge_dir)
+                )
+                if (
+                    "model" in settings
+                    and "effort" not in settings
+                    and isinstance(model, str)
+                    and effort is None
+                ):
+                    effort = effort_for_model_switch(None, model)
+                    if effort is not None:
+                        settings["effort"] = effort
+                if isinstance(model, str) and (
+                    isinstance(effort, str) or ("effort" in settings and effort is None)
+                ):
+                    resolved = await resolve_codex_effort_for_model(
+                        codex_client, effort, model, transport=state.socket_path
+                    )
+                    settings["effort"] = resolved
+            update_pending = False
+            try:
+                async with asyncio.timeout(
+                    _LEGACY_SERVER_UPDATE_TIMEOUT_S if legacy_server else SETTINGS_UPDATE_TIMEOUT_S
+                ):
+                    params = {"threadId": state.thread_id, **settings}
+                    update_pending = True
+                    try:
+                        await codex_client.request("thread/settings/update", params)
+                    except CodexAppServerResponseError as exc:
+                        if (
+                            exc.code != -32600
+                            or exc.message != f"thread not found: {state.thread_id}"
+                        ):
+                            raise
+                        # This rejection confirms nothing applied. Resume the
+                        # saved thread and retry once within the same budget.
+                        update_pending = False
+                        await codex_client.request(
+                            "thread/resume", {"threadId": state.thread_id, "excludeTurns": True}
+                        )
+                        update_pending = True
+                        await codex_client.request("thread/settings/update", params)
+            except TimeoutError:
+                if not update_pending:
+                    raise
+                # Codex may still apply the update, so this is not a refusal.
+                _logger.warning(
+                    "Codex-native thread/settings/update timed out for session=%s",
+                    conv_id,
+                    extra={"session_id": conv_id},
+                )
+                return JSONResponse(
+                    status_code=504,
+                    content={
+                        "error": "codex_native_settings_update_timeout",
+                        "detail": "Codex did not confirm the settings update in time.",
+                    },
+                ), settings
         except Exception as exc:  # noqa: BLE001 - surface app-server settings failures.
             _logger.warning(
                 "Codex-native thread/settings/update failed for session=%s thread=%s settings=%s",
@@ -302,11 +571,50 @@ def build_native_controls(
                         exc, context="codex-native settings update"
                     ),
                 },
-            )
+            ), settings
         finally:
             with contextlib.suppress(Exception):
-                await codex_client.close()
-        return Response(status_code=204)
+                await asyncio.wait_for(
+                    codex_client.close(), timeout=_CODEX_SETTINGS_CLOSE_TIMEOUT_S
+                )
+        applied: dict[str, str] = {}
+        model = settings.get("model")
+        if isinstance(model, str):
+            applied["model"] = model
+        effort = settings.get("effort")
+        if isinstance(effort, str) and effort:
+            _session_reasoning_effort[conv_id] = effort
+            applied["effort"] = effort
+        if applied:
+            failed = await asyncio.to_thread(mirror_applied_codex_settings, bridge_dir, applied)
+            for key in failed:
+                _logger.warning("Could not mirror Codex %s for session=%s", key, conv_id)
+        if isinstance(effort, str) and effort:
+            # Codex emits no settings notification when normalization leaves
+            # its effort unchanged, so confirm the applied value explicitly.
+            if server_client is not None:
+                try:
+                    mirrored = await server_client.post(
+                        f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/events",
+                        json={
+                            "type": "external_reasoning_effort_change",
+                            "data": {"reasoning_effort": effort},
+                        },
+                        timeout=5.0,
+                    )
+                    if mirrored.status_code >= 400:
+                        _logger.warning(
+                            "Could not mirror applied Codex effort for session=%s: HTTP %s",
+                            conv_id,
+                            mirrored.status_code,
+                        )
+                except (httpx.HTTPError, ConnectionError, DatabricksAuthError):
+                    _logger.warning(
+                        "Could not mirror applied Codex effort for session=%s",
+                        conv_id,
+                        exc_info=True,
+                    )
+        return Response(status_code=204), settings
 
     async def _codex_native_model_and_effort_for_settings_update(
         conv_id: str,

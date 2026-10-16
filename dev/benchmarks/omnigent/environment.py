@@ -33,14 +33,35 @@ import tarfile
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
-from typing import IO, NamedTuple
+from typing import IO, Any, NamedTuple
 
 import httpx
+import psutil
 import yaml
 
-from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.cli_auth import DATABRICKS_EXTRA_HEADERS_ENV_VAR
+from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR, SERVER_URL_ENV_VAR, USER_ID_ENV_VAR
+from omnigent.host.daemon_lifecycle import DAEMON_CONFIG_SIG_ENV_VAR
+from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
+from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from omnigent.runner._zygote import ZYGOTE_CONTROL_FD_ENV_VAR, ZYGOTE_HARNESS_FD_ENV_VAR
+from omnigent.runner.identity import (
+    OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_CONNECT_MARKER_ENV_VAR,
+    RUNNER_DELEGATED_AUTH_ENV_VAR,
+    RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
+    RUNNER_ID_ENV_VAR,
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
+    RUNNER_LAUNCH_HARNESS_ENV_VAR,
+    RUNNER_PARENT_PID_ENV_VAR,
+    RUNNER_SLICE_KEY_ENV_VAR,
+    RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+    RUNNER_WORKSPACE_ENV_VAR,
+    token_bound_runner_id,
+)
 from tests._helpers.compat import (
     apply_runner_env,
     apply_server_env,
@@ -56,6 +77,8 @@ _MOCK_SERVER = _REPO_ROOT / "tests" / "server" / "integration" / "mock_llm_serve
 _HEALTH_TIMEOUT_S = 90.0
 _MOCK_TIMEOUT_S = 15.0
 _POLL_INTERVAL_S = 0.2
+# Untimed setup poll for the interrupt journey; short so each sample starts promptly.
+_GATE_POLL_INTERVAL_S = 0.02
 _TURN_TIMEOUT_S = 180.0
 # Budget for the host daemon (host-backed cold journeys) to connect its tunnel
 # and register in the hosts table after being spawned. Covers
@@ -63,6 +86,49 @@ _TURN_TIMEOUT_S = 180.0
 _HOST_ONLINE_TIMEOUT_S = 60.0
 # Budget for a host-owned runner tunnel to disappear after ``stop_session``.
 _RUNNER_OFFLINE_TIMEOUT_S = 30.0
+# Grace for a stopped process group before it is killed.
+_STOP_GRACE_S = 8.0
+
+# Identity, routing, auth, and logging an enclosing Omnigent session publishes
+# into its process tree; inherited copies would bind bench processes to the
+# caller's session, server, or log file. Tuning knobs are kept.
+_CALLER_SESSION_ENV_VARS = frozenset(
+    {
+        SERVER_URL_ENV_VAR,
+        PROCESS_LOG_FILE_ENV_VAR,
+        USER_ID_ENV_VAR,
+        PRIMARY_SESSION_ID_ENV_VAR,
+        DATABRICKS_EXTRA_HEADERS_ENV_VAR,
+        HOST_ID_ENV_VAR,
+        HOST_NAME_ENV_VAR,
+        HOST_TOKEN_ENV_VAR,
+        DAEMON_CONFIG_SIG_ENV_VAR,
+        RUNNER_ID_ENV_VAR,
+        RUNNER_DELEGATED_AUTH_ENV_VAR,
+        RUNNER_PARENT_PID_ENV_VAR,
+        RUNNER_SLICE_KEY_ENV_VAR,
+        RUNNER_WORKSPACE_ENV_VAR,
+        RUNNER_CONNECT_MARKER_ENV_VAR,
+        RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
+        RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
+        RUNNER_LAUNCH_HARNESS_ENV_VAR,
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+        ZYGOTE_CONTROL_FD_ENV_VAR,
+        ZYGOTE_HARNESS_FD_ENV_VAR,
+        # No public constant, or defined in a module too heavy to import here.
+        "OMNIGENT_RUNNER_TUNNEL_TOKEN",
+        "OMNIGENT_REMOTE_AUTH_TOKEN",
+        "OMNIGENT_HARNESS_TMP_PARENT",
+        "OMNIGENT_HARNESS_AUTH_TOKEN",
+        # Stamped for native harnesses' policy hooks.
+        "OMNIGENT_SESSION_ID",
+        "OMNIGENT_POLICY_URL",
+    }
+)
+_CALLER_SESSION_ENV_PREFIXES = ("OMNIGENT_TERMINAL_",)
+# Instance-dir prefix of runner terminals (see omnigent/inner/terminal.py).
+_TERMINAL_DIR_GLOB = "omnigent-terminal-*"
 
 # Terminal SSE events — if one arrives before any delta, the turn produced no
 # streamed text (a failure for the TTFT journey).
@@ -103,6 +169,20 @@ class ServerRequestSnapshot(NamedTuple):
 
     total: int
     routes: dict[str, int]
+
+
+class GatedTurn(NamedTuple):
+    """A turn parked on the mock LLM's gate, with its SSE stream attached.
+
+    Built by :meth:`BenchEnvironment.start_gated_turn`. ``idle`` fires when the
+    stream reports the turn settled; ``outcome`` carries a stream error or
+    failed status for the caller to raise.
+    """
+
+    session_id: str
+    reader: asyncio.Task[None]
+    idle: asyncio.Event
+    outcome: dict[str, str]
 
 
 def _sse_session_status(data: str) -> str | None:
@@ -147,6 +227,83 @@ def _omni_executable() -> str:
     (``omni server`` / ``omni host``) while still honoring the compat pin.
     """
     return str(Path(server_executable()).with_name("omni"))
+
+
+def bench_child_environ(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return *environ* (default ``os.environ``) without the caller's session vars.
+
+    :param environ: Environment to filter, e.g. ``os.environ``.
+    :returns: A copy safe to hand to bench subprocesses.
+    """
+    source = os.environ if environ is None else environ
+    return {
+        key: value
+        for key, value in source.items()
+        if key not in _CALLER_SESSION_ENV_VARS and not key.startswith(_CALLER_SESSION_ENV_PREFIXES)
+    }
+
+
+def _signal_group(proc: subprocess.Popen[bytes], sig: int) -> None:
+    """Send *sig* to *proc*'s process group (the process alone off POSIX)."""
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, sig)
+        elif proc.poll() is None:
+            proc.send_signal(sig)
+
+
+def _group_members(proc: subprocess.Popen[bytes]) -> list[psutil.Process]:
+    """Return the live, non-zombie processes, other than *proc*, in *proc*'s group.
+
+    Empty when the group id has been recycled: a new process leads a group
+    with that id after *proc* was reaped.
+    """
+    if not hasattr(os, "getpgid"):
+        return []
+    leader_gone = proc.poll() is not None
+    members: list[psutil.Process] = []
+    for candidate in psutil.process_iter():
+        with contextlib.suppress(psutil.Error, OSError):
+            if os.getpgid(candidate.pid) != proc.pid:
+                continue
+            if candidate.pid == proc.pid:
+                if leader_gone:
+                    return []
+                continue
+            if candidate.status() != psutil.STATUS_ZOMBIE:
+                members.append(candidate)
+    return members
+
+
+def _stop_process_group(proc: subprocess.Popen[bytes]) -> None:
+    """SIGTERM *proc*'s process group, then kill whatever is left of it.
+
+    The group is only signalled while its leader is alive. Afterwards members
+    are killed one by one and the group is rescanned until it is empty, so
+    processes forked during shutdown don't escape and a recycled group id is
+    never signalled.
+    """
+    # Members seen before shutdown are killed even if they have since left the group.
+    seen = set(_group_members(proc))
+    if proc.poll() is None:
+        _signal_group(proc, signal.SIGTERM)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_STOP_GRACE_S)
+    if proc.poll() is None:
+        _signal_group(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+    deadline = time.monotonic() + _STOP_GRACE_S
+    while True:
+        # Once the group is empty, a later member would belong to a recycled id.
+        current = _group_members(proc)
+        seen.update(current)
+        for member in seen:
+            with contextlib.suppress(psutil.Error):
+                member.kill()  # psutil refuses a recycled pid
+        if not current or time.monotonic() >= deadline:
+            return
+        psutil.wait_procs(current, timeout=0.2)
 
 
 class BenchEnvironment:
@@ -204,6 +361,13 @@ class BenchEnvironment:
         self.client: httpx.AsyncClient | None = None
 
         self._tmp = Path("/tmp") / f"omni-bench-{uuid.uuid4().hex[:8]}"
+        # TMPDIR for bench subprocesses, so their terminal sockets can be swept.
+        self._child_tmp = self._tmp / "tmp"
+        # Spawning and teardown share this lock, so a start cancelled mid-spawn
+        # cannot register a child after teardown has run.
+        self._lifecycle_lock = threading.Lock()
+        self._stopping = False
+        self._children: list[subprocess.Popen[bytes]] = []
         self._mock_proc: subprocess.Popen[bytes] | None = None
         self._server_proc: subprocess.Popen[bytes] | None = None
         self._runner_proc: subprocess.Popen[bytes] | None = None
@@ -220,6 +384,16 @@ class BenchEnvironment:
     # ── lifecycle ────────────────────────────────────────────
 
     async def __aenter__(self) -> BenchEnvironment:
+        try:
+            return await self._enter()
+        except BaseException as exc:
+            # __aexit__ never runs when __aenter__ raises; tear down what started.
+            if not isinstance(exc, asyncio.CancelledError):
+                self._print_log_tails()
+            await self.__aexit__()
+            raise
+
+    async def _enter(self) -> BenchEnvironment:
         await asyncio.to_thread(self._start)
         # A request event hook injects the simulated client↔server network
         # delay before each request leaves the benchmark process. Registered
@@ -259,9 +433,15 @@ class BenchEnvironment:
 
     def _start(self) -> None:
         """Spawn the server (± mock + runner) and block until ready."""
-        self._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
         artifact_dir = self._tmp / "artifacts"
-        artifact_dir.mkdir(exist_ok=True)
+        # Under the lifecycle lock, so a start cancelled before it got here
+        # cannot recreate the temp dir after teardown removed it. Later writes
+        # all need this root, so they fail instead.
+        with self._lifecycle_lock:
+            self._raise_if_stopping()
+            self._tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._child_tmp.mkdir(exist_ok=True)
+            artifact_dir.mkdir(exist_ok=True)
 
         if self.with_runner:
             mock_port = _find_free_port()
@@ -273,7 +453,7 @@ class BenchEnvironment:
         self.base_url = f"http://localhost:{port}"
         binding_token = uuid.uuid4().hex
 
-        base_env = {**os.environ}
+        base_env = self.child_env()
         if self.with_runner:
             self.runner_id = token_bound_runner_id(binding_token)
             base_env["OPENAI_API_KEY"] = "mock-key"
@@ -296,29 +476,46 @@ class BenchEnvironment:
             self._host_proc = self._spawn_host(base_env)
             self._wait_host_online()
 
+    def child_env(self) -> dict[str, str]:
+        """Base environment for anything the bench spawns, journeys included.
+
+        Drops the caller's Omnigent session vars (:func:`bench_child_environ`)
+        and points ``TMPDIR`` at the bench's temp dir, so terminals the bench's
+        runners create are swept at teardown.
+        """
+        return {**bench_child_environ(), "TMPDIR": str(self._child_tmp)}
+
     def _stop(self) -> None:
         """Terminate host, runner, server, and mock; remove the temp dir."""
-        # Host first: SIGTERM-ing the daemon reaps the runners IT spawned (they
-        # are daemon-owned children), so it must go before the server so those
-        # runners' tunnels close cleanly.
-        for proc in (
-            self._host_proc,
-            self._runner_proc,
-            self._server_proc,
-            self._mock_proc,
-        ):
-            if proc is not None and proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
+        with self._lifecycle_lock:
+            self._stopping = True
+            children = list(self._children)
+        # Newest first, so the host daemon goes before the server and its runners'
+        # tunnels close cleanly. Stops descendants left in each child's process
+        # group; detached tmux servers are cleaned separately.
+        for proc in reversed(children):
+            _stop_process_group(proc)
+        self._kill_session_terminals()
         for handle in self._log_handles:
             handle.close()
         import shutil
 
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _kill_session_terminals(self) -> None:
+        """Kill the tmux servers of terminals created under the bench's TMPDIR.
+
+        Runners auto-create a REPL terminal per session; its detached tmux
+        server outlives a runner stopped before it closes its terminals.
+        """
+        for socket_path in self._child_tmp.glob(f"{_TERMINAL_DIR_GLOB}/tmux.sock"):
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                subprocess.run(
+                    ["tmux", "-S", str(socket_path), "kill-server"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
 
     def _sample_resources(self, interval: float = 1.0) -> None:
         """Sample the server process's CPU and RSS memory at *interval*-second intervals.
@@ -327,10 +524,6 @@ class BenchEnvironment:
         process terminates. The first ``cpu_percent`` call always returns 0.0
         (psutil baseline) — we discard it so only real measurements accumulate.
         """
-        try:
-            import psutil
-        except ImportError:
-            return
         if self._server_proc is None:
             return
         try:
@@ -419,10 +612,36 @@ class BenchEnvironment:
         self._log_handles.append(handle)
         return handle
 
+    def _spawn(self, args: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        """Start a child in its own process group and register it for teardown.
+
+        :raises RuntimeError: If teardown has already begun.
+        """
+        with self._lifecycle_lock:
+            self._raise_if_stopping()
+            proc: subprocess.Popen[bytes] = subprocess.Popen(
+                args, start_new_session=True, **kwargs
+            )
+            self._children.append(proc)
+        return proc
+
+    def _raise_if_stopping(self) -> None:
+        if self._stopping:
+            raise RuntimeError("benchmark environment is stopping")
+
+    def _print_log_tails(self, lines: int = 20) -> None:
+        """Echo the end of each child log before teardown deletes the temp dir."""
+        for log_path in sorted(self._tmp.glob("*.log")):
+            with contextlib.suppress(OSError):
+                tail = log_path.read_text(errors="replace").splitlines()[-lines:]
+                if tail:
+                    sys.stderr.write(f"--- {log_path.name} (last {len(tail)} lines) ---\n")
+                    sys.stderr.write("\n".join(tail) + "\n")
+
     def _spawn_mock(self, port: int) -> subprocess.Popen[bytes]:
-        return subprocess.Popen(
+        return self._spawn(
             [sys.executable, str(_MOCK_SERVER), str(port)],
-            env={**os.environ, "PYTHONPATH": str(_REPO_ROOT)},
+            env={**self.child_env(), "PYTHONPATH": str(_REPO_ROOT)},
             stdout=self._log("mock.log"),
             stderr=subprocess.STDOUT,
         )
@@ -467,7 +686,7 @@ class BenchEnvironment:
         server_cfg = self._tmp / "server.yaml"
         server_cfg.write_text(yaml.safe_dump(server_config))
         args.extend(["--config", str(server_cfg)])
-        return subprocess.Popen(
+        return self._spawn(
             args,
             env=env,
             cwd=compat_server_cwd(),
@@ -517,7 +736,7 @@ class BenchEnvironment:
                 "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
             }
         )
-        return subprocess.Popen(
+        return self._spawn(
             [runner_executable(), "-m", "omnigent.runner._entry"],
             env=runner_env,
             cwd=compat_runner_cwd(),
@@ -550,7 +769,7 @@ class BenchEnvironment:
             HOST_ID_ENV_VAR: self.host_id,
             HOST_NAME_ENV_VAR: f"bench-host-{self.host_id[-8:]}",
         }
-        return subprocess.Popen(
+        return self._spawn(
             [_omni_executable(), "host", "--server", self.base_url, "--non-interactive"],
             env=host_env,
             cwd=str(workspace),
@@ -563,18 +782,20 @@ class BenchEnvironment:
     def _wait_mock_ready(self) -> None:
         deadline = time.monotonic() + _MOCK_TIMEOUT_S
         while time.monotonic() < deadline:
+            self._raise_if_stopping()
             try:
                 if httpx.get(f"{self.mock_url}/stats", timeout=1).status_code == 200:
                     return
             except httpx.HTTPError:
                 pass
             time.sleep(0.1)
-        raise RuntimeError(f"mock LLM not ready within {_MOCK_TIMEOUT_S}s; logs in {self._tmp}")
+        raise RuntimeError(f"mock LLM not ready within {_MOCK_TIMEOUT_S}s; log tails above")
 
     def _wait_ready(self) -> None:
         """Wait for ``/health`` (and, in runner mode, the runner online)."""
         deadline = time.monotonic() + _HEALTH_TIMEOUT_S
         while time.monotonic() < deadline:
+            self._raise_if_stopping()
             try:
                 health = httpx.get(f"{self.base_url}/health", timeout=2)
                 if health.status_code == 200 and self._runner_ready():
@@ -582,7 +803,7 @@ class BenchEnvironment:
             except httpx.HTTPError:
                 pass
             time.sleep(_POLL_INTERVAL_S)
-        raise RuntimeError(f"server not ready within {_HEALTH_TIMEOUT_S}s; logs in {self._tmp}")
+        raise RuntimeError(f"server not ready within {_HEALTH_TIMEOUT_S}s; log tails above")
 
     def _runner_ready(self) -> bool:
         """Whether the boot runner reports online (always ``True`` server-only)."""
@@ -600,10 +821,11 @@ class BenchEnvironment:
         """
         deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
         while time.monotonic() < deadline:
+            self._raise_if_stopping()
             if self._host_proc is not None and self._host_proc.poll() is not None:
                 raise RuntimeError(
                     f"host daemon exited (code {self._host_proc.returncode}) before "
-                    f"coming online; logs in {self._tmp}"
+                    f"coming online; log tails above"
                 )
             try:
                 resp = httpx.get(f"{self.base_url}/v1/hosts", timeout=2)
@@ -937,7 +1159,7 @@ class BenchEnvironment:
                 last_error = snap.json().get("last_task_error") if snap.is_success else None
                 raise RuntimeError(f"turn failed: {last_error}")
         finally:
-            reader.cancel()
+            await _close_reader(reader, finished=settled.is_set())
 
     async def _wait_idle(self, session_id: str, *, timeout: float = _TURN_TIMEOUT_S) -> None:
         """Poll until the session is ``idle`` (a prior turn has settled)."""
@@ -1062,7 +1284,7 @@ class BenchEnvironment:
                     f"(session {session_id})"
                 )
         finally:
-            reader.cancel()
+            await _close_reader(reader, finished=first_delta.is_set() or first_response.is_set())
 
     async def time_to_first_delta(
         self, session_id: str, text: str, *, timeout: float = _TURN_TIMEOUT_S
@@ -1115,55 +1337,169 @@ class BenchEnvironment:
             session_id, text, wait_idle_first=False, timeout=timeout
         )
 
-    async def drive_and_interrupt(
+    async def start_gated_turn(
         self, session_id: str, *, timeout: float = _TURN_TIMEOUT_S
-    ) -> None:
-        """Drive a gated turn, interrupt it mid-flight, return when cancelled.
+    ) -> GatedTurn:
+        """Post a turn and return once its LLM call is parked on the mock's gate.
 
-        The caller configures a ``block=True`` mock response first (see
-        :meth:`configure_mock`), so the turn parks in ``running`` on the
-        executor's LLM call. We post an ``interrupt`` once running, wait for the
-        server's cancellation marker, then release the gate so the runner
-        unwinds cleanly. Times the server → runner → executor cancel path.
+        Queues one ``block=True`` mock response, attaches the session's SSE
+        stream, posts the message, and waits until the mock holds the turn's LLM
+        request at the gate. ``running`` alone is too early: a turn reports it
+        before calling the LLM, and an interrupt landing then would leave the
+        gated response queued for the next turn. :meth:`interrupt_gated_turn`
+        then times only the cancel path. Always pair with
+        :meth:`finish_gated_turn`.
 
-        :raises RuntimeError: If not in runner mode, or the interrupt is not
-            honored within *timeout*.
+        :raises RuntimeError: If not in runner mode, or the turn fails or does
+            not start within *timeout*.
         """
         assert self.client is not None
         if not self.with_runner:
-            raise RuntimeError("drive_and_interrupt requires with_runner=True")
-        body = {
-            "type": "message",
-            "data": {"role": "user", "content": [{"type": "input_text", "text": "Interrupt me."}]},
-        }
-        posted = await self.client.post(f"/v1/sessions/{session_id}/events", json=body)
-        posted.raise_for_status()
+            raise RuntimeError("start_gated_turn requires with_runner=True")
+        await self.configure_mock([{"text": "Interrupted before this reply.", "block": True}])
 
-        deadline = time.monotonic() + timeout
-        interrupted = False
+        connected = asyncio.Event()
+        running = asyncio.Event()
+        idle = asyncio.Event()
+        outcome: dict[str, str] = {}
+
+        async def _read_stream() -> None:
+            try:
+                async with self.client.stream(  # type: ignore[union-attr]
+                    "GET", f"/v1/sessions/{session_id}/stream", timeout=timeout
+                ) as resp:
+                    connected.set()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        status = _sse_session_status(line[len("data:") :].strip())
+                        if status in ("running", "waiting"):
+                            running.set()
+                        elif status == "failed":
+                            outcome["failed"] = "turn failed"
+                            idle.set()  # signal now; closing the stream isn't timed
+                            return
+                        elif status == "idle" and running.is_set():
+                            idle.set()
+                            return
+                    outcome["error"] = "stream ended before the turn settled"
+            except httpx.HTTPError as exc:
+                outcome["error"] = repr(exc)
+            finally:
+                connected.set()
+                running.set()
+                idle.set()
+
+        turn = GatedTurn(session_id, asyncio.create_task(_read_stream()), idle, outcome)
         try:
+            await asyncio.wait_for(connected.wait(), timeout=timeout)
+            body = {
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Interrupt me."}],
+                },
+            }
+            posted = await self.client.post(f"/v1/sessions/{session_id}/events", json=body)
+            posted.raise_for_status()
+            await asyncio.wait_for(running.wait(), timeout=timeout)
+            # Race the gate poll against the turn settling, so a turn that fails
+            # before calling the LLM errors at once instead of after the timeout.
+            gate = asyncio.ensure_future(self._wait_gate_pending(timeout=timeout))
+            settled = asyncio.ensure_future(idle.wait())
+            try:
+                await asyncio.wait({gate, settled}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in (gate, settled):
+                    task.cancel()
+                await asyncio.gather(gate, settled, return_exceptions=True)
+            if idle.is_set():
+                raise RuntimeError(f"gated turn settled before it was interrupted: {outcome}")
+            gate.result()  # raises when no LLM request reached the gate
+        except BaseException:
+            await self.finish_gated_turn(turn)
+            raise
+        return turn
+
+    async def interrupt_gated_turn(
+        self, turn: GatedTurn, *, timeout: float = _TURN_TIMEOUT_S
+    ) -> None:
+        """Interrupt a :meth:`start_gated_turn` turn; return when it settles.
+
+        Times the server → runner → executor cancel path: ``POST interrupt``
+        until the stream reports the session ``idle``.
+
+        :raises RuntimeError: If the turn already settled, or it fails or does
+            not settle within *timeout*.
+        """
+        assert self.client is not None
+        if turn.idle.is_set():
+            raise RuntimeError(f"gated turn settled before the interrupt: {turn.outcome}")
+        posted = await self.client.post(
+            f"/v1/sessions/{turn.session_id}/events", json={"type": "interrupt"}
+        )
+        posted.raise_for_status()
+        try:
+            await asyncio.wait_for(turn.idle.wait(), timeout=timeout)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"interrupt not honored within {timeout}s (session {turn.session_id})"
+            ) from exc
+        if turn.outcome:
+            raise RuntimeError(f"interrupted turn did not settle cleanly: {turn.outcome}")
+
+    async def finish_gated_turn(self, turn: GatedTurn) -> None:
+        """Release the mock's gate, drop any unused gated reply, and close the stream."""
+        with contextlib.suppress(httpx.HTTPError):
+            await self._mock_post("/gate/release", {})
+        with contextlib.suppress(httpx.HTTPError):
+            await self.configure_mock([])
+        await _close_reader(turn.reader, finished=turn.idle.is_set())
+
+    async def _wait_gate_pending(self, *, timeout: float) -> None:
+        """Poll the mock until an LLM request is held at its gate."""
+        deadline = time.monotonic() + timeout
+        async with httpx.AsyncClient(base_url=self.mock_url, timeout=10.0) as mock:
             while time.monotonic() < deadline:
-                snap = (await self.client.get(f"/v1/sessions/{session_id}")).json()
-                status = snap.get("status")
-                items = snap.get("items", [])
-                if status in ("running", "waiting") and not interrupted:
-                    await self.client.post(
-                        f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
-                    )
-                    interrupted = True
-                if _has_cancellation_marker(items):
+                resp = await mock.get("/gate/pending")
+                resp.raise_for_status()
+                if resp.json().get("pending"):
                     return
-                if status == "idle" and interrupted:
-                    if _has_cancellation_marker(items):
-                        return
-                    raise RuntimeError("turn settled without a cancellation marker")
-                await asyncio.sleep(_POLL_INTERVAL_S)
-            raise RuntimeError(f"interrupt not honored within {timeout}s (session {session_id})")
-        finally:
-            # Always release the gate so the blocked runner turn unwinds and
-            # teardown doesn't hang, even if the interrupt path errored above.
-            with contextlib.suppress(httpx.HTTPError):
-                await self._mock_post("/gate/release", {})
+                await asyncio.sleep(_GATE_POLL_INTERVAL_S)
+        raise RuntimeError(f"no LLM request reached the mock's gate within {timeout}s")
+
+    async def cancellation_markers(self, session_id: str) -> int:
+        """Count the session's "interrupted" markers (one per cancelled turn)."""
+        assert self.client is not None
+        snap = await self.client.get(f"/v1/sessions/{session_id}")
+        snap.raise_for_status()
+        return sum(1 for item in snap.json().get("items", []) if _has_cancellation_marker([item]))
+
+    async def wait_cancellation_markers(
+        self, session_id: str, count: int, *, timeout: float = _RUNNER_OFFLINE_TIMEOUT_S
+    ) -> None:
+        """Poll until the session holds at least *count* cancellation markers."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if await self.cancellation_markers(session_id) >= count:
+                return
+            await asyncio.sleep(_POLL_INTERVAL_S)
+        raise RuntimeError(
+            f"no cancellation marker within {timeout}s (session {session_id}, want {count})"
+        )
+
+
+async def _close_reader(reader: asyncio.Task[None], *, finished: bool) -> None:
+    """Await an SSE reader task, cancelling it only if it is still waiting.
+
+    A reader that already saw its terminal event is closing its response;
+    cancelling it then interrupts the close and leaks the pooled connection,
+    which exhausts the client's pool after ~100 turns.
+    """
+    if not finished:
+        reader.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await reader
 
 
 def _has_cancellation_marker(items: list[dict[str, object]]) -> bool:

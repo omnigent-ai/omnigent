@@ -1,6 +1,6 @@
 """File-backed session-sharing settings for the OSS server.
 
-Two server-wide sharing policies default from env vars at boot but can be
+Server-wide sharing policies default from env vars at boot but can be
 overridden at runtime from the Settings → Sharing admin panel, each persisted to
 a plaintext file in :func:`resolve_data_dir` (next to the ``admins`` roster) so
 it survives restarts without a database migration and takes effect without a
@@ -10,6 +10,8 @@ redeploy:
   (``on`` / ``read_only`` / ``restricted_read_only`` / ``off``);
 - whether *public* (anyone-with-the-link) read access may be granted —
   ``OMNIGENT_PUBLIC_SHARING`` → ``<data_dir>/public_sharing`` (``on`` / ``off``);
+- the public permission ceiling: ``OMNIGENT_PUBLIC_SHARING_MAX_LEVEL`` →
+  ``<data_dir>/public_sharing_max_level`` (``read`` / ``edit``, default read);
 - which *new* sessions start public: ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` →
   ``<data_dir>/default_public_sessions`` (``off`` / ``sandbox`` / ``all``).
 
@@ -26,17 +28,22 @@ import contextlib
 import logging
 import os
 import tempfile
+from collections.abc import Callable, Iterator
+from contextvars import ContextVar
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from starlette.types import ASGIApp, Receive, Scope, Send
+
 from omnigent.server.admin_list import resolve_data_dir
-from omnigent.server.auth import SharingMode, workspace_sharing_blocked
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, SharingMode, workspace_sharing_blocked
 
 logger = logging.getLogger(__name__)
 
 _SHARING_MODE_FILE = "sharing_mode"
 _PUBLIC_SHARING_FILE = "public_sharing"
+_PUBLIC_SHARING_MAX_LEVEL_FILE = "public_sharing_max_level"
 _DEFAULT_PUBLIC_SESSIONS_FILE = "default_public_sessions"
 # Public sharing is enabled unless a value explicitly says otherwise, so a typo
 # or a stray value fails OPEN (never silently disables a working feature).
@@ -56,6 +63,61 @@ def resolve_sharing_mode_path() -> Path:
 def resolve_public_sharing_path() -> Path:
     """Path of the file holding the admin public-sharing override."""
     return resolve_data_dir() / _PUBLIC_SHARING_FILE
+
+
+class PublicSharingMaxLevel(str, Enum):
+    """Maximum effective public permission, independent of the sign-in provider."""
+
+    READ = "read"
+    EDIT = "edit"
+
+    @property
+    def level(self) -> int:
+        return LEVEL_EDIT if self is PublicSharingMaxLevel.EDIT else LEVEL_READ
+
+    @classmethod
+    def coerce(cls, value: object) -> PublicSharingMaxLevel:
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value.strip().lower())
+            except ValueError:
+                pass
+        return cls.READ
+
+
+_public_sharing_max_level: ContextVar[Callable[[], PublicSharingMaxLevel]] = ContextVar(
+    "public_sharing_max_level", default=lambda: PublicSharingMaxLevel.READ
+)
+
+
+def effective_public_level(level: int | None) -> int | None:
+    """Apply the live ceiling outside the raw grant cache, including on open streams."""
+    if level is None:
+        return None
+    return min(level, _public_sharing_max_level.get()().level)
+
+
+@contextlib.contextmanager
+def public_sharing_policy_scope(max_level: Callable[[], PublicSharingMaxLevel]) -> Iterator[None]:
+    token = _public_sharing_max_level.set(max_level)
+    try:
+        yield
+    finally:
+        _public_sharing_max_level.reset(token)
+
+
+class PublicSharingPolicyMiddleware:
+    """Keep each application's live public policy in its request/task context."""
+
+    def __init__(self, app: ASGIApp, max_level: Callable[[], PublicSharingMaxLevel]) -> None:
+        self._app = app
+        self._max_level = max_level
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        with public_sharing_policy_scope(self._max_level):
+            await self._app(scope, receive, send)
 
 
 def resolve_default_public_sessions_path() -> Path:
@@ -183,6 +245,20 @@ def read_public_sharing_override() -> bool | None:
 def write_public_sharing_override(enabled: bool) -> None:
     """Persist the admin public-sharing override atomically."""
     _write_override_text(resolve_public_sharing_path(), "on" if enabled else "off")
+
+
+def public_sharing_max_level_env_default() -> PublicSharingMaxLevel:
+    return PublicSharingMaxLevel.coerce(os.environ.get("OMNIGENT_PUBLIC_SHARING_MAX_LEVEL"))
+
+
+def read_public_sharing_max_level_override() -> PublicSharingMaxLevel | None:
+    raw = _read_override_text(resolve_data_dir() / _PUBLIC_SHARING_MAX_LEVEL_FILE)
+    # Invalid overrides must not restore a more permissive boot default.
+    return PublicSharingMaxLevel.coerce(raw) if raw is not None else None
+
+
+def write_public_sharing_max_level_override(level: PublicSharingMaxLevel) -> None:
+    _write_override_text(resolve_data_dir() / _PUBLIC_SHARING_MAX_LEVEL_FILE, level.value)
 
 
 def default_public_sessions_env_default() -> DefaultPublicSessions:

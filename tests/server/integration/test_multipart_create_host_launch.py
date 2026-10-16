@@ -165,7 +165,7 @@ async def register_host(
                 frame_text = await conn.outbound_queue.get()
                 if frame_text is None:
                     return
-                frame = decode_host_frame(frame_text)
+                frame = decode_host_frame(frame_text.data)
                 if isinstance(frame, HostStatFrame):
                     cap.stats.append(frame)
                     fut = conn.pending_stats.pop(frame.request_id, None)
@@ -332,7 +332,7 @@ async def test_multipart_create_rejects_workspace_missing_on_host(
             frame_text = await conn.outbound_queue.get()
             if frame_text is None:
                 return
-            frame = decode_host_frame(frame_text)
+            frame = decode_host_frame(frame_text.data)
             if isinstance(frame, HostStatFrame):
                 fut = conn.pending_stats.pop(frame.request_id, None)
                 if fut is not None and not fut.done():

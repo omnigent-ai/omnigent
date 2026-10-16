@@ -1142,7 +1142,7 @@ def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
     [
         ({"claude-native": True, "codex-native": False}, "Codex"),
         ({"claude-native": False, "codex-native": True}, "Claude"),
-        # No AI Gateway anywhere: both arms are named.
+        # No Unity Gateway anywhere: both arms are named.
         ({"claude-native": False, "codex-native": False}, "Claude and Codex"),
     ],
 )

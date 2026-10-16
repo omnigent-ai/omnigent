@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import json
 import math
 import os
 import secrets
 import sys
+import threading
 import time
+import types
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -219,6 +222,12 @@ def main(argv: list[str] | None = None) -> int:
         print("omnigent claude hook: expected JSON object", file=sys.stderr)
         return 0
     bridge_dir = Path(args.bridge_dir)
+    from omnigent.harnesses.claude_native.lifecycle import record_hook_lifecycle
+
+    record_hook_lifecycle(bridge_dir, payload, time.time())
+    if payload.get("hook_event_name") == "SessionEnd":
+        # SessionEnd is diagnostic evidence, not a status or transcript change.
+        return 0
     _annotate_resume_session_context(bridge_dir, payload)
     if payload.get("hook_event_name") == "SessionStart" and payload.get("source") == "clear":
         rotated_session_id = _rotate_session_on_clear(bridge_dir)
@@ -938,6 +947,20 @@ def _main_permission_request(argv: list[str]) -> int:
     return 0
 
 
+def _skip_httpx_cli_import() -> None:
+    """
+    Keep httpx from importing its command-line client, and with it rich and click.
+
+    httpx imports ``httpx._main`` inside ``try/except ImportError``, so a
+    placeholder without ``main`` gives it the fallback stub. The policy hook
+    never runs that client, and Claude Code waits on the hook's imports.
+
+    :returns: None.
+    """
+    if "httpx" not in sys.modules:
+        sys.modules.setdefault("httpx._main", types.ModuleType("httpx._main"))
+
+
 def _main_evaluate_policy(argv: list[str]) -> int:
     """
     Evaluate a Claude Code ``PreToolUse`` / ``PostToolUse`` /
@@ -989,6 +1012,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     :returns: Process exit code. Always ``0`` — blocking verdicts
         are expressed via the JSON output, not exit codes.
     """
+    _skip_httpx_cli_import()
     from omnigent.native.native_policy_hook import (
         evaluation_response_to_hook_output,
         fail_ask_hook_output,
@@ -1360,5 +1384,34 @@ def _route_turn_post(
     return decoded if isinstance(decoded, dict) else None
 
 
+# Claude Code waits on these on every tool call and prompt.
+_FAST_EXIT_SUBCOMMANDS = frozenset({"evaluate-policy", "pre-tool-use"})
+
+
+def _exit_without_teardown(code: int) -> NoReturn:
+    """
+    Finalize as the interpreter would, then leave before module teardown.
+
+    Claude Code blocks on the policy hook until its process exits, and tearing
+    down the modules it imported costs tens of milliseconds on every tool call.
+    This joins non-daemon threads, then runs the ``threading`` and ``atexit``
+    exit callbacks, in the interpreter's own order (as CPython 3.13's forked
+    multiprocessing children do), so pending writes and exit work still finish.
+    Only object finalizers that run during module teardown are skipped.
+
+    :param code: Process exit code, e.g. ``0``.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    threading._shutdown()  # type: ignore[attr-defined]  # private, as in multiprocessing
+    atexit._run_exitfuncs()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    if sys.argv[1:2] and sys.argv[1] in _FAST_EXIT_SUBCOMMANDS:
+        _exit_without_teardown(exit_code)
+    raise SystemExit(exit_code)

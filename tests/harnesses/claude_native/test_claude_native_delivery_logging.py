@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +12,7 @@ import pytest
 
 from omnigent.debug_logging import current_session_id_scope, record_to_row
 from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
+from omnigent.native.input_diagnostics import input_delivery_scope
 
 
 @pytest.mark.parametrize(
@@ -118,6 +121,15 @@ def test_delivery_diagnostics(
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
         current_session_id_scope(None if scenario == "session_fallback" else "child-session"),
+        input_delivery_scope(
+            {
+                "input_stable_id": "a" * 32,
+                "pending_id": "pending_" + "b" * 32,
+                "delivery_attempt_id": "c" * 32,
+                "input_enqueued_at_ms": 12345,
+            },
+            response_id="resp_delivery",
+        ),
     ):
         if outcome == "returned":
             bridge.inject_user_message(tmp_path, content=content)
@@ -137,6 +149,14 @@ def test_delivery_diagnostics(
     attrs = record.attributes
     assert attrs["verification"] == verification
     assert attrs["outcome"] == outcome
+    assert attrs["input_stable_id"] == "a" * 32
+    assert attrs["pending_id"] == "pending_" + "b" * 32
+    assert attrs["delivery_attempt_id"] == "c" * 32
+    assert attrs["input_enqueued_at_ms"] == 12345
+    assert attrs["response_id"] == "resp_delivery"
+    assert attrs["delivery_outcome"] == (
+        "draft_cleared" if outcome == "returned" and verification == "draft_absent" else "unknown"
+    )
     assert record.levelname == (
         "INFO" if verification == "draft_absent" and outcome == "returned" else "WARNING"
     )
@@ -258,3 +278,85 @@ def test_trace_setup_failure_preserves_delivery_outcome(
             assert deliver(tmp_path, content="test prompt") == "delivered"
     assert delivered
     assert delivery_diagnostics._prompt_delivery_trace.get() is None
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout", "os_error"])
+@pytest.mark.parametrize("operation", ["send-keys", "private-operation"])
+def test_tmux_failure_diagnostics_are_content_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+    operation: str,
+) -> None:
+    private = "private argument and stderr sentinel"
+
+    def run(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(private, 10)
+        if failure == "os_error":
+            raise FileNotFoundError(2, private, private)
+        return SimpleNamespace(returncode=1, stderr=private, stdout="")
+
+    monkeypatch.setattr("subprocess.run", run)
+
+    @delivery_diagnostics.trace_delivery(
+        session_id_reader=lambda _: "owned-session",
+        cancelled_error=bridge.ClaudeInjectionCancelled,
+    )
+    def deliver(bridge_dir: Path, *, content: str) -> None:
+        bridge._run_tmux(private, operation, private)
+
+    with caplog.at_level("WARNING", logger=delivery_diagnostics.__name__):
+        with pytest.raises((RuntimeError, FileNotFoundError)):
+            deliver(tmp_path, content=private)
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_delivery_finished"
+    ]
+    row = record_to_row(record, source="runner")
+    attrs = row["attributes"]
+    assert attrs["tmux_operation"] == ("send-keys" if operation == "send-keys" else "other")
+    assert attrs["outcome"] == "error"
+    assert private not in json.dumps(row)
+    key, value = {
+        "exit": ("tmux_returncode", "1"),
+        "timeout": ("tmux_timeout_s", "10.0"),
+        "os_error": ("tmux_os_errno", "2"),
+    }[failure]
+    assert attrs[key] == value
+
+
+def test_tmux_cleanup_failure_preserves_first_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    failures = iter(
+        [
+            SimpleNamespace(returncode=1, stderr="delivery failed", stdout=""),
+            SimpleNamespace(returncode=2, stderr="cleanup failed", stdout=""),
+        ]
+    )
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: next(failures))
+
+    @delivery_diagnostics.trace_delivery(
+        session_id_reader=lambda _: None, cancelled_error=bridge.ClaudeInjectionCancelled
+    )
+    def deliver(bridge_dir: Path, *, content: str) -> None:
+        try:
+            bridge._run_tmux("owned-socket", "paste-buffer")
+        finally:
+            with contextlib.suppress(RuntimeError):
+                bridge._run_tmux("owned-socket", "kill-session")
+
+    with caplog.at_level("WARNING", logger=delivery_diagnostics.__name__):
+        with pytest.raises(RuntimeError, match="delivery failed"):
+            deliver(tmp_path, content="prompt")
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_delivery_finished"
+    ]
+    attrs = record_to_row(record, source="runner")["attributes"]
+    assert attrs["tmux_operation"] == "paste-buffer"
+    assert attrs["tmux_returncode"] == "1"

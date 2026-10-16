@@ -86,7 +86,9 @@ invocations below do not pause for registration or require those records.
    facets, a rendered VHS tape for CLI facets. The driver may be temporary and
    separate from the selected regression test. A reproduced facet is filmed failing (before-fix footage
    the fix step pairs with its after-fix re-recording); an already-fixed facet is
-   filmed passing (proof-it-works footage). Best-effort: skipped (and noted) when
+   filmed passing (proof-it-works footage). Burns timed step-by-step captions
+   below each new clip with `dev/caption_recording.py` and reviews the render;
+   the handoff also carries a short attachment description. Best-effort: skipped (and noted) when
    the recorders aren't installed.
 5. Checkpoints the machine-readable handoff to
    `.omnigent/repro-handoff.json` as soon as the verdict is known, updating it

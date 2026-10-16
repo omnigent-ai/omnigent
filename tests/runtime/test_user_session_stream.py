@@ -47,3 +47,49 @@ async def test_discovery_events_isolated_across_workspaces() -> None:
         user_session_stream.publish(user, {"type": "session_added", "session_id": "ws1"})
     event = await asyncio.wait_for(task, timeout=2.0)
     assert event == {"type": "session_added", "session_id": "ws1"}
+
+
+@pytest.mark.parametrize("event_type", ["session_added", "hosts_changed", "projects_changed"])
+@pytest.mark.parametrize("threaded", [False, True])
+async def test_closed_subscriber_does_not_break_discovery_delivery(
+    event_type: str, threaded: bool
+) -> None:
+    user = "alice@example.com"
+    stale_loop = asyncio.new_event_loop()
+    stale_loop.close()
+    stale_queue: asyncio.Queue[dict] = asyncio.Queue()
+    stale = (stale_queue, stale_loop)
+    user_session_stream._subscribers.setdefault(user, set()).add(stale)
+    live = asyncio.create_task(_collect_one(user))
+    await asyncio.sleep(0)
+    event = {"type": event_type, "session_id": "session-test"}
+    try:
+        if threaded:
+            await asyncio.to_thread(user_session_stream.publish, user, event)
+        else:
+            user_session_stream.publish(user, event)
+        assert stale not in user_session_stream._subscribers.get(user, set())
+        assert await asyncio.wait_for(live, timeout=2.0) == event
+        assert stale_queue.empty()
+    finally:
+        live.cancel()
+        await asyncio.gather(live, return_exceptions=True)
+    assert user not in user_session_stream._subscribers
+
+
+async def test_publish_removes_last_closed_subscriber_only_in_current_workspace() -> None:
+    user = "alice@example.com"
+    loop = asyncio.new_event_loop()
+    loop.close()
+    stale = (asyncio.Queue(), loop)
+    for workspace_id in (1, 2):
+        with workspace_scope(workspace_id):
+            user_session_stream._subscribers.setdefault(user, set()).add(stale)
+    with workspace_scope(1):
+        user_session_stream.publish(user, {"type": "hosts_changed"})
+        assert user not in user_session_stream._subscribers
+        user_session_stream.publish(user, {"type": "hosts_changed"})
+    with workspace_scope(2):
+        assert stale in user_session_stream._subscribers[user]
+        user_session_stream.publish(user, {"type": "hosts_changed"})
+        assert user not in user_session_stream._subscribers

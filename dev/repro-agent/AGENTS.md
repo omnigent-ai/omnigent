@@ -214,6 +214,65 @@ from guessing at code. Read the linked issue/ticket in full: its description, th
 reproduction steps, the version, any attached transcript or stack trace, and the
 discussion.
 
+Separate reported facts, observed facts, and hypotheses. Record the exact
+entry point, harness, build, authentication mode/profile, relevant configuration,
+and starting state; leave unknowns explicit. An OAuth user login, service
+principal, and PAT are different paths even when they show the same error.
+Do not replace the reported path with whichever configuration is easiest to run.
+
+Before choosing expected results, inspect relevant code, tests, and targeted
+history (`git log -S`, `git blame`, and linked decisions). An existing fallback
+or restriction may be intentional. Cite the rationale you find; absence of a
+comment is not evidence of accidental behavior. Keep observed symptoms separate
+from suspected causes. When code or logs suggest a competing explanation, use
+a discriminating observation or focused check and record what it supports or
+rules out. A familiar error message alone does not establish its cause.
+Follow the reported path to any shared registry, default, or policy definition
+that governs the behavior, then read its rationale, relevant callers, and tests.
+Do not infer the full contract from one local fallback.
+Even when the local fallback is explicit, follow the phase or operation type to
+its declaration and inspect other consumers for a shared table or default
+controlling error behavior. Cite that declaration, or a bounded search if absent.
+Follow imported policy symbols to their defining files: search for the declaration
+and other consumers. Record the governing symbol/value, definition path, historical
+rationale, and pinning test in `evidence`. A filename in search output or a symbol
+in a caller is not a definition read. If no shared definition exists, record the
+search that established that before choosing the test's expected result.
+
+For credential-lifetime or recovery hypotheses, first establish a working control
+through the reported credential-selection code and SDK. When external auth
+services are unavailable or sanitized, substitute only boundaries that this
+provider uses, with bounded local services and fake credentials. Static
+credentials need no invented issuance or refresh service. Keep application token
+resolution and the installed SDK intact; replacing the suspected component with
+canned results assumes the cause. Put timeouts on discovery and subprocess calls.
+After the control succeeds, follow the retained auth wrapper to its credential-
+producing delegate. Record that delegate's runtime class/module and the method
+actually invoked on it, without credential values. Profile-loading logs or
+subprocess calls shared by several providers do not identify which succeeded.
+If the executing delegate cannot be established, keep provider identity unresolved.
+Start with the smallest credential consumer, such as request-header construction,
+and preserve its working control before adding a long-running process. Add the
+full process only when the remaining hypothesis requires it. If initialization
+hangs, capture the blocking stack and output in the same bounded tool call; keep
+probe logs under the workspace. Use that observation to choose the next probe.
+If the stack identifies external configuration metadata/discovery calls, provide
+controlled responses and record whether the control reached them. Preserve other
+concrete blockers.
+Load an isolated version of the reported profile and use its credential at the
+caller's transport boundary. Keep the same application credential object while
+exercising the suspected expiry or rejection. Record whether it refreshes or
+recovers; mocking that object or its factory cannot satisfy this check. Complete
+this before writing a test that assumes stale credentials are the cause. A
+controlled check does not by itself reproduce an unavailable production incident;
+retain the controlled boundaries, concrete blockers and unsupported hypotheses.
+
+Keep this investigation bounded to the reported journey; a complete diagnosis
+is not required to hand off a valid reproduction. Preserve unresolved intent in
+`evidence` for Resolve and PR review. Do not turn a guess into an assertion or
+pause just because several fixes are possible. If missing report details prevent
+defining an observable failure, retain the `needs_more_info` rule below.
+
 Write down the concrete journey: the entry point (which screen/agent/command),
 the ordered user inputs, the environment/data it needed, and the observable
 failure (crash, traceback, wrong output, missing UI affordance). If the report is
@@ -457,8 +516,11 @@ The `tests/e2e_ui/` suite drives a mock LLM (`tests/server/integration/mock_llm_
 whose scripted responses take fault fields: `error` + `status_code` (fail the
 request at open time), `truncate_after: N` (open a normal `200` SSE stream, emit
 N events, then cut it off mid-stream — dropping the completion event so the turn
-dies in flight), and `block` + the `/gate/release` endpoint (hold a turn open to
-drive a stall/cancel). For faults on the *transport* rather than the model — a
+dies in flight), `chunk_delay: seconds` (sleep between SSE events so the reply
+streams in visibly — pair with `stream: true` for word-by-word deltas — letting
+you scroll, click, or watch layout *while* deltas are still arriving), and
+`block` + the `/gate/release` endpoint (hold a turn open to drive a
+stall/cancel). For faults on the *transport* rather than the model — a
 transient 4xx/5xx on the session stream, dropped events — a Playwright `route`
 handler that `fulfill`s or `abort`s the request works too (see
 `tests/e2e_ui/chat/test_stream_transient_404.py` and `test_stale_stream.py`).
@@ -466,6 +528,17 @@ Pick the injection that matches the reported trigger, drive the turn through it,
 and observe the SPA's error/recovery UI (the error pill, retry, reconnect) — that
 observed error state is the reproduction. The same journey driver can film it
 in Step 4, even when permanent coverage uses a narrower test.
+
+**A mid-stream symptom must be driven mid-stream.** The mock is not
+single-batch: `chunk_delay` paces the SSE stream on both `/v1/responses` (the
+default openai-agents e2e_ui fixture) and `/v1/messages`. When the report ties
+the failure to a live or just-finished turn — scroll snaps back while a long
+reply streams in, layout jumps as deltas render — a settled transcript has not
+exercised the trigger: pace the stream and drive the reported action while
+deltas are still arriving. `not_reproduced` may carry
+`environment_fidelity: real` only after that mid-stream trigger was actually
+driven; if you could not drive it, name the untested trigger in the facet's
+`evidence` and do not claim the reported environment in the verdict.
 
 Judge **each sub-symptom** honestly and independently:
 
@@ -507,6 +580,11 @@ you could not exercise), the overall verdict is `needs_manual_review` — a
 when *every* sub-symptom is fixed is the overall verdict `already_fixed`.
 
 ## Step 3 — Identify the smallest reliable regression coverage
+
+In the product checkout, read `tests/README.md` and `tests/_helpers/README.md`
+before writing setup; follow its API examples and the selection policy below.
+In `evidence`, name the nearest test/helper considered and explain any new setup.
+If the target repository has no catalog, inspect its nearby fixtures instead.
 
 Search existing tests across the repository by behavior, input event, and fixture,
 and read the nearest scenarios. Reuse their helpers before writing new setup.
@@ -575,7 +653,9 @@ saved under `recordings/<slug>/` in your workspace. **See
 [`dev/recording-lanes.md`](../recording-lanes.md) for the full how-to** — which
 surface to drive, standing the recorder's server up (build the SPA first, strip
 leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal` /
-`cli` / `desktop`), plus the empty-recordings and caption rules. This section states only
+`cli` / `desktop`), plus the empty-recordings and caption rules. Burn timed
+step-by-step captions into each new clip using `dev/caption_recording.py` and
+inspect the render as described there before handing it off. This section states only
 *which clip repro-agent produces*. Use the selected regression test when it can
 drive that surface. Otherwise reuse or create a separate temporary recording
 driver for the observed journey. Keep its source and command in the evidence
@@ -584,18 +664,25 @@ driver as permanent regression coverage.
 
 - a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): use the
   journey driver to reproduce and verify the failure, but film only the product surface
-  and the user-visible bug (e.g. `recordings/1234/before-picker.webm`). Never film
+  and the user-visible bug (captioned output: `recordings/1234/before-picker.mp4`). Never film
   pytest, assertion output, or the test source.
 - an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): use
   a journey driver to verify the passing journey, while the video shows only
-  the product behaving correctly (e.g. `recordings/1234/fixed-picker.webm`).
+  the product behaving correctly (captioned output: `recordings/1234/fixed-picker.mp4`).
 
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
-Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
+Keep raw captures under `recordings/<slug>/raw/<before|fixed>-<facet>.<ext>`.
+Declare the inspected captioned MP4, or use the shared guide's explicit
+`uncaptioned-<kind>-<facet>.<ext>` fallback if captioning fails.
 
 Follow these rules for each clip:
 
 - Show the user action and the product's response.
+- **Caption the screen from screen evidence.** Check that claimed elements are
+  in view and unobstructed, and quote only visibly rendered text. DOM attributes,
+  hidden accessibility labels and backend logs are not screen evidence. Disclose
+  unavailable frame inspection and limit claims to verified states. Follow
+  `dev/recording-lanes.md` and correct captions that conflict with the frames.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.
@@ -624,6 +711,11 @@ choice:
   even when a recording is available. For `needs_more_info` or
   `needs_manual_review`, include the known steps and clearly identify missing
   information or unverified steps; do not invent a successful reproduction.
+  For a component probe, label the manual user journey as unrun and report the
+  probe's observations separately. Before emitting either prose or JSON, match
+  each claimed observation to the executed operation and output. A printed label
+  is not proof that the named operation ran; a general stand-in caveat does not
+  make an unexecuted login, new process, connection, or recovery observed.
   You may also include a brief verdict and per-facet notes. Then, as the
   last thing before the JSON block, give concise test references per Step 3,
   including source locations and results. All of this is
@@ -660,7 +752,7 @@ choice:
   ],
   "test_path": "tests/e2e_ui/model_catalog/test_1234.py",
   "recordings": [
-    {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm",
+    {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.mp4", "format": "mp4",
      "capture_mode": "playwright_ui",
      "caption": "open the model picker → select the catalog → picker shows raw IDs instead of names"}
   ],
@@ -726,7 +818,23 @@ Field meanings:
   state, leaked subscriptions, timeouts) in `facets`/`evidence`.
 - `evidence` — what you observed live (snapshot reference, response, or log
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
-  only — you do not fix).
+  only — you do not fix). Include the tested configuration, sources for expected
+  behavior, competing explanations checked, and remaining uncertainty. Keep this
+  concise and distinguish observations from inferences; never include secrets.
+  Before finalizing, check that this field contains the governing definition
+  (symbol/value and source), its rationale and pinning test, or the bounded
+  search establishing that no shared definition exists. A local handler alone
+  does not establish that absence: inspect shared policy/type declarations and
+  other consumers. For credential hypotheses, include the configured-path
+  control and observation from Step 1. Execute missing feasible checks before
+  the final handoff; preserve concrete blockers and unverified causes explicitly.
+  For credential-related investigations, identify the provider that actually
+  returns credentials using its runtime type or call trace, including fallback
+  selection. Attempted SDK setup is not successful provider execution. Without
+  that evidence, keep provider identity unresolved and do not claim its failure
+  mode was ruled out by a different provider's successful control.
+  Label fresh-instance header checks separately from new-process or successful-
+  connection checks, and keep unexercised outcomes unverified throughout the handoff.
 - `recordings` — the Step 4 captures: a list of
   `{"surface", "kind", "path", "format", "capture_mode", "caption"}` objects. `kind` is
   `"before"` for a `reproduced` facet's failing run or `"fixed"` for an
@@ -737,11 +845,15 @@ Field meanings:
   what the clip shows — e.g. `"start a session → open the model picker → select
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
-  behavior (the journey completing). This is per-recording (each clip drives its
-  own steps), distinct from the bug-level `journey` field. `capture_mode` is one
-  of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
-  authored-but-unrendered VHS tape in the artifact, but do not declare it as a
-  recording. Empty list when nothing valid was recorded.
+  behavior (the journey completing). Each screen claim comes from screen
+  evidence, not from a transcript, API check, or DOM attribute read (Step 4). This attachment description
+  is separate from the timed captions burned into the video using
+  `dev/caption_recording.py`. This is per-recording
+  (each clip drives its own steps), distinct from the bug-level `journey`
+  field. `capture_mode` is one of the surface-appropriate values in
+  `dev/recording-lanes.md`. Keep an authored-but-unrendered VHS tape in the
+  artifact, but do not declare it as a recording. Empty list when nothing valid
+  was recorded.
 - `recording_unavailable_reason` — leave empty when every expected clip is
   present. Otherwise explain each missing clip:
 

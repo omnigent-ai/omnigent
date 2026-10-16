@@ -158,10 +158,10 @@ def test_key_provider_resolves_to_inline_family() -> None:
 def test_inline_databricks_gateway_enumerates_all_families(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An inline gateway on a Databricks AI Gateway surfaces every family.
+    """An inline gateway on a Databricks Unity Gateway surfaces every family.
 
     The web UI's credential flow writes a single-family ``openai-gateway`` when
-    the Databricks AI Gateway is entered for Codex, and pins it as Pi's default
+    the Databricks Unity Gateway is entered for Codex, and pins it as Pi's default
     when nothing else serves Pi. Pi must not be capped to that one family: the
     gateway fronts a workspace serving Claude, GPT and Gemini, so the resolver
     enumerates the workspace and exposes all of them — Claude on Pi's native
@@ -1354,7 +1354,7 @@ def _cli_config_databricks_config() -> dict[str, object]:
                 "default": True,
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
             },
         }
     }
@@ -1371,7 +1371,7 @@ _DATABRICKS_CODEX_CONFIG = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1"
 wire_api = "responses"
 
@@ -1491,7 +1491,7 @@ def _codex_config_with_base_url(base_url: str) -> str:
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "{base_url}"
 wire_api = "responses"
 
@@ -1504,7 +1504,7 @@ timeout_ms = 5000
 
 # Look-alike base URLs from the security finding: each embeds the "databricks"
 # and "ai-gateway" substrings somewhere in scheme+host+path, defeating the old
-# substring scan, but NONE is a real Databricks AI Gateway host. Routing any of
+# substring scan, but NONE is a real Databricks Unity Gateway host. Routing any of
 # them would leak the workspace bearer token to an attacker-controlled host.
 _LOOKALIKE_GATEWAY_URLS = [
     # "ai-gateway" + "databricks" labels, but the real host is evil.test.
@@ -1592,7 +1592,7 @@ def _cli_config_databricks_pinned_pi() -> dict[str, object]:
                 "default": ["openai", "pi"],
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
             },
         }
     }
@@ -1690,7 +1690,7 @@ args = ["%s", "sk-static"]
     ],
 )
 def test_is_databricks_ai_gateway_url_accepts_real_hosts(gateway_url: str) -> None:
-    """The hardened detector accepts genuine Databricks AI Gateway hosts."""
+    """The hardened detector accepts genuine Databricks Unity Gateway hosts."""
     assert creds._is_databricks_ai_gateway_url(gateway_url) is True
 
 
@@ -1717,7 +1717,7 @@ def test_is_databricks_ai_gateway_url_rejects_lookalikes(gateway_url: str) -> No
 def test_workspace_url_for_dedicated_gateway_uses_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A dedicated AI Gateway origin is not itself a workspace API host."""
+    """A dedicated Unity Gateway origin is not itself a workspace API host."""
     from omnigent.runtime.credentials import databricks as db_creds_mod
 
     def resolve(profile: str | None) -> db_creds_mod.WorkspaceCreds:
@@ -1833,7 +1833,7 @@ def test_databricks_prefixed_override_normalized_for_inline_anthropic() -> None:
 
     The spec's ``executor.model`` may be a Databricks-gateway id
     (``databricks-claude-opus-4-7``). That prefix only routes through the
-    Databricks AI Gateway; an inline vendor-direct provider (here a
+    Databricks Unity Gateway; an inline vendor-direct provider (here a
     key-kind ``api.anthropic.com``) cannot route it. The resolver must
     mechanically strip the prefix so the rendered ``models.json`` selects the
     bare ``claude-opus-4-7`` id the endpoint understands.
@@ -2210,7 +2210,7 @@ def test_vendor_namespaced_claude_id_is_not_split() -> None:
 def test_gateway_override_keeps_databricks_prefix_for_anthropic_family() -> None:
     """A ``databricks-`` override on a gateway-kind provider is sent verbatim.
 
-    A gateway fronting the Databricks AI Gateway is addressed by the prefixed
+    A gateway fronting the Databricks Unity Gateway is addressed by the prefixed
     endpoint name; stripping yields an id the endpoint answers 404 for. The
     family-default path already passed it through — the override path must
     agree.
@@ -2317,7 +2317,7 @@ def test_cli_config_databricks_registers_gpt_provider(
 ) -> None:
     """A cli-config provider fetches the model list via the real workspace URL.
 
-    The AI gateway hostname is NOT the workspace hostname (stripping
+    The Unity Gateway hostname is NOT the workspace hostname (stripping
     ``ai-gateway.`` produces NXDOMAIN). The fix resolves workspace credentials
     from ~/.databrickscfg (DEFAULT profile) and calls /api/2.0/serving-endpoints
     against the real workspace, so GPT and other non-Claude models appear in
@@ -2357,7 +2357,7 @@ def test_cli_config_databricks_registers_gpt_provider(
     cfg = provider.to_models_config()
     openai_entry = cfg["providers"].get("omnigent-openai")
     assert openai_entry is not None, "omnigent-openai provider missing from models.json"
-    # Uses the AI Gateway codex URL (supports tools); the REAL workspace hostname
+    # Uses the Unity Gateway codex URL (supports tools); the REAL workspace hostname
     # from databrickscfg fixes the NXDOMAIN issue for dedicated-subdomain gateways.
     assert (
         openai_entry["baseUrl"]

@@ -313,6 +313,8 @@ async def test_forwarder_does_not_post_compaction_on_non_compact_session_start(
     # event: the preceding startup SessionStart produced nothing. If this
     # body were external_compaction_status, the source check regressed.
     assert request["path"] == "/v1/sessions/conv_abc/events"
+    context = request["body"]["data"].pop("failure_context")
+    assert context["native_hook_event"] == "StopFailure"
     assert request["body"] == {
         "type": "external_session_status",
         "data": {"status": "failed"},

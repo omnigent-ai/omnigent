@@ -31,11 +31,16 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    to your handoff `recordings`. This is **not** gated on the repro handoff
    carrying footage — you have the test and the journey, which is all the recorder
    needs, so produce the after-clip whether or not any before-clip was recovered.
-   Use the same lanes as 2B.5 — see [`dev/recording-lanes.md`](../../../recording-lanes.md)
+   Burn timed step-by-step captions into each new clip and inspect the render
+   using `dev/caption_recording.py`; the attachment description alone is not
+   an on-screen caption. Use the same lanes as 2B.5 — see [`dev/recording-lanes.md`](../../../recording-lanes.md)
    (build the SPA first, record via `OMNIGENT_E2E_RECORD_DIR`, per-surface `web` /
-   `mobile` / `terminal` / `cli` / `desktop` mechanics) — saving to
-   `recordings/<slug>/after-<facet>.<ext>` with a `caption` for what the clip
-   shows. The test result determines the verdict separately; the footage must
+   `mobile` / `terminal` / `cli` / `desktop` mechanics). Save the raw capture to
+   `recordings/<slug>/raw/after-<facet>.<ext>`, render to
+   `recordings/<slug>/after-<facet>.mp4`, and declare only the inspected final
+   path with a `caption` for what the clip shows. If captioning fails, use the
+   shared guide's explicit fallback path instead.
+   The test result determines the verdict separately; the footage must
    show the product journey and its visible outcome, never the test runner. When
    the handoff *does* carry a before clip, carry it
    through **and** produce the after; when it carries none, still produce the
@@ -56,7 +61,9 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    compatibility, and performance? Does it miss facets or obvious adjacent edge
    cases, or introduce a regression in the surrounding code? Complete the shared
    impact assessment and run its checks for the whole PR. Record why the selected
-   approach is preferable in the review.
+   approach is preferable in the review. Apply `resolve-investigate` to the
+   reported configuration, competing causes, and historical design rationale;
+   explicitly identify policy changes even when the repro test passes.
    "Best" means the strongest maintainable fit for this codebase and bug, not a
    license to replace a sound, idiomatic contribution with a theoretically purer
    rewrite or a personal style preference.
@@ -65,8 +72,10 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    Establish one concrete reported failure or requested outcome and its
    acceptance criteria from `bug_url` and the PR's linked issue. Different
    layers or root causes can contribute to that outcome. If the issue bundles
-   independent problems, ask the author to split them or track them separately;
-   stop with `needs_more_info` if the intended scope is unclear.
+   independent problems, identify separable follow-ups in the review. Propose the
+   best-supported scope and keep working on clear requirements. Only a concrete
+   missing input or authorization conflict blocks that work; unresolved design
+   choices remain explicit for PR review under `resolve-investigate`.
 
    For each change, ask whether removing it would leave the intended fix
    incomplete, incorrect, unsafe, or inadequately tested or documented.

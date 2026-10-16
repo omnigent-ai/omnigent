@@ -20,6 +20,11 @@ import omnigent.runner.native.orchestration as _orchestration
 from omnigent import debug_logging
 from omnigent.errors import OmnigentError
 from omnigent.runner.app import _codex_native_launch_config
+from omnigent.runner.session_init_protocol import (
+    RunnerSessionInitSnapshot,
+    parse_runner_session_init_envelope,
+)
+from omnigent.util import http_retry
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +46,7 @@ def retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     # assertion (no recovery) rather than erroring in setup when run against a
     # tree that predates the retry hook.
     monkeypatch.setattr(_orchestration, "_launch_config_retry_sleep", _fake_sleep, raising=False)
+    monkeypatch.setattr(http_retry.random, "uniform", lambda low, high: low)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
     return slept
 
@@ -48,8 +54,16 @@ def retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 class _Resp:
     """Minimal stand-in for an httpx response carrying a fixed status + payload."""
 
-    def __init__(self, status_code: int, payload: Any, *, json_raises: bool = False) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        payload: Any,
+        *,
+        json_raises: bool = False,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
+        self.headers = httpx.Headers(headers)
         self._payload = payload
         self._json_raises = json_raises
 
@@ -105,6 +119,24 @@ class _SequenceClient:
 
 async def _run(client: _Client | None, session_id: str = "conv_1") -> Any:
     return await _codex_native_launch_config(session_id=session_id, server_client=client)
+
+
+def _init_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Build current wire metadata with explicit defaults for optional fields."""
+    return {
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "test",
+            "session_id": "conv_1",
+            "agent_id": "agent_1",
+            "snapshot": {
+                **RunnerSessionInitSnapshot(
+                    created_at=10, updated_at=11, workspace="/tmp/repo"
+                ).model_dump(mode="json"),
+                **snapshot,
+            },
+        }
+    }
 
 
 @pytest.mark.asyncio
@@ -177,7 +209,12 @@ async def test_launch_config_reads_the_metadata_only_snapshot(
 
     assert client.urls == ["/v1/sessions/conv_1"]
     assert client.params == [
-        {"include_items": "false", "include_liveness": "false", "include_usage": "false"}
+        {
+            "include_items": "false",
+            "include_liveness": "false",
+            "include_usage": "false",
+            "include_live_status": "false",
+        }
     ]
 
 
@@ -223,19 +260,26 @@ async def test_native_metadata_reads_skip_usage_aggregation(
         "include_items": "false",
         "include_liveness": "false",
         "include_usage": "false",
+        "include_live_status": "false",
     }
-    assert requests[0].extensions["timeout"]["read"] == 10.0
+    assert requests[0].extensions["timeout"]["read"] == 20.0
 
 
 @pytest.mark.asyncio
-async def test_happy_path_parses_full_config(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
+async def test_happy_path_parses_full_config(
+    monkeypatch: pytest.MonkeyPatch, use_envelope: bool
+) -> None:
     """A well-formed snapshot (with fork labels) parses into a launch config."""
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
     snapshot = {
         "workspace": "/tmp/repo",
         "terminal_launch_args": ["--config", "approval_policy=on-request"],
         "model_override": "gpt-5.4-mini",
+        "reasoning_effort": "high",
         "external_session_id": "thread_abc",
+        "harness_override": "auto",
+        "cost_control_mode_override": "on",
         "labels": {
             "omnigent.fork.source_id": "conv_source",
             "omnigent.fork.source_external_session_id": "thread_src",
@@ -243,18 +287,111 @@ async def test_happy_path_parses_full_config(monkeypatch: pytest.MonkeyPatch) ->
             "omnigent.codex_native.bypass_sandbox": "1",
         },
     }
-    cfg = await _run(_Client(_Resp(200, snapshot)))
+    client = _Client(_Resp(200, snapshot))
+    envelope = parse_runner_session_init_envelope(_init_payload(snapshot))
+    cfg = await _codex_native_launch_config(
+        session_id="conv_1",
+        server_client=client,
+        session_init=envelope if use_envelope else None,
+    )
+    assert client.urls == ([] if use_envelope else ["/v1/sessions/conv_1"])
     assert cfg.policy_server_url == "http://127.0.0.1:8123"
     assert cfg.terminal_launch_args == ["--config", "approval_policy=on-request"]
     assert cfg.model_override == "gpt-5.4-mini"
+    assert cfg.reasoning_effort == "high"
     assert cfg.external_session_id == "thread_abc"
     assert cfg.fork_source_id == "conv_source", "Fork source id should be read from labels."
     assert cfg.fork_source_external_id == "thread_src"
     assert cfg.fork_carry_history is True, "carry_history label '1' should parse to True."
     assert cfg.bypass_sandbox is True, "bypass_sandbox label '1' should parse to True."
+    assert cfg.auto_harness is True
+    assert cfg.routing_enabled is True
+    assert cfg.turn_routing is True
     assert cfg.workspace.name == "repo", (
         f"Workspace path should resolve from snapshot, got {cfg.workspace}."
     )
+
+
+@pytest.mark.asyncio
+async def test_complete_envelope_avoids_timed_out_metadata_read(
+    retry_sleeps: list[float],
+) -> None:
+    """A slow metadata endpoint cannot block a launch whose init supplies config."""
+    client = _Client(raise_exc=httpx.ReadTimeout("metadata endpoint stalled"))
+    envelope = parse_runner_session_init_envelope(_init_payload({}))
+    assert envelope is not None
+
+    cfg = await _codex_native_launch_config(
+        session_id="conv_1", server_client=client, session_init=envelope
+    )
+
+    assert cfg.workspace.name == "repo"
+    assert cfg.model_override is None
+    assert cfg.external_session_id is None
+    assert cfg.terminal_launch_args is None
+    assert cfg.bypass_sandbox is False
+    assert client.urls == []
+    assert retry_sleeps == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "envelope",
+        "protocol",
+        "workspace",
+        "terminal_launch_args",
+        "model_override",
+        "external_session_id",
+        "reasoning_effort",
+        "labels",
+        "harness_override",
+        "cost_control_mode_override",
+    ],
+)
+async def test_older_server_metadata_falls_back_with_retries(
+    missing: str, retry_sleeps: list[float]
+) -> None:
+    """Missing, unsupported, or partial init metadata retains the legacy GET."""
+    payload = _init_payload({"external_session_id": "thread_stale"})
+    if missing == "envelope":
+        payload.pop("session_init")
+    elif missing == "protocol":
+        payload["session_init"]["protocol_version"] = 1
+    else:
+        payload["session_init"]["snapshot"].pop(missing)
+    client = _SequenceClient(
+        [
+            httpx.ReadTimeout("first read stalled"),
+            _Resp(200, {"workspace": "/tmp/current", "external_session_id": "thread_current"}),
+        ]
+    )
+
+    cfg = await _codex_native_launch_config(
+        session_id="conv_1",
+        server_client=client,
+        session_init=parse_runner_session_init_envelope(payload),
+    )
+
+    assert cfg.workspace.name == "current"
+    assert cfg.external_session_id == "thread_current"
+    assert client.calls == 2
+    assert retry_sleeps == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_envelope_preserves_launch_config_validation() -> None:
+    """A provided model still passes through the same launch validation."""
+    client = _Client(raise_exc=AssertionError("unexpected metadata fetch"))
+    envelope = parse_runner_session_init_envelope(_init_payload({"model_override": ""}))
+
+    with pytest.raises(RuntimeError, match="Invalid model_override"):
+        await _codex_native_launch_config(
+            session_id="conv_1", server_client=client, session_init=envelope
+        )
+
+    assert client.urls == []
 
 
 @pytest.mark.asyncio
@@ -302,7 +439,15 @@ async def test_transient_timeout_recovers_on_retry(retry_sleeps: list[float]) ->
     assert client.calls == 2, "Should retry once after the transient read timeout."
     assert (
         client.params
-        == [{"include_items": "false", "include_liveness": "false", "include_usage": "false"}] * 2
+        == [
+            {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+                "include_live_status": "false",
+            }
+        ]
+        * 2
     )
     assert retry_sleeps == [pytest.approx(0.5)], "One backoff sleep before the retry."
 
@@ -332,12 +477,15 @@ async def test_retryable_status_recovers_on_retry(retry_sleeps: list[float]) -> 
 
 
 @pytest.mark.asyncio
-async def test_non_retryable_status_fails_without_retry(retry_sleeps: list[float]) -> None:
-    """A non-retryable status (404) fails on the first attempt without consuming retries."""
-    client = _SequenceClient([_Resp(404, None)])
-    with pytest.raises(RuntimeError, match="returned 404"):
+@pytest.mark.parametrize("status", [401, 403, 404])
+async def test_non_retryable_status_fails_without_retry(
+    retry_sleeps: list[float], status: int
+) -> None:
+    """Permanent request rejections fail without consuming retries."""
+    client = _SequenceClient([_Resp(status, None)])
+    with pytest.raises(RuntimeError, match=f"returned {status}"):
         await _codex_native_launch_config(session_id="conv_1", server_client=client)
-    assert client.calls == 1, "A 404 is a hard error, not a transient blip."
+    assert client.calls == 1
     assert retry_sleeps == [], "No backoff on a non-retryable status."
 
 
@@ -396,3 +544,66 @@ async def test_client_side_launch_config_failure_stays_unattributed() -> None:
     with pytest.raises(RuntimeError) as info:
         await _codex_native_launch_config(session_id="conv_1", server_client=client)
     assert not isinstance(info.value, OmnigentError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reader",
+    [
+        pytest.param(_orchestration._codex_native_launch_config, id="codex"),
+        pytest.param(_orchestration._pi_native_launch_config, id="pi"),
+        pytest.param(_orchestration._kiro_native_launch_config, id="kiro"),
+        pytest.param(_orchestration._opencode_native_launch_config, id="opencode"),
+    ],
+)
+async def test_rate_limit_honors_retry_after(
+    retry_sleeps: list[float], reader: Callable[..., Awaitable[Any]]
+) -> None:
+    client = _SequenceClient(
+        [
+            _Resp(429, None, headers={"Retry-After": "3"}),
+            _Resp(200, {"workspace": "/tmp/repo"}),
+        ]
+    )
+
+    cfg = await reader(session_id="conv_1", server_client=client)
+
+    assert cfg.workspace.name == "repo"
+    assert client.calls == 2
+    assert retry_sleeps == [3.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_is_not_reused_after_transport_failure(
+    retry_sleeps: list[float],
+) -> None:
+    client = _SequenceClient(
+        [
+            _Resp(429, None, headers={"Retry-After": "3"}),
+            httpx.ReadTimeout("slow"),
+            _Resp(200, {"workspace": "/tmp/repo"}),
+        ]
+    )
+
+    cfg = await _codex_native_launch_config(session_id="conv_1", server_client=client)
+
+    assert cfg.workspace.name == "repo"
+    assert client.calls == 3
+    assert retry_sleeps == [3.0, 1.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retry_after", "attempts", "delays"),
+    [("3", 3, [3.0, 3.0]), ("3600", 1, [])],
+)
+async def test_persistent_rate_limit_stops_within_budget(
+    retry_sleeps: list[float], retry_after: str, attempts: int, delays: list[float]
+) -> None:
+    client = _SequenceClient([_Resp(429, None, headers={"Retry-After": retry_after})] * 3)
+
+    with pytest.raises(OmnigentError, match="GET /v1/sessions returned 429"):
+        await _codex_native_launch_config(session_id="conv_1", server_client=client)
+
+    assert client.calls == attempts
+    assert retry_sleeps == delays

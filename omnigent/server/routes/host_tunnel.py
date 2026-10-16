@@ -38,6 +38,7 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostFsResultFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalDoneFrame,
@@ -48,10 +49,13 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
     HostMcpServersResultFrame,
+    HostMcpToolsResultFrame,
     HostModelOptionsResultFrame,
+    HostPluginsResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostSkillContentResultFrame,
     HostSkillsResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
@@ -73,6 +77,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     RunnerExitReports,
 )
+from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores.host_store import HostStore
 
 _logger = logging.getLogger(__name__)
@@ -80,6 +85,7 @@ _logger = logging.getLogger(__name__)
 SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
+_HEARTBEAT_FAILURE_LOG_INTERVAL_S = 60.0
 
 RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
 """Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
@@ -305,8 +311,39 @@ def create_host_tunnel_router(
         conn: HostConnection | None = None
         host_persisted = False
         stage = "hello"
+        connected_at = time.monotonic()
+        ended_by: str | None = None
+        disconnect_error: BaseException | None = None
+        disconnect_attrs: dict[str, Any] | None = None
+
+        def connection_attrs() -> dict[str, Any]:
+            if disconnect_attrs is not None:
+                return {
+                    **disconnect_attrs,
+                    "ended_by": ended_by,
+                    **(conn.diagnostics.snapshot() if conn else {}),
+                }
+            return {
+                "host_id": host_id,
+                "connection_id": conn.hello.connection_id if conn else None,
+                "connection_age_s": round(time.monotonic() - connected_at, 3),
+                "ended_by": ended_by,
+                "retirement_reason": conn.retirement_reason if conn else None,
+                "sender_end_reason": conn.sender_end_reason if conn else None,
+                **(conn.diagnostics.snapshot() if conn else {}),
+            }
+
+        def report_diagnostics() -> None:
+            _logger.warning(
+                "Host %s tunnel scheduling or send delay",
+                host_id,
+                extra=debug_event("host_tunnel_health", **connection_attrs()),
+            )
+
         try:
-            raw = await ws.receive_text()
+            raw = await receive_tunnel_hello(ws, peer_kind="host", peer_id=host_id)
+            if raw is None:
+                return
             frame = decode_host_frame(raw)
             if not isinstance(frame, HostHelloFrame):
                 error = "expected host.hello frame"
@@ -357,6 +394,13 @@ def create_host_tunnel_router(
             # restart converges as soon as each host reconnects.
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             stage = "connected"
+            conn.diagnostics.settings.update(
+                tunnel_side="server",
+                app_ping_interval_s=PING_INTERVAL_S,
+                app_silence_timeout_s=PING_INTERVAL_S * PING_MISS_THRESHOLD,
+                protocol_keepalive_source="unavailable_from_asgi",
+            )
+            conn.diagnostics.frame_received()
             _logger.info(
                 "Host %s connected (version=%s, name=%s, runners=%s)",
                 host_id,
@@ -366,87 +410,104 @@ def create_host_tunnel_router(
                 extra=debug_event(
                     "host_tunnel",
                     phase="connected",
-                    host_id=host_id,
                     version=frame.version,
+                    **connection_attrs(),
                 ),
             )
 
-            sender_task = asyncio.create_task(
-                _sender_loop(ws, conn),
-                name=f"host-sender:{host_id}",
-            )
-            ping_task = asyncio.create_task(
-                _ping_loop(ws, conn, host_id, host_store),
-                name=f"host-ping:{host_id}",
-            )
-            receive_task = asyncio.create_task(
-                _receive_loop(
-                    ws,
-                    conn,
-                    host_id,
-                    host_store,
-                    host_registry,
-                    runner_exit_reports,
-                    on_runner_exited,
-                    on_host_update,
-                ),
-                name=f"host-receive:{host_id}",
-            )
+            async with conn.diagnostics.monitoring(
+                report_diagnostics, connection_id=frame.connection_id
+            ):
+                sender_task = asyncio.create_task(
+                    _sender_loop(ws, conn),
+                    name=f"host-sender:{host_id}",
+                )
+                heartbeat_requested = asyncio.Event()
+                heartbeat_task = asyncio.create_task(
+                    _heartbeat_loop(
+                        heartbeat_requested,
+                        host_id=host_id,
+                        host_store=host_store,
+                        connection_id=frame.connection_id,
+                    ),
+                    name=f"host-heartbeat:{host_id}",
+                )
+                ping_task = asyncio.create_task(
+                    _ping_loop(ws, conn, host_id, heartbeat_requested),
+                    name=f"host-ping:{host_id}",
+                )
+                receive_task = asyncio.create_task(
+                    _receive_loop(
+                        ws,
+                        conn,
+                        host_id,
+                        host_store,
+                        host_registry,
+                        runner_exit_reports,
+                        on_runner_exited,
+                        on_host_update,
+                    ),
+                    name=f"host-receive:{host_id}",
+                )
 
-            if on_host_connect is not None:
                 try:
-                    await asyncio.wait_for(
-                        on_host_connect(host_id, tunnel_owner),
-                        timeout=30.0,
-                    )
-                except asyncio.TimeoutError:
-                    _logger.warning(
-                        "on_host_connect callback timed out for %s",
-                        host_id,
-                    )
-                except Exception:
-                    _logger.exception(
-                        "on_host_connect callback failed for %s",
-                        host_id,
-                    )
+                    if on_host_connect is not None:
+                        try:
+                            await asyncio.wait_for(
+                                on_host_connect(host_id, tunnel_owner),
+                                timeout=30.0,
+                            )
+                        except asyncio.TimeoutError:
+                            _logger.warning(
+                                "on_host_connect callback timed out for %s",
+                                host_id,
+                            )
+                        except Exception:
+                            _logger.exception(
+                                "on_host_connect callback failed for %s",
+                                host_id,
+                            )
 
-            try:
-                done, _pending = await asyncio.wait(
-                    {sender_task, ping_task, receive_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in done:
-                    exc = task.exception() if not task.cancelled() else None
-                    if exc is not None:
-                        raise exc
-            finally:
-                for task in (sender_task, ping_task, receive_task):
-                    task.cancel()
-                await asyncio.gather(
-                    sender_task,
-                    ping_task,
-                    receive_task,
-                    return_exceptions=True,
-                )
-                # If the host already reconnected, this handler's connection
-                # was replaced; only the current one may mark it offline.
-                if host_registry.deregister(host_id, conn=conn):
-                    await asyncio.to_thread(host_store.set_offline, host_id)
-                if on_host_disconnect is not None:
-                    try:
-                        await on_host_disconnect(host_id, tunnel_owner)
-                    except Exception:
-                        _logger.exception(
-                            "on_host_disconnect callback failed for %s",
-                            host_id,
-                        )
+                    done, _pending = await asyncio.wait(
+                        {sender_task, ping_task, receive_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
+                    for task in done:
+                        exc = task.exception() if not task.cancelled() else None
+                        if exc is not None:
+                            raise exc
+                finally:
+                    conn.diagnostics.freeze()
+                    disconnect_attrs = connection_attrs()
+                    for task in (sender_task, ping_task, receive_task, heartbeat_task):
+                        task.cancel()
+                    await asyncio.gather(
+                        sender_task,
+                        ping_task,
+                        receive_task,
+                        heartbeat_task,
+                        return_exceptions=True,
+                    )
+                    # If the host already reconnected, this handler's connection
+                    # was replaced; only the current one may mark it offline.
+                    if host_registry.deregister(host_id, conn=conn):
+                        await asyncio.to_thread(host_store.set_offline, host_id)
+                    if on_host_disconnect is not None:
+                        try:
+                            await on_host_disconnect(host_id, tunnel_owner)
+                        except Exception:
+                            _logger.exception(
+                                "on_host_disconnect callback failed for %s",
+                                host_id,
+                            )
 
-        except WebSocketDisconnect:
-            _logger.warning(
-                "Host %s disconnected",
-                host_id,
-                extra=debug_event("host_tunnel", phase="disconnected", host_id=host_id),
-            )
+        except asyncio.CancelledError as exc:
+            disconnect_error = exc
+            ended_by = "handler_cancelled"
+            raise
+        except WebSocketDisconnect as exc:
+            disconnect_error = exc
             # Only run disconnect cleanup if we actually registered this
             # host on THIS connection. A connect that failed before
             # register — e.g. the upsert IntegrityError when a peer
@@ -464,10 +525,11 @@ def create_host_tunnel_router(
                             host_id,
                         )
         except Exception as exc:
+            disconnect_error = exc
             _logger.exception(
                 "Host tunnel error for %s",
                 host_id,
-                extra=debug_event("host_tunnel", phase="error", host_id=host_id, stage=stage),
+                extra=debug_event("host_tunnel", phase="error", stage=stage, **connection_attrs()),
             )
             retryable = stage in {"registration", "registry", "connected"}
             await _send_connection_error(
@@ -476,6 +538,9 @@ def create_host_tunnel_router(
                 error=str(exc),
                 retryable=retryable,
             )
+            if conn is not None:
+                conn.close_requested_code = 4005
+                conn.close_requested_reason = "host connection failed"
             with contextlib.suppress(Exception):
                 await ws.close(code=4005, reason="host connection failed")
             if conn is not None:
@@ -483,6 +548,36 @@ def create_host_tunnel_router(
                     await asyncio.to_thread(host_store.set_offline, host_id)
             elif host_persisted:
                 await asyncio.to_thread(host_store.set_offline, host_id)
+        finally:
+            if conn is not None or disconnect_error is not None:
+                log = _logger.info
+                if disconnect_error is not None and not isinstance(
+                    disconnect_error, asyncio.CancelledError
+                ):
+                    log = _logger.warning
+                log(
+                    "Host %s disconnected",
+                    host_id,
+                    extra=debug_event(
+                        "host_tunnel",
+                        phase="disconnected",
+                        stage=stage,
+                        **connection_attrs(),
+                        error_type=type(disconnect_error).__name__ if disconnect_error else None,
+                        close_code=(
+                            disconnect_error.code
+                            if isinstance(disconnect_error, WebSocketDisconnect)
+                            else None
+                        ),
+                        close_reason=(
+                            disconnect_error.reason
+                            if isinstance(disconnect_error, WebSocketDisconnect)
+                            else None
+                        ),
+                        close_requested_code=conn.close_requested_code if conn else None,
+                        close_requested_reason=conn.close_requested_reason if conn else None,
+                    ),
+                )
 
     return router
 
@@ -539,16 +634,19 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
         raced it.
     """
     while True:
-        data = await conn.outbound_queue.get()
-        if data is None:
+        frame = await conn.outbound_queue.get()
+        if frame is None:
+            conn.sender_end_reason = "queue_retired"
             return
+        conn.diagnostics.dequeued(frame)
         try:
-            await ws.send_text(data)
+            await conn.diagnostics.send(ws.send_text, frame.data, app_ping_ts=frame.app_ping_ts)
         except RuntimeError:
             if ws.application_state is WebSocketState.DISCONNECTED:
                 # The ping loop or registry retirement closed the socket
                 # concurrently; the disconnect is already logged there.
                 _logger.debug("Host %s send raced a concurrent close", conn.host_id)
+                conn.sender_end_reason = "send_after_close"
                 return
             raise
 
@@ -603,6 +701,7 @@ async def _receive_loop(
                 code=message.get("code", 1000),
                 reason=message.get("reason"),
             )
+        conn.diagnostics.frame_received()
         raw = message.get("text")
         if not isinstance(raw, str):
             continue
@@ -630,6 +729,7 @@ async def _receive_loop(
                 )
                 continue
             if isinstance(runner_frame, PongFrame):
+                conn.diagnostics.app_pong_received(runner_frame.ts)
                 # Host-tunnel keepalive round-trip. DEBUG because pings are
                 # frequent — opt in via log level. ``ts`` is epoch-ms stamped
                 # when the server pinged, so now - ts is the daemon round-trip.
@@ -688,7 +788,9 @@ async def _receive_loop(
             # the cause so the runner status endpoint can answer "offline, and
             # here is why" to the client still waiting for the runner to connect.
             if runner_exit_reports is not None:
-                runner_exit_reports.record(frame.runner_id, frame.error, conn.owner)
+                runner_exit_reports.record(
+                    frame.runner_id, frame.error, conn.owner, had_connected=frame.had_connected
+                )
             if on_runner_exited is None:
                 log_runner_exited(host_id, frame.runner_id, frame.error)
             else:
@@ -857,10 +959,30 @@ async def _receive_loop(
             if skills_future is not None and not skills_future.done():
                 skills_future.set_result(frame)
             continue
+        if isinstance(frame, HostHarnessStartupResultFrame):
+            startup_future = conn.pending_harness_startup.pop(frame.request_id, None)
+            if startup_future is not None and not startup_future.done():
+                startup_future.set_result(frame.startup)
+            continue
         if isinstance(frame, HostMcpServersResultFrame):
             mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)
             if mcp_future is not None and not mcp_future.done():
                 mcp_future.set_result(frame)
+            continue
+        if isinstance(frame, HostPluginsResultFrame):
+            plugins_future = conn.pending_plugins.pop(frame.request_id, None)
+            if plugins_future is not None and not plugins_future.done():
+                plugins_future.set_result(frame)
+            continue
+        if isinstance(frame, HostSkillContentResultFrame):
+            content_future = conn.pending_skill_content.pop(frame.request_id, None)
+            if content_future is not None and not content_future.done():
+                content_future.set_result(frame)
+            continue
+        if isinstance(frame, HostMcpToolsResultFrame):
+            tools_future = conn.pending_mcp_tools.pop(frame.request_id, None)
+            if tools_future is not None and not tools_future.done():
+                tools_future.set_result(frame)
             continue
         if isinstance(frame, HostImportLocalSessionFrame):
             queue = conn.pending_import_local.get(frame.request_id)
@@ -946,45 +1068,131 @@ async def _receive_loop(
         )
 
 
+async def _heartbeat_loop(
+    requested: asyncio.Event,
+    *,
+    host_id: str,
+    host_store: HostStore,
+    connection_id: str | None = None,
+) -> None:
+    """Serialize host-liveness writes independently of socket pings."""
+    failure_count = 0
+    last_failure_log_at = 0.0
+    while True:
+        await requested.wait()
+        requested.clear()
+        started_at = time.monotonic()
+        try:
+            # Cancellation cannot stop the thread, but heartbeat only updates
+            # last-seen; a late write cannot change an offline host's status.
+            await asyncio.to_thread(host_store.heartbeat, host_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- persistence must not kill the tunnel
+            failure_count += 1
+            now = time.monotonic()
+            if (
+                failure_count == 1
+                or now - last_failure_log_at >= _HEARTBEAT_FAILURE_LOG_INTERVAL_S
+            ):
+                _logger.warning(
+                    "Host %s heartbeat persistence failed (%s; failure %d)",
+                    host_id,
+                    type(exc).__name__,
+                    failure_count,
+                    extra=debug_event(
+                        "host_heartbeat_failed",
+                        host_id=host_id,
+                        connection_id=connection_id,
+                        failure_count=failure_count,
+                        error_type=type(exc).__name__,
+                        duration_s=round(time.monotonic() - started_at, 3),
+                        error_category=ErrorCategory.SERVER.value,
+                        error_impact=ErrorImpact.TRANSIENT.value,
+                        error_phase=ErrorPhase.UNKNOWN.value,
+                    ),
+                )
+                last_failure_log_at = now
+            continue
+
+        if failure_count:
+            _logger.info(
+                "Host %s heartbeat persistence recovered after %d failure(s)",
+                host_id,
+                failure_count,
+                extra=debug_event(
+                    "host_heartbeat_recovered",
+                    host_id=host_id,
+                    connection_id=connection_id,
+                    failure_count=failure_count,
+                    duration_s=round(time.monotonic() - started_at, 3),
+                    error_category=ErrorCategory.SERVER.value,
+                    error_impact=ErrorImpact.TRANSIENT.value,
+                    error_phase=ErrorPhase.UNKNOWN.value,
+                ),
+            )
+            failure_count = 0
+            last_failure_log_at = 0.0
+
+
 async def _ping_loop(
     ws: WebSocket,
     conn: HostConnection,
     host_id: str,
-    host_store: HostStore,
+    heartbeat_requested: asyncio.Event,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
-    Each tick that the host is still alive also persists a heartbeat
-    (``host_store.heartbeat``) so the host's last-seen timestamp stays
-    fresh in the DB. That timestamp is the liveness freshness gate
-    (:data:`omnigent.stores.host_store.HOST_LIVENESS_TTL_S`): when a
-    host dies without a graceful disconnect, the heartbeat stops, the
-    timestamp goes stale, and the host's sessions correctly drop out of
-    the connected set even though ``set_offline`` never ran.
+    Heartbeat persistence is signalled to a separate connection-owned worker,
+    so a slow or failing store cannot delay application pings or tear down the
+    socket route. The host's last-seen timestamp remains the liveness gate:
+    when a dead host stops responding, the ping timeout still closes it.
 
     :param ws: Accepted Starlette WebSocket.
     :param conn: Host connection for timing checks.
     :param host_id: Host id for logging.
-    :param host_store: Persistent host store the heartbeat is written to.
+    :param heartbeat_requested: Event consumed by the heartbeat writer.
     """
     while True:
         await asyncio.sleep(PING_INTERVAL_S)
         elapsed = time.time() - conn.last_frame_at
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
+            conn.close_requested_code = 4003
+            conn.close_requested_reason = "ping timeout"
             _logger.warning(
                 "Host %s missed %d ping intervals (%.0fs); declaring dead",
                 host_id,
                 PING_MISS_THRESHOLD,
                 elapsed,
+                extra=debug_event(
+                    "host_ping_timeout",
+                    host_id=host_id,
+                    connection_id=conn.hello.connection_id,
+                    silent_s=round(elapsed, 3),
+                    close_requested_code=4003,
+                    close_requested_reason="ping timeout",
+                    **conn.diagnostics.snapshot(),
+                ),
             )
             with contextlib.suppress(RuntimeError):
                 await ws.close(code=4003, reason="ping timeout")
             return
-        # The host is still within the liveness window — refresh its
-        # last-seen so the freshness gate keeps it in the online set.
-        await asyncio.to_thread(host_store.heartbeat, host_id)
+        # Keep persistence off this task: a slow/failing store must not delay
+        # the application ping or terminate the socket route.
+        heartbeat_requested.set()
         try:
-            ping_text = encode_frame(PingFrame(ts=int(time.time() * 1000)))
-            conn.outbound_queue.put_nowait(ping_text)
-        except Exception:  # noqa: BLE001
+            ping_ts = int(time.time() * 1000)
+            conn.enqueue(encode_frame(PingFrame(ts=ping_ts)), app_ping_ts=ping_ts)
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "Host %s application ping enqueue failed",
+                host_id,
+                extra=debug_event(
+                    "host_ping_failed",
+                    host_id=host_id,
+                    connection_id=conn.hello.connection_id,
+                    error_type=type(exc).__name__,
+                    **conn.diagnostics.snapshot(),
+                ),
+            )
             return

@@ -16,9 +16,12 @@ from omnigent.harnesses.claude_native.bridge import (
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
+    ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
     ClaudeSignInPending,
+    ClaudeTerminalDialog,
     ClaudeTerminalExited,
+    ClaudeUserPromptPending,
     TmuxSessionNotAdvertised,
     cancellable_injection,
     inject_slash_command,
@@ -197,7 +200,8 @@ class ClaudeNativeExecutor(Executor):
                     "Claude Code's sign-in runs in its own terminal, so /login and "
                     "/logout do nothing from the web chat. Run omni setup on the host "
                     "to sign in again — or to sign out — then retry."
-                )
+                ),
+                undelivered=True,
             )
             return
         from omnigent.runtime import telemetry
@@ -261,7 +265,7 @@ class ClaudeNativeExecutor(Executor):
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message)
+            yield ExecutorError(message=message, undelivered=True)
             return
         except ClaudePromptTimeout as exc:
             _logger.exception(
@@ -288,6 +292,35 @@ class ClaudeNativeExecutor(Executor):
                 remediation=exc.remediation,
                 undelivered=True,
             )
+            return
+        except ClaudeTerminalDialog as exc:
+            # The pane is parked on a surface the person clears from the
+            # embedded terminal; reaping it would destroy that. Both raisers
+            # (the readiness gate, and the slash-command refusal ahead of a
+            # routed /model) fail before the first keystroke, so the sender's
+            # queued copy is the only record of the message.
+            _logger.warning(
+                "claude-native: terminal surface blocks delivery; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            return
+        except ClaudeUserPromptPending as exc:
+            # A question or permission prompt held the message before its submit
+            # Enter; the pane stays for the person to answer it.
+            _logger.warning(
+                "claude-native: pending Claude prompt blocks delivery; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            return
+        except (TmuxSessionNotAdvertised, ClaudeMessageNotAccepted) as exc:
+            # The terminal may still launch, or its unsent draft may be recoverable.
+            _logger.warning(
+                "claude-native: terminal refused delivery; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc), undelivered=True)
             return
         except RuntimeError as exc:
             _logger.exception(

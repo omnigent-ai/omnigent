@@ -389,6 +389,7 @@ class BwrapSandboxBackend(SandboxBackend):
                 else None
             ),
             credential_proxy=sandbox_spec.credential_proxy,
+            git_ssh=sandbox_spec.git_ssh,
         )
 
     def wrap_launcher_argv(
@@ -627,7 +628,11 @@ class BwrapSandboxBackend(SandboxBackend):
         # Isolate the network namespace when networking is disabled OR
         # when egress rules are active (hard enforcement — the helper
         # has no direct internet; only the relay->proxy path works).
-        if not policy.allow_network or policy.egress_relay_port is not None:
+        if (
+            not policy.allow_network
+            or policy.egress_relay_port is not None
+            or policy.git_ssh_socket_path is not None
+        ):
             bwrap_args.append("--unshare-net")
 
         # Namespacing + lifecycle hardening.

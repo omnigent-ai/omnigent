@@ -42,6 +42,7 @@ from omnigent.debug_logging import (
     sse_logging_enabled,
 )
 from omnigent.errors import ErrorImpact, ErrorPhase
+from omnigent.native.input_diagnostics import input_attributes
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -149,6 +150,9 @@ _TURN_OUTCOME_IMPACT = {
 # correlates a call to its result without naming the tool), alongside the
 # content fields dropped in _sse_safe_attributes.
 _SSE_SAFE_KEYS = (
+    "parent_session_id",
+    "child_session_id",
+    "agent_id",
     "status",
     "call_id",
     "message_id",
@@ -179,6 +183,10 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
         value = event.get(key)
         if value is not None and not isinstance(value, (dict, list)):
             attrs[key] = value
+    if event.get("type") == "session.status":
+        count = event.get("background_task_count")
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            attrs["background_task_count"] = count
     response = event.get("response")
     if isinstance(response, dict) and isinstance(response.get("id"), str):
         attrs["response_id"] = response["id"]
@@ -186,18 +194,37 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
         attrs["response_id"] = event["response_id"]
     item = event.get("item")
     if isinstance(item, dict):
+        nested_response_id = item.get("response_id")
+        if (
+            "response_id" not in attrs
+            and isinstance(nested_response_id, str)
+            and len(nested_response_id) <= 256
+        ):
+            attrs["response_id"] = nested_response_id
         if isinstance(item.get("id"), str):
             attrs["item_id"] = item["id"]
         if isinstance(item.get("type"), str):
             attrs["item_type"] = item["type"]
-        # For error items, capture level and code so dashboards can exclude
-        # info-level notices from error-rate metrics.
+        # For error items capture code, level and source (all flat on the item
+        # from to_api_dict()) so dashboards can exclude info-level notices from
+        # error-rate metrics and group errors by cause and source.
         if item.get("type") == "error":
             if isinstance(item.get("level"), str):
                 attrs["item_level"] = item["level"]
             code = item.get("code")
             if isinstance(code, str) and len(code) <= 64:
                 attrs["item_code"] = code
+            source = item.get("source")
+            if isinstance(source, str) and len(source) <= 32:
+                attrs["item_source"] = source
+    if event.get("type") == "session.input.consumed":
+        data = event.get("data")
+        if isinstance(data, dict):
+            for key in ("item_id", "cleared_pending_id"):
+                value = data.get(key)
+                if isinstance(value, str) and len(value) <= 256:
+                    attrs[key] = value
+    attrs.update(input_attributes(event))
     error = event.get("error")
     if not isinstance(error, dict) and isinstance(response, dict):
         error = response.get("error")
@@ -366,7 +393,8 @@ def shutdown_all() -> None:
     Broadcasts the end-of-stream sentinel to every queued subscriber so
     SSE generators return at their next iteration without waiting for a
     heartbeat timeout or forced task cancellation. Called from the asyncio
-    event loop (``_ShutdownSignalingServer.shutdown`` in ``cli.py``) before
+    event loop (``ShutdownSignalingServer.shutdown`` in
+    ``omnigent.server.graceful_shutdown``) before
     uvicorn's graceful-shutdown wait starts, so streams drain within the
     window rather than being force-cancelled. Sync callers should use
     :func:`close` per-conversation instead.

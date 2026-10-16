@@ -2,7 +2,7 @@ import type { SVGProps } from "react";
 
 // Databricks brand mark, drawn in currentColor so it follows the app theme like
 // its sibling icons. No baked `<title>` — the consumer names it, so the badge
-// reads as what it means ("Routed by the Databricks AI Gateway") rather than a
+// reads as what it means ("Routed by the Databricks Unity Gateway") rather than a
 // product name.
 export function DatabricksIcon(props: SVGProps<SVGSVGElement>) {
   return (

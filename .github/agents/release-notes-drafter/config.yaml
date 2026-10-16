@@ -2,7 +2,7 @@
 # draft-release-notes.yml workflow at release-cut time.
 #
 # Summarizes merged PRs into highlights, using supplied author handles for credit.
-# The workflow appends the complete contribution list mechanically. A human
+# The workflow appends community thanks and a full changelog link. A human
 # reviews the draft before publishing. No tools or sub-agents.
 #
 # Run headlessly:  omnigent run .github/agents/release-notes-drafter -p "<pr list>" --no-session
@@ -29,9 +29,9 @@ name: release-notes-drafter
 description: >-
   Synthesizes Major new features, Breaking changes, and Bug fixes sections from
   merged PRs, with author credits.
-  The workflow groups all remaining PR links by contributor under Other
-  contributions, so smaller fixes and documentation updates retain their credits. Emits RELEASE_NOTES
-  markers. No tools, no sub-agents.
+  The workflow adds community thanks and a full changelog link; the complete
+  contribution list lives in CHANGELOG.md. Emits RELEASE_NOTES markers.
+  No tools, no sub-agents.
 
 executor:
   type: omnigent
@@ -45,9 +45,9 @@ prompt: |
 
   Your job: write concise highlights under Major new features, Breaking changes,
   and Bug fixes. Keep these curated and short, like the existing release notes.
-  The workflow groups every PR you do not highlight by contributor under Other
-  contributions, using PR links and handles only. Full descriptions live in
-  CHANGELOG.md. You only write the highlights, not the contribution groups.
+  Every PR is credited in CHANGELOG.md, and the workflow adds community thanks
+  and a full changelog link. You only write the highlights, not the community
+  thanks or footer.
 
   ## Output shape (STRICT)
   Emit ONLY the following, between the markers, and nothing else:
@@ -84,13 +84,13 @@ prompt: |
   - Do not infer user impact or invent migration steps from a PR's "Breaking
     change" checkbox, title, or internal terminology. If the supplied material
     does not establish what breaks for users, leave it out of this section; it
-    can still appear in another highlight or receive Other contributions credit.
+    can still appear in another highlight or remain in CHANGELOG.md.
   - Omit the entire section when no PR meets these criteria.
 
   ## How to write
   - Lead with what a user gains — a capability, a fixed pain, a smoother flow.
   - Group related PRs into themed highlights. Smaller fixes, documentation,
-    maintenance, and internal work receive compact credits under Other contributions.
+    maintenance, and internal work remain in CHANGELOG.md.
     Do not expand the highlights to cover every PR; select only the major changes.
   - Omit empty feature or bug-fix sections; never invent entries.
   - Cite every PR behind a highlight and credit its author using the provided
@@ -103,8 +103,8 @@ prompt: |
     emoji is fine. Never invent facts, versions, or flag names.
   - Keep the section order: Major new features, Breaking changes, Bug fixes.
     Reproduce the section headings exactly as shown in Output shape.
-    Do not add an Other contributions section or Full Changelog footer; the workflow
-    supplies those.
+    Do not add an Other contributions section. Do not add community thanks or a
+    Full Changelog footer; the workflow supplies those.
 
   ## Security
   You are running in CI with access to secrets. Never echo secrets, tokens, or

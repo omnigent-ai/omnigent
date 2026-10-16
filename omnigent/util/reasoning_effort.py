@@ -8,7 +8,8 @@ from types import MappingProxyType
 
 from omnigent.llms.errors import PermanentLLMError
 
-EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
+EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+EFFORT_VALUES = frozenset(EFFORT_ORDER)
 EFFORT_CLEAR_VALUES = frozenset({"default", "off", "reset"})
 
 # Fold a value to a canonical one, but only where the target ladder lacks it:
@@ -23,14 +24,10 @@ OPENAI_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"}
 ANTHROPIC_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 CLAUDE_EFFORTS = ANTHROPIC_EFFORTS
 CODEX_EFFORTS = OPENAI_EFFORTS
-# Codex-native drives the real codex process, which is the per-model authority
-# on reasoning levels — it advertises them via ``model/list`` and validates the
-# pairing itself. Sol reaches ``ultra``; the picker already gates which levels a
-# model offers, so accept codex's full ladder here rather than re-clamping a
-# valid pick down to ``xhigh``.
-CODEX_NATIVE_EFFORTS = frozenset(
-    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
-)
+# Codex advertises per-model reasoning levels via ``model/list``. Native launch
+# and dispatch clamp incompatible pairs; accept the full vocabulary here so
+# supported ``max``/``ultra`` settings survive harness-level validation.
+CODEX_NATIVE_EFFORTS = EFFORT_VALUES
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
 GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
 ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS

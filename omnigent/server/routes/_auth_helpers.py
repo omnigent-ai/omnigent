@@ -270,8 +270,8 @@ def _require_access_and_level_sync(
     reused for both the sub-agent parent check and the snapshot.
 
     Behaviour is identical to calling ``require_access`` followed by
-    ``get_permission_level``: the displayed level is the caller's direct
-    grant (no parent walk), while the access decision walks sub-agent
+    ``get_permission_level``: the displayed level combines direct and capped
+    public grants (no parent walk), while the access decision walks sub-agent
     parents and yields 403 vs 404 the same way.
 
     :param user_id: The authenticated user, or ``None`` to skip.
@@ -300,8 +300,7 @@ def _require_access_and_level_sync(
     # ``pool_pre_ping`` — is the cost that matters.
     with shared_read_scope():
         # Single round-trip: admin flag + the user's and public grants on the
-        # conversation the caller asked about. The displayed level is the direct
-        # grant (no parent walk), matching get_permission_level exactly.
+        # conversation the caller asked about, without a parent walk for display.
         access = permission_store.resolve_access(user_id, conversation_id)
         level = resolved_level(access)
 

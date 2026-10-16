@@ -259,6 +259,8 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: pytest-${{ matrix.group }}-${{ github.run_id }}
+          # A retry must replace the failed attempt's partial coverage.
+          overwrite: true
           path: artifacts/
           retention-days: 14
           include-hidden-files: true  # the per-shard .coverage.<group> dotfile
@@ -456,7 +458,7 @@ jobs:
           cache: ""
 
       - name: Install codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@4f403d71435055cf820984e829cb630cbc73da53
         with:
           harness: codex
 
@@ -558,6 +560,8 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: coverage-summary-${{ github.run_id }}
+          # The status workflow must consume the recomputed summary on retries.
+          overwrite: true
           path: coverage-summary/
           retention-days: 14
           if-no-files-found: ignore

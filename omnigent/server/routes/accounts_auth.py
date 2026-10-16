@@ -266,6 +266,24 @@ def create_accounts_auth_router(
     _session_cookie = config.session_cookie_name
     _session_max_age = config.session_ttl_hours * 3600
 
+    def _reissue_session_cookie(response: Response, user_id: str, generation: str) -> None:
+        """Keep the caller signed in after rotating their own account generation."""
+        bind_account_authority(user_id, generation)
+        session_jwt = mint_session_cookie(
+            user_id=user_id,
+            cookie_secret=config.cookie_secret,
+            ttl_hours=config.session_ttl_hours,
+            provider="accounts",
+            account_generation=generation,
+        )
+        _set_session_cookie(
+            response,
+            session_jwt,
+            cookie_name=_session_cookie,
+            secure=_secure,
+            max_age_seconds=_session_max_age,
+        )
+
     # ── Login / logout / me ───────────────────────────────────────
 
     @router.post("/login")
@@ -303,7 +321,8 @@ def create_accounts_auth_router(
 
         # Opportunistic rehash if argon2 parameters were upgraded.
         # Cheap and self-healing; failure is non-fatal (the user
-        # still gets logged in with the old hash).
+        # still gets logged in with the old hash). Same password, so
+        # the generation and the user's other sessions are kept.
         if needs_rehash(password_hash):
             try:
                 account_store.update_password(username, hash_password(body.password))
@@ -782,6 +801,7 @@ def create_accounts_auth_router(
         Mints a fresh random password, stores its hash, returns
         the plaintext exactly once to the calling admin who
         then DMs it to the user out-of-band. No SMTP needed.
+        Also revokes the user's existing sessions and CLI logins.
         """
         admin_id = auth_provider.get_user_id(request)
         if admin_id is None or not account_store.is_admin(admin_id):
@@ -793,20 +813,33 @@ def create_accounts_auth_router(
 
         new_password = secrets.token_urlsafe(16)
         with target_account_scope(user_id, user.account_generation):
-            account_store.update_password(user_id, hash_password(new_password))
+            generation = account_store.update_password(
+                user_id, hash_password(new_password), revoke_sessions=True
+            )
+        auth_provider.revoke_user_sessions(user_id)
         _logger.info(
             "auth/users/reset: %s reset by %s",
             _redact_for_log(user_id),
             _redact_for_log(admin_id),
         )
-        return JSONResponse(
+        resp = JSONResponse(
             status_code=200,
             content={"id": user_id, "new_password": new_password},
         )
+        # An admin resetting their own account keeps this session, so the
+        # next request cannot sign them out before they save the password.
+        if user_id == admin_id and generation is not None:
+            _reissue_session_cookie(resp, admin_id, generation)
+        return resp
 
     @router.post("/users/me/password")
     async def change_own_password(request: Request, body: ChangePasswordRequest) -> Response:
-        """Self-serve password change (requires old password)."""
+        """Self-serve password change (requires old password).
+
+        Revokes every other session and CLI login of the account. The
+        caller gets a fresh session cookie; a bearer-token caller must
+        log in again.
+        """
         user_id = auth_provider.get_user_id(request)
         if user_id is None:
             return JSONResponse(status_code=401, content={"error": "not authenticated"})
@@ -825,9 +858,15 @@ def create_accounts_auth_router(
         except InvalidPasswordError:
             return JSONResponse(status_code=401, content={"error": "old password incorrect"})
 
-        account_store.update_password(user_id, hash_password(body.new_password))
+        generation = account_store.update_password(
+            user_id, hash_password(body.new_password), revoke_sessions=True
+        )
+        auth_provider.revoke_user_sessions(user_id)
         _logger.info("auth/users/me/password: changed for %s", _redact_for_log(user_id))
-        return Response(status_code=204)
+        resp = Response(status_code=204)
+        if generation is not None:
+            _reissue_session_cookie(resp, user_id, generation)
+        return resp
 
     return router
 

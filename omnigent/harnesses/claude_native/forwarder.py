@@ -20,6 +20,7 @@ import httpx
 
 from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
@@ -29,6 +30,8 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     HookReadResult,
     TranscriptReadResult,
+    _display_text,
+    _transcript_items_from_entry,
     compute_transcript_cumulative_cost,
     read_active_session_id,
     read_bridge_id,
@@ -57,6 +60,12 @@ from omnigent.native._native_post_delivery import (
     post_external_session_status,
     post_may_have_been_delivered,
 )
+from omnigent.native.failure_telemetry import (
+    FailureContext,
+    failure_log_attributes,
+    native_failure_id,
+    normalize_failure_context,
+)
 from omnigent.process_logging import harness_stderr_capture_enabled
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.session_event_batch import (
@@ -64,6 +73,7 @@ from omnigent.session_event_batch import (
     encode_session_event_batch,
 )
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
+from omnigent.version import VERSION
 
 _FORWARDER_STATE_FILE = "transcript_forwarder.json"
 _HOOK_STATE_FILE = "hook_forwarder.json"
@@ -88,6 +98,20 @@ _TRUNCATABLE_SUBAGENT_FIELDS = frozenset(
 # a handful over its lifetime, so a small bound is ample while still
 # surviving a cursor rewind that re-reads an already-persisted summary.
 _MAX_PERSISTED_COMPACTION_SEQS = 16
+_COMPACTION_SNAPSHOT_MAX_FAILURES = 8
+
+
+class _CompactionSnapshotError(ValueError):
+    """A retryable failure while reading or reconstructing a local snapshot."""
+
+
+class _CompactionItemsReadError(httpx.HTTPError):
+    """An HTTP failure from the pre-POST latest-item lookup."""
+
+    def __init__(self, cause: httpx.HTTPError) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
 
 # Cap on the in-memory ``(message_id, index)`` dedupe ring for streamed
 # deltas. The byte offset already prevents re-reading on the normal
@@ -138,9 +162,15 @@ _MAX_SEEN_BTW_KEYS = 64
 # progress rather than that a healthy backlog drain simply took a long time.
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
 _POST_TIMEOUT_S = 10.0
+# A child-history POST carries up to 100 items and can outlast the live lane's
+# budget; that lane runs off the latency-sensitive path, so it gets more room.
+_SUBAGENT_POST_TIMEOUT_S = 30.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _SUBAGENT_FORWARD_CONCURRENCY = 8
-_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS = 12
+# A batch gets a bounded number of attempts before it is split into
+# source-keyed individual posts. Individual transient failures stay pending
+# at the durable cursor so a temporary outage cannot lose child history.
+_SUBAGENT_BATCH_MAX_TRANSIENT_ATTEMPTS = 12
 _CURSOR_FINGERPRINT_BYTES = 256
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _HTTP_POST_MAX_PERMANENT_FAILURES = 3
@@ -156,6 +186,17 @@ _HTTP_POST_RETRY_MAX_DELAY_S = 30.0
 # range for any realistic max_delay_s / base_delay_s ratio.
 _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT = 32
 _HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
+_FORWARDER_REJECTION_REASONS = frozenset(
+    {
+        ErrorCode.FORBIDDEN,
+        ErrorCode.INVALID_INPUT,
+        ErrorCode.NOT_FOUND,
+        "event batch exceeds count or size limit",
+        "event type is not allowed on runner tunnel",
+        "source_id required for tunnel replay",
+        "invalid session event",
+    }
+)
 # A 503 ``subagent_delivery_not_confirmed`` means the runner could not deliver a
 # terminal sub-agent result to the parent inbox. It is retried (the work entry can
 # be created slightly after the child reports terminal — a short dispatch race), but
@@ -168,6 +209,10 @@ _SUBAGENT_DROPPED_ITEM_REASON = "sub-agent transcript incomplete: an item could 
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
+# A poll that keeps failing (e.g. host credentials unavailable) backs off up to
+# this delay and logs its traceback once per streak, then at most this often.
+_LOOP_FAILURE_MAX_BACKOFF_S = 30.0
+_LOOP_FAILURE_LOG_INTERVAL_S = 300.0
 
 # Claude Code hook event names → Omnigent session-status values
 # published on the per-conversation SSE stream. Unmapped events emit
@@ -269,10 +314,17 @@ def _observe_transcript_discovery(
         "observer_stderr_bytes=%s hook_settings=%s"
     )
     if escalate:
-        _logger.error(
+        # An idle pane nobody has used yet never fires a hook; only evidence of a
+        # broken observer (stderr, hooks without a path, no settings) is an error.
+        hook_failure = bool(stderr_size) or hooks_size is not None or not settings_present
+        log = _logger.error if hook_failure else _logger.warning
+        log(
             "Claude transcript forwarding has not started: no observer hook reported a " + detail,
             *args,
-            extra={"session_id": session_id},
+            extra={
+                "session_id": session_id,
+                "discovery_verdict": "hook_failure" if hook_failure else "idle",
+            },
         )
         diagnostics.error_logged = True
         diagnostics.warning_logged = True
@@ -720,6 +772,8 @@ class TranscriptForwardState:
         waits for transcript quiescence). Persisted so a restart inside
         that window doesn't lose the settle — the hook cursor has
         already advanced past the Stop edge and won't re-read it.
+    :param api_error_context: Latest explicit API error for the current response.
+        Cleared by subsequent output and persisted for hook retries after restart.
     """
 
     transcript_path: Path
@@ -730,6 +784,7 @@ class TranscriptForwardState:
     cursor_fingerprint: str | None = None
     settled_response_id: str | None = None
     pending_settled_response_id: str | None = None
+    api_error_context: FailureContext | None = None
 
 
 @dataclass(frozen=True)
@@ -867,6 +922,9 @@ class _ForwardDedupeState:
     # partial answer.
     btw_pending_key: str | None = None
     posted_btw_keys: dict[str, None] = field(default_factory=dict)
+    # Session already logged as moved off this runner, so the notice is not
+    # repeated for every item dropped afterwards.
+    session_not_bound_logged_for: str | None = None
 
 
 @dataclass(frozen=True)
@@ -941,7 +999,6 @@ class _PostRetryTracker:
         *,
         max_permanent_attempts: int = _HTTP_POST_MAX_PERMANENT_FAILURES,
         max_not_confirmed_attempts: int = _SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS,
-        max_transient_attempts: int | None = None,
         base_delay_s: float = _HTTP_POST_RETRY_BASE_DELAY_S,
         max_delay_s: float = _HTTP_POST_RETRY_MAX_DELAY_S,
     ) -> None:
@@ -952,17 +1009,12 @@ class _PostRetryTracker:
             failure is exhausted.
         :param max_not_confirmed_attempts: Attempts before a
             ``subagent_delivery_not_confirmed`` 503 is exhausted.
-        :param max_transient_attempts: Optional attempt budget for transient
-            failures. ``None`` preserves indefinite retries.
         :param base_delay_s: Initial retry delay in seconds.
         :param max_delay_s: Maximum retry delay in seconds.
         :returns: None.
         """
         self._max_permanent_attempts = max(1, max_permanent_attempts)
         self._max_not_confirmed_attempts = max(1, max_not_confirmed_attempts)
-        self._max_transient_attempts = (
-            max(1, max_transient_attempts) if max_transient_attempts is not None else None
-        )
         self._base_delay_s = max(0.0, base_delay_s)
         self._max_delay_s = max(0.0, max_delay_s)
         self._entries: dict[str, _PostRetryEntry] = {}
@@ -987,6 +1039,14 @@ class _PostRetryTracker:
         """Return whether ``key`` has a recorded failure awaiting retry."""
         return key in self._entries
 
+    def has_pending_retry_prefix(self, prefix: str) -> bool:
+        """Return whether a retry under ``prefix`` is waiting for backoff."""
+        now = time.monotonic()
+        return any(
+            key.startswith(prefix) and entry.next_attempt_at > now
+            for key, entry in self._entries.items()
+        )
+
     def clear(self, key: str) -> None:
         """
         Remove retry state for a successfully handled event.
@@ -999,8 +1059,24 @@ class _PostRetryTracker:
         # delivered); reset process-level forward-sync health (#1120).
         _note_forward_success()
 
+    def clear_snapshot_failure(self, key: str) -> None:
+        """Remove local snapshot retry state without changing HTTP health."""
+        self._entries.pop(key, None)
+
+    def snapshot_fallback_due(self, key: str) -> bool:
+        """Use the SDK fallback on the final local snapshot attempt."""
+        entry = self._entries.get(key)
+        return _COMPACTION_SNAPSHOT_MAX_FAILURES <= 1 or (
+            entry is not None and entry.attempts >= _COMPACTION_SNAPSHOT_MAX_FAILURES - 1
+        )
+
     def record_failure(
-        self, key: str, exc: httpx.HTTPError, *, session_id: str
+        self,
+        key: str,
+        exc: httpx.HTTPError,
+        *,
+        session_id: str,
+        max_transient_attempts: int | None = None,
     ) -> _PostRetryDecision:
         """
         Record one failed post and compute the next retry action.
@@ -1008,6 +1084,8 @@ class _PostRetryTracker:
         :param key: Stable retry key, e.g. ``"item:source-1"``.
         :param exc: HTTP exception raised while posting the event.
         :param session_id: Session targeted by the failed post.
+        :param max_transient_attempts: Optional batch budget before splitting
+            into individual requests. Individual transient failures have no limit.
         :returns: Retry decision for this failure.
         """
         # Count every failed post (transient or permanent) so a sustained
@@ -1026,8 +1104,8 @@ class _PostRetryTracker:
             or (
                 not permanent
                 and not not_confirmed
-                and self._max_transient_attempts is not None
-                and entry.attempts >= self._max_transient_attempts
+                and max_transient_attempts is not None
+                and entry.attempts >= max(1, max_transient_attempts)
             )
         )
         if give_up:
@@ -1049,6 +1127,39 @@ class _PostRetryTracker:
             delay_s=delay_s,
             exhausted=False,
             permanent=permanent,
+        )
+
+    def record_snapshot_failure(
+        self,
+        key: str,
+        *,
+        max_attempts: int,
+    ) -> _PostRetryDecision:
+        """Record a bounded local snapshot failure using the normal backoff."""
+        entry = self._entries.get(key)
+        if entry is None:
+            entry = _PostRetryEntry()
+            self._entries[key] = entry
+        entry.attempts += 1
+        if entry.attempts >= max(1, max_attempts):
+            entry.next_attempt_at = time.monotonic()
+            return _PostRetryDecision(
+                attempts=entry.attempts,
+                delay_s=0.0,
+                exhausted=True,
+                permanent=False,
+            )
+        exponent = min(max(0, entry.attempts - 1), _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT)
+        delay_s = min(
+            self._base_delay_s * (2**exponent),
+            self._max_delay_s,
+        )
+        entry.next_attempt_at = time.monotonic() + delay_s
+        return _PostRetryDecision(
+            attempts=entry.attempts,
+            delay_s=delay_s,
+            exhausted=False,
+            permanent=False,
         )
 
 
@@ -1079,10 +1190,13 @@ async def _forward_claude_diagnostics(
     bridge_dir: Path,
     session_id: str,
     poll_interval_s: float,
-) -> AsyncIterator[None]:
+) -> AsyncIterator[Callable[[], FailureContext]]:
     """Follow diagnostics independently of transcript discovery and HTTP progress."""
     if not harness_stderr_capture_enabled():
-        yield
+        yield lambda: {
+            "diagnostic_capture_enabled": False,
+            "diagnostic_capture_state": "disabled",
+        }
         return
 
     follower = ClaudeDebugLogFollower(bridge_dir)
@@ -1113,7 +1227,7 @@ async def _forward_claude_diagnostics(
 
     task = asyncio.create_task(poll(), name=f"claude-diagnostics-{session_id}")
     try:
-        yield
+        yield follower.health_snapshot
     finally:
         stop.set()
         # Let an in-flight thread finish before closing its descriptor. A second
@@ -1188,10 +1302,9 @@ async def forward_claude_transcript_to_session(
     seen_delta_keys: dict[tuple[str, int], None] = {}
     item_retries = _PostRetryTracker()
     status_retries = _PostRetryTracker()
+    compaction_retries = _PostRetryTracker()
     subagent_start_retries = _PostRetryTracker()
-    subagent_item_retries = _PostRetryTracker(
-        max_transient_attempts=_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS
-    )
+    subagent_item_retries = _PostRetryTracker()
     subagent_status_retries = _PostRetryTracker()
     session_event_batch_capability = _SessionEventBatchCapability()
     delta_batch_capability = _SessionEventBatchCapability()
@@ -1222,10 +1335,11 @@ async def forward_claude_transcript_to_session(
     observer_stderr_offset = 0
     transcript_diagnostics = _TranscriptDiscoveryDiagnostics(started_at=time.monotonic())
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
+    subagent_timeout = httpx.Timeout(_SUBAGENT_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
     async with (
-        _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s),
+        _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s) as diagnostic_health,
         open_server_client(
             base_url,
             headers=headers,
@@ -1237,10 +1351,12 @@ async def forward_claude_transcript_to_session(
             base_url,
             headers=headers,
             auth=auth,
-            timeout=timeout,
+            timeout=subagent_timeout,
             event_dispatcher=event_dispatcher,
         ) as subagent_client,
     ):
+        loop_failures = 0
+        loop_failure_logged_at = 0.0
         while True:
             try:
                 if subagent_task is not None and subagent_task.done():
@@ -1307,10 +1423,9 @@ async def forward_claude_transcript_to_session(
                         await _write_subagent_forward_state_async(bridge_dir, subagent_state)
                         item_retries = _PostRetryTracker()
                         status_retries = _PostRetryTracker()
+                        compaction_retries = _PostRetryTracker()
                         subagent_start_retries = _PostRetryTracker()
-                        subagent_item_retries = _PostRetryTracker(
-                            max_transient_attempts=_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS
-                        )
+                        subagent_item_retries = _PostRetryTracker()
                         subagent_status_retries = _PostRetryTracker()
                         external_session_id_mirrored = False
                         task_subjects = {}
@@ -1350,10 +1465,9 @@ async def forward_claude_transcript_to_session(
                         await _write_subagent_forward_state_async(bridge_dir, subagent_state)
                         item_retries = _PostRetryTracker()
                         status_retries = _PostRetryTracker()
+                        compaction_retries = _PostRetryTracker()
                         subagent_start_retries = _PostRetryTracker()
-                        subagent_item_retries = _PostRetryTracker(
-                            max_transient_attempts=_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS
-                        )
+                        subagent_item_retries = _PostRetryTracker()
                         subagent_status_retries = _PostRetryTracker()
                         external_session_id_mirrored = False
                         task_subjects = {}
@@ -1421,6 +1535,7 @@ async def forward_claude_transcript_to_session(
                             agent_name=agent_name,
                             state=state,
                             retry_tracker=item_retries,
+                            compaction_retry_tracker=compaction_retries,
                             skip_user_messages=skip_user_messages,
                             dedupe=dedupe,
                         )
@@ -1430,6 +1545,7 @@ async def forward_claude_transcript_to_session(
                             bridge_dir=bridge_dir,
                             state=hook_state,
                             retry_tracker=status_retries,
+                            compaction_retry_tracker=compaction_retries,
                             dedupe=dedupe,
                             task_subjects=task_subjects,
                             task_statuses=task_statuses,
@@ -1441,6 +1557,7 @@ async def forward_claude_transcript_to_session(
                             # above, so ``state.current_response_id`` is the active
                             # turn's id.
                             response_id=state.current_response_id,
+                            diagnostic_health=diagnostic_health,
                         )
                         # Deferred ``/compact``-refusal dismissal: runs AFTER
                         # the hook phase so the ``failed`` post always follows
@@ -1533,16 +1650,48 @@ async def forward_claude_transcript_to_session(
                     extra={"session_id": session_id},
                 )
             except Exception:
-                _logger.exception(
-                    "Claude transcript forwarder loop failed; session=%s",
-                    session_id,
-                    extra={"session_id": session_id},
-                )
+                loop_failures += 1
+                now = time.monotonic()
+                if (
+                    loop_failures == 1
+                    or now - loop_failure_logged_at >= _LOOP_FAILURE_LOG_INTERVAL_S
+                ):
+                    loop_failure_logged_at = now
+                    _logger.exception(
+                        "Claude transcript forwarder loop failed; session=%s failures=%d",
+                        session_id,
+                        loop_failures,
+                        extra={"session_id": session_id},
+                    )
+            else:
+                if loop_failures:
+                    _logger.info(
+                        "Claude transcript forwarder loop recovered after %d failures; session=%s",
+                        loop_failures,
+                        session_id,
+                        extra={"session_id": session_id},
+                    )
+                loop_failures = 0
             try:
-                await asyncio.sleep(poll_interval_s)
+                await asyncio.sleep(_loop_retry_delay_s(poll_interval_s, loop_failures))
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
                 raise
+
+
+def _loop_retry_delay_s(poll_interval_s: float, consecutive_failures: int) -> float:
+    """
+    Return how long the forwarder loop sleeps before its next poll.
+
+    :param poll_interval_s: The configured delay between healthy polls.
+    :param consecutive_failures: Polls that have failed in a row.
+    :returns: ``poll_interval_s`` while healthy, then doubling per failure
+        up to :data:`_LOOP_FAILURE_MAX_BACKOFF_S`.
+    """
+    if consecutive_failures <= 0:
+        return poll_interval_s
+    backoff_s = poll_interval_s * 2 ** min(consecutive_failures, 16)
+    return min(backoff_s, max(poll_interval_s, _LOOP_FAILURE_MAX_BACKOFF_S))
 
 
 def _subagents_dir_for_transcript(transcript_path: Path) -> Path:
@@ -1995,6 +2144,8 @@ async def _post_external_conversation_item_batch(
     encoded = _encoded_subagent_batch(items)
     if len(encoded) > MAX_SUBAGENT_EVENT_BATCH_BYTES:
         raise ValueError("encoded session event batch exceeds the 5 MiB forwarder limit")
+    for entry in items:
+        _log_transcript_failure(session_id, entry.item)
     response = await client.post(
         f"/v1/sessions/{session_id}/events",
         content=encoded,
@@ -2074,6 +2225,14 @@ async def _forward_one_subagent(
     status_capability: _SubagentStatusCapability,
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches."""
+    retry_prefixes = (
+        f"subagent_batch:{entry.child_conversation_id}:",
+        f"subagent_item:{entry.child_conversation_id}:",
+    )
+    if any(item_retry_tracker.has_pending_retry_prefix(prefix) for prefix in retry_prefixes):
+        # The failed head item still owns the source cursor. Avoid reparsing a
+        # large child transcript on every poll while its capped backoff runs.
+        return
     jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
     if not jsonl_path.exists():
         return
@@ -2165,7 +2324,10 @@ async def _forward_one_subagent(
                 )
             except httpx.HTTPError as exc:
                 decision = item_retry_tracker.record_failure(
-                    retry_key, exc, session_id=entry.child_conversation_id
+                    retry_key,
+                    exc,
+                    session_id=entry.child_conversation_id,
+                    max_transient_attempts=_SUBAGENT_BATCH_MAX_TRANSIENT_ATTEMPTS,
                 )
                 if not decision.exhausted:
                     _logger.warning(
@@ -2182,65 +2344,16 @@ async def _forward_one_subagent(
                         extra={"session_id": parent_session_id},
                     )
                     break
-                if (
-                    not decision.permanent
-                    and not _is_subagent_delivery_not_confirmed(exc)
-                    and not _batch_response_never_received(exc)
-                ):
-                    _logger.error(
-                        "Dropping claude-native sub-agent transcript batch after "
-                        "transient delivery retries were exhausted; child=%s items=%s "
-                        "attempts=%s http_status=%s",
-                        entry.child_conversation_id,
-                        len(batch),
-                        decision.attempts,
-                        _http_status_for_log(exc),
-                        extra={
-                            "session_id": entry.child_conversation_id,
-                            "event_name": "claude_subagent_transcript_dropped",
-                            "attributes": {
-                                "parent_session_id": parent_session_id,
-                                "drop_reason": "transient_retries_exhausted",
-                                "item_count": len(batch),
-                                "http_status": _http_status_for_log(exc),
-                                "attempts": decision.attempts,
-                                "exception_type": type(exc).__name__,
-                            },
-                        },
-                    )
-                    for pending_item in batch:
-                        item = pending_item.item
-                        append_dead_letter(
-                            bridge_dir,
-                            session_id=entry.child_conversation_id,
-                            event_type="external_conversation_item",
-                            payload={
-                                "source_id": item.source_id,
-                                "item_type": item.item_type,
-                                "item_data": item.data,
-                                "response_id": item.response_id,
-                            },
-                            reason="transient HTTP failure after retries",
-                            delivered_ambiguous=False,
-                            http_status=_http_status_for_log(exc),
-                        )
-                    completed_items.extend(batch)
-                    new_entry = replace(
-                        new_entry,
-                        last_activity_ts=now,
-                        delivery_error=_SUBAGENT_DROPPED_ITEM_REASON,
-                    )
-                else:
-                    _logger.warning(
-                        "Re-driving claude-native sub-agent transcript batch individually "
-                        "after HTTP failures; child=%s items=%s attempts=%s http_status=%s",
-                        entry.child_conversation_id,
-                        len(batch),
-                        decision.attempts,
-                        _http_status_for_log(exc),
-                        extra={"session_id": parent_session_id},
-                    )
-                    retry_individually = True
+                _logger.warning(
+                    "Re-driving claude-native sub-agent transcript batch individually "
+                    "after HTTP failures; child=%s items=%s attempts=%s http_status=%s",
+                    entry.child_conversation_id,
+                    len(batch),
+                    decision.attempts,
+                    _http_status_for_log(exc),
+                    extra={"session_id": parent_session_id},
+                )
+                retry_individually = True
             else:
                 completed_items.extend(batch)
                 delivered = True
@@ -2444,6 +2557,21 @@ def _tool_use_ids_in_transcript(
     return tool_use_ids
 
 
+def _subagent_own_spawn_tool_use_id(agent_jsonl_path: Path) -> str | None:
+    """Return the spawn tool-use id that created the sub-agent owning
+    *agent_jsonl_path*, read from its sibling ``agent-<id>.meta.json``.
+
+    Used by :func:`_subagent_parents_by_tool_use` to drop a sub-agent's own
+    spawn id from the ownership its transcript contributes. Returns ``None``
+    when the meta is missing or malformed, which leaves correlation unchanged.
+    """
+    meta_path = agent_jsonl_path.with_name(
+        agent_jsonl_path.name.removesuffix(".jsonl") + ".meta.json"
+    )
+    meta = _read_subagent_meta(meta_path)
+    return meta["toolUseId"] if meta is not None else None
+
+
 def _subagent_parents_by_tool_use(
     transcript_path: Path,
     subagents_dir: Path,
@@ -2464,10 +2592,23 @@ def _subagent_parents_by_tool_use(
         for path in sorted(subagents_dir.glob("agent-*.jsonl"))
     )
     for path, owner_id in transcript_owners:
+        # A ``fork`` sub-agent starts from a copy of the parent conversation,
+        # which includes the Agent/Task record that spawned the fork itself.
+        # Counting that inherited copy would make the fork an owner of its own
+        # spawn id — self-parenting it, or colliding with the real issuer so
+        # the id is dropped as ambiguous below. Either way the fork never
+        # resolves to a parent and is never registered as a child row. An agent
+        # is never its own parent, so skip only its own spawn id; ids it
+        # genuinely issued for its children still count.
+        own_spawn_tool_use_id = (
+            _subagent_own_spawn_tool_use_id(path) if owner_id is not None else None
+        )
         for tool_use_id in _tool_use_ids_in_transcript(
             path,
             include_sidechains=owner_id is not None,
         ):
+            if tool_use_id == own_spawn_tool_use_id:
+                continue
             if tool_use_id in owners and owners[tool_use_id] != owner_id:
                 ambiguous.add(tool_use_id)
             else:
@@ -2824,7 +2965,7 @@ def _session_cost_estimate(
     call via :func:`asyncio.to_thread`. ``C`` is the forwarder's real-time
     estimate: the parent transcript's own cost (sidechains excluded) plus
     the sum of each tracked sub-agent's own transcript cost (each priced
-    once per ``requestId`` — see
+    once per API response — see
     :func:`compute_transcript_cumulative_cost`). ``S`` is the statusLine
     total. See :func:`_forward_session_cost` for why the two are combined
     with ``max`` rather than added.
@@ -2892,8 +3033,8 @@ async def _forward_session_cost(
       for display.
     - ``policy_cost_usd`` = ``max(S, C)`` — the POLICY/budget cost. ``C``
       is the forwarder's real-time estimate (parent transcript own
-      messages + each tracked sub-agent's transcript, each priced once
-      per ``requestId``). ``C`` advances while ``S`` is frozen, so the
+      messages + each tracked sub-agent's transcript, each response
+      priced once). ``C`` advances while ``S`` is frozen, so the
       gate sees in-flight sub-agent spend and can block mid-turn. With no
       sub-agent there is no lag, so it equals ``S``.
 
@@ -3465,22 +3606,63 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
-def _stop_failure_detail(record: ClaudeHookRecord) -> str | None:
+def _stop_failure_detail(
+    record: ClaudeHookRecord,
+    *,
+    session_id: str,
+    transcript_context: FailureContext | None = None,
+) -> str | None:
     """
     Return the reason a ``StopFailure`` hook gives for its failed turn.
 
-    The hook carries the error text Claude Code rendered, which the transcript
-    mirror can deliver after the failed edge or not at all; without it the
-    server borrows the turn's last prose or reports no detail.
+    When ``error_details`` is absent, prefer an explicit API error from the
+    same response; only the category-or-nothing fallback is logged as a
+    WARNING so the missing field stays observable in structured logs.
 
     :param record: ``StopFailure`` hook record.
-    :returns: The error text, a category-only fallback, or ``None``.
+    :param session_id: Session id for structured warning logs on fallback.
+    :param transcript_context: Explicit API-error evidence matched to this hook.
+    :returns: The error detail, a category-only fallback, or ``None``.
     """
     if record.failure_message is not None:
         return record.failure_message
+    if transcript_context is not None:
+        message = transcript_context.get("native_error_message")
+        if isinstance(message, str):
+            return _display_text(message, is_api_error=True)
+    _logger.warning(
+        "StopFailure hook carried no error_details; using fallback detail; "
+        "session=%s event_cursor=%s category=%s",
+        session_id,
+        record.event_cursor,
+        record.failure_category,
+        extra={"session_id": session_id},
+    )
     if record.failure_category is not None:
         return f"Claude Code ended the turn with an API error ({record.failure_category})."
     return None
+
+
+def _transcript_api_error_for_hook(
+    bridge_dir: Path, record: ClaudeHookRecord, response_id: str | None
+) -> FailureContext | None:
+    """Match durable API-error evidence to the failed response and native session."""
+    if not response_id or not record.claude_session_id:
+        return None
+    state = _read_forward_state(bridge_dir)
+    if state is None or state.current_response_id != response_id:
+        return None
+    context = state.api_error_context
+    if (
+        not context
+        or context.get("native_api_error_message") is not True
+        or context.get("native_session_id") != record.claude_session_id
+        or context.get("native_agent_role") == "subagent"
+        or context.get("native_agent_id")
+        or not isinstance(context.get("native_error_message"), str)
+    ):
+        return None
+    return context
 
 
 def _is_subagent_hook_record(
@@ -3496,19 +3678,115 @@ def _is_subagent_hook_record(
     subagents share the parent's session id and transcript path, so an
     ``agent_id`` marks them. Fallback: the ``subagents/`` path component.
     """
+    return _subagent_hook_reason(record, parent_claude_session_ids) is not None
+
+
+def _subagent_hook_reason(
+    record: ClaudeHookRecord, parent_claude_session_ids: Collection[str] | None
+) -> str | None:
+    """Explain the existing subagent suppression decision without changing it."""
     if record.agent_id is not None:
-        return True
+        return "native_agent_id"
     # Primary: id not in any id the parent has ever held → subagent.
     if (
         parent_claude_session_ids
         and record.claude_session_id
         and record.claude_session_id not in parent_claude_session_ids
     ):
-        return True
+        return "foreign_native_session_id"
     # Fallback: subagent directory structure.
     if record.transcript_path is None:
-        return False
-    return "subagents" in record.transcript_path.parts
+        return None
+    return "subagent_transcript_path" if "subagents" in record.transcript_path.parts else None
+
+
+def _stop_failure_context(
+    record: ClaudeHookRecord,
+    *,
+    session_id: str,
+    parent_claude_session_ids: Collection[str],
+    diagnostic_health: Callable[[], FailureContext] | None = None,
+    transcript_context: FailureContext | None = None,
+) -> FailureContext:
+    """Preserve hook evidence separately from the displayed error detail."""
+    reason = _subagent_hook_reason(record, parent_claude_session_ids)
+    # Transcript evidence only stands in for absent ``error_details``, matching
+    # the precedence ``_stop_failure_detail`` applies to the displayed detail.
+    explicit_api_error = transcript_context if record.failure_message is None else None
+    context: dict[str, object] = {
+        **(record.failure_context or {}),
+        **(explicit_api_error or {}),
+        "failure_id": native_failure_id(
+            "claude_hook",
+            session_id,
+            record.claude_session_id,
+            record.agent_id,
+            record.event_cursor,
+            record.byte_offset,
+            record.recorded_at,
+        ),
+        "failure_source": "claude_hook",
+        "native_harness": "claude-native",
+        "native_error_category": record.failure_category,
+        "native_session_id": record.claude_session_id,
+        "native_agent_id": record.agent_id,
+        "native_agent_role": "subagent"
+        if reason
+        else (
+            "session_agent" if record.claude_session_id in parent_claude_session_ids else "unknown"
+        ),
+        "failure_decision": "suppressed" if reason else "session_failed",
+        "suppression_reason": reason,
+        "detail_source": (
+            "hook_error_details"
+            if record.failure_message is not None
+            else "explicit_api_error"
+            if explicit_api_error is not None
+            else "hook_error_category"
+            if record.failure_category is not None
+            else "missing"
+        ),
+        "native_hook_event": record.event_name,
+        "native_hook_cursor": record.event_cursor,
+        "native_hook_offset": record.byte_offset,
+        "native_hook_recorded_at": record.recorded_at,
+        "runner_version": VERSION,
+    }
+    if reason and len(parent_claude_session_ids) == 1:
+        context["native_parent_session_id"] = next(iter(parent_claude_session_ids))
+    if diagnostic_health is not None:
+        try:
+            context.update(diagnostic_health())
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot interrupt forwarding
+            _logger.debug("Claude diagnostic health snapshot failed: %s", type(exc).__name__)
+    return normalize_failure_context(context)
+
+
+def _log_transcript_failure(session_id: str, item: ClaudeTranscriptItem) -> None:
+    """Observe explicit API errors without manufacturing a failed status edge."""
+    if item.failure_context is None:
+        return
+    try:
+        context = {
+            **item.failure_context,
+            "failure_id": native_failure_id("claude_transcript", session_id, item.source_id),
+            "failure_source": "claude_transcript",
+            "detail_source": "explicit_api_error",
+            "failure_decision": "observed",
+            "runner_version": VERSION,
+        }
+        _logger.info(
+            "Claude native API-error evidence observed; session=%s",
+            session_id,
+            extra=debug_event(
+                "native_failure_observed",
+                session_id=session_id,
+                response_id=item.response_id,
+                **failure_log_attributes(context),
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - telemetry cannot interrupt forwarding
+        _logger.debug("Claude transcript failure telemetry failed: %s", type(exc).__name__)
 
 
 def _is_fork_hook_record(record: ClaudeHookRecord) -> bool:
@@ -3729,7 +4007,9 @@ async def _forward_available_status_events(
     task_subjects: dict[str, str],
     task_statuses: dict[str, str],
     task_order: list[str],
+    compaction_retry_tracker: _PostRetryTracker | None = None,
     response_id: str | None = None,
+    diagnostic_health: Callable[[], FailureContext] | None = None,
 ) -> HookForwardState:
     """
     Forward currently available hook events as ``session.status``.
@@ -3754,6 +4034,8 @@ async def _forward_available_status_events(
     :param state: Current hook cursor state.
     :param retry_tracker: In-memory retry/backoff tracker for hook
         status posts.
+    :param compaction_retry_tracker: Shared retry/backoff tracker for local
+        compaction snapshot reads; ``retry_tracker`` when omitted.
     :param dedupe: Mutable per-session baseline; turn-end edges record
         the ended turn's id on it as a pending settle (scheduled-wake
         detection — see :func:`_promote_pending_settle`).
@@ -3772,10 +4054,13 @@ async def _forward_available_status_events(
         closes the streaming ``activeResponse`` opened by the matching
         turn-start ``running`` edge. ``None`` when no turn id is known
         (the status still posts, just without a turn association).
+    :param diagnostic_health: Latest metadata-only diagnostic follower snapshot.
     :returns: Updated state. On post failure, returns the last
         durable state so successfully-posted statuses are not
         retried and the failing event is retried later.
     """
+    if compaction_retry_tracker is None:
+        compaction_retry_tracker = retry_tracker
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
     # Read all session ids ever pinned to this bridge so a rotation race
     # (batch spans the old id's StopFailure and the new SessionStart)
@@ -3815,6 +4100,29 @@ async def _forward_available_status_events(
         if status is not None and _is_subagent_hook_record(
             record, parent_claude_session_ids=parent_claude_session_ids
         ):
+            if status == "failed":
+                try:
+                    _logger.info(
+                        "Claude native subagent failure suppressed; session=%s",
+                        session_id,
+                        extra=debug_event(
+                            "native_failure_observed",
+                            session_id=session_id,
+                            response_id=response_id,
+                            **failure_log_attributes(
+                                _stop_failure_context(
+                                    record,
+                                    session_id=session_id,
+                                    parent_claude_session_ids=parent_claude_session_ids,
+                                    diagnostic_health=diagnostic_health,
+                                )
+                            ),
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001 - telemetry must not affect status
+                    _logger.debug(
+                        "Claude subagent failure telemetry failed: %s", type(exc).__name__
+                    )
             _logger.debug(
                 "Skipping subagent hook status; session=%s event=%s status=%s transcript=%s",
                 session_id,
@@ -3929,14 +4237,37 @@ async def _forward_available_status_events(
                         retry_key = f"compaction-hook:{record.event_cursor}"
                         if retry_tracker.retry_delay_s(retry_key) is not None:
                             return durable
+                        snapshot_retry_key = f"compaction-snapshot:{seq}"
+                        if compaction_retry_tracker.retry_delay_s(snapshot_retry_key) is not None:
+                            return durable
                         try:
                             await _persist_native_compaction_item(
                                 client,
                                 session_id=session_id,
                                 bridge_dir=bridge_dir,
+                                allow_snapshot_fallback=compaction_retry_tracker.snapshot_fallback_due(
+                                    snapshot_retry_key
+                                ),
                             )
+                        except _CompactionSnapshotError:
+                            decision = compaction_retry_tracker.record_snapshot_failure(
+                                snapshot_retry_key,
+                                max_attempts=_COMPACTION_SNAPSHOT_MAX_FAILURES,
+                            )
+                            _logger.warning(
+                                "Failed to read Claude compaction snapshot (hook path); "
+                                "session=%s seq=%s attempt=%s next_retry_s=%.3f",
+                                session_id,
+                                seq,
+                                decision.attempts,
+                                decision.delay_s,
+                                extra={"session_id": session_id},
+                            )
+                            return durable
                         except httpx.HTTPError as exc:
-                            if post_may_have_been_delivered(exc):
+                            items_read_error = isinstance(exc, _CompactionItemsReadError)
+                            http_exc = exc.cause if items_read_error else exc
+                            if not items_read_error and post_may_have_been_delivered(http_exc):
                                 # Ambiguous delivery: the boundary may already
                                 # be committed. Mark persisted and advance
                                 # rather than risk a duplicate on retry.
@@ -3949,10 +4280,11 @@ async def _forward_available_status_events(
                                     exc_info=True,
                                 )
                                 retry_tracker.clear(retry_key)
+                                compaction_retry_tracker.clear_snapshot_failure(snapshot_retry_key)
                                 await _mark_compaction_persisted(bridge_dir, seq)
                             else:
                                 decision = retry_tracker.record_failure(
-                                    retry_key, exc, session_id=session_id
+                                    retry_key, http_exc, session_id=session_id
                                 )
                                 if decision.exhausted:
                                     _logger.error(
@@ -3963,7 +4295,7 @@ async def _forward_available_status_events(
                                         session_id,
                                         seq,
                                         decision.attempts,
-                                        _http_status_for_log(exc),
+                                        _http_status_for_log(http_exc),
                                         extra={"session_id": session_id},
                                     )
                                     # Fall through to advance the cursor.
@@ -3977,7 +4309,7 @@ async def _forward_available_status_events(
                                         decision.attempts,
                                         decision.permanent,
                                         decision.delay_s,
-                                        _http_status_for_log(exc),
+                                        _http_status_for_log(http_exc),
                                         exc_info=True,
                                         extra={"session_id": session_id},
                                     )
@@ -3995,6 +4327,7 @@ async def _forward_available_status_events(
                             return durable
                         else:
                             retry_tracker.clear(retry_key)
+                            compaction_retry_tracker.clear_snapshot_failure(snapshot_retry_key)
                             await _mark_compaction_persisted(bridge_dir, seq)
                 durable = next_durable
                 await _write_hook_state_async(bridge_dir, durable)
@@ -4064,6 +4397,23 @@ async def _forward_available_status_events(
         retry_key = f"hook:{record.event_cursor}:{record.byte_offset}:{status}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return durable
+        failure_context: FailureContext | None = None
+        transcript_context: FailureContext | None = None
+        if status == "failed":
+            try:
+                if record.failure_message is None:
+                    transcript_context = await asyncio.to_thread(
+                        _transcript_api_error_for_hook, bridge_dir, record, response_id
+                    )
+                failure_context = _stop_failure_context(
+                    record,
+                    session_id=session_id,
+                    parent_claude_session_ids=parent_claude_session_ids,
+                    diagnostic_health=diagnostic_health,
+                    transcript_context=transcript_context,
+                )
+            except Exception as exc:  # noqa: BLE001 - telemetry must not prevent status delivery
+                _logger.debug("Claude hook failure telemetry failed: %s", type(exc).__name__)
         try:
             await post_external_session_status(
                 client,
@@ -4087,7 +4437,12 @@ async def _forward_available_status_events(
                 # the UI can name the shells. Dropped on ``failed`` for the same
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
-                failure_detail=_stop_failure_detail(record) if status == "failed" else None,
+                failure_detail=_stop_failure_detail(
+                    record, session_id=session_id, transcript_context=transcript_context
+                )
+                if status == "failed"
+                else None,
+                failure_context=failure_context,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
@@ -4108,6 +4463,8 @@ async def _forward_available_status_events(
                         client,
                         session_id=session_id,
                         reason=f"hook status {status} rejected",
+                        source_id=retry_key,
+                        http_error=exc,
                         response_id=response_id,
                     )
                 durable = next_durable
@@ -4299,13 +4656,8 @@ def _with_settle_latch(
     :param dedupe: Latch source for both settle fields.
     :returns: The updated state.
     """
-    return TranscriptForwardState(
-        transcript_path=state.transcript_path,
-        line_cursor=state.line_cursor,
-        byte_offset=state.byte_offset,
-        current_response_id=state.current_response_id,
-        seen_source_ids=state.seen_source_ids,
-        cursor_fingerprint=state.cursor_fingerprint,
+    return replace(
+        state,
         settled_response_id=dedupe.settled_response_id,
         pending_settled_response_id=dedupe.pending_settled_response_id,
     )
@@ -4338,6 +4690,7 @@ async def _handle_compact_summary_item(
     bridge_dir: Path,
     item: ClaudeTranscriptItem,
     retry_tracker: _PostRetryTracker,
+    compaction_retry_tracker: _PostRetryTracker | None = None,
 ) -> bool:
     """
     Persist a durable compaction boundary from a transcript summary record.
@@ -4362,9 +4715,13 @@ async def _handle_compact_summary_item(
     :param bridge_dir: Native Claude bridge directory.
     :param item: The compact-summary transcript item.
     :param retry_tracker: Retry/backoff tracker; keyed per compaction seq.
+    :param compaction_retry_tracker: Shared tracker for local snapshot reads;
+        ``retry_tracker`` when omitted.
     :returns: ``True`` when the caller may advance past this record,
         ``False`` when it must be retried later.
     """
+    if compaction_retry_tracker is None:
+        compaction_retry_tracker = retry_tracker
     seq = await _consume_pending_compaction(
         bridge_dir,
         claude_session_id=None,
@@ -4407,13 +4764,51 @@ async def _handle_compact_summary_item(
     retry_key = f"compaction:{seq}"
     if retry_tracker.retry_delay_s(retry_key) is not None:
         return False
+    snapshot_retry_key = f"compaction-snapshot:{seq}"
+    if compaction_retry_tracker.retry_delay_s(snapshot_retry_key) is not None:
+        return False
     try:
         await _persist_native_compaction_item(
             client,
             session_id=session_id,
             bridge_dir=bridge_dir,
             summary_override=_compact_summary_text(item),
+            summary_source_id=item.source_id,
+            allow_snapshot_fallback=compaction_retry_tracker.snapshot_fallback_due(
+                snapshot_retry_key
+            ),
         )
+    except _CompactionSnapshotError:
+        decision = compaction_retry_tracker.record_snapshot_failure(
+            snapshot_retry_key,
+            max_attempts=_COMPACTION_SNAPSHOT_MAX_FAILURES,
+        )
+        _logger.warning(
+            "Failed to read Claude compaction snapshot; session=%s seq=%s "
+            "attempt=%s next_retry_s=%.3f",
+            session_id,
+            seq,
+            decision.attempts,
+            decision.delay_s,
+            extra={"session_id": session_id},
+        )
+        return False
+    except _CompactionItemsReadError as exc:
+        http_exc = exc.cause
+        decision = retry_tracker.record_failure(retry_key, http_exc, session_id=session_id)
+        _logger.warning(
+            "Failed to read latest compaction boundary item; "
+            "session=%s seq=%s attempt=%s permanent=%s next_retry_s=%.3f http_status=%s",
+            session_id,
+            seq,
+            decision.attempts,
+            decision.permanent,
+            decision.delay_s,
+            _http_status_for_log(http_exc),
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return False
     except httpx.HTTPError as exc:
         if post_may_have_been_delivered(exc):
             # Ambiguous delivery: the boundary may already be committed.
@@ -4427,6 +4822,7 @@ async def _handle_compact_summary_item(
                 exc_info=True,
             )
             retry_tracker.clear(retry_key)
+            compaction_retry_tracker.clear_snapshot_failure(snapshot_retry_key)
             await _mark_compaction_persisted(bridge_dir, seq, expect_completion_ack=True)
             return True
         decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
@@ -4453,6 +4849,7 @@ async def _handle_compact_summary_item(
         )
         return False
     retry_tracker.clear(retry_key)
+    compaction_retry_tracker.clear_snapshot_failure(snapshot_retry_key)
     # Transcript path persisted the boundary. A ``SessionStart source=compact``
     # completion hook may still trail this summary for the SAME compaction;
     # arm the completion-ack window so that hook is absorbed, not persisted
@@ -4469,8 +4866,9 @@ async def _forward_available_items(
     agent_name: str,
     state: TranscriptForwardState,
     retry_tracker: _PostRetryTracker,
-    skip_user_messages: bool = False,
     dedupe: _ForwardDedupeState,
+    compaction_retry_tracker: _PostRetryTracker | None = None,
+    skip_user_messages: bool = False,
 ) -> TranscriptForwardState:
     """
     Forward currently available transcript items after ``state``.
@@ -4482,12 +4880,16 @@ async def _forward_available_items(
     :param state: Current transcript cursor state.
     :param retry_tracker: In-memory retry/backoff tracker for
         transcript item posts.
+    :param compaction_retry_tracker: Shared retry/backoff tracker for local
+        compaction snapshot reads; ``retry_tracker`` when omitted.
     :param dedupe: Last usage / context-window / model values POSTed;
         mutated in place to suppress duplicate ``external_*`` events.
     :returns: The updated transcript cursor state. On post failure it
         is the last durable cursor so retries don't re-post successful
         items.
     """
+    if compaction_retry_tracker is None:
+        compaction_retry_tracker = retry_tracker
     if dedupe.settled_response_id is None and state.settled_response_id is not None:
         # Restart recovery: adopt the persisted settle so a forwarder
         # restart inside a scheduled-wake gap still marks the wake.
@@ -4529,10 +4931,40 @@ async def _forward_available_items(
     # that already finished — the user sees idle → running → idle. Items carry
     # their own ``response_id`` (see :func:`_post_external_conversation_item`),
     # so the transcript's job here is items, not status.
-    updated = state
+    updated = (
+        state
+        if state.current_response_id == current_response_id
+        else replace(state, api_error_context=None)
+    )
+    if updated != state:
+        await _write_forward_state_async(bridge_dir, updated)
     for item in items:
         if item.source_id in seen:
             continue
+        if item.response_id == current_response_id:
+            context = normalize_failure_context(item.failure_context)
+            if context.get("native_api_error_message") is not True:
+                context = {}
+            # Multiple text blocks from one error record retain its first error detail.
+            same_error = (
+                context.get("native_record_id") is not None
+                and updated.api_error_context is not None
+                and context.get("native_record_id")
+                == updated.api_error_context.get("native_record_id")
+            )
+            if not same_error and updated.api_error_context != (context or None):
+                updated = replace(
+                    updated,
+                    api_error_context=context or None,
+                    # An error needs its response ID for hooks even if the POST fails.
+                    # Ordinary output must not advance it before a wake marker lands.
+                    current_response_id=current_response_id
+                    if context
+                    else updated.current_response_id,
+                )
+                # Hooks read durable context even when the item's POST is retried.
+                # Keep the delivery cursor unchanged until that POST succeeds.
+                await _write_forward_state_async(bridge_dir, updated)
         # Compaction boundary (primary, durable path). Claude writes an
         # ``isCompactSummary`` user record immediately after it compacts
         # its own context; that record — not the flaky
@@ -4551,6 +4983,7 @@ async def _forward_available_items(
                 bridge_dir=bridge_dir,
                 item=item,
                 retry_tracker=retry_tracker,
+                compaction_retry_tracker=compaction_retry_tracker,
             )
             if not handled:
                 # Hard persist failure or active backoff — stop the batch
@@ -4563,7 +4996,8 @@ async def _forward_available_items(
             dedupe.settled_response_id = None
             seen.add(item.source_id)
             seen_source_ids.append(item.source_id)
-            updated = TranscriptForwardState(
+            updated = replace(
+                updated,
                 transcript_path=state.transcript_path,
                 line_cursor=state.line_cursor,
                 byte_offset=state.byte_offset,
@@ -4635,15 +5069,25 @@ async def _forward_available_items(
                     delivered_ambiguous=False,
                     http_status=_http_status_for_log(exc),
                 )
-                await _post_forwarder_failed_status(
-                    client,
-                    session_id=session_id,
-                    reason=f"transcript item {item.source_id} rejected",
-                    response_id=current_response_id,
-                )
+                if _is_session_not_bound(exc):
+                    # The session now lives on another runner; a failed status
+                    # from this one would fail it there.
+                    _log_session_not_bound_once(
+                        dedupe, session_id=session_id, source_id=item.source_id
+                    )
+                else:
+                    await _post_forwarder_failed_status(
+                        client,
+                        session_id=session_id,
+                        reason=f"transcript item {item.source_id} rejected",
+                        source_id=retry_key,
+                        http_error=exc,
+                        response_id=current_response_id,
+                    )
                 seen.add(item.source_id)
                 seen_source_ids.append(item.source_id)
-                updated = TranscriptForwardState(
+                updated = replace(
+                    updated,
                     transcript_path=state.transcript_path,
                     line_cursor=state.line_cursor,
                     byte_offset=state.byte_offset,
@@ -4681,7 +5125,8 @@ async def _forward_available_items(
         await _maybe_sync_effort_from_slash_command(client, session_id=session_id, item=item)
         seen.add(item.source_id)
         seen_source_ids.append(item.source_id)
-        updated = TranscriptForwardState(
+        updated = replace(
+            updated,
             transcript_path=state.transcript_path,
             line_cursor=state.line_cursor,
             byte_offset=state.byte_offset,
@@ -4713,7 +5158,8 @@ async def _forward_available_items(
             cursor_fingerprint=fingerprint,
         )
     )
-    updated = TranscriptForwardState(
+    updated = replace(
+        updated,
         transcript_path=cursor.transcript_path,
         line_cursor=cursor.line_cursor,
         byte_offset=cursor.byte_offset,
@@ -5004,15 +5450,9 @@ def _validated_transcript_state(
             # was None because the file was missing). The file now exists and
             # the cursor is still at the start — adopt the computed fingerprint
             # without resetting seen_source_ids.
-            return TranscriptForwardState(
-                transcript_path=state.transcript_path,
-                line_cursor=state.line_cursor,
-                byte_offset=state.byte_offset,
-                current_response_id=state.current_response_id,
-                seen_source_ids=state.seen_source_ids,
+            return replace(
+                state,
                 cursor_fingerprint=current_fingerprint,
-                settled_response_id=state.settled_response_id,
-                pending_settled_response_id=state.pending_settled_response_id,
             )
         _logger.warning(
             "Claude transcript cursor missing fingerprint; skipping to end of transcript; "
@@ -5163,6 +5603,8 @@ async def _post_external_conversation_item(
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     from omnigent.runtime import telemetry
+
+    _log_transcript_failure(session_id, item)
 
     # The forwarder is the decoupled response path (it tails Claude's
     # transcript and re-POSTs items under its own trace, not the request's).
@@ -5922,12 +6364,157 @@ async def _post_external_compaction_status(
     resp.raise_for_status()
 
 
+def _restore_preserved_compaction_messages(
+    transcript_path: Path,
+    messages: list[tuple[str, dict[str, object]]],
+    *,
+    expected_summary_uuid: str | None = None,
+) -> list[tuple[str, dict[str, object]]]:
+    """Restore recent turns retained outside the summary's parent chain.
+
+    Incomplete references raise so the caller retries instead of committing a
+    snapshot that permanently drops retained context.
+
+    Visibility matches claude_agent_sdk._internal.sessions._is_visible_message.
+    """
+    records: dict[str, dict[str, object]] = {}
+    boundaries: list[dict[str, object]] = []
+    with transcript_path.open(encoding="utf-8") as transcript:
+        for line in transcript:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict) or not isinstance(record.get("uuid"), str):
+                continue
+            records[record["uuid"]] = record
+            if record.get("type") == "system" and record.get("subtype") == "compact_boundary":
+                boundaries.append(record)
+    boundary: dict[str, object] | None
+    if expected_summary_uuid is not None:
+        summary = records.get(expected_summary_uuid)
+        parent_uuid = summary.get("parentUuid") if summary is not None else None
+        if (
+            summary is None
+            or summary.get("type") != "user"
+            or summary.get("isCompactSummary") is not True
+            or not isinstance(parent_uuid, str)
+        ):
+            raise ValueError("Claude compaction summary identity is not available")
+        boundary = next(
+            (candidate for candidate in boundaries if candidate.get("uuid") == parent_uuid),
+            None,
+        )
+        if boundary is None:
+            raise ValueError("Claude compaction summary boundary is not available")
+    else:
+        boundary = boundaries[-1] if boundaries else None
+    if boundary is None:
+        return messages
+    metadata = boundary.get("compactMetadata")
+    if not isinstance(metadata, dict):
+        return messages
+    if "preservedMessages" not in metadata and "preservedSegment" not in metadata:
+        return messages
+    preserved = metadata.get("preservedMessages")
+    segment = metadata.get("preservedSegment")
+    primary_is_valid = (
+        isinstance(preserved, dict)
+        and isinstance(preserved.get("anchorUuid"), str)
+        and isinstance(preserved.get("uuids"), list)
+        and all(isinstance(uid, str) for uid in preserved["uuids"])
+    )
+    segment_is_valid = (
+        isinstance(segment, dict)
+        and isinstance(segment.get("anchorUuid"), str)
+        and isinstance(segment.get("headUuid"), str)
+        and isinstance(segment.get("tailUuid"), str)
+    )
+    if not primary_is_valid and not segment_is_valid:
+        raise ValueError("Invalid Claude preserved compaction metadata")
+
+    if primary_is_valid:
+        assert isinstance(preserved, dict)
+        anchor = preserved.get("anchorUuid")
+        retained_ids_value = preserved.get("uuids")
+        if not isinstance(retained_ids_value, list) or not all(
+            isinstance(uid, str) for uid in retained_ids_value
+        ):
+            raise ValueError("Invalid Claude preserved-message references")
+        retained_ids = retained_ids_value
+    else:
+        assert isinstance(segment, dict)
+        anchor = segment.get("anchorUuid")
+        head, cursor = segment.get("headUuid"), segment.get("tailUuid")
+        retained_ids = []
+        seen: set[str] = set()
+        while isinstance(cursor, str) and cursor not in seen:
+            seen.add(cursor)
+            retained_ids.append(cursor)
+            if cursor == head:
+                break
+            retained = records.get(cursor)
+            cursor = retained.get("parentUuid") if retained else None
+        else:
+            raise ValueError("Incomplete Claude preserved segment")
+        retained_ids.reverse()
+
+    if not isinstance(anchor, str):
+        raise ValueError("Invalid Claude compaction summary reference")
+    summary = records.get(anchor)
+    if (
+        summary is None
+        or summary.get("type") != "user"
+        or summary.get("isCompactSummary") is not True
+        or summary.get("parentUuid") != boundary.get("uuid")
+    ):
+        raise ValueError("Claude compaction summary is not available yet")
+    if expected_summary_uuid is not None and anchor != expected_summary_uuid:
+        raise ValueError("Claude compaction summary does not match the active item")
+    snapshot: list[tuple[str, dict[str, object]]] = []
+    included: set[str] = set()
+    for uid in [anchor, *retained_ids]:
+        if uid in included:
+            continue
+        record = records.get(uid)
+        if record is None:
+            raise ValueError("Claude retained message is not available yet")
+        included.add(uid)
+        role, message = record.get("type"), record.get("message")
+        if record.get("isMeta") or record.get("isSidechain") or record.get("teamName"):
+            continue
+        if role not in ("user", "assistant"):
+            continue
+        if not isinstance(message, dict):
+            raise ValueError("Claude retained message has no content")
+        content = message.get("content")
+        if not isinstance(content, (str, list)):
+            raise ValueError("Claude retained message has no content")
+        if not content:
+            _logger.warning("Skipping empty Claude retained message")
+            continue
+        snapshot.append((uid, {"type": "message", "role": role, "content": content}))
+
+    # The SDK may have followed either the summary or the retained tail.
+    # Replace that prefix while preserving turns that followed compaction.
+    positions = {uid: i for i, (uid, _) in enumerate(messages)}
+    prefix_end = max((positions[uid] for uid in included if uid in positions), default=-1)
+    if prefix_end < 0:
+        raise ValueError("Claude compaction snapshot does not match the active transcript")
+    snapshot.extend(
+        (uid, message) for uid, message in messages[prefix_end + 1 :] if uid not in included
+    )
+    return snapshot
+
+
 async def _persist_native_compaction_item(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     bridge_dir: Path,
     summary_override: str | None = None,
+    summary_source_id: str | None = None,
+    allow_snapshot_fallback: bool = False,
 ) -> None:
     """
     Persist a compaction boundary item to the conversation store.
@@ -5939,9 +6526,9 @@ async def _persist_native_compaction_item(
     session resume knows the compaction boundary — items before this
     marker are summarized and don't need to be loaded.
 
-    After writing the boundary, it also reads the post-compaction
-    transcript from Claude's own session state via
-    ``get_session_messages`` and includes them as ``compacted_messages``
+    Before writing the boundary, it reads the post-compaction
+    transcript via ``get_session_messages`` and restores turns retained by
+    Claude's compaction metadata. It includes them as ``compacted_messages``
     so session resume in ephemeral environments can reconstruct context
     without the CLI's local transcript files.
 
@@ -5953,38 +6540,131 @@ async def _persist_native_compaction_item(
         transcript ``isCompactSummary`` record, stored as the boundary's
         ``summary``. ``None`` (the hook-driven path, which has no summary
         text) falls back to a generic placeholder.
-    :raises httpx.HTTPError: If the boundary POST fails or is rejected.
+    :param summary_source_id: Transcript item source id for the
+        ``isCompactSummary`` path. When supplied, the local snapshot must
+        resolve the same Claude summary UUID; hook-driven calls omit it.
+    :param allow_snapshot_fallback: Persist the unchanged SDK snapshot, or
+        no snapshot if the SDK read failed, when the local retry budget is spent.
+    :raises _CompactionSnapshotError: If the native snapshot cannot be read
+        or reconstructed and fallback is not allowed.
+    :raises httpx.HTTPError: If the boundary lookup or POST fails or is rejected.
         The caller must not advance its cursor or mark the boundary
         persisted when this raises.
     """
     # Find the last persisted item to use as the compaction boundary.
-    resp = await client.get(
-        f"/v1/sessions/{session_id}/items",
-        params={"limit": 1, "order": "desc"},
-    )
-    resp.raise_for_status()
+    try:
+        resp = await client.get(
+            f"/v1/sessions/{session_id}/items",
+            params={"limit": 1, "order": "desc"},
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        # The lookup is an HTTP read, not the boundary POST. Keep its
+        # failure distinguishable so a lost GET response cannot be treated
+        # as ambiguous delivery of a boundary event.
+        raise _CompactionItemsReadError(exc) from exc
     items = resp.json().get("data", [])
     last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
 
-    # Read the post-compaction session messages so session resume can
-    # reconstruct context in ephemeral environments.
-    compacted_messages: list[dict[str, object]] | None = None
+    native_messages: list[tuple[str, dict[str, object]]] | None = None
+    sdk_message_count = 0
+    transcript_path: Path | None = None
     try:
+        expected_summary_uuid: str | None = None
+        if summary_source_id is not None:
+            suffix = ":0:compact_summary"
+            if not summary_source_id.endswith(suffix):
+                raise ValueError("Invalid compaction summary source id")
+            expected_summary_uuid = summary_source_id[: -len(suffix)]
+            if not expected_summary_uuid:
+                raise ValueError("Missing compaction summary identity")
         from claude_agent_sdk import get_session_messages
 
         claude_sid = read_claude_session_id(bridge_dir)
-        if claude_sid:
-            msgs = get_session_messages(claude_sid)
-            compacted_messages = [
-                {"type": "message", "role": m.type, "content": m.message.get("content", [])}
-                for m in msgs
-                if isinstance(m.message, dict)
-            ]
-    except Exception:  # noqa: BLE001
-        _logger.debug(
-            "Failed to read Claude session messages for compaction persist",
-            exc_info=True,
+        if not claude_sid:
+            raise ValueError("Claude native session id is unavailable")
+        msgs = await asyncio.to_thread(get_session_messages, claude_sid)
+        if not isinstance(msgs, list) or not msgs:
+            raise ValueError("Claude session reader returned no messages")
+        native_messages = []
+        for index, message in enumerate(msgs):
+            raw_message = getattr(message, "message", None)
+            role = getattr(message, "type", None)
+            if role not in ("user", "assistant") or not isinstance(raw_message, dict):
+                continue
+            content = raw_message.get("content")
+            if not isinstance(content, (str, list)):
+                continue
+            message_id = getattr(message, "uuid", None)
+            if not isinstance(message_id, str) or not message_id:
+                message_id = f"native-message-{index}"
+            native_messages.append(
+                (
+                    message_id,
+                    {"type": "message", "role": role, "content": content},
+                )
+            )
+        if not native_messages:
+            raise ValueError("Claude session reader returned no usable messages")
+        sdk_message_count = len(native_messages)
+        transcript_path = read_transcript_path(bridge_dir)
+        if transcript_path is not None:
+            native_messages = await asyncio.to_thread(
+                _restore_preserved_compaction_messages,
+                transcript_path,
+                native_messages,
+                expected_summary_uuid=expected_summary_uuid,
+            )
+        if expected_summary_uuid is not None and not any(
+            message_id == expected_summary_uuid for message_id, _ in native_messages
+        ):
+            raise ValueError("Claude compaction snapshot does not contain the active summary")
+    except Exception as exc:
+        if not allow_snapshot_fallback:
+            raise _CompactionSnapshotError("Failed to read Claude compaction snapshot") from exc
+        _logger.warning(
+            "Claude compaction snapshot retry budget exhausted; session=%s "
+            "using_sdk_fallback=%s error_type=%s",
+            session_id,
+            native_messages is not None,
+            type(exc).__name__,
+            extra={"session_id": session_id},
         )
+    compacted_messages: list[dict[str, object]] | None = None
+    if native_messages is not None:
+        compacted_messages = []
+        for message_id, message in native_messages:
+            snapshot_message = dict(message)
+            try:
+                _, forwarded_items = _transcript_items_from_entry(
+                    {"type": message["role"], "uuid": message_id, "message": message},
+                    line_number=0,
+                    record_offset=None,
+                    agent_name="claude-native",
+                    current_response_id=None,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                _logger.warning(
+                    "Unable to derive Claude compaction overlap identities; "
+                    "session=%s error_type=%s",
+                    session_id,
+                    type(exc).__name__,
+                    extra={"session_id": session_id},
+                )
+            else:
+                snapshot_message["forwarded_source_ids"] = [
+                    item.source_id for item in forwarded_items
+                ]
+            compacted_messages.append(snapshot_message)
+    _logger.info(
+        "Persisting Claude compaction snapshot; session=%s sdk_messages=%d "
+        "snapshot_messages=%d transcript_found=%s",
+        session_id,
+        sdk_message_count,
+        len(compacted_messages) if compacted_messages is not None else 0,
+        transcript_path is not None,
+        extra={"session_id": session_id},
+    )
 
     summary = (
         summary_override
@@ -6085,11 +6765,28 @@ async def _maybe_sync_effort_from_slash_command(
         )
 
 
+def _forwarder_rejection_context(error: httpx.HTTPError) -> FailureContext:
+    """Retain rejection metadata without copying echoed transcript content."""
+    if not isinstance(error, httpx.HTTPStatusError):
+        return {}
+    context: FailureContext = {"http_status": error.response.status_code}
+    try:
+        body = error.response.json()
+    except ValueError:
+        return context
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, str) and detail in _FORWARDER_REJECTION_REASONS:
+        context["forwarder_rejection_reason"] = detail
+    return context
+
+
 async def _post_forwarder_failed_status(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     reason: str,
+    source_id: str,
+    http_error: httpx.HTTPError,
     response_id: str | None = None,
 ) -> None:
     """
@@ -6099,6 +6796,8 @@ async def _post_forwarder_failed_status(
     :param session_id: Omnigent session/conversation id.
     :param reason: Diagnostic reason for the failure event, e.g.
         ``"transcript item item-1 rejected"``.
+    :param source_id: Retry key of the rejected hook or transcript item.
+    :param http_error: The rejection that exhausted the delivery retry budget.
     :param response_id: Active turn's response id, so this ``failed``
         edge closes the streaming ``activeResponse`` for the matching
         turn rather than leaving its tool cards spinning. ``None`` when
@@ -6112,6 +6811,16 @@ async def _post_forwarder_failed_status(
             status="failed",
             output=reason,
             response_id=response_id,
+            failure_context={
+                "failure_id": native_failure_id("forwarder_delivery", session_id, source_id),
+                "failure_source": "forwarder_delivery",
+                "forwarder_source_id": source_id,
+                "native_harness": "claude-native",
+                "detail_source": "forwarder_delivery_error",
+                "failure_decision": "session_failed",
+                "runner_version": VERSION,
+                **_forwarder_rejection_context(http_error),
+            },
         )
     except httpx.HTTPError:
         _logger.warning(
@@ -6121,6 +6830,37 @@ async def _post_forwarder_failed_status(
             exc_info=True,
             extra={"session_id": session_id},
         )
+
+
+def _log_session_not_bound_once(
+    dedupe: _ForwardDedupeState,
+    *,
+    session_id: str,
+    source_id: str,
+) -> None:
+    """
+    Log that a session left this runner, once per session.
+
+    :param dedupe: Forwarder state remembering the session already logged.
+    :param session_id: Omnigent session/conversation id.
+    :param source_id: Source id of the dropped transcript item, e.g.
+        ``"item-1:0:message"``; never the item content.
+    :returns: None.
+    """
+    if dedupe.session_not_bound_logged_for == session_id:
+        return
+    dedupe.session_not_bound_logged_for = session_id
+    _logger.info(
+        "Claude transcript item dropped: session is no longer bound to this runner; "
+        "session=%s source_id=%s",
+        session_id,
+        source_id,
+        extra=debug_event(
+            "claude_forwarder_session_not_bound",
+            session_id=session_id,
+            source_id=source_id,
+        ),
+    )
 
 
 async def _post_external_session_todos(
@@ -6161,6 +6901,19 @@ def _is_permanent_http_error(exc: httpx.HTTPError) -> bool:
     return 400 <= status_code < 500 and status_code not in _HTTP_TRANSIENT_STATUS_CODES
 
 
+def _is_session_not_bound(exc: httpx.HTTPError) -> bool:
+    """
+    Return whether ``exc`` means the session no longer belongs to this runner.
+
+    The runner event tunnel answers 403 for a session that was moved to another
+    runner while this runner's Claude pane and forwarder stayed alive.
+
+    :param exc: HTTP exception raised while posting an Omnigent event.
+    :returns: ``True`` for a 403 status response, otherwise ``False``.
+    """
+    return _http_status_for_log(exc) == 403
+
+
 def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:
     """
     Return whether ``exc`` is a runner ``subagent_delivery_not_confirmed`` 503.
@@ -6195,23 +6948,6 @@ def _http_status_for_log(exc: httpx.HTTPError) -> int | None:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code
     return None
-
-
-def _batch_response_never_received(exc: httpx.HTTPError) -> bool:
-    """
-    Return whether ``exc`` failed before any response reached the client.
-
-    A transport failure (read/connect/write timeout, read error, protocol
-    error) means the server never rendered a verdict on the batch, so the
-    payload is unproven rather than rejected. Splitting the batch is then
-    strictly better than discarding it: a whole-batch read timeout is usually
-    the batch's own size against the flat post timeout, and single items fit
-    where 100 do not.
-
-    :param exc: HTTP exception raised while posting an Omnigent event.
-    :returns: ``True`` when no HTTP response was received.
-    """
-    return not isinstance(exc, httpx.HTTPStatusError)
 
 
 def _read_hook_state(bridge_dir: Path) -> HookForwardState | None:
@@ -6301,7 +7037,9 @@ def _read_compaction_state(bridge_dir: Path) -> CompactionForwardState:
     persisted_raw = raw.get("persisted_seqs")
     persisted_seqs: tuple[int, ...] = ()
     if isinstance(persisted_raw, list):
-        persisted_seqs = tuple(s for s in persisted_raw if isinstance(s, int))
+        persisted_seqs = tuple(s for s in persisted_raw if isinstance(s, int) and s >= 0)[
+            -_MAX_PERSISTED_COMPACTION_SEQS:
+        ]
     pending: _PendingCompaction | None = None
     pending_raw = raw.get("pending")
     if isinstance(pending_raw, dict):
@@ -6676,10 +7414,9 @@ async def _claim_standalone_completion(bridge_dir: Path) -> int | None:
     no live token for two reasons, which must be handled differently:
 
     * The transcript ``isCompactSummary`` path already persisted this
-      compaction's boundary and set ``expect_completion_ack`` for its ``seq``
-      — this hook is the trailing duplicate completion signal. Absorb it
-      (clear the window, return ``None``): re-persisting would write a second
-      boundary.
+      compaction and set ``expect_completion_ack`` for its ``seq`` — this
+      hook is the trailing duplicate completion signal. Absorb it (clear
+      the window, return ``None``): re-persisting would write a second boundary.
     * No boundary is expected — the ``PreCompact`` was dropped or the
       forwarder attached after it fired, so neither the transcript path nor a
       token exists to persist the boundary. Mint a fresh monotonic ``seq``,
@@ -6689,8 +7426,8 @@ async def _claim_standalone_completion(bridge_dir: Path) -> int | None:
 
     The ack window is bound to the ``seq`` it was armed for
     (``expect_completion_ack_seq``). A hook is absorbed *only* when that seq
-    is genuinely present in ``persisted_seqs`` — the boundary the ack would
-    acknowledge really was stored. This closes the compound-miss lost-boundary
+    is present in ``persisted_seqs`` — the completion was
+    durably accounted for. This closes the compound-miss lost-boundary
     hazard (P2-1): if compaction A persists via the transcript path, A's
     completion hook never fires (so the flag stays armed), and a later
     compaction B's ``PreCompact`` is *also* dropped, B's completion hook would
@@ -6884,6 +7621,7 @@ def _read_forward_state(bridge_dir: Path) -> TranscriptForwardState | None:
         cursor_fingerprint=cursor_fingerprint,
         settled_response_id=settled_response_id,
         pending_settled_response_id=pending_settled_response_id,
+        api_error_context=normalize_failure_context(raw.get("api_error_context")) or None,
     )
 
 
@@ -6909,6 +7647,8 @@ def _write_forward_state(bridge_dir: Path, state: TranscriptForwardState) -> Non
         payload["byte_offset"] = state.byte_offset
     if state.cursor_fingerprint is not None:
         payload["cursor_fingerprint"] = state.cursor_fingerprint
+    if state.api_error_context is not None:
+        payload["api_error_context"] = normalize_failure_context(state.api_error_context)
     _write_json_atomic(bridge_dir / _FORWARDER_STATE_FILE, payload)
 
 

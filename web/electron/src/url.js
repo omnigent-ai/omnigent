@@ -12,9 +12,8 @@
   const api = factory();
   if (typeof module === "object" && module.exports) {
     module.exports = api;
-  } else {
-    root.omnigentUrl = api;
   }
+  root.omnigentUrl = api;
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
@@ -364,7 +363,73 @@
     serverVersion: null,
     minDesktopVersion: null,
     ui: Object.freeze({}),
+    auth: null,
+    serverName: null,
   });
+
+  /** Sign-in modes a server may name in its manifest's `auth.mode`. */
+  const MANIFEST_AUTH_MODES = new Set(["oidc", "accounts", "header", "custom", "none"]);
+  /** The only session cookies an Omnigent server sets. */
+  const SESSION_COOKIE_NAMES = new Set(["__Host-ap_session", "ap_session"]);
+  /** Longest server name the shell displays, in characters. */
+  const MAX_SERVER_NAME_LENGTH = 64;
+
+  /**
+   * The manifest's `auth` block, or null when absent or untrustworthy. The
+   * manifest is unauthenticated server input, so only known modes and the two
+   * real cookie names pass, and a `__Host-` cookie only for an https server
+   * (Chromium rejects it on http).
+   *
+   * @param {unknown} raw The manifest's `auth` value.
+   * @param {string} serverUrl The URL the manifest was fetched for.
+   * @returns {{ mode: string, sessionCookie: string | null } | null}
+   */
+  function parseManifestAuth(raw, serverUrl) {
+    if (raw === null || typeof raw !== "object" || !MANIFEST_AUTH_MODES.has(raw.mode)) {
+      return null;
+    }
+    let sessionCookie = null;
+    if (typeof raw.session_cookie === "string" && SESSION_COOKIE_NAMES.has(raw.session_cookie)) {
+      sessionCookie = raw.session_cookie;
+    }
+    let https = false;
+    try {
+      https = new URL(serverUrl).protocol === "https:";
+    } catch {
+      // Not a URL: treat as not https.
+    }
+    if (sessionCookie?.startsWith("__Host-") && !https) sessionCookie = null;
+    return { mode: raw.mode, sessionCookie };
+  }
+
+  /**
+   * A server-supplied display name made safe to show: control and invisible
+   * format characters (bidi marks and overrides, zero-width characters)
+   * removed, whitespace collapsed, at most {@link MAX_SERVER_NAME_LENGTH}
+   * user-perceived characters. Null when nothing is left.
+   *
+   * @param {unknown} raw
+   * @returns {string | null}
+   */
+  function sanitizeServerName(raw) {
+    if (typeof raw !== "string") return null;
+    const cleaned = raw
+      .replace(/[\p{Cc}\p{Cf}]/gu, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const graphemes =
+      typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+        ? Array.from(
+            new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(cleaned),
+            (s) => s.segment,
+          )
+        : Array.from(cleaned);
+    const name =
+      graphemes.length > MAX_SERVER_NAME_LENGTH
+        ? graphemes.slice(0, MAX_SERVER_NAME_LENGTH).join("").trimEnd()
+        : cleaned;
+    return name || null;
+  }
 
   /**
    * Timeout for the manifest fetch. Short and non-fatal for the same reason as
@@ -391,7 +456,9 @@
    * @param {string} serverUrl A normalized absolute http(s) server URL.
    * @param {{ signal?: AbortSignal }} [options] Optional connection cancellation.
    * @returns {Promise<{manifestVersion: number, serverVersion: string | null,
-   *   minDesktopVersion: string | null, ui: Record<string, unknown>}>}
+   *   minDesktopVersion: string | null, ui: Record<string, unknown>,
+   *   auth: { mode: string, sessionCookie: string | null } | null,
+   *   serverName: string | null}>}
    */
   async function fetchServerManifest(serverUrl, { signal } = {}) {
     signal?.throwIfAborted();
@@ -443,6 +510,8 @@
       // Passed through as-is: unknown keys are the extension point, so the
       // shell must not filter to the ones this release happens to know.
       ui: body.ui !== null && typeof body.ui === "object" ? body.ui : {},
+      auth: parseManifestAuth(body.auth, serverUrl),
+      serverName: sanitizeServerName(body.server_name),
     };
   }
 
@@ -463,6 +532,9 @@
     WELL_KNOWN_MANIFEST_PATH,
     MANIFEST_FETCH_TIMEOUT_MS,
     PRE_MANIFEST_BASELINE,
+    MAX_SERVER_NAME_LENGTH,
+    parseManifestAuth,
+    sanitizeServerName,
     fetchServerManifest,
   };
 });

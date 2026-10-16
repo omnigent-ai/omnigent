@@ -101,7 +101,9 @@ async def test_legacy_failure_keeps_current_reply_and_ignores_meta_messages(stat
 @pytest.mark.asyncio
 async def test_wire_failure_reason_wins_over_stored_text() -> None:
     data = {"status": "failed", "response_id": "resp_new", "output": "Actual failure"}
-    assert await _enrich(data, [_message("assistant", "Old reply", "resp_old")]) == data
+    result = await _enrich(data, [_message("assistant", "Old reply", "resp_old")])
+    assert result.pop("failure_context")["detail_source"] == "external_status_output"
+    assert result == data
 
 
 @pytest.mark.asyncio
@@ -115,6 +117,7 @@ async def test_harness_failure_detail_wins_over_stored_prose() -> None:
         [_message("assistant", "Now add the block on the new branch:", "resp_failed")],
     )
     assert result["output"] == "API Error: 500 Overloaded"
+    assert result["failure_context"]["detail_source"] == "external_status_failure_detail"
 
 
 @pytest.mark.asyncio
@@ -124,6 +127,34 @@ async def test_blank_failure_detail_falls_back_to_the_store() -> None:
         [_message("assistant", "Provider rejected this turn", "resp_failed")],
     )
     assert result["output"] == "Provider rejected this turn"
+    assert result["failure_context"]["detail_source"] == "assistant_output_fallback"
+
+
+@pytest.mark.asyncio
+async def test_failure_without_output_marks_missing_detail_and_keeps_category() -> None:
+    result = await _enrich(
+        {"status": "failed", "failure_context": {"native_error_category": "server_error"}}, []
+    )
+    assert "output" not in result
+    assert result["failure_context"]["native_error_category"] == "server_error"
+    assert result["failure_context"]["detail_source"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_store_fallback_overrides_stale_claimed_provenance() -> None:
+    result = await _enrich(
+        {
+            "status": "failed",
+            "response_id": "resp_failed",
+            "failure_context": {
+                "native_error_category": "server_error",
+                "detail_source": "missing",
+            },
+        },
+        [_message("assistant", "I am waiting for a background task.", "resp_failed")],
+    )
+    assert result["failure_context"]["native_error_category"] == "server_error"
+    assert result["failure_context"]["detail_source"] == "assistant_output_fallback"
 
 
 @pytest.mark.asyncio

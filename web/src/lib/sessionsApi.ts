@@ -152,6 +152,7 @@ interface SessionResponseWire {
    */
   title?: string | null;
   labels?: Record<string, string>;
+  project_id?: string | null;
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
   /**
@@ -317,7 +318,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   // attach) can pin to the replica holding that host's runner tunnel; a
   // sub-agent child inherits its parent's through the recorded parent link.
   setSessionHost(wire.id, wire.host_id);
-  setSessionParent(wire.id, wire.parent_session_id);
+  setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
     agentId: wire.agent_id,
@@ -334,6 +335,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,
+    projectId: wire.project_id ?? null,
     workspace: wire.workspace ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
@@ -742,6 +744,7 @@ export async function createBundledSession(
     labels?: Record<string, string>;
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };
+    mcp_registry_services?: string[];
   } = {},
 ): Promise<{ id: string }> {
   const form = new FormData();
@@ -887,8 +890,8 @@ export async function forkSession(
 
 /**
  * Fork a generic side chat in the parent's current working directory.
- * Hosted sessions launch a separate runner; CLI sessions use their existing
- * runner, and in-process sessions use normal server dispatch. Codex uses its
+ * Reuse the parent's live runner, relaunching the parent first if it has
+ * stopped. In-process sessions use normal server dispatch. Codex uses its
  * native `/side` fork instead.
  *
  * Like native Codex side chats, these share the parent's workspace. A saved
@@ -900,21 +903,22 @@ export async function forkSession(
  */
 export async function createSideChat(sourceId: string): Promise<{ childSessionId: string }> {
   let source = await getSession(sourceId);
-  if (source.hostResumable && source.hostOnline === false && source.runnerOnline !== true) {
+  if (
+    source.runnerOnline === false &&
+    source.hostId != null &&
+    (source.hostOnline !== false || source.hostResumable)
+  ) {
     await retrySession(sourceId);
     source = await getSession(sourceId);
   }
-  const { hostId, workspace, runnerId } = source;
-  const canLaunchOnHost = hostId && workspace && source.hostOnline !== false;
+  const { runnerId } = source;
   const canUseRunner =
     source.runnerOnline !== false && (runnerId != null || source.runnerOnline === true);
-  if (!canLaunchOnHost && !canUseRunner) {
+  if (!canUseRunner) {
     throw new Error("This session is disconnected. Reconnect it before starting a side chat.");
   }
   const fork = await forkSession(sourceId, { title: "Side chat", sideChat: true });
-  if (canLaunchOnHost) {
-    await launchRunner(hostId, fork.id, workspace);
-  } else if (runnerId) {
+  if (runnerId) {
     await updateSession(fork.id, { runnerId });
   }
   return { childSessionId: fork.id };

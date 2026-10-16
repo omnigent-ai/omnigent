@@ -873,6 +873,19 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     return _all_harness_install().get(key)
 
 
+def harness_cli_binary(key: str) -> str | None:
+    """Resolve the CLI selected for an install key, including Pi's path override."""
+    spec = harness_install_spec(key)
+    if spec is None:
+        return None
+    command = spec.binary
+    if key == PI_KEY:
+        from omnigent.harness_startup_config import resolve_harness_path
+
+        command = resolve_harness_path("pi") or command
+    return resolve_cli_binary(command)
+
+
 def harness_cli_version_satisfies(key: str) -> bool:
     """Return whether the installed CLI for *key* satisfies its version range.
 
@@ -888,7 +901,7 @@ def harness_cli_version_satisfies(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = resolve_cli_binary(spec.binary)
+    binary = harness_cli_binary(key)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary)
@@ -916,7 +929,7 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = resolve_cli_binary(spec.binary)
+    binary = harness_cli_binary(key)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary, timeout)
@@ -939,7 +952,7 @@ def harness_cli_version(key: str) -> tuple[str | None, str | None]:
     spec = harness_install_spec(key)
     if spec is None:
         return None, None
-    binary = resolve_cli_binary(spec.binary)
+    binary = harness_cli_binary(key)
     if binary is None:
         return None, None
     version = _harness_cli_version_string(spec, binary)
@@ -990,6 +1003,9 @@ def _harness_cli_version_string(
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
+        return None
+    # Failed launchers can print a runtime version, not the CLI's version.
+    if completed.returncode != 0:
         return None
     version = _parse_harness_cli_version(
         (completed.stdout or "") + "\n" + (completed.stderr or "")
