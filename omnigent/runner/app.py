@@ -2901,6 +2901,10 @@ def create_runner_app(
                 "opencode-native",
                 "kimi-native",
                 "devin-native",
+                "goose-native",
+                "hermes-native",
+                "kiro-native",
+                "qwen-native",
             ):
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
                     session_id
@@ -3959,9 +3963,13 @@ def create_runner_app(
             return False
         if expected_task is not None and turn_task is not expected_task:
             return False
+        turn_epoch = _turn_bind_epoch.get(conv_id, 0)
         turn_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await turn_task
+        # A replacement can start and finish while cancellation unwinds.
+        if _turn_bind_epoch.get(conv_id, 0) != turn_epoch:
+            return True
         if _active_turns.get(conv_id) is turn_task:
             _on_proxy_stream_end(conv_id)
             return True
@@ -3985,7 +3993,7 @@ def create_runner_app(
                 )
         return True
 
-    async def _forward_harness_interrupt(conv_id: str) -> None:
+    async def _forward_harness_interrupt(conv_id: str, *, turn_epoch: int) -> None:
         """Best-effort POST ``{"type":"interrupt"}`` to a conversation's harness.
 
         Releases the harness's parked policy/tool future so its ``run_turn``
@@ -3993,11 +4001,14 @@ def create_runner_app(
         runner-side floor does not depend on this succeeding.
 
         :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param turn_epoch: Turn generation captured before resolving its harness.
         """
         if process_manager is None:
             return
         try:
             harness_client = await process_manager.get_client(conv_id, "any")
+            if _turn_bind_epoch.get(conv_id, 0) != turn_epoch:
+                return
             await harness_client.post(
                 f"/v1/sessions/{conv_id}/events",
                 json={"type": "interrupt"},
@@ -4027,6 +4038,7 @@ def create_runner_app(
         if conv_id not in _active_turns:
             return
         target = _active_turns.get(conv_id)
+        turn_epoch = _turn_bind_epoch.get(conv_id, 0)
         if isinstance(target, asyncio.Task) and target.done():
             # A done Task is a corpse, not a live turn. Leaving it wedges every
             # ``conv in _active_turns`` liveness check (the buffer gate would strand
@@ -4034,7 +4046,7 @@ def create_runner_app(
             _sweep_dead_turn_slot(conv_id, target)
             return
         _interrupted_sessions.add(conv_id)
-        await _forward_harness_interrupt(conv_id)
+        await _forward_harness_interrupt(conv_id, turn_epoch=turn_epoch)
         # Floor: force-cancel the runner Task when we own one. In stream mode
         # there is no Task here — ``_resync_turn_state`` owns the sentinel pop,
         # and direct interrupt/stop callers rely on the forwarded interrupt
@@ -4099,7 +4111,7 @@ def create_runner_app(
         )
         if stream_sentinel:
             _active_turns.pop(conv_id, None)
-            await _forward_harness_interrupt(conv_id)
+            await _forward_harness_interrupt(conv_id, turn_epoch=_entry_epoch)
         else:
             await _cancel_inprocess_turn(conv_id)
         # Epoch advanced → a replacement ran (covers live-slot and empty-slot after teardown).
@@ -7282,6 +7294,7 @@ def create_runner_app(
         _codex_native_bridge_state_and_dir_for_session=(
             _codex_native_bridge_state_and_dir_for_session
         ),
+        _codex_terminal_ensure_locks=_codex_terminal_ensure_locks,
         _ensure_comment_relay_started=_ensure_comment_relay_started,
         _ensure_native_terminal_for_turn=_ensure_native_terminal_for_turn,
         _fetch_session_model_override=_fetch_session_model_override,

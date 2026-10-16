@@ -231,9 +231,20 @@ node --test --test-name-pattern='interactive OAuth cancellation' web/electron/te
 
 ### Databricks authentication diagnostics
 
-Run `just electron-dev` from a terminal and retain the `[omnigent] databricks`
-lines. For a packaged build, launch the app's executable from a terminal to see
-its stdout/stderr. No extra logging flag is required.
+For a customer report, reproduce the problem and choose **Server → Export
+Diagnostics…**. This works in packaged builds without Developer Mode or a
+terminal. It saves a bounded JSON Lines file (current log plus two rotated
+files, up to 3 MiB) from Electron's per-user logs directory, including desktop
+connection and authentication milestones. On macOS the directory is under
+`~/Library/Logs/Omnigent/` (or `Omnigent Dev` for development). This is an
+application log, **not** the macOS Unified Log or a collection of system-wide
+logs. The export excludes renderer console, CLI/server output, cookies and token
+stores; it does not include server-side diagnostics. The native Server menu is
+available even if the app is stuck on the connect screen.
+
+For development, `just electron-dev` still prints `[omnigent] databricks`
+lines in the terminal. Launching a packaged executable from a terminal also
+shows its stdout/stderr. No extra logging flag is required.
 
 The logs identify the selected mode, public OAuth client ID, requested scopes,
 whether a client secret is configured (not its value), token-exchange status,
@@ -243,7 +254,13 @@ Tokens, cookie values, client secrets, authorization codes, PKCE verifiers, full
 callback URLs, and raw response bodies are not logged. Token and account-API
 requests never follow redirects, so a 3xx from those endpoints is reported as a
 failure rather than carrying the grant or bearer to another destination. Workspace and client IDs
-are still deployment metadata; redact those before sharing logs publicly.
+are still deployment metadata; review and redact those before sharing logs
+publicly. The exported file records only approved fields (origin, phase,
+outcome, selected error codes, HTTP status and request ID), rather than copying
+all terminal output. OIDC diagnostics distinguish existing sessions, silent
+refresh, browser sign-in, token exchange and rejection/recovery. If an auth
+failure needs server-side context, correlate its request ID with the server's
+logs separately.
 
 - `bridge response` with `phase: 'session-create'` means the status came from
   `/auth/session/create` itself, before following a redirect.
@@ -684,6 +701,12 @@ console listener is stored on the registry entry
 (`designModeListener` / `designModeWebContents`) so `browserViewRegistry`'s
 `close()` detaches it on teardown. Electron-only (needs `executeJavaScript` +
 the native view); no server flag.
+
+All renderer IPC navigation uses the same URL policy, including the URL bar.
+A renderer's `agent: false` flag does not exempt a tab from address checks.
+Main-owned Arca preview eligibility still applies. Other internal sites must be
+opened in a separate browser; this also keeps later redirects in these tabs
+under the same policy.
 
 **JS trust boundary (important):** `omnigent:browser-execute` runs
 arbitrary JS in the child view via `executeJavaScript(js, true)`. It is exposed

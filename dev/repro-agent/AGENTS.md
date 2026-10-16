@@ -516,8 +516,11 @@ The `tests/e2e_ui/` suite drives a mock LLM (`tests/server/integration/mock_llm_
 whose scripted responses take fault fields: `error` + `status_code` (fail the
 request at open time), `truncate_after: N` (open a normal `200` SSE stream, emit
 N events, then cut it off mid-stream — dropping the completion event so the turn
-dies in flight), and `block` + the `/gate/release` endpoint (hold a turn open to
-drive a stall/cancel). For faults on the *transport* rather than the model — a
+dies in flight), `chunk_delay: seconds` (sleep between SSE events so the reply
+streams in visibly — pair with `stream: true` for word-by-word deltas — letting
+you scroll, click, or watch layout *while* deltas are still arriving), and
+`block` + the `/gate/release` endpoint (hold a turn open to drive a
+stall/cancel). For faults on the *transport* rather than the model — a
 transient 4xx/5xx on the session stream, dropped events — a Playwright `route`
 handler that `fulfill`s or `abort`s the request works too (see
 `tests/e2e_ui/chat/test_stream_transient_404.py` and `test_stale_stream.py`).
@@ -525,6 +528,17 @@ Pick the injection that matches the reported trigger, drive the turn through it,
 and observe the SPA's error/recovery UI (the error pill, retry, reconnect) — that
 observed error state is the reproduction. The same journey driver can film it
 in Step 4, even when permanent coverage uses a narrower test.
+
+**A mid-stream symptom must be driven mid-stream.** The mock is not
+single-batch: `chunk_delay` paces the SSE stream on both `/v1/responses` (the
+default openai-agents e2e_ui fixture) and `/v1/messages`. When the report ties
+the failure to a live or just-finished turn — scroll snaps back while a long
+reply streams in, layout jumps as deltas render — a settled transcript has not
+exercised the trigger: pace the stream and drive the reported action while
+deltas are still arriving. `not_reproduced` may carry
+`environment_fidelity: real` only after that mid-stream trigger was actually
+driven; if you could not drive it, name the untested trigger in the facet's
+`evidence` and do not claim the reported environment in the verdict.
 
 Judge **each sub-symptom** honestly and independently:
 
@@ -664,10 +678,11 @@ Declare the inspected captioned MP4, or use the shared guide's explicit
 Follow these rules for each clip:
 
 - Show the user action and the product's response.
-- **Caption the screen from screen evidence.** Compare claimed outcomes with
-  inspected frames or visible-state assertions from the clip. Backend storage
-  and logs do not establish what the UI displayed; keep those findings in
-  `evidence`. Correct captions that conflict with the frames.
+- **Caption the screen from screen evidence.** Check that claimed elements are
+  in view and unobstructed, and quote only visibly rendered text. DOM attributes,
+  hidden accessibility labels and backend logs are not screen evidence. Disclose
+  unavailable frame inspection and limit claims to verified states. Follow
+  `dev/recording-lanes.md` and correct captions that conflict with the frames.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the error it prints.
@@ -831,7 +846,7 @@ Field meanings:
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
   behavior (the journey completing). Each screen claim comes from screen
-  evidence, not from a transcript or API check (Step 4). This attachment description
+  evidence, not from a transcript, API check, or DOM attribute read (Step 4). This attachment description
   is separate from the timed captions burned into the video using
   `dev/caption_recording.py`. This is per-recording
   (each clip drives its own steps), distinct from the bug-level `journey`

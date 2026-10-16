@@ -4497,7 +4497,10 @@ def test_run_turn_spawn_env_honors_spec_env_passthrough(monkeypatch) -> None:
     assert "FAKE_HOST_SECRET" not in captured["env"]
 
 
-def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("layout", ["dist/cli.js", "dist/bundle/cli.js", "standalone"])
+def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
+    monkeypatch, tmp_path, layout
+) -> None:
     """The sandbox launcher policy names exactly the env the executor spawns.
 
     Defense in depth: ``_clean_pi_env`` already filters the spawn env,
@@ -4519,8 +4522,21 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
 
     monkeypatch.setenv("FAKE_HOST_SECRET", "PWNED")
     captured: dict[str, SandboxPolicy] = {}
+    if layout == "standalone":
+        executable = tmp_path / "install/bin/pi"
+        pi_binary = executable
+        install = executable.parent
+    else:
+        install = tmp_path / "install/node_modules"
+        executable = install / "@earendil-works/pi-coding-agent" / layout
+        pi_binary = install / ".bin/pi"
+        pi_binary.parent.mkdir(parents=True)
+        pi_binary.symlink_to(executable)
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.touch()
 
     def _fake_create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+        assert target_path == str(executable.resolve())
         captured["policy"] = sandbox
         return "/fake/launcher"
 
@@ -4540,7 +4556,7 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
     monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
 
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value=str(pi_binary)):
         executor = PiExecutor(
             cwd=str(tmp_path),
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
@@ -4550,6 +4566,7 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
     # fallback in ``_try_sandbox_pi``'s except clause).
     assert executor._sandboxed is True
     assert executor._pi_launch_path == "/fake/launcher"
+    assert captured["policy"].read_roots == [tmp_path.resolve(), install.resolve()]
     allowlist = captured["policy"].spawn_env_allowlist
     assert allowlist is not None
     # Per-spawn gateway var must be pruneproof even though it is not in

@@ -6769,11 +6769,13 @@ export function NewChatLandingScreen() {
                       >
                         <DropdownMenuTrigger asChild>
                           <ComposerHostTrigger
-                            label={`Host: ${hostLabel}, ${selectedHost?.status === "online" && !sandboxSelected ? "Online" : "Offline"}`}
+                            label={
+                              sandboxSelected
+                                ? `Host: ${hostLabel}`
+                                : `Host: ${hostLabel}, ${selectedHost?.status === "online" ? "Online" : "Offline"}`
+                            }
                             status={
-                              selectedHost?.status === "online" && !sandboxSelected
-                                ? "online"
-                                : "offline"
+                              sandboxSelected ? undefined : (selectedHost?.status ?? "offline")
                             }
                             cloud={isCloudHost}
                             className={cn(

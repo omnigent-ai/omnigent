@@ -80,6 +80,13 @@ and steers messages while the agent is busy.
   it is connected; click it to open the host menu.
 - In configuration, open the model picker, the effort picker, or the permission
   mode menu.
+- For a custom `claude-sdk` or `codex` agent session, open configuration and
+  pick an effort rung; the ladder is the harness's declared family (anthropic
+  or openai) and the pick persists on the session. Changing effort after a
+  completed turn applies on the next conversational turn and keeps the history.
+  Claude SDK `/compact` still operates on the existing client's context.
+  `/effort default` restores the harness's default. This is the in-session
+  dial, distinct from the new-session composer's effort choice.
 - Press Ctrl+Shift+M (Ctrl on every platform) to open the model picker without
   the gear; press Ctrl+Shift+L to focus the message box.
 - For a Codex session, open the Terminal view and change effort there, then
@@ -201,6 +208,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/start_session/test_composer_transition.py::test_selected_model_survives_delayed_create`
 - **`effort-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`
+- **`effort-picker`, SDK in-session composer:**
+  `tests/e2e_ui/chat/test_sdk_effort_dial.py::test_claude_sdk_session_offers_the_effort_dial`
+  covers selection, persistence and reload. The stale-catalog cases in
+  `web/src/store/chatStore.test.ts` cover saving while catalog refresh stalls.
+  The effort-transition cases in `tests/inner/test_claude_sdk_executor.py` and
+  `tests/inner/test_codex_executor.py` cover subsequent turns and default reset.
+  Manually, complete a turn, change effort, then send a follow-up; inspect the
+  mock provider request to confirm the new effort and prior conversation.
 - **`model-picker`, `effort-picker`, refused change:** the rollback cases in
   `web/src/store/chatStore.test.ts` and the composer case in
   `web/src/pages/ChatPage.composer.test.tsx` (`pnpm --dir web test`). A pick
