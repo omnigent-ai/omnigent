@@ -411,6 +411,8 @@ def test_linked_issues_marks_truncated_bodies_and_omitted_issues(tmp_path: Path)
     assert {"owner=test", "name=repo", "number=12"} <= set(args)
     # -F sends the PR number as the Int the query declares; -f would send a string.
     assert args[args.index("number=12") - 1] == "-F"
+    assert args[args.index("owner=test") - 1] == args[args.index("name=repo") - 1] == "-f"
+    assert "closingIssuesReferences(first: 5)" in args[-1]
     assert json.loads((tmp_path / "linked_issues.json").read_text()) == {
         "issues": [
             {

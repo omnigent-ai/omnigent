@@ -392,7 +392,9 @@ jobs:
               linked_issues_section = "(lookup unavailable)"
           else:
               shown, omitted = linked_issues["issues"], linked_issues["omitted"]
-              lines = [json.dumps(shown, ensure_ascii=False)] if shown else []
+              # Escaped backticks keep third-party issue text inside the fence.
+              shown_json = json.dumps(shown, ensure_ascii=False).replace("`", "\\u0060")
+              lines = ["```json", shown_json, "```"] if shown else []
               if omitted:
                   lines.append(f"({omitted} {'more ' if shown else ''}linked issues not shown)")
               linked_issues_section = "\n".join(lines) or "(none)"
