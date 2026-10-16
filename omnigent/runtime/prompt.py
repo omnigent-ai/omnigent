@@ -42,10 +42,9 @@ SUBAGENT_WAKE_NOTICE_INSTRUCTION = (
     "approval) are routine runtime status messages in the same way."
 )
 
-# Steers models toward the embedded browser they are handed: the browser_*
-# tools are auto-registered for every agent (ToolManager._register_browser_tools),
-# but a tool description alone loses to a model's native web tooling, so the
-# composed system prompt must carry the preference explicitly.
+# Steers models toward the embedded browser they are handed: a tool
+# description alone loses to a model's native web tooling, so the composed
+# system prompt must carry the preference explicitly.
 EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
     "Embedded browser: the browser_navigate / browser_snapshot / "
     "browser_click / browser_type / browser_screenshot tools drive the "
@@ -70,18 +69,21 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     ``spawn: true``) plus the ``web_fetch`` builtin, which dispatches the
     built-in web researcher through the same path.
 
-    The embedded-browser priority guidance applies to every agent,
-    mirroring the unconditional ``browser_*`` registration
-    (``ToolManager._register_browser_tools``).
+    The embedded-browser priority guidance follows the ``browser_*``
+    registration gate (``ToolManager._register_browser_tools``): every
+    agent unless the spec sets ``tool_groups.browser: false``, in which
+    case the prompt must not steer the model toward tools it lacks.
 
     :param spec: The parsed AgentSpec.
-    :returns: The applicable spec-level framework instructions, never empty.
+    :returns: The applicable spec-level framework instructions; empty for
+        an agent with no sub-agents and the browser group disabled.
     """
     instructions: list[str] = []
     dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
     if spec.tools.agents or spec.spawn or dispatches_web_researcher:
         instructions.append(SUBAGENT_WAKE_NOTICE_INSTRUCTION)
-    instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
+    if spec.tool_groups.browser:
+        instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)
     return instructions
 
 
@@ -187,9 +189,9 @@ def build_instructions_nullable(
     the fabricated ``"You are a helpful assistant."`` fallback when there is
     truly nothing to compose (no author text, no per-request text, no skills
     hint, no applicable spec-level or per-turn framework instructions).
-    With the embedded-browser guidance applying to every agent, a real spec
-    always carries at least one framework instruction, so callers should
-    expect text rather than ``None`` in practice.
+    The embedded-browser guidance makes this rare, but a spec that sets
+    ``tool_groups.browser: false`` with no author text and no sub-agents
+    composes to ``None``.
 
     Delivery channels that must not leak the fallback literal (e.g. a warn
     check, or a first-user-turn prefix) call this instead of comparing

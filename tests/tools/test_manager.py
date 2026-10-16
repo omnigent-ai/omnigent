@@ -21,6 +21,7 @@ from omnigent.spec.types import (
     MCPServerConfig,
     SharePolicy,
     SkillSpec,
+    ToolGroupsConfig,
     ToolRuntime,
     ToolsConfig,
 )
@@ -1662,3 +1663,77 @@ def test_get_tool_names_returns_registered_names() -> None:
 
     assert "load_skill" in names
     assert "sys_timer_set" in names
+
+
+# ─── ``tool_groups:`` — opting out of framework-owned groups ──────
+
+# Every tool each ``tool_groups`` key controls. Kept explicit so a group
+# quietly growing or shrinking a tool shows up here as a failure.
+_TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
+    "browser": frozenset(
+        {
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_screenshot",
+        }
+    ),
+    "scheduled_tasks": frozenset(
+        {
+            "sys_scheduled_task_create",
+            "sys_scheduled_task_list",
+            "sys_scheduled_task_update",
+            "sys_scheduled_task_delete",
+        }
+    ),
+    "comments": frozenset({"list_comments", "update_comment"}),
+    "policies": frozenset({"sys_add_policy", "sys_policy_registry"}),
+    "agent_discovery": frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list"}),
+}
+
+
+def _tool_names(spec: AgentSpec) -> set[str]:
+    """Names of every tool a ``ToolManager`` registers for *spec*."""
+    return {s["function"]["name"] for s in ToolManager(spec).get_tool_schemas()}
+
+
+def _grouped_spec(**groups: bool) -> AgentSpec:
+    """A minimal spec with the given ``tool_groups`` overrides."""
+    return AgentSpec(spec_version=1, skills_filter="none", tool_groups=ToolGroupsConfig(**groups))
+
+
+def test_tool_groups_default_registers_every_group() -> None:
+    """An absent ``tool_groups:`` block changes nothing: all 16 register."""
+    names = _tool_names(_grouped_spec())
+    for group, members in _TOOL_GROUP_MEMBERS.items():
+        assert members <= names, f"{group} members missing by default: {members - names}"
+
+
+@pytest.mark.parametrize("group", sorted(_TOOL_GROUP_MEMBERS))
+def test_tool_groups_false_drops_only_that_group(group: str) -> None:
+    """Disabling one group removes exactly its tools and nothing else."""
+    names = _tool_names(_grouped_spec(**{group: False}))
+    assert not (_TOOL_GROUP_MEMBERS[group] & names), f"{group} still registered"
+    for other, members in _TOOL_GROUP_MEMBERS.items():
+        if other != group:
+            assert members <= names, f"disabling {group} also dropped {members - names}"
+
+
+def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
+    """
+    With every group off, the 16 gated tools are gone but the session
+    reads, ``sys_session_rename`` and ``sys_cancel_task`` stay: multi-agent
+    participation and async handles depend on them, so they have no key.
+    """
+    names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
+    gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
+    assert len(gated) == 16
+    assert not (gated & names)
+    assert {
+        "sys_session_list",
+        "sys_session_get_history",
+        "sys_session_get_info",
+        "sys_session_rename",
+        "sys_cancel_task",
+    } <= names
