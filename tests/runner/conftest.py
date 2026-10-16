@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -346,7 +346,11 @@ class _FakeProcessManager:
         return True
 
     async def release(
-        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+        self,
+        conversation_id: str,
+        *,
+        only_if_idle_cutoff: float | None = None,
+        only_if_current: Callable[[], bool] | None = None,
     ) -> None:
         """Record a release and remove the session.
 
@@ -356,8 +360,11 @@ class _FakeProcessManager:
         :param conversation_id: Session/conversation id being released.
         :param only_if_idle_cutoff: Idle-reap cutoff; when given, a
             conversation with an active turn is not torn down.
+        :param only_if_current: Ownership check guarding delayed cleanup.
         """
         self.release_calls.append((conversation_id, only_if_idle_cutoff))
+        if only_if_current is not None and not only_if_current():
+            return
         if only_if_idle_cutoff is not None and conversation_id in self._active_turns:
             return
         self.released.append(conversation_id)
