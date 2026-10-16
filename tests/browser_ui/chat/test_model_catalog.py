@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
+import pytest
 from playwright.sync_api import Page, Request, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, model_option
@@ -159,3 +160,112 @@ def test_picker_open_and_selection_do_not_refetch_catalog_or_session(
     assert patch_info.value.request.post_data_json == {"model_override": "alternate"}
     assert chat.session_patches == [{"model_override": "alternate"}]
     assert unexpected_gets == []
+
+
+@pytest.mark.parametrize("viewport_height", [600, 340], ids=["desktop", "short"])
+def test_long_catalog_scrolls_to_and_selects_the_last_model(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    viewport_height: int,
+) -> None:
+    """Long model catalogs stay viewport-bounded, scrollable, and selectable."""
+    chat = chat_session_contract
+    models = [
+        model_option(
+            f"model-{index:02}",
+            display_name=f"Model {index:02} with a descriptive catalog label",
+            is_default=index == 0,
+        )
+        for index in range(32)
+    ]
+    last_model = models[-1]
+    chat.set_catalog(
+        harness="kiro-native",
+        models=models,
+        selected_model=str(models[0]["id"]),
+    )
+    viewport = {"width": 1280, "height": viewport_height}
+    page.set_viewport_size(viewport)
+    page.goto(chat.url)
+    _open_models(page)
+
+    menu = page.get_by_test_id("composer-agent-config-menu")
+    last_row = page.get_by_test_id(f"composer-agent-model-{last_model['id']}")
+    page.wait_for_function(
+        """async () => {
+          const menu = document.querySelector('[data-testid="composer-agent-config-menu"]');
+          if (!menu) return false;
+          if (menu.getAnimations({subtree: true}).some(
+            animation => animation.playState === "running" || animation.playState === "pending"
+          )) return false;
+
+          const rect = () => {
+            const {top, bottom, height} = menu.getBoundingClientRect();
+            return {top, bottom, height};
+          };
+          const close = (a, b) =>
+            Math.abs(a.top - b.top) < 0.25 &&
+            Math.abs(a.bottom - b.bottom) < 0.25 &&
+            Math.abs(a.height - b.height) < 0.25;
+          const frame = () => new Promise(requestAnimationFrame);
+
+          await frame();
+          const first = rect();
+          await frame();
+          const second = rect();
+          await frame();
+          const third = rect();
+          return close(first, second) && close(second, third);
+        }"""
+    )
+    scroll_metrics = menu.evaluate(
+        """element => {
+          const rect = element.getBoundingClientRect();
+          return {
+            scrollHeight: element.scrollHeight,
+            clientHeight: element.clientHeight,
+            scrollTop: element.scrollTop,
+            overflowY: getComputedStyle(element).overflowY,
+            left: rect.left,
+            top: rect.top,
+            width: rect.width,
+            height: rect.height,
+          };
+        }"""
+    )
+    assert scroll_metrics["overflowY"] in ("auto", "scroll")
+    assert scroll_metrics["scrollHeight"] > scroll_metrics["clientHeight"]
+    assert 0 < scroll_metrics["height"] <= 384
+    assert scroll_metrics["top"] >= 0
+    assert scroll_metrics["top"] + scroll_metrics["height"] <= viewport["height"]
+
+    page.mouse.move(
+        scroll_metrics["left"] + scroll_metrics["width"] / 2,
+        scroll_metrics["top"] + scroll_metrics["height"] / 2,
+    )
+    page.mouse.wheel(0, 2_000)
+    page.wait_for_function(
+        """() => {
+          const menu = document.querySelector('[data-testid="composer-agent-config-menu"]');
+          return menu && menu.scrollTop > 0;
+        }"""
+    )
+    menu_box = menu.bounding_box()
+    last_box = last_row.bounding_box()
+    assert menu_box is not None and last_box is not None
+    assert last_box["y"] >= menu_box["y"]
+    assert last_box["y"] + last_box["height"] <= menu_box["y"] + menu_box["height"]
+
+    session_path = f"/v1/sessions/{chat.session_id}"
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == session_path
+            and response.status == 200
+        )
+    ) as patch_info:
+        last_row.click()
+
+    assert patch_info.value.request.post_data_json == {"model_override": last_model["id"]}
+    assert chat.session_patches == [{"model_override": last_model["id"]}]
+    expect(last_row).to_have_attribute("aria-checked", "true")
