@@ -9,7 +9,7 @@ import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
-import { ChatHeader } from "./ChatHeader";
+import { ChatHeader, MIN_BREADCRUMB_PX } from "./ChatHeader";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -223,6 +223,95 @@ describe("ChatHeader — workspace pane alignment", () => {
 
     expect(header).not.toBeNull();
     expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
+  });
+
+  it("centers the desktop breadcrumb between symmetric side columns", () => {
+    const { container } = renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-1",
+      conversationTitle: "Centering check",
+      canShare: true,
+    });
+    const header = container.querySelector("header");
+    const slot = screen.getByRole("navigation", { name: "Conversation" }).parentElement;
+    const cluster = screen.getByTestId("header-actions");
+
+    // Middle column between side columns that start at the measured reservations;
+    // max-w-full keeps the centered item inside its column.
+    expect(header).toHaveClass(
+      "md:grid",
+      "md:grid-cols-[minmax(var(--chat-header-left,0px),1fr)_auto_minmax(var(--chat-header-right,0px),1fr)]",
+    );
+    expect(header).not.toHaveClass("justify-between");
+    expect(slot).toHaveClass("md:col-start-2", "md:justify-self-center", "min-w-0", "max-w-full");
+    expect(cluster).toHaveClass("md:col-start-3", "md:justify-self-end");
+    expect(cluster).toContainElement(screen.getByRole("button", { name: "Share session" }));
+  });
+
+  // Desktop header metrics the measurement reads back from computed styles
+  // (md:px-4 and md:gap-6), so the narrow case models the production boundary.
+  const HEADER_PADDING_PX = 16;
+  const COLUMN_GAP_PX = 24;
+
+  // Renders with an empty toggle slot and a 138px action cluster inside a header
+  // `headerWidth` px wide (padding included); returns the side-column variables.
+  function renderSideColumns(headerWidth: number) {
+    const computed = window.getComputedStyle.bind(window);
+    const styles = vi.spyOn(window, "getComputedStyle").mockImplementation((element) =>
+      element.tagName === "HEADER"
+        ? ({
+            paddingLeft: `${HEADER_PADDING_PX}px`,
+            paddingRight: `${HEADER_PADDING_PX}px`,
+            columnGap: `${COLUMN_GAP_PX}px`,
+          } as CSSStyleDeclaration)
+        : computed(element),
+    );
+    const rect = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        const width = this.dataset.testid === "header-actions" ? 138 : 0;
+        const box = { width, height: 0, x: 0, y: 0, top: 0, left: 0, right: width, bottom: 0 };
+        return { ...box, toJSON: () => box };
+      });
+    const clientWidth = vi
+      .spyOn(Element.prototype, "clientWidth", "get")
+      .mockImplementation(function (this: Element) {
+        return this.tagName === "HEADER" ? headerWidth : 0;
+      });
+    try {
+      const { container } = renderHeader({
+        sidebarOpen: true,
+        conversationId: "conv-1",
+        conversationTitle: "Centering check",
+        canShare: true,
+      });
+      const style = container.querySelector("header")!.style;
+      return [
+        style.getPropertyValue("--chat-header-left"),
+        style.getPropertyValue("--chat-header-right"),
+      ];
+    } finally {
+      styles.mockRestore();
+      rect.mockRestore();
+      clientWidth.mockRestore();
+    }
+  }
+
+  it("reserves the action cluster's width on both sides of a roomy header", () => {
+    expect(renderSideColumns(1000)).toEqual(["138px", "138px"]);
+  });
+
+  it("shrinks the empty side's reservation before a narrow header squeezes the breadcrumb", () => {
+    // A 384px header (a 768px viewport with the sidebar at its 50% limit) has
+    // 304px for the three columns: the populated side keeps its 138px and the
+    // empty side gets only the 46px that still leave the breadcrumb its minimum.
+    const columns = 384 - 2 * HEADER_PADDING_PX - 2 * COLUMN_GAP_PX;
+    expect(renderSideColumns(384)).toEqual(["46px", "138px"]);
+    expect(columns - 46 - 138).toBe(MIN_BREADCRUMB_PX);
+  });
+
+  it("falls back to each side's own width when even the breadcrumb minimum does not fit", () => {
+    expect(renderSideColumns(300)).toEqual(["0px", "138px"]);
   });
 });
 
