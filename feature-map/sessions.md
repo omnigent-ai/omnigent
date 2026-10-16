@@ -541,6 +541,12 @@ plain `uv run pytest`, which starts a private server for the test.
   distinguishes a replacement live on another replica from a failed launch
   with an old heartbeat or a local heartbeat. This controls liveness evidence;
   it does not drive an actual cross-replica host migration.
+- **`message-recovery`, rotated Codex session (own environment):**
+  `tests/e2e/test_codex_rotated_bridge_relaunch_e2e.py::test_rotated_codex_session_relaunches_into_its_bridge_directory`
+  drives `/new` in real Codex, stops that session's host-launched runner, then
+  sends a chat message to relaunch it. Chat and terminal replies must both
+  reach the rotated conversation with retained or missing bridge state. Only
+  model replies are scripted; no browser interaction is claimed.
 - **`message-recovery`, SDK sub-agent (server integration, plain `uv run pytest`):**
   `tests/server/integration/test_sessions_child_sessions.py::test_sdk_subagent_recovery_skips_session_init`
   covers recovery during ancestor healing and during the final binding refresh,

@@ -4014,6 +4014,9 @@ async def _wait_for_host_reconnect(
         await asyncio.sleep(min(0.1, remaining))
 
 
+_HOST_RUNNER_STARTUP_POLL_S = 1.0
+
+
 async def _wait_for_host_bound_runner_client(
     session_id: str,
     runner_router: RunnerRouter | None,
@@ -4024,78 +4027,117 @@ async def _wait_for_host_bound_runner_client(
     runner_exit_reports: RunnerExitReports | None,
     host_conn: HostConnection,
     host_registry: HostRegistry,
+    conversation_store: ConversationStore | None = None,
 ) -> httpx.AsyncClient | None:
+    """Wait for this runner, extending startup only for an explicit pending sign-in.
+
+    Host liveness can end the ordinary grace early for a dead or untracked
+    process. A bounded sign-in wait keeps the same binding and input until
+    authentication finishes; old hosts retain the ordinary startup budget.
+    Stop, rebind, cancellation and process exit still end the wait promptly.
+
+    :param conversation_store: Optional binding check while sign-in is pending.
     """
-    Wait for a host-bound runner to connect, ending early if the host
-    reports it already gone.
+    from omnigent.runner.identity import RUNNER_SIGN_IN_PENDING_WAIT_S
 
-    Races the connect grace (:func:`_wait_for_runner_client`) against a
-    one-shot ``host.runner_status`` query, because they answer different
-    questions and either can settle the outcome first:
-
-    * The runner connecting — or a crash report — resolves the wait exactly
-      as :func:`_wait_for_runner_client` does. This is ground truth and
-      always wins when it lands first.
-    * Concurrently, the host — the authoritative owner of runner-process
-      liveness — may report the runner ``dead`` or ``unknown`` (stopped,
-      crashed, or lost to a host restart). That means it will never
-      connect, so the wait ends immediately and the caller relaunches
-      without burning the rest of the grace.
-
-    Running the query *alongside* the wait rather than before it is what
-    keeps the query strictly a speed-up: a host that is too old to answer,
-    slow, or silent (verdict ``None`` / ``"alive"``) never shortcuts the
-    wait, so the connect grace runs its normal course with no added
-    latency.
-
-    :param session_id: Session/conversation identifier.
-    :param runner_router: The ``RunnerRouter`` instance, or ``None``.
-    :param tunnel_registry: The server's ``TunnelRegistry``, or ``None``.
-    :param runner_id: Runner id expected to connect.
-    :param timeout_s: Maximum seconds to wait for the connect.
-    :param runner_exit_reports: Crash-report store consulted by the
-        connect wait to abort early on a reported death.
-    :param host_conn: Live host connection to query for liveness.
-    :param host_registry: Registry used to enqueue the query frame.
-    :returns: The runner HTTP client if it connected, otherwise ``None``
-        (timed out, crash report, or host-confirmed dead/unknown).
-    """
-    connect_task = asyncio.ensure_future(
-        _wait_for_runner_client(
-            session_id,
-            runner_router,
-            tunnel_registry,
-            runner_id=runner_id,
-            timeout_s=timeout_s,
-            runner_exit_reports=runner_exit_reports,
+    def wait_for_connection(budget_s: float) -> asyncio.Task[httpx.AsyncClient | None]:
+        return asyncio.create_task(
+            _wait_for_runner_client(
+                session_id,
+                runner_router,
+                tunnel_registry,
+                runner_id=runner_id,
+                timeout_s=budget_s,
+                runner_exit_reports=runner_exit_reports,
+            )
         )
-    )
-    status_task = asyncio.ensure_future(
-        _query_host_runner_status(host_conn, host_registry, runner_id)
-    )
+
+    async def query_status(*, pause: bool = False) -> str | None:
+        if pause:
+            await asyncio.sleep(_HOST_RUNNER_STARTUP_POLL_S)
+        return await _query_host_runner_status(host_conn, host_registry, runner_id)
+
+    async def check_pending_owner() -> None:
+        if _intentional_stop_sessions.get(session_id) == runner_id:
+            raise OmnigentError(
+                "The session was stopped while waiting for host sign-in; send the message again.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        if conversation_store is not None:
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if current is None or current.runner_id != runner_id:
+                raise OmnigentError(
+                    "session runner binding changed while waiting for host sign-in; retry",
+                    code=ErrorCode.WRONG_REPLICA,
+                )
+
+    connect_task = wait_for_connection(timeout_s)
+    status_task = asyncio.create_task(query_status())
+    sign_in_deadline: float | None = None
+    waiting_for_sign_in = False
     try:
-        done, _pending = await asyncio.wait(
-            {connect_task, status_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        # The connect settling is authoritative (client, timeout, or crash
-        # report) — the host's opinion no longer matters once it lands.
-        if connect_task in done:
-            return connect_task.result()
-        # Only the status query has resolved so far.
-        if status_task.result() in ("dead", "unknown"):
-            # Host confirms the runner will never connect — stop waiting.
-            return None
-        # No verdict ("alive" or an unavailable/too-old/slow host): let the
-        # connect grace run to its natural conclusion.
-        return await connect_task
+        while True:
+            done, _pending = await asyncio.wait(
+                {connect_task, status_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if sign_in_deadline is not None:
+                await check_pending_owner()
+            if connect_task in done:
+                client = connect_task.result()
+                if client is not None:
+                    return client
+                if waiting_for_sign_in:
+                    return None
+                if (
+                    runner_exit_reports is not None
+                    and runner_exit_reports.get(runner_id) is not None
+                ):
+                    return None
+                if host_registry.get(host_conn.host_id) is not host_conn:
+                    return None
+                if status_task not in done:
+                    # A responsive host may have entered sign-in between polls.
+                    status_task.cancel()
+                    await asyncio.gather(status_task, return_exceptions=True)
+                    status_task = asyncio.create_task(query_status())
+                    await status_task
+                if status_task.result() != "sign_in_pending":
+                    return None
+            status = status_task.result()
+            if status in ("dead", "unknown"):
+                return None
+            if sign_in_deadline is None and status not in {"alive", "sign_in_pending"}:
+                return await connect_task
+            if status == "sign_in_pending" and not waiting_for_sign_in:
+                if sign_in_deadline is None:
+                    sign_in_deadline = time.monotonic() + RUNNER_SIGN_IN_PENDING_WAIT_S
+                await check_pending_owner()
+                budget_s = sign_in_deadline - time.monotonic()
+                if budget_s <= 0:
+                    return None
+                connect_task.cancel()
+                await asyncio.gather(connect_task, return_exceptions=True)
+                connect_task = wait_for_connection(budget_s)
+                waiting_for_sign_in = True
+            elif status == "alive" and waiting_for_sign_in:
+                # Sign-in finished; normal startup must now make progress.
+                assert sign_in_deadline is not None
+                budget_s = min(timeout_s, max(0.0, sign_in_deadline - time.monotonic()))
+                connect_task.cancel()
+                await asyncio.gather(connect_task, return_exceptions=True)
+                connect_task = wait_for_connection(budget_s)
+                waiting_for_sign_in = False
+            if (
+                sign_in_deadline is not None
+                and host_registry.get(host_conn.host_id) is not host_conn
+            ):
+                return None
+            status_task = asyncio.create_task(query_status(pause=True))
     finally:
-        outstanding = [t for t in (connect_task, status_task) if not t.done()]
+        outstanding = [task for task in (connect_task, status_task) if not task.done()]
         for task in outstanding:
             task.cancel()
         if outstanding:
-            # Drain the cancelled task(s); return_exceptions swallows the
-            # CancelledError so cleanup never masks the real return/raise.
             await asyncio.gather(*outstanding, return_exceptions=True)
 
 
@@ -4691,6 +4733,7 @@ async def ensure_runner_connected(
                     runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
                     host_conn=host_conn,
                     host_registry=host_registry,
+                    conversation_store=conversation_store,
                 )
                 if runner_client is not None:
                     return runner_client, await _reread()
@@ -4757,14 +4800,31 @@ async def ensure_runner_connected(
             )
 
         if runner_client is None:
-            runner_client = await _wait_for_runner_client(
-                session_id,
-                runner_router,
-                tunnel_registry,
-                runner_id=relaunched_runner_id,
-                timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
-                runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
-            )
+            if (
+                host_registry is not None
+                and host_conn is not None
+                and relaunched_runner_id is not None
+            ):
+                runner_client = await _wait_for_host_bound_runner_client(
+                    session_id,
+                    runner_router,
+                    tunnel_registry,
+                    runner_id=relaunched_runner_id,
+                    timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                    runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
+                    host_conn=host_conn,
+                    host_registry=host_registry,
+                    conversation_store=conversation_store,
+                )
+            else:
+                runner_client = await _wait_for_runner_client(
+                    session_id,
+                    runner_router,
+                    tunnel_registry,
+                    runner_id=relaunched_runner_id,
+                    timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                    runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
+                )
             conv = await _reread()
 
     return runner_client, conv

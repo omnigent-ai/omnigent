@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import ssl
+import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace, TracebackType
@@ -476,6 +477,278 @@ async def test_serve_tunnel_no_credential_error_after_streak(
     assert attempt == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
     assert message.startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
     assert "login https://ws.cloud.databricks.com/omnigent?o=123` " in message
+
+
+class _SignInFactory:
+    """Token factory whose credential source reports a pending interactive sign-in."""
+
+    def __init__(self, pending_calls: int, *, token: str | None) -> None:
+        """
+        :param pending_calls: Calls that report the sign-in as still pending.
+        :param token: What later calls return once it is no longer pending.
+        """
+        self._pending_calls = pending_calls
+        self._token = token
+        self.calls = 0
+        self.sign_in_pending = pending_calls > 0
+
+    def __call__(self) -> str | None:
+        self.calls += 1
+        self.sign_in_pending = self.calls <= self._pending_calls
+        return None if self.sign_in_pending else self._token
+
+
+def _clock_advanced_by_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Drive ``serve_tunnel``'s clock from its own sleeps; return the recorded delays."""
+    now = [1000.0]
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(
+        serve_module, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": _sleep})
+    )
+    monkeypatch.setattr(
+        serve_module, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: now[0]})
+    )
+    return sleeps
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_waits_for_a_pending_sign_in_then_connects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A never-connected runner polls a pending sign-in instead of upgrading without a token."""
+    from omnigent.runner.identity import RUNNER_CONNECT_MARKER_ENV_VAR, sign_in_pending_marker_path
+
+    marker = tmp_path / "runner.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
+    factory = _SignInFactory(pending_calls=4, token="tok-after-sign-in")
+    upgrades: list[str | None] = []
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **kwargs: Any) -> None:
+        del app
+        upgrades.append(auth_token)
+        kwargs["on_connected"]()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_sign_in_wait",
+            runner_version="0.1.0",
+            auth_token_factory=factory,
+        )
+
+    # No unauthenticated upgrade while pending: the first one carries the new token.
+    assert upgrades == ["tok-after-sign-in"]
+    assert len(sleeps) == 4
+    assert not sign_in_pending_marker_path(marker).exists()
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_refreshes_when_sign_in_finishes_after_the_token_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolved sign-in supplies its new token before the first upgrade."""
+
+    class _ResolvingSignIn:
+        calls = 0
+
+        def __call__(self) -> str | None:
+            self.calls += 1
+            return None if self.calls <= 2 else "tok-after-sign-in"
+
+        @property
+        def sign_in_pending(self) -> bool:
+            return self.calls < 2
+
+    upgrades: list[str | None] = []
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        del app
+        upgrades.append(auth_token)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://server.example.test",
+            runner_id="runner_sign_in_resolves",
+            runner_version="0.1.0",
+            auth_token_factory=_ResolvingSignIn(),
+        )
+
+    assert upgrades == ["tok-after-sign-in"]
+    assert len(sleeps) == 1
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_keeps_a_token_when_the_sign_in_flag_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A broken optional status accessor must not prevent an authenticated upgrade."""
+
+    class _BrokenSignInFlag:
+        def __call__(self) -> str | None:
+            return "tok-live"
+
+        @property
+        def sign_in_pending(self) -> bool:
+            raise RuntimeError("credential source unavailable")
+
+    upgrades: list[str | None] = []
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        del app
+        upgrades.append(auth_token)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://server.example.test",
+            runner_id="runner_sign_in_flag_broken",
+            runner_version="0.1.0",
+            auth_token_factory=_BrokenSignInFlag(),
+        )
+
+    assert upgrades == ["tok-live"]
+    assert "sign_in_pending read failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_fails_once_the_sign_in_is_no_longer_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sign-in that stops being pending without a token fails like any missing credential."""
+    from omnigent.runner.transports.ws_tunnel.serve import _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+    factory = _SignInFactory(pending_calls=2, token=None)
+    attempts = 0
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        del app
+        nonlocal attempts
+        attempts += 1
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_sign_in_required",
+            runner_version="0.1.0",
+            auth_token_factory=factory,
+        )
+
+    assert str(exc_info.value).startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+    assert attempts == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_bounds_the_wait_for_a_pending_sign_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sign-in still pending at the budget fails the launch as before."""
+    from omnigent.runner.transports.ws_tunnel.serve import (
+        _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS,
+        _SIGN_IN_PENDING_POLL_INTERVAL_S,
+        _SIGN_IN_PENDING_WAIT_S,
+    )
+
+    factory = _SignInFactory(pending_calls=10_000, token=None)
+    attempts = 0
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        del app
+        nonlocal attempts
+        attempts += 1
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="no credential available"):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_sign_in_timeout",
+            runner_version="0.1.0",
+            auth_token_factory=factory,
+        )
+
+    polls = [delay for delay in sleeps if delay == _SIGN_IN_PENDING_POLL_INTERVAL_S]
+    assert sum(polls) == _SIGN_IN_PENDING_WAIT_S
+    assert attempts == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+
+class _ContendedSignInFactory:
+    """Token factory whose ``sign_in_pending`` waits on a lock a concurrent mint holds."""
+
+    def __init__(self) -> None:
+        self.flag_requested = threading.Event()
+        self.mint_finished = threading.Event()
+        self.loop_stayed_free = False
+
+    def __call__(self) -> str | None:
+        return None
+
+    @property
+    def sign_in_pending(self) -> bool:
+        self.flag_requested.set()
+        # The mint finishes from the event loop, so it can only do so while the loop is free.
+        self.loop_stayed_free = self.mint_finished.wait(timeout=2.0)
+        return False
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_reads_sign_in_pending_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag read stuck behind the factory lock must not stall the runner's event loop."""
+    factory = _ContendedSignInFactory()
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        del app
+        raise asyncio.CancelledError
+
+    async def _finish_mint_once_the_flag_is_read() -> None:
+        while not factory.flag_requested.is_set():
+            await asyncio.sleep(0.01)
+        factory.mint_finished.set()
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    mint = asyncio.create_task(_finish_mint_once_the_flag_is_read())
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await serve_tunnel(
+                _noop_app,
+                server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+                runner_id="runner_sign_in_flag_off_loop",
+                runner_version="0.1.0",
+                auth_token_factory=factory,
+            )
+    finally:
+        mint.cancel()
+        await asyncio.gather(mint, return_exceptions=True)
+
+    assert factory.loop_stayed_free
 
 
 @pytest.mark.asyncio
@@ -3318,3 +3591,32 @@ async def test_serve_tunnel_keeps_escalating_after_brief_connection(
     # Attempt 3 (brief_drop): connected for 2 s < 5 s; no reset → sleep 2.0
     # Attempt 4 (stop): CancelledError before sleep
     assert sleeps == [0.5, 1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_pending_sign_in_cancellation_clears_launch_marker(tmp_path, monkeypatch) -> None:
+    from omnigent.runner.identity import RUNNER_CONNECT_MARKER_ENV_VAR, sign_in_pending_marker_path
+
+    marker = tmp_path / "runner.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
+    task = asyncio.create_task(
+        serve_tunnel(
+            _noop_app,
+            server_url="http://synthetic.invalid",
+            runner_id="runner-owned",
+            runner_version="0.1",
+            auth_token_factory=_SignInFactory(pending_calls=10_000, token=None),
+        )
+    )
+    try:
+        async with asyncio.timeout(1):
+            while not sign_in_pending_marker_path(marker).exists():
+                await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not sign_in_pending_marker_path(marker).exists()
+        assert not marker.exists()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
