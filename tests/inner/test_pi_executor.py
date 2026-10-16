@@ -2230,7 +2230,8 @@ def test_gateway_rejects_invalid_refresh_interval(interval):
 async def test_gateway_helper_failure_is_bounded_and_redacted(monkeypatch, command, error):
     from omnigent.inner import pi_executor
 
-    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.05)
+    if error == "timed out":
+        monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.05)
     with pytest.raises(OSError, match=error) as failure:
         await pi_executor._fetch_shell_command_token(command)
     assert "secret" not in str(failure.value)
