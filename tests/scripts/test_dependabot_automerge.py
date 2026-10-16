@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import difflib
 import importlib.util
 import io
 import json
@@ -22,7 +23,7 @@ SCRIPTS = ROOT / ".github/scripts"
 HEAD, BASE = "a" * 40, "b" * 40
 REPO = "example/project"
 PREFIX = f"repos/{REPO}"
-POLICY = {"python_patch_packages": ["ruff"], "cooldown_days": 7}
+POLICY = {"python": {"minor": ["ruff"]}, "cooldown_days": 7}
 LOCK = """version = 1
 [[package]]
 name = "ruff"
@@ -40,7 +41,7 @@ source = { registry = "https://pypi.org/simple" }
 def policy_module(monkeypatch):
     monkeypatch.syspath_prepend(str(SCRIPTS))
     spec = importlib.util.spec_from_file_location(
-        "dependabot_automerge", SCRIPTS / "dependabot_automerge.py"
+        "dependabot_policy", SCRIPTS / "dependabot_policy.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -80,7 +81,18 @@ def api():
             "encoding": "base64",
             "content": base64.b64encode(text.encode()).decode(),
         }
-    for name in ("Security Scan", "Trivy CVE Scan (repository)", "Trivy CVE Scan (dev-tools)"):
+    for name in (
+        "Security Scan",
+        "Trivy CVE Scan (repository)",
+        "Trivy CVE Scan (dev-tools)",
+        "Pre-commit checks",
+        "Pytest (runtime-core)",
+        "Integration (openai-agents)",
+        "web test",
+        "Browser Contract UI",
+        "Docker build",
+        "Pytest (codex-parity)",
+    ):
         routes[name] = {
             "total_count": 1,
             "check_runs": [
@@ -92,7 +104,19 @@ def api():
                 }
             ],
         }
-    for run_id, workflow in enumerate(("trivy.yml", "ci.yml", "lint.yml"), start=11):
+    for run_id, workflow in enumerate(
+        (
+            "trivy.yml",
+            "ci.yml",
+            "lint.yml",
+            "integration.yml",
+            "e2e.yml",
+            "web-tests.yml",
+            "e2e-ui.yml",
+            "docker-build.yml",
+        ),
+        start=11,
+    ):
         routes[
             f"{PREFIX}/actions/workflows/{workflow}/runs?head_sha={HEAD}&event=pull_request&per_page=100"
         ] = {
@@ -200,13 +224,17 @@ else:
 import io, json, os, urllib.request
 from pathlib import Path
 def fixture_urlopen(url, timeout):
-    assert url == 'https://pypi.org/pypi/ruff/0.15.2/json'
+    url = getattr(url, "full_url", url)
     root = Path(os.environ['PILOT_FIXTURES'])
     (root / 'pypi-called').touch()
     data = json.loads((root / 'api.json').read_text())
     if data.get('pypi_timeout'):
         raise TimeoutError('simulated PyPI timeout')
-    return io.BytesIO(json.dumps(data['pypi']).encode())
+    if url == 'https://pypi.org/pypi/ruff/0.15.2/json':
+        result = data['pypi']
+    else:
+        result = data['registry'][url]
+    return io.BytesIO(json.dumps(result).encode())
 urllib.request.urlopen = fixture_urlopen
 """)
     args = [
@@ -222,7 +250,9 @@ urllib.request.urlopen = fixture_urlopen
     if scan:
         workflow = yaml.safe_load((ROOT / ".github/workflows/security-scan.yml").read_text())
         step = next(s for s in workflow["jobs"]["scan"]["steps"] if s.get("id") == "dependabot")
-        (tmp_path / "python3").symlink_to(sys.executable)
+        python = tmp_path / "python3"
+        python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        python.chmod(0o755)
         args = ["bash", "-e", "-c", step["run"]]
     env = dict(
         os.environ,
@@ -238,7 +268,7 @@ urllib.request.urlopen = fixture_urlopen
         PR="123",
         HEAD_SHA=HEAD,
     )
-    process = subprocess.run(args, cwd=ROOT, env=env, text=True, capture_output=True, timeout=30)
+    process = subprocess.run(args, cwd=ROOT, env=env, text=True, capture_output=True, timeout=90)
     calls_file = tmp_path / "calls.jsonl"
     calls = (
         [json.loads(line) for line in calls_file.read_text().splitlines()]
@@ -586,3 +616,418 @@ def test_age_uses_registry_timestamp_and_accepts_exact_boundary(policy_module, a
     with pytest.raises(policy_module.NeedsReview, match="cooldown"):
         policy_module.validate_release(package, api["pypi"], 7, datetime(2020, 1, 7, tzinfo=UTC))
     policy_module.validate_release(package, api["pypi"], 7, datetime(2020, 1, 8, tzinfo=UTC))
+
+
+def set_changed_files(api, files):
+    """Serve real Git tree/blob shapes for each base/head fixture file."""
+    api["files"] = files
+    changed = [path for path, (old, new) in files.items() if old != new]
+    api["routes"][f"{PREFIX}/pulls/123"]["changed_files"] = len(changed)
+    api["routes"][f"{PREFIX}/pulls/123/files?per_page=100&page=1"] = [
+        {"filename": path, "status": "modified"} for path in changed
+    ]
+    for index, commit in enumerate((BASE, HEAD)):
+        trees = {commit: {}}
+        for path, contents in files.items():
+            parts = path.split("/")
+            tree_id = commit
+            for part in parts[:-1]:
+                child = tree_id + "/" + part
+                trees[tree_id][part] = {"path": part, "mode": "040000", "sha": child}
+                trees.setdefault(child, {})
+                tree_id = child
+            blob_id = commit + "/" + path
+            trees[tree_id][parts[-1]] = {"path": parts[-1], "mode": "100644", "sha": blob_id}
+            api["routes"][f"{PREFIX}/git/blobs/{blob_id}"] = {
+                "encoding": "base64",
+                "content": base64.b64encode(contents[index].encode()).decode(),
+            }
+        for sha, tree in trees.items():
+            api["routes"][f"{PREFIX}/git/trees/{sha}"] = {"tree": list(tree.values())}
+
+
+@pytest.fixture
+def expanded_update(api, request):
+    ecosystem = request.param
+    api["registry"] = {}
+    if ecosystem == "python":
+        old, new = (
+            LOCK.replace("ruff", "cachetools"),
+            LOCK.replace("ruff", "cachetools").replace("0.15.1", "0.15.2"),
+        )
+        set_changed_files(api, {"uv.lock": (old, new)})
+        api["registry"]["https://pypi.org/pypi/cachetools/0.15.2/json"] = copy.deepcopy(
+            api["pypi"]
+        )
+        api["registry"]["https://pypi.org/pypi/cachetools/0.15.2/json"]["urls"][0]["url"] = (
+            "https://files.pythonhosted.org/cachetools.whl"
+        )
+        name, pin, target, scanner = "cachetools", "0.15.2", "uv.lock", "uv"
+    elif ecosystem == "npm":
+        lock = {
+            "lockfileVersion": "9.0",
+            "settings": {"autoInstallPeers": True},
+            "importers": {
+                "web": {"dependencies": {"clsx": {"specifier": "^2.1.0", "version": "2.1.0"}}}
+            },
+            "packages": {"clsx@2.1.0": {"resolution": {"integrity": "sha512-old"}}},
+            "snapshots": {"clsx@2.1.0": {}},
+        }
+        old = yaml.safe_dump(lock)
+        new = old.replace("2.1.0", "2.1.1").replace("sha512-old", "sha512-new")
+        manifest = json.dumps({"dependencies": {"clsx": "^2.1.0"}, "scripts": {"test": "vitest"}})
+        set_changed_files(
+            api,
+            {
+                "pnpm-lock.yaml": (old, new),
+                "web/package.json": (manifest, manifest.replace("2.1.0", "2.1.1")),
+                "pnpm-workspace.yaml": ("packages: [web]\n", "packages: [web]\n"),
+            },
+        )
+        api["registry"]["https://registry.npmjs.org/clsx"] = {
+            "versions": {
+                "2.1.1": {
+                    "name": "clsx",
+                    "version": "2.1.1",
+                    "dist": {
+                        "integrity": "sha512-new",
+                        "tarball": "https://registry.npmjs.org/clsx/-/clsx-2.1.1.tgz",
+                    },
+                }
+            },
+            "time": {"2.1.1": "2020-01-01T00:00:00Z"},
+        }
+        name, pin, target, scanner = "clsx", "2.1.1", "pnpm-lock.yaml", "pnpm"
+    elif ecosystem == "cargo":
+        old = (
+            'version = 4\n[[package]]\nname = "anyhow"\nversion = "1.0.0"\n'
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+            'checksum = "old"\n'
+        )
+        set_changed_files(
+            api,
+            {
+                "tests/codex_parity/sidecar/Cargo.lock": (
+                    old,
+                    old.replace("1.0.0", "1.0.1").replace('"old"', '"new"'),
+                )
+            },
+        )
+        api["registry"]["https://crates.io/api/v1/crates/anyhow/1.0.1"] = {
+            "version": {
+                "num": "1.0.1",
+                "checksum": "new",
+                "yanked": False,
+                "created_at": "2020-01-01T00:00:00Z",
+            }
+        }
+        name, pin, target, scanner = (
+            "anyhow",
+            "1.0.1",
+            "tests/codex_parity/sidecar/Cargo.lock",
+            "cargo",
+        )
+    elif ecosystem == "github-actions":
+        old = (
+            "name: CI\non: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n"
+            "    steps:\n      - uses: actions/checkout@" + "1" * 40 + " # v4.1.0\n"
+        )
+        new = old.replace("1" * 40, "2" * 40).replace("v4.1.0", "v4.2.0")
+        set_changed_files(api, {".github/workflows/ci.yml": (old, new)})
+        api["routes"]["repos/actions/checkout/tags?per_page=100&page=1"] = [
+            {"name": tag, "commit": {"sha": sha * 40}}
+            for tag, sha in [("v4.1.0", "1"), ("v4.2.0", "2")]
+        ]
+        for tag in ["v4.1.0", "v4.2.0"]:
+            api["routes"][f"repos/actions/checkout/releases/tags/{tag}"] = {
+                "draft": False,
+                "prerelease": False,
+                "published_at": "2020-01-01T00:00:00Z",
+            }
+        api["routes"][
+            "advisories?ecosystem=actions&affects=actions%2Fcheckout%404.2.0&per_page=100&page=1"
+        ] = []
+        name, pin, target, scanner = "actions/checkout", "4.2.0", "", ""
+    else:
+        assert ecosystem == "pre-commit"
+        old = (
+            "repos:\n  - repo: https://github.com/pre-commit/pre-commit-hooks\n"
+            "    rev: v6.0.0\n    hooks:\n      - id: check-yaml\n"
+        )
+        set_changed_files(api, {".pre-commit-config.yaml": (old, old.replace("v6.0.0", "v6.1.0"))})
+        api["routes"]["repos/pre-commit/pre-commit-hooks/releases/tags/v6.1.0"] = {
+            "draft": False,
+            "prerelease": False,
+            "published_at": "2020-01-01T00:00:00Z",
+        }
+        api["routes"][
+            "advisories?ecosystem=pip&affects=pre-commit-hooks%406.1.0&per_page=100&page=1"
+        ] = []
+        name, pin, target, scanner = (
+            "https://github.com/pre-commit/pre-commit-hooks",
+            "v6.1.0",
+            "",
+            "",
+        )
+    api["report"]["Results"][0].update(
+        Target=target, Type=scanner, Packages=[{"Name": name, "Version": pin}]
+    )
+    return ecosystem, api
+
+
+@pytest.mark.parametrize(
+    "expanded_update", ["python", "npm", "cargo", "github-actions", "pre-commit"], indirect=True
+)
+@pytest.mark.parametrize("entry", ["merge", "approval", "scan"])
+def test_expanded_updates_use_production_entry_points(tmp_path, expanded_update, entry):
+    ecosystem, api = expanded_update
+    process, calls = run_cli(
+        tmp_path,
+        api,
+        mode="merge",
+        sweep=entry == "merge",
+        approval=entry == "approval",
+        scan=entry == "scan",
+    )
+    assert process.returncode == 0, process.stdout + process.stderr
+    if entry == "merge":
+        assert calls[-1][:2] == ["pr", "merge"], process.stdout
+    elif entry == "approval":
+        assert "policy satisfied" in process.stdout
+    else:
+        output = (tmp_path / "outputs").read_text()
+        assert "eligible=true" in output
+        assert ("workflow_pins=true" in output) == (ecosystem == "github-actions")
+        if ecosystem == "github-actions":
+            changed = tmp_path / "changed.txt"
+            changed.write_text(".github/workflows/ci.yml\n")
+            for authorized, expected in [("true", 0), ("", 1)]:
+                guard = subprocess.run(
+                    ["bash", str(SCRIPTS / "security-scan/sensitive-paths.sh")],
+                    env=dict(
+                        os.environ, CHANGED_FILES=str(changed), DEPENDABOT_WORKFLOW_PINS=authorized
+                    ),
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                assert guard.returncode == expected, guard.stdout + guard.stderr
+            workflow = yaml.safe_load((ROOT / ".github/workflows/security-scan.yml").read_text())
+            sensitive = next(
+                s for s in workflow["jobs"]["scan"]["steps"] if s["name"] == "Sensitive-path guard"
+            )
+            assert (
+                sensitive["env"]["DEPENDABOT_WORKFLOW_PINS"]
+                == "${{ steps.dependabot.outputs.workflow_pins }}"
+            )
+            path = ".github/workflows/ci.yml"
+            old, new = api["files"][path]
+            checked_out = tmp_path / path
+            checked_out.parent.mkdir(parents=True)
+            checked_out.write_text(new)
+            diff = tmp_path / "pr.diff"
+            diff.write_text(
+                f"diff --git a/{path} b/{path}\n"
+                + "".join(
+                    difflib.unified_diff(
+                        old.splitlines(keepends=True),
+                        new.splitlines(keepends=True),
+                        fromfile=f"a/{path}",
+                        tofile=f"b/{path}",
+                    )
+                )
+            )
+            for script in ("secret-scan.py", "exfil-scan.py", "lint-workflow-misuse.py"):
+                scan = subprocess.run(
+                    [sys.executable, str(SCRIPTS / "security-scan" / script)],
+                    cwd=tmp_path,
+                    env=dict(os.environ, DIFF_FILE=str(diff), CHANGED_FILES=str(changed)),
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                assert scan.returncode == 0, scan.stdout + scan.stderr
+    if entry != "merge":
+        assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+@pytest.mark.parametrize(
+    "expanded_update", ["npm", "cargo", "github-actions", "pre-commit"], indirect=True
+)
+def test_expanded_updates_require_their_actual_jobs(tmp_path, expanded_update):
+    ecosystem, api = expanded_update
+    name = {
+        "npm": "web test",
+        "cargo": "Pytest (codex-parity)",
+        "github-actions": "Pre-commit checks",
+        "pre-commit": "Pre-commit checks",
+    }[ecosystem]
+    api["routes"][name]["check_runs"][0]["conclusion"] = "skipped"
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert "human review or retry required" in process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+@pytest.fixture
+def evaluate_fixture(policy_module, expanded_update, monkeypatch):
+    _ecosystem, api = expanded_update
+    monkeypatch.setattr(policy_module, "registry_json", lambda url: api["registry"][url])
+    monkeypatch.setattr(policy_module, "gh_json", lambda args: api["routes"][args[1]])
+    monkeypatch.setattr(
+        policy_module,
+        "paginated",
+        lambda endpoint: api["routes"][endpoint + "?per_page=100&page=1"],
+    )
+    policy = json.loads((ROOT / ".github/dependabot-automerge.json").read_text())
+
+    def evaluate():
+        files = api["files"]
+        changed = {path for path, (old, new) in files.items() if old != new}
+        return policy_module.evaluate_changes(files.__getitem__, changed, policy)
+
+    return api, evaluate
+
+
+@pytest.mark.parametrize(
+    "old,new,minor,allowed",
+    [
+        ("1.2.3", "1.2.4", False, True),
+        ("1.2.3", "1.3.0", True, True),
+        ("0.2.3", "0.3.0", True, False),
+        ("1.2.3", "2.0.0", True, False),
+        ("1.2.3", "1.2.4rc1", True, False),
+        ("1.2.3", "1.2.2", True, False),
+    ],
+)
+def test_update_policy_respects_version_boundaries(policy_module, old, new, minor, allowed):
+    if allowed:
+        policy_module.upgrade(old, new, minor)
+    else:
+        with pytest.raises(policy_module.NeedsReview):
+            policy_module.upgrade(old, new, minor)
+
+
+@pytest.mark.parametrize("expanded_update", ["npm"], indirect=True)
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "scripts",
+        "pin",
+        "source",
+        "integrity",
+        "young",
+        "override",
+        "shared",
+        "graph",
+        "duplicate_key",
+    ],
+)
+def test_web_updates_preserve_security_and_compatibility(evaluate_fixture, policy_module, fault):
+    api, evaluate = evaluate_fixture
+    assert evaluate()["ecosystem"] == "npm"
+    files = api["files"]
+    if fault == "scripts":
+        old, new = files["web/package.json"]
+        files["web/package.json"] = (old, new.replace("vitest", "curl attacker"))
+    elif fault == "pin":
+        for path in ("web/package.json", "pnpm-lock.yaml"):
+            files[path] = tuple(text.replace("^2.1.", "2.1.") for text in files[path])
+    elif fault in {"integrity", "source", "young"}:
+        metadata = api["registry"]["https://registry.npmjs.org/clsx"]
+        if fault == "young":
+            metadata["time"]["2.1.1"] = "2100-01-01T00:00:00Z"
+        else:
+            metadata["versions"]["2.1.1"]["dist"][
+                "integrity" if fault == "integrity" else "tarball"
+            ] = "untrusted"
+    elif fault == "override":
+        text = "packages: [web]\noverrides: {clsx: 2.1.1}\n"
+        files["pnpm-workspace.yaml"] = (text, text)
+    elif fault == "shared":
+        locks = [yaml.safe_load(text) for text in files["pnpm-lock.yaml"]]
+        for lock in locks:
+            lock["importers"]["web/electron"] = copy.deepcopy(lock["importers"]["web"])
+        files["pnpm-lock.yaml"] = tuple(yaml.safe_dump(lock) for lock in locks)
+    elif fault == "graph":
+        old, new = files["pnpm-lock.yaml"]
+        lock = yaml.safe_load(new)
+        lock["snapshots"]["clsx@2.1.1"] = {"dependencies": {"unexpected": "1.0.0"}}
+        files["pnpm-lock.yaml"] = (old, yaml.safe_dump(lock))
+    else:
+        old, new = files["pnpm-lock.yaml"]
+        files["pnpm-lock.yaml"] = (old, new + "\nimporters: {}\n")
+    with pytest.raises(policy_module.NeedsReview):
+        evaluate()
+
+
+@pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
+@pytest.mark.parametrize(
+    "fault", ["run", "permission", "unknown_action", "untested", "unreleased", "young"]
+)
+def test_action_updates_only_change_tested_release_pins(evaluate_fixture, policy_module, fault):
+    api, evaluate = evaluate_fixture
+    assert evaluate()["ecosystem"] == "github-actions"
+    path = ".github/workflows/ci.yml"
+    old, new = api["files"][path]
+    if fault in {"run", "permission"}:
+        new += "      - run: curl attacker\n" if fault == "run" else "permissions: write-all\n"
+    elif fault == "unknown_action":
+        new = new.replace("actions/checkout", "actions/create-github-app-token")
+    elif fault == "untested":
+        api["files"] = {".github/workflows/release.yml": (old, new)}
+    elif fault == "unreleased":
+        new = new.replace("2" * 40, "3" * 40)
+    else:
+        api["routes"]["repos/actions/checkout/releases/tags/v4.2.0"]["published_at"] = (
+            "2100-01-01T00:00:00Z"
+        )
+    if fault != "untested":
+        api["files"][path] = (old, new)
+    with pytest.raises(policy_module.NeedsReview):
+        evaluate()
+
+
+@pytest.mark.parametrize("expanded_update", ["pre-commit", "cargo"], indirect=True)
+def test_hooks_and_rust_preserve_commands_and_sources(evaluate_fixture, policy_module):
+    api, evaluate = evaluate_fixture
+    ecosystem = evaluate()["ecosystem"]
+    (path,) = api["files"]
+    old, new = api["files"][path]
+    new += (
+        "    entry: curl attacker\n"
+        if ecosystem == "pre-commit"
+        else 'dependencies = ["unexpected"]\n'
+    )
+    api["files"][path] = (old, new)
+    with pytest.raises(policy_module.NeedsReview):
+        evaluate()
+
+
+@pytest.mark.parametrize("expanded_update", ["npm", "cargo"], indirect=True)
+def test_expanded_advisories_block_changed_versions(tmp_path, expanded_update):
+    _ecosystem, api = expanded_update
+    package = api["report"]["Results"][0]["Packages"][0]
+    api["report"]["Results"][0]["Vulnerabilities"].append(
+        {
+            "PkgName": package["Name"],
+            "InstalledVersion": package["Version"],
+            "Severity": "HIGH",
+            "VulnerabilityID": "CVE-new",
+        }
+    )
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert "CVE-new" in process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+@pytest.mark.parametrize("expanded_update", ["github-actions", "pre-commit"], indirect=True)
+def test_action_and_hook_advisories_block_unattended_merge(tmp_path, expanded_update):
+    _ecosystem, api = expanded_update
+    (endpoint,) = [key for key in api["routes"] if key.startswith("advisories?")]
+    api["routes"][endpoint] = [{"ghsa_id": "GHSA-test", "severity": "high", "withdrawn_at": None}]
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert "GHSA-test" in process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)

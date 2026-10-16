@@ -87,28 +87,35 @@ def test_lockfiles_are_declared_at_their_workspace_roots(entries: list[dict[str,
     assert uv_dirs == ["/"]
 
 
-def test_minor_patch_groups_keep_the_pilot_separate(entries: list[dict[str, Any]]) -> None:
-    """Each ecosystem has one general group; Python also isolates eligible patches."""
+def test_automatic_groups_match_policy_and_keep_manual_updates(
+    entries: list[dict[str, Any]],
+) -> None:
+    policy = json.loads((REPO_ROOT / ".github/dependabot-automerge.json").read_text())
+    expected = {
+        "uv": [
+            ("python-tooling", policy["python"]["minor"], ["minor", "patch"]),
+            ("python-library-patches", policy["python"]["patch"], ["patch"]),
+        ],
+        "npm": [
+            ("web-tooling", policy["npm"]["minor"], ["minor", "patch"]),
+            ("web-library-patches", policy["npm"]["patch"], ["patch"]),
+        ],
+        "github-actions": [("actions-tested", policy["actions"], ["minor", "patch"])],
+        "cargo": [("cargo-tested-patches", policy["cargo"]["patch"], ["patch"])],
+    }
     for entry in entries:
         if not _version_updates_on(entry):
             continue
         groups = _version_groups(entry)
-        if entry["package-ecosystem"] == "uv":
-            assert next(iter(groups)) == "python-tooling-patches"
-            pilot = groups.pop("python-tooling-patches")
-            policy = json.loads((REPO_ROOT / ".github/dependabot-automerge.json").read_text())
-            assert set(pilot["patterns"]) == set(policy["python_patch_packages"])
-            assert pilot["update-types"] == ["patch"]
-            assert entry["cooldown"]["default-days"] == policy["cooldown_days"]
-        assert len(groups) == 1, (
-            f"{entry['package-ecosystem']}: {len(groups)} version-update groups "
-            f"({', '.join(groups)}); each group is its own PR"
-        )
-        (spec,) = groups.values()
-        assert spec.get("patterns") == ["*"], entry["package-ecosystem"]
-        assert sorted(spec.get("update-types", [])) == ["minor", "patch"], entry[
-            "package-ecosystem"
-        ]
+        for name, patterns, types in expected.get(entry["package-ecosystem"], []):
+            assert next(iter(groups)) == name
+            group = groups.pop(name)
+            assert group["patterns"] == patterns
+            assert group["update-types"] == types
+        assert len(groups) == 1
+        (general,) = groups.values()
+        assert general["patterns"] == ["*"]
+        assert sorted(general["update-types"]) == ["minor", "patch"]
 
 
 def test_disabled_entries_ignore_everything(entries: list[dict[str, Any]]) -> None:

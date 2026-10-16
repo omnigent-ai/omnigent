@@ -264,9 +264,9 @@ def main() -> int:
                 os.environ.get("EXPECTED_HEAD") or pull["head"]["sha"],
             )
         except (ValueError, KeyError, TypeError, OSError, subprocess.CalledProcessError) as exc:
-            print(f"Dependabot pilot requires human review: {exc}")
+            print(f"Dependabot update requires human review: {exc}")
         else:
-            print(f"Dependabot patch policy satisfied: {', '.join(candidate['packages'])}")
+            print(f"Dependabot update policy satisfied: {', '.join(candidate['packages'])}")
             return 0
     print(f"::error::{decision.reason}")
     return 1

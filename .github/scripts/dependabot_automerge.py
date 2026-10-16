@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a small Dependabot pilot using trusted policy and read-only PR data."""
+"""Evaluate routine Dependabot upgrades using trusted policy and read-only PR data."""
 
 from __future__ import annotations
 
@@ -8,107 +8,45 @@ import base64
 import io
 import json
 import os
-import re
 import subprocess
 import zipfile
 import zlib
-from datetime import UTC, datetime, timedelta
+from functools import cache
 from pathlib import Path
 from urllib.parse import urlencode
-from urllib.request import urlopen
 
-import tomllib
+from dependabot_policy import (
+    NeedsReview,
+    evaluate_changes,
+    require,
+)
 from maintainer_approval import gh_json, latest_decisive_reviews, paginated
 
 POLICY = Path(__file__).resolve().parents[1] / "dependabot-automerge.json"
 REPORT_CHECKS = ("Security Scan", "Trivy CVE Scan (repository)", "Trivy CVE Scan (dev-tools)")
 
 
-class NeedsReview(ValueError):
-    """The PR does not meet the unattended-merge policy."""
+@cache
+def git_object(repository: str, kind: str, sha: str) -> dict:
+    return gh_json(["api", f"repos/{repository}/git/{kind}/{sha}"])
 
 
-def require(condition: bool, reason: str) -> None:
-    if not condition:
-        raise NeedsReview(reason)
-
-
-def patch_upgrade(old: str, new: str) -> bool:
-    if not all(re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", v) for v in (old, new)):
-        return False
-    before, after = (tuple(map(int, v.split("."))) for v in (old, new))
-    return before[:2] == after[:2] and after[2] > before[2]
-
-
-def lock_changes(before: dict, after: dict, policy: dict) -> list[dict]:
-    require(
-        {k: v for k, v in before.items() if k != "package"}
-        == {k: v for k, v in after.items() if k != "package"},
-        "Lockfile resolution settings changed",
-    )
-    indexes = []
-    for lock in (before, after):
-        by_name: dict[str, list[dict]] = {}
-        for package in lock["package"]:
-            by_name.setdefault(package["name"], []).append(package)
-        indexes.append(by_name)
-    old_packages, new_packages = indexes
-    require(old_packages.keys() == new_packages.keys(), "Packages were added or removed")
-    changes = []
-    for name, old in old_packages.items():
-        new = new_packages[name]
-        if old == new:
-            continue
-        require(name in policy["python_patch_packages"], f"{name} requires human review")
-        require(len(old) == len(new) == 1, f"{name} has multiple conditional versions")
-        previous, current = old[0], new[0]
+def read_file(repository: str, sha: str, path: str) -> str:
+    parts = path.split("/")
+    for index, part in enumerate(parts):
+        tree = git_object(repository, "trees", sha)
+        require(not tree.get("truncated"), "Git tree is incomplete")
+        entries = [entry for entry in tree["tree"] if entry["path"] == part]
+        require(len(entries) == 1, f"Missing file: {path}")
+        entry = entries[0]
         require(
-            patch_upgrade(previous["version"], current["version"]),
-            f"{name} is not a patch upgrade",
+            entry["mode"] == ("100644" if index == len(parts) - 1 else "040000"),
+            f"{path} must be a regular file",
         )
-        require(
-            current["source"] == {"registry": "https://pypi.org/simple"},
-            f"{name} is not from PyPI",
-        )
-        mutable = {"version", "sdist", "wheels"}
-        require(
-            {k: v for k, v in previous.items() if k not in mutable}
-            == {k: v for k, v in current.items() if k not in mutable},
-            f"{name} changed its source, dependencies, or resolution markers",
-        )
-        changes.append(current)
-    require(bool(changes), "No eligible package upgrades")
-    return changes
-
-
-def validate_release(package: dict, release: dict, cooldown_days: int, now: datetime) -> None:
-    name, version = package["name"], package["version"]
-    require(release["info"]["version"] == version, f"{name}: registry version mismatch")
-    files = {entry["url"]: entry for entry in release["urls"]}
-    artifacts = package.get("wheels", []) + ([package["sdist"]] if "sdist" in package else [])
-    require(bool(artifacts), f"{name}: no locked artifacts")
-    cutoff = now - timedelta(days=cooldown_days)
-    for artifact in artifacts:
-        published = files.get(artifact["url"])
-        require(published is not None, f"{name}: artifact is absent from PyPI")
-        require(not published["yanked"], f"{name}: artifact is yanked")
-        require(
-            artifact["hash"] == f"sha256:{published['digests']['sha256']}"
-            and artifact["size"] == published["size"],
-            f"{name}: artifact does not match PyPI",
-        )
-        uploaded = datetime.fromisoformat(published["upload_time_iso_8601"])
-        require(uploaded <= cutoff, f"{name}: artifact has not completed the cooldown")
-
-
-def read_lock(repository: str, sha: str) -> dict:
-    tree = gh_json(["api", f"repos/{repository}/git/trees/{sha}"])
-    require(not tree.get("truncated"), "Git tree is incomplete")
-    entries = [entry for entry in tree["tree"] if entry["path"] == "uv.lock"]
-    require(len(entries) == 1 and entries[0]["mode"] == "100644", "uv.lock must be a regular file")
-    blob = gh_json(["api", f"repos/{repository}/git/blobs/{entries[0]['sha']}"])
-    require(blob["encoding"] == "base64", "Unexpected lockfile encoding")
-    return tomllib.loads(base64.b64decode(blob["content"]).decode())
+        sha = entry["sha"]
+    blob = git_object(repository, "blobs", sha)
+    require(blob["encoding"] == "base64", "Unexpected file encoding")
+    return base64.b64decode(blob["content"]).decode()
 
 
 def evaluate(repository: str, number: int, expected_head: str | None = None) -> dict:
@@ -129,10 +67,11 @@ def evaluate(repository: str, number: int, expected_head: str | None = None) -> 
     )
     files = paginated(f"repos/{repository}/pulls/{number}/files")
     require(
-        pull["changed_files"] == len(files) == 1
-        and files[0]["filename"] == "uv.lock"
-        and files[0]["status"] == "modified",
-        "Pilot accepts only uv.lock changes; manifests and other files need review",
+        pull["changed_files"] == len(files) and bool(files), "Incomplete changed-file inventory"
+    )
+    require(
+        all(f["status"] == "modified" for f in files),
+        "Added, deleted or renamed files need review",
     )
     reviews = paginated(f"repos/{repository}/pulls/{number}/reviews")
     require(
@@ -140,24 +79,22 @@ def evaluate(repository: str, number: int, expected_head: str | None = None) -> 
         "A reviewer has requested changes",
     )
     policy = json.loads(POLICY.read_text())
-    changes = lock_changes(read_lock(repository, base), read_lock(repository, head), policy)
-    now = datetime.now(UTC)
-    for package in changes:
-        url = f"https://pypi.org/pypi/{package['name']}/{package['version']}/json"
-        with urlopen(url, timeout=30) as response:
-            validate_release(package, json.load(response), policy["cooldown_days"], now)
-    return {
-        "head": head,
-        "base": base,
-        "packages": [f"{p['name']}=={p['version']}" for p in changes],
-    }
+
+    @cache
+    def read(path):
+        return read_file(repository, base, path), read_file(repository, head, path)
+
+    decision = evaluate_changes(read, {f["filename"] for f in files}, policy)
+    return dict(decision, head=head, base=base)
 
 
-def require_advisory_policy(report: dict, packages: list[str]) -> None:
+def require_advisory_policy(
+    report: dict, packages: list[str], target="uv.lock", scanner="uv"
+) -> None:
     require(isinstance(report.get("Results"), list), "Incomplete Trivy report")
     inventory = set()
     for result in report["Results"]:
-        if result.get("Target") != "uv.lock" or result.get("Type") != "uv":
+        if result.get("Target") != target or result.get("Type") != scanner:
             continue
         for package in result.get("Packages", []):
             inventory.add(f"{package['Name']}=={package['Version']}")
@@ -171,8 +108,9 @@ def require_advisory_policy(report: dict, packages: list[str]) -> None:
     require(set(packages) <= inventory, "Trivy did not inventory every changed package")
 
 
-def require_reports(repository: str, head: str, packages: list[str]) -> None:
-    for name in REPORT_CHECKS:
+def require_reports(repository: str, candidate: dict) -> None:
+    head = candidate["head"]
+    for name in (*REPORT_CHECKS, *candidate["checks"]):
         # Filter server-side before pagination; large CI matrices fill the first page.
         query = urlencode({"check_name": name, "per_page": 100})
         response = gh_json(["api", f"repos/{repository}/commits/{head}/check-runs?{query}"])
@@ -187,7 +125,7 @@ def require_reports(repository: str, head: str, packages: list[str]) -> None:
     # Require actual CI completion, even if Merge Ready treats an absent
     # path-filtered check as skippable while its workflow is being created.
     completed_runs = {}
-    for workflow in ("ci.yml", "lint.yml", "trivy.yml"):
+    for workflow in sorted(set(candidate["workflows"]) | {"ci.yml", "lint.yml", "trivy.yml"}):
         query = urlencode({"head_sha": head, "event": "pull_request", "per_page": 100})
         response = gh_json(
             ["api", f"repos/{repository}/actions/workflows/{workflow}/runs?{query}"]
@@ -202,6 +140,22 @@ def require_reports(repository: str, head: str, packages: list[str]) -> None:
             f"Latest {workflow} run did not succeed",
         )
         completed_runs[workflow] = latest
+    if not candidate["target"]:
+        ecosystem = "actions" if candidate["ecosystem"] == "github-actions" else "pip"
+        for pin in candidate["packages"]:
+            name, value = pin.split("==")
+            name = (
+                "/".join(name.split("/")[:2]) if ecosystem == "actions" else name.rsplit("/", 1)[1]
+            )
+            query = urlencode(
+                {"ecosystem": ecosystem, "affects": f"{name}@{value.removeprefix('v')}"}
+            )
+            for advisory in paginated(f"advisories?{query}"):
+                require(
+                    advisory.get("withdrawn_at") or advisory["severity"] in {"low", "medium"},
+                    f"{pin}: {advisory['ghsa_id']} requires human review",
+                )
+        return
     trivy_run = completed_runs["trivy.yml"]
     artifacts = gh_json(
         ["api", f"repos/{repository}/actions/runs/{trivy_run['id']}/artifacts?per_page=100"]
@@ -220,7 +174,12 @@ def require_reports(repository: str, head: str, packages: list[str]) -> None:
     ).stdout
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            require_advisory_policy(json.loads(archive.read("trivy-results.json")), packages)
+            require_advisory_policy(
+                json.loads(archive.read("trivy-results.json")),
+                candidate["packages"],
+                candidate["target"],
+                candidate["scanner"],
+            )
     except (zipfile.BadZipFile, zlib.error) as exc:
         raise NeedsReview(f"Trivy repository report is unreadable: {exc}") from exc
 
@@ -248,14 +207,14 @@ def sweep(repository: str, mode: str) -> None:
         ]
     )
     require(len(pulls) < 100, "Dependabot PR listing reached its limit; refusing a partial sweep")
-    rows = ["## Dependabot auto-merge pilot", "", f"Mode: `{mode}`", ""]
+    rows = ["## Dependabot auto-merge", "", f"Mode: `{mode}`", ""]
     for pull in pulls:
         number = pull["number"]
         try:
             decision = evaluate(repository, number)
             packages = ", ".join(decision["packages"])
             rows.append(f"- #{number}: eligible ({packages})")
-            require_reports(repository, decision["head"], decision["packages"])
+            require_reports(repository, decision)
             if mode == "merge":
                 current = gh_json(["api", f"repos/{repository}/pulls/{number}"])
                 require(
@@ -328,6 +287,8 @@ def main() -> int:
     if path := os.environ.get("GITHUB_OUTPUT"):
         with open(path, "a") as output:
             output.write(f"eligible={eligible}\n")
+            if eligible == "true" and decision["ecosystem"] == "github-actions":
+                output.write("workflow_pins=true\n")
     return 0
 
 

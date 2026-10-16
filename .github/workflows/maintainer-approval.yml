@@ -50,9 +50,19 @@ jobs:
           sparse-checkout: |
             .github/scripts/maintainer_approval.py
             .github/scripts/dependabot_automerge.py
+            .github/scripts/dependabot_policy.py
             .github/dependabot-automerge.json
           sparse-checkout-cone-mode: false
           persist-credentials: false
+
+      - name: Install trusted policy parser
+        if: >-
+          github.event.pull_request.user.login == 'dependabot[bot]' &&
+          vars.DEPENDABOT_AUTOMERGE_MODE == 'merge'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dependabot-policy-env"
+          "$RUNNER_TEMP/dependabot-policy-env/bin/pip" install --disable-pip-version-check --only-binary=:all: PyYAML==6.0.3
+          echo "$RUNNER_TEMP/dependabot-policy-env/bin" >> "$GITHUB_PATH"
 
       - name: Require maintainer approval
         env:
