@@ -1193,6 +1193,11 @@ export interface ChatActions {
    */
   clearQueuedMessages: (conversationId: string) => void;
   /**
+   * Drop a conversation's optimistic pending bubbles, keeping an unsent `initialDraft`.
+   * For inputs the server settled with no `session.input.consumed` receipt (Stop session).
+   */
+  dropPendingUserMessages: (conversationId: string) => void;
+  /**
    * Flush the queue head if the session is idle and ready. Level-triggered:
    * safe to call on any state change (idempotent — no-ops when busy, when the
    * queue is empty, or when the head isn't for the bound conversation). POSTing
@@ -2096,6 +2101,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return {
         queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
       };
+    });
+  },
+
+  dropPendingUserMessages: (conversationId) => {
+    setterFor(conversationId)((s) => {
+      // A draft awaiting model readiness is unsent, so it stays the person's to send.
+      const kept = s.pendingUserMessages.filter((p) => p.initialDraft !== undefined);
+      return kept.length === s.pendingUserMessages.length ? {} : { pendingUserMessages: kept };
     });
   },
 
