@@ -20,6 +20,7 @@ import {
   type MCPDraft,
 } from "@/lib/agentConfig";
 import type { AgentConfigRevision } from "@/lib/agentsApi";
+import { randomUUID } from "@/lib/randomUUID";
 import { ApiError } from "@/lib/sessionsApi";
 
 export function EditCustomAgentDialog({
@@ -225,7 +226,7 @@ export function EditCustomAgentDialog({
                           servers: [
                             ...draft.servers,
                             {
-                              key: crypto.randomUUID(),
+                              key: randomUUID(),
                               name: "",
                               existing: false,
                               editable: true,

@@ -123,7 +123,10 @@ beforeEach(() => {
     );
   });
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 describe("Custom agents settings", () => {
   it("keeps duplicate names by ID and reviews server agents without mutation actions", async () => {
@@ -369,6 +372,15 @@ async function openEditor() {
 }
 
 describe("editing custom agents", () => {
+  it("adds an MCP server without native crypto.randomUUID", async () => {
+    vi.stubGlobal("crypto", {
+      getRandomValues: globalThis.crypto.getRandomValues.bind(globalThis.crypto),
+    });
+    configResponses();
+    await openEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Add server" }));
+    expect(screen.getByRole("textbox", { name: "Server name" })).toBeVisible();
+  });
   it.each([false, undefined])("keeps old servers read-only for edits: %s", async (edit) => {
     flags.edit = edit;
     mount("/settings/custom-agents/a1");
