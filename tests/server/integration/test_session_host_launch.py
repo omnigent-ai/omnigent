@@ -3765,6 +3765,144 @@ async def test_retry_session_host_refusal_is_typed_and_does_not_persist(
     assert after.json() == before.json()
 
 
+_SPAWN_REFUSAL = (
+    "failed to spawn runner: [Errno 2] No such file or directory:\n'/opt/host-venv/bin/python'"
+)
+_SPAWN_REFUSAL_FLAT = (
+    "failed to spawn runner: [Errno 2] No such file or directory: '/opt/host-venv/bin/python'"
+)
+
+
+async def test_retry_session_names_uncategorized_host_refusal(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry reports the host's spawn refusal at once instead of a bare unavailable error."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    # A refusal must not wait out the connect timeout for a runner that is not coming.
+    monkeypatch.setattr(sessions_module, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 30.0)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    before = await client.get(f"/v1/sessions/{session_id}/items")
+    set_runner_client(None)
+
+    responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=_SPAWN_REFUSAL,
+            launch_error_code="runner_spawn_failed",
+        )
+    )
+    started = time.monotonic()
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+    await responder
+
+    assert response.status_code == 503, response.text
+    error = response.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert error["message"] == (
+        "The host could not start a runner for this session — the host reported "
+        f"the launch failed: {_SPAWN_REFUSAL_FLAT}. Fix it on the host, then retry."
+    )
+    assert time.monotonic() - started < budget(10.0)
+    after = await client.get(f"/v1/sessions/{session_id}/items")
+    assert after.json() == before.json()
+
+
+async def test_retry_session_names_launched_runner_that_never_connected(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launch the host accepted but whose runner never connected says so on Retry."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    set_runner_client(None)
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+    await responder
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["message"] == (
+        "The host was asked to start a runner for this session, but none "
+        "connected to the server. Check the runner log on the host, then retry."
+    )
+
+
+async def test_native_message_relaunch_refusal_keeps_host_reason(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native send whose relaunch the host refused records the host's reason."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    comm = await _connect_host(app)
+    session_id = await _native_host_session(client, app, db_uri, comm)
+    responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=_SPAWN_REFUSAL,
+            launch_error_code="runner_spawn_failed",
+        )
+    )
+    try:
+        response = await _post_hello(client, session_id)
+    finally:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            _ = await responder
+
+    assert response.status_code == 202, response.text
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+    assert errors[0]["message"] == (
+        "The host could not start a runner for this session — the host reported "
+        f"the launch failed: {_SPAWN_REFUSAL_FLAT}. Fix it on the host, then retry."
+    )
+
+
+def test_host_launch_refusal_hides_reason_from_non_owners_and_bounds_it() -> None:
+    """Only the host owner sees the host's text, flattened and capped."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _HOST_REFUSAL_REASON_MAX_CHARS,
+        HostLaunchRefusedError,
+    )
+
+    refusal = HostLaunchRefusedError("bad\x1b[0m\n" + "x" * 1000, "owner@example.com")
+
+    hidden = refusal.for_viewer("collaborator@example.com")
+    assert "bad" not in str(hidden)
+    assert "daemon log on the host" in str(hidden)
+    assert str(refusal) == str(hidden)
+    shown = str(refusal.for_viewer("owner@example.com"))
+    reason = shown.split("the launch failed: ", 1)[1].split(". Fix it", 1)[0]
+    assert reason.startswith("bad [0m x")
+    assert len(reason) == _HOST_REFUSAL_REASON_MAX_CHARS
+    assert reason.endswith("…")
+
+
 async def test_relaunch_stops_the_superseded_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
