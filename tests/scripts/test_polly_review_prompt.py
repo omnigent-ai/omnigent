@@ -270,5 +270,9 @@ def test_prompt_bounds_scope_by_linked_issues(
 
 def test_review_job_can_read_linked_issues() -> None:
     workflow = yaml.safe_load(_WORKFLOW.read_text())
-    review = workflow["jobs"]["review"]
-    assert review.get("permissions", workflow["permissions"])["issues"] == "read"
+    assert workflow["jobs"]["review"]["permissions"] == {
+        "contents": "read",
+        "issues": "read",
+        "pull-requests": "write",
+    }
+    assert "issues" not in workflow["permissions"]

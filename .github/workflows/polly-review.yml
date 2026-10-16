@@ -40,7 +40,6 @@ on:
 
 permissions:
   contents: read
-  issues: read
   pull-requests: write
 
 env:
@@ -92,6 +91,11 @@ jobs:
   review:
     name: Polly AI Review
     needs: [gate, trigger]
+    # Only this job reads linked issues to bound review scope.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
     # Ignored comments must not cancel reviews, including the bot's own post.
     # Queue eligible requests; the duplicate check runs after the active review.
     concurrency:
