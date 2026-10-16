@@ -58,7 +58,12 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
  * opted in. Returns true when routed (the caller cancels the default click).
  */
 export function maybeOpenLinkInApp(conversationId: string | undefined, href: string): boolean {
-  if (!conversationId || !supportsBrowser() || !readOpenLinksInApp()) return false;
+  return readOpenLinksInApp() && openLinkInApp(conversationId, href);
+}
+
+/** Explicit menu choices do not depend on the plain-click preference. */
+export function openLinkInApp(conversationId: string | undefined, href: string): boolean {
+  if (!conversationId || !supportsBrowser()) return false;
   let url: URL;
   try {
     url = new URL(href, window.location.href);
@@ -97,6 +102,15 @@ export function followLinkWithPopupFallback(
   }
   if (!/^(?:https?:)?\/\//i.test(href)) return;
   event.preventDefault();
+  openLinkInBrowser(href);
+}
+
+/** Open explicitly outside the embedded view, retaining the web popup fallback. */
+export function openLinkInBrowser(href: string): void {
+  if (isNativeShell()) {
+    window.open(href, "_blank", "noopener,noreferrer");
+    return;
+  }
   const popup = window.open("about:blank", "_blank");
   if (popup) {
     popup.opener = null;

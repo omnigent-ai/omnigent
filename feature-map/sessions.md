@@ -9,6 +9,8 @@ the header menu), and each place is a separate entry point.
 
 ## Sub-features
 
+- `chat-link-menu`: right-click a website or reachable workspace file link to
+  open it in Omnigent, open it in a browser, or copy its destination.
 - `pin`: pinned sessions move to their own section and back.
 - `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
   old Pinned slot. Dragging a pinned row into a folder unpins it without one.
@@ -279,6 +281,12 @@ does not send a message; enter a question and send when ready.
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
 create or select a closable Browser soft tab automatically.
 
+**Chat links:** in a full conversation or the side-chat workspace tab, right-click
+a website or reachable file link. Choose **Open in Omnigent**, **Open in browser
+tab** (web) or **Open in default browser** (desktop), or **Copy link**. A file's
+browser and copy actions use its conversation's file-preview URL, retaining any
+cited line and column. Explicit choices leave the ordinary-click preference as is.
+
 **Desktop recent sessions:** hold Control and press Tab to open the five most
 recent sessions. Continue pressing Tab (or Shift+Tab) to cycle, release Control
 to switch, or press Escape to cancel.
@@ -298,6 +306,17 @@ Tests that stop a runner, restart the server, or read the database cannot run
 through `verify-env run`. They are marked "own environment" below; run them with
 plain `uv run pytest`, which starts a private server for the test.
 
+- **`chat-link-menu`, full chat and side-chat workspace tab (browser contract):**
+  `tests/browser_ui/chat/test_transcript_rendering.py::test_file_link_context_menu_opens_and_copies_the_viewer_url`
+  checks all three file actions, a real clipboard write, and a new browser tab.
+  `test_external_link_click_opens_the_rendered_target` and
+  `test_external_link_falls_back_inside_a_popup_blocked_host` in the same file
+  cover the website menu's new-tab and popup-blocked routes. Run with
+  `uv run pytest tests/browser_ui/chat/test_transcript_rendering.py -k 'external_link or file_link_context_menu' --browser-ui-skip-build --video=on --output=<evidence-directory>`;
+  no server or runner is required. Desktop website routing and the click
+  preference are covered by `ChatMarkdown.inAppLinkRouting.test.tsx` and
+  `openLinkInApp.test.ts`; these mock the bridge and do not establish real
+  Electron or operating-system browser behavior.
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
 - **`pin-undo`, sidebar row:**
@@ -649,6 +668,12 @@ plain `uv run pytest`, which starts a private server for the test.
 
 ## Gotchas
 
+- Website links need the desktop browser bridge for **Open in Omnigent**; the
+  entry is disabled in a normal web tab. Workspace files use the existing file
+  viewer on either platform. Missing or unverified file links keep their existing
+  feedback, and mail links and page fragments keep the browser's native menu.
+- Copying a file link copies its preview URL, not a raw host file path. The
+  recipient still needs access to that conversation and its reachable filesystem.
 - Existing side chats on separate runners must still be closed individually.
   Hostless CLI Stop keeps its existing per-conversation behavior.
 - Starting a side chat after its parent stopped relaunches the parent. The new

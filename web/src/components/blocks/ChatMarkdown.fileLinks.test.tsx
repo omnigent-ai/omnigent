@@ -17,7 +17,9 @@ import { FileViewerContext } from "@/shell/FileViewerContext";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn().mockResolvedValue(undefined) }));
 import { showToast } from "@/components/ui/toast";
+import { copyText } from "@/lib/clipboard";
 
 const toastMock = vi.mocked(showToast);
 const fetchMock = vi.fn();
@@ -25,10 +27,15 @@ const fetchMock = vi.fn();
 beforeEach(() => {
   fetchMock.mockReset();
   toastMock.mockReset();
+  vi.mocked(copyText).mockClear();
   vi.stubGlobal("fetch", fetchMock);
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  delete window.__OMNIGENT_BASE_PATH__;
+});
 
 function jsonResponse(body: unknown, status = 200): Response {
   return {
@@ -102,6 +109,38 @@ function renderMarkdown(
 }
 
 describe("markdown links to workspace files", () => {
+  it("offers file preview, browser tab and copy actions scoped to the viewer conversation", async () => {
+    window.__OMNIGENT_BASE_PATH__ = "/omni";
+    renderMarkdown("[notes](docs/notes.md:12:3)", ["docs/notes.md"], FILE_VIEWER_WITH_SESSION);
+    const link = screen.getByRole("button", { name: "notes" });
+    fireEvent.contextMenu(link);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open in Omnigent" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12, column: 3 });
+
+    fireEvent.contextMenu(link);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy link" }));
+    const expected = `${window.location.origin}/omni/c/conv_1?file=docs%2Fnotes.md&line=12&column=3`;
+    await waitFor(() => expect(copyText).toHaveBeenCalledWith(expected));
+
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    const popupDocument = document.implementation.createHTMLDocument();
+    vi.spyOn(window, "open").mockReturnValue({ opener: window, document: popupDocument } as Window);
+    fireEvent.contextMenu(link);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open in browser tab" }));
+    expect(click.mock.instances[0]).toHaveProperty("href", expected);
+  });
+
+  it("reports a failed link copy instead of claiming success", async () => {
+    vi.mocked(copyText).mockRejectedValueOnce(new Error("clipboard unavailable"));
+    renderMarkdown("[notes](docs/notes.md)", ["docs/notes.md"], FILE_VIEWER_WITH_SESSION);
+    fireEvent.contextMenu(screen.getByRole("button", { name: "notes" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy link" }));
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith("Could not copy the link. Please try again."),
+    );
+    expect(openFile).not.toHaveBeenCalled();
+  });
+
   it("opens the FileViewer for an absolute path instead of navigating", () => {
     renderMarkdown(`[proposal.md](${WORKSPACE}/docs/proposal.md)`, ["docs/proposal.md"]);
 
