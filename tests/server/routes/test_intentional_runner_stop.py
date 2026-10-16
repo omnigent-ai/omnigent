@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from collections.abc import Iterator
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from omnigent.host.frames import HostHelloFrame, HostStopRunnerFrame, decode_host_frame
@@ -104,6 +107,43 @@ async def test_host_stop_ack_settles_late_native_activity(
     finally:
         await asyncio.wrap_future(session_live_state.submit("drain_test_writes", lambda: None))
         session_live_state.configure(None)
+
+
+async def test_host_stop_ack_tells_a_parent_on_another_runner(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stopping a sub-agent's own runner mid-turn wakes its parent on the parent's runner."""
+    store, ids = family
+    child_id = ids["elsewhere"]
+    session_live_state.configure(store)
+    posted: list[tuple[str, dict[str, Any]]] = []
+
+    def parent_runner(request: httpx.Request) -> httpx.Response:
+        posted.append((request.url.path, json.loads(request.content)["data"]))
+        return httpx.Response(204)
+
+    parent_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(parent_runner), base_url="http://runner"
+    )
+
+    async def runner_client(session_id: str, *_args: Any, **_kwargs: Any) -> Any:
+        return parent_client if session_id == ids["parent"] else None
+
+    monkeypatch.setattr(sessions, "_stop_session_host_runner", AsyncMock(return_value=True))
+    monkeypatch.setattr(sessions, "_get_runner_client", runner_client)
+    try:
+        assert await orchestration._stop_host_runner_intentionally(
+            child_id, "host", "runner-other", None, store
+        )
+    finally:
+        await asyncio.wrap_future(session_live_state.submit("drain_test_writes", lambda: None))
+        session_live_state.configure(None)
+    assert sessions._session_status_cache[child_id] == "idle"
+    assert [(path, data["status"]) for path, data in posted] == [
+        (f"/v1/sessions/{child_id}/events", "lost")
+    ]
+    assert "Its runner was stopped." in posted[0][1]["output"]
 
 
 @pytest.mark.parametrize("outcome", ["delivered", "offline", "error", "cancelled"])

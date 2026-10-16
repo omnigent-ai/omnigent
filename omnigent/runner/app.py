@@ -171,6 +171,7 @@ from omnigent.runner.subagent_routing import (
 from omnigent.runner.subagent_work import (
     _CODEX_NATIVE_HARNESS,
     _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX,
+    _SUBAGENT_LOST_STATUS,
     _SUBAGENT_TERMINAL_STATUSES,
     _WAKE_POST_MAX_ATTEMPTS,
     _child_session_parents,
@@ -2667,7 +2668,7 @@ def create_runner_app(
         # session: re-queue results the previous process never drained. Start
         # the durable server scan now, but overlap it with terminal creation;
         # sys_read_inbox uses the same locked helper if a turn races the scan.
-        _deliver_retained_subagent_results(session_id)
+        await _deliver_retained_subagent_results(session_id)
         _subagent_recovery_task = _start_subagent_recovery(session_id)
         if session_id not in _session_async_tasks:
             _session_async_tasks[session_id] = {}
@@ -6666,6 +6667,33 @@ def create_runner_app(
             status = data.get("status") if isinstance(data, dict) else None
             forwarded_output = data.get("output") if isinstance(data, dict) else None
             output = forwarded_output if isinstance(forwarded_output, str) else None
+            if status == _SUBAGENT_LOST_STATUS:
+                # The server's guess that the child's runner went away mid-turn.
+                # Like a launch timeout, it settles only the open dispatch it names
+                # and lets a relaunched child's real result replace it.
+                raw_work_id = data.get("work_id") if isinstance(data, dict) else None
+                lost_work_id = (
+                    raw_work_id if isinstance(raw_work_id, str) and raw_work_id else None
+                )
+                # A notice naming no dispatch can't be matched to one, so it settles nothing.
+                lost_entry = (
+                    await _ensure_subagent_work_entry(conversation_id, work_id=lost_work_id)
+                    if lost_work_id is not None
+                    else None
+                )
+                if (
+                    lost_entry is not None
+                    and lost_entry.work_id == lost_work_id
+                    and lost_entry.status not in _SUBAGENT_TERMINAL_STATUSES
+                ):
+                    lost_entry.launch_timed_out = True
+                    _mark_subagent_terminal_and_wake(
+                        conversation_id,
+                        status="failed",
+                        output=output or "Error: native sub-agent turn failed",
+                        only_if_work_id=lost_entry.work_id,
+                    )
+                return Response(status_code=204)
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             terminal_status = None
@@ -6789,10 +6817,13 @@ def create_runner_app(
                     and delivery_ack.reason == _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX
                     and await _parent_is_nested_subagent(delivery_ack.entry)
                 ):
-                    # Acknowledge instead of asking the forwarder to poll. The
-                    # entry stays terminal and undelivered; it is handed over
-                    # only if this runner ever creates the parent's inbox.
-                    return Response(status_code=204)
+                    # Acknowledge instead of asking the forwarder to poll; the
+                    # entry waits here for the parent's inbox. The reason tells
+                    # the server to deliver through the parent's own runner.
+                    return JSONResponse(
+                        status_code=202,
+                        content={"delivered": False, "reason": delivery_ack.reason},
+                    )
                 is_known = (
                     conversation_id in _session_sub_agent_names or recovered_entry is not None
                 )

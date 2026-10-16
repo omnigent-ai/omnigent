@@ -2115,6 +2115,20 @@ def register_events_routes(
                     )
                     if recovered is not None:
                         runner_result = recovered
+                else:
+                    # A child on a runner of its own reaches no inbox for a parent
+                    # that runs elsewhere: deliver through the parent's runner.
+                    from omnigent.server.routes import sessions as _sf
+
+                    via_parent = await _sf._forward_subagent_status_to_parent_runner(
+                        conv,
+                        runner_router,
+                        conversation_store,
+                        forward_body,
+                        runner_result,
+                    )
+                    if via_parent is not None:
+                        runner_result = via_parent
                 _require_external_status_forward(
                     session_id,
                     status,
