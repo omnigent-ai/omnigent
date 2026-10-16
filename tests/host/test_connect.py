@@ -256,6 +256,22 @@ async def test_host_skills_distinguishes_empty_and_failure(
     monkeypatch.setattr(skill_sources, "resolve_harness_skills", lambda *_: [])
     assert host._handle_skills(frame) == HostSkillsResultFrame(request_id="r", status="ok")
 
+    from omnigent.spec.skill_sources import SkillSourceContext
+    from omnigent.spec.types import SkillSpec
+
+    warning = "Codex plugin skills unavailable: `codex plugin list` exited 1"
+
+    def incomplete(ctx: SkillSourceContext, _harness: str) -> list[SkillSpec]:
+        assert ctx.warnings is not None
+        ctx.warnings.append(warning)
+        return []
+
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", incomplete)
+    host = _make_host_process()
+    assert host._handle_skills(frame) == HostSkillsResultFrame(
+        request_id="r", status="ok", warnings=[warning]
+    )
+
     def fail(*_args: object) -> None:
         raise OSError("unreadable skill directory")
 

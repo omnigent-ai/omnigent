@@ -207,6 +207,12 @@ def test_import_local_frames_round_trip() -> None:
         HostSkillsResultFrame(request_id="req_skills", status="ok"),
         HostSkillsResultFrame(
             request_id="req_skills",
+            status="ok",
+            skills=[{"name": "review", "description": "Review changes"}],
+            warnings=["Codex plugin skills unavailable: `codex plugin list` exited 1"],
+        ),
+        HostSkillsResultFrame(
+            request_id="req_skills",
             status="failed",
             error_code="invalid_path",
             error="path must be absolute",
@@ -215,6 +221,29 @@ def test_import_local_frames_round_trip() -> None:
 )
 def test_skills_frames_round_trip(frame: HostSkillsFrame | HostSkillsResultFrame) -> None:
     assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_skills_result_from_an_older_host_is_a_complete_catalog() -> None:
+    frame = decode_host_frame(
+        json.dumps({"kind": "host.skills_result", "request_id": "r", "status": "ok"})
+    )
+    assert isinstance(frame, HostSkillsResultFrame)
+    assert frame.warnings == []
+
+
+@pytest.mark.parametrize("warnings", ["codex", [1], [None]])
+def test_skills_result_rejects_malformed_warnings(warnings: object) -> None:
+    with pytest.raises(ValueError, match="warnings"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.skills_result",
+                    "request_id": "r",
+                    "status": "ok",
+                    "warnings": warnings,
+                }
+            )
+        )
 
 
 @pytest.mark.parametrize(

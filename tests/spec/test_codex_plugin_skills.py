@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 from unittest.mock import Mock
@@ -61,9 +62,15 @@ def _discover(
     skills_filter: str | list[str] = "all",
     *,
     codex_home: Path | None = None,
+    warnings: list[str] | None = None,
 ) -> dict[str, Path | None]:
     ctx = SkillSourceContext(
-        roots=(), home=home, skills_filter=skills_filter, bundle_dir=None, codex_home=codex_home
+        roots=(),
+        home=home,
+        skills_filter=skills_filter,
+        bundle_dir=None,
+        codex_home=codex_home,
+        warnings=warnings,
     )
     return {s.name: s.skill_dir for s in resolve_harness_skills(ctx, "codex-native")}
 
@@ -81,11 +88,13 @@ def test_enabled_plugin_skills_keep_namespaces_and_standalone_skills(
         codex_cli, _entry(), _entry("other"), _entry("disabled", enabled=False), _entry("missing")
     )
 
-    assert _discover(tmp_path) == {
+    warnings: list[str] = []
+    assert _discover(tmp_path, warnings=warnings) == {
         "review": standalone,
         "toolkit:review": first,
         "other:review": second,
     }
+    assert warnings == []
 
 
 def test_plugin_updates_follow_the_inventory_version(tmp_path: Path, codex_cli: Mock) -> None:
@@ -119,7 +128,9 @@ def test_plugin_skill_filters(
     _skill(root / "skills")
     _skill(root / "skills", "hidden", hidden=True)
 
-    assert set(_discover(tmp_path, skills_filter)) == expected
+    warnings: list[str] = []
+    assert set(_discover(tmp_path, skills_filter, warnings=warnings)) == expected
+    assert warnings == []
     if skills_filter == "none" or skills_filter == []:
         codex_cli.assert_not_called()
 
@@ -192,29 +203,86 @@ def test_plugin_inventory_uses_session_home_and_workspace(tmp_path: Path, codex_
 
 
 @pytest.mark.parametrize(
-    "failure",
+    "failure,summary,logged",
     [
-        FileNotFoundError(),
-        subprocess.TimeoutExpired("codex", 5),
-        subprocess.CalledProcessError(2, "codex"),
+        (
+            FileNotFoundError(2, "No such file or directory", "/private/bin/codex"),
+            "`codex plugin list` could not be run",
+            "[Errno 2] No such file or directory: '/private/bin/codex'",
+        ),
+        (subprocess.TimeoutExpired("codex", 5), "`codex plugin list` timed out after 5s", ""),
+        (subprocess.CalledProcessError(2, "codex"), "`codex plugin list` exited 2", ""),
+        (
+            subprocess.CalledProcessError(
+                1, "codex", stderr="Error: bad /Users/alice/.codex/config.toml\n  line 3\n"
+            ),
+            "`codex plugin list` exited 1",
+            "Error: bad /Users/alice/.codex/config.toml line 3",
+        ),
     ],
 )
 def test_unavailable_plugin_inventory_keeps_standalone_skills(
-    tmp_path: Path, codex_cli: Mock, failure: Exception
+    tmp_path: Path,
+    codex_cli: Mock,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception,
+    summary: str,
+    logged: str,
 ) -> None:
     codex_home = tmp_path / ".codex"
     standalone = _skill(codex_home / "skills")
     _skill(_plugin(codex_home) / "skills")
     codex_cli.side_effect = failure
+    warnings: list[str] = []
 
-    assert _discover(tmp_path) == {"review": standalone}
+    with caplog.at_level(logging.WARNING, logger="omnigent.spec.codex_plugin_skills"):
+        assert _discover(tmp_path, warnings=warnings) == {"review": standalone}
+
+    # The menu learns what failed without host paths; the host log keeps the output.
+    message = f"Codex plugin skills unavailable: {summary}"
+    assert warnings == [f"{message}; see the host log for details." if logged else f"{message}."]
+    assert "/" not in warnings[0]
+    assert [record.getMessage() for record in caplog.records] == [
+        f"{message}: {logged}" if logged else message
+    ]
+
+
+def test_plugin_cache_without_a_codex_binary_warns(
+    tmp_path: Path, codex_cli: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: None)
+    codex_home = tmp_path / ".codex"
+    standalone = _skill(codex_home / "skills")
+    warnings: list[str] = []
+    # Without a plugin cache there are no plugin skills to miss.
+    assert _discover(tmp_path, warnings=warnings) == {"review": standalone}
+    assert warnings == []
+    _skill(_plugin(codex_home) / "skills")
+    assert _discover(tmp_path, warnings=warnings) == {"review": standalone}
+    assert warnings == ["Codex plugin skills unavailable: `codex` was not found on the host."]
+    codex_cli.assert_not_called()
+
+
+def test_unavailable_plugin_inventory_without_a_collector_only_logs(
+    tmp_path: Path, codex_cli: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    _skill(_plugin(tmp_path / ".codex") / "skills")
+    codex_cli.side_effect = subprocess.CalledProcessError(1, "codex")
+    with caplog.at_level(logging.WARNING, logger="omnigent.spec.codex_plugin_skills"):
+        assert _discover(tmp_path) == {}
+    assert [record.getMessage() for record in caplog.records] == [
+        "Codex plugin skills unavailable: `codex plugin list` exited 1"
+    ]
 
 
 @pytest.mark.parametrize("output", ["{", "[]", '{"installed": {}}', '{"installed": [null, {}]}'])
 def test_malformed_plugin_inventory(tmp_path: Path, codex_cli: Mock, output: str) -> None:
     _skill(_plugin(tmp_path / ".codex") / "skills")
     codex_cli.return_value = subprocess.CompletedProcess([], 0, stdout=output)
-    assert _discover(tmp_path) == {}
+    warnings: list[str] = []
+    assert _discover(tmp_path, warnings=warnings) == {}
+    # Unreadable output is a discovery failure; entries that merely fail validation are skipped.
+    assert len(warnings) == (0 if output.startswith('{"installed": [') else 1)
 
 
 @pytest.mark.parametrize("manifest", ["{", "[]", "{}", '{"name": 42}'])

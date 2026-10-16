@@ -40,7 +40,10 @@ and steers messages while the agent is busy.
 - `managed-mcp-sign-in`: selecting an unconnected service opens inline sign-in;
   selection and launch wait for success. States: connected, pending, cancelled,
   failed, popup blocked, Databricks workspace prompt, bearer token needed.
-- `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
+- `slash-menu`: typing `/` (`$` for Codex) opens commands and skills with keyboard
+  navigation. States: loading, error/retry, unavailable while disconnected, and an
+  incomplete catalog — a failed `codex plugin list` is named with Retry while the
+  skills that were read stay listed, instead of "No skills available".
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
@@ -91,8 +94,10 @@ and steers messages while the agent is busy.
   the gear; press Ctrl+Shift+L to focus the message box.
 - For a Codex session, open the Terminal view and change effort there, then
   return to Chat.
-- Type `/` in the message box; attach files with the button, by paste, or by
-  dropping them on the transcript.
+- Type `/` (`$` for Codex) in the message box; a skill source the host could not
+  read is named in the Skills section with a Retry link beside the skills it did
+  read. Attach files with the button, by paste, or by dropping them on the
+  transcript.
 - Send while the agent is working to queue a message, then steer it.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
   page in the same project. Selecting **/new** in Commands also opens it.
@@ -127,7 +132,8 @@ and steers messages while the agent is busy.
   target. Covered by
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
-- Attach files or type `/` before the first send.
+- Attach files or type `/` (`$` for Codex) before the first send; an unreadable
+  skill source shows the same warning and Retry here.
 - Open **MCPs** in the workspace bar above the composer (the plug icon when space is tight), then turn
   services on or off in **Tools for this session** before launching on a host or
   sandbox. Turning a service off keeps its account connected. Explicit selections
@@ -272,7 +278,9 @@ Other connection providers alone do not enable the managed MCP picker.
   covers deleted projects with dangling session membership.
   No running agent is needed.
 - **`slash-menu`:**
-  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`;
+  incomplete catalog:
+  `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`
 - **`attachments`:**
   `tests/browser_ui/chat/test_composer_attachments.py::test_attach_supported_files_and_remove`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,
