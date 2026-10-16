@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import ssl
+import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace, TracebackType
@@ -606,6 +607,59 @@ async def test_serve_tunnel_bounds_the_wait_for_a_pending_sign_in(
     polls = [delay for delay in sleeps if delay == _SIGN_IN_PENDING_POLL_INTERVAL_S]
     assert sum(polls) == _SIGN_IN_PENDING_WAIT_S
     assert attempts == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+
+class _ContendedSignInFactory:
+    """Token factory whose ``sign_in_pending`` waits on a lock a concurrent mint holds."""
+
+    def __init__(self) -> None:
+        self.flag_requested = threading.Event()
+        self.mint_finished = threading.Event()
+        self.loop_stayed_free = False
+
+    def __call__(self) -> str | None:
+        return None
+
+    @property
+    def sign_in_pending(self) -> bool:
+        self.flag_requested.set()
+        # The mint finishes from the event loop, so it can only do so while the loop is free.
+        self.loop_stayed_free = self.mint_finished.wait(timeout=2.0)
+        return False
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_reads_sign_in_pending_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag read stuck behind the factory lock must not stall the runner's event loop."""
+    factory = _ContendedSignInFactory()
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        del app
+        raise asyncio.CancelledError
+
+    async def _finish_mint_once_the_flag_is_read() -> None:
+        while not factory.flag_requested.is_set():
+            await asyncio.sleep(0.01)
+        factory.mint_finished.set()
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    mint = asyncio.create_task(_finish_mint_once_the_flag_is_read())
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await serve_tunnel(
+                _noop_app,
+                server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+                runner_id="runner_sign_in_flag_off_loop",
+                runner_version="0.1.0",
+                auth_token_factory=factory,
+            )
+    finally:
+        mint.cancel()
+        await asyncio.gather(mint, return_exceptions=True)
+
+    assert factory.loop_stayed_free
 
 
 @pytest.mark.asyncio

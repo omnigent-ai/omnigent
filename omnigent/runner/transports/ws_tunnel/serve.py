@@ -193,11 +193,10 @@ _AUTH_REDIRECT_SCHEMES = {"http", "https"}
 # mirrors the host tunnel's ``_LOGIN_REDIRECT_FATAL_ATTEMPTS`` posture.
 _LOGIN_REDIRECT_FATAL_ATTEMPTS = 3
 
-# A token factory whose credential source is waiting on an interactive sign-in
-# (e.g. a host credential service that reopened its browser login) reports
-# ``sign_in_pending``. A runner that never connected polls it instead of
-# upgrading without a credential, so the launch survives a sign-in finished
-# within the budget; a sign-in that is no longer pending fails as before.
+# A never-connected runner whose token factory reports ``sign_in_pending`` (e.g. a
+# host credential service reopened its browser login) polls instead of upgrading
+# without a credential. 150 s covers the ~105 s median re-sign-in after an expired
+# grant; an abandoned sign-in still fails within the five-minute launch triage window.
 _SIGN_IN_PENDING_WAIT_S = 150.0
 _SIGN_IN_PENDING_POLL_INTERVAL_S = 2.0
 
@@ -482,7 +481,7 @@ async def serve_tunnel(
         close_details: _CloseDetails | None = None
         auth_token = await _refresh_auth_token(auth_token, auth_token_factory)
         if not ever_connected and not sign_in_wait_ended:
-            pending = _sign_in_pending(auth_token_factory)
+            pending = await _sign_in_pending(auth_token_factory)
             if pending and sign_in_wait_started is None:
                 sign_in_wait_started = time.monotonic()
                 _logger.warning(
@@ -812,9 +811,15 @@ async def serve_tunnel(
             delay_s = min(delay_s * 2, _MAX_RECONNECT_DELAY_S)
 
 
-def _sign_in_pending(factory: Callable[[], str | None] | None) -> bool:
-    """Return whether *factory*'s credential source is waiting on a sign-in."""
-    return bool(getattr(factory, "sign_in_pending", False))
+async def _sign_in_pending(factory: Callable[[], str | None] | None) -> bool:
+    """Return whether *factory*'s credential source is waiting on a sign-in.
+
+    Read off the event loop like the factory call: the flag can wait on a lock
+    the factory holds through a concurrent mint request.
+    """
+    if factory is None:
+        return False
+    return bool(await asyncio.to_thread(getattr, factory, "sign_in_pending", False))
 
 
 def _prepare_auth_retry(factory: Callable[[], str | None] | None) -> None:
