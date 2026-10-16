@@ -1242,3 +1242,20 @@ def test_merge_ready_is_a_commit_status_not_a_job_check(tmp_path, api, state):
     assert process.returncode == 0, process.stderr
     assert "Waiting for successful Merge Ready status" in process.stdout
     assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+def test_report_mode_checks_advisories_without_automatic_approval(tmp_path, api):
+    del api["routes"]["Maintainer Approval"]
+    api["report"]["Results"][0]["Vulnerabilities"].append(
+        {
+            "PkgName": "ruff",
+            "InstalledVersion": "0.15.2",
+            "Severity": "HIGH",
+            "VulnerabilityID": "CVE-changed-version",
+        }
+    )
+    process, calls = run_cli(tmp_path, api, mode="report", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert "CVE-changed-version requires human review" in process.stdout
+    assert not any(call[:3] == ["api", "--method", "POST"] for call in calls)
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)

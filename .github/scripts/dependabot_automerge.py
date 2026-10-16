@@ -138,11 +138,12 @@ def latest_check(repository: str, head: str, name: str) -> dict:
 
 
 def require_approval(repository: str, candidate: dict, mode: str) -> None:
+    if mode != "merge":
+        return
     check = latest_check(repository, candidate["head"], "Maintainer Approval")
     require(check["status"] == "completed", "Waiting for Maintainer Approval")
     if check["conclusion"] == "success":
         return
-    require(mode == "merge", "Maintainer Approval needs refreshing in merge mode")
     require(check["conclusion"] == "failure", "Maintainer Approval needs human intervention")
     match = re.fullmatch(
         rf"https://github.com/{re.escape(repository)}/actions/runs/(\d+)/job/\d+",
