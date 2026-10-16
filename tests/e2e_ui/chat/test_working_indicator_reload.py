@@ -171,6 +171,12 @@ def test_running_empty_session_reload_keeps_working_indicator(
     the session has no persisted chat bubbles, and the browser hydrates
     from ``GET /v1/sessions/{id}`` after a fresh page load.
 
+    The ``running`` edge names an in-flight turn id, the signal a genuine
+    turn always carries. A bare ``running`` with no turn id is instead the
+    lost terminal-idle signature the sidebar now settles against a live but
+    idle runner (``tests/e2e_ui/sessions/test_sidebar_running_spinner_lost_idle``),
+    so keeping this a tracked turn is what tells the two apart.
+
     :param page: Playwright page fixture.
     :param seeded_session_pair: ``(base_url, session_a_id, session_b_id)``
         from the local server fixture. This fixture respawns the shared
@@ -178,7 +184,8 @@ def test_running_empty_session_reload_keeps_working_indicator(
     :returns: None.
     """
     base_url, session_id, _other_session_id = seeded_session_pair
-    _publish_status(base_url, session_id, "running")
+    response_id = "resp_working_indicator_1"
+    _publish_status(base_url, session_id, "running", response_id=response_id)
 
     try:
         page.goto(f"{base_url}/c/{session_id}")
@@ -192,7 +199,7 @@ def test_running_empty_session_reload_keeps_working_indicator(
         # Reload used to lose Working and fall back to the new-chat headline.
         expect(page.get_by_text("What should we work on?")).to_have_count(0)
     finally:
-        _publish_status(base_url, session_id, "idle")
+        _publish_status(base_url, session_id, "idle", response_id=response_id)
 
 
 def test_live_tool_output_updates_running_card(
