@@ -69,7 +69,7 @@ dependencies = [
     # omnigent deps (runtime, spec, server, persistent terminal, etc.).
     "alembic>=1.0,<2",
     "anyio>=4.0,<5",
-    "cachetools>=5.0,<7",
+    "cachetools>=5.0,<8",
     "filelock>=3.0",
     # _HostGroup (omnigent/cli.py) rewrites a leading positional server URL
     # into `--server` before Click parses it, so it no longer depends on
