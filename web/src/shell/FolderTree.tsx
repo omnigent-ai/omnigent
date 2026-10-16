@@ -763,20 +763,19 @@ function FolderTreeInner({
     onExpand: togglePath,
   });
   const dropRoot = scrollElementRef.current?.closest<HTMLElement>("[data-upload-drop-root]");
-  const dropFeedback =
-    dropActive && dropHover && dropRoot && upload ? (
-      <>
-        <span className="sr-only" role="status" aria-live="polite">
-          Upload to {dropHover.directory || upload.destination}
-        </span>
-        {!dropHover.folderRow && (
-          <WorkspaceUploadRootIndicator
-            container={dropRoot}
-            destination={dropHover.directory || upload.destination}
-          />
-        )}
-      </>
-    ) : null;
+  const dropFeedback = (
+    <>
+      <span className="sr-only" role="status" aria-live="polite">
+        {dropActive && dropHover ? `Upload to ${dropHover.directory || "workspace root"}` : ""}
+      </span>
+      {dropActive && dropHover && dropRoot && upload && !dropHover.folderRow && (
+        <WorkspaceUploadRootIndicator
+          container={dropRoot}
+          destination={dropHover.directory || upload.destination}
+        />
+      )}
+    </>
+  );
 
   // Once a revealed directory's row exists in the flat tree (its ancestors'
   // lazy listings have landed), smooth-scroll it into view and start the
