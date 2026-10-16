@@ -177,6 +177,17 @@ describe("resolveServerInfo archive_worktree_cleanup", () => {
   });
 });
 
+describe("resolveServerInfo request_managed_sandbox_host_id", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ request_managed_sandbox_host_id: advertised });
+    expect(parsed.request_managed_sandbox_host_id).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo smart_routing_sources", () => {
   it("reads an explicit field verbatim", async () => {
     const parsed = await probe({

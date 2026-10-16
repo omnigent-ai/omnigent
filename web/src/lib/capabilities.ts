@@ -212,6 +212,12 @@ export interface ServerInfo {
    */
   archive_worktree_cleanup?: boolean;
   /**
+   * True when a managed create accepts ``host_id`` naming its new sandbox
+   * host. Older servers reject it, so the create omits it there. Fails to
+   * ``false``.
+   */
+  request_managed_sandbox_host_id?: boolean;
+  /**
    * True when the server stores user agents (``omnigent agent add``,
    * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
    * and the Import bundle button. Absent on older servers (off).
@@ -281,6 +287,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   installable_harnesses: [],
   dictation_available: false,
   archive_worktree_cleanup: false,
+  request_managed_sandbox_host_id: false,
   branding: null,
 };
 
@@ -392,6 +399,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           dictation_available: data.dictation_available === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+          request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
           agent_config_edit: data.agent_config_edit === true,

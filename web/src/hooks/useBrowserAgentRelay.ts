@@ -15,7 +15,7 @@ import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
-import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import type { Host } from "@/hooks/useHosts";
@@ -262,7 +262,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
               staleTime: Infinity,
               retry: false,
             });
-            setSessionHost(source.id, source.hostId);
+            setSessionHost(source.id, sessionRoutingHostId(source.hostId, source.labels));
             setSessionParent(source.id, source.parentSessionId);
             if (source.hostId) {
               sourceHostId = source.hostId;
