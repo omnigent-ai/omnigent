@@ -8,6 +8,7 @@
 
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
+import { HIDDEN_PICKER_AGENTS_STORAGE_KEY } from "./pickerEntryVisibility";
 
 /** localStorage keys that constitute exportable user preferences. */
 const EXPORTABLE_KEYS = [
@@ -22,6 +23,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-workspace-panel",
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
   DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY,
