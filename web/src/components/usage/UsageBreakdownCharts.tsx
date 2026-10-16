@@ -1,34 +1,14 @@
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import type { Payload } from "recharts/types/component/DefaultTooltipContent";
-import type { SessionUsage } from "@/lib/usageApi";
 
 interface Props {
-  sessions: SessionUsage[];
+  harnessBreakdown: Record<string, number>;
+  modelBreakdown: Record<string, number>;
   animate?: boolean;
 }
 
-function aggregateByKey(
-  sessions: SessionUsage[],
-  keyFn: (s: SessionUsage) => string | null,
-): { name: string; cost: number }[] {
-  const map = new Map<string, number>();
-  for (const s of sessions) {
-    const key = keyFn(s) ?? "Unknown";
-    map.set(key, (map.get(key) ?? 0) + s.costUsd);
-  }
-  return Array.from(map.entries())
-    .map(([name, cost]) => ({ name, cost }))
-    .sort((a, b) => b.cost - a.cost);
-}
-
-function aggregateByModel(sessions: SessionUsage[]): { name: string; cost: number }[] {
-  const map = new Map<string, number>();
-  for (const s of sessions) {
-    for (const [model, cost] of Object.entries(s.models)) {
-      map.set(model, (map.get(model) ?? 0) + cost);
-    }
-  }
-  return Array.from(map.entries())
+function breakdownToChartData(breakdown: Record<string, number>): { name: string; cost: number }[] {
+  return Object.entries(breakdown)
     .map(([name, cost]) => ({ name, cost }))
     .sort((a, b) => b.cost - a.cost);
 }
@@ -103,9 +83,9 @@ function HorizontalBarChart({
   );
 }
 
-export function UsageBreakdownCharts({ sessions, animate = true }: Props) {
-  const byHarness = aggregateByKey(sessions, (s) => s.harness);
-  const byModel = aggregateByModel(sessions);
+export function UsageBreakdownCharts({ harnessBreakdown, modelBreakdown, animate = true }: Props) {
+  const byHarness = breakdownToChartData(harnessBreakdown);
+  const byModel = breakdownToChartData(modelBreakdown);
 
   return (
     <div className="grid gap-6 md:grid-cols-2">

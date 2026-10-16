@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
-import pytest
+import asyncio
 
+import pytest
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+
+from omnigent.errors import OmnigentError, StaleCursorError
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.routes.usage import (
+    MAX_SESSION_PAGE_SIZE,
     _build_usage_report,
     _day_offset,
     _session_cost,
     _session_models,
+    create_usage_router,
 )
+from omnigent.server.schemas import UsageReport
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -249,6 +259,185 @@ def test_build_usage_report_unpriced_session(
     assert bare.models == {}
 
 
+def test_build_usage_report_first_page_computes_breakdowns(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    _add_session(
+        store,
+        monkeypatch,
+        ts=1_700_000_000,
+        cost=1.25,
+        by_model={"model-a": {"total_cost_usd": 1.25}},
+        title="s1",
+    )
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: 1_700_000_000)
+    monkeypatch.setattr(
+        "omnigent.server.routes.usage._resolve_session_harness",
+        lambda _conv: "codex-native",
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.usage._resolve_llm_model",
+        lambda _conv: "model-a",
+    )
+
+    # The web page always requests a bounded first page; the breakdowns ride it.
+    report = _build_usage_report(store, None, include_page_details=True, limit=50)
+
+    assert report.harness_breakdown == {"codex-native": 1.25}
+    assert report.model_breakdown == {"model-a": 1.25}
+
+
+def test_build_usage_report_breakdowns_span_all_sessions_not_just_the_page(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    now = 1_700_000_000
+    for i, cost in enumerate((1.0, 2.0, 4.0)):
+        _add_session(
+            store,
+            monkeypatch,
+            ts=now - i * _DAY,
+            cost=cost,
+            by_model={"model-a": {"total_cost_usd": cost}},
+            title=f"s{i}",
+        )
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: now)
+    monkeypatch.setattr(
+        "omnigent.server.routes.usage._resolve_session_harness",
+        lambda _conv: "codex-native",
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.usage._resolve_llm_model",
+        lambda _conv: "model-a",
+    )
+
+    # One session fits on the page, but with no date filter the breakdowns still
+    # sum every session the account owns — the page no longer holds them to add
+    # up.
+    report = _build_usage_report(store, None, include_page_details=True, limit=1)
+
+    assert len(report.sessions) == 1
+    assert report.sessions_has_more is True
+    assert report.harness_breakdown == {"codex-native": 7.0}
+    assert report.model_breakdown == {"model-a": 7.0}
+
+
+def test_build_usage_report_breakdowns_respect_date_range(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    now = 1_700_000_000
+    _add_session(
+        store,
+        monkeypatch,
+        ts=now - 2 * _DAY,
+        cost=1.0,
+        by_model={"model-a": {"total_cost_usd": 1.0}},
+        title="old",
+    )
+    _add_session(
+        store,
+        monkeypatch,
+        ts=now,
+        cost=4.0,
+        by_model={"model-a": {"total_cost_usd": 4.0}},
+        title="new",
+    )
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: now)
+    monkeypatch.setattr(
+        "omnigent.server.routes.usage._resolve_session_harness",
+        lambda _conv: "codex-native",
+    )
+
+    # The breakdowns follow the selected range: a window that excludes the older
+    # session sums only the in-window spend, matching the session list.
+    report = _build_usage_report(
+        store, None, include_page_details=True, limit=50, updated_at_min=now
+    )
+
+    assert [s.title for s in report.sessions] == ["new"]
+    assert report.harness_breakdown == {"codex-native": 4.0}
+    assert report.model_breakdown == {"model-a": 4.0}
+
+
+def test_build_usage_report_breakdowns_bucket_unknown_harness(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    _add_session(
+        store,
+        monkeypatch,
+        ts=1_700_000_000,
+        cost=2.5,
+        by_model={"model-a": {"total_cost_usd": 2.5}},
+        title="no-harness",
+    )
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: 1_700_000_000)
+    monkeypatch.setattr(
+        "omnigent.server.routes.usage._resolve_session_harness",
+        lambda _conv: None,
+    )
+
+    # A session with no resolved harness still contributes its spend under an
+    # "Unknown" bucket, so the chart total matches the account total.
+    report = _build_usage_report(store, None, include_page_details=True, limit=50)
+
+    assert report.harness_breakdown == {"Unknown": 2.5}
+    assert report.model_breakdown == {"model-a": 2.5}
+
+
+def test_build_usage_report_cursor_pages_skip_breakdowns(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    now = 1_700_000_000
+    _add_session(
+        store,
+        monkeypatch,
+        ts=now - _DAY,
+        cost=1.0,
+        by_model={"model-a": {"total_cost_usd": 1.0}},
+        title="older",
+    )
+    _add_session(
+        store,
+        monkeypatch,
+        ts=now,
+        cost=2.0,
+        by_model={"model-a": {"total_cost_usd": 2.0}},
+        title="newer",
+    )
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: now)
+    monkeypatch.setattr(
+        "omnigent.server.routes.usage._resolve_session_harness",
+        lambda _conv: "codex-native",
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.usage._resolve_llm_model",
+        lambda _conv: "model-a",
+    )
+
+    first = _build_usage_report(store, None, include_page_details=True, limit=1)
+    assert first.sessions_has_more
+    assert first.harness_breakdown == {"codex-native": 3.0}
+
+    second = _build_usage_report(
+        store, None, include_page_details=True, limit=1, after=first.sessions_last_id
+    )
+
+    # Cursor pages carry sessions only: the web UI reads breakdowns from the
+    # first page, so later pages neither recompute nor return them.
+    assert [s.title for s in second.sessions] == ["older"]
+    assert second.harness_breakdown == {}
+    assert second.model_breakdown == {}
+
+
 def test_sum_daily_cost_range(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     store.add_daily_cost("alice", "2026-07-01", 1.0)
@@ -260,3 +449,174 @@ def test_sum_daily_cost_range(db_uri: str) -> None:
     assert store.sum_daily_cost("alice", "0000-00-00") == 7.0  # all-time
     assert store.sum_daily_cost("alice", "2026-08-01") == 0.0  # nothing in range
     assert store.sum_daily_cost("nobody", "0000-00-00") == 0.0
+
+
+def test_build_usage_report_pages_and_filters_sessions_by_updated_at(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    now = 1_700_000_000
+    ids = [
+        _add_session(store, monkeypatch, ts=now - 2 * _DAY, cost=1.0, by_model={}, title="oldest"),
+        _add_session(store, monkeypatch, ts=now - _DAY, cost=1.0, by_model={}, title="middle"),
+        _add_session(store, monkeypatch, ts=now, cost=1.0, by_model={}, title="newest"),
+    ]
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: now)
+
+    first = _build_usage_report(store, None, limit=2)
+    assert [s.title for s in first.sessions] == ["newest", "middle"]
+    assert first.sessions_has_more is True
+    assert first.sessions_last_id == ids[1]
+
+    last = _build_usage_report(store, None, limit=2, after=first.sessions_last_id)
+    assert [s.title for s in last.sessions] == ["oldest"]
+    assert last.sessions_has_more is False
+
+    # Inclusive bounds on last activity, applied before paging.
+    window = _build_usage_report(store, None, updated_at_min=now - _DAY, updated_at_max=now - _DAY)
+    assert [s.title for s in window.sessions] == ["middle"]
+    assert window.sessions_has_more is False
+
+
+def _usage_client(monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, object]]) -> TestClient:
+    """A client for the usage route whose report builder records its keyword arguments."""
+
+    def fake_build(store: object, user_id: object, **kwargs: object) -> UsageReport:
+        calls.append(kwargs)
+        return UsageReport()
+
+    monkeypatch.setattr("omnigent.server.routes.usage._build_usage_report", fake_build)
+    app = FastAPI()
+    app.include_router(
+        create_usage_router(object(), feature_flags=FeatureFlags(frozenset())),  # type: ignore[arg-type]
+        prefix="/v1",
+    )
+    return TestClient(app)
+
+
+def test_get_usage_clamps_limit_and_converts_date_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+    client = _usage_client(monkeypatch, calls)
+
+    assert client.get("/v1/usage").status_code == 200
+    assert client.get("/v1/usage?limit=1000&after=conv_x").status_code == 200
+    assert client.get("/v1/usage?limit=0&since=2026-07-01&until=2026-07-02").status_code == 200
+
+    # No ``limit`` keeps the unbounded legacy contract; the web page opts in.
+    assert calls[0]["limit"] is None
+    assert calls[0]["after"] is None
+    assert calls[1]["limit"] == MAX_SESSION_PAGE_SIZE
+    assert calls[1]["after"] == "conv_x"
+    assert calls[2]["limit"] == 1
+    # 2026-07-01T00:00:00Z .. 2026-07-02T23:59:59Z
+    assert calls[2]["updated_at_min"] == 1_782_864_000
+    assert calls[2]["updated_at_max"] == 1_783_036_799
+
+
+@pytest.mark.parametrize("query", ["since=07/01/2026", "until=2026-13-01", "since=yesterday"])
+def test_get_usage_rejects_malformed_dates(monkeypatch: pytest.MonkeyPatch, query: str) -> None:
+    calls: list[dict[str, object]] = []
+    client = _usage_client(monkeypatch, calls)
+
+    resp = client.get(f"/v1/usage?{query}")
+
+    assert resp.status_code == 422, resp.text
+    assert "YYYY-MM-DD" in resp.json()["detail"]
+    assert calls == []
+
+
+def test_get_usage_maps_stale_cursor_to_http_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A builder stale cursor surfaces over HTTP as 400 ``stale_cursor``."""
+
+    def raise_stale(store: object, user_id: object, **kwargs: object) -> UsageReport:
+        raise StaleCursorError("conv_gone")
+
+    monkeypatch.setattr("omnigent.server.routes.usage._build_usage_report", raise_stale)
+    app = FastAPI()
+    app.include_router(
+        create_usage_router(object(), feature_flags=FeatureFlags(frozenset())),  # type: ignore[arg-type]
+        prefix="/v1",
+    )
+
+    # Mirror create_app's OmnigentError handler so the test exercises the real
+    # error-code -> HTTP-status mapping the paginated client recovers from.
+    @app.exception_handler(OmnigentError)
+    async def _handle(_request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    resp = TestClient(app).get("/v1/usage?after=conv_gone")
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "stale_cursor"
+
+
+def test_build_usage_report_stale_client_cursor_raises(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    now = 1_700_000_000
+    _add_session(store, monkeypatch, ts=now - _DAY, cost=1.0, by_model={}, title="older")
+    newest = _add_session(store, monkeypatch, ts=now, cost=1.0, by_model={}, title="newest")
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: now)
+    first = _build_usage_report(store, None, limit=1)
+    assert first.sessions_last_id == newest
+
+    assert asyncio.run(store.delete_conversation(newest))
+
+    # A deleted client cursor surfaces as StaleCursorError, not an empty page.
+    with pytest.raises(StaleCursorError):
+        _build_usage_report(store, None, limit=1, after=newest)
+
+
+def test_build_usage_report_unbounded_returns_every_session(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    now = 1_700_000_000
+    for i in range(3):
+        _add_session(store, monkeypatch, ts=now - i * _DAY, cost=1.0, by_model={}, title=f"s{i}")
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: now)
+
+    # No ``limit`` keeps the pre-pagination contract: every session, one report.
+    report = _build_usage_report(store, None)
+
+    assert len(report.sessions) == 3
+    assert report.sessions_has_more is False
+
+
+def test_build_usage_report_unbounded_walk_restarts_on_stale_cursor(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    now = 1_700_000_000
+    for i in range(3):
+        _add_session(store, monkeypatch, ts=now - i * _DAY, cost=1.0, by_model={}, title=f"s{i}")
+    monkeypatch.setattr("omnigent.db.utils.now_epoch", lambda: now)
+
+    from omnigent.server.routes import usage as usage_module
+
+    real_page = usage_module._list_conversation_page
+    calls = {"n": 0}
+
+    def flaky_page(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StaleCursorError("conv_gone")
+        return real_page(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(usage_module, "_list_conversation_page", flaky_page)
+
+    # The unbounded legacy walk restarts on a cursor that vanished mid-walk
+    # instead of surfacing it, so the caller still gets every surviving session.
+    report = _build_usage_report(store, None)
+
+    assert len(report.sessions) == 3
+    assert report.sessions_has_more is False
+    assert calls["n"] >= 2  # the stale first attempt plus the restart

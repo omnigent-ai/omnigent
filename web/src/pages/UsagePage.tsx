@@ -7,7 +7,12 @@ import { UsageBreakdownCharts } from "@/components/usage/UsageBreakdownCharts";
 import { UsageSessionTable } from "@/components/usage/UsageSessionTable";
 import { useUsageReport } from "@/hooks/useUsageReport";
 import { formatSessionCostUsd } from "@/lib/formatCost";
-import type { DailyCost, SessionUsage } from "@/lib/usageApi";
+import {
+  aggregateHarnessBreakdown,
+  aggregateModelBreakdown,
+  type DailyCost,
+  type SessionUsage,
+} from "@/lib/usageApi";
 import { cn } from "@/lib/utils";
 
 type RangeKey = "7d" | "30d" | "90d" | "all" | "custom";
@@ -73,9 +78,6 @@ function filterSessions(
 }
 
 export function UsagePage() {
-  const { data, isLoading, isError, refetch } = useUsageReport();
-  const { trackClick } = useOmnigentAnalytics();
-
   const [rangeKey, setRangeKey] = useState<RangeKey>("30d");
   const [customStart, setCustomStart] = useState(() => daysAgoIso(30));
   const [customEnd, setCustomEnd] = useState(todayIso);
@@ -83,21 +85,64 @@ export function UsagePage() {
   const today = todayIso();
   const { since, until } = rangeToWindow(rangeKey, customStart, customEnd);
 
+  const { data, isLoading, isError, refetch, fetchNextPage, hasNextPage, isFetchingNextPage } =
+    useUsageReport(since, until);
+  const { trackClick } = useOmnigentAnalytics();
+
+  const firstPage = data?.pages[0];
+
+  // A pre-pagination server ignores the new query params and omits the
+  // breakdown fields, so the page filters and aggregates its response itself.
+  const legacy = firstPage?.legacy ?? false;
+
+  // Deduplicate repeated rows by id, preferring the newest observed version.
+  const allSessions = useMemo(() => {
+    const byId = new Map<string, SessionUsage>();
+    for (const session of data?.pages.flatMap((page) => page.sessions) ?? []) {
+      const existing = byId.get(session.id);
+      if (!existing || session.updatedAt > existing.updatedAt) {
+        byId.set(session.id, session);
+      }
+    }
+    return [...byId.values()];
+  }, [data]);
+
+  // A legacy server returns every session unfiltered; narrow to the window here.
+  const sessions = useMemo(
+    () => (legacy ? filterSessions(allSessions, since, until) : allSessions),
+    [legacy, allSessions, since, until],
+  );
+
   const filteredCosts = useMemo(
-    () => (data ? filterDailyCosts(data.dailyCosts, since, until) : []),
-    [data, since, until],
+    () => (firstPage ? filterDailyCosts(firstPage.dailyCosts, since, until) : []),
+    [firstPage, since, until],
   );
 
-  const filteredSessions = useMemo(
-    () => (data ? filterSessions(data.sessions, since, until) : []),
-    [data, since, until],
-  );
+  // A current server sends range-scoped breakdowns on the first page; a legacy
+  // one sends none, so aggregate the windowed sessions locally instead.
+  const { harnessBreakdown, modelBreakdown } = useMemo(() => {
+    if (legacy) {
+      return {
+        harnessBreakdown: aggregateHarnessBreakdown(sessions),
+        modelBreakdown: aggregateModelBreakdown(sessions),
+      };
+    }
+    return {
+      harnessBreakdown: firstPage?.harnessBreakdown ?? {},
+      modelBreakdown: firstPage?.modelBreakdown ?? {},
+    };
+  }, [legacy, sessions, firstPage]);
 
+  // The daily rollup is the authoritative window total, so it stays fixed
+  // regardless of how many session pages are loaded. When the rollup is empty
+  // (lag, or a legacy server), fall back to the loaded session spend.
   const totalCost = useMemo(() => {
     const fromDaily = filteredCosts.reduce((sum, d) => sum + d.costUsd, 0);
-    if (fromDaily > 0) return fromDaily;
-    return filteredSessions.reduce((sum, s) => sum + s.costUsd, 0);
-  }, [filteredCosts, filteredSessions]);
+    if (fromDaily === 0) {
+      return sessions.reduce((sum, s) => sum + s.costUsd, 0);
+    }
+    return fromDaily;
+  }, [filteredCosts, sessions]);
 
   return (
     <PageScroll>
@@ -179,7 +224,7 @@ export function UsagePage() {
           </div>
         )}
 
-        {data && (
+        {firstPage && (
           <div className="flex flex-col gap-8">
             <div className="rounded-lg border border-border bg-card p-4">
               <p className="text-xs text-muted-foreground">Total cost</p>
@@ -187,7 +232,10 @@ export function UsagePage() {
                 {formatSessionCostUsd(totalCost)}
               </p>
               <p className="mt-0.5 text-xs text-muted-foreground">
-                {filteredSessions.length} session{filteredSessions.length !== 1 && "s"}
+                <span>
+                  {sessions.length} session{sessions.length !== 1 && "s"}
+                </span>
+                {hasNextPage && " loaded"}
               </p>
             </div>
 
@@ -196,11 +244,38 @@ export function UsagePage() {
               <CostTimelineChart dailyCosts={filteredCosts} />
             </section>
 
-            <UsageBreakdownCharts sessions={filteredSessions} />
+            <div>
+              <UsageBreakdownCharts
+                harnessBreakdown={harnessBreakdown}
+                modelBreakdown={modelBreakdown}
+              />
+            </div>
 
             <section>
               <h2 className="mb-3 text-sm font-medium text-muted-foreground">Sessions</h2>
-              <UsageSessionTable sessions={filteredSessions} />
+              <UsageSessionTable sessions={sessions} />
+              {hasNextPage && (
+                <div className="mt-4 flex justify-center">
+                  <button
+                    type="button"
+                    className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+                    onClick={() => {
+                      trackClick("usage.load_more", "button");
+                      void fetchNextPage();
+                    }}
+                    disabled={isFetchingNextPage}
+                  >
+                    {isFetchingNextPage ? (
+                      <span className="flex items-center gap-2">
+                        <Loader2Icon className="h-4 w-4 animate-spin" />
+                        Loading...
+                      </span>
+                    ) : (
+                      "Load More"
+                    )}
+                  </button>
+                </div>
+              )}
             </section>
           </div>
         )}
