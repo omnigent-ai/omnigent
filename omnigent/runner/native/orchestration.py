@@ -519,14 +519,14 @@ async def _observe_terminal_interactive(
                     )
             if not slow_logged and loop.time() >= started_at + slow_after_s:
                 slow_logged = True
-                tail, sign_in_prompt = await _stalled_pane_diagnostics(instance)
+                tail, sign_in_prompt, shape = await _stalled_pane_diagnostics(instance)
                 slow_event = debug_event("terminal_interactive_slow", session_id=session_id)
                 slow_event["attributes"] = {
                     "harness": harness,
                     "terminal_id": terminal_id,
                     "terminal_instance_id": instance.diagnostic_id,
                     "readiness_signal": readiness_signal,
-                    **_pane_attributes(tail, sign_in_prompt),
+                    **_pane_attributes(tail, sign_in_prompt, shape),
                 }
                 # Most slow starts still succeed, so this stays below the deadline's WARNING.
                 _logger.info(
@@ -544,10 +544,10 @@ async def _observe_terminal_interactive(
         raise
     except Exception as exc:  # noqa: BLE001 — observer failure must not fail session creation
         # A stopped pane reports its final screen with the exit; a live one is read here.
-        tail, sign_in_prompt = (
+        tail, sign_in_prompt, shape = (
             await _stalled_pane_diagnostics(instance)
             if isinstance(exc, TimeoutError)
-            else (None, None)
+            else (None, None, {})
         )
         unobserved_event = debug_event("terminal_interactive_unobserved", session_id=session_id)
         unobserved_event["attributes"] = {
@@ -556,7 +556,7 @@ async def _observe_terminal_interactive(
             "terminal_instance_id": instance.diagnostic_id,
             "readiness_signal": readiness_signal,
             "reason": type(exc).__name__,
-            **_pane_attributes(tail, sign_in_prompt),
+            **_pane_attributes(tail, sign_in_prompt, shape),
         }
         _logger.warning(
             "Native terminal interactivity was not observed: session=%s harness=%s "
@@ -5808,9 +5808,11 @@ def _pane_tail_message(tail: str | None) -> str:
     return f"\nTerminal output:\n{tail}" if tail else ""
 
 
-def _pane_attributes(tail: str | None, sign_in_prompt: bool | None) -> dict[str, object]:
+def _pane_attributes(
+    tail: str | None, sign_in_prompt: bool | None, shape: Mapping[str, object]
+) -> dict[str, object]:
     """Pane attributes for a startup record: only what a live pane read established."""
-    attributes: dict[str, object] = {}
+    attributes: dict[str, object] = dict(shape)
     if sign_in_prompt is not None:
         attributes["sign_in_prompt_detected"] = sign_in_prompt
     if tail:
@@ -5828,26 +5830,36 @@ def _startup_terminal_output(instance: TerminalInstance) -> str | None:
     return _redacted_terminal_text(instance.last_exit_text() or "")
 
 
-async def _stalled_pane_diagnostics(instance: TerminalInstance) -> tuple[str | None, bool]:
-    """Return a live pane's redacted tail and whether it shows a sign-in prompt.
+async def _stalled_pane_diagnostics(
+    instance: TerminalInstance,
+) -> tuple[str | None, bool, dict[str, str | int]]:
+    """Return a live pane's redacted tail, whether it shows a sign-in prompt, and its shape.
 
     The flag reports an actionable prompt. The tail is withheld whenever any
     sign-in material is on screen, including a prompt the launcher has already
-    moved past, so a one-time code or address never reaches a log.
+    moved past, so a one-time code or address never reaches a log. The shape
+    (:func:`~omnigent.harnesses.diagnostics.describe_pane_shape`) holds no pane
+    text, so it is recorded whether or not capture is on.
     """
-    from omnigent.harnesses.diagnostics import contains_sign_in_material, detect_sign_in_prompt
+    from omnigent.harnesses.diagnostics import (
+        contains_sign_in_material,
+        describe_pane_shape,
+        detect_sign_in_prompt,
+    )
 
     try:
-        screen = await _read_pane_screen(instance)
+        screen = await _read_pane_screen_or_none(instance)
+        shape = describe_pane_shape(screen)
+        screen = screen or ""
         prompt = detect_sign_in_prompt(screen) is not None
         if contains_sign_in_material(screen):
-            return None, prompt
-        return _redacted_terminal_text(screen), False
+            return None, prompt, shape
+        return _redacted_terminal_text(screen), False, shape
     except Exception:  # noqa: BLE001 — a diagnostics failure costs the tail, not the observation
         _logger.debug(
             "Stalled pane diagnostics failed for %s", instance.diagnostic_id, exc_info=True
         )
-        return None, False
+        return None, False, {}
 
 
 class _CodexTerminalExited(RuntimeError):
@@ -5868,15 +5880,20 @@ class _CodexSignInPromptSeen(RuntimeError):
 
 async def _read_pane_screen(instance: TerminalInstance) -> str:
     """Return the pane's screen with wrapped rows joined, or ``""`` when it cannot be read."""
+    return await _read_pane_screen_or_none(instance) or ""
+
+
+async def _read_pane_screen_or_none(instance: TerminalInstance) -> str | None:
+    """Return the pane's screen with wrapped rows joined, or ``None`` when it cannot be read."""
     try:
         # A sign-in address is far wider than the 80-column pane the runner
         # creates, so read wrapped rows joined back into their original lines.
         result = await instance.read(join_wrapped=True)
     except Exception:  # noqa: BLE001 — an unreadable pane simply shows nothing yet
         _logger.debug("Startup pane read failed for %s", instance.diagnostic_id, exc_info=True)
-        return ""
+        return None
     raw_screen = result.get("screen") if isinstance(result, dict) else None
-    return raw_screen if isinstance(raw_screen, str) else ""
+    return raw_screen if isinstance(raw_screen, str) else None
 
 
 async def _wait_for_codex_thread_or_terminal_exit(
@@ -5964,11 +5981,13 @@ async def _record_agent_startup_pending(
     from omnigent.harnesses.codex_native.bridge import write_bridge_startup_error
     from omnigent.harnesses.diagnostics import (
         contains_sign_in_material,
+        describe_pane_shape,
         detect_sign_in_prompt,
         sign_in_next_step,
     )
 
-    screen = await _read_pane_screen(terminal_instance)
+    raw_screen = await _read_pane_screen_or_none(terminal_instance)
+    screen = raw_screen or ""
     prompt = detect_sign_in_prompt(screen)
     if prompt is not None:
         code = "databricks_sign_in_pending"
@@ -6000,6 +6019,7 @@ async def _record_agent_startup_pending(
         "sign_in_prompt_detected": prompt is not None,
         "code": code,
     }
+    attributes.update(describe_pane_shape(raw_screen))
     # The pane is the only record of what holds startup, unless sign-in material is on it.
     tail = None if contains_sign_in_material(screen) else _redacted_terminal_text(screen)
     if tail:

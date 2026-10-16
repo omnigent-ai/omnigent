@@ -9,6 +9,7 @@ import pytest
 from omnigent.harnesses.diagnostics import (
     bounded_diagnostic_tail,
     contains_sign_in_material,
+    describe_pane_shape,
     detect_sign_in_prompt,
     sanitize_diagnostic_text,
     sign_in_next_step,
@@ -440,3 +441,68 @@ def test_sign_in_next_step_names_the_agent_and_carries_no_address() -> None:
         "sign-in completes; then send your message again."
     )
     assert "http" not in step
+
+
+_PANE_TEXT = "example-repo"
+
+
+@pytest.mark.parametrize(
+    ("screen", "expected"),
+    [
+        (None, {"pane_state": "unreadable"}),
+        ("", {"pane_state": "blank", "pane_lines": 0}),
+        (" \n\t\n", {"pane_state": "blank", "pane_lines": 0}),
+        (
+            "Traceback (most recent call last):\n"
+            f'  File "/home/u/{_PANE_TEXT}/settings.py", line 9, in load\n'
+            f"json.decoder.JSONDecodeError: Expecting value in {_PANE_TEXT}: line 1 column 1\n",
+            {
+                "pane_state": "traceback",
+                "pane_lines": 3,
+                "pane_traceback_type": "json.decoder.JSONDecodeError",
+            },
+        ),
+        (
+            "Traceback (most recent call last):\n"
+            '  File "launcher.py", line 2\n'
+            "KeyboardInterrupt\n",
+            {
+                "pane_state": "traceback",
+                "pane_lines": 3,
+                "pane_traceback_type": "KeyboardInterrupt",
+            },
+        ),
+        (
+            f"Checking {_PANE_TEXT} for updates...\nUpgrade the agent if available? (Y/n) ",
+            {"pane_state": "yes_no_prompt", "pane_lines": 2},
+        ),
+        (
+            f"────\n Settings Error\n /home/u/{_PANE_TEXT}/settings.json\n"
+            " ❯ 1. Exit and fix manually\n Enter to confirm · Esc to cancel\n",
+            {"pane_state": "dialog", "pane_lines": 5},
+        ),
+        (
+            f"╭──────╮\n│ ✻ Welcome to {_PANE_TEXT} │\n╰──────╯\n",
+            {"pane_state": "tui", "pane_lines": 3},
+        ),
+        (f"launcher: refreshing {_PANE_TEXT} login\n", {"pane_state": "text", "pane_lines": 1}),
+    ],
+    ids=[
+        "unreadable",
+        "empty",
+        "whitespace",
+        "traceback",
+        "traceback-bare-exception",
+        "yes-no-prompt",
+        "dialog",
+        "tui",
+        "text",
+    ],
+)
+def test_describe_pane_shape_names_the_screen_without_its_text(
+    screen: str | None, expected: dict[str, object]
+) -> None:
+    """Each screen gets a fixed label; only an exception's class name leaves the pane."""
+    shape = describe_pane_shape(screen)
+    assert shape == expected
+    assert _PANE_TEXT not in repr(shape)
