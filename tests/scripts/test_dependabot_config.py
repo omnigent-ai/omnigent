@@ -1,15 +1,14 @@
 """Offline policy checks for ``.github/dependabot.yml``.
 
 A YAML syntax check cannot tell whether the config keeps the promises its
-header makes: one grouped minor/patch PR per ecosystem per week, majors kept
-out of those groups, every lockfile declared once at its root, and every
-declared path actually present. Dependabot only validates the file after it
-is on ``main``, so these assertions are the pre-merge gate.
+header makes: individual PRs except for cross-pinned MLflow packages, every
+lockfile declared once at its root, and every declared path actually present.
+Dependabot only validates the file after it is on ``main``, so these assertions
+are the pre-merge gate.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -34,14 +33,6 @@ def _directories(entry: dict[str, Any]) -> list[str]:
 
 def _version_updates_on(entry: dict[str, Any]) -> bool:
     return entry.get("open-pull-requests-limit", 5) > 0
-
-
-def _version_groups(entry: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {
-        name: spec
-        for name, spec in (entry.get("groups") or {}).items()
-        if spec.get("applies-to", "version-updates") == "version-updates"
-    }
 
 
 def test_every_entry_has_a_schedule(entries: list[dict[str, Any]]) -> None:
@@ -87,35 +78,21 @@ def test_lockfiles_are_declared_at_their_workspace_roots(entries: list[dict[str,
     assert uv_dirs == ["/"]
 
 
-def test_automatic_groups_match_policy_and_keep_manual_updates(
-    entries: list[dict[str, Any]],
-) -> None:
-    policy = json.loads((REPO_ROOT / ".github/dependabot-automerge.json").read_text())
-    expected = {
-        "uv": [
-            ("python-tooling", policy["python"]["minor"], ["minor", "patch"]),
-            ("python-library-patches", policy["python"]["patch"], ["patch"]),
-        ],
-        "npm": [
-            ("web-tooling", policy["npm"]["minor"], ["minor", "patch"]),
-            ("web-library-patches", policy["npm"]["patch"], ["patch"]),
-        ],
-        "github-actions": [("actions-tested", policy["actions"], ["minor", "patch"])],
-        "cargo": [("cargo-tested-patches", policy["cargo"]["patch"], ["patch"])],
-    }
+def test_only_cross_pinned_mlflow_packages_are_grouped(entries: list[dict[str, Any]]) -> None:
     for entry in entries:
-        if not _version_updates_on(entry):
+        groups = entry.get("groups") or {}
+        if entry["package-ecosystem"] != "uv":
+            assert not groups, f"{entry['package-ecosystem']}: updates must have individual PRs"
             continue
-        groups = _version_groups(entry)
-        for name, patterns, types in expected.get(entry["package-ecosystem"], []):
-            assert next(iter(groups)) == name
-            group = groups.pop(name)
-            assert group["patterns"] == patterns
-            assert group["update-types"] == types
-        assert len(groups) == 1
-        (general,) = groups.values()
-        assert general["patterns"] == ["*"]
-        assert sorted(general["update-types"]) == ["minor", "patch"]
+        assert len(groups) == 2
+        assert {group.get("applies-to", "version-updates") for group in groups.values()} == {
+            "version-updates",
+            "security-updates",
+        }
+        for group in groups.values():
+            assert set(group["patterns"]) == {"mlflow", "mlflow-skinny", "mlflow-tracing"}
+            assert not group.get("exclude-patterns")
+            assert not group.get("update-types"), "MLflow must also resolve together for majors"
 
 
 def test_disabled_entries_ignore_everything(entries: list[dict[str, Any]]) -> None:

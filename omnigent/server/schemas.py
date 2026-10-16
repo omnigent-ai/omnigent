@@ -158,6 +158,80 @@ class UpsertMCPServerRequest(BaseModel):
         return self
 
 
+class MCPServerPatch(BaseModel):
+    """Partial MCP declaration; omitted fields and credential keys are preserved."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    transport: Literal["http", "stdio"] | None = None
+    description: str | None = Field(default=None, max_length=512)
+    url: str | None = None
+    command: str | None = None
+    args: list[str] | None = Field(default=None, max_length=64)
+    headers: dict[str, str | None] | None = None
+    env: dict[str, str | None] | None = None
+
+    @model_validator(mode="after")
+    def validate_patch(self) -> Self:
+        for key in ("transport", "url", "command", "args"):
+            if key in self.model_fields_set and getattr(self, key) is None:
+                raise ValueError(f"{key} cannot be null")
+        for values in (self.headers, self.env):
+            if values and "[REDACTED]" in values.values():
+                raise ValueError("Omit unchanged credentials instead of sending placeholders")
+        return self
+
+
+class AgentConfigPatch(BaseModel):
+    """Merge-style update of an owned agent, with immutable identity."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    description: str | None = Field(default=None, max_length=4096)
+    instructions: str | None = None
+    model: str | None = Field(default=None, min_length=1)
+    harness: str | None = Field(default=None, min_length=1)
+    mcp_servers: (
+        dict[Annotated[str, Field(pattern=_MCP_SERVER_NAME_RE)], MCPServerPatch | None] | None
+    ) = None
+
+    @model_validator(mode="after")
+    def validate_patch(self) -> Self:
+        for key in ("model", "harness", "mcp_servers"):
+            if key in self.model_fields_set and getattr(self, key) is None:
+                raise ValueError(f"{key} cannot be null")
+        for value in (self.model, self.harness):
+            if value is not None and not value.strip():
+                raise ValueError("Model and harness must be nonempty")
+        return self
+
+
+class AgentMCPConfig(BaseModel):
+    """Editable MCP projection without credential values."""
+
+    transport: str
+    description: str | None = None
+    url: str | None = None
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    configured_header_names: list[str] = Field(default_factory=list)
+    configured_env_names: list[str] = Field(default_factory=list)
+    editable: bool = True
+
+
+class AgentConfigObject(BaseModel):
+    """Owner-only configuration read and PATCH result."""
+
+    id: str
+    name: str
+    version: int
+    description: str | None = None
+    harness: str | None = None
+    model: str | None = None
+    instructions: str | None = None
+    mcp_servers: dict[str, AgentMCPConfig] = Field(default_factory=dict)
+
+
 class SkillSummary(BaseModel):
     """
     Safe subset of a discovered skill for API exposure.
