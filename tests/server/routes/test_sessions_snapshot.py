@@ -12,17 +12,19 @@ import pytest
 from sqlalchemy.exc import StatementError
 
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
+from omnigent.runtime.policies.builder import ancestor_ids_from_tree
 from omnigent.server.routes import sessions as _sessions_mod
 from omnigent.server.routes.sessions import (
     _LABEL_VALUE_MAX_LEN,
     SessionLiveness,
     _get_session_snapshot,
     _persist_session_status_error_labels,
-    _publish_subtree_cost_to_ancestors,
+    _publish_ancestor_subtree_costs,
     _truncate_label,
 )
 from omnigent.server.schemas import SessionResponse
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.stores.conversation_store import TreeUsageNode
 
 
 async def _drain_model_options(session_id: str) -> None:
@@ -134,20 +136,11 @@ class _ConversationStore:
             agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         )
 
-    def list_conversations(
-        self,
-        *,
-        limit: int = 100,
-        after: str | None = None,
-        kind: str | None = "default",
-        root_conversation_id: str | None = None,
-        include_archived: bool = False,
-    ) -> PagedList[Conversation]:
+    def list_tree_usage(self, root_conversation_id: str) -> list[TreeUsageNode]:
         """Return the spawn tree sharing ``root_conversation_id``.
 
-        ``load_session_usage`` walks the tree via this method to sum a
-        parent's subtree usage, and passes ``include_archived=True`` —
-        archived conversations still hold spend. With an explicit graph, return every
+        ``load_session_usage`` reads the tree via this method to sum a
+        parent's subtree usage. With an explicit graph, return every
         conversation sharing the root; otherwise synthesize the single
         childless conversation the legacy tests expect.
         """
@@ -160,19 +153,13 @@ class _ConversationStore:
         else:
             convs = [
                 Conversation(
-                    id=root_conversation_id or "",
+                    id=root_conversation_id,
                     created_at=1,
                     updated_at=1,
-                    root_conversation_id=root_conversation_id or "",
-                    agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+                    root_conversation_id=root_conversation_id,
                 )
             ]
-        return PagedList(
-            data=convs,
-            first_id=convs[0].id if convs else None,
-            last_id=convs[-1].id if convs else None,
-            has_more=False,
-        )
+        return [TreeUsageNode(c.id, c.parent_conversation_id, c.session_usage) for c in convs]
 
     def list_items(
         self,
@@ -2886,7 +2873,7 @@ async def test_session_snapshot_usage_by_model_merges_differing_models() -> None
     assert snapshot.usage_by_model["model-b"].total_cost_usd == 0.04
 
 
-def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
+def test_publish_ancestor_subtree_costs_publishes_each_ancestor_subtree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A child usage update re-publishes every ancestor's subtree cost.
@@ -2933,7 +2920,10 @@ def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
     recorder = _UsageStreamRecorder()
     monkeypatch.setattr(_sessions_mod, "session_stream", recorder)
 
-    _publish_subtree_cost_to_ancestors(conv_store, "405bfe154d5c0e795a2b87021bc897bf")  # type: ignore[arg-type]
+    tree = conv_store.list_tree_usage("8463f762110b86b1ba33ddf7a8fc1172")
+    _publish_ancestor_subtree_costs(
+        tree, ancestor_ids_from_tree(tree, "405bfe154d5c0e795a2b87021bc897bf")
+    )
 
     by_conv = {pub.conversation_id: pub.event for pub in recorder.published}
     # Only the two ancestors are re-published — never the originating child.
@@ -2957,6 +2947,169 @@ def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
     )
     # The payload is a session.usage broadcast the web client renders as the badge.
     assert by_conv["b460374fc8e697b296708f52dc9d8179"]["type"] == "session.usage"
+
+
+_G, _P, _C = (
+    "8463f762110b86b1ba33ddf7a8fc1172",
+    "b460374fc8e697b296708f52dc9d8179",
+    "405bfe154d5c0e795a2b87021bc897bf",
+)
+
+
+def _cost_tree(child_cost: float) -> list[TreeUsageNode]:
+    """grandparent($1) -> parent($2) -> child(*child_cost*)."""
+    return [
+        TreeUsageNode(_G, None, {"total_cost_usd": 1.0}),
+        TreeUsageNode(_P, _G, {"total_cost_usd": 2.0}),
+        TreeUsageNode(_C, _P, {"total_cost_usd": child_cost}),
+    ]
+
+
+async def test_ancestor_costs_coalesce_to_one_trailing_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A burst of child usage events publishes each ancestor once, with the final value.
+
+    The window opens on the first offer and flushes from the newest tree read
+    (ordered by when each read started, not when it finished), so an older
+    read landing late cannot overwrite the final badge. An offer after the
+    flush opens a fresh window: the last value is never swallowed.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "_ANCESTOR_COST_COALESCE_SECONDS", 0.05)
+    recorder = _UsageStreamRecorder()
+    monkeypatch.setattr(_sessions_mod, "session_stream", recorder)
+    coalescer = orchestration._AncestorCostCoalescer()
+
+    first, second, third = (coalescer.next_seq() for _ in range(3))
+    coalescer.offer(_C, _cost_tree(4.0), first)
+    coalescer.offer(_C, _cost_tree(6.0), third)
+    coalescer.offer(_C, _cost_tree(5.0), second)  # started before third, finished after
+    assert recorder.published == [], "the window must hold publishes until it closes"
+
+    await asyncio.sleep(0.15)
+    by_conv = {pub.conversation_id: pub.event["total_cost_usd"] for pub in recorder.published}
+    assert len(recorder.published) == 2
+    assert by_conv == {_P: 8.0, _G: 9.0}
+
+    recorder.published.clear()
+    coalescer.offer(_C, _cost_tree(7.0), coalescer.next_seq())
+    await asyncio.sleep(0.15)
+    assert {pub.conversation_id: pub.event["total_cost_usd"] for pub in recorder.published} == {
+        _P: 9.0,
+        _G: 10.0,
+    }
+
+
+async def test_root_read_refreshes_a_pending_ancestor_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The root's own newer read must not be overwritten by an older pending flush."""
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "_ANCESTOR_COST_COALESCE_SECONDS", 0.05)
+    recorder = _UsageStreamRecorder()
+    monkeypatch.setattr(_sessions_mod, "session_stream", recorder)
+    coalescer = orchestration._AncestorCostCoalescer()
+
+    coalescer.offer(_C, _cost_tree(4.0), coalescer.next_seq())
+    root_spent = _cost_tree(4.0)
+    root_spent[0] = TreeUsageNode(_G, None, {"total_cost_usd": 5.0})
+    coalescer.offer(_G, root_spent, coalescer.next_seq())
+    await asyncio.sleep(0.15)
+
+    by_conv = {pub.conversation_id: pub.event["total_cost_usd"] for pub in recorder.published}
+    assert by_conv == {_P: 6.0, _G: 11.0}
+
+
+async def test_late_older_read_cannot_republish_older_spend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read that started first but lands after the flush publishes the newest spend."""
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "_ANCESTOR_COST_COALESCE_SECONDS", 0.05)
+    recorder = _UsageStreamRecorder()
+    monkeypatch.setattr(_sessions_mod, "session_stream", recorder)
+    coalescer = orchestration._AncestorCostCoalescer()
+
+    older, newer = coalescer.next_seq(), coalescer.next_seq()
+    coalescer.offer(_C, _cost_tree(6.0), newer)
+    await asyncio.sleep(0.15)
+    recorder.published.clear()
+    coalescer.offer(_C, _cost_tree(4.0), older)
+    await asyncio.sleep(0.15)
+
+    by_conv = {pub.conversation_id: pub.event["total_cost_usd"] for pub in recorder.published}
+    assert by_conv == {_P: 8.0, _G: 9.0}
+
+
+def test_windows_from_a_closed_loop_are_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A loop closed mid-window leaves no pending state behind for the next loop."""
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "_ANCESTOR_COST_COALESCE_SECONDS", 60.0)
+    monkeypatch.setattr(_sessions_mod, "session_stream", _UsageStreamRecorder())
+    coalescer = orchestration._AncestorCostCoalescer()
+
+    async def offer(tree: list[TreeUsageNode]) -> None:
+        coalescer.offer(tree[-1].id, tree, coalescer.next_seq())
+
+    first = asyncio.new_event_loop()
+    first.run_until_complete(offer(_cost_tree(4.0)))
+    first.close()
+    other_root = [
+        TreeUsageNode("aa" * 16, None, {"total_cost_usd": 1.0}),
+        TreeUsageNode("bb" * 16, "aa" * 16, {"total_cost_usd": 2.0}),
+    ]
+    second = asyncio.new_event_loop()
+    try:
+        second.run_until_complete(offer(other_root))
+        assert [p.loop for p in coalescer._pending.values()] == [second]
+    finally:
+        second.close()
+
+
+async def test_pending_ancestor_publish_never_feeds_gating(
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+) -> None:
+    """Gating reads the store, so spend persisted while a badge is pending still counts."""
+    from omnigent.runtime.policies.builder import build_policy_engine
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.spec.types import AgentSpec, FunctionPolicySpec, FunctionRef
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    monkeypatch.setattr(orchestration, "_ANCESTOR_COST_COALESCE_SECONDS", 60.0)
+    monkeypatch.setattr(_sessions_mod, "session_stream", _UsageStreamRecorder())
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation()
+    child = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=root.id, title="worker:a"
+    )
+    store.set_session_usage(child.id, {"total_cost_usd": 1.0})
+    coalescer = orchestration._AncestorCostCoalescer()
+    coalescer.offer(child.id, store.list_tree_usage(root.id), coalescer.next_seq())
+    store.set_session_usage(child.id, {"total_cost_usd": 3.0})
+
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="x"),
+        conversation_id=child.id,
+        conversation_store=store,
+        default_policies=[
+            FunctionPolicySpec(
+                name="budget",
+                on=None,
+                function=FunctionRef(
+                    path="omnigent.policies.builtins.cost.cost_budget",
+                    arguments={"max_cost_usd": 100.0},
+                ),
+            )
+        ],
+    )
+    assert engine.usage["total_cost_usd"] == pytest.approx(3.0)
 
 
 # ── _truncate_label ──────────────────────────────────────────────────────────

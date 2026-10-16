@@ -10,15 +10,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import itertools
 import json
 import math
 import re
 import secrets
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
+import cachetools
 import httpx
 from fastapi import (
     HTTPException,
@@ -28,6 +31,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
@@ -391,6 +395,7 @@ from omnigent.stores.conversation_store import (
     RUNNER_LIVENESS_TTL_S,
     ConversationNotFoundError,
     NameAlreadyExistsError,
+    TreeUsageNode,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -1234,50 +1239,24 @@ def _build_session_list_item(
     )
 
 
-def _publish_subtree_cost_to_ancestors(
-    conv_store: ConversationStore,
-    session_id: str,
-    conv: Conversation | None = None,
+def _publish_ancestor_subtree_costs(
+    tree: Sequence[TreeUsageNode],
+    ancestor_ids: Iterable[str],
 ) -> None:
     """
-    Re-publish each ancestor's subtree-summed cost after a child usage update.
+    Publish each ancestor's subtree-summed cost from one spawn-tree read.
 
     A sub-agent's spend is persisted on its own child conversation, so an
     ancestor's stored ``session_usage`` doesn't move when the child spends —
     yet the ancestor's displayed "Session cost" reads its own number, so a
-    parent's badge would never reflect a running sub-agent. (The policy gate
-    already reads the subtree sum via :func:`load_session_usage`; this is the
-    display side.) For each ancestor of *session_id*, recompute its subtree
-    priced cost and publish a ``session.usage`` event carrying it.
+    parent's badge would never reflect a running sub-agent. Display only; the
+    policy gate sums the tree itself.
 
-    One tree load serves the whole walk. Every ancestor of this session is in
-    the same tree, so both the chain and each ancestor's sum are derived from
-    one set of freshly-read rows — previously each ancestor paged the tree
-    again, and the chain came from a conversation row that may have been read
-    before a concurrent delete/recreate moved this session elsewhere.
-
-    Sync (does store reads + SSE fan-out); call via
-    :func:`asyncio.to_thread`, mirroring the elicitation ancestor-publish
-    helpers. ``session_stream.publish`` is safe to call from a worker thread.
-
-    :param conv_store: Store used to load the tree.
-    :param session_id: The child session whose usage just changed, e.g.
-        ``"conv_child123"``.
-    :param conv: The child's already-loaded conversation row, when the caller
-        holds one. Only its ``root_conversation_id`` is used, and only as a
-        hint: :func:`load_session_tree` verifies the tree it names actually
-        contains this session and resolves the root itself when it does not.
-        The parameter belongs to this function, not to whichever caller first
-        needed it, so that no caller can be removed and leave a signature
-        behind that its remaining callers already depend on.
+    :param tree: The spawn tree, as read by :func:`load_session_tree`.
+    :param ancestor_ids: The ancestors to publish, e.g. ``["conv_parent"]``.
     :returns: None.
     """
-    tree = load_session_tree(
-        session_id,
-        conv_store,
-        conv.root_conversation_id if conv is not None else None,
-    )
-    for ancestor_id in ancestor_ids_from_tree(tree, session_id):
+    for ancestor_id in ancestor_ids:
         ancestor_usage = _sum_subtree_usage(tree, ancestor_id)
         subtree_cost = _priced_cost_for_display(ancestor_usage)
         usage_by_model = _usage_by_model_for_display(ancestor_usage)
@@ -1296,6 +1275,109 @@ def _publish_subtree_cost_to_ancestors(
             payload["usage_by_model"] = usage_by_model
         event = SessionUsageEvent(**payload)
         session_stream.publish(ancestor_id, event.model_dump(exclude_none=True))
+
+
+# Ancestor badge publishes are coalesced per spawn tree: a parent with N busy
+# sub-agents would otherwise re-sum and re-publish the same badge N times per
+# flush cadence. One second is below what a person notices on a cost badge and
+# caps each ancestor at one publish per second per process.
+_ANCESTOR_COST_COALESCE_SECONDS = 1.0
+
+
+# How long the newest tree read is kept per tree, so a read that started
+# earlier but finished after a flush cannot publish older spend.
+_ANCESTOR_COST_LATEST_TTL_SECONDS = 60.0
+
+
+@dataclass
+class _PendingAncestorCosts:
+    """One spawn tree's ancestor publish, waiting for its window to close."""
+
+    loop: asyncio.AbstractEventLoop
+    ancestor_ids: set[str] = field(default_factory=set)
+
+
+class _AncestorCostCoalescer:
+    """
+    Trailing-edge, per-tree coalescing of ancestor subtree-cost publishes.
+
+    Display only (cost badges via ``session.usage``); gating never reads it.
+    The first offer for a tree opens a fixed window; the flush publishes every
+    ancestor offered during it from the newest tree read seen for that tree,
+    including reads made for the root's own badge, so the final value always
+    goes out and no read is added. State is per process: on multiple replicas
+    each coalesces its own events, and a badge can briefly show another
+    replica's older value until the next usage event or snapshot.
+    """
+
+    def __init__(self) -> None:
+        self._seq = itertools.count()
+        self._pending: dict[tuple[int, str], _PendingAncestorCosts] = {}
+        self._latest: cachetools.TTLCache[tuple[int, str], tuple[int, Sequence[TreeUsageNode]]] = (
+            cachetools.TTLCache(maxsize=1024, ttl=_ANCESTOR_COST_LATEST_TTL_SECONDS)
+        )
+
+    def next_seq(self) -> int:
+        """Order a tree read; take it before the read so newer reads rank higher."""
+        return next(self._seq)
+
+    def offer(self, session_id: str, tree: Sequence[TreeUsageNode], seq: int) -> None:
+        """Record *tree* and queue *session_id*'s ancestors for publication.
+
+        :param session_id: The conversation whose usage just changed.
+        :param tree: Its spawn tree, read after the usage was persisted.
+        :param seq: :meth:`next_seq` taken before *tree* was read.
+        """
+        ancestors = ancestor_ids_from_tree(tree, session_id)
+        key = (current_workspace_id(), ancestors[-1] if ancestors else session_id)
+        latest = self._latest.get(key)
+        if latest is None or seq > latest[0]:
+            self._latest[key] = (seq, tree)
+        if not ancestors:
+            return
+        loop = asyncio.get_running_loop()
+        pending = self._pending.get(key)
+        if pending is None or pending.loop is not loop:
+            # A loop that closed before its window ended never flushes.
+            for stale_key in [k for k, p in self._pending.items() if p.loop.is_closed()]:
+                del self._pending[stale_key]
+            pending = _PendingAncestorCosts(loop=loop)
+            self._pending[key] = pending
+            loop.call_later(_ANCESTOR_COST_COALESCE_SECONDS, self._flush, key, pending, tree)
+        pending.ancestor_ids.update(ancestors)
+
+    def _flush(
+        self,
+        key: tuple[int, str],
+        pending: _PendingAncestorCosts,
+        fallback_tree: Sequence[TreeUsageNode],
+    ) -> None:
+        if self._pending.get(key) is pending:
+            del self._pending[key]
+        latest = self._latest.get(key)
+        tree = latest[1] if latest is not None else fallback_tree
+        _publish_ancestor_subtree_costs(tree, pending.ancestor_ids)
+
+
+_ancestor_costs = _AncestorCostCoalescer()
+
+
+def _load_subtree_usage(
+    conversation_store: ConversationStore,
+    session_id: str,
+    root_conversation_id: str | None,
+) -> tuple[dict[str, Any], list[TreeUsageNode]]:
+    """
+    Read *session_id*'s spawn tree once for both its badge and its ancestors'.
+
+    :param conversation_store: Store to read the tree from.
+    :param session_id: The conversation whose usage just changed.
+    :param root_conversation_id: Root hint from a row the caller holds,
+        verified against the tree it produces; ``None`` resolves it.
+    :returns: ``(subtree_usage, tree)`` — see :func:`load_session_usage`.
+    """
+    tree = load_session_tree(session_id, conversation_store, root_conversation_id)
+    return _sum_subtree_usage(tree, session_id), tree
 
 
 def _build_session_response(
@@ -2066,11 +2148,13 @@ async def _persist_external_session_usage(
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush. The
     # caller's row supplies the root so the tree scan needs no extra row read.
-    subtree_usage = await asyncio.to_thread(
-        load_session_usage,
-        session_id,
+    # The same read feeds the coalesced ancestor publish below.
+    tree_seq = _ancestor_costs.next_seq()
+    subtree_usage, tree = await asyncio.to_thread(
+        _load_subtree_usage,
         conversation_store,
-        root_conversation_id=conv.root_conversation_id if conv is not None else None,
+        session_id,
+        conv.root_conversation_id if conv is not None else None,
     )
     subtree_cost = _priced_cost_for_display(subtree_usage)
     usage_by_model = _usage_by_model_for_display(subtree_usage)
@@ -2096,14 +2180,8 @@ async def _persist_external_session_usage(
     # This session's usage also moves its ANCESTORS' subtree cost (its spend
     # rolls up into every ancestor), so re-publish each ancestor's subtree cost
     # too — otherwise a grandparent's badge wouldn't reflect a deep descendant.
-    # No-op for a top-level session (no ancestors). Threaded: it pages the
-    # conversation tree per ancestor.
-    await asyncio.to_thread(
-        _publish_subtree_cost_to_ancestors,
-        conversation_store,
-        session_id,
-        conv,
-    )
+    # No-op for a top-level session (no ancestors).
+    _ancestor_costs.offer(session_id, tree, tree_seq)
     return raw_tokens
 
 
@@ -8955,22 +9033,11 @@ async def _relay_runner_stream_once(
                             # surfaces tokens). context_tokens/window ride on the
                             # same event so the ring updates live. Threaded: store
                             # reads + SSE fan-out.
-                            # One row read serves both the subtree sum and
-                            # the ancestor publish below (each would
-                            # otherwise re-derive the tree root itself).
-                            _usage_conv = await asyncio.to_thread(
-                                conversation_store.get_conversation,
-                                session_id,
-                            )
-                            _subtree_usage = await asyncio.to_thread(
-                                load_session_usage,
-                                session_id,
-                                conversation_store,
-                                root_conversation_id=(
-                                    _usage_conv.root_conversation_id
-                                    if _usage_conv is not None
-                                    else None
-                                ),
+                            # One tree read serves both the subtree sum and
+                            # the coalesced ancestor publish below.
+                            _tree_seq = _ancestor_costs.next_seq()
+                            _subtree_usage, _usage_tree = await asyncio.to_thread(
+                                _load_subtree_usage, conversation_store, session_id, None
                             )
                             _subtree_cost = _priced_cost_for_display(_subtree_usage)
                             _usage_by_model = _usage_by_model_for_display(_subtree_usage)
@@ -9006,12 +9073,7 @@ async def _relay_runner_stream_once(
                                 # Ancestors' badges only move on cost/usage, not a
                                 # context-only publish — keep the roll-up gated.
                                 if _subtree_cost is not None or _usage_by_model is not None:
-                                    await asyncio.to_thread(
-                                        _publish_subtree_cost_to_ancestors,
-                                        conversation_store,
-                                        session_id,
-                                        _usage_conv,
-                                    )
+                                    _ancestor_costs.offer(session_id, _usage_tree, _tree_seq)
 
                     failed_response = event.get("response")
                     if (
@@ -12946,6 +13008,7 @@ async def _get_session_snapshot(
 
 __all__ = [
     "_accumulate_session_usage",
+    "_ancestor_costs",
     "_archive_stop",
     "_best_effort_stop",
     "_bind_and_launch_managed_runner",
@@ -12979,6 +13042,7 @@ __all__ = [
     "_kick_managed_relaunch",
     "_kick_managed_wake",
     "_labels_for_viewer",
+    "_load_subtree_usage",
     "_maybe_relaunch_managed_sandbox",
     "_maybe_wake_stale_resumable_managed_sandbox",
     "_native_subagent_wrapper_labels",
@@ -12994,9 +13058,9 @@ __all__ = [
     "_persist_native_cumulative_usage",
     "_persist_native_terminal_failure",
     "_persist_session_event",
+    "_publish_ancestor_subtree_costs",
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",
-    "_publish_subtree_cost_to_ancestors",
     "_recover_subagent_status_forward_via_parent",
     "_register_policy_elicitation",
     "_relay_runner_stream",

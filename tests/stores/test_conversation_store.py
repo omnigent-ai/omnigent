@@ -313,6 +313,15 @@ def test_get_conversations_empty_input_skips_query(
     assert conversation_store.get_conversations([]) == {}
 
 
+def test_list_tree_usage_matches_the_full_tree_listing(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Single-DB mode: one joined statement covers the full listing's rows."""
+    from tests.stores.tree_usage_scenario import assert_tree_usage_matches_full_listing
+
+    assert_tree_usage_matches_full_listing(conversation_store)
+
+
 def test_list_latest_message_items_for_conversations(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

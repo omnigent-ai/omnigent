@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 from collections.abc import Mapping
@@ -107,6 +108,7 @@ from omnigent.stores.conversation_store import (
     CreatedSession,
     DailyCostState,
     SessionConnectivity,
+    TreeUsageNode,
     pinned_label_key,
 )
 from omnigent.stores.conversation_store.overrides import (
@@ -169,6 +171,10 @@ _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 # single statement it always was.
 _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
 
+# Ids per metadata read when a split deployment sums a spawn tree. Far below
+# every backend's bind-parameter limit (SQLite's default is 32,766).
+_TREE_USAGE_IDS_PER_STATEMENT = 1000
+
 # How many co-located sessions ``has_other_live_session_in_workspace`` will
 # name before it stops looking. Real directories hold one or two sessions; the
 # bound keeps the archived-filter query's ``IN`` list small and caps the work a
@@ -178,6 +184,11 @@ _WORKSPACE_SHARER_SCAN_LIMIT = 32
 
 class _RowCountResult(Protocol):
     rowcount: int
+
+
+def _usage(raw: str | None) -> dict[str, Any]:
+    """Parse a stored ``session_usage`` blob; empty when none is recorded."""
+    return json.loads(raw) if raw else {}
 
 
 def _to_conversation(
@@ -1409,6 +1420,71 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             for row in rows
         }
+
+    def list_tree_usage(self, root_conversation_id: str) -> list[TreeUsageNode]:
+        """
+        Narrow column read of tree shape plus each row's usage blob.
+
+        One joined statement when conversations and metadata share an engine;
+        otherwise the shape from the AP DB, then usage by primary key. Selects
+        columns rather than ORM entities and skips labels and the other
+        metadata blobs. See :meth:`ConversationStore.list_tree_usage`.
+        """
+        workspace_id = current_workspace_id()
+        in_tree = (
+            SqlConversation.workspace_id == workspace_id,
+            SqlConversation.root_conversation_id == root_conversation_id,
+        )
+        if self._conv_engine is self._engine:
+            with self._conv_session("list_tree_usage") as session:
+                rows = session.execute(
+                    select(
+                        SqlConversation.id,
+                        SqlConversation.parent_conversation_id,
+                        SqlConversationMetadata.session_usage,
+                    )
+                    .outerjoin(
+                        SqlConversationMetadata,
+                        and_(
+                            SqlConversationMetadata.workspace_id == SqlConversation.workspace_id,
+                            SqlConversationMetadata.id == SqlConversation.id,
+                        ),
+                    )
+                    .where(*in_tree)
+                ).all()
+            return [
+                TreeUsageNode(id=row_id, parent_conversation_id=parent, session_usage=_usage(raw))
+                for row_id, parent, raw in rows
+            ]
+        with self._conv_session("list_tree_usage") as session:
+            shape = session.execute(
+                select(SqlConversation.id, SqlConversation.parent_conversation_id).where(*in_tree)
+            ).all()
+        if not shape:
+            return []
+        usage_by_id: dict[str, str | None] = {}
+        with self._session("list_tree_usage") as meta_sess:
+            # Batched so a very large tree stays under the backend's bind limit.
+            for batch in itertools.batched(
+                (row.id for row in shape), _TREE_USAGE_IDS_PER_STATEMENT
+            ):
+                for meta_id, raw in meta_sess.execute(
+                    select(
+                        SqlConversationMetadata.id, SqlConversationMetadata.session_usage
+                    ).where(
+                        SqlConversationMetadata.workspace_id == workspace_id,
+                        SqlConversationMetadata.id.in_(batch),
+                    )
+                ):
+                    usage_by_id[meta_id] = raw
+        return [
+            TreeUsageNode(
+                id=row.id,
+                parent_conversation_id=row.parent_conversation_id,
+                session_usage=_usage(usage_by_id.get(row.id)),
+            )
+            for row in shape
+        ]
 
     def list_child_conversation_ids_by_parent(
         self,

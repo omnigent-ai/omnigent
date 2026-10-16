@@ -281,6 +281,25 @@ def test_increment_session_usage(store: SqlAlchemyConversationStore) -> None:
     assert result2["input_tokens"] == 150
 
 
+def test_list_tree_usage_reads_across_dbs(store: SqlAlchemyConversationStore) -> None:
+    """Split-DB mode: shape and usage live apart, so the read takes two steps."""
+    from tests.stores.tree_usage_scenario import assert_tree_usage_matches_full_listing
+
+    assert store._conv_engine is not store._engine
+    assert_tree_usage_matches_full_listing(store)
+
+
+def test_list_tree_usage_batches_metadata_reads(
+    store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Split-DB mode: a tree larger than one id batch is still read whole."""
+    from omnigent.stores.conversation_store import sqlalchemy_store
+    from tests.stores.tree_usage_scenario import assert_tree_usage_matches_full_listing
+
+    monkeypatch.setattr(sqlalchemy_store, "_TREE_USAGE_IDS_PER_STATEMENT", 1)
+    assert_tree_usage_matches_full_listing(store)
+
+
 def test_apply_session_usage_delta_drops_negative_and_non_finite_increments() -> None:
     """A forged usage frame can't drive a cumulative counter backwards or poison it.
 
