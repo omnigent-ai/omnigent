@@ -1884,7 +1884,8 @@ async def _run_tunnel_from_env() -> None:
     # parent-death killer stand down so the runner outlives the CLI.
     adopted_event = threading.Event()
     # Set when the host hangs up; the parent-death killer then lets work finish.
-    finish_work_event = threading.Event()
+    # Without a parent watchdog nothing would act on it, so a hangup stops as before.
+    finish_work_event = threading.Event() if parent_pid is not None else None
     _shutting_down_state = getattr(app.state, "shutting_down", None)
     _install_signal_handlers(
         stop_event,
@@ -2152,7 +2153,15 @@ def _install_signal_handlers(
     # once the host is gone. No reason is recorded: the eventual exit path names it.
     sighup = getattr(signal, "SIGHUP", None)
     if finish_work_event is not None and sighup is not None:
-        _try_add_handler(sighup, finish_work_event.set)
+
+        def _handle_hangup() -> None:
+            # An adopted runner's watchdog has stood down, so a hangup stops it.
+            if adopted_event is not None and adopted_event.is_set():
+                _handle_shutdown_signal(sighup)
+            else:
+                finish_work_event.set()
+
+        _try_add_handler(sighup, _handle_hangup)
 
 
 def _install_crash_logging() -> None:

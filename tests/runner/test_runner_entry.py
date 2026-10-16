@@ -2581,6 +2581,56 @@ async def test_install_signal_handlers_sighup_finishes_work_instead_of_dying() -
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
+    not hasattr(signal, "SIGHUP") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_sighup_stops_an_adopted_runner() -> None:
+    """An adopted runner's watchdog has stood down, so a hangup still stops it."""
+    import threading
+
+    stop_event = asyncio.Event()
+    adopted = threading.Event()
+    adopted.set()
+    finish_work = threading.Event()
+    reasons: list[str] = []
+    _install_signal_handlers(
+        stop_event,
+        adopted_event=adopted,
+        finish_work_event=finish_work,
+        record_reason=reasons.append,
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        os.kill(os.getpid(), signal.SIGHUP)
+        await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGUSR1, signal.SIGUSR2):
+            loop.remove_signal_handler(sig)
+
+    assert not finish_work.is_set()
+    assert reasons == ["received SIGHUP"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGHUP") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_without_finish_work_leaves_sighup_alone() -> None:
+    """A runner with no parent watchdog keeps SIGHUP's default stop behavior."""
+    stop_event = asyncio.Event()
+    before = signal.getsignal(signal.SIGHUP)
+    _install_signal_handlers(stop_event)
+    loop = asyncio.get_running_loop()
+    try:
+        assert signal.getsignal(signal.SIGHUP) == before
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
     not hasattr(signal, "SIGTERM") or sys.platform == "win32",
     reason="POSIX signal delivery required",
 )
