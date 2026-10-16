@@ -2124,11 +2124,20 @@ async def test_events_model_change_unconfirmed_switch_answers_503(
     resp = await _post_model_change_with_status_sequence(
         monkeypatch,
         ["claude-opus-4-6"],
+        pane_status="idle",
     )
     assert resp.status_code == 503, resp.text
     body = resp.json()
     assert body["error"] == "claude_native_model_unconfirmed"
     assert "did not confirm" in body["detail"]
+    context = body["failure_context"]
+    assert context["failure_source"] == "native_control"
+    assert context["control_failure_reason"] == "model_unconfirmed"
+    assert context["control_model_before"] == "claude-opus-4-6"
+    assert context["control_model_observed"] == "claude-opus-4-6"
+    assert context["control_model_requested"] == "claude-opus-4-7"
+    assert context["control_pane_status_snapshot"] == "idle"
+    assert context["control_confirmation_budget_ms"] == 300
 
 
 @pytest.mark.asyncio

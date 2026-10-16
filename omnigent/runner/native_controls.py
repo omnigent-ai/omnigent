@@ -12,6 +12,7 @@ import dataclasses
 import logging
 import time
 import urllib.parse
+import uuid
 import weakref
 from collections.abc import Callable, Coroutine, Mapping
 from pathlib import Path
@@ -28,6 +29,7 @@ from fastapi.responses import JSONResponse, Response
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
 from omnigent.inner.databricks_executor import DatabricksAuthError
+from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
 from omnigent.runner.app_support import (
     _client_safe_error_payload,
     _SpecEntry,
@@ -44,6 +46,7 @@ from omnigent.runner.native import (
 from omnigent.runner.resource_registry import CODEX_NATIVE_TERMINAL_ROLE, SessionResourceRegistry
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.version import VERSION
 
 if TYPE_CHECKING:
     pass
@@ -278,6 +281,21 @@ def build_native_controls(
         weakref.WeakValueDictionary()
     )
 
+    def _control_failure_context(
+        conv_id: str, harness: str, reason: str, **evidence: object
+    ) -> FailureContext:
+        return normalize_failure_context(
+            {
+                "failure_id": f"err_{uuid.uuid4().hex}",
+                "failure_source": "native_control",
+                "runner_version": VERSION,
+                "native_harness": harness,
+                "control_failure_reason": reason,
+                "control_pane_status_snapshot": _native_pane_status.get(conv_id),
+                **evidence,
+            }
+        )
+
     async def _handle_codex_native_settings_update(
         conv_id: str,
         settings: _JsonObject,
@@ -412,12 +430,14 @@ def build_native_controls(
 
         if ready_deadline is None:
             ready_deadline = asyncio.get_running_loop().time() + _CODEX_SETTINGS_READY_TIMEOUT_S
+        ready_timed_out = False
         try:
             state = await asyncio.wait_for(
                 _ready_codex_bridge_for_settings(conv_id),
                 timeout=ready_deadline - asyncio.get_running_loop().time(),
             )
         except TimeoutError:
+            ready_timed_out = True
             _logger.warning(
                 "Codex-native runtime was not ready for settings update for session=%s",
                 conv_id,
@@ -428,11 +448,29 @@ def build_native_controls(
             # No loaded Codex bridge means nothing applied the settings; a
             # silent 204 here would let the caller claim a switch the
             # app-server never saw.
+            registry = resource_registry.terminal_registry
+            backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+            returncode = getattr(getattr(backend, "proc", None), "returncode", None)
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": "codex_native_settings_update_failed",
                     "detail": "Codex-native settings update requires a loaded Codex bridge.",
+                    "failure_context": _control_failure_context(
+                        conv_id,
+                        "codex-native",
+                        "bridge_not_ready",
+                        control_wait_timed_out=ready_timed_out,
+                        control_model_requested=settings.get("model"),
+                        control_terminal_registered=registry.get(conv_id, "codex", "main")
+                        is not None
+                        if registry is not None
+                        else None,
+                        control_backend_registered=backend is not None,
+                        control_backend_returncode=str(returncode)
+                        if type(returncode) is int
+                        else None,
+                    ),
                 },
             ), settings
 
@@ -1382,6 +1420,16 @@ def build_native_controls(
                 "detail": (
                     f"the terminal did not confirm the switch to {model_arg} within "
                     f"{_CLAUDE_MODEL_CONFIRM_TIMEOUT_S:.0f}s — a dialog may be open in the pane"
+                ),
+                "failure_context": _control_failure_context(
+                    conv_id,
+                    "claude-native",
+                    "model_unconfirmed",
+                    control_model_requested=selected_model,
+                    control_model_command_arg=model_arg,
+                    control_model_before=baseline,
+                    control_model_observed=current,
+                    control_confirmation_budget_ms=round(_CLAUDE_MODEL_CONFIRM_TIMEOUT_S * 1000),
                 ),
             },
         )

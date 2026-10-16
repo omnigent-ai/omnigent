@@ -8,6 +8,7 @@ import pytest
 
 from omnigent import debug_logging as dl
 from omnigent.runner import create_runner_app
+from omnigent.runner.app_support import _client_safe_error_detail
 from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.helpers import NullServerClient
 
@@ -25,6 +26,7 @@ async def test_runner_request_overrides_primary_and_logs_failed_init(
     @app.get("/v1/sessions/{session_id}/logging-probe")
     async def probe(session_id: str) -> dict[str, str]:
         logging.getLogger("omnigent.runner.test").info("child probe")
+        _client_safe_error_detail(RuntimeError("synthetic failure"), context="handled probe")
         return {"id": session_id}
 
     with capture_debug_rows("runner") as rows:
@@ -44,6 +46,12 @@ async def test_runner_request_overrides_primary_and_logs_failed_init(
     assert failure["attributes"]["status_code"] == "501"
     assert failure["attributes"]["error_code"] == "not_implemented"
     assert next(row for row in rows if row["message"] == "child probe")["session_id"] == "child"
+    assert (
+        next(row for row in rows if row["message"].startswith("handled probe failed:"))[
+            "session_id"
+        ]
+        == "child"
+    )
     assert next(row for row in rows if row["message"] == "process probe")["session_id"] == "parent"
     assert not any(row["event_name"] == "runner_session_initialized" for row in rows)
 
