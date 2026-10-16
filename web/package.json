@@ -59,7 +59,7 @@
     "@tiptap/extension-table": "3.30.5",
     "@tiptap/markdown": "3.30.5",
     "@tiptap/pm": "3.30.5",
-    "@tiptap/react": "3.30.5",
+    "@tiptap/react": "3.31.4",
     "@tiptap/starter-kit": "3.30.5",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-webgl": "^0.19.0",
