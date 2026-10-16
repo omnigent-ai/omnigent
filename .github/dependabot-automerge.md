@@ -30,10 +30,16 @@ post-merge workflows can trigger; no workflow-token fallback is permitted.
 | Pre-commit hooks | `pre-commit-hooks`, patches and stable minors | Only the release revision changes; hook commands/settings stay fixed; updated hooks must pass Lint. |
 | Rust sidecar | Named crates.io dependencies, patches | Only `tests/codex_parity/sidecar/Cargo.lock`; registry checksum/age, actual Codex parity job and browser workflow. |
 
-The JSON policy lists exact packages/patterns and tested Actions paths. Updates
-are grouped separately from ordinary review-required updates in Dependabot's
-configuration. Every changed package must qualify, including transitives.
-A mixed group remains manual; maintainers can split it.
+The JSON policy lists exact packages/patterns and tested Actions paths. Dependabot
+opens individual version and security update PRs by default, so one update needing
+review does not hold up unrelated updates. Only the cross-pinned `mlflow`,
+`mlflow-skinny` and `mlflow-tracing` packages are grouped together, separately for
+version and security updates. Every changed package must qualify for auto-merge,
+including transitives; an individual PR can still require manual review.
+
+Keep GitHub's repository/organization **Grouped security updates** setting disabled
+so ecosystems without an explicit group also receive individual security PRs.
+Schedules, PR limits, cooldowns and existing exclusions still apply.
 
 Major updates, prereleases, `0.x` minor updates, compatibility override changes,
 new/removed packages, dependency-graph changes and source changes require review.
