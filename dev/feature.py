@@ -75,6 +75,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    from dev.repro import _launch_env
     from dev.resolve import _die, _resolve_base_ref, _unique_branch
     from omnigent.host.git_worktree import WorktreeError, create_worktree
 
@@ -94,8 +95,13 @@ def main() -> None:
         f"\nThe feature-agent will build the feature, then {action}.\n"
         f"  input:  {payload}\n  branch: {branch}  (off {base[:12]})\n"
     )
-    if not args.yes and input("Proceed? [y/N] ").strip().lower() not in ("y", "yes"):
-        _die("aborted by user")
+    if not args.yes:
+        try:
+            answer = input("Proceed? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes"):
+            _die("aborted by user")
 
     try:
         created = create_worktree(repo_path=str(_REPO_ROOT), branch_name=branch, base_branch=base)
@@ -108,12 +114,18 @@ def main() -> None:
     if args.server is not None:
         cmd += ["--server", args.server]
     print(f"→ running: {shlex.join(cmd)}\n→ cwd:     {worktree}\n")
-    result = subprocess.run(cmd, cwd=str(worktree), check=False)
+    try:
+        returncode = subprocess.run(
+            cmd, cwd=str(worktree), env=_launch_env(args.feature_url), check=False
+        ).returncode
+    except OSError as exc:
+        print(f"error: could not run omnigent: {exc}", file=sys.stderr)
+        returncode = 1
     print(
-        f"\n→ done (exit {result.returncode}). Branch {created.branch} in {worktree}\n"
+        f"\n→ done (exit {returncode}). Branch {created.branch} in {worktree}\n"
         f"  Clean up: git worktree remove {worktree} && git branch -D {created.branch}"
     )
-    raise SystemExit(result.returncode)
+    raise SystemExit(returncode)
 
 
 if __name__ == "__main__":

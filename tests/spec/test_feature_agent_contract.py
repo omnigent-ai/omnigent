@@ -103,11 +103,13 @@ def test_feature_handoff_passes_the_shared_review_gate() -> None:
     module_spec.loader.exec_module(cycle)
 
     example = _handoff_example()
+    dispositions = example["review_cycle"]["dispositions"]
+    assert dispositions
     state = {
         "head_sha": example["review_cycle"]["head_sha"],
         "fingerprint": example["review_cycle"]["fingerprint"],
         "completed": {"polly": True, "ocr": True},
-        "feedback": [{"key": example["review_cycle"]["dispositions"][0]["key"]}],
+        "feedback": [{"key": item["key"]} for item in dispositions],
     }
     cycle.validate(state, example)
 

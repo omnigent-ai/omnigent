@@ -1,22 +1,6 @@
-# feature-agent (local) — build one feature from a Linear feature ticket, or
-# remediate requested changes on an existing feature-agent PR.
-#
-# Writes the requirements and CUJs, chooses a design (recording the rejected
-# alternatives), implements it with tests, records a captioned demo for every
-# covered CUJ, opens a ready-for-review PR on omnigent-ai/omnigent, and iterates
-# on CI and Polly/OCR until green and settled. It never merges.
-#
-# Usage (run from the root of your omnigent-ai/omnigent checkout):
-#
-#   python dev/feature.py https://linear.app/omnigent/issue/OMNI-1234/slug
-#
-# or directly:
-#
-#   omnigent run dev/feature-agent \
-#     -p '{"feature_url":"https://linear.app/omnigent/issue/OMNI-1234"}'
-#
-# The brain runs on the Claude Agent SDK, so configure a Claude provider first
-# (`omnigent setup`).
+# feature-agent (local). See `description:` below for what it does.
+# Usage: python dev/feature.py https://linear.app/omnigent/issue/OMNI-1234/slug
+# The brain runs on the Claude Agent SDK; configure a provider first (`omnigent setup`).
 
 spec_version: 1
 name: feature_agent
