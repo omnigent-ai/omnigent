@@ -391,6 +391,9 @@ def test_detect_sign_in_prompt_does_not_treat_an_auth_shaped_hostname_as_the_end
         "Sign in to continue\nEnter code 12345678\n",
         "Sign in to continue:\n  code: abcd-1234\n",
         "https://signin.example.com/device",
+        "Sign in to continue:\n\n\n\n  code: HQ7M-2KPD\n",
+        "Sign in to continue:\n  HQ7M-2KPD\n",
+        "code: HQ7M-2KPD",
     ],
     ids=[
         "moved-past-prompt",
@@ -399,6 +402,9 @@ def test_detect_sign_in_prompt_does_not_treat_an_auth_shaped_hostname_as_the_end
         "cued-numeric-code",
         "cued-lowercase-code",
         "bare-endpoint",
+        "code-below-a-gap",
+        "unlabelled-code",
+        "labelled-code-without-cue",
     ],
 )
 def test_contains_sign_in_material_outlives_an_actionable_prompt(screen: str) -> None:
@@ -416,7 +422,7 @@ def test_contains_sign_in_material_outlives_an_actionable_prompt(screen: str) ->
         "Opened https://github.com/omnigent-ai/omnigent/pull/123 for review\n",
         "exit code 1\n",
         "Launcher: update check before starting Claude Code... OMNI-STALL-e532148b\n",
-        "code: HQ7M-2KPD",
+        "launcher: refreshing workspace login\nusing a cached token\n",
     ],
     ids=[
         "none",
@@ -426,7 +432,7 @@ def test_contains_sign_in_material_outlives_an_actionable_prompt(screen: str) ->
         "ordinary-link",
         "exit-code",
         "claude-code-with-marker",
-        "uncued-code",
+        "login-refresh-without-code",
     ],
 )
 def test_contains_sign_in_material_ignores_ordinary_output(screen: str | None) -> None:

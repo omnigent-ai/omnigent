@@ -117,6 +117,12 @@ _ECHOED_CONTROL = re.compile(r"\^\[(?:\[[0-9;?]*[A-Za-z~]?)?")
 _SIGN_IN_CODE = re.compile(
     r"\b(?:[A-Z0-9]{4,8}-[A-Z0-9]{4,8}|(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{6,9})\b"
 )
+# The same shape in any case, for checks that withhold rather than lift a code.
+_SIGN_IN_CODE_ANY_CASE = re.compile(_SIGN_IN_CODE.pattern, re.IGNORECASE)
+# A value labelled as a code, e.g. "code: HQ7M-2KPD", needs no sign-in wording.
+_LABELLED_SIGN_IN_CODE = re.compile(
+    r"\bcode\s*[:=]\s*(?:" + _SIGN_IN_CODE.pattern + r")", re.IGNORECASE
+)
 
 
 def _nearby(lines: list[str], index: int) -> str:
@@ -153,9 +159,11 @@ def contains_sign_in_material(screen: str | None) -> bool:
     :func:`detect_sign_in_prompt` rejects a prompt the launcher has moved past,
     but the address and one-time code it printed are still on screen and still
     secret. Diagnostics that export pane text use this broader check to decide
-    whether the text may be logged at all. A line that mentions a code counts
-    only beside sign-in wording, whatever the code looks like: "Claude Code" is
-    on most launcher lines.
+    whether the text may be logged at all, so it errs toward withholding: sign-in
+    wording anywhere with a code-shaped token anywhere counts, as does a value
+    labelled ``code:``. A line that merely mentions a code counts only beside
+    sign-in wording, whatever the code looks like: "Claude Code" is on most
+    launcher lines.
 
     :param screen: ANSI-stripped terminal screen text, or ``None``.
     :returns: ``True`` when any sign-in material is on screen.
@@ -165,6 +173,11 @@ def contains_sign_in_material(screen: str | None) -> bool:
     lines = screen.splitlines()
     endpoints, cued = _sign_in_addresses(lines)
     if endpoints or cued:
+        return True
+    # A code may sit anywhere below its prompt, or outlive a prompt that scrolled away.
+    if _SIGN_IN_CUE.search(screen) and _SIGN_IN_CODE_ANY_CASE.search(screen):
+        return True
+    if _LABELLED_SIGN_IN_CODE.search(screen):
         return True
     return any(
         _SIGN_IN_CODE_LINE.search(line) and _SIGN_IN_CUE.search(_nearby(lines, index))
