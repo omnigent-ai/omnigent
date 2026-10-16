@@ -81,7 +81,11 @@ import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesys
 import { getCliServerUrl } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { randomUUID } from "@/lib/randomUUID";
-import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  sandboxDiscoveryProviders,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+} from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
@@ -849,6 +853,8 @@ function SupportedForkSessionForm({
     () => (info !== "loading" ? sandboxProviderOptions(info) : []),
     [info],
   );
+  const discoveryProviders =
+    !workspaceRecovery && info !== "loading" ? sandboxDiscoveryProviders(info) : [];
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -1498,7 +1504,9 @@ function SupportedForkSessionForm({
               <p className="text-sm text-muted-foreground" data-testid="fork-session-no-hosts">
                 Loading hosts…
               </p>
-            ) : onlineHosts.length === 0 && !managedSandboxesEnabled ? (
+            ) : onlineHosts.length === 0 &&
+              !managedSandboxesEnabled &&
+              discoveryProviders.length === 0 ? (
               // Nothing usable (no hosts, or all offline) and no sandbox to
               // fall back on — show the connect command directly so the user
               // can unblock. The submit button stays greyed until a host is
@@ -1593,27 +1601,23 @@ function SupportedForkSessionForm({
                         <HostLabel host={host} />
                       </SelectItem>
                     ))}
-                    {managedSandboxesEnabled &&
-                      sandboxProviderRows.map((provider) =>
-                        provider !== null &&
-                        info.sandbox_provider_capabilities?.[provider]?.reusable_hosts ? (
-                          <SelectGroup key={`discover-${provider}`}>
-                            <SelectSeparator />
-                            <SelectItem
-                              value={`${DISCOVER_SANDBOX_PREFIX}${provider}`}
-                              className="text-muted-foreground"
-                            >
-                              <span className="flex items-center gap-2">
-                                <PlusIcon className="size-4" aria-hidden="true" />
-                                <span>
-                                  Existing Static Sandbox
-                                  {sandboxProviderRows.length > 1 && ` (${provider})`}
-                                </span>
-                              </span>
-                            </SelectItem>
-                          </SelectGroup>
-                        ) : null,
-                      )}
+                    {discoveryProviders.map((provider) => (
+                      <SelectGroup key={`discover-${provider}`}>
+                        <SelectSeparator />
+                        <SelectItem
+                          value={`${DISCOVER_SANDBOX_PREFIX}${provider}`}
+                          className="text-muted-foreground"
+                        >
+                          <span className="flex items-center gap-2">
+                            <PlusIcon className="size-4" aria-hidden="true" />
+                            <span>
+                              Existing Static Sandbox
+                              {discoveryProviders.length > 1 && ` (${provider})`}
+                            </span>
+                          </span>
+                        </SelectItem>
+                      </SelectGroup>
+                    ))}
                   </SelectContent>
                 </Select>
                 {discoveryProvider !== null && (

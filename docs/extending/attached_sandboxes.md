@@ -62,6 +62,34 @@ directly from the ordinary host picker.
 There is no get-or-create operation or assumption of one box per user. Creation
 always goes through `provision`; reuse goes through explicit selection.
 
+Discovery does not require creation. A controller that only manages existing
+boxes can declare:
+
+```python
+@property
+def capabilities(self):
+    return replace(
+        super().capabilities,
+        managed_launch=False,
+        reusable_hosts=True,
+        resume_stopped=True,
+    )
+```
+
+The plugin registry reads `managed_launch` when configuring creation. For a
+directly injected `ManagedSandboxConfig`, also set
+`managed_launch_supported=False`. The provider still implements discovery,
+authorization, preparation, resume and host startup; `provision` can retain its
+default unsupported implementation.
+
+`GET /v1/info` lists creation providers in `sandbox_providers` and advertises
+`reusable_hosts` independently in `sandbox_provider_capabilities`. Both session
+pickers show **+ Existing Static Sandbox** even when there are no connected
+hosts and `managed_sandboxes_enabled` is false. **New static sandbox** appears
+only when creation is supported. Direct creation requests to a discovery-only
+provider are rejected without provisioning. A failed creation attempt does not
+disable discovery; discovery and attachment never call `provision`.
+
 ## Provider contract
 
 Keep the customer controller and HTTP client in the existing
@@ -210,6 +238,11 @@ Create another session with **New static sandbox** and verify it gets a differen
 box. Have the controller create a box independently, then choose **+ Existing
 Static Sandbox**, select it and start a session. Refreshing the list must not
 start any boxes. Repeat selection and verify the same host registration is reused.
+
+With creation disabled, verify that **New static sandbox** disappears while
+**+ Existing Static Sandbox** remains available in both New session and Clone
+session, including before any hosts are registered. Discover a box, connect it
+and reuse it for two sessions without any controller creation call.
 
 ## Prototype limits
 

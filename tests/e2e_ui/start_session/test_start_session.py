@@ -3469,7 +3469,10 @@ async def _drive_agy_default_permissions(base_url: str, session_id: str) -> None
             await browser.close()
 
 
-def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(built_spa, tmp_path):
+@pytest.mark.parametrize("supports_creation", [False, True])
+def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
+    built_spa, tmp_path, supports_creation
+):
     """The browser keeps reusable boxes visible while per-session sandboxes stay hidden."""
 
     import httpx
@@ -3539,8 +3542,9 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(built_spa, 
 
             info = json.loads(_managed_info_body())
             info.update(
-                sandbox_provider="static",
-                sandbox_providers=["static"],
+                managed_sandboxes_enabled=supports_creation,
+                sandbox_provider="static" if supports_creation else None,
+                sandbox_providers=["static"] if supports_creation else [],
                 sandbox_provider_capabilities={"static": {"reusable_hosts": True}},
             )
             await page.route("**/v1/info", lambda route: route.fulfill(json=info))
@@ -3586,13 +3590,16 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(built_spa, 
                 await page.reload()
                 await chip.click()
                 create_static = page.get_by_role("menuitem", name="New static sandbox", exact=True)
-                await expect(create_static).to_be_visible()
-                await create_static.click()
-                await expect(chip).to_have_attribute(
-                    "aria-label", re.compile("New static sandbox")
-                )
-                await expect(create_static).to_be_hidden()
-                await chip.click()
+                if supports_creation:
+                    await expect(create_static).to_be_visible()
+                    await create_static.click()
+                    await expect(chip).to_have_attribute(
+                        "aria-label", re.compile("New static sandbox")
+                    )
+                    await expect(create_static).to_be_hidden()
+                    await chip.click()
+                else:
+                    await expect(create_static).to_have_count(0)
                 row = page.get_by_test_id("new-chat-landing-host-host_devbox")
                 await expect(row).to_be_visible()
                 await expect(row).to_contain_text("Asleep")

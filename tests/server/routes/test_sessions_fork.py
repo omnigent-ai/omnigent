@@ -2295,23 +2295,30 @@ async def test_fork_managed_rejects_unconfigured_server() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider,error",
+    [("daytona", "is not configured on this server"), ("modal", "does not support creating")],
+)
 async def test_fork_managed_rejects_unoffered_provider(
     monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    error: str,
 ) -> None:
     """A provider this server doesn't offer fails the POST, naming what it has."""
     conv = _make_conversation()
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     app = _build_app(conv_store)
     launches = _arm_managed_app(app, monkeypatch)
+    app.state.sandbox_config.default.managed_launch_supported = False
     client = TestClient(app)
 
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed", "sandbox_provider": "daytona"},
+        json={"host_type": "managed", "sandbox_provider": provider},
     )
 
     assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
-    assert "is not configured on this server" in resp.json()["error"]["message"]
+    assert error in resp.json()["error"]["message"]
     assert launches == []
 
 

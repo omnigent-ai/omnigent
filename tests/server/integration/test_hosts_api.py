@@ -1513,7 +1513,10 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
     assert not [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]
 
 
-async def test_attach_api_reuses_one_tunnel_for_two_session_launches(host_api_app):
+@pytest.mark.parametrize("supports_creation", [False, True])
+async def test_attach_api_reuses_one_tunnel_for_two_session_launches(
+    host_api_app, supports_creation
+):
     from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
     from omnigent.onboarding.sandboxes.types import SandboxInfo
     from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
@@ -1540,12 +1543,14 @@ async def test_attach_api_reuses_one_tunnel_for_two_session_launches(host_api_ap
         on_host_start=connect,
     )
     fake.list_for_user = lambda *, owner: [SandboxInfo("devbox", name="My devbox")]
+    fake.supports_managed_launch = supports_creation
     app.state.sandbox_config = ManagedSandboxDeployment.single(
         ManagedSandboxConfig(
             server_url="http://test",
             token_ttl_s=3600,
             provider="modal",
             launcher_factory=lambda: fake,
+            managed_launch_supported=supports_creation,
         )
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

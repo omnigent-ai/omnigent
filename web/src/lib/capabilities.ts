@@ -128,7 +128,7 @@ export interface ServerInfo {
    */
   sandbox_providers?: string[];
   /**
-   * UI-relevant capability flags per launch-capable provider, e.g.
+   * UI-relevant capability flags per creation or discovery provider, e.g.
    * ``{ agent_sandbox: { multi_repo: true } }``. The new-session repo picker
    * branches on these (multi-repo list vs single). A provider absent from the
    * map, or the map absent entirely, defaults every flag off.
@@ -517,4 +517,11 @@ export function sandboxProviderOptions(info: ServerInfo): (string | null)[] {
   const offered = info.sandbox_providers;
   if (Array.isArray(offered) && offered.length > 0) return offered;
   return [info.sandbox_provider];
+}
+
+/** Reusable providers can offer discovery without offering creation. */
+export function sandboxDiscoveryProviders(info: ServerInfo): string[] {
+  return Object.entries(info.sandbox_provider_capabilities ?? {})
+    .filter(([, capabilities]) => capabilities?.reusable_hosts === true)
+    .map(([provider]) => provider);
 }

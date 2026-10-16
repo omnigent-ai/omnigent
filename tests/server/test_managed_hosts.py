@@ -2424,6 +2424,48 @@ async def test_info_reports_managed_sandboxes_capability(
     assert body["sandbox_provider"] == expected_provider
 
 
+@pytest.mark.parametrize("with_creation_provider", [False, True])
+async def test_info_advertises_discovery_without_creation(
+    db_uri, tmp_path, with_creation_provider
+):
+    fake = FakeSandboxLauncher(can_resume=True, reusable_hosts=True)
+    fake.supports_managed_launch = False
+    discovery_config = ManagedSandboxConfig(
+        server_url="http://test",
+        provider="modal",
+        launcher_factory=lambda: fake,
+        token_ttl_s=3600,
+        managed_launch_supported=False,
+    )
+    configs = [discovery_config]
+    if with_creation_provider:
+        creation_launcher = FakeSandboxLauncher()
+        creation_launcher.provider = "daytona"
+        configs.append(
+            replace(
+                discovery_config,
+                provider="daytona",
+                managed_launch_supported=True,
+                launcher_factory=lambda: creation_launcher,
+            )
+        )
+    config = ManagedSandboxDeployment(configs=tuple(configs))
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/v1/info")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["managed_sandboxes_enabled"] is with_creation_provider
+    assert body["sandbox_provider"] == ("daytona" if with_creation_provider else None)
+    assert body["sandbox_providers"] == (["daytona"] if with_creation_provider else [])
+    assert body["sandbox_provider_capabilities"]["modal"]["reusable_hosts"] is True
+    store = HostStore(db_uri)
+    with pytest.raises(HTTPException, match="does not support creating"):
+        await launch_managed_host(config=config, owner=_OWNER, host_store=store, provider="modal")
+    assert not fake.prepared and not fake.provisioned_names and not fake.host_starts
+    assert store.list_hosts(_OWNER) == []
+
+
 async def test_info_reports_enabled_for_injected_custom_launcher(
     db_uri: str,
     tmp_path: Path,
@@ -5768,13 +5810,17 @@ def contributed_acme_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     reset_plugin_state_for_tests()
 
 
+@pytest.mark.parametrize("supports_creation", [False, True])
 def test_parse_contributed_provider_builds_registry_backed_factory(
     contributed_acme_provider: None,
+    monkeypatch,
+    supports_creation,
 ) -> None:
     """
     A provider contributed through the entry point group is configurable and
     serves managed sessions, without being named in this module.
     """
+    monkeypatch.setattr(_AcmeLauncher, "supports_managed_launch", supports_creation)
     cfg = parse_sandbox_config(
         {
             "provider": "acme",
@@ -5785,9 +5831,7 @@ def test_parse_contributed_provider_builds_registry_backed_factory(
     assert cfg is not None
     cfg = cfg.default
     assert cfg.provider == "acme"
-    # Contributed providers register in order to serve, so the web UI must be
-    # told the sandbox option works rather than offered one that 400s.
-    assert cfg.managed_launch_supported is True
+    assert cfg.managed_launch_supported is supports_creation
     assert cfg.token_ttl_s == 1234
 
     launcher = cfg.launcher_factory()
@@ -5795,6 +5839,8 @@ def test_parse_contributed_provider_builds_registry_backed_factory(
     # The `sandbox.acme` block reached the launcher through the config_model
     # the registry documents, rather than being silently dropped.
     assert launcher.config.namespace == "sandboxes"
+    with pytest.raises(click.ClickException, match="create a sandbox"):
+        SandboxHostLauncher.provision(launcher, "unsupported")
 
 
 def test_contributed_provider_config_is_validated(

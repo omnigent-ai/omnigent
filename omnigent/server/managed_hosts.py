@@ -677,14 +677,15 @@ class ManagedSandboxConfig:
         provider's maximum sandbox lifetime so a live sandbox can
         always re-authenticate its tunnel across reconnects.
     :param managed_launch_supported: Whether ``launcher_factory`` can
-        actually serve a managed launch. The YAML path sets this from
-        :data:`PROVIDERS_WITH_MANAGED_LAUNCH` — staged providers
+        create a sandbox. The YAML path uses contributed providers'
+        ``managed_launch`` capability or :data:`PROVIDERS_WITH_MANAGED_LAUNCH` — staged providers
         (``lakebox``) parse but get ``False``, since their factory
         rejects at launch. Defaults to ``True`` for
         directly-constructed configs (an embedding deployment's
         custom factory IS the support). Drives the unauthenticated
         ``managed_sandboxes_enabled`` capability flag on
-        ``GET /v1/info``, which gates the web UI's sandbox option.
+        ``GET /v1/info``, which gates creation. Set ``False`` for injected
+        discovery-only providers; attachment and resume remain available.
     :param provider: Short provider name surfaced to the web UI so the
         new-session sandbox option can be labeled per provider (e.g.
         ``"modal"`` → "Modal Sandbox", ``"lakebox"`` → "Databricks
@@ -924,25 +925,37 @@ class ManagedSandboxDeployment:
 
     def provider_ui_capabilities(self) -> dict[str, dict[str, bool]]:
         """
-        UI-relevant capability flags per launchable provider, for ``/v1/info``.
+        UI-relevant flags for creation and discovery providers, for ``/v1/info``.
 
         Only the flags the web branches on are exposed (not the full internal
         :class:`SandboxCapabilities`), so the wire contract stays small — add an
-        inner key here to surface another flag. Instantiates each launchable
+        inner key here to surface another flag. Instantiates each configured
         provider's launcher to read its declared capabilities.
 
         ponytail: builds launchers on each call; memoize on the deployment only
         if /v1/info shows up hot (provider count is tiny, __init__ does no I/O).
 
-        :returns: Capability flags for each launchable provider, in configured order.
+        :returns: Capability flags for each usable provider, in configured order.
         """
         caps: dict[str, dict[str, bool]] = {}
         for config in self.configs:
-            if config.managed_launch_supported and config.provider is not None:
-                launcher = config.launcher_factory()
+            if config.provider is not None:
+                try:
+                    launcher = config.launcher_factory()
+                except HTTPException:
+                    if config.managed_launch_supported:
+                        raise
+                    continue  # Staged providers have no usable launcher yet.
+                if (
+                    not config.managed_launch_supported
+                    and not launcher.capabilities.reusable_hosts
+                ):
+                    continue
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
                 if launcher.capabilities.reusable_hosts:
                     caps[config.provider]["reusable_hosts"] = True
+                if not config.managed_launch_supported:
+                    continue
                 from omnigent.inference_config import parse_inference_config
                 from omnigent.server.inference_catalog import ambient_gateway_providers
 
@@ -1928,7 +1941,9 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         launcher_factory=launcher_factory,
         token_ttl_s=token_ttl_s,
         managed_launch_supported=(
-            provider in PROVIDERS_WITH_MANAGED_LAUNCH or provider in community
+            launcher_factory().capabilities.managed_launch
+            if provider in community
+            else provider in PROVIDERS_WITH_MANAGED_LAUNCH
         ),
         provider=provider,
         host_config=host_config,
@@ -3901,6 +3916,8 @@ async def launch_managed_host(
     entry = _select_provider_config(config, provider)
     launcher = build_owner_launcher(entry, config, owner)
     reusable = launcher.capabilities.reusable_hosts
+    if not entry.managed_launch_supported or not launcher.capabilities.managed_launch:
+        raise HTTPException(400, "sandbox provider does not support creating new sandboxes")
     if reusable and not launcher.capabilities.resume_stopped:
         raise HTTPException(400, "reusable sandbox providers must support resume")
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)

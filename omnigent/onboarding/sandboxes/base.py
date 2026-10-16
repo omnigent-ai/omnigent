@@ -557,7 +557,6 @@ class SandboxLifecycle(ABC):
             credentials are missing and cannot be installed.
         """
 
-    @abstractmethod
     def provision(self, name: str) -> str:
         """
         Create a new sandbox and return its id.
@@ -572,8 +571,10 @@ class SandboxLifecycle(ABC):
             ``"omnigent-host"``.
         :returns: The provider-assigned (or reserved) sandbox id, e.g.
             ``"lovable-wattlebird-1530"``.
+        :raises SandboxCapabilityError: If creation is unsupported.
         :raises click.ClickException: If provisioning fails.
         """
+        raise self._capability_error("create a sandbox")
 
     def attach(self, sandbox_id: str) -> None:
         """
