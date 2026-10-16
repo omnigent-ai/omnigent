@@ -116,6 +116,28 @@ Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit
 
 `POST /v1/scheduled-tasks/{id}/run` fires a task immediately and returns 202. It does not disturb the recurring schedule, which makes it the way to test a new automation without waiting for its next occurrence.
 
+### Starting a run from an external event
+
+The run-now body is optional. With it, a background tool can start one run per external event, such as a new email, a chat message, or an alert, and every run uses the automation's agent, policies, cost cap, and host.
+
+```jsonc
+// POST /v1/scheduled-tasks/{id}/run
+{
+  "input": "From: ana@example.com\nSubject: Pricing question\n\nCould you share ...",
+  "labels": { "app.thread": "18c2f0a9" },
+  "idempotency_key": "mail:18c2f0a9:4"
+}
+// 202 Accepted
+{ "triggered": true, "id": "9f2c…", "run_id": "41ab…" }
+```
+
+- `input` (at most 100,000 characters) is sent after the stored prompt, inside `<run_input>` and `</run_input>`. The stored prompt is unchanged, so write it to describe what to do with the input, and treat the input as data in it.
+- `labels` (at most 20, keys and values up to 200 characters) are merged into the session's labels so the caller can find it. Keys in the `omnigent.` namespace are rejected with 422; server-internal and policy-owned keys such as `cost_control.*` are rejected with 400, as on session create.
+- `idempotency_key` replaces the task as the in-flight key: runs with different keys start concurrently, and a key that is still being dispatched returns 409. The key is not stored: once dispatch finishes, the same key starts a new run, so the caller keeps its own record of the events it has handled. Runs without a key keep the one-in-flight-per-task rule.
+- `run_id` is returned with every run-now call, with or without a body. It is the ID of the row the fire records in `GET /v1/scheduled-tasks/{id}/runs`, including a `failed` row, so the caller can follow the run and its `conversation_id`. The run turns `succeeded` when the session's turn ends; until then, the session shows the agent's progress and any approval it is waiting for in `pending_elicitations`.
+
+A paused automation is still runnable through this route, so an automation that should only run on events can stay paused.
+
 ## API reference
 
 | Method | Path | Purpose |
@@ -125,7 +147,7 @@ Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit
 | `GET` | `/v1/scheduled-tasks/{id}` | Read one task. |
 | `PATCH` | `/v1/scheduled-tasks/{id}` | Update fields, or pause/resume. |
 | `DELETE` | `/v1/scheduled-tasks/{id}` | Delete a task. |
-| `POST` | `/v1/scheduled-tasks/{id}/run` | Run now (202). |
+| `POST` | `/v1/scheduled-tasks/{id}/run` | Run now (202), optionally with an input, labels, and an idempotency key. |
 | `GET` | `/v1/scheduled-tasks/{id}/runs` | Run history. |
 
 A task response carries `id`, `name`, `prompt`, `rrule`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `workspace`, `host_id`, `execution_target`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.

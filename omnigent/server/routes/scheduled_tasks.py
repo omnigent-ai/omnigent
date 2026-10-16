@@ -16,10 +16,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from typing import Any
+from typing import Annotated, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Body, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
@@ -36,6 +36,11 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
+from omnigent.server.routes._sessions.helpers import (
+    _reject_reserved_cost_control_label_seed,
+    _reject_server_reserved_label_seed,
+)
+from omnigent.server.scheduled.fire import RunRequest
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
@@ -90,6 +95,40 @@ class CreateScheduledTaskRequest(BaseModel):
             self.host_id is not None or self.workspace is not None
         ):
             raise ValueError(_MANAGED_SANDBOX_WITH_HOST_MSG)
+        return self
+
+
+# One run's input is an event such as an email; 100k characters leaves room for a
+# long thread while keeping a single request bounded.
+_RUN_INPUT_MAX_CHARS = 100_000
+_RUN_LABELS_MAX = 20
+_RUN_LABEL_MAX_CHARS = 200
+
+
+class RunScheduledTaskRequest(BaseModel):
+    """Optional body for ``POST /v1/scheduled-tasks/{id}/run``: what this run works on."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Sent to the agent after the stored prompt, delimited as <run_input>.
+    input: str | None = Field(default=None, max_length=_RUN_INPUT_MAX_CHARS)
+    # Merged into the fired session's labels so the caller can find the session.
+    labels: dict[str, str] = Field(default_factory=dict, max_length=_RUN_LABELS_MAX)
+    # Replaces the task as the in-flight key: runs with different keys fire
+    # concurrently, a retried key that is still in flight is refused.
+    idempotency_key: str | None = Field(
+        default=None, min_length=1, max_length=_RUN_LABEL_MAX_CHARS
+    )
+
+    @model_validator(mode="after")
+    def _check_labels(self) -> RunScheduledTaskRequest:
+        for key, value in self.labels.items():
+            if not key or len(key) > _RUN_LABEL_MAX_CHARS or len(value) > _RUN_LABEL_MAX_CHARS:
+                raise ValueError(
+                    f"label keys and values must be 1 to {_RUN_LABEL_MAX_CHARS} characters"
+                )
+            if key.startswith("omnigent."):
+                raise ValueError(f"label {key!r} is in the reserved 'omnigent.' namespace")
         return self
 
 
@@ -522,6 +561,7 @@ def create_scheduled_tasks_router(
     async def run_scheduled_task_now(
         request: Request,
         scheduled_task_id: str,
+        body: Annotated[RunScheduledTaskRequest | None, Body()] = None,
     ) -> dict[str, Any]:
         """Trigger an immediate fire of one of the caller's scheduled tasks.
 
@@ -541,25 +581,40 @@ def create_scheduled_tasks_router(
         endpoint's ``last_run_status`` once recorded. Returns ``409`` when a fire
         for this task is already in flight, and ``503`` when the scheduler
         subsystem is not running (no trigger wired).
+
+        The optional body starts the run from an external event: ``input`` is
+        sent after the stored prompt, ``labels`` are merged into the session's
+        labels, and ``idempotency_key`` replaces the task as the in-flight key.
+        The response carries ``run_id``, the ID of the run row this fire records.
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
+        if body is not None and body.labels:
+            # Same guards as session create: no server-internal or policy-owned keys.
+            _reject_server_reserved_label_seed(body.labels)
+            _reject_reserved_cost_control_label_seed(body.labels)
+        run = RunRequest(
+            run_id=uuid.uuid4().hex,
+            input=body.input if body is not None else None,
+            labels=dict(body.labels) if body is not None else {},
+            idempotency_key=body.idempotency_key if body is not None else None,
+        )
         run_now = getattr(request.app.state, "scheduled_task_run_now", None)
         if run_now is None:
             raise OmnigentError(
                 "scheduled task scheduler is not running",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
-        started = await run_now(task.workspace_id, task.id)
+        started = await run_now(task.workspace_id, task.id, run=run)
         if not started:
             # The row exists (we just loaded it) and paused is allowed, so the
-            # only skip reason is an already-in-flight fire for this task.
+            # only skip reason is an already-in-flight fire with the same key.
             raise OmnigentError(
                 "a run for this scheduled task is already in flight",
                 code=ErrorCode.CONFLICT,
             )
-        return {"triggered": True, "id": task.id}
+        return {"triggered": True, "id": task.id, "run_id": run.run_id}
 
     @router.patch("/scheduled-tasks/{scheduled_task_id}")
     async def update_scheduled_task(
