@@ -27,7 +27,7 @@ from fastapi import FastAPI
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import inflight_text, session_stream
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server import presence
+from omnigent.server import presence, queued_messages
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER, LEVEL_READ
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -3136,19 +3136,20 @@ async def _end_stream_via_close(session_id: str, task: asyncio.Task[Any]) -> htt
     return await asyncio.wait_for(task, 2.0)
 
 
-def _sse_presence_events(body: str) -> list[dict[str, Any]]:
+def _sse_events(body: str, event_type: str) -> list[dict[str, Any]]:
     """
-    Parse ``session.presence`` frames out of a raw SSE body.
+    Parse the frames of one event type out of a raw SSE body.
 
     :param body: The buffered ``text/event-stream`` payload.
-    :returns: Decoded presence event dicts, in wire order.
+    :param event_type: The wire ``type`` to keep, e.g. ``"session.presence"``.
+    :returns: Decoded event dicts of that type, in wire order.
     """
     events: list[dict[str, Any]] = []
     for line in body.splitlines():
         if not line.startswith("data: ") or line == "data: [DONE]":
             continue
         payload = json.loads(line[len("data: ") :])
-        if payload.get("type") == "session.presence":
+        if payload.get("type") == event_type:
             events.append(payload)
     return events
 
@@ -3185,7 +3186,7 @@ async def test_stream_presence_join_broadcast_and_snapshot(
         # presence snapshot must list the connecting viewer themself.
         # An empty list here means the ``_resource_snapshot`` append is
         # missing — joiners would see nobody until the next edge.
-        snapshots = _sse_presence_events(resp.text)
+        snapshots = _sse_events(resp.text, "session.presence")
         assert snapshots, f"no session.presence frame in stream body: {resp.text[:500]}"
         assert [v["user_id"] for v in snapshots[0]["viewers"]] == ["alice@example.com"]
         assert snapshots[0]["viewers"][0]["idle"] is True
@@ -3260,7 +3261,7 @@ async def test_stream_local_single_user_not_tracked(
         # The stream's own snapshot-on-connect ran AFTER any (buggy)
         # registration would have happened, so a "local" viewer in it
         # proves the attribution filter was dropped from the route.
-        snapshots = _sse_presence_events(resp.text)
+        snapshots = _sse_events(resp.text, "session.presence")
         assert snapshots, f"no session.presence frame in stream body: {resp.text[:500]}"
         assert snapshots[0]["viewers"] == []
         # Top-level session: the presence scope (root) is the session itself.
@@ -3496,3 +3497,131 @@ async def test_shared_parent_readiness_remains_private(
         )
     assert response.status_code == 201, response.text
     assert "harness_not_configured" not in response.text
+
+
+# ── SSE stream queue shares (follow-ups queued in other windows) ──────
+# Same buffered-transport technique as the presence tests above. The
+# ``X-Omnigent-Client-Id`` header ties a client's queue share to its stream.
+
+
+async def test_stream_snapshot_carries_other_windows_queue(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """A window joining the session sees follow-ups another window already holds."""
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    alice = {"X-Forwarded-Email": "alice@example.com"}
+
+    put = await auth_client.put(
+        f"/v1/sessions/{session_id}/queue",
+        headers=alice,
+        json={"client_id": "c_desktop", "messages": [{"queue_id": "q_1", "text": "held"}]},
+    )
+    assert put.status_code == 204, put.text
+
+    collector = await start_session_stream_collector(session_id)
+    task = asyncio.create_task(
+        auth_client.get(
+            f"/v1/sessions/{session_id}/stream",
+            headers={**alice, "X-Omnigent-Client-Id": "c_browser"},
+        )
+    )
+    try:
+        # The presence join proves the generator is running before we close.
+        join = await collector.next_event()
+        assert join["type"] == "session.presence"
+        resp = await _end_stream_via_close(session_id, task)
+        assert resp.status_code == 200
+        # The features header is a comma-separated token list; check membership.
+        features = [f.strip() for f in resp.headers["x-omnigent-stream-features"].split(",")]
+        assert "queue" in features
+        snapshots = _sse_events(resp.text, "session.queue")
+        assert snapshots, f"no session.queue frame in stream body: {resp.text[:500]}"
+        assert [(m["client_id"], m["text"]) for m in snapshots[0]["messages"]] == [
+            ("c_desktop", "held")
+        ]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await collector.stop()
+
+
+async def test_stream_keeps_queue_share_open_and_expires_it_on_disconnect(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stream's client id pins its share; dropping the stream drives the
+    generator's ``finally`` → detach → grace → empty-queue broadcast."""
+    monkeypatch.setattr(queued_messages, "_DETACH_GRACE_S", 0.05)
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    headers = {"X-Forwarded-Email": "alice@example.com", "X-Omnigent-Client-Id": "c_desktop"}
+
+    collector = await start_session_stream_collector(session_id)
+    task = asyncio.create_task(
+        auth_client.get(f"/v1/sessions/{session_id}/stream", headers=headers)
+    )
+    try:
+        join = await collector.next_event()
+        assert join["type"] == "session.presence"
+        put = await auth_client.put(
+            f"/v1/sessions/{session_id}/queue",
+            headers=headers,
+            json={"client_id": "c_desktop", "messages": [{"queue_id": "q_1", "text": "held"}]},
+        )
+        assert put.status_code == 204, put.text
+        shared = await collector.next_event()
+        assert shared["type"] == "session.queue"
+        assert [(m["client_id"], m["text"]) for m in shared["messages"]] == [("c_desktop", "held")]
+        # Attached to the open stream, the share outlives the (shrunken) grace:
+        # an expiry here means the route never passed the header to attach().
+        await collector.assert_no_event(within=0.3)
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        expired = await collector.next_event()
+        assert expired["type"] == "session.queue"
+        assert expired["messages"] == []
+        assert queued_messages.snapshot(session_id)["messages"] == []
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await collector.stop()
+
+
+async def test_put_queue_requires_edit_access(auth_client: httpx.AsyncClient) -> None:
+    """A reader cannot publish a queue share (403); an editor can (204); strangers see 404."""
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    bob = {"X-Forwarded-Email": "bob@example.com"}
+    body = {"client_id": "c_bob", "messages": [{"queue_id": "q_1", "text": "held"}]}
+
+    resp = await auth_client.put(f"/v1/sessions/{session_id}/queue", headers=bob, json=body)
+    assert resp.status_code == 404, resp.text
+
+    grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="alice@example.com",
+        target_user="bob@example.com",
+        level=LEVEL_READ,
+    )
+    assert grant.status_code == 200, grant.text
+    resp = await auth_client.put(f"/v1/sessions/{session_id}/queue", headers=bob, json=body)
+    assert resp.status_code == 403, resp.text
+    assert queued_messages.snapshot(session_id)["messages"] == []
+
+    grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="alice@example.com",
+        target_user="bob@example.com",
+        level=LEVEL_EDIT,
+    )
+    assert grant.status_code == 200, grant.text
+    resp = await auth_client.put(f"/v1/sessions/{session_id}/queue", headers=bob, json=body)
+    assert resp.status_code == 204, resp.text
+    assert [
+        (m["created_by"], m["text"]) for m in queued_messages.snapshot(session_id)["messages"]
+    ] == [("bob@example.com", "held")]

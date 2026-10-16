@@ -37,7 +37,7 @@ from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import init as init_runtime
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server import _elicitation_registry, presence
+from omnigent.server import _elicitation_registry, presence, queued_messages
 from omnigent.server.app import create_app
 from omnigent.server.routes import sessions as sessions_routes
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -429,6 +429,8 @@ def _reset_elicitation_state() -> Iterator[None]:
     # Presence is likewise module-global (keyed by conversation/user)
     # with pending leave-grace timers that would fire into later tests.
     presence.reset_for_tests()
+    # Same shape: client-published queue shares with pending expiry timers.
+    queued_messages.reset_for_tests()
 
 
 # Originals of the sessions-module globals that many tests monkeypatch.

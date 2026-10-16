@@ -17,6 +17,7 @@ import {
   ClockIcon,
   GripVerticalIcon,
   ImageIcon,
+  MonitorSmartphoneIcon,
   PaperclipIcon,
   PencilIcon,
   XIcon,
@@ -35,8 +36,31 @@ const ACTION_BUTTON_CLASS =
 
 const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
 
+const IMAGE_FILENAME = /\.(png|jpe?g|gif|webp|bmp|svg|heic|heif|avif)$/i;
+
 export const queuedMessageCollisionDetection: CollisionDetection = (args) =>
   args.pointerCoordinates ? pointerWithin(args) : closestCenter(args);
+
+/**
+ * Where dragging `activeId` onto `overId` lands: the own row it should sit
+ * before (`null` = end), or `undefined` when nothing moves. Down lands after
+ * the target, up before it. A row another window holds is never a target:
+ * its slot cannot be taken, so dropping onto it moves nothing.
+ */
+export function queuedReorderTarget(
+  messages: QueuedMessage[],
+  activeId: string,
+  overId: string,
+): string | null | undefined {
+  if (activeId === overId) return undefined;
+  const from = messages.findIndex((m) => m.queueId === activeId);
+  const to = messages.findIndex((m) => m.queueId === overId);
+  if (from === -1 || to === -1 || messages[to]!.remote !== undefined) return undefined;
+  const landing = from < to ? to + 1 : to;
+  const before = messages.slice(landing).find((m) => m.remote === undefined);
+  const beforeQueueId = before?.queueId ?? null;
+  return beforeQueueId === activeId ? undefined : beforeQueueId;
+}
 
 interface QueuedMessagesStripProps {
   /** Messages waiting to be flushed, in FIFO order (head first). */
@@ -64,7 +88,10 @@ interface QueuedMessagesStripProps {
   widthClassName?: string;
 }
 
-/** A single queued-message row, draggable by its grip when reordering is on. */
+/**
+ * A single queued-message row, draggable by its grip when reordering is on.
+ * A row another window holds (`message.remote`) is read-only and not draggable.
+ */
 function QueuedRow({
   message,
   onDelete,
@@ -85,19 +112,28 @@ function QueuedRow({
     isDragging,
   } = useDraggable({
     id: message.queueId,
-    disabled: !reorderable,
+    disabled: !reorderable || message.remote !== undefined,
   });
-  // The whole row is the drop target so dropping anywhere on it reorders.
+  // The whole row is the drop target so dropping anywhere on it reorders; a
+  // row another window holds is not one (see `queuedReorderTarget`).
   const { setNodeRef: setDropRef, isOver } = useDroppable({
     id: message.queueId,
-    disabled: !reorderable,
+    disabled: !reorderable || message.remote !== undefined,
   });
+  const remote = message.remote;
   const hasText = message.text.trim().length > 0;
   const files = message.files ?? [];
-  const attachmentNames = files.map(attachmentFilename);
-  const AttachmentIcon = files.every((file) => file.type.startsWith("image/"))
-    ? ImageIcon
-    : PaperclipIcon;
+  const attachmentNames = remote ? remote.attachments : files.map(attachmentFilename);
+  const allImages = remote
+    ? remote.attachments.every((name) => IMAGE_FILENAME.test(name))
+    : files.every((file) => file.type.startsWith("image/"));
+  const AttachmentIcon = allImages ? ImageIcon : PaperclipIcon;
+  let remoteLabel: string | null = null;
+  if (remote !== undefined) {
+    remoteLabel = remote.createdBy
+      ? `Queued by ${remote.createdBy} in another window`
+      : "Queued in another window";
+  }
 
   return (
     <div
@@ -111,7 +147,15 @@ function QueuedRow({
           "after:absolute after:inset-x-0 after:-bottom-0.5 after:h-px after:bg-muted-foreground/50",
       )}
     >
-      {reorderable ? (
+      {remoteLabel !== null ? (
+        <span className="mx-1 flex shrink-0 items-center" title={remoteLabel}>
+          <MonitorSmartphoneIcon
+            className={cn(ACTION_ICON_CLASS, "text-muted-foreground")}
+            aria-hidden="true"
+          />
+          <span className="sr-only">{remoteLabel}</span>
+        </span>
+      ) : reorderable ? (
         <Button
           ref={setDragRef}
           type="button"
@@ -169,50 +213,52 @@ function QueuedRow({
         <span className="shrink-0 text-xs text-destructive">Send failed</span>
       )}
       {/* Always visible (not hover-gated) so the actions are discoverable;
-          they brighten on hover/focus. */}
-      <span className="flex shrink-0 items-center gap-0">
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          aria-label="Edit queued message"
-          className={ACTION_BUTTON_CLASS}
-          onClick={() => onEdit(message.queueId)}
-        >
-          <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
-        </Button>
-        {onSteer ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                aria-label={
-                  message.requiresRetry ? "Retry queued message" : "Send queued message now"
-                }
-                className={ACTION_BUTTON_CLASS}
-                onClick={() => onSteer(message.queueId)}
-              >
-                <ArrowUpIcon className="size-4 max-md:size-4" aria-hidden="true" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="top">
-              {message.requiresRetry ? "Retry" : "Send now"}
-            </TooltipContent>
-          </Tooltip>
-        ) : null}
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          aria-label="Remove queued message"
-          className={ACTION_BUTTON_CLASS}
-          onClick={() => onDelete(message.queueId)}
-        >
-          <XIcon className="size-4 max-md:size-4" aria-hidden="true" />
-        </Button>
-      </span>
+          they brighten on hover/focus. Only this window's own rows act. */}
+      {remote !== undefined ? null : (
+        <span className="flex shrink-0 items-center gap-0">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Edit queued message"
+            className={ACTION_BUTTON_CLASS}
+            onClick={() => onEdit(message.queueId)}
+          >
+            <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
+          </Button>
+          {onSteer ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={
+                    message.requiresRetry ? "Retry queued message" : "Send queued message now"
+                  }
+                  className={ACTION_BUTTON_CLASS}
+                  onClick={() => onSteer(message.queueId)}
+                >
+                  <ArrowUpIcon className="size-4 max-md:size-4" aria-hidden="true" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="top">
+                {message.requiresRetry ? "Retry" : "Send now"}
+              </TooltipContent>
+            </Tooltip>
+          ) : null}
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Remove queued message"
+            className={ACTION_BUTTON_CLASS}
+            onClick={() => onDelete(message.queueId)}
+          >
+            <XIcon className="size-4 max-md:size-4" aria-hidden="true" />
+          </Button>
+        </span>
+      )}
     </div>
   );
 }
@@ -248,14 +294,9 @@ export function QueuedMessagesStrip({
 
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
-    if (onReorder === undefined || over === null || active.id === over.id) return;
-    const from = messages.findIndex((m) => m.queueId === active.id);
-    const to = messages.findIndex((m) => m.queueId === over.id);
-    if (from === -1 || to === -1) return;
-    // Dragging down past the target lands after it (before the next row, or the
-    // end); dragging up lands before it. Mirrors dnd-kit sortable's semantics
-    // and lets a drag reach the very end of the list.
-    const beforeQueueId = from < to ? (messages[to + 1]?.queueId ?? null) : messages[to]!.queueId;
+    if (onReorder === undefined || over === null) return;
+    const beforeQueueId = queuedReorderTarget(messages, String(active.id), String(over.id));
+    if (beforeQueueId === undefined) return;
     onReorder(String(active.id), beforeQueueId);
   };
 

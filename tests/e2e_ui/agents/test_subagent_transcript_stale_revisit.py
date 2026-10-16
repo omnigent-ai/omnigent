@@ -43,7 +43,6 @@ import contextlib
 import json
 import re
 import subprocess
-import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -58,6 +57,8 @@ from tests.e2e_ui.conftest import (
     _server_state,
     configure_mock_llm,
     open_right_rail,
+    release_mock_gate,
+    wait_for_mock_gate,
 )
 
 _AGENT_NAME = "stale_transcript_dispatcher"
@@ -259,32 +260,6 @@ def _send(page: Page, text: str) -> None:
     page.get_by_role("button", name="Send", exact=True).click()
 
 
-def _wait_for_gate_pending(mock_url: str, timeout_s: float = 120.0) -> None:
-    """Poll the mock LLM until a request is blocked on the gate.
-
-    :param mock_url: Mock LLM server base URL.
-    :param timeout_s: Max seconds to wait for the child's gated call.
-    :raises AssertionError: If no request blocks within the budget.
-    """
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        resp = httpx.get(f"{mock_url}/gate/pending", timeout=5.0, trust_env=False)
-        if resp.json()["pending"]:
-            return
-        time.sleep(0.5)
-    raise AssertionError("worker's gated LLM call never became pending")
-
-
-def _release_gate(mock_url: str) -> None:
-    """Release the oldest pending mock-LLM gate (the worker's reply).
-
-    :param mock_url: Mock LLM server base URL.
-    """
-    resp = httpx.post(f"{mock_url}/gate/release", timeout=5.0, trust_env=False)
-    resp.raise_for_status()
-    assert resp.json()["released"], "gate release found nothing pending"
-
-
 def _open_agents_rail(page: Page):
     """Expand the Workspace rail and select its Agents tab.
 
@@ -333,7 +308,7 @@ def test_subagent_transcript_visible_after_completion_without_refresh(
 
     # The worker's LLM call is held on the mock gate, so the child is
     # provably mid-turn while the user visits it.
-    _wait_for_gate_pending(chat.mock_url)
+    wait_for_mock_gate(chat.mock_url, timeout_s=120.0)
 
     # Inject the reported trigger: the child's live SSE tail silently
     # delivers nothing. On the sharded deployment this is the unkeyed /
@@ -358,7 +333,7 @@ def test_subagent_transcript_visible_after_completion_without_refresh(
     # Return to the parent and let the worker finish.
     back_link.click()
     page.wait_for_url(re.compile(re.escape(f"/c/{chat.session_id}")))
-    _release_gate(chat.mock_url)
+    assert release_mock_gate(chat.mock_url), "gate release found nothing pending"
 
     # The worker's reply (identified by the nonce) reaches the parent via the
     # real dispatch -> child turn -> inbox -> auto-wake pipeline. This is the

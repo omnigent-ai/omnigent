@@ -54,7 +54,9 @@ and steers messages while the agent is busy.
   in the session view (not on mobile).
 - `new-session-hotkey`: ⌘/Ctrl+Alt+N opens and focuses the new-session composer.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
-  can be steered into the running turn.
+  can be steered into the running turn. The queue belongs to the session: a
+  second window or the desktop app on the same session lists the same
+  follow-ups in the same order, and they drain one per turn across windows.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
   and always-steer preference, keeping their element screenshots.
 - `pi-compact`: `/compact` follows the normal queue/Always steer preference.
@@ -296,7 +298,8 @@ Other connection providers alone do not enable the managed MCP picker.
   Ctrl+Shift+M does nothing.
 - **`queue-and-steer`:**
   `tests/e2e_ui/chat/test_queue_steer.py::test_steer_sends_queued_message_while_busy`,
-  `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`
+  `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`,
+  `tests/e2e_ui/collaboration/test_queued_messages_sync_across_clients.py::test_queued_followups_are_shared_across_clients`
 - **`browser-pointer-queue`, desktop:** manually hold an agent turn open, then
   send a normal composer follow-up and two pointer instructions (Send and Enter).
   With Always steer off, all three stay queued and the popup says "Queued for

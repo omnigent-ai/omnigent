@@ -41,8 +41,27 @@ message is only sent to the server when it's flushed or steered.
   signal for SDK and native.
 - **Auto-flush head on idle (FIFO):** when the agent goes idle, send the head of
   the queue as the next turn. Type-ahead "just works" without any click.
-- Persist the queue in `localStorage` (keyed by session) so it survives a hard
-  refresh. (Trade-off: no cross-device sync — acceptable for unsent drafts.)
+- The queue is in-memory per client (a hard refresh clears it), but it is
+  **shared across clients of the same session**: each client publishes the
+  entries it holds (`PUT /v1/sessions/{id}/queue`), the server merges every
+  client's share into one FIFO list and broadcasts it as `session.queue`, and
+  each strip lists the whole session queue in that order. Entries another
+  client holds are read-only there (their payload — attachments included —
+  lives only in the client that queued them) and a client flushes its own head
+  only when it is the session-wide head, so two windows drain one message per
+  turn in the order both display. A client's share lives as long as its SSE
+  stream (plus a short grace), so a closed window cannot strand the others.
+  From the first connection attempt, and again from the moment a stream drops,
+  until the next `session.queue` snapshot has arrived (the stream announces one
+  with `X-Omnigent-Stream-Features: queue`) the client treats the queue as
+  unknown: an idle send queues rather than overtake a follow-up it has not seen
+  yet, and the flush waits for the snapshot (with a bounded fallback). An older server's stream carries no announcement, so sends there
+  behave as before. A window queues at most 50 follow-ups per session (the
+  server's share bound): the composer refuses the next one and keeps its text,
+  so every queued message has its own ordering slot and none is hidden from
+  other windows. A share update that fails for a transient reason is retried
+  with backoff, and a `session.queue` list that disagrees with the published
+  share in membership, order or content is republished.
 
 ### Per-message actions
 
