@@ -735,6 +735,12 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
             what="a follow-up turn to complete on the same session and runner on replica B",
         )
 
+        # Text can be durable before the terminal event publishes the final status.
+        _poll_until(
+            lambda: _session_snapshot(replica_b.client, session_id).get("status") == "idle",
+            timeout=60.0,
+            what="replica B to publish the follow-up turn's final status",
+        )
         snapshot_a = _session_snapshot(stack.client, session_id)
         assert snapshot_a.get("status") != "running", (
             f"Replica A still reports the completed session as running; "

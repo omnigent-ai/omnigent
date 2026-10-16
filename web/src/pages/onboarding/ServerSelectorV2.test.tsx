@@ -118,7 +118,9 @@ describe("ServerSelectorV2", () => {
       />,
     );
     fireEvent.pointerDown(screen.getByRole("button", { name: /choose team url/i }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "old.example.com" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "https://old.example.com/" }));
+    expect(onConnect).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Join your team (old.example.com)" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("rejected");
     unmount();
 
@@ -276,6 +278,7 @@ describe("ServerSelectorV2", () => {
       target: { value: "https://typed.example.com" },
     });
     fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Join your team (typed.example.com)" }));
     expect(
       await screen.findByRole("heading", { name: /where do you work today/i }),
     ).toBeInTheDocument();
@@ -327,6 +330,7 @@ describe("ServerSelectorV2", () => {
       target: { value: "https://typed.example.com" },
     });
     fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Join your team (typed.example.com)" }));
     const laptop = await screen.findByRole("radio", { name: /my laptop/i });
     resolveFirst({ remote: true });
     await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledTimes(2));
@@ -599,7 +603,7 @@ describe("ServerSelectorV2", () => {
     expect(open).toHaveAttribute("aria-busy", "true");
   });
 
-  it("a second join from the MDM dropdown can't start or hide the first's progress", async () => {
+  it("a second join from the MDM landing can't start or hide the first's progress", async () => {
     const { onConnect, finish } = pendingSignIn();
     render(
       <ServerSelectorV2
@@ -615,11 +619,15 @@ describe("ServerSelectorV2", () => {
     openPresetDropdown();
     const input = await screen.findByRole("textbox", { name: "Server URL" });
     fireEvent.change(input, { target: { value: "https://other.example.com" } });
-    // Both Enters land before the dropdown's close renders.
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onConnect).not.toHaveBeenCalled();
+    const join = screen.getByRole("button", { name: "Join your team (other.example.com)" });
     act(() => {
-      fireEvent.keyDown(input, { key: "Enter" });
-      fireEvent.keyDown(input, { key: "Enter" });
+      fireEvent.click(join);
+      fireEvent.click(join);
     });
+    expect(join).toBeDisabled();
+    expect(screen.getByRole("button", { name: /choose team url/i })).toBeDisabled();
     expect(onConnect).toHaveBeenCalledTimes(1);
     await waitFor(() =>
       expect(screen.queryByRole("textbox", { name: "Server URL" })).not.toBeInTheDocument(),
@@ -818,5 +826,106 @@ describe("ServerSelectorV2", () => {
       "aria-checked",
       "true",
     );
+  });
+});
+
+describe("onboarding parity", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([
+    [{}, "Server ready"],
+    [{ error: "Server unavailable" }, "Server unavailable"],
+    [{ cancelled: true }, "Connection cancelled."],
+  ])(
+    "opens a selected local server without retrying failed installation (%j)",
+    async (result, message) => {
+      const setup = makeSetup({
+        installed: false,
+        recentServers: ["http://localhost:6767/"],
+        onInstallCli: vi.fn().mockResolvedValue({ ok: false, error: "Installer failed" }),
+        onConnect: vi.fn().mockResolvedValue(result),
+      });
+      render(<ServerSelectorV2 setup={setup} />);
+      fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Continue anyway" }));
+      await screen.findByText(message);
+      expect(setup.onConnect).toHaveBeenCalledWith("http://localhost:6767/", expect.any(Function));
+      expect(setup.onInstallCli).toHaveBeenCalledOnce();
+      expect(setup.onStartLocal).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not offer Continue anyway when new local setup has no server destination", async () => {
+    const setup = makeSetup({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: false, error: "Installer failed" }),
+    });
+    render(<ServerSelectorV2 setup={setup} />);
+    fireEvent.click(screen.getByRole("button", { name: /get started locally/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await screen.findByText("Installer failed");
+    expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
+  });
+
+  it("requires confirmation for remote HTTP and honours cancellation", async () => {
+    const confirm = vi
+      .spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    const setup = makeSetup({ recentServers: ["http://team.example.com/"] });
+    render(<ServerSelectorV2 setup={setup} />);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" })));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("unencrypted HTTP"));
+    expect(setup.onConnect).not.toHaveBeenCalled();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" })));
+    expect(setup.onConnect).toHaveBeenCalledWith("http://team.example.com/", expect.any(Function));
+  });
+
+  it("asks before enrolling a runner on remote HTTP", async () => {
+    const confirm = vi
+      .spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    const setup = makeSetup({
+      installed: true,
+      managedServers: ["http://team.example.com/"],
+      onConnectRunner: vi.fn().mockResolvedValue({ ok: true }),
+    });
+    render(<ServerSelectorV2 setup={setup} />);
+    fireEvent.click(screen.getByRole("button", { name: /join your team/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "Open Omnigent" }));
+    await screen.findByText("Connection cancelled.");
+    expect(setup.onConnectRunner).not.toHaveBeenCalled();
+    expect(setup.onConnect).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(setup.onConnect).toHaveBeenCalledOnce());
+    expect(setup.onConnectRunner).toHaveBeenCalledOnce();
+    expect(confirm).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["https://team.example.com/", "http://localhost:8000/", "http://[::1]:8000/"])(
+    "does not warn for %s",
+    async (url) => {
+      const confirm = vi.spyOn(window, "confirm");
+      const setup = makeSetup({ installed: true, recentServers: [url] });
+      render(<ServerSelectorV2 setup={setup} />);
+      fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+      await waitFor(() => expect(setup.onConnect).toHaveBeenCalledOnce());
+      expect(confirm).not.toHaveBeenCalled();
+    },
+  );
+
+  it("can open an existing local server from manual installation instructions", async () => {
+    const setup = makeSetup({
+      installed: false,
+      installSupported: false,
+      recentServers: ["http://localhost:6767/"],
+    });
+    render(<ServerSelectorV2 setup={setup} />);
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    expect(screen.getByRole("link", { name: "Installation instructions" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
+    await waitFor(() => expect(setup.onConnect).toHaveBeenCalledOnce());
+    expect(setup.onStartLocal).not.toHaveBeenCalled();
   });
 });

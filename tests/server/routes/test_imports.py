@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.imports import (
     LocalImportRequest,
@@ -23,6 +24,7 @@ from omnigent.server.routes.imports import (
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 
 def _seed_claude_agent(db_uri: str) -> str:
@@ -34,6 +36,65 @@ def _seed_claude_agent(db_uri: str) -> str:
         bundle_location="builtin://claude-native-ui",
     )
     return agent_id
+
+
+@pytest.mark.parametrize(
+    "owner,caller,expected_status",
+    [
+        ("alice@example.com", "alice@example.com", 201),
+        ("alice@example.com", "bob@example.com", 403),
+        (None, "alice@example.com", 404),
+    ],
+)
+async def test_import_checks_host_ownership_before_persisting(
+    db_uri: str, owner: str | None, caller: str, expected_status: int
+) -> None:
+    _seed_claude_agent(db_uri)
+    host_id = "0123456789abcdef0123456789abcdef"
+    host_store = HostStore(db_uri)
+    if owner is not None:
+        host_store.upsert_on_connect(host_id, "laptop", owner)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    app = FastAPI()
+    app.include_router(
+        create_imports_router(
+            conversation_store,
+            SqlAlchemyAgentStore(db_uri),
+            host_store=host_store,
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        ),
+        prefix="/v1",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as import_client:
+        response = await import_client.post(
+            "/v1/imports",
+            headers={"X-Forwarded-Email": caller},
+            json={
+                "source": "claude",
+                "external_session_id": "owned-host-import",
+                "workspace": "/workspace",
+                "host_id": host_id,
+                "items": [
+                    {
+                        "type": "message",
+                        "response_id": "claude:turn-1",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Hello"}],
+                        },
+                    }
+                ],
+            },
+        )
+    assert response.status_code == expected_status, response.text
+    conversation = conversation_store.find_conversation_by_external_session_id("owned-host-import")
+    if expected_status == 201:
+        assert conversation is not None
+        assert conversation.host_id == host_id
+    else:
+        assert conversation is None
 
 
 async def test_import_session_creates_normal_session_and_blocks_duplicate(
@@ -315,6 +376,68 @@ async def test_force_import_replaces_existing_session(
     items = await client.get(f"/v1/sessions/{conversation.id}/items")
     assert items.status_code == 200
     assert [item["content"][0]["text"] for item in items.json()["data"]] == ["new prompt"]
+
+
+@pytest.mark.parametrize("host_owner,expected_status", [(None, 404), ("bob@example.com", 403)])
+async def test_rejected_force_import_preserves_existing_session(
+    db_uri: str, host_owner: str | None, expected_status: int
+) -> None:
+    _seed_claude_agent(db_uri)
+    caller = "alice@example.com"
+    host_id = "0123456789abcdef0123456789abcdef"
+    host_store = HostStore(db_uri)
+    if host_owner is not None:
+        host_store.upsert_on_connect(host_id, "laptop", host_owner)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    permission_store = SqlAlchemyPermissionStore(db_uri)
+    app = FastAPI()
+    app.include_router(
+        create_imports_router(
+            conversation_store,
+            SqlAlchemyAgentStore(db_uri),
+            host_store=host_store,
+            permission_store=permission_store,
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        ),
+        prefix="/v1",
+    )
+    payload = {
+        "source": "claude",
+        "external_session_id": "claude-force-rejected",
+        "workspace": "/repo/old",
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:old",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "original prompt"}],
+                },
+            }
+        ],
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"X-Forwarded-Email": caller},
+    ) as import_client:
+        created = await import_client.post("/v1/imports", json=payload)
+        assert created.status_code == 201, created.text
+        session_id = created.json()["session_id"]
+        original = conversation_store.get_conversation(session_id)
+        original_items = conversation_store.list_items(session_id).data
+        assert original is not None
+        assert len(original_items) == 1
+
+        rejected = await import_client.post(
+            "/v1/imports",
+            json={**payload, "force": True, "host_id": host_id, "workspace": "/repo/new"},
+        )
+
+    assert rejected.status_code == expected_status, rejected.text
+    assert conversation_store.get_conversation(session_id) == original
+    assert conversation_store.list_items(session_id).data == original_items
+    assert permission_store.get_permission_level(caller, session_id) == LEVEL_OWNER
 
 
 async def test_import_session_rejects_empty_history(client: httpx.AsyncClient) -> None:
@@ -980,8 +1103,8 @@ async def test_import_local_live_host_off_replica_is_wrong_replica(
     signal the client re-addresses on — the import failed permanently.
 
     Only a sharded (multi-replica) deployment has an "other replica" to
-    re-address to, so force the sharded signal on — the test host stack has no
-    lakebox module, which auto-detects as single-replica.
+    re-address to, so force the sharded signal on — the test host stack is
+    single-replica by default.
     """
     from omnigent.server.routes import _host_launch
 

@@ -21,6 +21,20 @@ except ImportError:
 # deliberately replaces ambient state; subprocesses inherit the safe override.
 _TEST_OMNIGENT_DATA_DIR = Path(tempfile.mkdtemp(prefix="omnigent-pytest-")).resolve()
 os.environ["OMNIGENT_DATA_DIR"] = str(_TEST_OMNIGENT_DATA_DIR)
+# Servers and runners booted by tests otherwise sweep the developer's live
+# harness root. Prefer /tmp for the AF_UNIX path-length limit; some sandboxes
+# only allow the default temp dir.
+try:
+    _TEST_HARNESS_TMP_PARENT = Path(tempfile.mkdtemp(prefix="omni-h-", dir="/tmp"))
+except OSError:
+    _TEST_HARNESS_TMP_PARENT = Path(tempfile.mkdtemp(prefix="omni-h-"))
+os.environ["OMNIGENT_HARNESS_TMP_PARENT"] = str(_TEST_HARNESS_TMP_PARENT)
+
+# Tests and their subprocesses must not ship logs through the caller's sink.
+# Sink tests configure their own credentials or sender explicitly.
+for _test_env_name in tuple(os.environ):
+    if _test_env_name.startswith("OMNIGENT_DEBUG_LOG_"):
+        os.environ.pop(_test_env_name)
 
 # Skip the synchronous api.litellm.ai/model_catalog HTTP fallback during
 # tests. Hardened CI runners can't reach the public internet, so every
@@ -144,6 +158,7 @@ def pytest_unconfigure(config: pytest.Config) -> None:
     for cmdline in survivors:
         print(f"\nUNREAPED omnigent process survived SIGKILL: {cmdline}", file=sys.stderr)
     shutil.rmtree(_TEST_OMNIGENT_DATA_DIR, ignore_errors=True)
+    shutil.rmtree(_TEST_HARNESS_TMP_PARENT, ignore_errors=True)
 
 
 # Per-worker progress logger: fsync'd START/END lines so a

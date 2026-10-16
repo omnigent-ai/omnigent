@@ -17,7 +17,8 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     read_transcript_items_from_offset,
 )
-from omnigent.harnesses.codex_native.main import _CODEX_THREAD_ID_RE, _find_codex_rollout
+from omnigent.harnesses.codex_native.bridge import bridge_root
+from omnigent.harnesses.codex_native.main import _CODEX_THREAD_ID_RE
 from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
 from omnigent.harnesses.kimi_native.forwarder import (
     read_kimi_wire_items,
@@ -245,6 +246,78 @@ def _codex_source_is_interactive(source: object) -> bool:
     return isinstance(source, str) and source.lower() in _CODEX_INTERACTIVE_SOURCES
 
 
+def _unique_paths(paths: Sequence[Path]) -> tuple[Path, ...]:
+    """Keep the first occurrence of each configured storage path."""
+    unique: list[Path] = []
+    for path in paths:
+        if path not in unique:
+            unique.append(path)
+    return tuple(unique)
+
+
+def _codex_native_storage_homes() -> tuple[Path, ...]:
+    """Return private Codex homes under the producer's bridge root."""
+    root = bridge_root()
+    try:
+        bridge_dirs = tuple(root.iterdir())
+    except OSError:
+        return ()
+    homes: list[Path] = []
+    for bridge_dir in bridge_dirs:
+        try:
+            if not bridge_dir.is_dir() or bridge_dir.is_symlink():
+                continue
+            codex_home = bridge_dir / "codex-home"
+            if codex_home.is_dir() and not codex_home.is_symlink():
+                homes.append(codex_home)
+        except OSError:
+            continue
+    return tuple(homes)
+
+
+def _codex_storage_homes(codex_home: Path | None = None) -> tuple[Path, ...]:
+    """Return configured, normal, and native private Codex homes."""
+    if codex_home is not None:
+        return (codex_home,)
+    configured = os.environ.get("CODEX_HOME")
+    normal = Path.home() / ".codex"
+    configured_home = Path(configured).expanduser() if configured else normal
+    return _unique_paths((configured_home, normal, *_codex_native_storage_homes()))
+
+
+def _codex_rollout_paths(home: Path) -> list[Path]:
+    """Return active and archived Codex rollout files in one home."""
+    rollouts: list[Path] = []
+    sessions = home / "sessions"
+    archived_sessions = home / "archived_sessions"
+    if sessions.is_dir():
+        rollouts.extend(path for path in sessions.glob("**/rollout-*.jsonl") if path.is_file())
+    if archived_sessions.is_dir():
+        rollouts.extend(
+            path for path in archived_sessions.glob("rollout-*.jsonl") if path.is_file()
+        )
+    return rollouts
+
+
+def _codex_rollout_session_id(path: Path) -> str | None:
+    """Return the safe thread id encoded at the end of a rollout filename."""
+    session_id = path.stem[-36:]
+    return session_id if _CODEX_THREAD_ID_RE.fullmatch(session_id) else None
+
+
+def _codex_rollout_candidates(
+    homes: Sequence[Path],
+) -> list[tuple[Path, Path, str]]:
+    """Return ``(rollout, home, thread_id)`` candidates across Codex homes."""
+    candidates: list[tuple[Path, Path, str]] = []
+    for home in homes:
+        for path in _codex_rollout_paths(home):
+            session_id = _codex_rollout_session_id(path)
+            if session_id is not None:
+                candidates.append((path, home, session_id))
+    return candidates
+
+
 def _recent_local_sessions_with_recency(
     source: ImportSource,
     *,
@@ -333,22 +406,8 @@ def _recent_local_sessions_with_recency(
         return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "codex":
-        configured_home = os.environ.get("CODEX_HOME")
-        home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
-        rollouts: list[Path] = []
-        sessions = home / "sessions"
-        archived_sessions = home / "archived_sessions"
-        if sessions.is_dir():
-            rollouts.extend(path for path in sessions.glob("**/rollout-*.jsonl") if path.is_file())
-        if archived_sessions.is_dir():
-            rollouts.extend(
-                path for path in archived_sessions.glob("rollout-*.jsonl") if path.is_file()
-            )
         candidates = []
-        for path in rollouts:
-            session_id = path.stem[-36:]
-            if not _CODEX_THREAD_ID_RE.fullmatch(session_id):
-                continue
+        for path, _, session_id in _codex_rollout_candidates(_codex_storage_homes()):
             # Read the rollout's source (one line) and skip non-interactive
             # runs (exec / mcp / sub-agent / internal) that Codex itself hides.
             if not _codex_source_is_interactive(_codex_rollout_source(path)):
@@ -616,6 +675,9 @@ def _codex_response_item(
                 "arguments": arguments,
                 "call_id": call_id,
             }
+            namespace = payload.get("namespace")
+            if isinstance(namespace, str) and namespace:
+                data["namespace"] = namespace
             normalized_type = "function_call"
     elif item_type in {"function_call_output", "custom_tool_call_output"}:
         call_id = payload.get("call_id")
@@ -632,18 +694,23 @@ def _codex_response_item(
     )
 
 
-def _find_archived_codex_rollout(codex_home: Path, session_id: str) -> Path | None:
-    """Return the newest archived Codex rollout matching a session id."""
-    archived_sessions = codex_home / "archived_sessions"
-    if not archived_sessions.is_dir():
-        return None
-    suffix = f"-{session_id}.jsonl"
-    matches = [
-        path
-        for path in archived_sessions.glob("rollout-*.jsonl")
-        if path.name.endswith(suffix) and path.is_file()
-    ]
-    return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
+def _find_codex_rollout_in_homes(
+    homes: Sequence[Path], session_id: str
+) -> tuple[Path, Path] | None:
+    """Return the newest matching Codex rollout and its containing home."""
+    selected: tuple[Path, Path] | None = None
+    selected_mtime = 0.0
+    for path, home, candidate_id in _codex_rollout_candidates(homes):
+        if candidate_id != session_id:
+            continue
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            continue
+        if selected is None or modified_at > selected_mtime:
+            selected = (path, home)
+            selected_mtime = modified_at
+    return selected
 
 
 def _codex_thread_name_from_index(home: Path, session_id: str) -> str | None:
@@ -739,14 +806,10 @@ def load_codex_session(
     codex_home: Path | None = None,
 ) -> LocalSessionImport:
     """Load one Codex session from its local rollout JSONL file."""
-    configured_home = os.environ.get("CODEX_HOME")
-    home = codex_home or (Path(configured_home).expanduser() if configured_home else None)
-    home = home or Path.home() / ".codex"
-    rollout_path = _find_codex_rollout(home, session_id) or _find_archived_codex_rollout(
-        home, session_id
-    )
-    if rollout_path is None:
+    selected = _find_codex_rollout_in_homes(_codex_storage_homes(codex_home), session_id)
+    if selected is None:
         raise SessionImportNotFoundError(f"Codex session {session_id!r} was not found")
+    rollout_path, home = selected
 
     # Past the size threshold, restart from each compaction boundary so the
     # import matches what the agent resumes with, dropping the pre-compaction

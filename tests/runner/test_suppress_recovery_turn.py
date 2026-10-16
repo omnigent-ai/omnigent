@@ -462,6 +462,75 @@ async def test_newer_turn_finishing_during_initialization_supersedes_recovery() 
 
 
 @pytest.mark.asyncio
+async def test_forward_in_flight_during_initialization_skips_history_recovery(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runner-connect init must not start a second turn for an in-flight forward.
+
+    The server's runner-connect init sends no suppress flag, while the first
+    message for an already-connected runner is forwarded without waiting for
+    it. If init's history load sees that persisted message while the forward
+    is past its active-turn check, a history_resume turn and the forward's turn
+    both reach the harness; a real harness answers the second with 204, which
+    the runner reports as ``turn failed (status 204)``.
+    """
+    from omnigent.runner.app import _session_histories_ref
+
+    # The history cache is module-global; a leftover entry would let the
+    # forward skip the history read this test parks on.
+    _session_histories_ref.pop(SESSION_ID, None)
+    parked = 0
+    init_parked, both_parked, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class PausedHistoryServer(_HistoryServerClient):
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            nonlocal parked
+            response = await super().get(url, **kwargs)
+            if url.endswith(f"/{SESSION_ID}/items") and not release.is_set():
+                parked += 1
+                (init_parked if parked == 1 else both_parked).set()
+                await release.wait()
+            return response
+
+    app, _pm, harness = _build_sdk_app(PausedHistoryServer())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    async with _runner_client(app) as client:
+        init = asyncio.create_task(
+            client.post("/v1/sessions", json=_session_init_payload(suppress_recovery_turn=False))
+        )
+        # Init must hold the first history read so it decides after the forward
+        # has passed its active-turn check but before that turn starts.
+        await asyncio.wait_for(init_parked.wait(), timeout=5)
+        forward = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{SESSION_ID}/events",
+                params={"stream": "true"},
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": AGENT_ID,
+                    "content": [{"type": "input_text", "text": "hello from history"}],
+                    "persisted_item_id": "msg_001",
+                },
+            )
+        )
+        await asyncio.wait_for(both_parked.wait(), timeout=5)
+        release.set()
+        assert (await init).status_code == 201
+        assert (await forward).status_code == 200
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+
+    assert len(harness.posted_bodies) == 1, (
+        f"expected only the forward's turn; got {len(harness.posted_bodies)} turn-starts"
+    )
+    (init_row,) = _init_rows(caplog)
+    assert init_row["recovery_turn"] == "none"
+    assert init_row["forward_in_flight"] is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "statuses, startup_repaint",
     [

@@ -83,11 +83,11 @@ def seeded_pdf_session(
 # ---------------------------------------------------------------------------
 
 
-def test_pdf_file_renders_inline(
+def test_pdf_preview_toolbar_and_zoom(
     page: Page,
     seeded_pdf_session: tuple[str, str, str],
 ) -> None:
-    """A PDF renders inline via react-pdf, not the binary placeholder."""
+    """Render a PDF, check its toolbar, then zoom and reset the same preview."""
     base_url, session_id, _file_path = seeded_pdf_session
     page.goto(f"{base_url}/c/{session_id}?view=explore")
 
@@ -112,44 +112,9 @@ def test_pdf_file_renders_inline(
     # The toolbar reports the page count.
     expect(file_viewer.get_by_text(re.compile(r"^\d+ pages?$"))).to_be_visible()
 
-
-def test_pdf_toolbar_hides_diff_but_shows_comments(
-    page: Page,
-    seeded_pdf_session: tuple[str, str, str],
-) -> None:
-    """The diff toggle is hidden for PDFs; comments are available."""
-    base_url, session_id, _file_path = seeded_pdf_session
-    page.goto(f"{base_url}/c/{session_id}?view=explore")
-
-    file_button = page.get_by_role("button", name=re.compile(rf"^{re.escape(_PDF_FILE_PATH)}\b"))
-    expect(file_button).to_be_visible(timeout=30_000)
-    file_button.click()
-
-    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
-    expect(file_viewer).to_be_visible()
-    # Wait until the PDF has actually rendered so the toolbar is in its final state.
-    expect(file_viewer.locator("canvas").first).to_be_visible(timeout=30_000)
-
     # PDFs render through PdfViewer — no diff surface, but comments are supported.
     expect(file_viewer.get_by_role("button", name="Show diff")).to_have_count(0)
     expect(file_viewer.get_by_role("button", name="Show comments")).to_be_visible()
-
-
-def test_pdf_zoom_percentage_resets(
-    page: Page,
-    seeded_pdf_session: tuple[str, str, str],
-) -> None:
-    """Zooming in enables the percentage-as-reset control; clicking it returns to 100%."""
-    base_url, session_id, _file_path = seeded_pdf_session
-    page.goto(f"{base_url}/c/{session_id}?view=explore")
-
-    file_button = page.get_by_role("button", name=re.compile(rf"^{re.escape(_PDF_FILE_PATH)}\b"))
-    expect(file_button).to_be_visible(timeout=30_000)
-    file_button.click()
-
-    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
-    expect(file_viewer).to_be_visible()
-    expect(file_viewer.locator("canvas").first).to_be_visible(timeout=30_000)
 
     reset = file_viewer.get_by_role("button", name="Reset zoom")
     # At 100% the reset control shows "100%" and is disabled (nothing to reset).

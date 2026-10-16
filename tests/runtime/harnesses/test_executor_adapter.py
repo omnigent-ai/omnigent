@@ -642,6 +642,41 @@ async def test_coded_executor_error_is_raised_with_its_code() -> None:
     assert raised.value.undelivered is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [None, "databricks_sign_in_pending"])
+@pytest.mark.parametrize("undelivered", [False, True])
+async def test_executor_delivery_evidence_survives_without_an_error_code(
+    code: str | None, undelivered: bool
+) -> None:
+    """The relay needs delivery evidence independently of error classification."""
+    import asyncio
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message="Terminal is not ready", code=code, undelivered=undelivered)]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_not_ready", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+        detail = adapter._build_error_detail(raised.value)
+        assert detail.undelivered is (True if undelivered else None)
+        assert detail.code == (code or "RuntimeError")
+        assert detail.message == (
+            "Terminal is not ready" if code else "inner executor error: Terminal is not ready"
+        )
+    finally:
+        await adapter.on_shutdown()
+
+
 def test_build_error_detail_uses_omnigent_error_code() -> None:
     """
     :class:`OmnigentError` (and its
@@ -690,21 +725,28 @@ _OLD_CLI_REFUSAL = (
 )
 
 
-def test_build_error_detail_codes_old_cli_model_refusal() -> None:
+@pytest.mark.parametrize("undelivered", [False, True])
+def test_build_error_detail_codes_old_cli_model_refusal(undelivered: bool) -> None:
     """
     A claude-sdk turn ending on Claude Code's "version N or newer is required"
     refusal reaches the adapter as a bare ``RuntimeError``; the detail is coded
     ``client_update_required`` and names both versions and the update command,
     with the raw text kept as the message.
     """
-    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
 
     adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
-    error = RuntimeError(f"inner executor error: {_OLD_CLI_REFUSAL}")
+    message = f"inner executor error: {_OLD_CLI_REFUSAL}"
+    error = (
+        InnerExecutorError(message, code=None, undelivered=True)
+        if undelivered
+        else RuntimeError(message)
+    )
 
     detail = adapter._build_error_detail(error)
 
     assert detail.code == "client_update_required"
+    assert detail.undelivered is (True if undelivered else None)
     assert detail.message == str(error)
     assert detail.title == "Claude Code needs an update"
     assert detail.cause is not None
@@ -740,6 +782,65 @@ def test_old_cli_refusal_text_does_not_override_other_classifications() -> None:
     assert unrelated.code == "RuntimeError"
     assert unrelated.title is None
     assert unrelated.cause is None
+    assert unrelated.remediation is None
+
+
+# The provider's model-not-found text as it reaches the adapter from the SDK.
+_MODEL_NOT_FOUND = (
+    "There's an issue with the selected model (anthropic/claude-opus-4-8). "
+    "It may not exist or you may not have access to it."
+)
+
+
+@pytest.mark.parametrize("undelivered", [False, True])
+def test_build_error_detail_adds_model_unavailable_recovery_hint(undelivered: bool) -> None:
+    """
+    A claude-sdk turn ending on a model-not-found refusal reaches the adapter as
+    a bare ``RuntimeError``; the detail gains a recovery hint while keeping the
+    generic ``RuntimeError`` code (so the web shows the agent-turn-error
+    headline) and the original message with its model id.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    message = f"inner executor error: {_MODEL_NOT_FOUND}"
+    error = (
+        InnerExecutorError(message, code=None, undelivered=True)
+        if undelivered
+        else RuntimeError(message)
+    )
+
+    detail = adapter._build_error_detail(error)
+
+    assert detail.code == "RuntimeError"
+    assert detail.undelivered is (True if undelivered else None)
+    assert detail.message == str(error)
+    # No title/cause so the web keeps the agent-named turn-error headline and the
+    # original provider message, matching the already-covered native card.
+    assert detail.title is None
+    assert detail.cause is None
+    assert "anthropic/claude-opus-4-8" in detail.message
+    assert detail.remediation is not None
+    assert "model picker" in detail.remediation
+    assert "/model" in detail.remediation
+
+
+def test_model_unavailable_hint_does_not_override_other_classifications() -> None:
+    """The hint is a last-resort text check: a coded or SDK-typed failure keeps
+    its code and gains no spurious remediation."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+
+    named = adapter._build_error_detail(
+        InnerExecutorError(_MODEL_NOT_FOUND, code="databricks_sign_in_pending")
+    )
+    assert named.code == "databricks_sign_in_pending"
+    assert named.remediation is None
+
+    typed = adapter._build_error_detail(httpx.ConnectError(_MODEL_NOT_FOUND))
+    assert typed.code == "connection_error"
+    assert typed.remediation is None
 
 
 def test_classify_openai_exception_maps_known_types() -> None:
@@ -2051,6 +2152,8 @@ class _OneInjectionCtx:
 
         self._injection: Any = injection
         self.emitted: list[Any] = []
+        self.response_id = "resp_injection"
+        self.session_id = "session_injection"
         # Mirror TurnContext: the watcher skips delivery once cancelled.
         self.cancelled = asyncio.Event()
 

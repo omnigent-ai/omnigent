@@ -20,14 +20,14 @@ import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nat
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
   theme: "system" as string,
+  isEmbedded: false,
   archiveMutate: vi.fn(),
   deleteMutate: vi.fn(),
   bulkArchiveMutate: vi.fn(),
   bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
-  harnessSettingsEnabled: false,
   importSessionsPanel: vi.fn(() => null),
-  reviewImportsPanel: vi.fn(() => null),
+  enabledConnections: [] as string[],
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
@@ -52,20 +52,17 @@ const mocks = vi.hoisted(() => ({
 vi.mock("next-themes", () => ({
   useTheme: () => ({ theme: mocks.theme, systemTheme: "light", setTheme: mocks.setTheme }),
 }));
-vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => false }));
+vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => mocks.isEmbedded }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
-    features: { harness_settings_ui: mocks.harnessSettingsEnabled },
+    enabled_connections: mocks.enabledConnections,
   }),
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
   ImportSessionsPanel: mocks.importSessionsPanel,
-}));
-vi.mock("@/components/onboarding/HostImportReview", () => ({
-  ReviewImportsPanel: mocks.reviewImportsPanel,
 }));
 vi.mock("@/lib/accountsApi", () => ({
   logout: vi.fn(),
@@ -75,6 +72,7 @@ vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
+  subscribeIdentity: () => () => {},
 }));
 vi.mock("@/hooks/useConversations", async () => {
   // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
@@ -192,6 +190,9 @@ vi.mock("@/pages/MembersPage", () => ({
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
 }));
+vi.mock("@/components/McpRegistry", () => ({
+  McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
+}));
 
 import { SettingsPage } from "./SettingsPage";
 
@@ -233,10 +234,10 @@ beforeEach(() => {
   mocks.fetchNextPage.mockReset();
   mocks.conversationQuery.mockReset();
   mocks.theme = "system";
+  mocks.isEmbedded = false;
   mocks.accountsEnabled = true;
-  mocks.harnessSettingsEnabled = false;
   mocks.importSessionsPanel.mockClear();
-  mocks.reviewImportsPanel.mockClear();
+  mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
@@ -263,23 +264,28 @@ afterEach(() => {
 });
 
 describe("Import sessions", () => {
-  it.each([true, false])(
-    "shows Harness imports only with Harnesses settings disabled (enabled=%s)",
-    (enabled) => {
-      mocks.harnessSettingsEnabled = enabled;
-      renderPage("/settings/import");
+  it("keeps session imports without the legacy Harness imports section", () => {
+    renderPage("/settings/import");
 
-      expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
-      expect(mocks.importSessionsPanel).toHaveBeenCalled();
-      if (enabled) {
-        expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
-        expect(mocks.reviewImportsPanel).not.toHaveBeenCalled();
-      } else {
-        expect(screen.getByRole("heading", { name: "Harness imports" })).toBeTruthy();
-        expect(mocks.reviewImportsPanel).toHaveBeenCalled();
-      }
-    },
-  );
+    expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
+    expect(mocks.importSessionsPanel).toHaveBeenCalled();
+    expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
+  });
+});
+
+describe("MCP settings", () => {
+  it("renders configured MCP accounts at their own URL", () => {
+    mocks.enabledConnections = ["mcp"];
+    renderPage("/settings/mcp");
+    expect(screen.getByText("mcp-accounts-stub")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "MCP" })).toBeInTheDocument();
+  });
+
+  it("explains a deep link when MCP is not configured", () => {
+    renderPage("/settings/mcp");
+    expect(screen.getByText("MCP services are not configured on this server.")).toBeInTheDocument();
+    expect(screen.queryByText("mcp-accounts-stub")).not.toBeInTheDocument();
+  });
 });
 
 const DEFAULT_UPDATE_CONFIG: UpdateConfig = {
@@ -454,7 +460,9 @@ describe("SettingsPage", () => {
     if (description === null) throw new Error("Missing composer shortcut description");
     expect(Array.from(description.children).map((line) => line.tagName)).toEqual(["P", "P"]);
     expect(
-      within(description).getByText("Off: Enter submits and Shift+Enter inserts a newline."),
+      within(description).getByText(
+        /Off: Enter submits and Shift\+Enter or (?:⌥|Alt)\+Enter inserts a newline\./,
+      ),
     ).toBeInTheDocument();
     expect(
       within(description).getByText(/On: Enter inserts a newline and (?:⌘|Ctrl)\+Enter submits\./),
@@ -501,6 +509,24 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("theme-system")).toHaveAttribute("aria-checked", "true");
     fireEvent.click(screen.getByTestId("theme-dark"));
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("opens the embedded host's theme settings in a new tab", () => {
+    mocks.isEmbedded = true;
+    const url = "https://workspace.example.com/settings/user/preferences";
+    vi.spyOn(host, "getOmnigentThemeSettingsUrl").mockReturnValue(url);
+    renderPage("/settings/appearance");
+
+    expect(screen.queryByTestId("theme-system")).not.toBeInTheDocument();
+    for (const name of [
+      "Click to open Databricks user preferences page.",
+      "Open Databricks preferences",
+    ]) {
+      const link = screen.getByRole("link", { name });
+      expect(link).toHaveAttribute("href", url);
+      expect(link).toHaveAttribute("target", "_blank");
+      expect(link).toHaveAttribute("rel", "noreferrer");
+    }
   });
 
   it("renders the Terminal theme radiogroup with auto selected by default", () => {
@@ -589,7 +615,7 @@ describe("SettingsPage", () => {
     const group = screen.getByRole("radiogroup", { name: "Default Workspace tab" });
     const options = within(group).getAllByRole("radio");
     expect(options).toHaveLength(4);
-    ["Files", "Changes", "GitHub", "Agents"].forEach((label, index) => {
+    ["Files", "Changes", "Pull Requests", "Agents"].forEach((label, index) => {
       expect(options[index]).toHaveAccessibleName(label);
     });
     expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(

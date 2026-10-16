@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -23,7 +24,7 @@ from omnigent.entities import (
     PagedList,
     StoredFile,
 )
-from omnigent.errors import OmnigentError
+from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, OmnigentError
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -33,7 +34,14 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes import _session_create_validation as create_validation
 from omnigent.server.routes.sessions import create_sessions_router, routes_core
-from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS, SIDE_CHAT_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    _FORK_ONLY_DROPPED_LABEL_KEYS,
+    FORK_SOURCE_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
+)
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests.server.helpers import create_test_agent
 
 # ── Minimal store stubs ──────────────────────────────────────────
 
@@ -600,6 +608,74 @@ def _build_app(
 
 
 # ── Tests ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("source_runner", [None, "runner_shared"])
+def test_side_chat_records_its_source_without_a_persisted_workspace(
+    nested: bool, source_runner: str | None
+) -> None:
+    source = _make_conversation(
+        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "original"} if nested else {}
+    )
+    source.runner_id = source_runner
+    store = _ConversationStore({source.id: source})
+    client = TestClient(_build_app(store))
+
+    response = client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": True})
+
+    assert response.status_code == 201, response.text
+    labels = response.json()["labels"]
+    assert labels[SIDE_CHAT_LABEL_KEY] == "1"
+    assert labels[SIDE_CHAT_SOURCE_LABEL_KEY] == source.id
+    assert FORK_SOURCE_LABEL_KEY not in labels
+    assert response.json()["kind"] == "default"
+    assert response.json()["host_id"] is None
+    assert response.json()["parent_session_id"] is None
+
+
+def test_normal_fork_does_not_copy_side_chat_routing_source() -> None:
+    source = _make_conversation(
+        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "original"}
+    )
+    store = _ConversationStore({source.id: source})
+    client = TestClient(_build_app(store))
+
+    response = client.post(f"/v1/sessions/{source.id}/fork", json={})
+
+    assert response.status_code == 201, response.text
+    assert SIDE_CHAT_SOURCE_LABEL_KEY not in response.json()["labels"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_workspace", [None, "/workspace"])
+async def test_runnerless_side_chat_preserves_source_workspace_requirement(
+    client: httpx.AsyncClient, db_uri: str, source_workspace: str | None
+) -> None:
+    agent = await create_test_agent(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    source = store.create_conversation(agent_id=agent["id"], workspace=source_workspace)
+
+    response = await client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": True})
+
+    assert response.status_code == 201, response.text
+    child_id = response.json()["id"]
+    needs_workspace = source_workspace is not None
+    labels = response.json()["labels"]
+    assert labels[SIDE_CHAT_LABEL_KEY] == "1"
+    assert labels[SIDE_CHAT_SOURCE_LABEL_KEY] == source.id
+    assert labels.get(FORK_SOURCE_LABEL_KEY) == (source.id if needs_workspace else None)
+    connectivity = store.get_session_connectivity([child_id])[child_id]
+    assert connectivity.runner_id is None
+    assert connectivity.host_id is None
+    assert connectivity.needs_workspace is needs_workspace
+
+    snapshot = await client.get(f"/v1/sessions/{child_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["runner_online"] is not needs_workspace
+    health = await client.get("/health", params={"session_ids": child_id})
+    assert health.status_code == 200, health.text
+    assert health.json()["sessions"][child_id]["runner_online"] is not needs_workspace
 
 
 @pytest.mark.asyncio
@@ -2291,8 +2367,10 @@ async def test_fork_copies_only_another_users_agent(
 
 def _cross_user_fork(
     artifact_store: _ArtifactStore | None,
+    *,
+    source_owner: str | None = "owner@example.com",
 ) -> tuple[TestClient, _ConversationStore]:
-    """A forker's client for a session whose agent belongs to another user."""
+    """Build a fork client for a session agent with the given owner."""
     agent_id = "30f9aa4d441e344d3eb273f8cc13e4a5"
     conv_store = _ConversationStore(
         conversations={"e9f8f58523cec9a57d3bdf93be543e8c": _make_conversation(agent_id=agent_id)},
@@ -2310,7 +2388,14 @@ def _cross_user_fork(
                 name="orion",
                 bundle_location=f"{agent_id}/e70dc208",
                 session_id="e9f8f58523cec9a57d3bdf93be543e8c",
-                created_by="owner@example.com",
+                created_by=source_owner,
+            ),
+            "44b4151dd6cdfed6ee19430832398e05": Agent(
+                id="44b4151dd6cdfed6ee19430832398e05",
+                created_at=1,
+                name="codex",
+                bundle_location="44b4151dd6cdfed6ee19430832398e05/hash",
+                version=1,
             ),
         }
     )
@@ -2366,6 +2451,44 @@ async def test_failed_cross_user_fork_removes_its_copied_bundle() -> None:
     assert resp.status_code == 500, resp.text
     assert len(written) == 1 and not written[0].startswith("30f9aa4d"), written
     assert set(artifacts.blobs) == {original}, "the unused copy must be deleted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller", "source_owner"),
+    [
+        ("owner@example.com", None),
+        ("forker@example.com", "owner@example.com"),
+    ],
+    ids=["legacy-own-session-null-owner", "cross-user"],
+)
+async def test_fork_needing_a_copy_of_a_missing_bundle_is_refused_cleanly(
+    caller: str, source_owner: str | None
+) -> None:
+    artifacts = _ArtifactStore(blobs={})
+    client, conv_store = _cross_user_fork(artifact_store=artifacts, source_owner=source_owner)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={},
+        headers={"X-Forwarded-Email": caller},
+    )
+
+    assert resp.status_code == 410, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "session_agent_missing"
+    assert error["message"] == SESSION_AGENT_BUNDLE_MISSING_MESSAGE
+    assert conv_store.fork_calls == []
+    assert artifacts.blobs == {}, "no copy may be written without a source"
+
+    switched = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05"},
+        headers={"X-Forwarded-Email": caller},
+    )
+    assert switched.status_code == 201, switched.text
+    assert conv_store.fork_calls[0]["agent_id"] == "44b4151dd6cdfed6ee19430832398e05"
+    assert artifacts.blobs == {}, "a server agent is bound, not copied"
 
 
 def _attachment_fork_client(

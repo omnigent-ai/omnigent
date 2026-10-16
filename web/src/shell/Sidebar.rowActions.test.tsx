@@ -12,7 +12,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 
 import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -20,6 +20,12 @@ import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+import { sessionActionRestrictions, type SessionActionSource } from "@/lib/sessionCapabilities";
+
+vi.mock("@/hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: (_id: string, source: SessionActionSource) =>
+    sessionActionRestrictions(source),
+}));
 
 // Controllable rename mutation so the double-click test can assert the
 // committed title was forwarded to the PATCH. `isMobile` toggles the mocked
@@ -93,6 +99,11 @@ vi.mock("@/hooks/useConversations", async () => {
     useTogglePinnedConversation: () => ({
       mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
         mocks.pinnedStore.toggle(id, pinned),
+      // Unpin goes through mutateAsync so the Undo pill waits for the write.
+      mutateAsync: ({ id, pinned }: { id: string; pinned: boolean }) => {
+        mocks.pinnedStore.toggle(id, pinned);
+        return Promise.resolve({});
+      },
     }),
     useRenameConversation: () => mocks.rename,
     useLeaveSession: () => mocks.leave,
@@ -662,6 +673,83 @@ describe("double-click to rename", () => {
   });
 });
 
+describe("rename under the iOS soft keyboard", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Stub the iOS shell on an 844px layout. The returned function raises the
+   * keyboard through UIKit's keyboard-viewport bridge or, for shells without
+   * it, through WebKit's shrinking visualViewport.
+   */
+  function stubIOSShell(source: "native" | "visualViewport"): (visibleHeight: number) => void {
+    const viewport = Object.assign(new EventTarget(), { height: 844, offsetTop: 0 });
+    let nativeViewport: { width: number; height: number } | null = null;
+    const nativeListeners = new Set<() => void>();
+    vi.stubGlobal("innerHeight", 844);
+    vi.stubGlobal("visualViewport", viewport);
+    vi.stubGlobal("omnigentNative", {
+      kind: "ios",
+      ...(source === "native" && {
+        getKeyboardViewport: () => nativeViewport,
+        onKeyboardViewportChanged: (callback: () => void) => {
+          nativeListeners.add(callback);
+          return () => nativeListeners.delete(callback);
+        },
+      }),
+    });
+    return (visibleHeight) => {
+      act(() => {
+        if (source === "native") {
+          nativeViewport = { width: window.innerWidth, height: visibleHeight };
+          nativeListeners.forEach((callback) => callback());
+        } else {
+          viewport.height = visibleHeight;
+          viewport.dispatchEvent(new Event("resize"));
+        }
+      });
+    };
+  }
+
+  it.each(["native", "visualViewport"] as const)(
+    "re-centers the focused rename field once the %s keyboard inset shrinks the list",
+    (source) => {
+      // The field focuses (raising the keyboard) while still visible; the
+      // drawer's keyboard-inset padding then shrinks the list underneath it.
+      const openKeyboard = stubIOSShell(source);
+      renderSidebar();
+      fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+      const input = screen.getByTestId("rename-conversation-input");
+      expect(input).toHaveFocus();
+      const scrollIntoView = vi.fn();
+      input.scrollIntoView = scrollIntoView;
+
+      openKeyboard(508);
+
+      expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveStyle({
+        paddingBottom: "336px",
+      });
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: "center" });
+    },
+  );
+
+  it("re-centers a rename field that opens while the keyboard is already up", () => {
+    const openKeyboard = stubIOSShell("native");
+    renderSidebar();
+    openKeyboard(508);
+    const scrollIntoView = vi.spyOn(HTMLElement.prototype, "scrollIntoView");
+
+    fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+
+    const input = screen.getByTestId("rename-conversation-input");
+    expect(input).toHaveFocus();
+    expect(scrollIntoView.mock.contexts).toContain(input);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "center" });
+  });
+});
+
 describe("leave a shared session", () => {
   // Every other row action is owner-only, so "Leave session" is the one thing
   // a shared-with viewer can actually do: drop the session from their own
@@ -1125,6 +1213,17 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("keeps Fork visible but unavailable for a managed source", () => {
+    mockConversations([{ ...CONV, labels: { "omnigent.host_type": "managed" } }]);
+    renderSidebar();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    const fork = screen.getByRole("menuitem", { name: "Fork" });
+    expect(fork).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork, { key: "Enter" });
+    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+  });
+
   it("opens the fork dialog for the selected session", () => {
     renderSidebar();
 

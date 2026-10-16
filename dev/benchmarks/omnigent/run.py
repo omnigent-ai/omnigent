@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import datetime
 import json
+import signal
 import sys
 from pathlib import Path
 
@@ -321,9 +323,35 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+async def _run_until_terminated(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
+    """Run the benchmark, turning SIGTERM into cancellation so teardown still runs.
+
+    Without this, SIGTERM (``timeout``, ``kill``) ends the process before
+    :class:`BenchEnvironment` stops its server, runner, host, and mock.
+    """
+    task = asyncio.current_task()
+    assert task is not None
+    cancelled = False
+
+    def _on_sigterm() -> None:
+        # Ignore repeats: a second SIGTERM must not cancel the teardown in flight.
+        nonlocal cancelled
+        if not cancelled:
+            cancelled = True
+            task.cancel()
+
+    with contextlib.suppress(NotImplementedError):  # no loop signal handlers on Windows
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, _on_sigterm)
+    return await run_benchmark(args)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
-    report, passed = asyncio.run(run_benchmark(args))
+    try:
+        report, passed = asyncio.run(_run_until_terminated(args))
+    except asyncio.CancelledError:
+        console.print("\n[red]Terminated; benchmark processes stopped.[/red]")
+        return 128 + signal.SIGTERM
     if args.output is not None:
         args.output.write_text(json.dumps(report, indent=2))
         console.print(f"\n  Results written to [cyan]{args.output}[/cyan]")

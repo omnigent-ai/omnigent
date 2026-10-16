@@ -51,7 +51,30 @@ finalizer. The finalizer validates and uses that restored file as the PR
 description; without it, the publisher can only construct a less readable
 fallback from machine-oriented handoff fields.
 
-### Get the GitHub write token (needed for every push / `gh` write)
+### Checked publication provided by CI
+
+When `.omnigent/pr-gate.json` exists, use the `pr.py` helper supplied in the
+`resolve-drive-pr` skill directory. This mode replaces the direct GitHub write
+and token-recovery recipes below. Keep Git pushes on the supplied credential;
+never decode another token or change credential configuration.
+
+| Action | Helper arguments |
+| --- | --- |
+| Open a PR after the required checks | `create --title TITLE --body-file FILE --base main` |
+| Update its description | `edit --number N --body-file FILE` |
+| Reply to findings | `comment --number N --body-file FILE` |
+| Submit a review without approval | `review --number N --head SHA --event COMMENT --body-file FILE` |
+| Mark a draft ready | `ready --number N` |
+
+Run the helper from the fix checkout. Use `review_cycle.py request` for review
+requests; CI routes it through the host. Follow CI's review budget and warning
+policy. Actions the helper does not support remain maintainer actions; never
+recover a broader credential, approve, or merge to work around that boundary.
+
+### Legacy direct publication: GitHub write token
+
+The following token setup applies only when CI has not supplied the checked
+publication helper and has explicitly authorized direct publication.
 
 Any write to GitHub — `git push`, `gh pr create`, `gh pr edit --add-reviewer`,
 `gh pr comment`, `gh pr close` — needs the resolve-agent App installation token

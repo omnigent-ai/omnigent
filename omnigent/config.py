@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TypeAlias
 
 import yaml
+
+_log = logging.getLogger(__name__)
+_cwd_missing_warned = False
 
 _Config: TypeAlias = dict[str, object]
 
@@ -35,7 +39,18 @@ def load_global_config(path: Path | None = None) -> _Config:
 
 def load_local_config(path: Path | None = None) -> _Config:
     """Load the project-level config, returning an empty mapping when absent."""
-    resolved_path = path or Path.cwd() / _LOCAL_CONFIG_RELPATH
+    global _cwd_missing_warned
+    if path is None:
+        try:
+            resolved_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
+        except OSError:
+            # A runner can outlive its working directory; no local config to load.
+            if not _cwd_missing_warned:
+                _cwd_missing_warned = True
+                _log.warning("load_local_config: cwd no longer exists; skipping project config")
+            return {}
+    else:
+        resolved_path = path
     if not resolved_path.exists():
         return {}
     with resolved_path.open() as config_file:
@@ -83,15 +98,17 @@ def _merge_effective_config(
     return merged
 
 
-def load_effective_config() -> _Config:
-    """Merge user and project config, with project values taking precedence.
+def load_effective_config(*, workspace: str | Path | None = None) -> _Config:
+    """Merge global and project config, with project values taking precedence.
 
     The ``harness`` mapping is deep-merged (per-harness sub-keys, local
     winning per-field) so a project's per-harness overrides augment —
     rather than replace — the user's global ones. Every other key is a
-    shallow replace.
+    shallow replace. When supplied, *workspace* selects the project config
+    directory instead of the process cwd.
     """
-    return _merge_effective_config(load_global_config(), load_local_config())
+    local_path = Path(workspace) / _LOCAL_CONFIG_RELPATH if workspace is not None else None
+    return _merge_effective_config(load_global_config(), load_local_config(local_path))
 
 
 def save_global_config(

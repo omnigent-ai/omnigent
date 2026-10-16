@@ -14,6 +14,7 @@ import {
   ChevronRightIcon,
   CopyIcon,
   ExternalLinkIcon,
+  FolderOpenIcon,
   Loader2Icon,
   RotateCcwIcon,
   RotateCwIcon,
@@ -31,9 +32,12 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { shortModelName } from "@/components/CostRoutingControl";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+import { useScopedConversationId } from "@/components/chat/conversationScope";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
+import { useForkDialog } from "@/shell/ForkDialogContext";
 import type { RelatedRenderError, RenderErrorDetails } from "@/lib/renderItems";
 import {
   type RoutingDecisionExtras,
@@ -248,6 +252,15 @@ export function ErrorBanner({
   onRetry,
   relatedErrors = EMPTY_RELATED_ERRORS,
 }: ErrorBannerProps) {
+  const forkDialog = useForkDialog();
+  const conversationId = useScopedConversationId();
+  const workspaceMissing =
+    code === "workspace_missing" ||
+    relatedErrors.some((error) => error.code === "workspace_missing");
+  // Side-chat sources resolve their own capabilities in the fork form.
+  const scopedForkSource =
+    forkDialog?.currentSessionId != null && conversationId !== forkDialog.currentSessionId;
+  const recoveryDisabledReason = scopedForkSource ? undefined : forkDialog?.disabledReason;
   const notice = level === "info" && relatedErrors.every((error) => error.level === "info");
   const tone = notice ? "var(--muted-foreground)" : "var(--destructive)";
   const headline = errorHeadline({ message, source: "", code, title, cause, remediation, level });
@@ -302,7 +315,7 @@ export function ErrorBanner({
     { itemId, message, source, code, level, title, cause, remediation },
     ...relatedErrors,
   ].find((error) => RETRYABLE_ERROR_CODES.has(error.code));
-  const retryable = onRetry !== undefined && actionableError !== undefined;
+  const retryable = !workspaceMissing && onRetry !== undefined && actionableError !== undefined;
   const retryLabel =
     actionableError && CONTINUE_TURN_ERROR_CODES.has(actionableError.code)
       ? "Retry"
@@ -496,6 +509,35 @@ export function ErrorBanner({
             <XIcon className="size-4" aria-hidden="true" />
           </Button>
         </div>
+        {workspaceMissing &&
+          forkDialog &&
+          conversationId &&
+          (scopedForkSource || forkDialog.canFork) && (
+            <div className="mx-[4px] mt-[8px]" onClick={(event) => event.stopPropagation()}>
+              <DisabledActionTooltip
+                reason={recoveryDisabledReason}
+                label="Continue in another directory…"
+                className="max-w-full"
+              >
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-auto max-w-full whitespace-normal text-left"
+                  disabled={!!recoveryDisabledReason}
+                  onClick={() =>
+                    forkDialog.openForkDialog({
+                      sourceSessionId: conversationId,
+                      workspaceRecovery: true,
+                    })
+                  }
+                >
+                  <FolderOpenIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                  Continue in another directory…
+                </Button>
+              </DisabledActionTooltip>
+            </div>
+          )}
         {signInComplete && parsed.message ? (
           <p
             data-testid="error-notice-body"

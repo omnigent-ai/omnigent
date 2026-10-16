@@ -64,7 +64,7 @@ a run happens to pass. Outages beyond the short default run only with
 | S5 | approve | 20 s | pass | pass |
 | S5 | approve | 150 s | gap: R2 | pass |
 | S5 | send | 20 s / 150 s | gap: [R3](#r3-a-message-sent-while-the-host-is-unreachable-is-lost) | gap: R3 |
-| S5 | stop | 20 s / 150 s | gap: [R4](#r4-stop-reports-success-while-the-host-is-unreachable) | gap: R4 |
+| S5 | stop | 20 s / 150 s | pass | pass |
 | S6 | tool ends during outage, approval pending (half-open and refused) | 20 s / 120 s | gap: [R5](#r5-the-page-never-says-it-is-offline) | gap: R5 |
 | S7 | before the first call, mid-stream | 10 s / 60 s | pass | pass |
 | S7 | before the first call | 180 s | pass | pass |
@@ -105,12 +105,15 @@ reconnected, because passive recovery clears only `runner_disconnected`.
 
 ### R4: Stop reports success while the host is unreachable
 
-Both harnesses. With no live tunnel the server finds no runner to stop. It
-treats the Stop as done and shows the session idle. The turn keeps running on
-the host and finishes once the host returns. With Claude, the next message was in
-some runs delivered while Claude was still busy with the "stopped" turn, and
-it never appeared in Claude's transcript. With Codex, the next message is processed
-after the "stopped" turn completes.
+**Resolved.** Stop returns `503` promptly when the host is unreachable and
+runner termination cannot be confirmed. The user can retry after reconnection.
+The refused Stop leaves the existing turn intact, so it finishes when the
+host returns.
+
+Verified with Claude and Codex during both 20 s and 150 s refused-link
+outages. All four cases preserve exactly one user message, final reply and
+tool result, settle to idle, and accept the next turn after reconnection.
+The 20 s cases also show no failed status within the reconnect grace.
 
 ### R5: The page never says it is offline
 

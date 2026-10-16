@@ -45,7 +45,7 @@ from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
@@ -216,6 +216,7 @@ from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -318,6 +319,10 @@ async def _wake_runner_for_model_change(
     )
     return conv
 
+
+# Allow runtime recovery (15s), connect/catalog/update (12s), and confirmation
+# mirroring/cleanup (6s) to finish before the server restores a selection.
+_CODEX_SETTINGS_FORWARD_TIMEOUT_S = 40.0
 
 _CODEX_SETTINGS_RESTORED_MESSAGE = (
     "The terminal did not apply the model and reasoning effort changes. "
@@ -585,7 +590,11 @@ def register_core_routes(
             encode_host_frame,
         )
         from omnigent.runner.identity import token_bound_runner_id
-        from omnigent.server.routes._host_launch import resolve_host_launch
+        from omnigent.server.routes._host_launch import (
+            LAUNCH_TIMEOUT_ENV_VAR,
+            resolve_host_launch,
+            resolve_launch_timeout_s,
+        )
 
         with creation_stage("create_acl_ms"):
             target = await asyncio.to_thread(
@@ -652,13 +661,20 @@ def register_core_routes(
                 ),
             )
         )
+        launch_timeout_s = resolve_launch_timeout_s()
         try:
             host_registry.send_text(conn, launch_frame)
-            launch_result = await asyncio.wait_for(future, timeout=30.0)
+            launch_result = await asyncio.wait_for(future, timeout=launch_timeout_s)
         except ConnectionError as exc:
             launch_result = {"status": "failed", "error": str(exc)}
         except asyncio.TimeoutError:
-            launch_result = {"status": "failed", "error": "host launch timed out"}
+            launch_result = {
+                "status": "failed",
+                "error": (
+                    f"host launch timed out after {launch_timeout_s:g}s "
+                    f"(raise {LAUNCH_TIMEOUT_ENV_VAR} if this launch needs longer)"
+                ),
+            }
         finally:
             conn.pending_launches.pop(request_id, None)
             if not future.done():
@@ -1019,6 +1035,19 @@ def register_core_routes(
             enforce_handler_allowlist=not local_single_user_enabled(),
         )
 
+        if parsed_metadata.mcp_registry_services:
+            from omnigent.mcp_selection import registry_selection_labels, selected_mcp_spec
+            from omnigent.server.routes.session_mcp_servers import _require_registry_service
+
+            for service_id in parsed_metadata.mcp_registry_services:
+                _require_registry_service(request, service_id, user_id)
+            labels = {
+                **parsed_metadata.labels,
+                **registry_selection_labels(spec, parsed_metadata.mcp_registry_services),
+            }
+            parsed_metadata = parsed_metadata.model_copy(update={"labels": labels})
+            spec = selected_mcp_spec(spec, labels)
+
         # Caller-supplied external host: validate the workspace against
         # the uploaded spec's os_env boundary BEFORE creating the row
         # (mirroring the JSON path — a bad workspace never produces a
@@ -1038,6 +1067,19 @@ def register_core_routes(
                 host_registry=getattr(request.app.state, "host_registry", None),
             )
             parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
+
+        from omnigent.server.mcp_compatibility import (
+            registry_services,
+            require_registry_mcp_runtime,
+        )
+
+        require_registry_mcp_runtime(
+            registry_services(spec),
+            host_id=parsed_metadata.host_id,
+            runner_id=inherited_runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+        )
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
@@ -2613,9 +2655,33 @@ def register_core_routes(
             else:
                 from omnigent.server.routes import sessions as _sf
 
+                if (
+                    runner_router is not None
+                    and conv.host_id is None
+                    and conv.kind == "default"
+                    and conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
+                    and not runner_router.runner_is_online(body.runner_id.strip())
+                ):
+                    host_id = await asyncio.to_thread(
+                        routing_host_id,
+                        dataclasses.replace(conv, runner_id=body.runner_id.strip()),
+                        conversation_store,
+                    )
+                    if host_id is not None and await asyncio.to_thread(
+                        runner_router.host_is_on_another_replica, host_id
+                    ):
+                        raise OmnigentError(
+                            "side chat runner is connected to another server replica",
+                            code=ErrorCode.WRONG_REPLICA,
+                        )
                 runner_id = _sf._registered_runner_id(
                     runner_router, body.runner_id, user_id=user_id
                 )
+                if runner_router is not None:
+                    await asyncio.to_thread(
+                        runner_router.require_mcp_registry_support,
+                        dataclasses.replace(conv, runner_id=runner_id),
+                    )
                 try:
                     await asyncio.to_thread(
                         conversation_store.replace_runner_id, session_id, runner_id
@@ -2758,8 +2824,8 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
-        updated = await asyncio.to_thread(
-            conversation_store.update_conversation,
+        update_result = await asyncio.to_thread(
+            conversation_store.update_conversation_with_changes,
             session_id,
             title=body.title,
             reasoning_effort=None if clear_effort else effort,
@@ -2778,8 +2844,10 @@ def register_core_routes(
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
         )
-        if updated is None:
+        if update_result is None:
             raise _session_not_found()
+        updated = update_result.conversation
+        effort_changed = update_result.reasoning_effort_changed
         saved = live_change.position() if live_change is not None else 0
         if body.silent:
             # An active live change orders this write against its own when refused.
@@ -2828,9 +2896,16 @@ def register_core_routes(
         # This server rolls back Codex refusals and keeps unconfirmed changes, so the
         # runner neither saves a refusal nor waits out this server's forward timeout.
         negotiation: dict[str, object] = {"rollback_on_refusal": True} if codex_native else {}
+        settings_forward_timeout = (
+            _CODEX_SETTINGS_FORWARD_TIMEOUT_S if codex_native else _TUI_INJECT_FORWARD_TIMEOUT_S
+        )
         combined_model_forward = False
         _model_forward = None
-        if live_forward and (effort is not None or clear_effort):
+        if (
+            live_forward
+            and (effort is not None or clear_effort)
+            and (effort_changed or (live_model_change and codex_native))
+        ):
             effort_event: dict[str, object] = {
                 "type": "effort_change",
                 "effort": updated.reasoning_effort,
@@ -2853,10 +2928,7 @@ def register_core_routes(
                 session_id,
                 runner_router,
                 event,
-                # Same TUI injection budget as the model change below: the
-                # ``/effort`` confirm dialog can render seconds after the
-                # command.
-                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                timeout_s=settings_forward_timeout,
             )
             model_applied = bool(
                 combined_model_forward
@@ -2873,7 +2945,7 @@ def register_core_routes(
                         session_id,
                         runner_router,
                         effort_event,
-                        timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                        timeout_s=settings_forward_timeout,
                     )
             if codex_native and (
                 (effort_forward is None and model_applied)
@@ -2918,8 +2990,7 @@ def register_core_routes(
                     session_id,
                     runner_router,
                     {"type": "model_change", "model": updated.model_override, **negotiation},
-                    # The runner can answer by confirming a TUI model dialog.
-                    timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                    timeout_s=settings_forward_timeout,
                 )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
@@ -3239,7 +3310,9 @@ def register_core_routes(
             owns a session-scoped ``body.agent_id``; 400 if the source
             has no agent binding, ``body.up_to_response_id`` names
             no response in the source session, or a managed fork asks
-            for a sandbox this server has not configured.
+            for a sandbox this server has not configured; 410 if the
+            source's agent was removed or a required bundle copy finds
+            its source missing.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -3453,7 +3526,12 @@ def register_core_routes(
         # otherwise ride along as stale metadata that could hydrate a wrong mode
         # in generic native-wrapper UI state. Drop it whenever the agent changes.
         if switching_agent:
+            from omnigent.mcp_selection import MCP_SELECTION_PREFIX
+
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+            dropped_label_keys_set.update(
+                key for key in source.labels if key.startswith(MCP_SELECTION_PREFIX)
+            )
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always
@@ -3473,10 +3551,11 @@ def register_core_routes(
                 )
             extra_labels[_CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
 
-        # A side-chat fork is hidden from the left sidebar (it surfaces only as a
-        # Workspace-rail tab). Stamp the label the sessions-list filter reads.
+        # Side chats use the source for shared-runner routing and stay hidden
+        # from the sidebar while appearing in the Workspace rail.
         if body.side_chat:
             extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
+            extra_labels[SIDE_CHAT_SOURCE_LABEL_KEY] = source_id
 
         # When the fork binds a NATIVE target, the native CLI won't replay
         # the copied Omnigent transcript on its own — mark the fork so the

@@ -11,6 +11,7 @@ import { withBasePath } from "@/lib/basePath";
 import { isDatabricksWorkspace } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
+import { isTempConvId } from "@/lib/tempConversationId";
 import {
   browseLocationBase,
   browseLocationSegment,
@@ -153,7 +154,7 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
  * Fetch the content of a workspace file for the given conversation.
  *
  * Disabled (no request made) when `conversationId` or `path` is
- * null / undefined.
+ * null / undefined, or when `conversationId` is a client-only temp id.
  *
  * Fires one trailing invalidation when the session transitions from active
  * (running/waiting) to idle so the viewer picks up any file writes the agent
@@ -162,37 +163,40 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
  * editor's scroll and cursor position.
  */
 export function useFileContent(conversationId: string | undefined, path: string | null) {
+  // A `temp:*` id (navigate-first new-chat window) has no server session yet,
+  // so never request `/v1/sessions/temp:*/resources/*` for it.
+  const serverId = isTempConvId(conversationId) ? undefined : conversationId;
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const sessionActive =
-    !!conversationId &&
-    conversationId === focusedId &&
+    !!serverId &&
+    serverId === focusedId &&
     (sessionStatus === "running" || sessionStatus === "waiting");
   // Serveable when the runner is online OR (runner offline but) the host can
   // read the workspace from disk — keeps the viewer live while the agent is
   // asleep. `false` only when neither source can answer.
-  const serveable = useWorkspaceServeable(conversationId);
+  const serveable = useWorkspaceServeable(serverId);
   const queryClient = useQueryClient();
 
   const prevRef = useRef<{ id: string | undefined; active: boolean }>({
-    id: conversationId,
+    id: serverId,
     active: sessionActive,
   });
   useEffect(() => {
-    const sameSession = prevRef.current.id === conversationId;
+    const sameSession = prevRef.current.id === serverId;
     const justWentIdle = sameSession && prevRef.current.active && !sessionActive;
-    prevRef.current = { id: conversationId, active: sessionActive };
-    if (justWentIdle && conversationId && path) {
+    prevRef.current = { id: serverId, active: sessionActive };
+    if (justWentIdle && serverId && path) {
       void queryClient.invalidateQueries({
-        queryKey: ["file-content", conversationId, path],
+        queryKey: ["file-content", serverId, path],
       });
     }
-  }, [conversationId, path, sessionActive, queryClient]);
+  }, [serverId, path, sessionActive, queryClient]);
 
   return useQuery({
-    queryKey: ["file-content", conversationId, path],
-    queryFn: () => fetchFileContent(conversationId!, path!),
-    enabled: !!conversationId && !!path && serveable !== false,
+    queryKey: ["file-content", serverId, path],
+    queryFn: () => fetchFileContent(serverId!, path!),
+    enabled: !!serverId && !!path && serveable !== false,
     staleTime: 5_000,
   });
 }

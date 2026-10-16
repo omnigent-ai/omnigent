@@ -8,10 +8,13 @@ from typing import Any
 from unittest.mock import patch
 
 import httpx
+import pytest
 import respx
 from click.testing import CliRunner
 
 from omnigent.cli import _import_item_payload, cli
+from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
+from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 
 _BASE = "http://localhost:6767"
 
@@ -19,6 +22,14 @@ _BASE = "http://localhost:6767"
 def _patch_server(base_url: str = _BASE) -> Any:
     """Patch the CLI so it uses *base_url* without spawning a real server."""
     return patch("omnigent.cli._resolve_attach_server", return_value=base_url)
+
+
+def _import_labels(source: str, *, carry_history: bool = True) -> dict[str, str]:
+    """Labels an import of *source* carries: offline routing, plus history carry."""
+    labels = {IMPORT_SOURCE_LABEL_KEY: source}
+    if carry_history:
+        labels[FORK_CARRY_HISTORY_LABEL_KEY] = "1"
+    return labels
 
 
 def _write_export(path: Path, *, meta: dict[str, Any], items: list[dict[str, Any]]) -> None:
@@ -183,10 +194,13 @@ def test_session_import_falls_back_to_native_agent(tmp_path: Path) -> None:
     )
 
     seen_agent_ids: list[str] = []
+    seen_labels: list[object] = []
 
     def _responder(request: httpx.Request) -> httpx.Response:
-        agent_id = json.loads(request.content)["agent_id"]
+        body = json.loads(request.content)
+        agent_id = body["agent_id"]
         seen_agent_ids.append(agent_id)
+        seen_labels.append(body.get("labels"))
         if agent_id == "ag_missing":
             return httpx.Response(404, json={"error": {"message": "Agent not found"}})
         return httpx.Response(200, json={"id": "conv_new"})
@@ -201,6 +215,76 @@ def test_session_import_falls_back_to_native_agent(tmp_path: Path) -> None:
     assert "conv_new" in result.output
     # First tried the exported id, then fell back to the native agent id.
     assert seen_agent_ids == ["ag_missing", fallback_id]
+    # The retry keeps the import labels.
+    assert seen_labels == [_import_labels("claude")] * 2
+
+
+_USER_ITEM = {
+    "id": "msg_1",
+    "type": "message",
+    "status": "completed",
+    "response_id": "resp_1",
+    "role": "user",
+    "content": [{"type": "input_text", "text": "hi"}],
+}
+
+
+@pytest.mark.parametrize(
+    ("harness", "source", "carry_history"),
+    [
+        ("codex-native", "codex", True),
+        ("claude-native", "claude", True),
+        ("native-pi", "pi", True),
+        ("qwen-native", "qwen", True),
+        ("opencode-native", "opencode", True),
+        ("kimi-native", "kimi", False),
+        ("kiro-native", "kiro", False),
+    ],
+)
+@respx.mock
+def test_session_import_labels_native_transcript_as_import(
+    tmp_path: Path, harness: str, source: str, carry_history: bool
+) -> None:
+    """A native export is labeled as an import; carry-history only where forks carry it."""
+    src = tmp_path / "s.jsonl"
+    _write_export(
+        src,
+        meta={"id": "conv_old", "agent_id": "ag_abc", "harness": harness},
+        items=[_USER_ITEM],
+    )
+    route = respx.post(f"{_BASE}/v1/sessions").mock(
+        return_value=httpx.Response(200, json={"id": "conv_new"})
+    )
+
+    with _patch_server():
+        result = CliRunner().invoke(cli, ["session", "import", "-i", str(src)])
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(route.calls.last.request.content)
+    assert body["labels"] == _import_labels(source, carry_history=carry_history)
+
+
+@pytest.mark.parametrize("harness", ["claude-sdk", "cursor-native"])
+@respx.mock
+def test_session_import_leaves_session_without_import_source_unlabeled(
+    tmp_path: Path, harness: str
+) -> None:
+    """A non-native export, or a native one with no import source, sends no label."""
+    src = tmp_path / "s.jsonl"
+    _write_export(
+        src,
+        meta={"id": "conv_old", "agent_id": "ag_abc", "harness": harness},
+        items=[_USER_ITEM],
+    )
+    route = respx.post(f"{_BASE}/v1/sessions").mock(
+        return_value=httpx.Response(200, json={"id": "conv_new"})
+    )
+
+    with _patch_server():
+        result = CliRunner().invoke(cli, ["session", "import", "-i", str(src)])
+
+    assert result.exit_code == 0, result.output
+    assert "labels" not in json.loads(route.calls.last.request.content)
 
 
 def test_session_import_missing_meta_errors(tmp_path: Path) -> None:

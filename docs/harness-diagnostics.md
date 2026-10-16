@@ -251,8 +251,24 @@ This event covers fresh-thread discovery. A terminal that dies before
 registration uses the `terminal_exit_observed` path described above, since no
 discovery task exists yet; its cause reaches the session's
 `native_terminal_start_failed` error instead of a bridge startup-error marker.
-Earlier app-server process-launch failures, resume failures, and errors after a
-thread starts keep their existing logging.
+Failures to spawn the app-server process, resume failures, and errors after a
+thread starts keep their existing logging. A spawned app-server that never
+becomes ready is covered by the readiness failure snapshot below.
+
+## Codex app-server readiness failure snapshot
+
+When a spawned native Codex app-server fails before `CodexNativeAppServer.start()`
+returns, because it exits early, never accepts the readiness probe within its
+budget, or fails a startup RPC, the launching runner or CLI process emits
+`event_name=codex_app_server_start_failed` at WARNING level before cleanup
+terminates the child. The record carries the process, reader, and stderr
+attributes listed above with `phase=app_server_startup` and `exception_type`
+(the startup exception's class, never its message); it has no thread-discovery
+or terminal fields. The exception still propagates to the caller's existing
+error reporting, so this row precedes the session's `native_terminal_start_failed`
+error or the CLI's startup error. Cancellation emits no event. If the collector
+fails, the row carries `diagnostics_error_type` instead of the snapshot; a
+logging failure cannot replace the startup error or skip teardown.
 
 ## Native turn failure evidence
 
@@ -284,6 +300,13 @@ output, it records `detail_source=missing`.
 | `native_request_id`, `native_error_request_id` | Claude's `requestId` and an unqualified error-body `request_id`, respectively; neither is assumed to be a provider ID |
 | `gateway_request_id`, `provider_request_id` | Only populated when the source explicitly names that ownership |
 | `failure_context_missing_fields` | Comma-separated list of unavailable source fields, including IDs, versions, and inference details |
+
+Claude forwarding failures retain the rejected delivery's `http_status` and,
+when recognized, `forwarder_rejection_reason`. The reason is restricted to
+known tunnel rejection messages and error codes; arbitrary response text and
+validation bodies are omitted because they can echo transcript content.
+The status can be synthesized from a runner-tunnel acknowledgement, so it does
+not establish that a corresponding HTTP request reached the server.
 
 Claude transcript entries marked `isApiErrorMessage` also produce INFO
 `native_failure_observed` events, correlated by Omnigent session/response ID and
@@ -400,6 +423,7 @@ or deleted.
 ```sh
 uv run --no-sync pytest -q tests/harnesses/codex_native/test_codex_native_diagnostics.py tests/runner/test_codex_startup_telemetry.py tests/host/test_connect.py -k 'codex or harness_stderr'
 uv run --no-sync pytest -q tests/harnesses/codex_native/test_codex_native_continuous_diagnostics.py tests/harnesses/codex_native/test_codex_native_app_server_stderr.py
+uv run --no-sync pytest -q tests/harnesses/codex_native/app_server/test_startup.py
 uv run --no-sync pytest -q tests/harnesses/codex_native/test_codex_native_logging_env.py tests/test_harness_diagnostics.py
 uv run --no-sync pytest -q tests/inner/test_terminal.py tests/runner/test_terminal_startup_exit.py
 uv run --no-sync pytest -q tests/e2e/test_codex_continuous_diagnostics_e2e.py
@@ -458,8 +482,9 @@ excerpt. Registered Codex exit records still include their existing screen-only
 excerpt in either mode. The CLI's separate terminal-readiness wait is unchanged.
 
 After deploying the runner, filter the debug-log table by the incident time
-window, exact session ID, and `event_name = 'codex_thread_start_failed'`.
-Confirm `stderr_capture_enabled = 'True'` for an opted-in runner and compare
+window, exact session ID, and `event_name = 'codex_thread_start_failed'`, or
+`event_name = 'codex_app_server_start_failed'` for an app-server that never
+became ready. Confirm `stderr_capture_enabled = 'True'` for an opted-in runner and compare
 the process and reader states with its tail. With the flag unset or `0`, confirm
 `stderr_capture_enabled = 'False'` and no `stderr_tail` attribute. A row with
 `stderr_reader_state = 'failed'` and `stderr_reader_error_type = 'ValueError'`

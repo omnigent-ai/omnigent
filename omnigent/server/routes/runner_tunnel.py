@@ -49,6 +49,7 @@ from omnigent.server import managed_host_keepalive, session_live_state, shutdown
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.tunnel_handshake import receive_tunnel_hello
 
 _logger = logging.getLogger(__name__)
 
@@ -505,7 +506,9 @@ def create_runner_tunnel_router(
 
         try:
             # 3. Receive hello frame.
-            raw = await ws.receive_text()
+            raw = await receive_tunnel_hello(ws, peer_kind="runner", peer_id=runner_id)
+            if raw is None:
+                return
             frame = decode_frame(raw)
             if not isinstance(frame, HelloFrame):
                 await ws.close(code=4001, reason="expected hello frame")
@@ -658,6 +661,8 @@ def create_runner_tunnel_router(
 
         except WebSocketDisconnect as exc:
             shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
+            if session is not None:
+                session.peer_close_reason = getattr(exc, "reason", None) or None
             _logger.warning(
                 "Runner %s websocket disconnected (code=%s, reason=%r)",
                 runner_id,

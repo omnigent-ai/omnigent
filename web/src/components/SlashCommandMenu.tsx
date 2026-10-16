@@ -19,6 +19,7 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/context": "Show context window usage for this session",
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name>",
+  "/new": "Start a blank session in the same project",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
   "/side":
     "Start a side chat: an ephemeral fork opened as its own sub-agent chat, kept out of this conversation",
@@ -26,7 +27,6 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
 };
 
 const DEFAULT_BUILTIN_NAMES = new Set(Object.keys(BUILTIN_SLASH_COMMANDS));
-
 // First token must read as a command name (`/cross-review`,
 // `/dev-productivity:simplify`) — letters/digits then word chars, `:`, `-`.
 // The leading `/` is the only slash allowed IN THE NAME, so file paths like

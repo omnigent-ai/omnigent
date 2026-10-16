@@ -95,3 +95,55 @@ it("a cancel from the shell (workspace picker closed) fails the terminal with Re
   expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
   expect(screen.queryByText(/server ready/i)).not.toBeInTheDocument();
 });
+
+it("shows manual instructions without an installer and detects the CLI after installation", async () => {
+  const getCliStatus = vi
+    .fn()
+    .mockResolvedValueOnce({ installed: false, installSupported: false })
+    .mockResolvedValueOnce({ installed: false, installSupported: false })
+    .mockResolvedValueOnce({ installed: true, installSupported: false });
+  const startLocalServer = vi.fn().mockResolvedValue({ ok: true, url: "http://localhost:6767/" });
+  const installCli = vi.fn();
+  const setServerUrl = vi.fn().mockResolvedValue({});
+  stubBridge({
+    getRecentServers: async () => [],
+    getCliStatus,
+    startLocalServer,
+    installCli,
+    setServerUrl,
+  });
+  render(<BridgeSetupApp />);
+  fireEvent.click(await screen.findByRole("button", { name: /get started locally/i }));
+  fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+  expect(screen.getByRole("link", { name: "Installation instructions" })).toHaveAttribute(
+    "href",
+    "https://omnigent.ai/quickstart/install#install-omnigent",
+  );
+  expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
+  expect(installCli).not.toHaveBeenCalled();
+  expect(startLocalServer).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+  await screen.findByRole("alert");
+  expect(startLocalServer).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+  await waitFor(() => expect(setServerUrl).toHaveBeenCalledWith("http://localhost:6767/"));
+  expect(installCli).not.toHaveBeenCalled();
+  expect(startLocalServer).toHaveBeenCalledOnce();
+});
+
+it("keeps remote connections available without a CLI or installer", async () => {
+  const setServerUrl = vi.fn().mockResolvedValue({});
+  const startLocalServer = vi.fn();
+  const installCli = vi.fn();
+  stubBridge({
+    getCliStatus: async () => ({ installed: false, installSupported: false }),
+    setServerUrl,
+    startLocalServer,
+    installCli,
+  });
+  render(<BridgeSetupApp />);
+  fireEvent.click(await screen.findByRole("button", { name: "Open Omnigent" }));
+  await waitFor(() => expect(setServerUrl).toHaveBeenCalledOnce());
+  expect(startLocalServer).not.toHaveBeenCalled();
+  expect(installCli).not.toHaveBeenCalled();
+});

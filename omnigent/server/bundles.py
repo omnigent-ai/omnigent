@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import posixpath
 import tarfile
 import tempfile
@@ -15,7 +16,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import generate_agent_id, uploaded_agent_id
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec import AgentSpec, ExtractionError, ToolRuntime, load
 
@@ -24,34 +25,16 @@ if TYPE_CHECKING:
     from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.artifact_store import ArtifactStore
 
+_logger = logging.getLogger(__name__)
+
 
 def _is_dotted_callable_path(path: str) -> bool:
-    """Whether a local-tool ``path`` is a dotted Python *import* path.
-
-    A server-side ``callable:`` tool carries a dotted import path such as
-    ``"subprocess.check_output"`` that the runner resolves with
-    ``importlib.import_module`` and then invokes (see
-    ``omnigent.runner.tool_dispatch._resolve_spec_callable``) — the
-    GHSA-756x runner-RCE sink. Bundled tool *files* instead carry a
-    bundle-relative filesystem path (``"tools/python/arxiv_search.py"``),
-    distinguished by a ``/`` separator or a source-file suffix; those run
-    the bundle's own shipped code rather than importing an arbitrary
-    server-installed module, so they are out of scope here.
-    """
+    """Distinguish dotted Python imports from bundle-relative tool files."""
     return "/" not in path and not path.endswith((".py", ".ts")) and "." in path
 
 
 def _reject_uploaded_callable_tools(spec: AgentSpec) -> None:
-    """Reject server-side Python ``callable:`` tools in an untrusted upload.
-
-    Recurses into sub-agents — each is a full :class:`AgentSpec` with its
-    own ``local_tools`` — mirroring the handler-allowlist guard's sub-agent
-    coverage so a malicious callable can't hide in a child agent.
-
-    :param spec: The parsed (sub-)agent spec to scan.
-    :raises OmnigentError: If any (sub-)agent declares a server-runtime tool
-        whose ``path`` is a dotted import path.
-    """
+    """Reject server-side callable and source-file tools in untrusted bundles."""
     for tool in spec.local_tools:
         if (
             tool.runtime == ToolRuntime.SERVER
@@ -63,6 +46,19 @@ def _reject_uploaded_callable_tools(spec: AgentSpec) -> None:
                 f"callable tool (tool {tool.name!r} -> {tool.path!r}); a "
                 "'callable:' tool imports and runs operator-trusted code on "
                 "the runner, so it is rejected from untrusted uploads",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # Source-file tools also require operator-authored bundles.
+        if (
+            tool.runtime == ToolRuntime.SERVER
+            and tool.path is not None
+            and tool.path.endswith((".py", ".ts"))
+        ):
+            raise OmnigentError(
+                "uploaded agent bundle may not ship a server-side Python/TS "
+                f"tool file (tool {tool.name!r} -> {tool.path!r}); its module "
+                "body is imported and executed in-process on the runner at tool "
+                "discovery, so it is rejected from untrusted uploads",
                 code=ErrorCode.INVALID_INPUT,
             )
     for sub in spec.sub_agents:
@@ -137,7 +133,7 @@ def validate_agent_bundle(
     :raises OmnigentError: If the bundle is invalid, the spec is
         missing a name, or (when *enforce_handler_allowlist*) a policy
         names an unregistered handler, ``os_env.cwd`` is an absolute or
-        escaping path, or a tool declares a server-side Python ``callable:``.
+        escaping path, or a tool declares a server-side callable or Python/TS source file.
     """
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -151,6 +147,10 @@ def validate_agent_bundle(
         raise
     except ExtractionError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    except OSError:
+        raise OmnigentError(
+            "Agent bundle validation failed", code=ErrorCode.INTERNAL_ERROR
+        ) from None
     except Exception as exc:
         # Catch YAML parse errors and other unexpected failures
         # during spec loading so they surface as 400, not 500.
@@ -174,12 +174,7 @@ def validate_agent_bundle(
         # Terminals and nested agents can override the session working directory.
         _reject_uploaded_escaping_cwd(spec)
 
-        # Untrusted uploads may not declare server-side Python ``callable:``
-        # tools (GHSA-756x-9hf6-q4h4): the runner imports the dotted path and
-        # invokes it, so a bundle pointing one at e.g. ``subprocess.check_output``
-        # is authenticated RCE on shared runner infrastructure. Bundled tool
-        # *files* (``tools/python/*.py``) are unaffected: they ship the agent's
-        # own code, not an arbitrary server-installed module.
+        # Server-side callables and source-file tools require operator-authored bundles.
         _reject_uploaded_callable_tools(spec)
 
     return spec
@@ -200,7 +195,15 @@ def agent_needs_own_copy(agent: Agent, user_id: str | None) -> bool:
 
 def copy_agent_bundle(artifact_store: ArtifactStore, location: str, new_agent_id: str) -> str:
     """Store a copy of the bundle at *location* under *new_agent_id*; return its location."""
-    data = artifact_store.get(location)
+    try:
+        data = artifact_store.get(location)
+    except KeyError as exc:
+        _logger.warning(
+            "agent bundle %s is missing from the artifact store; cannot copy it", location
+        )
+        raise OmnigentError(
+            SESSION_AGENT_BUNDLE_MISSING_MESSAGE, code=ErrorCode.SESSION_AGENT_MISSING
+        ) from exc
     new_location = bundle_location(new_agent_id, data)
     artifact_store.put(new_location, data)
     return new_location
@@ -354,5 +357,9 @@ def uploaded_agent_for(
             and agent.name == name
             and agent.bundle_location == location
         ):
+            # The blob can vanish while the row survives (pruned artifacts, a DB
+            # restored without its store); this upload holds the same files.
+            if not artifact_store.exists(location):
+                artifact_store.put(location, bundle_bytes)
             return agent
     return None

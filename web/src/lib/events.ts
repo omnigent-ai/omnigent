@@ -10,6 +10,7 @@
 
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type {
+  AgyPermission,
   BackgroundTaskInfo,
   CodexPersistMode,
   ErrorInfo,
@@ -280,6 +281,8 @@ export interface ElicitationRequest {
   rememberScope?: RememberScope | null;
   /** Codex-native MCP approval persistence modes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
+  /** Optional Antigravity action description and advertised persist pattern. */
+  agyPermission?: AgyPermission | null;
 }
 
 /**

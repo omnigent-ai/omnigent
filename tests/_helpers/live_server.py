@@ -46,7 +46,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,6 +108,38 @@ def local_server_env(
     return env
 
 
+def isolated_process_env(
+    home: Path, overrides: Mapping[str, str | None], base_env: Mapping[str, str] | None
+) -> dict[str, str]:
+    """Build an isolated runtime environment; None overrides remove inherited keys."""
+    if {"HOME", "OMNIGENT_DATA_DIR"} & overrides.keys():
+        raise ValueError("HOME and OMNIGENT_DATA_DIR are owned by the isolated stack")
+    env = local_server_env({}, base_env=base_env)
+    # Keep the suite's private harness root so this runtime never sweeps a live one.
+    harness_tmp_parent = env.get("OMNIGENT_HARNESS_TMP_PARENT")
+    # A parent runner's identity, zygote FDs and logging paths cannot belong to
+    # this fresh runtime. Tests opt into their required settings explicitly.
+    for name in list(env):
+        if name.startswith("OMNIGENT") or name == "RUNNER_SERVER_URL":
+            env.pop(name)
+    if harness_tmp_parent is not None:
+        env["OMNIGENT_HARNESS_TMP_PARENT"] = harness_tmp_parent
+    env.update(
+        HOME=str(home),
+        OMNIGENT_DATA_DIR=str(home / ".omnigent"),
+        OMNIGENT_AUTH_PROVIDER="header",
+        OMNIGENT_LOCAL_SINGLE_USER="1",
+        OMNIGENT_DISABLE_CATALOG_LOOKUP="1",
+        OMNIGENT_DISABLE_TELEMETRY="1",
+    )
+    for name, value in overrides.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
+    return env
+
+
 def terminate_process(proc: subprocess.Popen[bytes] | subprocess.Popen[str] | None) -> None:
     """Reap a running child, escalating SIGTERM to SIGKILL after ten seconds."""
     if proc is None or proc.poll() is not None:
@@ -127,13 +159,22 @@ def isolated_local_server(
     bootstrap: str = "from omnigent.cli import main\n\nmain()\n",
     poll_interval: float = 0.5,
     health_timeout: float = 120.0,
+    env: Mapping[str, str | None] | None = None,
+    base_env: Mapping[str, str] | None = None,
+    extra_args: Sequence[str] = (),
+    cwd: Path | None = None,
 ) -> Iterator[str]:
-    """Run this checkout's single-user server; yield its URL and retain server.log.
+    """Run this checkout's server; yield its URL and retain server.log.
 
     Supply a bootstrap only when the scenario needs a fault installed before
-    the CLI starts. Existing profile/compatibility tests should use
+    the CLI starts. Defaults to single-user header auth; env can override or
+    remove defaults (None removes a key). Extra CLI args configure agents, etc.
+    HOME and data belong to this server. Existing profile/compatibility tests should use
     :func:`start_live_server` instead.
     """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    home = tmp_path / "server-home"
+    home.mkdir(exist_ok=True)
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     log_path = tmp_path / "server.log"
@@ -152,8 +193,10 @@ def isolated_local_server(
                 f"sqlite:///{tmp_path / 'chat.db'}",
                 "--artifact-location",
                 str(tmp_path / "artifacts"),
+                *extra_args,
             ],
-            env=local_server_env({}),
+            env=isolated_process_env(home, env or {}, base_env),
+            cwd=cwd,
             stdout=log,
             stderr=subprocess.STDOUT,
         )

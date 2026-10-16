@@ -23,6 +23,7 @@ import logging
 import subprocess
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -57,6 +58,10 @@ from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.host_registry import HostConnection
+from omnigent.server.routes._host_launch import (
+    LAUNCH_TIMEOUT_ENV_VAR,
+    resolve_launch_timeout_s,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -675,6 +680,91 @@ async def test_inline_launch_failure_still_returns_bound_session(
         "runner binding should persist even when the host reports launch failure"
     )
     assert conv.host_id == _HOST_ID
+
+
+@pytest.fixture
+def _uncached_launch_budget() -> Iterator[None]:
+    """Let a test set the launch budget, and leave no cached value behind.
+
+    :func:`resolve_launch_timeout_s` caches for the process lifetime, so
+    clearing on the way out matters even when the test fails.
+    """
+    resolve_launch_timeout_s.cache_clear()
+    try:
+        yield
+    finally:
+        resolve_launch_timeout_s.cache_clear()
+
+
+async def test_inline_launch_timeout_honors_the_configured_budget(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    _uncached_launch_budget: None,
+) -> None:
+    """A launch that never answers is failed at the CONFIGURED budget, not the
+    built-in 30s.
+
+    Launches that build a container sandbox, pull an image or start the app the
+    agent will test legitimately run past 30s, and failing them loses a session
+    nothing was wrong with. The budget is operator-tunable; this pins that the
+    inline create path reads it. Driven downward (1s) so the assertion is fast —
+    the same wiring is what lets a deployment drive it upward.
+    """
+    monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, "1")
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+
+    async def _answer_stat_but_never_the_launch() -> None:
+        """Validate the workspace, then leave the launch unanswered."""
+        deadline = Deadline(30.0)
+        for _ in range(40):
+            output = await comm.receive_output(timeout=deadline.next_wait(30.0))
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostStatFrame):
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostStatResultFrame(
+                                request_id=frame.request_id,
+                                status="ok",
+                                exists=True,
+                                type="directory",
+                                canonical_path=frame.path,
+                            )
+                        ),
+                    }
+                )
+            elif isinstance(frame, HostLaunchRunnerFrame):
+                return
+        raise AssertionError("host never received a launch frame from the inline path")
+
+    responder = asyncio.create_task(_answer_stat_but_never_the_launch())
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        resp = await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+        )
+    elapsed = time.monotonic() - started
+    await responder
+
+    # Lenient inline contract: the create still returns the bound session.
+    assert resp.status_code == 201, f"expected 201 despite launch timeout, got {resp.status_code}"
+    # The point of the test: it gave up at the configured 1s, so the
+    # hard-coded 30s is no longer what bounds a launch. Unscaled on purpose:
+    # a CI-scaled budget would exceed 30s and pass against the old wait.
+    assert elapsed < 20.0, (
+        f"create waited {elapsed:.1f}s — the configured launch budget was ignored"
+    )
+    assert "host launch timed out after 1s" in caplog.text
+    assert LAUNCH_TIMEOUT_ENV_VAR in caplog.text, (
+        "the timeout error should name the override so an operator can raise it"
+    )
 
 
 @pytest.mark.parametrize("disconnect", [False, True], ids=["replaced", "disconnected"])
@@ -1412,6 +1502,46 @@ async def test_stop_session_stops_host_launched_runner(
     )
 
 
+@pytest.mark.parametrize("runner_status", ["alive", "dead", "unknown", "offline", None])
+async def test_stop_session_requires_confirmed_host_runner_exit(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: str | None,
+) -> None:
+    """An unacknowledged stop succeeds only when the host confirms the runner is gone."""
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_events
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    if runner_status == "offline":
+        await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+        await comm.wait(timeout=budget(5.0))
+    monkeypatch.setattr(sessions, "_stop_session_via_runner", AsyncMock(return_value=True))
+    host_stop = AsyncMock(return_value=False)
+    status_query = AsyncMock(return_value=runner_status)
+    monkeypatch.setattr(routes_events, "_stop_host_runner_intentionally", host_stop)
+    monkeypatch.setattr(routes_events, "_query_host_runner_status", status_query)
+    stopped = runner_status in {"dead", "unknown"}
+    try:
+        for _ in range(2 if stopped else 1):
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events", json={"type": "stop_session"}
+            )
+            assert response.status_code == (202 if stopped else 503), response.text
+        if runner_status == "offline":
+            status_query.assert_not_awaited()
+        else:
+            assert status_query.await_args.args[2] == session["runner_id"]
+        if not stopped:
+            assert session_id in routes_events._interrupt_fenced_sessions
+        assert host_stop.await_count == (2 if stopped else 1)
+    finally:
+        routes_events._interrupt_fenced_sessions.discard(session_id)
+
+
 async def test_stopped_host_session_writes_no_label_and_host_stays_online(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -2025,7 +2155,11 @@ async def test_native_message_relaunch_unanswered_launch_is_not_host_offline_whi
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A launch the host never answered is not called offline while the host is connected."""
+    """A launch the connected host never answered refuses the send instead of failing the turn.
+
+    Nothing shows a runner failed to start, so the message is not consumed and the
+    host is not called offline; the client keeps the message to resend.
+    """
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import helpers as sessions_helpers
     from omnigent.server.routes.sessions import routes_events
@@ -2044,11 +2178,12 @@ async def test_native_message_relaunch_unanswered_launch_is_not_host_offline_whi
         with contextlib.suppress(asyncio.CancelledError, Exception):
             _ = await responder
 
-    assert response.status_code == 202, response.text
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "runner_unavailable"
     assert app.state.host_registry.get(_HOST_ID) is not None
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
-    errors = [item for item in items if item["type"] == "error"]
-    assert [item["message"] for item in errors] == [_RUNNER_NOT_AVAILABLE]
+    assert [item for item in items if item["type"] in ("error", "message")] == []
+    assert (await client.get(f"/v1/sessions/{session_id}")).json()["status"] != "failed"
     assert [e.attributes["outcome"] for e in _runner_client_wait_events(caplog)] == [
         "never_connected"
     ]
@@ -2156,10 +2291,17 @@ async def test_message_relaunch_pre_connect_exit_withholds_log_tail_from_non_own
     real_record = RunnerExitReports.record
 
     def _record_as_host_owner(
-        self: RunnerExitReports, runner_id: str, error: str, owner: str | None
+        self: RunnerExitReports,
+        runner_id: str,
+        error: str,
+        owner: str | None,
+        *,
+        had_connected: bool | None = None,
     ) -> None:
         del owner
-        real_record(self, runner_id, error, owner="host-owner@example.com")
+        real_record(
+            self, runner_id, error, owner="host-owner@example.com", had_connected=had_connected
+        )
 
     monkeypatch.setattr(RunnerExitReports, "record", _record_as_host_owner)
     monkeypatch.setattr(
