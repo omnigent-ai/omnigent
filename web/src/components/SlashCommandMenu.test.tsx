@@ -193,3 +193,12 @@ describe("skill display name matching", () => {
     expect(rankedSlashCommandNames(commands, "simplified", new Set())).toEqual([]);
   });
 });
+
+describe("menu surface", () => {
+  it("blurs what sits behind it so a translucent dark popover does not ghost the transcript", () => {
+    // The built-in dark palettes give --popover an alpha; without a backdrop
+    // blur the transcript lines behind the floating menu read through it.
+    const { container } = render(<SlashCommandMenu {...props} />);
+    expect(container.firstElementChild).toHaveClass("backdrop-blur-md");
+  });
+});

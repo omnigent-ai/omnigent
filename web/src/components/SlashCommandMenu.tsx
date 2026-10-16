@@ -284,7 +284,7 @@ export function SlashCommandMenu({
   // with section headers and icon + name + inline description rows. No separate
   // detail card — each row is self-describing.
   return (
-    <div className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu">
+    <div className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu backdrop-blur-md">
       <div ref={listRef} className="max-h-80 overflow-y-auto">
         {builtinRows.length > 0 && sectionHeader("Commands")}
         {builtinRows.map((row) => (
