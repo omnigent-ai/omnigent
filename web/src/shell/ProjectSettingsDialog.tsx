@@ -441,14 +441,14 @@ export function ProjectSettingsDialog({
           {useWorktree && (
             <Field
               label="Base branch"
-              hint="Branch new worktrees fork from; blank uses the current branch"
+              hint="Branch new worktrees fork from; a remote branch such as origin/main is fetched first. Blank uses the current branch."
               htmlFor="project-settings-base-branch"
             >
               <input
                 id="project-settings-base-branch"
                 data-testid="project-settings-base-branch"
                 className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                placeholder="e.g. main"
+                placeholder="e.g. origin/main"
                 value={baseBranch}
                 onChange={(e) => setBaseBranch(e.target.value)}
                 disabled={isLoading}
