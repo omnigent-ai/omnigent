@@ -8,7 +8,7 @@ import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import psutil
 import pytest
@@ -73,6 +73,168 @@ async def test_start_reuses_initialized_readiness_client_for_hook_trust(
         assert startup_client.close_calls == 1
     finally:
         await server.close()
+
+
+async def test_start_respawns_on_silent_startup_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Silent startup timeout triggers respawn; second attempt succeeds."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+    async def _supported_version(_codex_path: str) -> tuple[int, int, int]:
+        return (0, 147, 0)
+
+    startup_client = _FakeStartupClient()
+    readiness_calls = []
+
+    async def _ready_with_respawn(_self: CodexNativeAppServer) -> _FakeStartupClient:
+        readiness_calls.append(len(readiness_calls) + 1)
+        if len(readiness_calls) == 1:
+            # First call: process alive, never listened.
+            proc_mock = AsyncMock()
+            proc_mock.returncode = None
+            proc_mock.wait = AsyncMock()
+            _self.proc = proc_mock
+            _self.recent_stderr = []
+            raise codex_native_app_server.CodexAppServerSilentStartTimeout(
+                "Timed out after 60s waiting for the Codex app-server at unix://socket: "
+                "None; stderr=",
+                0,
+            )
+        # Second call: success.
+        return startup_client
+
+    async def _trust(
+        _self: CodexNativeAppServer, *, client: CodexAppServerClient | None = None
+    ) -> None:
+        pass
+
+    monkeypatch.setattr(codex_native_app_server, "_codex_cli_version", _supported_version)
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _ready_with_respawn)
+    monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _trust)
+
+    # Track spawn and kill calls.
+    spawn_calls = []
+    kill_calls = []
+
+    async def _spawn_spy(self, resolved_listen):
+        spawn_calls.append(resolved_listen)
+        # Don't actually spawn; just set a mock proc.
+        proc_mock = AsyncMock()
+        proc_mock.returncode = None
+        proc_mock.wait = AsyncMock()
+        self.proc = proc_mock
+        self.recent_stderr = []
+        self.stderr_task = None
+
+    monkeypatch.setattr(CodexNativeAppServer, "_spawn_app_server_process", _spawn_spy)
+
+    def _terminate_spy(proc):
+        kill_calls.append(proc)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._terminate_process_tree", _terminate_spy
+    )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._kill_process_tree", lambda *args: None
+    )
+
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+
+    # Mock process registry.
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.unregister_codex_native_process",
+        lambda *args: None,
+    )
+
+    await server.start()
+    try:
+        # Verify: spawn called twice (initial + respawn), readiness called twice.
+        assert len(spawn_calls) == 2
+        assert len(readiness_calls) == 2
+        assert len(kill_calls) == 1  # First proc killed once.
+    finally:
+        await server.close()
+
+
+async def test_start_fails_on_second_silent_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Second silent timeout raises RuntimeError (not respawned again)."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+    async def _supported_version(_codex_path: str) -> tuple[int, int, int]:
+        return (0, 147, 0)
+
+    async def _always_timeout(_self: CodexNativeAppServer) -> _FakeStartupClient:
+        # Both attempts timeout with process alive.
+        proc_mock = AsyncMock()
+        proc_mock.returncode = None
+        proc_mock.wait = AsyncMock()
+        _self.proc = proc_mock
+        _self.recent_stderr = []
+        raise codex_native_app_server.CodexAppServerSilentStartTimeout(
+            "Timed out after 60s waiting for the Codex app-server at unix://socket: None; stderr=",
+            0,
+        )
+
+    async def _trust(
+        _self: CodexNativeAppServer, *, client: CodexAppServerClient | None = None
+    ) -> None:
+        pass
+
+    monkeypatch.setattr(codex_native_app_server, "_codex_cli_version", _supported_version)
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _always_timeout)
+    monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _trust)
+
+    async def _spawn_noop(self, resolved_listen):
+        proc_mock = AsyncMock()
+        proc_mock.returncode = None
+        proc_mock.wait = AsyncMock()
+        self.proc = proc_mock
+        self.recent_stderr = []
+        self.stderr_task = None
+
+    monkeypatch.setattr(CodexNativeAppServer, "_spawn_app_server_process", _spawn_noop)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._terminate_process_tree", lambda *args: None
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._kill_process_tree", lambda *args: None
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.unregister_codex_native_process",
+        lambda *args: None,
+    )
+
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+
+    # Second timeout should raise CodexAppServerSilentStartTimeout (same message), not retry again.
+    with pytest.raises(codex_native_app_server.CodexAppServerSilentStartTimeout):
+        await server.start()
 
 
 async def test_start_cancellation_closes_reused_client_and_app_server(

@@ -186,6 +186,18 @@ _MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION = (0, 154, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
+class CodexAppServerSilentStartTimeout(RuntimeError):
+    """App-server timed out with process alive and never listening.
+
+    Same message as RuntimeError timeout, but signals to start() that the
+    process is still alive and can be respawned.
+    """
+
+    def __init__(self, message: str, stderr_bytes: int) -> None:
+        super().__init__(message)
+        self.stderr_bytes = stderr_bytes
+
+
 @dataclass(frozen=True)
 class _CodexModelDiscoveryProcess:
     """Short-lived Codex process plus its bounded stderr drain."""
@@ -2019,6 +2031,62 @@ class CodexNativeAppServer:
     certificate_failure: CertificateFailure | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
 
+    async def _spawn_app_server_process(self, resolved_listen: str) -> None:
+        """
+        Spawn the Codex app-server subprocess and start the stderr drain.
+
+        Allocates a process registry tag, builds the argv, acquires the
+        owner lock, spawns the subprocess, registers it, and starts the
+        stderr background task. This is a self-contained unit for both
+        the initial spawn and respawn.
+
+        :param resolved_listen: Resolved listen URL (unix:// or ws://).
+        :returns: None.
+        :raises: On subprocess creation or owner lock failure.
+        """
+        self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
+        tagged_argv0 = (
+            f"{Path(self.codex_path).name} "
+            f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
+        )
+        argv = _build_native_codex_app_server_argv(
+            tagged_argv0=tagged_argv0,
+            listen_url=resolved_listen,
+            config_overrides=self.config_overrides,
+        )
+        proc_env = codex_app_server_diagnostic_env(
+            {**self.env, "CODEX_HOME": str(self.codex_home)}
+        )
+        self.process_owner_lock = acquire_codex_native_process_owner_lock()
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=proc_env,
+                cwd=str(self.cwd),
+                executable=self.codex_path,
+                **_proc.spawn_kwargs(),
+            )
+        except BaseException:
+            if self.process_owner_lock is not None:
+                self.process_owner_lock.close()
+                self.process_owner_lock = None
+            raise
+        if self.process_owner_lock is not None:
+            register_codex_native_process(
+                pid=self.proc.pid,
+                pgid=_process_group_id(self.proc),
+                session_tag=self.process_registry_tag,
+                owner_lock_path=self.process_owner_lock.path,
+            )
+        self.recent_stderr = []
+        self.stderr_task = asyncio.create_task(
+            self._stderr_loop(),
+            name="codex-native-app-server-stderr",
+        )
+
     async def start(self) -> None:
         """
         Start the Codex app-server and wait for the socket.
@@ -2192,48 +2260,7 @@ class CodexNativeAppServer:
         effort_catalog_transport = self.listen_url or str(self.socket_path)
         _effort_catalog_cache.pop(effort_catalog_transport, None)
         _effort_catalog_misses.pop(effort_catalog_transport, None)
-        self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
-        tagged_argv0 = (
-            f"{Path(self.codex_path).name} "
-            f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
-        )
-        argv = _build_native_codex_app_server_argv(
-            tagged_argv0=tagged_argv0,
-            listen_url=resolved_listen,
-            config_overrides=self.config_overrides,
-        )
-        proc_env = codex_app_server_diagnostic_env(
-            {**self.env, "CODEX_HOME": str(self.codex_home)}
-        )
-        self.process_owner_lock = acquire_codex_native_process_owner_lock()
-        try:
-            self.proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-                env=proc_env,
-                cwd=str(self.cwd),
-                executable=self.codex_path,
-                **_proc.spawn_kwargs(),
-            )
-        except BaseException:
-            if self.process_owner_lock is not None:
-                self.process_owner_lock.close()
-                self.process_owner_lock = None
-            raise
-        if self.process_owner_lock is not None:
-            register_codex_native_process(
-                pid=self.proc.pid,
-                pgid=_process_group_id(self.proc),
-                session_tag=self.process_registry_tag,
-                owner_lock_path=self.process_owner_lock.path,
-            )
-        self.recent_stderr = []
-        self.stderr_task = asyncio.create_task(
-            self._stderr_loop(),
-            name="codex-native-app-server-stderr",
-        )
+        await self._spawn_app_server_process(resolved_listen)
         # Ordering invariant: hooks.json is written before the spawn above,
         # and the trust handshake must complete before the first turn — codex
         # resolves trust when it dispatches a hook, so trust landing after the
@@ -2248,7 +2275,43 @@ class CodexNativeAppServer:
         # blocking session creation (fail-open). ``BaseException`` on the
         # outer guard so a cancellation mid-trust still tears down.
         try:
-            startup_client = await self._wait_until_ready()
+            try:
+                startup_client = await self._wait_until_ready()
+            except CodexAppServerSilentStartTimeout as silent:
+                # A loaded host can leave a fresh app-server silent; a second spawn listens.
+                _logger.warning(
+                    "Codex app-server never listened and is still running (stderr_bytes=%d); "
+                    "respawning it once on a fresh port",
+                    silent.stderr_bytes,
+                )
+                silent_proc = self.proc
+                if silent_proc is not None:
+                    _terminate_process_tree(silent_proc)
+                    try:
+                        await asyncio.wait_for(silent_proc.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        _kill_process_tree(silent_proc)
+                        await silent_proc.wait()
+                if self.process_registry_tag is not None:
+                    unregister_codex_native_process(self.process_registry_tag)
+                if self.process_owner_lock is not None:
+                    self.process_owner_lock.close()
+                    self.process_owner_lock = None
+                if self.stderr_task is not None:
+                    self.stderr_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self.stderr_task
+                if self.listen_url and self.listen_url.startswith("ws://"):
+                    port = _allocate_loopback_port()
+                    resolved_listen = f"ws://127.0.0.1:{port}"
+                    self.listen_url = resolved_listen
+                else:
+                    with contextlib.suppress(FileNotFoundError):
+                        self.socket_path.unlink()
+                    resolved_listen = f"unix://{self.socket_path}"
+                # The second spawn gets its own full readiness budget.
+                await self._spawn_app_server_process(resolved_listen)
+                startup_client = await self._wait_until_ready()
             try:
                 # Standalone CLI launches may have no shared catalog snapshot.
                 # Correct their copied defaults before a TUI creates its thread.
@@ -2516,8 +2579,11 @@ class CodexNativeAppServer:
         flight when it expires is not interrupted.
 
         :returns: Connected app-server client. The caller owns it.
-        :raises RuntimeError: If the app-server exits or never
-            becomes ready within ``_APP_SERVER_READY_TIMEOUT_SECONDS``.
+        :raises CodexAppServerSilentStartTimeout: If the app-server times out
+            while its process is still alive (never listened). The caller can
+            respawn once and retry.
+        :raises RuntimeError: If the app-server exits early (real failure) or
+            times out after respawn.
         """
         deadline = asyncio.get_running_loop().time() + _APP_SERVER_READY_TIMEOUT_SECONDS
         last_error: Exception | None = None
@@ -2550,12 +2616,18 @@ class CodexNativeAppServer:
                     with contextlib.suppress(Exception):
                         await client.close()
                 await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
+
         detail = " | ".join((self.recent_stderr or [])[-5:])
         target = self.listen_url or f"unix://{self.socket_path}"
-        raise RuntimeError(
+        message = (
             f"Timed out after {_APP_SERVER_READY_TIMEOUT_SECONDS:g}s waiting for the "
             f"Codex app-server at {target}: {last_error}; stderr={detail}"
         )
+        # Still running but never listened: start() can respawn it once.
+        if self.proc is not None and self.proc.returncode is None:
+            stderr_bytes = sum(len(line.encode("utf-8")) for line in (self.recent_stderr or []))
+            raise CodexAppServerSilentStartTimeout(message, stderr_bytes)
+        raise RuntimeError(message)
 
     async def _stderr_loop(self) -> None:
         """
