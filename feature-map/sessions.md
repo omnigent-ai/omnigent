@@ -102,7 +102,9 @@ the header menu), and each place is a separate entry point.
   last 10 seconds before they leave it. Errors and approvals bypass that delay.
   This only affects grouping, and existing hover/rename holds still apply.
   Created and Updated group by their respective date, independently of ordering,
-  with headings such as “Created today” and “Updated yesterday”. All groupings replace
+  with the Created/Updated prefix only on the first date section, followed by
+  headings such as “Yesterday” and “Earlier”. Environment metadata shows an icon
+  with its label available to screen readers. All groupings replace
   Projects, Shared and Sessions with titled groups; the first group's header takes
   the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
   the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps

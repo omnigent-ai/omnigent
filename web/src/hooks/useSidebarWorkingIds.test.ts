@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { Conversation } from "./useConversations";
 import { useSidebarWorkingIds } from "./useSidebarWorkingIds";
 
-const idle: Conversation = {
+const idle: Conversation = Object.freeze({
   id: "session",
   object: "conversation",
   title: "Session",
@@ -12,7 +12,7 @@ const idle: Conversation = {
   labels: {},
   permission_level: null,
   status: "idle",
-};
+});
 const running: Conversation = { ...idle, status: "running" };
 
 beforeEach(() => vi.useFakeTimers());
@@ -42,7 +42,6 @@ it("enters Working immediately and requires ten uninterrupted idle seconds per s
   expect(result.current.has(idle.id)).toBe(true);
   act(() => vi.advanceTimersByTime(1));
   expect([...result.current]).toEqual([]);
-  expect(idle.status).toBe("idle");
 });
 
 it("holds startup and clears timers when disabled, removed, or unmounted", () => {

@@ -2868,9 +2868,20 @@ function ConversationList({
                           {sessionGroups.map((group, index) => (
                             <ConversationSection
                               key={group.title}
-                              title={group.title}
+                              title={
+                                index === 0
+                                  ? group.title
+                                  : group.title.replace(
+                                      /^(?:Created|Updated) (.)/,
+                                      (_, initial: string) => initial.toUpperCase(),
+                                    )
+                              }
                               conversations={group.conversations}
-                              emptyMessage={group.title === "Working" ? "No sessions" : undefined}
+                              emptyMessage={
+                                group.title === "Working" && !sessionStatus
+                                  ? emptyMessage
+                                  : undefined
+                              }
                               footer={
                                 index === sessionGroups.length - 1 ? sessionStatus : undefined
                               }
@@ -4296,7 +4307,7 @@ function SessionMetaLine({
           {i > 0 && <span aria-hidden>·</span>}
           <span className="flex min-w-0 items-center gap-1">
             <Icon aria-hidden className="size-3.5 shrink-0" />
-            <span className="truncate">{value}</span>
+            <span className={key === "environment" ? "sr-only" : "truncate"}>{value}</span>
           </span>
         </Fragment>
       ))}

@@ -3077,6 +3077,10 @@ describe("Sidebar view options", () => {
     "Updated in the last 7 days",
     "Updated in the last 30 days",
     "Updated earlier",
+    "Yesterday",
+    "In the last 7 days",
+    "In the last 30 days",
+    "Earlier",
   ]);
   const groupHeaders = () =>
     screen
@@ -3106,13 +3110,30 @@ describe("Sidebar view options", () => {
     expect(screen.getByRole("menuitemradio", { name: "Updated" })).toBeInTheDocument();
   });
 
-  it("keeps an empty Working section with muted text and the list controls", () => {
+  it.each(["empty", "loading", "error"])("keeps Working visible while %s", (state) => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
     mockConversations([]);
+    const original = useConvMock.getMockImplementation()!;
+    useConvMock.mockImplementation(
+      (...args) =>
+        ({
+          ...original(...args),
+          isLoading: state === "loading",
+          isError: state === "error",
+          error: state === "error" ? new Error("unavailable") : null,
+        }) as ReturnType<typeof useConversations>,
+    );
     renderGroupingSidebar();
     expect(groupHeaders()).toEqual(["Working"]);
     const working = within(groupSection("Working"));
-    expect(working.getByText("No sessions")).toHaveClass("text-muted-foreground");
+    if (state === "empty") {
+      expect(working.getByText("No sessions")).toHaveClass("text-muted-foreground");
+    } else {
+      expect(working.queryByText("No sessions")).toBeNull();
+      expect(working.getByRole("status")).toHaveTextContent(
+        state === "loading" ? "Loading…" : "Failed to load: unavailable",
+      );
+    }
     expect(working.getByTestId("session-filter")).toBeInTheDocument();
     expect(working.getByTestId("sessions-new-session")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Working" }));
@@ -3176,8 +3197,7 @@ describe("Sidebar view options", () => {
     selectSessionFilter("all");
 
     expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
-    const titles =
-      grouping === "status" ? ["Working", "Done"] : ["Updated today", "Updated earlier"];
+    const titles = grouping === "status" ? ["Working", "Done"] : ["Updated today", "Earlier"];
     expect(groupHeaders()).toEqual(titles);
     expect(within(groupSection(titles[1])).getByText("conv_shared")).toBeInTheDocument();
     // The first group carries every list control: filter, Select and New session.
@@ -3223,7 +3243,7 @@ describe("Sidebar view options", () => {
 
     // A next page can land in any group, so collapsing only the last one
     // mustn't stall pagination; collapsing every group does.
-    fireEvent.click(screen.getByRole("button", { name: "Updated earlier" }));
+    fireEvent.click(screen.getByRole("button", { name: "Earlier" }));
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Updated today" }));
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
@@ -3270,21 +3290,15 @@ describe("Sidebar view options", () => {
       ]);
       renderGroupingSidebar();
       const prefix = grouping === "created" ? "Created" : "Updated";
-      expect(groupHeaders()).toEqual([
-        `${prefix} today`,
-        `${prefix} yesterday`,
-        `${prefix} earlier`,
-      ]);
+      expect(groupHeaders()).toEqual([`${prefix} today`, "Yesterday", "Earlier"]);
       expect(within(groupSection(`${prefix} today`)).getByText("conv_today")).toBeInTheDocument();
+      expect(within(groupSection("Yesterday")).getByText("conv_yesterday")).toBeInTheDocument();
       expect(
-        within(groupSection(`${prefix} yesterday`)).getByText("conv_yesterday"),
-      ).toBeInTheDocument();
-      expect(
-        within(groupSection(`${prefix} ${grouping === "created" ? "earlier" : "today"}`)).getByText(
+        within(groupSection(grouping === "created" ? "Earlier" : `${prefix} today`)).getByText(
           "conv_old",
         ),
       ).toBeInTheDocument();
-      expect(within(groupSection(`${prefix} earlier`)).getByText("conv_filed")).toBeInTheDocument();
+      expect(within(groupSection("Earlier")).getByText("conv_filed")).toBeInTheDocument();
       if (grouping === "updated") {
         expect(
           within(groupSection("Updated today"))
@@ -3294,6 +3308,34 @@ describe("Sidebar view options", () => {
       }
       expect(screen.queryByText("Projects")).toBeNull();
       expect(screen.getAllByTestId("session-filter")).toHaveLength(1);
+    },
+  );
+
+  it.each(["created", "updated"])(
+    "prefixes the first available %s group and preserves collapse keys",
+    (grouping) => {
+      const prefix = grouping === "created" ? "Created" : "Updated";
+      localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping }));
+      localStorage.setItem(
+        "omnigent:collapsed-sidebar-sections",
+        JSON.stringify([`${prefix} earlier`]),
+      );
+      const now = new Date();
+      const yesterday =
+        new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime() / 1000;
+      mockConversations([
+        conv("conv_yesterday", "Codex", { created_at: yesterday, updated_at: yesterday }),
+        conv("conv_old", "Codex", { created_at: 0, updated_at: 0 }),
+      ]);
+      renderGroupingSidebar();
+      expect(screen.getByRole("button", { name: `${prefix} yesterday` })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Earlier" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      expect(screen.queryByText("conv_old")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Earlier" }));
+      expect(within(groupSection("Earlier")).getByText("conv_old")).toBeInTheDocument();
     },
   );
 
@@ -3393,8 +3435,9 @@ describe("Sidebar view options", () => {
     fireEvent.click(screen.getByTestId("session-show-environment"));
     fireEvent.click(screen.getByTestId("session-show-updated"));
 
-    // The row names a host's kind, not the host; the tooltip carries the name.
+    // Environment text is available to screen readers without widening the metadata row.
     expect(within(row).getByTestId("session-row-meta")).toHaveTextContent("Remote·fix/retries");
+    expect(within(row).getByText("Remote")).toHaveClass("sr-only");
     expect(within(row).getByTestId("session-row-updated")).toHaveTextContent("2m");
     // With a second line, the controls and the timestamp stay on the title line.
     expect(controls()).toHaveClass("top-4", "md:top-3.5");
@@ -3402,6 +3445,7 @@ describe("Sidebar view options", () => {
     // A session without a branch omits that part rather than leaving a gap.
     const bare = screen.getByText("conv_no_branch").closest("li")!;
     expect(within(bare).getByTestId("session-row-meta")).toHaveTextContent(/^Local machine$/);
+    expect(within(bare).getByText("Local machine")).toHaveClass("sr-only");
     expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).show).toEqual([
       "updated",
       "environment",
@@ -3409,7 +3453,7 @@ describe("Sidebar view options", () => {
     ]);
   });
 
-  it("labels this machine's host by device instead of its host name", () => {
+  it("keeps the device name accessible on the environment icon", () => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ show: ["environment"] }));
     // A loopback server with one online host: that host is this machine.
     isServerLocalMock.mockReturnValue(true);
@@ -3422,6 +3466,7 @@ describe("Sidebar view options", () => {
       "session-row-meta",
     );
     expect(meta).toHaveTextContent(/^This /);
+    expect(within(meta).getByText(/^This /)).toHaveClass("sr-only");
     expect(meta).not.toHaveTextContent("Build Mac");
   });
 

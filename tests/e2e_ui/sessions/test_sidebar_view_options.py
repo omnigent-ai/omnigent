@@ -119,10 +119,17 @@ def test_grouping_and_show_toggles_persist_across_reload(
     running_link = f'a[href="/c/{_RUNNING}"]'
     expect(working.locator(running_link)).to_be_visible()
     expect(done.locator(f'a[href="/c/{_IDLE}"]')).to_be_visible()
+    running_badge = (
+        page.locator("li")
+        .filter(has=page.locator(running_link))
+        .get_by_test_id("session-state-badge")
+    )
+    expect(running_badge).to_have_attribute("data-state", "running")
     page.get_by_text("What should we build?", exact=True).hover()
     assert sockets, "Session updates socket never connected"
     monkeypatch.setitem(_ROWS[0], "status", "idle")
     sockets[-1].send(json.dumps({"type": "changed", "items": [_ROWS[0]]}))
+    expect(running_badge).to_have_count(0)
     expect(working.locator(running_link)).to_be_visible()
     expect(done.locator(running_link)).to_be_visible(timeout=15_000)
     expect(working.get_by_text("No sessions", exact=True)).to_be_visible()
@@ -159,9 +166,7 @@ def test_grouping_and_show_toggles_persist_across_reload(
     page.get_by_test_id("session-grouping-updated").click()
     page.keyboard.press("Escape")
     expect(_section_header(page, "Updated today")).to_be_visible()
-    updated_yesterday = page.locator("section").filter(
-        has=_section_header(page, "Updated yesterday")
-    )
+    updated_yesterday = page.locator("section").filter(has=_section_header(page, "Yesterday"))
     expect(updated_yesterday.locator(f'a[href="/c/{_AWAITING}"]')).to_be_visible()
     expect(_section_header(page, "Sessions")).to_have_count(0)
     # The first group takes the Projects header's place, so the filter stays put.
@@ -180,9 +185,10 @@ def test_grouping_and_show_toggles_persist_across_reload(
     page.get_by_test_id("session-show-environment").click()
     page.get_by_test_id("session-show-repo").click()
     page.keyboard.press("Escape")
-    # Environment · Repo (from the sandbox label) · Branch.
+    # Environment is icon-only visually; its label remains available to screen readers.
     meta = "Local machine·omnigent·fix/payment-retries"
     expect(idle_row.get_by_test_id("session-row-meta")).to_have_text(meta)
+    expect(idle_row.get_by_text("Local machine", exact=True)).to_have_class("sr-only")
 
     page.reload()
     expect(_section_header(page, "Updated today")).to_be_visible(timeout=30_000)
@@ -194,8 +200,8 @@ def test_grouping_and_show_toggles_persist_across_reload(
     page.keyboard.press("Escape")
     for title, session_id in [
         ("Created today", _IDLE),
-        ("Created yesterday", _RUNNING),
-        ("Created earlier", _AWAITING),
+        ("Yesterday", _RUNNING),
+        ("Earlier", _AWAITING),
     ]:
         section = page.locator("section").filter(has=_section_header(page, title))
         expect(section.locator(f'a[href="/c/{session_id}"]')).to_be_visible()
