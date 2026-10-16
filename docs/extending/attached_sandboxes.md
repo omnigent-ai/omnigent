@@ -45,7 +45,15 @@ configuration later cannot turn a saved static box into an ad hoc one.
 
 `provision` must create a fresh box. To adopt an existing or per-user box, use the
 attachment action below. Providers may expose separate static/ad hoc entries in
-the existing registry, for example Arca and Arclet, backed by their own controller.
+the existing registry, backed by their own controller.
+
+A controller that resolves one canonical box per user can offer a single
+"use my sandbox" action: find that box, create it if absent, then connect it.
+That does not require a discovery dialog. This prototype does not yet integrate
+that create-or-get operation with stable host registration; returning an existing
+box from `provision` alone would incorrectly give it a new host identity. A
+discovery UI is needed only if users must choose among existing boxes inside
+Omnigent. Neither case requires a second provider interface.
 
 ## Provider contract
 
@@ -53,7 +61,7 @@ Keep the customer controller and HTTP client in the existing
 [provider plugin](sandbox_providers.md). No generic HTTP adapter, second provider
 interface, discovery service or external provider store is required upstream.
 
-The one new optional method is:
+The attachment authorization hook is optional and rejects requests by default:
 
 ```python
 def attach_for_user(self, sandbox_id: str, *, owner: str) -> None:
@@ -63,7 +71,23 @@ def attach_for_user(self, sandbox_id: str, *, owner: str) -> None:
         raise PermissionError("not your sandbox")
 ```
 
-Existing methods handle the rest:
+The server also calls the optional `bind_principal(principal)` hook before any
+user-scoped provider operation. It defaults to a no-op for existing providers.
+An HTTP provider can use it to configure its controller client's user header.
+Creation and attachment use the authenticated account identity; later wake,
+startup, status, relaunch, termination, keepalive and background cleanup use the
+saved host owner. The value is an opaque account identifier, not necessarily an
+email address, and never an owner supplied in the request body. It is identity
+context, not a forwarded user access token: the controller must authenticate the
+server and authorize the operation for that principal.
+
+The launcher factory must return a fresh instance, since the bound identity must
+never be shared across users. Background cleanup groups hosts by workspace,
+provider and owner. Deployment-wide capability inspection and operator-owned
+warm-pool tooling remain unbound; constructors and capability properties must
+not require an end-user identity.
+
+Existing lifecycle methods handle the rest:
 
 | Method | Customer implementation |
 | --- | --- |
@@ -84,12 +108,22 @@ HTTP is only the customer's control channel. Agents still run through the
 existing outbound host/runner connections. The controller must honor the supplied
 host identity and token; returning an HTTP endpoint alone is insufficient.
 
+## Workspace policy
+
+The controller can choose an existing checkout, a per-session worktree, or
+another directory. Omnigent only needs the chosen path to start the session's
+runner there; being a static sandbox does not require a particular policy.
+Today users can choose directories and use the existing worktree settings.
+A controller-driven per-session workspace policy still needs an integration at
+session startup that requests and uses that path. `start_host` alone cannot
+provide this: a running host can serve many new sessions without starting again.
+
 ## Try it
 
 After the [schema/application rollout](../sandbox-attachment-rollout.md), install
 and configure an opt-in provider on an isolated server. Open New session, select
 **New static sandbox** and submit a prompt. Once the session starts, open
-New session again: its `static-...` host should now be available to select. Create
+New session again: the created host should now be available to select. Create
 a second session on that host, then delete the first; the second must stay bound
 and the provider must not delete the box.
 
@@ -126,7 +160,6 @@ attachment once it is online. Automations retain their existing sandbox
 restrictions. Cross-replica wake coordination retains the existing resume
 implementation's limits; it is not a new distributed lease mechanism.
 
-Arca's current self-authenticating host startup does not yet honor this token
-contract. Its adapter must be updated, or a subsequent change must support that
-startup mode in the existing host path. This prototype does not change MAS or
-Arclet and has not been validated against a real customer controller.
+Self-authenticating hosts need an adapter for this token contract, or a subsequent
+change must support their startup mode in the existing host path. This prototype
+has not been validated against a real customer controller.

@@ -668,8 +668,8 @@ class ManagedSandboxConfig:
     :param launcher_factory: Zero-argument factory producing the
         :class:`~omnigent.onboarding.sandboxes.base.SandboxLauncher`
         each launch uses, e.g.
-        ``lambda: ModalSandboxLauncher(image=…)``. Called per launch
-        (launchers may cache provider handles internally). May raise
+        ``lambda: ModalSandboxLauncher(image=…)``. Must return a fresh instance
+        because calls bind the host owner's identity; never share it across users. May raise
         ``HTTPException`` to report an unusable backend — the YAML
         path uses this for providers without managed support.
     :param token_ttl_s: Launch-token lifetime in seconds, e.g.
@@ -3744,6 +3744,9 @@ def build_owner_launcher(
     :returns: A ready launcher.
     """
     launcher = entry.launcher_factory()
+    bind = getattr(launcher, "bind_principal", None)
+    if bind is not None:
+        bind(owner)
     # getattr: embedding deployments may inject duck-typed launchers.
     needed = getattr(launcher, "owner_credential_provider", None)
     if needed is not None and deployment is not None:

@@ -5961,6 +5961,103 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
     assert fake.host_starts == []
 
 
+@pytest.mark.parametrize(("attach", "reusable"), [(False, False), (False, True), (True, True)])
+async def test_provider_operations_keep_the_host_owner_across_fresh_launchers(
+    db_uri, monkeypatch, attach, reusable
+):
+    from omnigent.server.managed_hosts import attach_sandbox_host, host_sandbox_is_running
+
+    store = HostStore(db_uri)
+    owners = ("account:alice", "bob@example.com")
+    box_owners = {f"existing-{index}": owner for index, owner in enumerate(owners)}
+    calls = []
+
+    def factory():
+        bound = []
+        fake = FakeSandboxLauncher(
+            can_resume=True,
+            reusable_hosts=reusable,
+            attachments=box_owners,
+            on_host_start=lambda start: store.upsert_on_connect(
+                start.host_id, start.host_name, bound[0]
+            ),
+        )
+
+        def bind(principal):
+            assert not bound, "a launcher must not be shared across operations/users"
+            bound.append(principal)
+
+        def provision(name):
+            box_owners[name] = bound[0]
+            return name
+
+        monkeypatch.setattr(fake, "bind_principal", bind)
+        monkeypatch.setattr(fake, "provision", provision)
+        for method in (
+            "prepare_for_launch",
+            "prepare",
+            "provision",
+            "attach_for_user",
+            "resume",
+            "start_host",
+            "is_running",
+            "terminate",
+        ):
+            original = getattr(fake, method)
+
+            def checked(*args, method=method, original=original, **kwargs):
+                assert len(bound) == 1, f"{method} called without an authenticated owner"
+                if method not in {"prepare_for_launch", "prepare", "provision"}:
+                    assert bound[0] == box_owners[args[0]], "controller received the wrong owner"
+                calls.append((method, bound[0]))
+                return original(*args, **kwargs)
+
+            monkeypatch.setattr(fake, method, checked)
+        return fake
+
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://srv.example.com",
+            provider="modal",
+            launcher_factory=factory,
+            token_ttl_s=3600,
+        )
+    )
+
+    async def use_box(index, owner):
+        if attach:
+            host_id = await attach_sandbox_host(
+                config=config,
+                owner=owner,
+                host_store=store,
+                provider="modal",
+                sandbox_id=f"existing-{index}",
+                name=f"static-{index}",
+            )
+        else:
+            launched = await launch_managed_host(config=config, owner=owner, host_store=store)
+            host_id = launched.host_id
+        host = store.get_host(host_id)
+        assert host.user_id == owner
+        assert host_sandbox_is_running(host, config) is None
+        store.set_offline(host_id)
+        await resume_managed_host(host_id, store, config)
+        assert store.is_online(host_id)
+        if not reusable:
+            await relaunch_managed_host(
+                config=config, host=store.get_host(host_id), host_store=store
+            )
+        await terminate_managed_host(store.get_host(host_id), store, config)
+
+    await asyncio.gather(*(use_box(index, owner) for index, owner in enumerate(owners)))
+    required = {"prepare_for_launch", "start_host", "resume", "is_running"}
+    required |= {"attach_for_user"} if attach else {"prepare", "provision"}
+    if not reusable:
+        required.add("terminate")
+    for owner in owners:
+        assert required <= {method for method, principal in calls if principal == owner}
+
+
 @pytest.mark.parametrize("failure", ["none", "startup", "gone", "delete-during-wake"])
 async def test_attached_sandbox_reuses_host_and_never_provisions_or_terminates(db_uri, failure):
     from omnigent.server.managed_hosts import attach_sandbox_host

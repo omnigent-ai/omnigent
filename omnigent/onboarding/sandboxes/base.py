@@ -940,6 +940,15 @@ class SandboxHostLauncher(SandboxLifecycle):
     transport.
     """
 
+    def bind_principal(self, principal: str) -> None:
+        """Bind the server-authenticated owner before user-scoped provider calls.
+
+        Lifecycle requests and background batches get fresh launchers bound to
+        the saved host owner. Providers may configure their controller client
+        here; deployment-wide capability discovery remains unbound. The default
+        does nothing for providers using only deployment credentials.
+        """
+
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         """Set request context before provider preparation, allocation, or resume.
 
