@@ -78,6 +78,7 @@ from omnigent.harness_plugins import (
     DEVIN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
+from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import failure_log_attributes
 from omnigent.native.native_coding_agents import (
@@ -86,7 +87,6 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
-from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
