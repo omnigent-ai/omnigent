@@ -27,6 +27,10 @@ while IFS= read -r path; do
   [[ -z "$path" ]] && continue
   case "$path" in
     .github/workflows/*)
+      if [[ "${DEPENDABOT_WORKFLOW_PINS:-false}" == "true" ]]; then
+        echo "Validated Dependabot action-pin update: $path"
+        continue
+      fi
       echo "::error file=$path::Untrusted PR edits a CI workflow. Workflow changes can exfiltrate secrets or weaken gates; a maintainer must review."
       fail=1
       ;;

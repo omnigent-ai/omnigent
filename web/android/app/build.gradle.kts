@@ -38,7 +38,8 @@ fun buildProperty(key: String): String? =
 
 val appVersionCode = buildProperty("versionCode")?.toIntOrNull() ?: 9
 val appVersionName = buildProperty("versionName") ?: "0.1.3"
-val databricksOAuthClientId = buildProperty("databricksOAuthClientId") ?: ""
+// The public first-party Databricks client the desktop and iOS apps use too.
+val databricksOAuthClientId = buildProperty("databricksOAuthClientId") ?: "omnigent"
 val databricksOAuthRedirectUrl =
     buildProperty("databricksOAuthRedirectUrl") ?: "https://login.databricks.com/mobile-redirect"
 val databricksOAuthRedirectUri = URI(databricksOAuthRedirectUrl)

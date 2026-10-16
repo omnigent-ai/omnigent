@@ -71,6 +71,7 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.codex_native.forwarder import (
     _replay_dead_letters_before_resume,
+    codex_rollout_last_turn_model,
     supervise_forwarder,
 )
 from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
@@ -1856,6 +1857,10 @@ def _copy_rollout_with_cwd(
             dst.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
+class _CodexForkModelMismatchError(Exception):
+    """A fork's source rollout last ran on a model other than the fork's."""
+
+
 def _clone_codex_rollout(
     *,
     source_session_id: str,
@@ -1863,6 +1868,7 @@ def _clone_codex_rollout(
     target_thread_id: str,
     clone_codex_home: Path,
     clone_workspace: Path,
+    clone_model: str | None = None,
 ) -> Path | None:
     """
     Clone a source Codex rollout into the clone's own ``CODEX_HOME``.
@@ -1895,9 +1901,17 @@ def _clone_codex_rollout(
     :param clone_workspace: The resolved directory the clone will run in
         (its worktree or same dir). Written into the structural ``cwd``
         fields. Pass an already-resolved path.
+    :param clone_model: Model the clone launches on, e.g.
+        ``"system.ai.gpt-6-1-sol"``. When the source's last turn ran on a
+        different model, the clone is declined: Codex would first compact
+        the copied history on the source's model, and the fork would fail
+        whenever that model is unavailable (for example, over budget).
+        ``None`` skips the check.
     :returns: Path to the written clone rollout, or ``None`` when the ids
-        are unsafe or the source rollout can't be found on this host
-        (caller launches fresh in that case).
+        are unsafe or the source rollout can't be found on this host (the
+        caller rebuilds from Omnigent items or launches fresh).
+    :raises _CodexForkModelMismatchError: If the source's last turn used a
+        model other than *clone_model*; the caller must rebuild the history.
     :raises click.ClickException: If the source rollout is malformed.
     """
     if not _CODEX_THREAD_ID_RE.fullmatch(source_thread_id):
@@ -1908,6 +1922,17 @@ def _clone_codex_rollout(
     source = _find_codex_rollout(source_home, source_thread_id)
     if source is None:
         return None
+    if clone_model is not None:
+        from omnigent.models.codex_model_vocabulary import comparable_model_id
+
+        source_model = codex_rollout_last_turn_model(source)
+        if source_model is not None and comparable_model_id(source_model) != comparable_model_id(
+            clone_model
+        ):
+            raise _CodexForkModelMismatchError(
+                f"Codex rollout {source.name} last ran on {source_model}, "
+                f"but the fork launches on {clone_model}"
+            )
     # Preserve the source's ``sessions/<YYYY>/<MM>/<DD>/`` layout; only swap
     # the thread id embedded in the rollout filename so the clone lands in
     # its own CODEX_HOME under the assigned id.

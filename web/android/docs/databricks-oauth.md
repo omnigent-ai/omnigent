@@ -14,7 +14,7 @@ Set these Gradle project properties when building the app:
 
 | Property                     | Default                                        | Purpose                                          |
 | ---------------------------- | ---------------------------------------------- | ------------------------------------------------ |
-| `databricksOAuthClientId`    | Empty                                          | Registered Databricks public OAuth client ID.    |
+| `databricksOAuthClientId`    | `omnigent`                                     | Registered Databricks public OAuth client ID.    |
 | `databricksOAuthRedirectUrl` | `https://login.databricks.com/mobile-redirect` | Exact HTTPS callback registered for that client. |
 
 For example:
@@ -26,10 +26,11 @@ cd web/android
   -PdatabricksOAuthRedirectUrl=https://login.databricks.com/mobile-redirect
 ```
 
-The values are public configuration, not secrets. Do not add a client secret to
-the app and do not borrow a Databricks CLI client ID. An empty client ID is
-accepted by Gradle so ordinary builds continue to work, but native workspace
-sign-in rejects it when configuration is loaded.
+The values are public configuration, not secrets. The default `omnigent` is the
+public first-party client the desktop and iOS apps also use; override it only for
+a different registered client. Do not add a client secret to the app and do not
+borrow a Databricks CLI client ID. An empty client ID is accepted by Gradle, but
+native workspace sign-in rejects it when configuration is loaded.
 
 The redirect must use HTTPS on the default port, contain a nonempty path, and
 have no credentials, query, or fragment. The exact redirect must be registered

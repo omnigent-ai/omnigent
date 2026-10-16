@@ -4,7 +4,7 @@
 CI and still be un-landable because `main` moved under it — GitHub reports this as
 `mergeable: CONFLICTING` / `mergeStateStatus: DIRTY`, and a conflicted branch is
 **not done** no matter how green its checks look (its CI and preview ran against a
-stale base). Never report `fixed` on a branch that doesn't merge. Check it, and
+stale base). Never report success (Resolve: `fixed`) on a branch that doesn't merge. Check it, and
 re-check after every push and again right before the final verdict (4.5):
 
 ```
@@ -19,14 +19,15 @@ gh pr view <pr> --json mergeable,mergeStateStatus,baseRefName
   ```
   git fetch origin main
   git rebase origin/main        # resolve conflicts: edit, `git add`, `git rebase --continue`
-  # re-run the selected permanent checks and relevant archived reproduction after resolving, then:
+  # re-run the selected permanent checks (Resolve: and archived reproduction), then:
   git push --force-with-lease
   ```
 
   Resolve conflicts by **understanding both sides**, not by blindly taking one —
   the incoming `main` change may interact with the fix. After resolving, **re-run
-  the selected permanent checks and relevant archived reproduction** (the merge may have silently broken the
-  fix), then force-push. On a **fork PR you can't push to**, a conflict is one more
+  the selected permanent checks** (Resolve: and relevant archived reproduction),
+  since the merge may have silently broken the fix, then force-push. (Resolve
+  review path:) On a **fork PR you can't push to**, a conflict is one more
   reason to **take over** into your own PR (Step 4 preamble): branch off latest
   `main`, replay their commits (`git cherry-pick` / `am`), resolve there, and
   continue on your PR. If a rebase is beyond mechanical resolution (a deep semantic
@@ -55,7 +56,7 @@ settles:
   - **The diff caused it** → fix the code (not the test), re-run the relevant
     tests locally to confirm, then land the fix per the **push-or-take-over rule**:
     `git commit` + `git push` when it's your PR or an in-repo branch you can push
-    to (the push re-runs CI); on a **fork PR** you can't push to, take over and
+    to (the push re-runs CI); (Resolve review path:) on a **fork PR** you can't push to, take over and
     open your own PR carrying their commits + your fix (see the Step 4 preamble),
     then continue this loop on **your** PR.
   - **Pre-existing / flaky / infra** → do **not** chase it or paper over it. Note

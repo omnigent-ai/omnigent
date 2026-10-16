@@ -26,7 +26,9 @@ be able to write resources without a separate Omnigent account.
 - `profile-selection`: when several Databricks profiles match the workspace, the
   person's own profile wins over a service principal.
 - `expired-credential`: an expired or revoked Databricks credential leads to a
-  re-authentication prompt, not a raw 403 from the workspace edge.
+  re-authentication prompt. When a newly launched runner explicitly reports a
+  pending host sign-in, its first message waits on that same runner until the
+  sign-in finishes or its bounded wait expires.
 - `proxy-env`: login detects the right mode even with HTTP proxy variables set.
 - `host-lifecycle`: register in the foreground or background, run as a per-user
   system service, and check status, stop, stop a session, or reset the host ID.
@@ -121,6 +123,15 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `tests/e2e/test_host_auth_prefers_user_over_m2m_sp_e2e.py::test_resolve_auth_for_host_must_not_select_m2m_sp_over_user_profile`
 - **`expired-credential`:**
   `tests/e2e/test_expired_databricks_credential_launch.py::test_expired_databricks_credential_offers_reauth_not_edge_403`
+- **Pending host sign-in:**
+  `tests/server/integration/test_session_host_launch.py::test_host_session_message_waits_for_bound_runner_before_relaunch`
+  checks that the original message is forwarded once after the sign-in wait,
+  without replacing the runner. The `sign_in_pending` parameter covers the
+  explicit pending state; ordinary startup retains its shorter grace.
+  `tests/server/routes/test_runner_connect_wait.py::test_explicit_sign_in_wait_is_bounded_and_owned`
+  covers cancellation, stop, replacement, process exit and expiry. The isolated
+  header-mode environment has no interactive credential source, so it cannot
+  drive an actual browser reauthorization.
 - **`databricks-credential-kind`:** needs a real workspace and one test
   profile of each kind. No e2e covers the host daemon against a real workspace.
 - **`host-lifecycle`:** run `omnigent host --help` and the management commands

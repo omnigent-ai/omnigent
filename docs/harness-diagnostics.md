@@ -301,6 +301,20 @@ output, it records `detail_source=missing`.
 | `gateway_request_id`, `provider_request_id` | Only populated when the source explicitly names that ownership |
 | `failure_context_missing_fields` | Comma-separated list of unavailable source fields, including IDs, versions, and inference details |
 
+The server also retains typed provider fields from explicit failed-status
+`output` or `failure_detail`, including gateway JSON whose message contains
+another JSON error. Parsing is limited to 16,384 characters and three envelopes; malformed
+or unmarked text adds no inferred facts. Stored assistant prose and idle or
+cancelled status edges are not parsed for provider facts.
+
+`provider_error_type`, `provider_error_code`, `provider_error_param`, available
+HTTP status and explicitly named request IDs reach the existing failure record
+with `inference_detail_source=provider_error_json`. An unqualified error-body
+`request_id` remains separate from the session event's transport request ID.
+Existing structured evidence takes precedence. Values use the shared bounds
+and credential redaction; raw messages, unrelated fields and request bodies
+are not copied into this metadata. Status policy and display text stay the same.
+
 Claude forwarding failures retain the rejected delivery's `http_status` and,
 when recognized, `forwarder_rejection_reason`. The reason is restricted to
 known tunnel rejection messages and error codes; arbitrary response text and
@@ -417,6 +431,26 @@ possible append overshoot). This is CLI-version-dependent, not an Omnigent disk
 quota. The next enabled launch in the same bridge directory removes the prior
 owned file and its rotated predecessor. Other user debug files are never read
 or deleted.
+
+## Codex bridge availability
+
+When an input cannot be delivered because bridge state is unavailable, the
+executor emits one INFO `codex_bridge_state_unavailable` record after its
+existing startup wait. Polling does not emit this record. `bridge_state_status`
+distinguishes `missing`, `not_file`, `unreadable`, `invalid_encoding`,
+`invalid_json`, and `invalid_state`; `bridge_state_errno` retains an observed
+OS error number when available. Invalid UTF-8 is treated as unavailable state,
+like malformed JSON, rather than escaping as a decoding exception.
+
+`wait_sleep_ms` is accumulated polling sleep, and `wait_budget_ms` is the
+current nominal budget. `startup_wait_extended` records whether a configured
+command received its longer allowance. `startup_error_present` distinguishes
+a runner-reported startup failure, and `startup_failure_coded` indicates a
+semantic failure code without exporting the marker's content.
+The record uses the same state read that stopped delivery and carries existing
+input correlation IDs when available. It contains no file paths, state bytes,
+startup-error text, or user input. Error wording, wait budgets, and undelivered
+input handling are unchanged.
 
 ## Verification
 
