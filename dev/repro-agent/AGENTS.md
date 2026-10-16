@@ -129,7 +129,8 @@ Your first turn is a fixed checklist — do all of it before Step 1:
    emitting a verdict handoff; the workflow must retry it). Also note — without failing —
    whether the recorders are available (Playwright browsers for
    `pytest --video`, `vhs` for CLI tapes): Step 4 degrades gracefully when they
-   are missing.
+   are missing, and expects a recorder run for every filmable facet when they
+   are present.
 
 If you cannot reach the app at all, stop and report an operational failure
 without emitting a verdict handoff so the workflow retries. App, network,
@@ -662,15 +663,18 @@ driver for the observed journey. Keep its source and command in the evidence
 for Resolve to re-record; producing footage does not require selecting that
 driver as permanent regression coverage.
 
-- a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): use the
-  journey driver to reproduce and verify the failure, but film only the product surface
-  and the user-visible bug (captioned output: `recordings/1234/before-picker.mp4`). Never film
-  pytest, assertion output, or the test source.
+- a **`reproduced`** or **`likely_repro`** facet → **before-fix footage**
+  (`kind: "before"`): use the journey driver to reproduce and verify the failure,
+  but film only the product surface and the user-visible bug (captioned output:
+  `recordings/1234/before-picker.mp4`). Never film pytest, assertion output, or
+  the test source. A `likely_repro` clip films the stand-in you drove; its
+  caption names that stand-in.
 - an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): use
   a journey driver to verify the passing journey, while the video shows only
   the product behaving correctly (captioned output: `recordings/1234/fixed-picker.mp4`).
 
-`not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
+`not_reproduced`, `needs_more_info`, and `needs_manual_review` facets have
+nothing to film — skip them.
 Keep raw captures under `recordings/<slug>/raw/<before|fixed>-<facet>.<ext>`.
 Declare the inspected captioned MP4, or use the shared guide's explicit
 `uncaptioned-<kind>-<facet>.<ext>` fallback if captioning fails.
@@ -688,10 +692,20 @@ Follow these rules for each clip:
   expired login and capture the error it prints.
 - For internal/API-only results with no visible user interaction, written
   evidence is enough. Set `recordings: []` and describe the result in `evidence`.
+- An absence is filmable. When the bug is that nothing happens (a parent chat
+  never shows its sub-agent's return, a toast never appears), film the
+  triggering action and the screen staying in that stale state, with whatever
+  error the product does show, for longer than a healthy response takes.
 - If recording is blocked by missing tools or an environment that cannot run
   the journey, set `recordings: []` and name the specific blocker in
   `recording_unavailable_reason`. Do not block the verdict because footage is
   missing or rejected; explain the gap and continue.
+- A blocker is the observed result of a recorder run. When the preflight
+  recorder check passed, point the recorder at the facet's lane before declaring
+  it blocked, and name the command you ran and its observed error in
+  `recording_unavailable_reason`. "The recorder was not stood up", a
+  multi-process journey, a flaky native boot, or a bug that is an absence are
+  not blockers; a reason that names no attempted recorder run is insufficient.
 
 ## Output — the reproduction artifacts
 
@@ -837,11 +851,11 @@ Field meanings:
   connection checks, and keep unexercised outcomes unverified throughout the handoff.
 - `recordings` — the Step 4 captures: a list of
   `{"surface", "kind", "path", "format", "capture_mode", "caption"}` objects. `kind` is
-  `"before"` for a `reproduced` facet's failing run or `"fixed"` for an
-  `already_fixed` facet's passing run (the fix step later re-records the same
-  drivers post-fix as `"after"`); `path` workspace-relative. `caption` is a
-  short, human-readable description of **the actions this specific clip
-  performs**, written as the ordered steps a viewer will watch and ending in
+  `"before"` for a `reproduced` or `likely_repro` facet's failing run or
+  `"fixed"` for an `already_fixed` facet's passing run (the fix step later
+  re-records the same drivers post-fix as `"after"`); `path` workspace-relative.
+  `caption` is a short, human-readable description of **the actions this specific
+  clip performs**, written as the ordered steps a viewer will watch and ending in
   what the clip shows — e.g. `"start a session → open the model picker → select
   the catalog → picker shows raw IDs"`. Phrase it for *this* clip's outcome: a
   `before` caption ends in the failure, a `fixed` caption ends in the correct
@@ -860,7 +874,9 @@ Field meanings:
   - For internal/API-only results, say there is no visible user interaction
     and put the written evidence in `evidence`.
   - For a recording failure, name the missing tool or the environment problem.
-    Text-only CLI output is not a reason to skip recording.
+    When the preflight recorder check passed, name the recorder command you ran
+    and its observed error; a reason that names no attempted recorder run is
+    insufficient. Text-only CLI output is not a reason to skip recording.
   - Do not substitute a video of test output or a made-up demonstration.
 
 Keep other prose terse, but include the full manual reproduction recipe and

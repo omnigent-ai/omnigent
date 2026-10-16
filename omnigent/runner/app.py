@@ -2216,6 +2216,7 @@ def create_runner_app(
             FileTooLarge,
             InvalidPath,
             PathUnreachable,
+            PermissionDenied,
             UnsupportedMediaType,
         )
 
@@ -2229,6 +2230,8 @@ def create_runner_app(
             # available without a second round trip.
             status = 403
             error["reachable_roots"] = exc.reachable_roots
+        elif isinstance(exc, PermissionDenied):
+            status = 403
         elif isinstance(exc, InvalidPath):
             status = 400
         elif isinstance(exc, DirectoryNotEmpty):
