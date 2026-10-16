@@ -415,6 +415,17 @@ def record(
     return pending_id
 
 
+def find_by_stable_id(conversation_id: str, stable_id: str) -> str | None:
+    """
+    Backward-compatible alias for :func:`pending_id_for_stable_id`.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The web client's 32-hex submission id.
+    :returns: The matching entry's pending id, or ``None``.
+    """
+    return pending_id_for_stable_id(conversation_id, stable_id)
+
+
 def _evict_beyond_cap(entries: dict[str, _Entry]) -> None:
     """
     Drop the oldest unheld entries until at most the cap remain unheld.

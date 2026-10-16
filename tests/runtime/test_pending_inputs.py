@@ -589,6 +589,29 @@ def test_stable_id_dedup_scoped_per_conversation() -> None:
     assert id_a != id_b
 
 
+def test_find_by_stable_id_returns_the_live_entry() -> None:
+    """A re-POST's dedup pre-check resolves a still-pending submission."""
+    stable = "ef" * 16
+    pending_id = pending_inputs.record("conv_find", [_text_block("hi")], stable_id=stable)
+    assert pending_inputs.find_by_stable_id("conv_find", stable) == pending_id
+    # Read-only: the entry stays queued for the transcript drain.
+    assert len(pending_inputs.snapshot_for("conv_find")) == 1
+
+
+def test_find_by_stable_id_misses_unknown_and_drained_entries() -> None:
+    stable = "0b" * 16
+    assert pending_inputs.find_by_stable_id("conv_find_miss", stable) is None
+    pending_inputs.record("conv_find_miss", [_text_block("hi")], stable_id=stable)
+    assert pending_inputs.resolve_oldest("conv_find_miss") is not None
+    assert pending_inputs.find_by_stable_id("conv_find_miss", stable) is None
+
+
+def test_find_by_stable_id_scoped_per_conversation() -> None:
+    stable = "1c" * 16
+    pending_inputs.record("conv_find_a", [_text_block("x")], stable_id=stable)
+    assert pending_inputs.find_by_stable_id("conv_find_b", stable) is None
+
+
 def test_record_evicts_the_oldest_entry_beyond_the_per_conversation_cap() -> None:
     """The queue is bounded: recording past the cap drops the oldest entry."""
     cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION
@@ -938,7 +961,7 @@ def test_mark_interrupted_skips_held_and_unknown_entries() -> None:
 
 
 def test_has_pending_and_snapshot_ignore_interrupted_entries() -> None:
-    """A cancelled message neither keeps the session "working" nor redraws on reload."""
+    """A cancelled message neither keeps the session \"working\" nor redraws on reload."""
     first = pending_inputs.record("conv_a", [_text_block("first")])
     second = pending_inputs.record("conv_a", [_text_block("second")])
 
