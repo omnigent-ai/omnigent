@@ -174,6 +174,29 @@ def npm_key(key: str) -> tuple[str, str]:
     return name, value
 
 
+def npm_reachable(lock: dict, sections: dict) -> set[str]:
+    def package_key(name, pin):
+        # Aliased references carry the real name before the version.
+        return pin if "@" in pin.split("(", 1)[0] else f"{name}@{pin}"
+
+    pending = []
+    for section in ("dependencies", "devDependencies", "optionalDependencies"):
+        for name, dependency in sections.get(section, {}).items():
+            pending.append(package_key(name, dependency["version"]))
+    seen = set()
+    while pending:
+        key = pending.pop()
+        if key in seen:
+            continue
+        seen.add(key)
+        snapshot = lock["snapshots"].get(key, {})
+        for section in ("dependencies", "optionalDependencies"):
+            pending.extend(
+                package_key(name, pin) for name, pin in snapshot.get(section, {}).items()
+            )
+    return seen
+
+
 def npm_changes(read, files: set[str], policy: dict) -> dict:
     require(
         files <= {"pnpm-lock.yaml", "web/package.json"} and "pnpm-lock.yaml" in files,
@@ -187,10 +210,17 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
         "pnpm settings, catalogs or compatibility overrides changed",
     )
     old_packages, new_packages = before["packages"], after["packages"]
+    reachable = {
+        key.split("(", 1)[0]
+        for sections in before["importers"].values()
+        for key in npm_reachable(before, sections)
+    }
+    # pnpm also prunes stale lock entries that no workspace consumer can reach.
+    pruned = old_packages.keys() - new_packages.keys() - reachable
     for key in old_packages.keys() & new_packages.keys():
         require(old_packages[key] == new_packages[key], f"Existing npm resolution changed: {key}")
     removed, added = {}, {}
-    for key in old_packages.keys() - new_packages.keys():
+    for key in old_packages.keys() - new_packages.keys() - pruned:
         name, pin = npm_key(key)
         require(name not in removed, f"Ambiguous npm upgrade: {name}")
         removed[name] = pin
@@ -231,35 +261,21 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
         return value
 
     # Shared packages must not silently upgrade an untested workspace consumer.
-    def reachable(sections):
-        pending = []
-        for section in ("dependencies", "devDependencies", "optionalDependencies"):
-            for name, dependency in sections.get(section, {}).items():
-                pending.append(f"{name}@{dependency['version']}")
-        seen = set()
-        while pending:
-            key = pending.pop()
-            if key in seen:
-                continue
-            seen.add(key)
-            snapshot = before["snapshots"].get(key, {})
-            for section in ("dependencies", "optionalDependencies"):
-                pending.extend(f"{name}@{pin}" for name, pin in snapshot.get(section, {}).items())
-        return seen
-
     for importer, sections in before["importers"].items():
         if importer == "web":
             continue
         require(
             not any(
                 key.split("(", 1)[0] in {f"{n}@{v}" for n, v in removed.items()}
-                for key in reachable(sections)
+                for key in npm_reachable(before, sections)
             ),
             f"A changed package is shared with {importer}; human review required",
         )
     expected = copy.deepcopy(before)
     snapshots = {}
     for key, snapshot in expected["snapshots"].items():
+        if key.split("(", 1)[0] in pruned:
+            continue
         for name, pin in removed.items():
             if key == f"{name}@{pin}" or key.startswith(f"{name}@{pin}("):
                 key = f"{name}@{added[name]}" + key[len(f"{name}@{pin}") :]
@@ -336,7 +352,7 @@ def github_release(repository: str, sha: str, days: int) -> tuple[str, str]:
     return tag.removeprefix("v"), tag
 
 
-def action_changes(read, files: set[str], policy: dict) -> dict:
+def action_changes(read, files: set[str], policy: dict, *, for_scan: bool = False) -> dict:
     changes = set()
     exercised = set()
     workflows = {"ci.yml", "lint.yml"}
@@ -371,15 +387,18 @@ def action_changes(read, files: set[str], policy: dict) -> dict:
             if path in policy["action_test_paths"]:
                 exercised.add((name, old_sha, new_sha))
                 workflows.add(policy["action_test_paths"][path])
-    require(
-        bool(changes) and changes == exercised, "Each changed action must be exercised by PR CI"
-    )
+    require(bool(changes), "No action pin changes")
+    if not for_scan:
+        require(changes == exercised, "Each changed action must be exercised by PR CI")
     packages = []
     for name, old_sha, new_sha in sorted(changes):
         repository = "/".join(name.split("/")[:2])
         old, _ = github_release(repository, old_sha, 0)
-        new, _ = github_release(repository, new_sha, policy["cooldown_days"])
-        upgrade(old, new, minor=True)
+        new, _ = github_release(repository, new_sha, 0 if for_scan else policy["cooldown_days"])
+        if for_scan:
+            require(version(new) > version(old), "Action pin is not an upgrade")
+        else:
+            upgrade(old, new, minor=True)
         packages.append({"name": name, "version": new})
     return decision(
         "github-actions", packages, workflows=sorted(workflows), checks=["Pre-commit checks"]
