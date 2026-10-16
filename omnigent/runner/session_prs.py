@@ -66,6 +66,7 @@ class SessionPullRequest(PullRequestRef):
     title_lookup_timed_out: bool = False
     # Cached PR state ("OPEN", "CLOSED", "MERGED"); None when not yet fetched.
     state: str | None = None
+    state_checked_at: float = 0
 
 
 class _Associations(BaseModel):
@@ -202,6 +203,7 @@ class SessionPrRegistry:
                     title_checked_at=previous.title_checked_at if previous else 0,
                     title_lookup_timed_out=previous.title_lookup_timed_out if previous else False,
                     state=previous.state if previous else None,
+                    state_checked_at=previous.state_checked_at if previous else 0,
                 )
             state.prs = list(entries.values())
             if observation_id:
@@ -238,8 +240,9 @@ class SessionPrRegistry:
                     entry.title_lookup_timed_out = title is None and entry.url in timed_out_urls
                     changed = True
                 pr_state = states.get(entry.url)
-                if pr_state is not None and entry.state != pr_state:
+                if pr_state is not None and entry.state_checked_at <= now and entry.state != pr_state:
                     entry.state = pr_state
+                    entry.state_checked_at = now
                     changed = True
             if changed:
                 self._write(registry)

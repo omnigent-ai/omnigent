@@ -104,7 +104,6 @@ import {
   PullRequestPanel,
   derivePullRequestPanelState,
   LARGE_DIFF_THRESHOLD,
-  selectDefaultPr,
 } from "./PullRequestPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -150,6 +149,13 @@ function renderChanges() {
   return r;
 }
 
+/** Render, then switch to the Comments tab (see renderChanges). */
+function renderComments() {
+  const r = renderPanel();
+  fireEvent.mouseDown(screen.getByRole("tab", { name: /^Comments/ }));
+  return r;
+}
+
 /** Silences console.error for the current test and returns a reader for the React
  *  duplicate- and missing-key warnings logged so far. */
 function watchKeyWarnings(): () => string[] {
@@ -161,8 +167,8 @@ function watchKeyWarnings(): () => string[] {
       .filter((message) => /same key|unique "key"/.test(message));
 }
 
-/** The markdown body of each comment card, in rendered order. The fixtures used
- *  with it have no PR description, so every markdown block is a comment. */
+/** The markdown body of each comment card, in rendered order. Only the active
+ *  tab mounts, so on the Comments tab every markdown block is a comment. */
 function commentBodies(): (string | null)[] {
   return screen.getAllByTestId("markdown").map((el) => el.textContent);
 }
@@ -265,6 +271,70 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText(/pending/)).toBeNull();
   });
 
+  it("shows each assigned reviewer with its current state and team kind", () => {
+    state.info!.data!.pr!.reviewers = [
+      { login: "alice", kind: "user", state: "PENDING" },
+      { login: "bob", kind: "user", state: "APPROVED" },
+      { login: "carol", kind: "user", state: "COMMENTED" },
+      { login: "platform-team", kind: "team", state: "CHANGES_REQUESTED" },
+      { login: "former-reviewer", kind: "user", state: "DISMISSED" },
+    ];
+    renderPanel();
+
+    expect(screen.getByRole("heading", { name: "Reviewers" })).toBeInTheDocument();
+    for (const [subject, status] of [
+      ["alice", "Pending"],
+      ["bob", "Approved"],
+      ["carol", "Commented"],
+      ["Team platform-team", "Changes requested"],
+      ["former-reviewer", "Dismissed"],
+    ]) {
+      expect(screen.getByRole("listitem", { name: `${subject}: ${status}` })).toBeInTheDocument();
+    }
+    expect(screen.getByText("(team)")).toBeInTheDocument();
+
+    const reviewersSection = screen.getByRole("heading", { name: "Reviewers" }).closest("section");
+    const checksSection = screen.getByRole("heading", { name: "Checks" }).closest("section");
+    expect(reviewersSection).not.toBeNull();
+    expect(checksSection).not.toBeNull();
+    expect(
+      reviewersSection!.compareDocumentPosition(checksSection!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("shows an empty reviewer section when the host reports no reviewers", () => {
+    state.info!.data!.pr!.reviewers = [];
+    renderPanel();
+
+    expect(screen.getByRole("heading", { name: "Reviewers" })).toBeInTheDocument();
+    expect(screen.getByText("No reviewers assigned.")).toBeInTheDocument();
+  });
+
+  it("omits reviewers for a host that does not include the optional field", () => {
+    renderPanel();
+
+    expect(screen.queryByRole("heading", { name: "Reviewers" })).toBeNull();
+  });
+
+  it("updates reviewers when the active PR changes", () => {
+    state.info!.data!.pr!.reviewers = [{ login: "alice", kind: "user", state: "PENDING" }];
+    const { rerender } = renderPanel();
+    expect(screen.getByRole("listitem", { name: "alice: Pending" })).toBeInTheDocument();
+
+    state.info!.data!.pr = {
+      ...state.info!.data!.pr!,
+      number: 6001,
+      title: "chore: another PR",
+      reviewers: [{ login: "platform-team", kind: "team", state: "APPROVED" }],
+    };
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+
+    expect(screen.queryByRole("listitem", { name: "alice: Pending" })).toBeNull();
+    expect(
+      screen.getByRole("listitem", { name: "Team platform-team: Approved" }),
+    ).toBeInTheDocument();
+  });
+
   it.each([
     ["OPEN", "Open", "text-green-700"],
     ["CLOSED", "Closed", "text-red-700"],
@@ -280,7 +350,7 @@ describe("PullRequestPanel", () => {
     expect(screen.getByRole("link", { name: /chore: dummy PR/ })).not.toHaveClass("flex-1");
   });
 
-  it("lands on the Summary tab, showing the PR description and comments", async () => {
+  it("lands on Summary with the description and counts comments on their own tab", async () => {
     state.info!.data!.pr!.body = "## Overview\nThis PR does the thing.";
     state.info!.data!.pr!.comments = [
       {
@@ -294,9 +364,19 @@ describe("PullRequestPanel", () => {
     // Summary is the default — the diff sections aren't mounted yet.
     expect(screen.queryByTestId("diff")).toBeNull();
     expect(await screen.findByText(/This PR does the thing\./)).toBeInTheDocument();
-    expect(screen.getByText("Comments (1)")).toBeInTheDocument();
+    // Comments have their own tab, which shows how many there are.
+    expect(screen.queryByText("Looks good to me!")).toBeNull();
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "Summary",
+      "Comments 1",
+      "Changes",
+    ]);
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Comments 1" }));
     expect(screen.getByText("octocat")).toBeInTheDocument();
     expect(screen.getByText("Looks good to me!")).toBeInTheDocument();
+    expect(screen.queryByText(/This PR does the thing\./)).toBeNull();
+    expect(screen.queryByText("Checks")).toBeNull();
   });
 
   it("renders GitHub comments in order, including ones without a URL or time", () => {
@@ -317,19 +397,60 @@ describe("PullRequestPanel", () => {
       { author: null, body: "Third", created_at: null, url: null },
       { author: null, body: "Fourth", created_at: null, url: null },
     ];
-    renderPanel();
+    renderComments();
 
-    expect(screen.getByText("Comments (4)")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Comments 4" })).toBeInTheDocument();
     expect(commentBodies()).toEqual(["First", "Second", "Third", "Fourth"]);
     expect(keyWarnings()).toEqual([]);
   });
 
-  it("shows Summary empty states when the PR has no body or comments", () => {
+  it.each([
+    ["shared suffixes", ["zoe_data", "amy_data", "a-bot", "z-bot"]],
+    ["other suffixes", ["build[bot]", "lint[bot]", "zoe_acme", "amy_acme"]],
+    ["ordinary usernames", ["ci[bot]", "bob", "alice"]],
+  ])("spaces comment colors consistently for %s", (_, orderedAuthors) => {
+    const comments = [...orderedAuthors].reverse().map((author) => ({
+      author,
+      body: `Comment by ${author}`,
+      created_at: null,
+      url: null,
+    }));
+    const repeatedAuthor = orderedAuthors[0]!.toUpperCase();
+    state.info!.data!.pr!.comments = [
+      ...comments,
+      { author: repeatedAuthor, body: "Another comment", created_at: null, url: null },
+      { author: null, body: "Deleted author", created_at: null, url: null },
+    ];
+    const assertColors = () => {
+      orderedAuthors.forEach((author, index) => {
+        expect(screen.getByText(author).previousElementSibling).toHaveStyle({
+          backgroundColor: `oklch(0.48 0.13 ${(index * 360) / orderedAuthors.length})`,
+          color: "#fff",
+        });
+      });
+      expect(screen.getByText(repeatedAuthor).previousElementSibling).toHaveStyle({
+        backgroundColor: "oklch(0.48 0.13 0)",
+      });
+      expect(screen.getByText("unknown").previousElementSibling).not.toHaveAttribute("style");
+    };
+    const view = renderComments();
+    assertColors();
+    view.unmount();
+    state.info!.data!.pr!.comments.reverse();
+    renderComments();
+    assertColors();
+  });
+
+  it("shows empty states when the PR has no body or comments", () => {
     // The default fixture carries neither a body nor comments.
     renderPanel();
     expect(screen.getByText("No description provided.")).toBeInTheDocument();
-    expect(screen.getByText("No comments yet.")).toBeInTheDocument();
     expect(screen.queryByTestId("diff")).toBeNull();
+
+    const commentsTab = screen.getByRole("tab", { name: "Comments" });
+    expect(commentsTab).toHaveTextContent(/^Comments\s*$/);
+    fireEvent.mouseDown(commentsTab);
+    expect(screen.getByText("No comments yet.")).toBeInTheDocument();
   });
 
   it("marks incomplete checks and comments without claiming they are empty", () => {
@@ -346,8 +467,24 @@ describe("PullRequestPanel", () => {
 
     expect(screen.getByText("Checks")).toBeInTheDocument();
     expect(screen.getByText(/Some checks are unavailable/)).toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Comments" }));
     expect(screen.getByText("Some comments are unavailable.")).toBeInTheDocument();
     expect(screen.queryByText("No comments yet.")).not.toBeInTheDocument();
+  });
+
+  it("explains unreadable checks instead of showing empty counts", () => {
+    // The token read the PR but GitHub refused its check runs.
+    state.info!.data!.pr!.checks = { passing: 0, failing: 0, pending: 0, total: 0, runs: [] };
+    state.info!.data!.pr!.checks_supported = false;
+    renderPanel();
+
+    expect(screen.getByText("Checks")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Checks can’t be read with this GitHub token. Fine-grained personal access tokens can’t read check runs; use a classic token or a GitHub App.",
+    );
+    expect(screen.queryByText(/Some checks are unavailable/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /passed|failed|pending/ })).toBeNull();
+    expect(screen.getByText("No description provided.")).toBeInTheDocument();
   });
 
   it("retains loaded comments while indicating that more could not be fetched", () => {
@@ -355,9 +492,9 @@ describe("PullRequestPanel", () => {
     state.info!.data!.pr!.comments = [
       { author: "reviewer", body: "Loaded comment", created_at: null, url: null },
     ];
-    renderPanel();
+    renderComments();
 
-    expect(screen.getByText("Comments (1+)")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Comments 1+" })).toBeInTheDocument();
     expect(screen.getByText("Loaded comment")).toBeInTheDocument();
     expect(screen.getByText("Some comments are unavailable.")).toBeInTheDocument();
   });
@@ -380,6 +517,12 @@ describe("PullRequestPanel", () => {
     renderPanel();
 
     expect(screen.getByText(/No open PR for/)).toBeInTheDocument();
+    // The empty state shows the panel title; the provider stays in the tooltip.
+    expect(screen.getByRole("heading", { name: "Pull Requests" })).toHaveAttribute(
+      "title",
+      "GitHub",
+    );
+    expect(screen.getByText("Pull Requests")).not.toHaveClass("sr-only");
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("GitLab discovery failed.");
     expect(screen.queryByText("Pull requests aren’t available.")).not.toBeInTheDocument();
@@ -399,6 +542,9 @@ describe("PullRequestPanel", () => {
     renderChanges();
     const diffs = await screen.findAllByTestId("diff");
     expect(diffs.map((d) => d.getAttribute("data-path"))).toEqual(["hello.py", "src/app.ts"]);
+    // index.css binds @pierre/diffs' font variables on this class; outside it the
+    // shadow stylesheet falls back to a fixed 13px that ignores the Interface font size.
+    for (const diff of diffs) expect(diff.closest(".github-diff-stack")).not.toBeNull();
   });
 
   it("jumps to a file's section when its sidebar row is clicked", async () => {
@@ -903,7 +1049,10 @@ describe("PullRequestPanel", () => {
     it("uses the generic label and names the missing CLI", () => {
       state.info!.data = gitlab({ authenticated: false, cli: { name: "glab", available: false } });
       renderPanel();
-      expect(screen.getByRole("heading", { name: "gitlab" })).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Pull Requests" })).toHaveAttribute(
+        "title",
+        "gitlab",
+      );
       expect(screen.getByText("gitlab CLI not found")).toBeInTheDocument();
       expect(screen.getByText("glab")).toHaveClass("font-mono");
       expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
@@ -1092,9 +1241,9 @@ describe("PullRequestPanel", () => {
             comment({ body: "Fair, resolving this.", created_at: "2026-09-05T08:15:09.000Z" }),
           ],
         });
-        renderPanel();
+        renderComments();
 
-        expect(screen.getByText("Comments (3)")).toBeInTheDocument();
+        expect(screen.getByRole("tab", { name: "Comments 3" })).toBeInTheDocument();
         expect(commentBodies()).toEqual([
           "Why not reuse the helper?",
           "It predates the helper.",
@@ -1114,7 +1263,7 @@ describe("PullRequestPanel", () => {
         state.info!.data = withPr({
           comments: [comment({ body: "First of two" }), comment({ body: "Second of two" })],
         });
-        renderPanel();
+        renderComments();
 
         expect(commentBodies()).toEqual(["First of two", "Second of two"]);
         expect(keyWarnings()).toEqual([]);
@@ -1140,7 +1289,7 @@ describe("PullRequestPanel", () => {
           url: first.url,
         });
         state.info!.data = withPr({ comments: [first, second] });
-        const { rerender } = renderPanel();
+        const { rerender } = renderComments();
         const card = screen.getByText("Thread two").closest("li");
 
         // The next poll returns a reply to the first thread, ahead of the second.
@@ -1662,141 +1811,5 @@ describe("session PR selection", () => {
     };
     renderPanel();
     expect(usePullRequestChangedFiles).toHaveBeenLastCalledWith("conv_1", true, url, "base:head");
-  });
-});
-
-describe("selectDefaultPr", () => {
-  const pr = (url: string, prState?: string | null): PullRequestAssociation => ({
-    url,
-    host: "github.com",
-    repository: "example/repo",
-    number: 1,
-    relationship: "created",
-    state: prState,
-  });
-
-  it("returns undefined for an empty list", () => {
-    expect(selectDefaultPr([])).toBeUndefined();
-  });
-
-  it("prefers OPEN over MERGED", () => {
-    const open = pr("https://github.com/a/b/pull/1", "OPEN");
-    const merged = pr("https://github.com/a/b/pull/2", "MERGED");
-    expect(selectDefaultPr([merged, open])).toBe(open.url);
-    expect(selectDefaultPr([open, merged])).toBe(open.url);
-  });
-
-  it("prefers OPEN over CLOSED", () => {
-    const open = pr("https://github.com/a/b/pull/1", "OPEN");
-    const closed = pr("https://github.com/a/b/pull/2", "CLOSED");
-    expect(selectDefaultPr([closed, open])).toBe(open.url);
-  });
-
-  it("prefers CLOSED over MERGED", () => {
-    const closed = pr("https://github.com/a/b/pull/1", "CLOSED");
-    const merged = pr("https://github.com/a/b/pull/2", "MERGED");
-    expect(selectDefaultPr([merged, closed])).toBe(closed.url);
-    expect(selectDefaultPr([closed, merged])).toBe(closed.url);
-  });
-
-  it("ranks an unprobed PR after OPEN but ahead of CLOSED and MERGED", () => {
-    const open = pr("https://github.com/a/b/pull/1", "OPEN");
-    const unknown = pr("https://github.com/a/b/pull/2", null);
-    const closed = pr("https://github.com/a/b/pull/3", "CLOSED");
-    const merged = pr("https://github.com/a/b/pull/4", "MERGED");
-    expect(selectDefaultPr([merged, closed, unknown])).toBe(unknown.url);
-    expect(selectDefaultPr([unknown, open])).toBe(open.url);
-  });
-
-  it("returns the first PR when all states are equal", () => {
-    const a = pr("https://github.com/a/b/pull/1", "OPEN");
-    const b = pr("https://github.com/a/b/pull/2", "OPEN");
-    expect(selectDefaultPr([a, b])).toBe(a.url);
-  });
-
-  it("compares states case-insensitively", () => {
-    const open = pr("https://github.com/a/b/pull/1", "open");
-    const merged = pr("https://github.com/a/b/pull/2", "merged");
-    expect(selectDefaultPr([merged, open])).toBe(open.url);
-  });
-});
-
-describe("session PR selection across sessions", () => {
-  const one = "https://github.com/example/one/pull/42";
-  const two = "https://github.com/example/two/pull/42";
-
-  /** A tracking payload whose selected PR is `selectedUrl`, listing `prs` in order. */
-  function trackingInfo(selectedUrl: string, prs: { url: string; state?: string | null }[]) {
-    return {
-      isLoading: false,
-      error: null,
-      isFetching: false,
-      data: {
-        ...state.info!.data!,
-        tracking_available: true,
-        selected_pr_url: selectedUrl,
-        prs: prs.map(({ url, state: prState }): PullRequestAssociation => ({
-          url,
-          host: "github.com",
-          repository: url.replace("https://github.com/", "").split("/pull/")[0],
-          number: 42,
-          title: `PR from ${url.split("/pull/")[0].split("/").pop()}`,
-          relationship: "created",
-          state: prState ?? null,
-        })),
-        pr: {
-          ...state.info!.data!.pr!,
-          url: selectedUrl,
-          state: prs.find((p) => p.url === selectedUrl)?.state ?? "OPEN",
-        },
-      },
-    };
-  }
-
-  it("remembers each session's PR when switching sessions and back", () => {
-    state.info = trackingInfo(one, [{ url: one, state: "OPEN" }]);
-    const { rerender } = renderPanel();
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
-
-    state.info = trackingInfo(two, [{ url: two, state: "MERGED" }]);
-    rerender(<PullRequestPanel conversationId="conv_2" />);
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_2", { poll: true, prUrl: two });
-
-    // conv_1 keeps its own PR rather than adopting conv_2's.
-    state.info = trackingInfo(one, [{ url: one, state: "OPEN" }]);
-    rerender(<PullRequestPanel conversationId="conv_1" />);
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
-  });
-
-  it("selects the open PR even when the server's default is merged", () => {
-    state.info = trackingInfo(two, [
-      { url: two, state: "MERGED" },
-      { url: one, state: "OPEN" },
-    ]);
-    renderPanel();
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
-    expect(screen.getByRole("combobox", { name: "Session pull request" })).toHaveTextContent(
-      "example/one #42",
-    );
-  });
-
-  it("keeps an explicit selection when data refreshes", async () => {
-    const user = userEvent.setup();
-    state.info = trackingInfo(one, [
-      { url: one, state: "OPEN" },
-      { url: two, state: "MERGED" },
-    ]);
-    const { rerender } = renderPanel();
-
-    await user.click(screen.getByRole("combobox", { name: "Session pull request" }));
-    await user.click(screen.getByRole("option", { name: /example\/two #42/ }));
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
-
-    state.info = trackingInfo(one, [
-      { url: one, state: "OPEN" },
-      { url: two, state: "MERGED" },
-    ]);
-    rerender(<PullRequestPanel conversationId="conv_1" />);
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
   });
 });

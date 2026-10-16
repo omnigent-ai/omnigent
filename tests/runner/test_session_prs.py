@@ -652,17 +652,6 @@ def test_title_cache_preserves_newer_timeout_marker(
 # ── State-based ordering ─────────────────────────────────────────────────────
 
 
-def test_list_sorts_open_before_merged(tmp_path: Path) -> None:
-    """OPEN PR is placed first in list() regardless of last_seen_at order."""
-    store = SessionPrRegistry("conv_a", root=tmp_path)
-    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=30)
-    store.record([PullRequestRef.from_url(B)], relationship="created", source="test", timestamp=20)
-    store.update_titles({}, states={A: "MERGED", B: "OPEN"})
-    result = store.list()
-    # B (OPEN, older) must come before A (MERGED, newer)
-    assert [e.url for e in result] == [B, A]
-
-
 @pytest.mark.parametrize(
     "a_state,b_state,expected_order",
     [
@@ -714,6 +703,21 @@ def test_update_titles_caches_state(tmp_path: Path) -> None:
     before = store.list()
     store.update_titles({})
     assert store.list() == before
+
+
+def test_out_of_order_state_updates_rejected(tmp_path: Path) -> None:
+    """An older observation cannot overwrite a newer cached state."""
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    # First update at timestamp 30: state becomes MERGED.
+    store.update_titles({}, states={A: "MERGED"}, timestamp=30)
+    assert {e.url: e.state for e in store.list()} == {A: "MERGED"}
+    # Later update at timestamp 40 (fresher): state becomes OPEN.
+    store.update_titles({}, states={A: "OPEN"}, timestamp=40)
+    assert {e.url: e.state for e in store.list()} == {A: "OPEN"}
+    # Earlier update at timestamp 35 (stale): should not overwrite the OPEN state.
+    store.update_titles({}, states={A: "MERGED"}, timestamp=35)
+    assert {e.url: e.state for e in store.list()} == {A: "OPEN"}
 
 
 def test_state_ranks_ahead_of_relationship(tmp_path: Path) -> None:
