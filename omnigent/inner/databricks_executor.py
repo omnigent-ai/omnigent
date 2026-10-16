@@ -91,6 +91,25 @@ class DatabricksCredentials:
     token: str
 
 
+def _describe_config_error(exc: BaseException) -> str:
+    """Describe a credential-resolution error without echoing config file lines.
+
+    ``configparser`` errors quote the offending line, which in a credentials
+    file may be a token, so they (and errors chained from one) are reduced to
+    their class name.
+    """
+    import configparser
+
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if isinstance(link, configparser.Error):
+            return type(exc).__name__
+        link = link.__cause__ or link.__context__
+    return str(exc)
+
+
 def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | None:
     """
     Resolve Databricks ``(host, bearer_token)`` for *profile* using the
@@ -135,6 +154,8 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
        by non-executor callers that only need a one-shot credential
        check.
     """
+    import configparser
+
     try:
         from databricks.sdk.config import Config
     except ImportError:
@@ -147,15 +168,14 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
     try:
         cfg = Config(profile=sdk_profile)
         headers = cfg.authenticate()
-    except ValueError as profile_exc:
-        # ValueError is what Config raises for every user-facing resolution
-        # failure (missing profile, malformed file, no credentials in env,
-        # unknown auth_type, etc.). Anything else (e.g. network errors
-        # fetching OAuth tokens) should propagate.
+    except (ValueError, configparser.Error) as profile_exc:
+        # Config raises ValueError for user-facing resolution failures; its
+        # strict ConfigParser raises configparser.Error on a duplicated section
+        # or key, which the file fallback tolerates. Anything else propagates.
         logger.debug(
             "databricks-sdk credential resolution failed for profile %r: %s",
             sdk_profile,
-            profile_exc,
+            _describe_config_error(profile_exc),
         )
         if sdk_profile is not None:
             # Profile not found; fall back to ambient credentials
@@ -166,7 +186,7 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
             try:
                 cfg = Config()
                 headers = cfg.authenticate()
-            except ValueError:
+            except (ValueError, configparser.Error):
                 return _read_databrickscfg_file_fallback(profile)
         else:
             return _read_databrickscfg_file_fallback(profile)
@@ -210,8 +230,17 @@ def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksC
     if not cfg_path.exists():
         return None
 
-    config = configparser.ConfigParser()
-    config.read(cfg_path)
+    # strict=False: tolerate the duplicated [DEFAULT] some tools (e.g. the Databricks
+    # VS Code extension) leave in ~/.databrickscfg; the last value wins.
+    config = configparser.ConfigParser(strict=False)
+    try:
+        config.read(cfg_path)
+    except (configparser.Error, UnicodeDecodeError) as exc:
+        # Log only the class: parser errors quote the offending line, which may hold a token.
+        logger.warning(
+            "Ignoring unparseable Databricks config %s (%s)", cfg_path, type(exc).__name__
+        )
+        return None
 
     resolved_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
     if resolved_profile and resolved_profile in config:
@@ -406,8 +435,16 @@ def _read_databrickscfg_host(profile: str | None = None) -> str | None:
     if not cfg_path.exists():
         return None
 
-    config = configparser.ConfigParser()
-    config.read(cfg_path)
+    # strict=False: tolerate duplicate sections/keys in ~/.databrickscfg.
+    config = configparser.ConfigParser(strict=False)
+    try:
+        config.read(cfg_path)
+    except (configparser.Error, UnicodeDecodeError) as exc:
+        # Log only the class: parser errors quote the offending line, which may hold a token.
+        logger.warning(
+            "Ignoring unparseable Databricks config %s (%s)", cfg_path, type(exc).__name__
+        )
+        return None
 
     resolved_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
     if resolved_profile:
@@ -694,6 +731,8 @@ def _resolve_databricks_auth(
         installed.
     :raises ValueError: When both ``profile`` and ``host`` are given.
     """
+    import configparser
+
     try:
         from databricks.sdk.config import Config
     except ImportError as exc:
@@ -713,7 +752,9 @@ def _resolve_databricks_auth(
     try:
         cfg = Config(profile=sdk_profile)
         cfg.authenticate()
-    except ValueError:
+    except (ValueError, configparser.Error) as exc:
+        # configparser.Error: the SDK's strict parser rejected the config file
+        # (e.g. a duplicated [DEFAULT]); the file fallback below tolerates it.
         if profile is None and sdk_profile is not None:
             # Profile name came from the DATABRICKS_CONFIG_PROFILE env var,
             # not from an explicit profile argument.  Fall back to the
@@ -726,14 +767,15 @@ def _resolve_databricks_auth(
             # fall back — the user asked for a specific workspace and silently
             # using a different one violates the "Fail loud" principle.
             logger.warning(
-                "Databricks profile %r (from DATABRICKS_CONFIG_PROFILE) not found "
-                "in config file; falling back to ambient credential chain.",
+                "Databricks profile %r (from DATABRICKS_CONFIG_PROFILE) could not be "
+                "resolved (%s); falling back to ambient credential chain.",
                 sdk_profile,
+                _describe_config_error(exc),
             )
             try:
                 cfg = Config()
                 cfg.authenticate()
-            except ValueError:
+            except (ValueError, configparser.Error):
                 cfg = None
         else:
             cfg = None
@@ -932,10 +974,10 @@ def _read_databrickscfg_no_inheritance() -> configparser.ConfigParser | None:
     cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
     if not cfg_path.exists():
         return None
-    config = configparser.ConfigParser(default_section=_NO_DEFAULT_INHERITANCE)
+    config = configparser.ConfigParser(default_section=_NO_DEFAULT_INHERITANCE, strict=False)
     try:
         config.read(cfg_path)
-    except configparser.Error:
+    except (configparser.Error, UnicodeDecodeError):
         return None
     return config
 
@@ -1101,10 +1143,11 @@ def databrickscfg_workspace_id_for_host(host: str) -> str | None:
     cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
     if not cfg_path.exists():
         return None
-    config = configparser.ConfigParser()
+    # strict=False: tolerate duplicate sections/keys in ~/.databrickscfg.
+    config = configparser.ConfigParser(strict=False)
     try:
         config.read(cfg_path)
-    except configparser.Error:
+    except (configparser.Error, UnicodeDecodeError):
         return None
     for section in _databrickscfg_profiles_for_host(host):
         values = config.defaults() if section == "DEFAULT" else config[section]
@@ -1122,10 +1165,11 @@ def databrickscfg_workspace_id_for_profile(profile: str) -> str | None:
     cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
     if not cfg_path.exists():
         return None
-    config = configparser.ConfigParser()
+    # strict=False: tolerate duplicate sections/keys in ~/.databrickscfg.
+    config = configparser.ConfigParser(strict=False)
     try:
         config.read(cfg_path)
-    except configparser.Error:
+    except (configparser.Error, UnicodeDecodeError):
         return None
     if profile == "DEFAULT":
         values = config.defaults()

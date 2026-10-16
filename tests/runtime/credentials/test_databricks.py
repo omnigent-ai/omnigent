@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,9 @@ from omnigent.runtime.credentials.databricks import (
     WorkspaceCreds,
     resolve_databricks_workspace,
 )
+
+# Bound at import time, before the autouse fixture stubs the module attribute.
+_RealSdkConfig = pytest.importorskip("databricks.sdk.config").Config
 
 
 @pytest.fixture(autouse=True)
@@ -104,6 +108,106 @@ def test_resolves_default_when_profile_is_none(
 
     # profile=None went straight to [DEFAULT] and pulled both values.
     assert creds == WorkspaceCreds(host="https://default.example.com", token="default-token")
+
+
+def test_duplicate_default_sections_resolve_instead_of_crashing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A ``.databrickscfg`` with a duplicate ``[DEFAULT]`` section (as written
+    by the Databricks VS Code extension) resolves to the last-defined host
+    and token instead of raising ``configparser.DuplicateOptionError``.
+    """
+    cfg = _write_cfg(
+        tmp_path,
+        (
+            "[DEFAULT]\n"
+            "host = https://first.example.com\n"
+            "token = first-token\n"
+            "\n"
+            "[DEFAULT]\n"
+            "host = https://second.example.com\n"
+            "token = second-token\n"
+        ),
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    creds = resolve_databricks_workspace(profile=None)
+
+    assert creds == WorkspaceCreds(host="https://second.example.com", token="second-token")
+
+
+def test_sdk_rejecting_duplicate_default_sections_falls_through_to_cfg(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Restore the real SDK Config: its strict parser raises DuplicateOptionError
+    # (not ValueError); the resolver must fall through to the tolerant cfg path.
+    monkeypatch.setattr("databricks.sdk.config.Config", _RealSdkConfig)
+    for var in [name for name in os.environ if name.startswith("DATABRICKS_")]:
+        monkeypatch.delenv(var)
+    cfg = _write_cfg(
+        tmp_path,
+        (
+            "[DEFAULT]\n"
+            "host = https://first.example.com\n"
+            "token = first-token\n"
+            "\n"
+            "[DEFAULT]\n"
+            "host = https://second.example.com\n"
+            "token = second-token\n"
+        ),
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    creds = resolve_databricks_workspace(profile=None)
+
+    assert creds == WorkspaceCreds(host="https://second.example.com", token="second-token")
+
+
+_UNPARSEABLE_CFGS = {
+    # A token before any section header: MissingSectionHeaderError quotes the line.
+    "orphan-token": (
+        b"token = dapi-orphan\n[DEFAULT]\nhost = https://x.example.com\n",
+        "MissingSectionHeaderError",
+    ),
+    # Bytes invalid in UTF-8 and cp1252: UnicodeDecodeError, a ValueError the SDK
+    # path already tolerates.
+    "undecodable": (
+        b"\x81\x8d[DEFAULT]\nhost = https://x.example.com\ntoken = dapi-orphan\n",
+        "UnicodeDecodeError",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "content, error_name", list(_UNPARSEABLE_CFGS.values()), ids=list(_UNPARSEABLE_CFGS)
+)
+def test_unparseable_cfg_reports_no_credentials_instead_of_crashing(
+    content: bytes,
+    error_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Malformed beyond what strict=False tolerates: the real SDK parser and the
+    # cfg fallback both reject it. The resolver must end in its usual OSError
+    # and keep the token out of the logs.
+    monkeypatch.setattr("databricks.sdk.config.Config", _RealSdkConfig)
+    for var in [name for name in os.environ if name.startswith("DATABRICKS_")]:
+        monkeypatch.delenv(var)
+    cfg = tmp_path / "databrickscfg"
+    cfg.write_bytes(content)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    with (
+        caplog.at_level("DEBUG", logger="omnigent.runtime.credentials.databricks"),
+        pytest.raises(OSError),
+    ):
+        resolve_databricks_workspace(profile=None)
+
+    # The warning names the file and the error class only, never the offending line.
+    assert any(f"({error_name})" in record.getMessage() for record in caplog.records)
+    assert "dapi-orphan" not in caplog.text
 
 
 def test_named_profile_overrides_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

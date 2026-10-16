@@ -279,6 +279,18 @@ def _read_section(config: configparser.ConfigParser, section: str) -> WorkspaceC
     )
 
 
+def _chains_parse_error(exc: BaseException) -> bool:
+    """Whether *exc* or any exception chained below it is a ``configparser.Error``."""
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if isinstance(link, configparser.Error):
+            return True
+        link = link.__cause__ or link.__context__
+    return False
+
+
 def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
     """
     Call ``databricks-sdk``'s ``Config.authenticate()`` once and unpack
@@ -311,17 +323,18 @@ def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
     try:
         cfg = Config(profile=sdk_profile)
         headers = cfg.authenticate()
-    except ValueError as exc:
+    except (ValueError, configparser.Error) as exc:  # the SDK parses the file strictly
         # INFO (not WARNING): expired tokens raise here. WARNING would
         # surface via root's lastResort handler to stderr, drowning the
         # clean ClickException. INFO still lands in cli-*.log; frames are
         # debug-only so a TTY-mirrored host console stays concise.
+        is_parse_error = _chains_parse_error(exc)  # parser text may quote a token line
         _logger.info(
             "databricks-sdk Config(profile=%r).authenticate() failed: %s — "
             "falling through to configparser path.",
             sdk_profile,
-            exc,
-            exc_info=_logger.isEnabledFor(logging.DEBUG),
+            type(exc).__name__ if is_parse_error else exc,
+            exc_info=_logger.isEnabledFor(logging.DEBUG) and not is_parse_error,
         )
         return None
 
@@ -398,8 +411,17 @@ def _try_resolve_from_cfg(profile: str | None, cfg_path: Path) -> WorkspaceCreds
     if not cfg_path.exists():
         return None
 
-    config = configparser.ConfigParser()
-    config.read(cfg_path)
+    # strict=False: tolerate the duplicated [DEFAULT] some tools (e.g. the Databricks
+    # VS Code extension) leave in ~/.databrickscfg; the last value wins.
+    config = configparser.ConfigParser(strict=False)
+    try:
+        config.read(cfg_path)
+    except (configparser.Error, UnicodeDecodeError) as exc:
+        # Log only the class: parser errors quote the offending line, which may hold a token.
+        _logger.warning(
+            "Ignoring unparseable Databricks config %s (%s)", cfg_path, type(exc).__name__
+        )
+        return None
 
     if profile is not None:
         # _read_section raises _SectionPresentButInvalid when the
