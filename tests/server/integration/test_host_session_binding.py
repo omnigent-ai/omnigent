@@ -2084,7 +2084,7 @@ async def test_runner_exited_after_connect_keeps_idle_session_idle(
     else:
         assert session_live_state.last_liveness_stamp("runner_ran_idle") is None
 
-    caplog.set_level("WARNING", logger="omnigent")
+    caplog.set_level("INFO", logger="omnigent")
     _comm = await _report_runner_exited(
         app, "runner_ran_idle", had_connected=True if connection_source == "host" else None
     )
@@ -2127,7 +2127,7 @@ async def test_runner_exited_before_connect_fails_idle_session(
     conv = conv_store.create_conversation(agent_id=None, runner_id="runner_never_connected")
     conv_store.set_session_live_status(conv.id, "idle")
 
-    caplog.set_level("WARNING", logger="omnigent")
+    caplog.set_level("INFO", logger="omnigent")
     _comm = await _report_runner_exited(app, "runner_never_connected", had_connected=had_connected)
     async with asyncio.timeout(5.0):
         while _persisted_task_error(conv_store, conv.id) is None:
@@ -2168,7 +2168,7 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
     else:
         assert session_live_state.last_liveness_stamp("runner_ran_mid_turn") is None
 
-    caplog.set_level("WARNING", logger="omnigent")
+    caplog.set_level("INFO", logger="omnigent")
     _comm = await _report_runner_exited(
         app, "runner_ran_mid_turn", had_connected=True if connection_source == "host" else None
     )
@@ -2296,7 +2296,7 @@ async def test_runner_exited_keeps_existing_failure_cause(
         assert _persisted_task_error(conv_store, session_id) == original_error
 
         collector = await start_session_stream_collector(session_id)
-        caplog.set_level("WARNING", logger="omnigent")
+        caplog.set_level("INFO", logger="omnigent")
         _comm = await _report_runner_exited(app, runner_id)
         async with asyncio.timeout(5.0):
             while not _disconnect_decisions(caplog, session_id):
@@ -2341,7 +2341,7 @@ async def test_session_response_keeps_existing_failure_cause_while_exit_report_i
             _host,
         ) = await _failed_native_session_on_never_connected_runner(app, client)
 
-        caplog.set_level("WARNING", logger="omnigent")
+        caplog.set_level("INFO", logger="omnigent")
         _comm = await _report_runner_exited(app, runner_id, had_connected=True)
         async with asyncio.timeout(5.0):
             while not _disconnect_decisions(caplog, session_id):

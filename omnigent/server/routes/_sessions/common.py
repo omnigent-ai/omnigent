@@ -57,6 +57,7 @@ from omnigent.spec.types import (
     StateUpdate,
 )
 from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+from omnigent.stores.host_store import HostStore
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -1061,6 +1062,27 @@ def get_server_host_registry() -> HostRegistry | None:
     return _server_host_registry
 
 
+# Persistent host rows, set once at app startup. Runner-disconnect handling
+# runs in background tasks with no request in scope and reads host liveness here.
+_server_host_store: HostStore | None = None
+
+
+def set_server_host_store(host_store: HostStore | None) -> None:
+    """Stash the host store for background host-liveness checks.
+
+    :param host_store: Persistent host registrations, or ``None`` in setups
+        without host tunnels.
+    :returns: None.
+    """
+    global _server_host_store
+    _server_host_store = host_store
+
+
+def get_server_host_store() -> HostStore | None:
+    """Return the store stashed by :func:`set_server_host_store`."""
+    return _server_host_store
+
+
 __all__ = [
     "COST_CONTROL_OVERRIDE_VALUES",
     "SUBAGENT_ROUTING_OVERRIDE_VALUES",
@@ -1254,9 +1276,11 @@ __all__ = [
     "_session_status_cache",
     "_session_terminal_pending_cache",
     "get_server_host_registry",
+    "get_server_host_store",
     "get_server_runner_router",
     "host_interactive_shells_for_request",
     "set_server_host_registry",
+    "set_server_host_store",
     "set_server_runner_router",
 ]
 

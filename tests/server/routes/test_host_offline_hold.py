@@ -1,0 +1,87 @@
+"""Decide when a dropped runner's host is offline, so its turn can wait for it."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import replace
+
+import pytest
+
+from omnigent.db.utils import now_epoch
+from omnigent.server.routes._sessions import orchestration
+from omnigent.stores.host_store import Host
+
+_HOST_ID = "host_0123456789abcdef"
+
+
+def _host(*, status: str = "offline", sandbox_provider: str | None = None) -> Host:
+    now = now_epoch()
+    return Host(
+        host_id=_HOST_ID,
+        name="test-laptop",
+        user_id="user@example.com",
+        status=status,
+        created_at=now - 3600,
+        updated_at=now,
+        sandbox_provider=sandbox_provider,
+    )
+
+
+class _FakeHostStore:
+    def __init__(self, host: Callable[[], Host] | None = None, *, error: Exception | None = None):
+        # Build the row at read time so its last-seen is fresh when the test runs.
+        self.host = host
+        self.error = error
+
+    def get_host(self, host_id: str) -> Host | None:
+        if self.error is not None:
+            raise self.error
+        return self.host() if self.host is not None and host_id == _HOST_ID else None
+
+
+class _FakeRegistry:
+    def __init__(self, connected: bool) -> None:
+        self.connected = connected
+
+    def get(self, host_id: str) -> object | None:
+        return object() if self.connected else None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("store", "connected", "expected"),
+    [
+        # A laptop that went to sleep: no tunnel here and its row reads offline.
+        (_FakeHostStore(_host), False, True),
+        # Its row went stale without a graceful disconnect.
+        (_FakeHostStore(lambda: replace(_host(status="online"), updated_at=0)), False, True),
+        # Connected to this replica, or live by its row on another one.
+        (_FakeHostStore(_host), True, False),
+        (_FakeHostStore(lambda: _host(status="online")), False, False),
+        # A managed sandbox has its own wake path; an unknown host proves nothing.
+        (_FakeHostStore(lambda: _host(sandbox_provider="e2b")), False, False),
+        (_FakeHostStore(), False, False),
+        # An unreadable row is inconclusive.
+        (_FakeHostStore(error=RuntimeError("store down")), False, None),
+        (None, False, False),
+    ],
+)
+async def test_host_offline_state(
+    monkeypatch: pytest.MonkeyPatch,
+    store: _FakeHostStore | None,
+    connected: bool,
+    expected: bool | None,
+) -> None:
+    """Only a user-run host that is gone everywhere counts as offline."""
+    monkeypatch.setattr(orchestration, "get_server_host_store", lambda: store)
+    monkeypatch.setattr(
+        orchestration, "get_server_host_registry", lambda: _FakeRegistry(connected)
+    )
+    assert await orchestration._host_offline_state(_HOST_ID) is expected
+
+
+@pytest.mark.asyncio
+async def test_host_offline_state_without_a_host_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session with no known host never waits for one."""
+    monkeypatch.setattr(orchestration, "get_server_host_store", lambda: _FakeHostStore(_host))
+    assert await orchestration._host_offline_state(None) is False

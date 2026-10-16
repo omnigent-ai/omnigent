@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -1031,6 +1032,7 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
     quiet ``idle`` (no ``runner_disconnected`` status, no persisted error
     labels) rather than rendering "Error · runner_disconnected".
     """
+    caplog.set_level(logging.INFO)
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
 
@@ -1075,6 +1077,9 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
         assert record.attributes["intentional_stop"] is True
         assert record.attributes["cached_session_status"] is None
         assert record.attributes["decision"] == "intentional_stop"
+        # An expected outcome is not a warning and carries no traceback.
+        assert record.levelno == logging.INFO
+        assert not record.exc_info
 
         # No durable runner_disconnected label persists, so snapshots and
         # child summaries stay clean.
@@ -1837,6 +1842,7 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
     the drop and asserts the relay publishes no failure and persists no
     error labels — the disconnect surfaces through liveness instead.
     """
+    caplog.set_level(logging.INFO)
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
 
@@ -1895,6 +1901,8 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
         assert record.attributes["intentional_stop"] is False
         assert record.attributes["cached_session_status"] == "idle"
         assert record.attributes["decision"] == "idle_no_failure"
+        assert record.levelno == logging.INFO
+        assert not record.exc_info
     finally:
         gate.set()
         if collector is not None:
@@ -2288,7 +2296,7 @@ async def test_disconnect_uses_status_arriving_during_lookup(
             assert not any(row["event_name"] == "session_turn_failed" for row in rows)
 
         decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
-        assert decision["level"] == "WARNING"
+        assert decision["level"] == ("WARNING" if expect_failed else "INFO")
         assert (
             decision["attributes"].items()
             >= {
@@ -3751,3 +3759,77 @@ def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
         f"({_MAX_RECONNECT_DELAY_S} * (1 + {_RECONNECT_JITTER_FRACTION}) = "
         f"{worst_case_reconnect_s}s)"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_offline", [True, False])
+async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    host_offline: bool,
+) -> None:
+    """
+    A relay that loses a mid-turn runner whose host went offline does not fail it.
+
+    The disconnect sweep holds that turn until the host returns, so the relay
+    records ``held_host_offline`` and publishes no failure. A host that is
+    still online means the runner itself died, and the turn fails as before.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+
+    async def scripted_host_offline(
+        _session_id: str, _store: object, _runner_id: str | None
+    ) -> bool:
+        return host_offline
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._relay_host_offline",
+        scripted_host_offline,
+    )
+    caplog.set_level(logging.INFO)
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    frames = ['data: {"type": "session.status", "status": "running"}\n\n']
+    fake_runner = _ScriptedThenDropRunnerClient(frames, gate)
+    store = _RecordingLabelStore()
+    session_id = "2f3e4d5c6b7a8998a7b6c5d4e3f2a1b0"
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_host_offline",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        record = next(
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "runner_stream_disconnected"
+        )
+        error = sessions_module._last_task_error_from_labels(store.labels.get(session_id, {}))
+        if host_offline:
+            assert record.attributes["decision"] == "held_host_offline"
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+            assert error is None
+        else:
+            assert record.attributes["decision"] == "failed_mid_turn"
+            assert sessions_module._session_status_cache.get(session_id) == "failed"
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)

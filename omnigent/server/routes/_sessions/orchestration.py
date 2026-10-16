@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import math
 import re
 import secrets
@@ -238,6 +239,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_status_cache,
     _session_terminal_pending_cache,
     get_caps,
+    get_server_host_registry,
+    get_server_host_store,
     get_server_runner_router,
     session_stream,
     set_server_runner_router,
@@ -8016,6 +8019,150 @@ _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S: float = 30.0
 _MID_TURN_STATUSES = ("running", "waiting")
 
 
+# A sleeping or offline laptop takes its runner with it and usually returns
+# minutes to hours later with the turn still running, so a turn interrupted
+# that way waits this long for its host before it fails.
+HOST_OFFLINE_HOLD_S: float = 6 * 3600.0
+# How often a held runner re-checks its host and cross-replica liveness.
+_HOST_OFFLINE_RECHECK_S: float = 60.0
+
+
+async def _host_offline_state(host_id: str | None) -> bool | None:
+    """
+    Report whether a dropped runner's host is a user machine that went away too.
+
+    :param host_id: Host the runner ran on, or ``None`` when unknown.
+    :returns: ``True`` when the host is user-run and neither connected here nor
+        live by its row; ``False`` when it is connected, managed, or unknown;
+        ``None`` when its row cannot be read.
+    """
+    host_store = get_server_host_store()
+    if host_id is None or host_store is None:
+        return False
+    registry = get_server_host_registry()
+    if registry is not None and registry.get(host_id) is not None:
+        return False
+    try:
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+    except Exception:  # noqa: BLE001 — an unreadable row proves nothing either way
+        _logger.warning(
+            "Runner disconnect: host lookup failed for host=%s", host_id, exc_info=True
+        )
+        return None
+    return host is not None and host.sandbox_provider is None and not host_is_live(host)
+
+
+async def _session_host_id(
+    conv: Conversation | _RelayStatusSnapshot, conversation_store: ConversationStore
+) -> str | None:
+    """
+    Return the host a session runs on; a sub-agent rides its parent's host.
+
+    :param conv: The session row, or a relay's saved snapshot of it.
+    :param conversation_store: Store used to read a sub-agent's parent.
+    :returns: The host id, or ``None`` when unknown or unreadable.
+    """
+    if conv.host_id is not None or conv.parent_conversation_id is None:
+        return conv.host_id
+    try:
+        parent = await asyncio.to_thread(
+            conversation_store.get_conversation, conv.parent_conversation_id
+        )
+    except Exception:  # noqa: BLE001 — an unreadable parent leaves the host unknown
+        return None
+    return parent.host_id if parent is not None else None
+
+
+def _split_host_offline_holds(
+    convs: Sequence[Conversation],
+) -> tuple[list[Conversation], list[Conversation]]:
+    """
+    Split a dropped runner's sessions into settle-now and hold-for-host.
+
+    Only an interrupted turn waits for the host; an idle session or a
+    requested Stop settles at once, exactly as without a hold.
+
+    :param convs: Sessions bound to the dropped runner.
+    :returns: ``(settle_now, held)``.
+    """
+    settle_now: list[Conversation] = []
+    held: list[Conversation] = []
+    for conv in convs:
+        live = _session_status_cache.get(conv.id, conv.live_status)
+        if conv.id in _intentional_stop_sessions or live not in _MID_TURN_STATUSES:
+            settle_now.append(conv)
+        else:
+            held.append(conv)
+    return settle_now, held
+
+
+def _log_host_offline_hold(
+    event: str,
+    convs: Sequence[Conversation],
+    *,
+    runner_id: str,
+    host_id: str | None,
+    hold_s: float | None = None,
+    outcome: str | None = None,
+    held_s: float | None = None,
+) -> None:
+    """Log one row per held session so each turn's hold joins to its session."""
+    for conv in convs:
+        _logger.info(
+            "Runner %s: %s for session=%s",
+            runner_id,
+            event,
+            conv.id,
+            extra=debug_event(
+                event,
+                session_id=conv.id,
+                turn_id=_session_active_response_cache.get(conv.id),
+                runner_id=runner_id,
+                host_id=host_id,
+                hold_s=hold_s,
+                outcome=outcome,
+                held_s=held_s,
+            ),
+        )
+
+
+async def _relay_host_offline(
+    session_id: str,
+    conversation_store: ConversationStore,
+    runner_id: str | None,
+) -> bool:
+    """
+    Report whether a lost relay's session sits on a host that went offline.
+
+    The same drop schedules this replica's disconnect sweep, which holds the
+    interrupted turn while the host is away, so the relay leaves the outcome
+    to it. Any unreadable row reads as not offline and fails as before.
+
+    :param session_id: Session whose relay gave up.
+    :param conversation_store: Store used to find the session's host.
+    :param runner_id: Runner the relay streamed from, or ``None`` when unknown.
+    :returns: ``True`` only when the session's user-run host is confirmed offline.
+    """
+    if get_server_host_store() is None:
+        return False
+    handle = _runner_relay_tasks.get(session_id)
+    conv: Conversation | _RelayStatusSnapshot | None = (
+        handle.status_snapshot if handle is not None else None
+    )
+    if conv is None and runner_id is not None:
+        try:
+            bound = await asyncio.to_thread(
+                conversation_store.list_conversations_by_runner_id, runner_id
+            )
+        except Exception:  # noqa: BLE001 — unknown session state fails as before
+            return False
+        conv = next((c for c in bound if c.id == session_id), None)
+    if conv is None:
+        return False
+    host_id = await _session_host_id(conv, conversation_store)
+    return await _host_offline_state(host_id) is True
+
+
 class _RelayTransportLost(Exception):
     """Runner stream transport dropped mid-relay.
 
@@ -8235,7 +8382,12 @@ async def _runner_disconnect_requires_failure(
     else:
         decision = "idle_no_failure"
 
-    _logger.warning(
+    # Only a decision that fails the session is a warning; an idle session or
+    # an already-recorded failure is the expected outcome of a runner drop.
+    _logger.log(
+        logging.WARNING
+        if decision in ("failed_mid_turn", "failed_before_start")
+        else logging.INFO,
         "Runner disconnect for session=%s: %s (status=%s source=%s)",
         session_id,
         decision,
@@ -8451,6 +8603,8 @@ async def _relay_runner_stream(
                 decision = "server_shutdown"
             elif await _relay_runner_live_elsewhere(session_id, conversation_store):
                 decision = "live_elsewhere"
+            elif await _relay_host_offline(session_id, conversation_store, outage_runner_id):
+                decision = "held_host_offline"
             elif await _runner_disconnect_requires_failure(
                 session_id, conversation_store, origin="runner_disconnected_mid_turn"
             ):
@@ -8459,11 +8613,14 @@ async def _relay_runner_stream(
                 decision = "idle_no_failure"
             # One row per outage outcome: which branch below fired, how long the
             # runner was gone against the grace, and how many retries it got.
-            _logger.warning(
+            # Only a failed turn is a warning; the other outcomes are expected.
+            failed = decision == "failed_mid_turn"
+            _logger.log(
+                logging.WARNING if failed else logging.INFO,
                 "Relay: runner transport lost for session=%s (%s)",
                 session_id,
                 decision,
-                exc_info=True,
+                exc_info=failed,
                 extra=debug_event(
                     "runner_stream_disconnected",
                     session_id=session_id,
@@ -8510,6 +8667,11 @@ async def _relay_runner_stream(
                     session_id,
                     extra={"session_id": session_id},
                 )
+            elif decision == "held_host_offline":
+                # The host went away with its runner; the disconnect sweep holds
+                # the turn until the host returns, and the reconnect restarts
+                # this relay.
+                pass
             elif decision == "idle_no_failure":
                 # No evidence of an interrupted turn. Liveness drives the
                 # reconnect affordance; preserve status and prior error labels.
