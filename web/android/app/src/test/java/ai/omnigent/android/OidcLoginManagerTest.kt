@@ -337,10 +337,11 @@ class OidcLoginManagerTest {
             OidcLoginManager::class.java.getDeclaredMethod(
                 "requestTicket",
                 String::class.java,
+                String::class.java,
             )
         method.isAccessible = true
         @Suppress("UNCHECKED_CAST")
-        return method.invoke(this, origin) as Ticket?
+        return method.invoke(this, origin, "test-code-challenge") as Ticket?
     }
 
     private data class Ticket(
@@ -357,9 +358,10 @@ class OidcLoginManagerTest {
                 "pollForToken",
                 String::class.java,
                 String::class.java,
+                String::class.java,
             )
         method.isAccessible = true
-        return method.invoke(this, origin, ticket) as String?
+        return method.invoke(this, origin, ticket, "test-code-verifier") as String?
     }
 
     private companion object {
