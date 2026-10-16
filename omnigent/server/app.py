@@ -154,6 +154,10 @@ from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 _RECONNECT_BINDING_BATCH_SIZE = 128
+# A cached session read can trail a fresh rebind by seconds, so a session the
+# by-runner lookup binds to a connecting runner is rechecked this often, this long.
+_RECONNECT_BINDING_RECHECK_INTERVAL_S = 2.0
+_RECONNECT_BINDING_RECHECK_DEADLINE_S = 30.0
 
 
 class SmartRoutingSourcesInfo(BaseModel):
@@ -3753,7 +3757,56 @@ def create_app(
         convs.sort(key=lambda conv: not is_independent(conv))
         _logger.info("_on_runner_connect: runner=%s, %d bound session(s)", runner_id, len(convs))
         roots: list[tuple[Conversation, httpx.AsyncClient]] = []
+        # Listed as bound here, but the refreshed row still names another runner.
+        unconfirmed: list[str] = []
         store_slots = asyncio.Semaphore(RECOVERY_STORE_CONCURRENCY)
+
+        def attach(conv: Conversation) -> httpx.AsyncClient | None:
+            """Attach a session confirmed on this runner; return its client if it is a root."""
+            with runner_log_scope(conv.id, runner_id):
+                _logger.info("_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id)
+                try:
+                    routed = runner_router.client_for_session_resources(conv.id, conversation=conv)
+                except OmnigentError as exc:
+                    if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.WRONG_REPLICA):
+                        # The runner dropped again before we reached this session.
+                        _logger.warning(
+                            "Runner %s went offline before session %s was re-attached",
+                            runner_id,
+                            conv.id,
+                            extra=debug_event(
+                                "runner_reconnect_client_offline",
+                                runner_id=runner_id,
+                                error_code=exc.code,
+                            ),
+                        )
+                    else:
+                        _logger.exception(
+                            "Failed to resolve runner client for session %s on reconnect",
+                            conv.id,
+                        )
+                    return None
+                if routed.runner_id != runner_id:
+                    return None
+                _ensure_runner_relay(
+                    conv.id,
+                    runner_id,
+                    routed.client,
+                    conversation_store,
+                    conversation=conv,
+                )
+                if not is_independent(conv):
+                    prefetch_session_routing_catalogs(conv.id, conv, routed.client)
+                # A crash can leave a persisted count absent from the live index.
+                session_live_state.persist_pending_count(
+                    conv.id, pending_elicitations.count_for(conv.id)
+                )
+                cached_sandbox = _session_sandbox_status_cache.get(conv.id)
+                # A reconnect proves readiness only for a launch already marked failed.
+                if cached_sandbox is not None and cached_sandbox.stage == "failed":
+                    _publish_sandbox_status(conv.id, "ready")
+                return routed.client if is_independent(conv) else None
+
         for _, candidates in groupby(convs, key=is_independent):
             # Awaited reads let attachment yield between batches, even for native mirrors.
             for batch in batched(candidates, _RECONNECT_BINDING_BATCH_SIZE):
@@ -3772,56 +3825,14 @@ def create_app(
                     return
                 for snapshot in batch:
                     conv = current.get(snapshot.id)
-                    if conv is None or conv.runner_id != runner_id:
+                    if conv is None:
                         continue
-                    with runner_log_scope(conv.id, runner_id):
-                        _logger.info(
-                            "_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id
-                        )
-                        try:
-                            routed = runner_router.client_for_session_resources(
-                                conv.id, conversation=conv
-                            )
-                        except OmnigentError as exc:
-                            if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.WRONG_REPLICA):
-                                # The runner dropped again before we reached this session.
-                                _logger.warning(
-                                    "Runner %s went offline before session %s was re-attached",
-                                    runner_id,
-                                    conv.id,
-                                    extra=debug_event(
-                                        "runner_reconnect_client_offline",
-                                        runner_id=runner_id,
-                                        error_code=exc.code,
-                                    ),
-                                )
-                            else:
-                                _logger.exception(
-                                    "Failed to resolve runner client for session %s on reconnect",
-                                    conv.id,
-                                )
-                            continue
-                        if routed.runner_id != runner_id:
-                            continue
-                        _ensure_runner_relay(
-                            conv.id,
-                            runner_id,
-                            routed.client,
-                            conversation_store,
-                            conversation=conv,
-                        )
-                        if is_independent(conv):
-                            roots.append((conv, routed.client))
-                        else:
-                            prefetch_session_routing_catalogs(conv.id, conv, routed.client)
-                        # A crash can leave a persisted count absent from the live index.
-                        session_live_state.persist_pending_count(
-                            conv.id, pending_elicitations.count_for(conv.id)
-                        )
-                        cached_sandbox = _session_sandbox_status_cache.get(conv.id)
-                        # A reconnect proves readiness only for a launch already marked failed.
-                        if cached_sandbox is not None and cached_sandbox.stage == "failed":
-                            _publish_sandbox_status(conv.id, "ready")
+                    if conv.runner_id != runner_id:
+                        unconfirmed.append(conv.id)
+                        continue
+                    client = attach(conv)
+                    if client is not None:
+                        roots.append((conv, client))
 
         async def recover_root(conv: Conversation, client: httpx.AsyncClient) -> None:
             with runner_log_scope(conv.id, runner_id):
@@ -3904,11 +3915,84 @@ def create_app(
                     else:
                         _logger.exception("Failed to re-assign session %s on reconnect", conv.id)
 
+        async def recheck_unconfirmed(ids: list[str], recoveries: asyncio.TaskGroup) -> None:
+            """Recover sessions whose refreshed row trails a fresh bind to this runner."""
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            deadline = started + _RECONNECT_BINDING_RECHECK_DEADLINE_S
+            try:
+                while True:
+                    async with store_slots:
+                        listed = await asyncio.to_thread(
+                            conversation_store.list_conversations_by_runner_id, runner_id
+                        )
+                    # A session the consistent lookup no longer lists was really rebound.
+                    still_bound = {conv.id for conv in listed}
+                    ids = [sid for sid in ids if sid in still_bound]
+                    if not ids or tunnel_registry.get(runner_id) is not connection:
+                        return
+                    waited_s = loop.time() - started
+                    if loop.time() + _RECONNECT_BINDING_RECHECK_INTERVAL_S > deadline:
+                        for sid in ids:
+                            with runner_log_scope(sid, runner_id):
+                                _logger.warning(
+                                    "Session %s still reads as bound elsewhere %.1fs after "
+                                    "runner %s connected; skipping its recovery",
+                                    sid,
+                                    waited_s,
+                                    runner_id,
+                                    extra=debug_event(
+                                        "runner_reconnect_binding_unsettled",
+                                        runner_id=runner_id,
+                                        waited_s=round(waited_s, 3),
+                                    ),
+                                )
+                        return
+                    await asyncio.sleep(_RECONNECT_BINDING_RECHECK_INTERVAL_S)
+                    async with store_slots:
+                        current = await asyncio.to_thread(
+                            conversation_store.get_conversations, ids
+                        )
+                    if tunnel_registry.get(runner_id) is not connection:
+                        return
+                    for sid in list(ids):
+                        conv = current.get(sid)
+                        if conv is None or conv.runner_id != runner_id:
+                            continue
+                        ids.remove(sid)
+                        with runner_log_scope(sid, runner_id):
+                            _logger.info(
+                                "Session %s binding to runner %s settled after %.1fs",
+                                sid,
+                                runner_id,
+                                loop.time() - started,
+                                extra=debug_event(
+                                    "runner_reconnect_binding_settled",
+                                    runner_id=runner_id,
+                                    waited_s=round(loop.time() - started, 3),
+                                ),
+                            )
+                        client = attach(conv)
+                        if client is not None:
+                            recoveries.create_task(
+                                recover_root(conv, client), name=f"recover-root-{conv.id}"
+                            )
+            except Exception:
+                # Recovery already running for confirmed sessions must not be cancelled.
+                _logger.exception(
+                    "Failed to recheck session bindings for runner %s on reconnect", runner_id
+                )
+
         # A hung initialization delays only its own tree. All tasks are joined and
         # cancelled with this connection; no detached recovery or shared deadline.
         async with asyncio.TaskGroup() as recoveries:
             for conv, client in roots:
                 recoveries.create_task(recover_root(conv, client), name=f"recover-root-{conv.id}")
+            if unconfirmed:
+                recoveries.create_task(
+                    recheck_unconfirmed(unconfirmed, recoveries),
+                    name=f"recheck-bindings-{runner_id}",
+                )
 
     def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
         assert runner_account_store is not None and auth_provider is not None

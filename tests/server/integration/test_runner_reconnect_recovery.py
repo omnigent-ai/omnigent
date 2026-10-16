@@ -402,6 +402,64 @@ async def test_reconnect_skips_root_rebound_before_initialization(
             sessions._session_status_cache.pop(sid, None)
 
 
+@pytest.mark.parametrize("settles", [True, False])
+async def test_reconnect_rechecks_a_fresh_binding_the_refresh_has_not_seen(
+    app: FastAPI,
+    agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    settles: bool,
+) -> None:
+    import omnigent.server.app as server_app
+
+    monkeypatch.setattr(server_app, "_RECONNECT_BINDING_RECHECK_INTERVAL_S", 0.01)
+    monkeypatch.setattr(
+        server_app, "_RECONNECT_BINDING_RECHECK_DEADLINE_S", budget(2) if settles else 0.05
+    )
+    lagging, healthy = [_create_session(app, agent.id) for _ in range(2)]
+    store = app.state.runner_router._conversation_store
+    get_many = store.get_conversations
+    stale_reads = 0
+
+    def read_bindings(ids: list[str]) -> dict[str, Conversation]:
+        nonlocal stale_reads
+        rows = get_many(ids)
+        # A cached read still serves the runner this session was bound to before.
+        if lagging.id in rows and (not settles or stale_reads < 2):
+            stale_reads += 1
+            rows[lagging.id] = replace(rows[lagging.id], runner_id="previous-runner")
+        return rows
+
+    monkeypatch.setattr(store, "get_conversations", read_bindings)
+    requested: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201)
+
+    try:
+        async with _recover(app, monkeypatch, respond) as (relays, finished):
+            await asyncio.wait_for(finished.wait(), budget(5))
+            if settles:
+                assert stale_reads == 2
+                assert sorted(requested) == sorted([healthy.id, lagging.id])
+                assert lagging.id in relays
+                assert sessions._session_status_cache[lagging.id] == "idle"
+            else:
+                assert requested == [healthy.id]
+                assert lagging.id not in relays
+                assert sessions._session_status_cache[lagging.id] == "failed"
+            gave_up = [
+                record
+                for record in caplog.records
+                if record.levelno == logging.WARNING
+                and "still reads as bound elsewhere" in record.getMessage()
+            ]
+            assert bool(gave_up) is not settles
+    finally:
+        sessions._session_status_cache.pop(lagging.id, None)
+
+
 async def test_reconnecting_trees_share_store_budget_without_waiting_for_initialization(
     app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
