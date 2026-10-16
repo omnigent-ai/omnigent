@@ -1317,17 +1317,11 @@ const TreeNodeRow = memo(function TreeNodeRow({
           />
         </span>
         <span
-          data-upload-glow={dropHighlighted ? "" : undefined}
           className={cn(
             "min-w-0 flex-1 truncate text-ui",
             dirDotClass,
             dropHighlighted && "text-foreground",
           )}
-          style={
-            dropHighlighted
-              ? { textShadow: "0 0 6px var(--info), 0 0 12px var(--info)" }
-              : undefined
-          }
         >
           {node.name}/
         </span>
