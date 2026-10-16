@@ -1,8 +1,34 @@
 """Failure evidence cannot override attribution, leak credentials, or reject an edge."""
 
+import json
+
 import pytest
 
-from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
+from omnigent.native.failure_telemetry import (
+    exception_code_origin,
+    failure_log_attributes,
+    normalize_failure_context,
+)
+
+
+@pytest.mark.parametrize("prefer_framework", [False, True])
+def test_code_origin_can_name_the_caller_instead_of_a_library_leaf(prefer_framework: bool) -> None:
+    with pytest.raises(ValueError) as raised:
+        json.loads("private-runner-data")
+    origin = exception_code_origin(
+        raised.value, prefer_module_prefix=__name__ if prefer_framework else None
+    )
+    assert origin is not None
+    assert origin.startswith(__name__ if prefer_framework else "json.")
+    assert origin.rsplit(":", 1)[1].isdigit()
+    assert len(origin) <= 256
+    assert "private-runner-data" not in origin
+    assert __file__ not in origin
+
+
+def test_code_origin_does_not_invent_a_traceback() -> None:
+    assert exception_code_origin(RuntimeError("private-runner-data")) is None
+    assert exception_code_origin(None) is None
 
 
 @pytest.mark.parametrize("value", [None, [], "bad", 17, {"http_status": True}])
