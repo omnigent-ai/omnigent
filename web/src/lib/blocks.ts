@@ -517,6 +517,7 @@ const AGENT_TURN_ERROR_CODES = new Set([
 const SPECIFIC_ERROR_CODES = new Set([
   "connection_error",
   "context_length_exceeded",
+  "input_too_large",
   "rate_limit_exceeded",
   "codex_thread_reset",
   "session_agent_missing",
