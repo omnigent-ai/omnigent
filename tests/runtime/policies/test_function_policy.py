@@ -109,6 +109,7 @@ def _build_engine(
     policies: list,
     *,
     initial_labels: dict[str, str] | None = None,
+    conversation_title: str | None = None,
 ) -> PolicyEngine:
     """Build a PolicyEngine + fresh conversation for tests."""
     conv = store.create_conversation()
@@ -117,6 +118,7 @@ def _build_engine(
         label_defs={},
         ask_timeout=30,
         conversation_id=conv.id,
+        conversation_title=conversation_title,
         initial_labels=initial_labels or {},
         conversation_store=store,
     )
@@ -1096,6 +1098,41 @@ async def test_engine_data_chains_sequentially_across_policies(
     assert result.data == {"query": "after-second"}
 
 
+@pytest.mark.parametrize(
+    "tool_name,expected",
+    [
+        ("sys_scheduled_task_create", PolicyAction.ASK),
+        ("sys_scheduled_task_update", PolicyAction.ASK),
+        ("sys_scheduled_task_list", PolicyAction.ALLOW),
+        ("sys_scheduled_task_delete", PolicyAction.ALLOW),
+    ],
+)
+async def test_schedule_approval_uses_dispatched_tool_identity(
+    conversation_store: SqlAlchemyConversationStore,
+    tool_name: str,
+    expected: PolicyAction,
+) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    def transform_name(_event: dict) -> PolicyResult:
+        return PolicyResult(action=PolicyAction.ALLOW, data={"name": "display-only-name"})
+
+    engine = _build_engine(
+        conversation_store,
+        [
+            FunctionPolicy(_spec(name="transform", phase=Phase.TOOL_CALL), transform_name),
+            FunctionPolicy(
+                _spec(name="schedule-approval", phase=Phase.TOOL_CALL),
+                ask_on_scheduled_task_change,
+            ),
+        ],
+    )
+    result = await engine.evaluate(
+        EvaluationContext(phase=Phase.TOOL_CALL, content={"name": tool_name}, tool_name=tool_name)
+    )
+    assert result.action == expected
+
+
 # ── Gap 7: legacy (content, phase) callable shim ─────────────────────────────
 
 
@@ -1282,3 +1319,88 @@ async def test_engine_conversation_id_distinct_per_conversation(
     await engine_b.evaluate(EvaluationContext(phase=Phase.REQUEST, content="b"))
     assert captured[0] != captured[1]
     assert None not in captured
+
+
+# -- _build_event forwards conversation_title ----------
+
+
+def test_build_event_includes_conversation_title_none() -> None:
+    """
+    ``_build_event`` includes ``conversation_title: None`` when the
+    context has none set.
+
+    What breaks if this fails: the key is missing from the event
+    dict, causing ``KeyError`` in policy callables that check
+    ``event["context"]["conversation_title"]``.
+    """
+    ctx = EvaluationContext(phase=Phase.REQUEST, content="hello")
+    event = _build_event(ctx)
+    assert "conversation_title" in event["context"]
+    assert event["context"]["conversation_title"] is None
+
+
+def test_build_event_passes_through_conversation_title() -> None:
+    """
+    ``_build_event`` forwards ``EvaluationContext.conversation_title``
+    into ``event["context"]["conversation_title"]`` unchanged.
+    """
+    ctx = EvaluationContext(
+        phase=Phase.REQUEST,
+        content="hello",
+        conversation_title="Fix login bug",
+    )
+    event = _build_event(ctx)
+    assert event["context"]["conversation_title"] == "Fix login bug"
+
+
+# -- PolicyEngine injects conversation_title -----------
+
+
+@pytest.mark.asyncio
+async def test_engine_injects_conversation_title_matching_engine_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``PolicyEngine.evaluate`` injects its own ``conversation_title``
+    into every event, even when the caller's ``EvaluationContext``
+    doesn't set one.
+
+    What breaks if this fails: policy callables building a
+    human-readable, session-scoped path would see
+    ``conversation_title: None`` even though the engine was built
+    with a title.
+    """
+    captured: dict[str, Any] = {}
+
+    def fn(event: dict) -> PolicyResult:
+        captured["conversation_title"] = event["context"]["conversation_title"]
+        return PolicyResult(action=PolicyAction.ALLOW)
+
+    policy = FunctionPolicy(_spec(), fn)
+    engine = _build_engine(
+        conversation_store,
+        [policy],
+        conversation_title="Fix login bug",
+    )
+    await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hi"))
+    assert captured["conversation_title"] == "Fix login bug"
+
+
+@pytest.mark.asyncio
+async def test_engine_conversation_title_none_when_untitled(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``PolicyEngine.evaluate`` injects ``conversation_title: None`` for
+    an engine built without one, rather than omitting the key.
+    """
+    captured: dict[str, Any] = {}
+
+    def fn(event: dict) -> PolicyResult:
+        captured["conversation_title"] = event["context"]["conversation_title"]
+        return PolicyResult(action=PolicyAction.ALLOW)
+
+    policy = FunctionPolicy(_spec(), fn)
+    engine = _build_engine(conversation_store, [policy])
+    await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hi"))
+    assert captured["conversation_title"] is None

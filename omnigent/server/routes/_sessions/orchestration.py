@@ -2953,7 +2953,9 @@ async def _persist_external_conversation_item_unlocked(
             # pending match is evidence of a web submission; preserve others.
             held_older = [*matched.skipped, *matched.uncertain]
         elif item.stable_id is not None or _is_kiro_native_session(conv):
-            skipped_pending = matched.skipped
+            skipped_pending = [
+                pending_inputs.classify_missing_native_record(entry) for entry in matched.skipped
+            ]
             # Jumped-over entries that a positional drain may already have
             # settled: drained without an undelivered record.
             uncertain_pending = matched.uncertain
@@ -3098,12 +3100,18 @@ async def _persist_external_conversation_item_unlocked(
             match_method=match_method,
         )
     for uncertain in uncertain_pending:
+        cause_class = (
+            "interrupted_or_lifecycle" if uncertain.interrupted else "reconciliation_ambiguity"
+        )
         log_input_event(
             _logger,
             "native_input_settled",
             session_id=session_id,
             attributes=pending_inputs.delivery_attributes(uncertain),
             outcome="user_interrupted" if uncertain.interrupted else "prior_fifo_match_uncertain",
+            cause_class=cause_class,
+            reason_code=uncertain.reason_code
+            or ("turn_interrupted" if uncertain.interrupted else "prior_fifo_attribution"),
             matched_item_id=persisted.id,
             matched_response_id=persisted.response_id,
             matched_pending_id=cleared_pending_id,
@@ -3232,11 +3240,66 @@ def _failed_event_undelivered(event: Mapping[str, Any]) -> bool:
     return isinstance(raw_error, dict) and raw_error.get("undelivered") is True
 
 
+_NATIVE_INPUT_LIFECYCLE_STAGES: dict[str, pending_inputs.NativeInputDeliveryStage] = {
+    "response.in_progress": "native_turn_started",
+    "response.completed": "native_turn_completed",
+    "response.failed": "native_turn_failed",
+    "response.cancelled": "native_turn_cancelled",
+    "response.incomplete": "native_turn_incomplete",
+}
+_NATIVE_INPUT_REASON_CODE_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+
+
+def _native_input_reason_code(event: Mapping[str, Any]) -> str:
+    """Return a bounded lifecycle code without copying human-authored error text."""
+    raw_response = event.get("response")
+    raw_error = raw_response.get("error") if isinstance(raw_response, dict) else None
+    if not isinstance(raw_error, dict):
+        raw_error = event.get("error")
+    raw_code = raw_error.get("code") if isinstance(raw_error, dict) else None
+    if isinstance(raw_code, str) and _NATIVE_INPUT_REASON_CODE_RE.fullmatch(raw_code):
+        return raw_code
+    event_type = event.get("type")
+    if isinstance(event_type, str):
+        fallback = event_type.replace(".", "_")
+        if _NATIVE_INPUT_REASON_CODE_RE.fullmatch(fallback):
+            return fallback
+    return "unknown_lifecycle"
+
+
+def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) -> None:
+    """Retain an identity-linked runner lifecycle edge on its queued web input."""
+    event_type = event.get("type")
+    stage = _NATIVE_INPUT_LIFECYCLE_STAGES.get(event_type) if isinstance(event_type, str) else None
+    stable_id = input_attributes(event).get("input_stable_id")
+    if stage is None or not isinstance(stable_id, str):
+        return
+    raw_response = event.get("response")
+    response_id = raw_response.get("id") if isinstance(raw_response, dict) else None
+    native_turn_id = event.get("native_turn_id")
+    cause_class: pending_inputs.NativeInputCauseClass | None = None
+    if event_type == "response.failed" and _failed_event_undelivered(event):
+        stage = "rejected_before_handoff"
+        cause_class = "rejected_before_handoff"
+    elif event_type in {"response.cancelled", "response.incomplete"}:
+        cause_class = "interrupted_or_lifecycle"
+    pending_inputs.mark_lifecycle(
+        session_id,
+        stable_id,
+        stage=stage,
+        cause_class=cause_class,
+        reason_code=_native_input_reason_code(event),
+        native_turn_id=native_turn_id if isinstance(native_turn_id, str) else None,
+        lifecycle_response_id=response_id if isinstance(response_id, str) else None,
+    )
+
+
 async def _settle_undelivered_native_input(
     conversation_store: ConversationStore | None,
     session_id: str,
     response_id: str | None,
     input_stable_id: str | None,
+    reason_code: str | None = None,
 ) -> None:
     """
     Commit a failed native turn's own queued web message as a user item.
@@ -3260,7 +3323,17 @@ async def _settle_undelivered_native_input(
         turn, passed only when the harness reported the failure as undelivered;
         ``None`` settles nothing.
     """
-    if conversation_store is None or input_stable_id is None:
+    if input_stable_id is None:
+        return
+    pending_inputs.mark_lifecycle(
+        session_id,
+        input_stable_id,
+        stage="rejected_before_handoff",
+        cause_class="rejected_before_handoff",
+        reason_code=reason_code or "reported_undelivered",
+        lifecycle_response_id=response_id,
+    )
+    if conversation_store is None:
         return
     pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
     if pending_id is None:
@@ -7742,6 +7815,49 @@ def _owned_by_parent_runtime(conv: Conversation | _RelayStatusSnapshot | None) -
     return conv is not None and is_parent_owned_subagent(conv)
 
 
+def _note_runner_idle_shutdown(runner_id: str, convs: Sequence[Conversation] = ()) -> int:
+    """Mark an idle-shut-down runner's sessions as intentionally stopped.
+
+    The runner's idle watchdog exits only with no active work, so the
+    intentional-stop paths settle these sessions to idle instead of failing
+    them. Relay-bound sessions are found here; *convs* adds stored sessions
+    without a local relay. A session this replica still believes mid-turn is
+    logged: the runner and server disagreed about whether a turn was in flight.
+
+    :param runner_id: Runner that closed with ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``.
+    :param convs: Stored sessions bound to the runner.
+    :returns: How many sessions were newly marked.
+    """
+    session_ids = {
+        session_id
+        for session_id, handle in _runner_relay_tasks.items()
+        if handle.runner_id == runner_id
+    }
+    session_ids.update(conv.id for conv in convs if conv.runner_id == runner_id)
+    marked = 0
+    for session_id in sorted(session_ids):
+        if _intentional_stop_sessions.get(session_id) is not None:
+            continue
+        cached = _session_status_cache.get(session_id)
+        if cached in _MID_TURN_STATUSES:
+            _logger.warning(
+                "Runner %s shut down idle while session=%s was %s here; settling it idle",
+                runner_id,
+                session_id,
+                cached,
+                extra=debug_event(
+                    "runner_idle_shutdown_status_mismatch",
+                    session_id=session_id,
+                    turn_id=_session_active_response_cache.get(session_id),
+                    runner_id=runner_id,
+                    cached_session_status=cached,
+                ),
+            )
+        _intentional_stop_sessions[session_id] = runner_id
+        marked += 1
+    return marked
+
+
 async def _runner_disconnect_requires_failure(
     session_id: str,
     conversation_store: ConversationStore,
@@ -8312,6 +8428,8 @@ async def _relay_runner_stream_once(
                             ready.set()
                         continue
 
+                    _record_native_input_lifecycle(session_id, event)
+
                     if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES or (
                         evt_type == "session.status" and event.get("status") == "running"
                     ):
@@ -8658,6 +8776,7 @@ async def _relay_runner_stream_once(
                                 and _failed_event_undelivered(event)
                                 else None
                             ),
+                            reason_code=_native_input_reason_code(event),
                         )
                     error_item = _error_item_from_sse(
                         event,
@@ -8893,6 +9012,15 @@ async def _relay_runner_stream_once(
                                         session_id,
                                         _usage_conv,
                                     )
+
+                    failed_response = event.get("response")
+                    if (
+                        evt_type == "response.failed"
+                        and current_response_id is None
+                        and not (isinstance(failed_response, dict) and failed_response.get("id"))
+                        and _failed_event_undelivered(event)
+                    ):
+                        continue
 
                     # Reset the turn-scoped response_id on any
                     # terminal event so it doesn't leak to the

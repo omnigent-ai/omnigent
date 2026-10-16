@@ -17,6 +17,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
+from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.codex_egress import (
@@ -3680,16 +3681,35 @@ async def _maybe_handle_turn_event(
                 _logger.warning("Codex forwarder ignored malformed error notification")
                 return True
             turn_id = _turn_id_from_payload(params)
-            if forwarder_state is not None and turn_id is not None:
+            if forwarder_state is not None:
                 if turn_id in forwarder_state.surfaced_terminal_error_turns:
                     _logger.info(
                         "Codex forwarder ignored duplicate terminal error: turn_id=%s",
                         turn_id,
                     )
                     return True
-                forwarder_state.surfaced_terminal_error_turns.add(turn_id)
-                if bridge_dir is not None:
-                    clear_active_turn_id_if_matches(bridge_dir, turn_id)
+                # Child threads have no on-disk bridge to correlate against.
+                if bridge_dir is not None and (
+                    turn_id is None
+                    or (
+                        not clear_active_turn_id_if_matches(bridge_dir, turn_id)
+                        and not _terminal_turn_boundary_matches_idle_bridge(
+                            bridge_dir, params, turn_id
+                        )
+                    )
+                ):
+                    _logger.info(
+                        "Codex forwarder ignored stale terminal error",
+                        extra=debug_event(
+                            "codex_terminal_error_ignored",
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            reason="stale_or_ambiguous_turn",
+                        ),
+                    )
+                    return True
+                if turn_id is not None:
+                    forwarder_state.surfaced_terminal_error_turns.add(turn_id)
             await _post_turn_status_edge(
                 client,
                 session_id,

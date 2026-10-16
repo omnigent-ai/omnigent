@@ -5667,34 +5667,60 @@ _OLD_CLI_CARD = {
 }
 
 
+_CODEX_MODEL_DETAIL = (
+    "The 'system.ai.gpt-6-1-sol' model is not supported when using Codex with a ChatGPT account."
+)
+_CODEX_MODEL_CARD = {
+    "title": "Model unavailable with ChatGPT login",
+    "cause": _CODEX_MODEL_DETAIL,
+    "remediation": (
+        "Choose a model supported by your ChatGPT account using the model picker or /model. "
+        "To use another provider, configure it for Codex with `omnigent setup` "
+        "on the host, then start a new session."
+    ),
+}
+
+
 @pytest.mark.parametrize("wire_output", [False, True])
 @pytest.mark.parametrize(
-    ("detail", "expected_code", "card"),
+    ("detail", "expected_code", "card", "wrapper", "reauth_required"),
     [
         (
             'API Error: 499 {"error_code":"CANCELLED","message":""}',
             "transient_upstream_error",
             {},
+            "claude-code-native-ui",
+            False,
         ),
-        (_OLD_CLI_DETAIL, "client_update_required", _OLD_CLI_CARD),
+        (_OLD_CLI_DETAIL, "client_update_required", _OLD_CLI_CARD, "claude-code-native-ui", False),
+        (_CODEX_MODEL_DETAIL, None, _CODEX_MODEL_CARD, "codex-native-ui", False),
+        (_CODEX_MODEL_DETAIL, "native_turn_error", {}, "claude-code-native-ui", False),
+        (_CODEX_MODEL_DETAIL, "codex_reauth_required", {}, "codex-native-ui", True),
     ],
 )
-async def test_native_gateway_cancel_and_old_cli_failures_are_coded_live_and_after_reload(
+async def test_native_failures_are_coded_live_and_after_reload(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     wire_output: bool,
     detail: str,
-    expected_code: str,
+    expected_code: str | None,
     card: dict[str, str],
+    wrapper: str,
+    reauth_required: bool,
 ) -> None:
-    """A gateway 499 is retryable and an old-CLI refusal names its fix, live and on reload."""
+    """Native failures keep their diagnosis and raw detail through status and persistence."""
     published: list[dict[str, Any]] = []
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda _session_id, event: published.append(event),
     )
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
+    harness = "codex-native" if wrapper == "codex-native-ui" else "claude-native"
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}
+    )
+    session = await _create_session(client, agent["id"], labels={"omnigent.wrapper": wrapper})
+    if expected_code is None:
+        expected_code = "codex_turn_error" if wire_output else "native_turn_error"
     session_id = session["id"]
     response_id = "resp_native_coded_failure"
     item_resp = await client.post(
@@ -5707,7 +5733,7 @@ async def test_native_gateway_cancel_and_old_cli_failures_are_coded_live_and_aft
                 "source_id": "src_native_coded_failure",
                 "item_data": {
                     "role": "assistant",
-                    "agent": "claude-native-ui",
+                    "agent": wrapper,
                     "content": [{"type": "output_text", "text": detail}],
                 },
             },
@@ -5716,6 +5742,8 @@ async def test_native_gateway_cancel_and_old_cli_failures_are_coded_live_and_aft
     assert item_resp.status_code == 202, item_resp.text
 
     data: dict[str, Any] = {"status": "failed", "response_id": response_id}
+    if reauth_required:
+        data["reauth_required"] = True
     if wire_output:
         data["output"] = detail
     status_resp = await client.post(
@@ -5737,7 +5765,7 @@ async def test_native_gateway_cancel_and_old_cli_failures_are_coded_live_and_aft
     assert snapshot_resp.json()["last_task_error"] == {
         "code": expected_code,
         "message": detail,
-        "agent_name": "claude-native-ui",
+        "agent_name": wrapper,
         **card,
     }
 
@@ -12859,3 +12887,102 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+_PI_MODEL_NOT_FOUND = (
+    'Pi model error: 404 {"type":"error","error":{"type":"not_found_error",'
+    '"message":"model: anthropic/claude-opus-4-8"}}'
+)
+_MODEL_UNAVAILABLE_REMEDIATION = (
+    "Choose a different model with the model picker or /model, or check that the "
+    "provider is configured and your account can access this model."
+)
+
+
+@pytest.mark.parametrize(
+    ("item_data", "card"),
+    [
+        pytest.param(
+            {"source": "execution", "code": "RuntimeError", "message": _PI_MODEL_NOT_FOUND},
+            {
+                "title": "Model unavailable",
+                "cause": _PI_MODEL_NOT_FOUND,
+                "remediation": _MODEL_UNAVAILABLE_REMEDIATION,
+            },
+            id="bare-provider-rejection-gains-card",
+        ),
+        pytest.param(
+            {
+                "source": "execution",
+                "code": "pi_model_change_failed",
+                "message": _PI_MODEL_NOT_FOUND,
+                "title": "Pi kept its model",
+                "remediation": "Pick another model.",
+            },
+            {"title": "Pi kept its model", "cause": None, "remediation": "Pick another model."},
+            id="harness-card-preserved",
+        ),
+        pytest.param(
+            {
+                "source": "execution",
+                "code": "RuntimeError",
+                "message": _PI_MODEL_NOT_FOUND,
+                "cause": "The provider rejected the pinned model.",
+            },
+            {
+                "title": None,
+                "cause": "The provider rejected the pinned model.",
+                "remediation": None,
+            },
+            id="poster-cause-preserved",
+        ),
+        pytest.param(
+            {
+                "source": "execution",
+                "code": "RuntimeError",
+                "message": (
+                    'Pi model error: 401 {"type":"error","error":{"type":"authentication_error",'
+                    '"message":"invalid x-api-key"}}'
+                ),
+            },
+            {"title": None, "cause": None, "remediation": None},
+            id="unrelated-error-unlabeled",
+        ),
+    ],
+)
+async def test_external_error_item_model_unavailable_card_live_and_after_reload(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    item_data: dict[str, str],
+    card: dict[str, str | None],
+) -> None:
+    """
+    A provider model rejection a native harness forwards verbatim gains the
+    shared recovery card on both the live frame and the persisted item, while
+    the original code and message stay intact. Harness-classified and
+    unrelated errors are left as posted.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {"item_type": "error", "item_data": item_data},
+        },
+    )
+    assert resp.status_code in (200, 202), resp.text
+
+    done = [ev for _sid, ev in published if ev.get("type") == "response.output_item.done"]
+    assert len(done) == 1
+    items = await client.get(f"/v1/sessions/{session['id']}/items")
+    errors = [item for item in items.json()["data"] if item["type"] == "error"]
+    assert len(errors) == 1
+    for shown in (done[0]["item"], errors[0]):
+        assert shown["code"] == item_data["code"]
+        assert shown["message"] == item_data["message"]
+        for field, value in card.items():
+            assert shown.get(field) == value, (field, shown)

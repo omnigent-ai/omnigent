@@ -29,6 +29,8 @@ __all__ = [
     "classify_terminal_failure",
     "describe_failure_code",
     "diagnose_client_update_required",
+    "diagnose_codex_model_rejection",
+    "diagnose_model_unavailable",
 ]
 
 
@@ -304,6 +306,66 @@ def diagnose_client_update_required(message: str) -> FailureDiagnosis | None:
             f"version {match.group('required')} or newer is required."
         ),
         remediation="Run `claude update` on the host, then start a new session.",
+    )
+
+
+def diagnose_codex_model_rejection(message: str) -> FailureDiagnosis | None:
+    """Explain Codex's explicit refusal of a model on a ChatGPT account."""
+    if "model is not supported when using codex with a chatgpt account" not in message.lower():
+        return None
+    return FailureDiagnosis(
+        title="Model unavailable with ChatGPT login",
+        cause=message.strip(),
+        remediation=(
+            "Choose a model supported by your ChatGPT account using the model picker or /model. "
+            f"To use another provider, configure it for Codex with `{cli_invocation()} setup` "
+            "on the host, then start a new session."
+        ),
+    )
+
+
+# Provider model-not-found shapes, matched narrowly so unrelated 404s, auth,
+# rate-limit, and budget failures keep their own handling.
+# Claude Code: "There's an issue with the selected model (<id>). It may not exist..."
+_MODEL_UNAVAILABLE_MARKER = "issue with the selected model"
+# Anthropic's not-found body for an unknown model id, as a harness forwards it:
+# `404 {"type":"error","error":{"type":"not_found_error","message":"model: <id>"}}`.
+_ANTHROPIC_MODEL_NOT_FOUND = re.compile(r'"message"\s*:\s*"model:\s*[^"\s]+"', re.IGNORECASE)
+_NOT_FOUND_STATUS = re.compile(r"\b404\b|not_found_error", re.IGNORECASE)
+# OpenAI's rejection of an unknown or inaccessible model id; the prose form must
+# name the model so other "does not exist" resource errors stay unlabeled.
+_OPENAI_MODEL_NOT_FOUND = re.compile(
+    r'"code"\s*:\s*"model_not_found"'
+    r"|\bmodel\b[^\n]{0,120}?does not exist or you do not have access to it",
+    re.IGNORECASE,
+)
+
+
+def _is_model_unavailable(message: str) -> bool:
+    if _MODEL_UNAVAILABLE_MARKER in message.lower():
+        return True
+    if _OPENAI_MODEL_NOT_FOUND.search(message):
+        return True
+    return bool(_NOT_FOUND_STATUS.search(message) and _ANTHROPIC_MODEL_NOT_FOUND.search(message))
+
+
+def diagnose_model_unavailable(message: str) -> FailureDiagnosis | None:
+    """Explain a provider rejecting the selected model, with a recovery hint.
+
+    Applies where the harness forwards the provider's rejection without a next
+    step: the in-process SDK path and Pi's forwarded ``Pi model error: 404 …``
+    item. Claude Code appends its own ``/model`` hint. Returns ``None`` for
+    anything that is not a model-not-found rejection.
+    """
+    if not _is_model_unavailable(message):
+        return None
+    return FailureDiagnosis(
+        title="Model unavailable",
+        cause=message.strip(),
+        remediation=(
+            "Choose a different model with the model picker or /model, or check that the "
+            "provider is configured and your account can access this model."
+        ),
     )
 
 

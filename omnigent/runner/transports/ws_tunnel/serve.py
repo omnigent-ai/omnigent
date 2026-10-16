@@ -47,6 +47,7 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runner.transports.ws_tunnel.frames import (
     EVENT_INGEST_CAPABILITY,
+    RUNNER_IDLE_SHUTDOWN_CLOSE_REASON,
     EventAckFrame,
     EventReadyFrame,
     HelloFrame,
@@ -148,6 +149,31 @@ _GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S = 5.0
 # cancelled — a stuck stream must not wedge shutdown forever.
 _GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S = 5.0
 RUNNER_TUNNEL_REJECTION_PREFIX = "runner tunnel rejected by server "
+# Raised instead of the rejection above when the runner had no credential
+# to send, so the message names the local cause rather than the server.
+RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX = "runner tunnel has no credential available "
+
+
+def _reauth_hint(server_url: str | None) -> str:
+    """Build the re-authentication hint for a fatal tunnel auth failure.
+
+    :param server_url: The runner's server URL, e.g.
+        ``"https://ws.databricks.com/api/2.0/omnigent"``, or ``None``.
+    :returns: e.g. ``"run `omnigent login https://ws.databricks.com/omnigent`
+        to re-authenticate"``.
+    """
+    if not server_url:
+        return "check remote server authentication"
+    # `omnigent login` detects the fronting workspace itself; the display
+    # form keeps ``?o=``, which selects the workspace on multi-workspace hosts.
+    from omnigent.util.server_url import display_server_url
+
+    return f"run `{cli_invocation()} login {display_server_url(server_url)}` to re-authenticate"
+
+
+class RunnerTunnelAuthRejectedError(RuntimeError):
+    """The tunnel's credential was refused or is unavailable."""
+
 
 # Schemes that, when surfaced through ``InvalidURI.uri``, indicate
 # the WebSocket upgrade request was redirected somewhere the
@@ -511,18 +537,13 @@ async def serve_tunnel(
                 # fresh token each attempt, so the session survives
                 # once credentials become valid again.
                 if not ever_connected and login_redirect_streak >= _LOGIN_REDIRECT_FATAL_ATTEMPTS:
-                    # Show the display form (workspace /omnigent URL, ?o=
-                    # when known), not the internal API mount; it round-trips
-                    # through `omnigent login` to the same server.
-                    from omnigent.util.server_url import display_server_url
-
-                    raise RuntimeError(
+                    raise RunnerTunnelAuthRejectedError(
                         f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                         f"(redirect to non-WebSocket URL {redirect_url} "
                         f"persisted across {login_redirect_streak} attempts); "
                         "the server likely requires auth — "
-                        f"run `{cli_invocation()} login {display_server_url(server_url)}` or "
-                        f"`{cli_invocation()} setup` to configure credentials"
+                        f"{_reauth_hint(server_url)}, or "
+                        f"run `{cli_invocation()} setup` to configure credentials"
                     ) from exc
                 retry_reason = (
                     f"login-page redirect during upgrade ({redirect_url}); "
@@ -534,27 +555,31 @@ async def serve_tunnel(
                     http_auth_rejection_streak += 1
                     if (
                         not ever_connected
+                        and auth_token is None
+                        and auth_token_factory is not None
+                        and not getattr(auth_token_factory, "declined", False)
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):
-                        if server_url:
-                            # `omnigent login` detects the fronting workspace
-                            # itself — unlike a raw `databricks auth login
-                            # --host`, which would need the workspace host,
-                            # not the server URL (for workspace-hosted
-                            # servers the API mount is the wrong --host).
-                            from omnigent.util.server_url import display_server_url
-
-                            login_hint = (
-                                f"run `omnigent login {display_server_url(server_url)}` "
-                                "to re-authenticate"
-                            )
-                        else:
-                            login_hint = "check remote server authentication"
-                        raise RuntimeError(
+                        # Same streak as the rejection below: a transient mint
+                        # failure (factory returned None) still gets the loop-top
+                        # re-mint; only the message names the local cause.
+                        raise RunnerTunnelAuthRejectedError(
+                            f"{RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX}"
+                            f"(HTTP {http_status} persisted across "
+                            f"{http_auth_rejection_streak} unauthenticated attempts; the "
+                            "credential source returned no token, e.g. the host "
+                            "credential service's grant expired or was rejected); "
+                            f"{_reauth_hint(server_url)}"
+                        ) from exc
+                    if (
+                        not ever_connected
+                        and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+                    ):
+                        raise RunnerTunnelAuthRejectedError(
                             f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                             f"(HTTP {http_status} persisted across "
                             f"{http_auth_rejection_streak} attempts); "
-                            f"{login_hint}"
+                            f"{_reauth_hint(server_url)}"
                         ) from exc
                     # Invalidate the cached token so the loop-top _refresh_auth_token
                     # fetches a fresh one on the next attempt. The loop-top call is
@@ -1081,15 +1106,9 @@ async def _serve_tunnel_once(
         )
         if event_dispatcher is not None:
             event_dispatcher.connected(send_text)
-        # Reconnect work can itself await event delivery; start receiving the
-        # new generation's ready frame before that work waits for an ACK.
-        reconnect_task = (
-            asyncio.ensure_future(on_ready())
-            if on_ready is not None and event_dispatcher is not None
-            else None
-        )
-        if on_ready is not None and reconnect_task is None:
-            await on_ready()
+        # Recovery can await work sent through this tunnel, including when
+        # events use HTTP. Keep receiving requests and pings while it runs.
+        reconnect_task = asyncio.ensure_future(on_ready()) if on_ready is not None else None
         _logger.info(
             "runner %s connected to %s",
             runner_id,
@@ -1202,6 +1221,9 @@ async def _serve_tunnel_once(
                                 dispatch_tasks,
                                 on_graceful_shutdown,
                             )
+                            # Only the idle watchdog sets shutdown_event; tell the
+                            # server this exit attests no active work.
+                            await ws.close(code=1000, reason=RUNNER_IDLE_SHUTDOWN_CLOSE_REASON)
                             break
                         try:
                             raw = recv_task.result()
@@ -1261,8 +1283,8 @@ async def _graceful_drain(
        actually handed to ``ws.send`` (bounded — a wedged stream is left for
        the caller's ``_cancel_dispatch_tasks`` so it can't hang shutdown).
 
-    The caller then returns, and its ``async with websockets.connect`` closes
-    the socket with a normal close handshake. The handshake completing is the
+    The caller then closes the socket with a normal close handshake carrying
+    :data:`RUNNER_IDLE_SHUTDOWN_CLOSE_REASON`. The handshake completing is the
     confirmation the server read our frames (WebSocket/TCP ordering), which is
     what turns an abrupt ``runner_disconnected`` drop into a clean
     end-of-stream on the server relay. Tunneled-WS channels (browser terminal

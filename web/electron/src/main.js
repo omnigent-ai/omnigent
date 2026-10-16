@@ -118,6 +118,7 @@ const {
 } = require("./settingsNavigation");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
+const { diagnostics } = require("./diagnostics");
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -1048,6 +1049,13 @@ const UNAVAILABLE_HINT = "Databricks isn't responding.";
 
 function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedReturnUrl } = {}) {
   if (win.isDestroyed()) return;
+  diagnostics.record("auth_required", {
+    origin: originOf(failedUrl),
+    phase: "databricks",
+    code: error.errorCode,
+    status: error.status,
+    requestId: error.requestId,
+  });
   console.warn("[omnigent] databricks auth: connection requires sign-in", {
     origin: originOf(failedUrl),
     phase: error.phase ?? "authentication",
@@ -1143,6 +1151,11 @@ function oidcSignInMessage(serverUrl, error, serverName) {
 /** Return an OIDC window to the connect screen, explaining why. */
 function showOidcAuthRequired(win, serverUrl, error, serverName = null) {
   if (win.isDestroyed()) return;
+  diagnostics.record("auth_required", {
+    origin: originOf(serverUrl),
+    phase: "oidc",
+    code: error?.code,
+  });
   console.warn("[omnigent] oidc auth: connection requires sign-in", {
     origin: originOf(serverUrl),
     code: error?.code,
@@ -2107,6 +2120,7 @@ async function loadServerUrl(
   { interactive = false, loadUrl, attempt = beginConnectionAttempt(win) } = {},
 ) {
   const signal = attempt.controller.signal;
+  let serverUrl = requestedServerUrl;
   const current = () =>
     !signal.aborted && !win.isDestroyed() && connectionAttempts.get(win) === attempt;
   const assertCurrent = () => {
@@ -2115,7 +2129,7 @@ async function loadServerUrl(
   };
   try {
     assertCurrent();
-    let serverUrl = requestedServerUrl;
+    diagnostics.record("connection_start", { origin: originOf(serverUrl), interactive });
     databricksAuth?.reset(win);
     oidcAuth?.detach(win);
     pinWindow(win, originOf(serverUrl), attempt);
@@ -2133,6 +2147,7 @@ async function loadServerUrl(
     let target = loadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
     let manifest = null;
     if (usesBrowserAuth(serverUrl)) {
+      diagnostics.record("auth_mode", { origin: originOf(serverUrl), phase: "databricks" });
       reportConnectionProgress(win, attempt, "authenticating");
       const auth = getDatabricksAuth();
       win.webContents.stop();
@@ -2212,6 +2227,7 @@ async function loadServerUrl(
       assertCurrent();
       const cookieName = oidcSessionCookie(serverUrl, manifest, windowState?.ephemeral);
       if (cookieName) {
+        diagnostics.record("auth_mode", { origin: originOf(serverUrl), phase: "oidc" });
         if (windowState) {
           windowState.authKind = "oidc";
           windowState.oidcCookie = cookieName;
@@ -2256,6 +2272,7 @@ async function loadServerUrl(
     if (!reconnectOverlay.isShown(win)) connectionLoading.show(win, attempt, "Opening Omnigent…");
     await win.loadURL(target);
     assertCurrent();
+    diagnostics.record("connection_result", { origin: originOf(serverUrl), outcome: "loaded" });
     // Loaded: any reconnect this window was waiting on is over.
     cancelReconnect(win);
     // Only a manifest that was actually read can say the name went away.
@@ -2265,6 +2282,14 @@ async function loadServerUrl(
     const arcaServerUrl = windowArcaServerUrl(win);
     void refreshArcaBinary().then(() => arcaAutoConnect.ensure(arcaServerUrl));
     return serverUrl;
+  } catch (error) {
+    diagnostics.record("connection_result", {
+      origin: originOf(serverUrl),
+      outcome: error?.name === "AbortError" ? "cancelled" : "failed",
+      code: error?.code ?? error?.errorCode,
+      status: error?.status,
+    });
+    throw error;
   } finally {
     connectionLoading.hide(win, attempt);
     attempt.pending = false;
@@ -2316,6 +2341,10 @@ function registerNavigationFallbacks(win) {
       // not yank the window off its new destination.
       const failedOrigin = originOf(validatedURL ?? "");
       if (failedOrigin !== windows.get(win)?.origin) return;
+      diagnostics.record("navigation_failed", {
+        origin: failedOrigin,
+        code: `net_${Math.abs(errorCode)}`,
+      });
       let error = `${errorDescription || "load failed"} (${errorCode})`;
       const serverUrl = windows.get(win)?.serverUrl;
       const reconnectable =
@@ -2355,6 +2384,7 @@ function registerNavigationFallbacks(win) {
     const state = windows.get(win);
     const failedOrigin = originOf(url ?? "");
     if (failedOrigin !== state?.origin) return;
+    diagnostics.record("navigation_failed", { origin: failedOrigin, status: httpResponseCode });
     const status = httpStatusText
       ? `${httpResponseCode} ${httpStatusText}`
       : `HTTP ${httpResponseCode}`;
@@ -3346,6 +3376,32 @@ function changeServer() {
 // roles kills those shortcuts inside webview text fields.
 // ---------------------------------------------------------------------------
 
+async function exportDiagnostics() {
+  const parent = activeWindow();
+  try {
+    const options = {
+      title: "Export Omnigent Desktop Diagnostics",
+      defaultPath: `Omnigent-desktop-diagnostics-${new Date().toISOString().slice(0, 10)}.jsonl`,
+      filters: [{ name: "Diagnostic logs", extensions: ["jsonl"] }],
+    };
+    const { canceled, filePath } = parent
+      ? await dialog.showSaveDialog(parent, options)
+      : await dialog.showSaveDialog(options);
+    if (canceled || !filePath) return;
+    diagnostics.exportTo(filePath);
+  } catch (error) {
+    const options = {
+      type: "error",
+      title: "Could not export diagnostics",
+      message: "Omnigent could not save the desktop diagnostics.",
+      detail: error?.message ?? "Check that the destination is writable and try again.",
+      buttons: ["OK"],
+    };
+    if (parent && !parent.isDestroyed()) await dialog.showMessageBox(parent, options);
+    else await dialog.showMessageBox(options);
+  }
+}
+
 function buildMenu() {
   const isMac = process.platform === "darwin";
   const aboutItem = aboutMenuItem("Omnigent", () => {
@@ -3408,6 +3464,11 @@ function buildMenu() {
       },
     },
     { type: "separator" },
+    {
+      id: "export_diagnostics",
+      label: "Export Diagnostics…",
+      click: () => void exportDiagnostics(),
+    },
     // Keep update checks in the shell-owned About modal so the menu, update
     // prompt, and About item all converge on one status/progress surface.
     {
@@ -5066,10 +5127,10 @@ let deepLinkInFlight = false;
  */
 function enqueueDeepLink(raw) {
   if (!parseOmnigentDeepLink(raw)) {
-    console.log(`[omnigent] deep-link: ignored unrecognized URL ${String(raw)}`);
+    console.log("[omnigent] deep-link: ignored unrecognized URL");
     return;
   }
-  console.log(`[omnigent] deep-link: queued ${raw} (ready=${app.isReady()})`);
+  console.log(`[omnigent] deep-link: queued (ready=${app.isReady()})`);
   pendingDeepLinks.push(raw);
   drainPendingDeepLinks();
 }
@@ -5264,6 +5325,7 @@ if (!gotLock) {
   });
 
   app.whenReady().then(() => {
+    diagnostics.initialize(app);
     // App User Model ID so Windows attributes notifications/taskbar correctly.
     if (process.platform === "win32")
       app.setAppUserModelId(isDevBuild ? DEV_DOMAIN : "ai.omnigent.desktop");

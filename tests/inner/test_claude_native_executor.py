@@ -267,6 +267,7 @@ async def test_run_turn_points_auth_commands_at_omni_setup(
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "omni setup" in events[0].message
+    assert events[0].undelivered is True
 
 
 @pytest.mark.asyncio

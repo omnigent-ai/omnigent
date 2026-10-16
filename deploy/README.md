@@ -254,6 +254,55 @@ or a workspace API path) all work with the same command; for Databricks it
 runs `databricks auth login` against the right workspace for you (requires
 the `databricks` extra).
 
+### OIDC login client upgrades
+
+OIDC ticket login requires PKCE and explicit browser approval. This is a
+breaking change for older CLIs, mobile apps, Slack integrations, and custom
+clients: their next login cannot complete until they are updated. Existing
+sessions and refresh grants keep their normal expiry and revocation behavior.
+Browser-only login and the other authentication modes are unchanged.
+
+An old client's empty login request opens an **Update Omnigent to sign in**
+page. CLI users should run `omni upgrade` and retry their login; mobile users
+should update the app through their normal distribution channel; Slack users
+need their administrator to update the integration. The terminal or Slack
+message may still say the login was rejected because installed old clients
+do not display the server's detailed error text.
+Update the centrally managed Slack bot before the server: its old error modal
+can replace the upgrade link before the user opens it.
+
+The server returns HTTP 200 only to let these clients open the instructions.
+Its `ticket` field is a fixed, non-redeemable notice marker: no login ticket
+or credentials are created, and polling returns terminal HTTP 410. Requests
+containing invalid PKCE data still return HTTP 400. There is no legacy login
+fallback.
+
+Before deploying the server, make client builds containing the PKCE update
+available through your CLI, mobile, and Slack distribution channels, and
+announce that older clients must upgrade to sign in again. Test both an old
+and an updated client against a staging server with your actual identity
+provider. The old client must show the upgrade page without signing in; the
+updated client must complete fresh sign-in and browser approval. Preserve
+PKCE and consent enforcement if rolling back an unrelated deployment issue.
+
+Updated clients send proof in `X-Omnigent-Code-Verifier`; proxies must forward
+this header without logging it. Query-based proof remains supported for API
+compatibility, so do not retain `/auth/cli-poll` query strings either: a ticket
+and verifier together can redeem an approved login. Approval requires a browser
+session authenticated for that specific ticket; ordinary browser sessions,
+runner tokens, and refresh-issued tokens cannot approve it. Existing sessions
+remain valid elsewhere. Generic OIDC ticket flows require fresh IdP authentication
+and a signed ID token with `auth_time` at or after the reauthentication request.
+Verify that your IdP honors `prompt=login` and `max_age=0` and supplies `auth_time`;
+missing or stale claims fail closed. GitHub OAuth may reuse its provider session,
+but still requires ticket-specific browser sign-in and approval.
+Polling responses forbid caching, including successful credential responses.
+CLI and Slack display a comparison code; native mobile apps currently rely
+on explicit browser approval without displaying that code in the app. Include
+the actual native apps in staging checks before publishing a mobile build.
+
+### Register the host
+
 Then register the machine as a host, so sessions created in the web UI can
 run on it:
 
