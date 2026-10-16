@@ -17,7 +17,7 @@ ratatui = "0.29"
 ansi-to-tui = "7"
 unicode-width = "0.2"
 notify = "8"
-notify-debouncer-full = "0.5"
+notify-debouncer-full = "0.7"
 ignore = "0.4"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
