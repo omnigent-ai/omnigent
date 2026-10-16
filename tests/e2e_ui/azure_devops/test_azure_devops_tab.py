@@ -225,7 +225,9 @@ def test_azure_partial_results_keep_loaded_data_and_explain_unavailable_diff(
     rail.get_by_role("tab", name="Pull Requests").click()
 
     expect(rail.get_by_text("Add the widget", exact=True)).to_be_visible()
-    expect(rail.get_by_text(re.compile(r"1\s*passed"))).to_be_visible()
+    expect(
+        rail.get_by_role("tabpanel", name="Summary").get_by_text(re.compile(r"1\s*passed"))
+    ).to_be_visible()
     page.screenshot(path=tmp_path / "azure-partial-summary.png", animations="disabled")
     pr_tabs = rail.get_by_role("tablist", name="Pull request")
     pr_tabs.get_by_role("tab", name="Comments", exact=True).click()
@@ -327,8 +329,9 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
     panel.get_by_role("button", name="Link a PR", exact=True).click()
     panel.get_by_role("textbox", name="Pull request URL").fill(_SECOND_URL)
     panel.get_by_role("button", name="Link", exact=True).click()
-    picker = panel.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_contain_text("!12")
+    pr_list = panel.get_by_role("list", name="Session pull requests")
+    selected = pr_list.locator('button[aria-current="true"]')
+    expect(selected).to_have_accessible_name(re.compile(r"!12"))
     expect(panel.get_by_text("Another repository", exact=True)).to_be_visible()
     panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
     expect(
@@ -337,13 +340,14 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
         )
     ).to_be_visible()
     page.screenshot(path=tmp_path / "azure-outside-workspace.png", animations="disabled")
-    picker.click()
-    page.get_by_role("option").filter(has_text="contoso/web/app !7").click()
+    pr_list.get_by_role("button", name="contoso/web/app !7").click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
-    picker.click()
-    page.get_by_role("option").filter(has_text="contoso/web/other !12").click()
+    pr_list.get_by_role("button", name="contoso/web/other !12").click()
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
-    expect(picker).to_contain_text("!7")
+    page.get_by_role("dialog", name=re.compile(r"^Unlink this ")).get_by_role(
+        "button", name="Unlink", exact=True
+    ).click()
+    expect(selected).to_have_accessible_name(re.compile(r"!7"))
     expect(page.get_by_test_id("composer-pr-link")).to_have_text("!7")
     page.screenshot(path=tmp_path / "azure-selection.png", animations="disabled")
 

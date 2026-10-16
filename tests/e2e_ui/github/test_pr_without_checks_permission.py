@@ -239,8 +239,10 @@ def test_linked_pr_resolves_when_checks_are_forbidden(
     rail.get_by_role("button", name="Link a PR", exact=True).click()
     rail.get_by_label("Pull request URL").fill(PR_URL)
     rail.get_by_role("button", name="Link", exact=True).click()
-    picker = rail.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_contain_text("#42", timeout=30_000)
+    selected = rail.get_by_role("list", name="Session pull requests").locator(
+        'button[aria-current="true"]'
+    )
+    expect(selected).to_have_accessible_name(re.compile(r"#42"), timeout=30_000)
     unreachable = rail.get_by_text(re.compile(r"Can.t reach the upstream repo"))
     expect(_pr_header(rail).or_(unreachable)).to_be_visible(timeout=30_000)
     page.screenshot(path=str(tmp_path / "linked-pr.png"), animations="disabled")
