@@ -67,7 +67,15 @@ def test_handoff_example_has_every_field_and_exact_literals() -> None:
     handoff = _skills()["feature-handoff"]
     example = _handoff_example()
 
-    for key in re.findall(r"^- `([a-z_]+)`", handoff.split("## Field meanings", 1)[1], re.M):
+    # Each top-level bullet names its keys before the first colon, possibly across lines.
+    meanings = handoff.split("## Field meanings", 1)[1]
+    keys = {
+        key
+        for names in re.findall(r"^- (.*?):\s", meanings, re.M | re.S)
+        for key in re.findall(r"`([a-z_]+)`", names)
+    }
+    assert {"pushed_branch", "maintainer_review", "last_pushed_sha"} <= keys
+    for key in keys:
         assert key in example, key
     assert example["mode"] in {"authored_feature", "review_remediation"}
     for literal in (

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import sys
 import urllib.parse
@@ -106,7 +107,7 @@ def main() -> None:
     cmd = ["omnigent", "run", str(agent_dir), "-p", payload]
     if args.server is not None:
         cmd += ["--server", args.server]
-    print(f"→ running: {' '.join(cmd)}\n→ cwd:     {worktree}\n")
+    print(f"→ running: {shlex.join(cmd)}\n→ cwd:     {worktree}\n")
     result = subprocess.run(cmd, cwd=str(worktree), check=False)
     print(
         f"\n→ done (exit {result.returncode}). Branch {created.branch} in {worktree}\n"

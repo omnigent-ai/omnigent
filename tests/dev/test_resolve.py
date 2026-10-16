@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+from pathlib import Path
 
 import pytest
 
 from dev.resolve import (
+    _unique_branch,
     branch_slug,
     build_payload,
     parse_ci_run_url,
@@ -182,3 +185,27 @@ def test_branch_slug_ticket_only() -> None:
         )
         == "dc59e331"
     )
+
+
+def test_unique_branch_skips_local_branches_under_each_prefix(tmp_path: Path) -> None:
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git(
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "base",
+    )
+    for branch in ("fix/omni-1", "feat/omni-1", "feat/omni-1-2"):
+        git("branch", branch)
+
+    assert _unique_branch("omni-1", tmp_path) == "fix/omni-1-2"
+    assert _unique_branch("omni-1", tmp_path, prefix="feat") == "feat/omni-1-3"
+    assert _unique_branch("omni-2", tmp_path, prefix="feat") == "feat/omni-2"

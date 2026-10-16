@@ -20,7 +20,8 @@ the per-surface mechanics, and captioning. Use the CUJ ID as the facet and
   to `recordings/<ticket-key>/demo-<cuj>.mp4`. Captions list the actions shown
   and end with the observed result.
 - Play and inspect each render before declaring it in the handoff and PR Demo.
-  If captioning fails, use the guide's uncaptioned fallback path.
+  If captioning fails, use the guide's uncaptioned fallback path and say why in
+  that clip's `caption` and the PR Demo. A usable uncaptioned clip still counts.
 - For API or configuration CUJs, record a VHS terminal session that runs the
   real CLI or API call and shows its output. Written evidence alone is not a
   demo.
