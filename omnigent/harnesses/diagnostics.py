@@ -275,8 +275,9 @@ _YES_NO_PROMPT = re.compile(
     r"[(\[](?:y/n|yes/no)[)\]][ \t]*:?[ \t]*$", re.IGNORECASE | re.MULTILINE
 )
 _TRACEBACK_HEADER = "Traceback (most recent call last):"
+# A traceback's frames are indented, so its exception is the first unindented line naming one.
 _EXCEPTION_LINE = re.compile(
-    r"^[ \t]*((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:Error|Exception|Expired|Exit|Interrupt|Timeout))"
+    r"^((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:Error|Exception|Expired|Exit|Interrupt|Timeout))"
     r"(?::|[ \t]*$)",
     re.MULTILINE,
 )
@@ -305,10 +306,10 @@ def describe_pane_shape(screen: str | None) -> dict[str, str | int]:
         shape["pane_state"] = "blank"
     elif _TRACEBACK_HEADER in screen:
         shape["pane_state"] = "traceback"
-        raised = _EXCEPTION_LINE.findall(screen.rsplit(_TRACEBACK_HEADER, 1)[1])
+        raised = _EXCEPTION_LINE.search(screen.rsplit(_TRACEBACK_HEADER, 1)[1])
         if raised:
             # The class name alone: a module path can name the person's own code.
-            shape["pane_traceback_type"] = raised[-1].rsplit(".", 1)[-1][:80]
+            shape["pane_traceback_type"] = raised[1].rsplit(".", 1)[-1][:80]
     elif _YES_NO_PROMPT.search(screen):
         shape["pane_state"] = "yes_no_prompt"
     elif _KEY_HINT.search(screen):

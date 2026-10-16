@@ -4022,7 +4022,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
 
 
 @pytest.mark.parametrize(
-    ("screen", "expected_code", "expected_title", "tail_expected"),
+    ("screen", "expected_code", "expected_title", "tail_expected", "capture"),
     [
         (
             "dbexec: launcher 1.2.3\nSign in to continue:\n"
@@ -4030,8 +4030,22 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
             "databricks_sign_in_pending",
             "Codex can't start until you sign in to Databricks",
             False,
+            "1",
         ),
-        ("Loading configuration...\n", "agent_startup_pending", "Codex is still starting", True),
+        (
+            "Loading configuration...\n",
+            "agent_startup_pending",
+            "Codex is still starting",
+            True,
+            "1",
+        ),
+        (
+            "Loading configuration...\n",
+            "agent_startup_pending",
+            "Codex is still starting",
+            False,
+            "0",
+        ),
         # The launcher moved past its prompt, so it is no longer actionable, but the
         # code and address it printed are still on screen.
         (
@@ -4041,9 +4055,10 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
             "agent_startup_pending",
             "Codex is still starting",
             False,
+            "1",
         ),
     ],
-    ids=["sign-in-prompt", "loading", "sign-in-material-after-prompt"],
+    ids=["sign-in-prompt", "loading", "loading-capture-off", "sign-in-material-after-prompt"],
 )
 @pytest.mark.asyncio
 async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
@@ -4054,6 +4069,7 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
     expected_code: str,
     expected_title: str,
     tail_expected: bool,
+    capture: str,
 ) -> None:
     """
     A thread-start deadline with a live pane records a pending cause and keeps waiting.
@@ -4123,7 +4139,7 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
     monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
     monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
-    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", capture)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
     monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
     caplog.set_level(logging.WARNING, logger="omnigent.runner.app")
@@ -4168,6 +4184,7 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
     ]
     # The text-free description is recorded whether or not the tail may be.
     assert pending_record.attributes["pane_state"] == "text"
+    assert pending_record.attributes["pane_lines"] == len(screen.strip().splitlines())
     if tail_expected:
         assert pending_record.attributes["terminal_last_output"] == screen.strip()
         # The local runner log renders only the message, so the tail rides on it too.

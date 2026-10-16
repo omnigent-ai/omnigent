@@ -453,12 +453,11 @@ async def _observe_terminal_interactive(
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — observer failure must not fail session creation
-        # A live pane is read here in full. A stopped one keeps its tail with the exit
-        # records, but its text-free shape is read here, where every harness reports it.
+        # A stopped pane's tail stays with its exit records; only its shape is taken here.
         if isinstance(exc, TimeoutError):
             tail, sign_in_prompt, shape = await _stalled_pane_diagnostics(instance)
-        elif isinstance(exc, RuntimeError):
-            tail, sign_in_prompt, shape = None, None, await _stopped_pane_shape(instance)
+        elif not instance.running:
+            tail, sign_in_prompt, shape = None, None, _stopped_pane_shape(instance)
         else:
             tail, sign_in_prompt, shape = None, None, {}
         unobserved_event = debug_event("terminal_interactive_unobserved", session_id=session_id)
@@ -5732,12 +5731,16 @@ async def _stalled_pane_diagnostics(
         return None, False, {}
 
 
-async def _stopped_pane_shape(instance: TerminalInstance) -> dict[str, str | int]:
-    """Return the text-free shape of a pane that stopped before it was interactive."""
+def _stopped_pane_shape(instance: TerminalInstance) -> dict[str, str | int]:
+    """Return the text-free shape of the final frame a stopped pane left behind.
+
+    A stopped instance refuses reads, so this classifies the exit frame it
+    retained, whether or not capture may export that frame.
+    """
     from omnigent.harnesses.diagnostics import describe_pane_shape
 
     try:
-        return describe_pane_shape(await _read_pane_screen_or_none(instance))
+        return describe_pane_shape(instance.last_exit_text())
     except Exception:  # noqa: BLE001 — a diagnostics failure costs the shape, not the record
         _logger.debug("Stopped pane shape failed for %s", instance.diagnostic_id, exc_info=True)
         return {}

@@ -465,6 +465,14 @@ _PANE_TEXT = "example-repo"
         ),
         (
             "Traceback (most recent call last):\n"
+            '  File "/srv/app/main.py", line 4, in run\n'
+            f"{_PANE_TEXT.replace('-', '_')}.errors.LicenseError: expired\n"
+            "wrapper recovered and continued\n"
+            f"AuthError: refresh status for {_PANE_TEXT}\n",
+            {"pane_state": "traceback", "pane_lines": 5, "pane_traceback_type": "LicenseError"},
+        ),
+        (
+            "Traceback (most recent call last):\n"
             '  File "launcher.py", line 2\n'
             "KeyboardInterrupt\n",
             {
@@ -493,6 +501,7 @@ _PANE_TEXT = "example-repo"
         "empty",
         "whitespace",
         "traceback",
+        "traceback-own-exception-not-later-output",
         "traceback-bare-exception",
         "yes-no-prompt",
         "dialog",
@@ -526,15 +535,3 @@ def test_pane_shape_summary_renders_the_labels_for_a_log_message(
     shape: dict[str, object], summary: str
 ) -> None:
     assert pane_shape_summary(shape) == summary
-
-
-def test_describe_pane_shape_keeps_only_the_exception_class_name() -> None:
-    """A module path can name the person's own code, so only the class name is kept."""
-    screen = (
-        "Traceback (most recent call last):\n"
-        '  File "/srv/app/main.py", line 4\n'
-        f"{_PANE_TEXT.replace('-', '_')}.errors.LicenseError: expired\n"
-    )
-    shape = describe_pane_shape(screen)
-    assert shape["pane_traceback_type"] == "LicenseError"
-    assert _PANE_TEXT.replace("-", "_") not in repr(shape)

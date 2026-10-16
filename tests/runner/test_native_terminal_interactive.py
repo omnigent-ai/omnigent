@@ -24,9 +24,16 @@ class _FakeTerminal:
 
     async def read(self, *, join_wrapped: bool = False) -> dict[str, object]:
         del join_wrapped
+        # Like TerminalInstance.read, a stopped pane refuses reads.
+        if not self.running:
+            return {"error": "Terminal is not running"}
         if self._screens:
             self._last_screen = self._screens.popleft()
         return {"screen": self._last_screen}
+
+    def last_exit_text(self) -> str | None:
+        """The final frame a stopped pane retained, as TerminalInstance keeps it."""
+        return None if self.running else self._last_screen
 
 
 @pytest.mark.asyncio

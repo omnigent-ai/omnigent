@@ -40,7 +40,9 @@ redacted. This existing excerpt is exported independently of
 `OMNIGENT_HARNESS_STDERR_ENABLED`. With that flag enabled, the native startup
 records `terminal_interactive_slow`, `terminal_interactive_unobserved` and
 `agent_startup_pending` also carry a `terminal_last_output` excerpt of a live
-pane that has not become interactive; see
+pane that has not become interactive. With or without it they carry
+`pane_state`, `pane_lines` and, for a Python traceback, `pane_traceback_type`,
+which describe the screen without its text; see
 [Native startup stall records](harness-diagnostics.md#native-startup-stall-records).
 
 A terminal that exits before registration also emits `terminal_exit_observed`,
