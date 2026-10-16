@@ -42,6 +42,8 @@ from tests.runner.helpers import NullServerClient
         "terminal_before_registration_empty",
         "unknown_unavailable",
         "unknown_empty",
+        "queued_idle_after_resume",
+        "unknown_idle_only_empty",
     ],
 )
 async def test_quiet_codex_discovered_child_holds_its_parent_pane(
@@ -53,10 +55,22 @@ async def test_quiet_codex_discovered_child_holds_its_parent_pane(
     class EventClient:
         def __init__(self) -> None:
             self.events: asyncio.Queue = asyncio.Queue()
+            self.queued_idle_handled: asyncio.Future | None = None
 
         async def request(self, _method: str, params: dict) -> dict:
             if params["threadId"] == "thread_child" and outcome.endswith("unavailable"):
                 raise RuntimeError("synthetic child history unavailable")
+            if params["threadId"] == "thread_child" and outcome == "queued_idle_after_resume":
+                self.queued_idle_handled = asyncio.get_running_loop().create_future()
+                await self.events.put(
+                    (
+                        {
+                            "method": "thread/status/changed",
+                            "params": {"threadId": "thread_child", "status": {"type": "idle"}},
+                        },
+                        self.queued_idle_handled,
+                    )
+                )
             status = (
                 "completed"
                 if outcome.startswith(("completed_backfill", "terminal_before_registration"))
@@ -68,7 +82,15 @@ async def test_quiet_codex_discovered_child_holds_its_parent_pane(
                         "id": params["threadId"],
                         "turns": []
                         if outcome.endswith("empty")
-                        else [{"id": "turn_child", "status": status, "items": []}],
+                        else [
+                            {
+                                "id": "turn_new"
+                                if outcome == "queued_idle_after_resume"
+                                else "turn_child",
+                                "status": status,
+                                "items": [],
+                            }
+                        ],
                     }
                 }
             }
@@ -164,6 +186,15 @@ async def test_quiet_codex_discovered_child_holds_its_parent_pane(
         if outcome.startswith(("completed_backfill", "terminal_before_registration")):
             assert not await reaper._is_busy(pane)
             return
+        if outcome == "queued_idle_after_resume":
+            assert client.queued_idle_handled is not None
+            await asyncio.wait_for(client.queued_idle_handled, 5)
+        elif outcome == "unknown_idle_only_empty":
+            await client.emit(
+                "thread/status/changed", {"threadId": "thread_child", "status": {"type": "idle"}}
+            )
+            assert not await reaper._is_busy(pane)
+            return
         assert await reaper._is_busy(pane)
         assert not await reaper._is_busy(other)
         # No further child output is needed to hold past the full idle window.
@@ -183,7 +214,13 @@ async def test_quiet_codex_discovered_child_holds_its_parent_pane(
                 "turn/completed",
                 {
                     "threadId": "thread_child",
-                    "turn": {"id": "turn_new", "status": outcome, "items": []},
+                    "turn": {
+                        "id": "turn_new",
+                        "status": "completed"
+                        if outcome == "queued_idle_after_resume"
+                        else outcome,
+                        "items": [],
+                    },
                 },
             )
         else:

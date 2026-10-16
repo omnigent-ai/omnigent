@@ -73,7 +73,7 @@ class NativeSubagentActivity:
         current_turn = self.active_threads.get(thread_id)
         if active:
             self.active_threads[thread_id] = turn_id or current_turn
-        elif turn_id is None or current_turn in {None, turn_id}:
+        elif current_turn in {None, turn_id}:
             self.active_threads.pop(thread_id, None)
 
     def move(self, session_id: str) -> None:
