@@ -211,24 +211,32 @@ def linked_issues(pull_request: str) -> dict | None:
         references = json.loads(response.stdout)["data"]["repository"]["pullRequest"][
             "closingIssuesReferences"
         ]
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
-        print(
-            "::warning::Could not read linked issues; scope is reviewed from the PR description."
-        )
-        return None
-    issues = []
-    for node in filter(None, references["nodes"]):
-        body = node.get("body") or ""
-        issues.append(
+        issues = [
             {
                 "issue": f"{node['repository']['nameWithOwner']}#{node['number']}",
                 "title": node["title"],
                 "state": node["state"],
-                "body": body[:LINKED_ISSUE_BODY_LIMIT],
-                "body_truncated": len(body) > LINKED_ISSUE_BODY_LIMIT,
+                "body": (node.get("body") or "")[:LINKED_ISSUE_BODY_LIMIT],
+                "body_truncated": len(node.get("body") or "") > LINKED_ISSUE_BODY_LIMIT,
             }
+            for node in filter(None, references["nodes"])
+        ]
+        omitted = max(references["totalCount"] - len(issues), 0)
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+    ) as error:
+        detail = getattr(error, "stderr", None) or error
+        print(
+            "::warning::Could not read linked issues; scope is reviewed from the PR description. "
+            f"({type(error).__name__}: {' '.join(str(detail).split())[:500]})"
         )
-    return {"issues": issues, "omitted": max(references["totalCount"] - len(issues), 0)}
+        return None
+    return {"issues": issues, "omitted": omitted}
 
 
 def main() -> None:

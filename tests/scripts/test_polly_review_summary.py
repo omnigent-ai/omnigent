@@ -430,17 +430,39 @@ def test_linked_issues_marks_truncated_bodies_and_omitted_issues(tmp_path: Path)
     }
 
 
+_PARTIAL_NODE = {
+    "data": {
+        "repository": {
+            "pullRequest": {
+                "closingIssuesReferences": {
+                    "totalCount": 1,
+                    "nodes": [{"number": 7, "repository": {"nameWithOwner": "test/repo"}}],
+                }
+            }
+        }
+    }
+}
+
+
 @pytest.mark.parametrize(
-    "gh_script",
+    ("gh_script", "detail"),
     [
-        "sys.exit(1)\n",
-        "print('not json')\n",
-        "print(json.dumps({'data': {'repository': None}}))\n",
+        (
+            "sys.stderr.write('HTTP 401: Bad credentials\\n'); sys.exit(1)\n",
+            "CalledProcessError: HTTP 401: Bad credentials",
+        ),
+        ("print('not json')\n", "JSONDecodeError"),
+        ("print(json.dumps({'data': {'repository': None}}))\n", "TypeError"),
+        (f"print({json.dumps(json.dumps(_PARTIAL_NODE))})\n", "KeyError: 'title'"),
     ],
-    ids=["command-failure", "invalid-json", "missing-pull-request"],
+    ids=["command-failure", "invalid-json", "missing-pull-request", "partial-node"],
 )
-def test_linked_issues_lookup_failure_records_unavailable(tmp_path: Path, gh_script: str) -> None:
+def test_linked_issues_lookup_failure_records_unavailable(
+    tmp_path: Path, gh_script: str, detail: str
+) -> None:
     result = _run_linked_issues(tmp_path, _fake_gh(tmp_path, gh_script))
 
-    assert "::warning::Could not read linked issues" in result.stdout
+    assert result.stdout.startswith("::warning::Could not read linked issues")
+    assert detail in result.stdout
+    assert result.stdout.count("\n") == 1
     assert json.loads((tmp_path / "linked_issues.json").read_text()) is None

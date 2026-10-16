@@ -237,9 +237,7 @@ def test_feature_map_note_is_requested_only_for_user_facing_changes(
 
 
 _LINKED_ISSUE = {"issue": "o/r#7", "title": "Stale turn", "state": "OPEN", "body": "Keep it."}
-_LINKED_ISSUE_JSON = (
-    '[{"issue": "o/r#7", "title": "Stale turn", "state": "OPEN", "body": "Keep it."}]'
-)
+_LINKED_ISSUE_JSON = json.dumps([_LINKED_ISSUE], ensure_ascii=False)
 
 
 @pytest.mark.parametrize(
