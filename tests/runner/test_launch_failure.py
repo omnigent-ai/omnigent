@@ -11,6 +11,7 @@ from omnigent.runner.launch_failure import (
     classify_terminal_failure,
     describe_failure_code,
     diagnose_client_update_required,
+    diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
     diagnose_model_unavailable,
 )
@@ -515,6 +516,89 @@ def test_model_unavailable_ignores_unrelated_errors(message: str) -> None:
     assert diagnose_model_unavailable(message) is None
 
 
+_COMPACTION_PREFIX = (
+    "Codex compacts this conversation on the previous model, gpt-6-astra, "
+    "before switching to gpt-6-1-sol"
+)
+
+
+@pytest.mark.parametrize(
+    ("code", "title", "cause_start", "remediation_start", "category"),
+    [
+        (
+            "budget_exhausted",
+            "gpt-6-astra is over its AI gateway budget",
+            "The AI gateway refused a compaction request on gpt-6-astra: its budget is exhausted.",
+            "Fork this session",
+            ErrorCategory.USER,
+        ),
+        (
+            "codex_turn_error",
+            "Codex can't compact on gpt-6-astra",
+            "gpt-6-astra rejected a compaction request. Codex retries it every turn",
+            "Fork this session",
+            ErrorCategory.UPSTREAM,
+        ),
+        (
+            "rate_limit_exceeded",
+            "Codex can't compact on gpt-6-astra right now",
+            f"{_COMPACTION_PREFIX}, and that model is temporarily unavailable.",
+            "Retry later",
+            ErrorCategory.UPSTREAM,
+        ),
+        (
+            "transient_upstream_error",
+            "Codex can't compact on gpt-6-astra right now",
+            f"{_COMPACTION_PREFIX}, and that model is temporarily unavailable.",
+            "Retry later",
+            ErrorCategory.UPSTREAM,
+        ),
+    ],
+)
+def test_codex_compaction_model_failure_names_both_models_and_the_way_out(
+    code: str, title: str, cause_start: str, remediation_start: str, category: ErrorCategory
+) -> None:
+    diagnosis = diagnose_codex_compaction_model_failure(
+        code, compaction_model="system.ai.gpt-6-astra", selected_model="system.ai.gpt-6-1-sol"
+    )
+
+    assert diagnosis.title == title
+    assert diagnosis.cause.startswith(cause_start)
+    assert "gpt-6-1-sol" in diagnosis.cause
+    assert diagnosis.remediation is not None
+    assert diagnosis.remediation.startswith(remediation_start)
+    assert "fork" in diagnosis.remediation.lower()
+    assert "continue on gpt-6-1-sol" in diagnosis.remediation
+    # Only a budget can be raised; the other failures clear on their own or not at all.
+    assert ("raise that budget" in diagnosis.remediation) is (code == "budget_exhausted")
+    assert diagnosis.category is category
+
+
+@pytest.mark.parametrize("code", ["budget_exhausted", "codex_turn_error", "rate_limit_exceeded"])
+def test_codex_compaction_model_failure_cause_fits_its_label(code: str) -> None:
+    """A reloaded card keeps the whole cause, even for long model names."""
+    from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
+
+    diagnosis = diagnose_codex_compaction_model_failure(
+        code,
+        compaction_model=f"system.ai.{'p' * 40}",
+        selected_model=f"system.ai.{'s' * 40}",
+    )
+
+    assert len(diagnosis.cause) <= LABEL_VALUE_MAX_LEN
+
+
+def test_compaction_model_failure_code_survives_its_budget_text() -> None:
+    """A reloaded card keeps the code whose budget text names the previous model's limit."""
+    message = 'unexpected status 403 Forbidden: Budget "example" has reached its limit of $100.'
+
+    assert classify_native_turn_error("codex_turn_error", message) == "budget_exhausted"
+    assert (
+        classify_native_turn_error("codex_compaction_model_failed", message)
+        == "codex_compaction_model_failed"
+    )
+
+
 @pytest.mark.parametrize(
     ("code", "expected_substring"),
     [
@@ -531,6 +615,7 @@ def test_model_unavailable_ignores_unrelated_errors(message: str) -> None:
         ("databricks_sign_in_pending", "Databricks sign-in"),
         ("agent_startup_pending", "still starting"),
         ("codex_thread_not_started", "never ran"),
+        ("codex_compaction_model_failed", "previous model"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:
