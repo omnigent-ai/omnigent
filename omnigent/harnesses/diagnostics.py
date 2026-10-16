@@ -260,3 +260,59 @@ def sign_in_next_step(agent: str) -> str:
         f"Open the sign-in link and sign in. {agent} continues on its own once the "
         "sign-in completes; then send your message again."
     )
+
+
+# Key hints a dialog or picker prints under its options, e.g. "Enter to confirm · Esc to cancel".
+_KEY_HINT = re.compile(
+    r"\b(?:enter|return) to (?:confirm|continue|select|submit|proceed)\b"
+    r"|\besc(?:ape)? to (?:cancel|exit|reject|go back|skip|close)\b"
+    r"|\bpress (?:enter|return|any key)\b",
+    re.IGNORECASE,
+)
+# A launcher question waiting on a typed answer, e.g. "Upgrade if available? (Y/n)".
+_YES_NO_PROMPT = re.compile(
+    r"[(\[](?:y/n|yes/no)[)\]][ \t]*:?[ \t]*$", re.IGNORECASE | re.MULTILINE
+)
+_TRACEBACK_HEADER = "Traceback (most recent call last):"
+_EXCEPTION_LINE = re.compile(
+    r"^[ \t]*((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:Error|Exception|Expired|Exit|Interrupt|Timeout))"
+    r"(?::|[ \t]*$)",
+    re.MULTILINE,
+)
+_BOX_DRAWING = frozenset("─━│┃╭╮╯╰┌┐└┘├┤┬┴┼═║╔╗╚╝")
+
+
+def describe_pane_shape(screen: str | None) -> dict[str, str | int]:
+    """
+    Describe what a terminal screen shows without keeping any of its text.
+
+    Startup records carry this for every person, so a stalled pane can be told
+    apart even where its text may not be logged. Only fixed labels, a line count
+    and a Python exception's class name leave the screen.
+
+    :param screen: ANSI-stripped screen text, or ``None`` when the pane could not be read.
+    :returns: ``pane_state``, one of ``unreadable``, ``blank``, ``traceback``,
+        ``yes_no_prompt``, ``dialog``, ``tui`` or ``text``, plus ``pane_lines`` (the
+        non-blank line count) for a readable pane. A traceback adds
+        ``pane_traceback_type``, e.g. ``"json.decoder.JSONDecodeError"``.
+    """
+    if screen is None:
+        return {"pane_state": "unreadable"}
+    lines = sum(1 for line in screen.splitlines() if line.strip())
+    shape: dict[str, str | int] = {"pane_lines": lines}
+    if not lines:
+        shape["pane_state"] = "blank"
+    elif _TRACEBACK_HEADER in screen:
+        shape["pane_state"] = "traceback"
+        raised = _EXCEPTION_LINE.findall(screen.rsplit(_TRACEBACK_HEADER, 1)[1])
+        if raised:
+            shape["pane_traceback_type"] = raised[-1][:80]
+    elif _YES_NO_PROMPT.search(screen):
+        shape["pane_state"] = "yes_no_prompt"
+    elif _KEY_HINT.search(screen):
+        shape["pane_state"] = "dialog"
+    elif _BOX_DRAWING.intersection(screen):
+        shape["pane_state"] = "tui"
+    else:
+        shape["pane_state"] = "text"
+    return shape

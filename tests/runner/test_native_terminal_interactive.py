@@ -248,8 +248,44 @@ async def test_observer_stays_content_free_when_the_pane_cannot_be_read(
     ]
     for record in records:
         assert record.attributes["sign_in_prompt_detected"] is False
+        assert record.attributes["pane_state"] == "unreadable"
         assert "terminal_last_output" not in record.attributes
         assert "Terminal output:" not in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_observer_describes_a_stalled_pane_without_capture(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With capture off, the slow and deadline records still name what the pane shows."""
+    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "0")
+    screen = "Checking for updates...\nUpgrade the agent if available? (Y/n) "
+    terminal = _FakeTerminal([screen])
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        await _observe_terminal_interactive(
+            session_id="conv_prompted",
+            terminal_id="terminal_claude_main",
+            harness="claude-native",
+            readiness_signal="claude_composer",
+            instance=terminal,  # type: ignore[arg-type]
+            is_interactive=lambda _pane: False,
+            timeout_s=0.05,
+            slow_after_s=0.0,
+            poll_interval_s=0.0,
+        )
+
+    records = [r for r in caplog.records if getattr(r, "event_name", None)]
+    assert [r.event_name for r in records] == [
+        "terminal_interactive_slow",
+        "terminal_interactive_unobserved",
+    ]
+    for record in records:
+        assert record.attributes["pane_state"] == "yes_no_prompt"
+        assert record.attributes["pane_lines"] == 2
+        assert "terminal_last_output" not in record.attributes
+        assert "Upgrade" not in record.getMessage()
 
 
 @pytest.mark.asyncio

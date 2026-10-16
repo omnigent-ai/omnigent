@@ -4166,6 +4166,8 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
     (pending_record,) = [
         r for r in caplog.records if getattr(r, "event_name", None) == "agent_startup_pending"
     ]
+    # The text-free description is recorded whether or not the tail may be.
+    assert pending_record.attributes["pane_state"] == "text"
     if tail_expected:
         assert pending_record.attributes["terminal_last_output"] == screen.strip()
         # The local runner log renders only the message, so the tail rides on it too.
