@@ -41,6 +41,13 @@ ExecutorExtra: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ExecutorUsage: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 CompactedMessages: TypeAlias = list[Message]
 
+
+class NativeSessionCheckpointer(Protocol):
+    """Persist a runtime session reference before executing its first turn."""
+
+    async def __call__(self, session_id: str) -> None: ...
+
+
 # ``enqueue_session_message`` content — arbitrary user-supplied payload
 # (string text or a structured JSON value).
 EnqueuedContent: TypeAlias = Any  # type: ignore[explicit-any]
@@ -666,6 +673,13 @@ class Executor:
 
     def supports_streaming(self) -> bool:
         return False
+
+    def configure_native_session(
+        self,
+        session_id: str | None,
+        checkpoint: NativeSessionCheckpointer,
+    ) -> None:
+        """Attach durable runtime-session lifecycle support when applicable."""
 
     def supports_tool_calling(self) -> bool:
         return True

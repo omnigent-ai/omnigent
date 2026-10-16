@@ -200,6 +200,8 @@ class ExecutorAdapter(HarnessApp):
         self._harness_label = harness_label
         # Lazily-constructed inner executor, reused across turns for the conversation lifetime.
         self._executor: Executor | None = None
+        self._native_session_id: str | None = None
+        self._native_session_reference_present = False
         # Per-turn turn context. The stable tool/elicitation/policy bridges read this at call
         # time so MCP handlers that closure-captured the bridge on turn 1 dispatch into the
         # current turn's ctx, not turn 1's dead ctx.
@@ -238,6 +240,31 @@ class ExecutorAdapter(HarnessApp):
         Lazily constructs the executor on the first call; subsequent calls reuse the cached
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
+        cleanup = self._abandoned_executor_cleanup
+        if cleanup is not None and (
+            ctx.native_session_reference_present or self._native_session_reference_present
+        ):
+            if not await asyncio.shield(cleanup):
+                raise RuntimeError("Could not close the previous native session safely.")
+            if self._abandoned_executor_cleanup is cleanup:
+                self._abandoned_executor_cleanup = None
+        if (
+            ctx.native_session_reference_present
+            and ctx.native_session_id != self._native_session_id
+        ):
+            old_executor = self._executor
+            if old_executor is not None and not await self._safe_interrupt(
+                old_executor, self._session_key
+            ):
+                raise RuntimeError("Could not close the previous native session safely.")
+            self._executor = None
+            self._native_session_id = ctx.native_session_id
+        if ctx.native_session_reference_present and not self._native_session_reference_present:
+            self._native_session_reference_present = True
+            if self._executor is not None:
+                self._executor.configure_native_session(
+                    self._native_session_id, self._stable_native_session_checkpoint
+                )
         executor = self._ensure_executor()
         messages = _translate_input_to_messages(request.input)
         # Stamp session_key on every message so the inner executor keys its client consistently,
@@ -952,6 +979,13 @@ class ExecutorAdapter(HarnessApp):
         evaluation_id = f"poleval_{secrets.token_hex(16)}"
         return await ctx.evaluate_policy(evaluation_id, phase, data)
 
+    async def _stable_native_session_checkpoint(self, session_id: str) -> None:
+        ctx = self._current_ctx
+        if ctx is None or not ctx.native_session_reference_present:
+            raise RuntimeError("No active turn context for native session checkpoint.")
+        await ctx.checkpoint_native_session(session_id)
+        self._native_session_id = session_id
+
     def _ensure_executor(self) -> Executor:
         """
         Construct the inner executor on first use; return cached
@@ -961,6 +995,10 @@ class ExecutorAdapter(HarnessApp):
         """
         if self._executor is None:
             self._executor = self._executor_factory()
+            if self._native_session_reference_present:
+                self._executor.configure_native_session(
+                    self._native_session_id, self._stable_native_session_checkpoint
+                )
         return self._executor
 
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
