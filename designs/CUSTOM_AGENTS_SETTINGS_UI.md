@@ -40,8 +40,9 @@ Search only covers loaded rows and says so while more pages exist.
 ## Configuration editing API
 
 `/v1/info.agent_config_edit` advertises owner-only configuration reads and partial
-updates. Settings exposes an Edit dialog for owned agents when this capability
-is true. Existing list/detail responses and multipart installation are unchanged.
+updates. Settings uses one inline form to preview and edit owned agents when this
+capability is true. Owned agents open directly in the form; Save changes stays
+inactive until a field changes. Existing list/detail responses and multipart installation are unchanged.
 
 1. `GET /v1/agents/{id}/config` returns description, model, harness, literal
    instructions, and MCP declarations keyed by name. Save the response's `ETag`.
@@ -109,8 +110,8 @@ The editor gates on capability and ownership, retains drafts on error, and
 requires explicit reload/discard confirmation on 412. It sends only changed fields
 and credential keys. Existing MCP names/transports and managed servers are read-only.
 Model/harness compatibility remains server-validated because the projection does
-not expose executor-specific editability. Cancel, Escape, and close confirm dirty
-drafts; browser refresh warns, but history navigation can discard an unsaved draft. Renaming needs identity/collision semantics;
+not expose executor-specific editability. Cancel and the form's back button confirm
+dirty drafts; browser refresh warns, but global history/settings navigation can discard an unsaved draft. Renaming needs identity/collision semantics;
 run counts and global sorting require separate server support.
 
 Verification entry points and steps are in

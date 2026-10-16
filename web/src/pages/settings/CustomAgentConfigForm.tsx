@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
+import { TrashIcon } from "lucide-react";
+import { useNavigate } from "@/lib/routing";
+import { BackButton } from "./HarnessCatalog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -23,15 +26,16 @@ import type { AgentConfigRevision } from "@/lib/agentsApi";
 import { randomUUID } from "@/lib/randomUUID";
 import { ApiError } from "@/lib/sessionsApi";
 
-export function EditCustomAgentDialog({
+export function CustomAgentConfigForm({
   id,
   name,
-  onClose,
+  onDelete,
 }: {
   id: string;
   name: string;
-  onClose: () => void;
+  onDelete: () => void;
 }) {
+  const navigate = useNavigate();
   const query = useCustomAgentConfig(id);
   const save = usePatchCustomAgent(id);
   const labels = useBrainHarnessLabels();
@@ -39,7 +43,7 @@ export function EditCustomAgentDialog({
   const [draft, setDraft] = useState<AgentConfigDraft | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [conflict, setConflict] = useState(false);
-  const [confirm, setConfirm] = useState<"close" | "reload" | null>(null);
+  const [confirm, setConfirm] = useState<"reload" | "back" | null>(null);
   const [reloading, setReloading] = useState(false);
   const busy = save.isPending || reloading;
 
@@ -67,10 +71,6 @@ export function EditCustomAgentDialog({
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
 
-  function close() {
-    save.reset();
-    onClose();
-  }
   async function reload() {
     setConfirm(null);
     setReloading(true);
@@ -85,10 +85,10 @@ export function EditCustomAgentDialog({
     }
     setReloading(false);
   }
-  function request(action: "close" | "reload") {
+  function request(action: "reload" | "back") {
     if (busy) return;
     if (dirty) setConfirm(action);
-    else if (action === "close") close();
+    else if (action === "back") navigate("/settings/custom-agents");
     else void reload();
   }
   async function submit(event: React.FormEvent) {
@@ -97,10 +97,10 @@ export function EditCustomAgentDialog({
     setError(null);
     try {
       const result = await save.mutateAsync({ etag: revision.etag, patch });
-      toast.success(
-        result.etag ? "Agent saved" : "Agent saved. Reopen the editor to reload its revision.",
-      );
-      close();
+      toast.success("Agent saved");
+      setRevision(result);
+      setDraft(agentConfigDraft(result.config));
+      save.reset();
     } catch (err) {
       if (err instanceof ApiError && [412, 428].includes(err.status)) {
         setConflict(true);
@@ -130,179 +130,181 @@ export function EditCustomAgentDialog({
 
   return (
     <>
-      <Dialog
-        open
-        onOpenChange={(open) => {
-          if (!open) request("close");
-        }}
-      >
-        <DialogContent className="flex max-h-[85vh] flex-col sm:max-w-2xl" showCloseButton={!busy}>
-          <DialogHeader>
-            <DialogTitle>Edit {name}</DialogTitle>
-            <DialogDescription>
-              Changes apply to sessions on their next turn. The agent name stays the same.
-            </DialogDescription>
-          </DialogHeader>
-          {!draft ? (
-            <>
-              {loadError ? (
-                <p role="alert">
-                  {loadError}{" "}
-                  <Button variant="link" onClick={() => void query.refetch()}>
-                    Retry
-                  </Button>
-                </p>
-              ) : (
-                <p role="status">Loading configuration…</p>
-              )}
-              <DialogFooter>
-                <Button variant="ghost" onClick={close}>
-                  Cancel
-                </Button>
-              </DialogFooter>
-            </>
-          ) : (
-            <form
-              onSubmit={(event) => void submit(event)}
-              className="flex min-h-0 flex-1 flex-col gap-4"
-            >
-              <div className="-mx-1 min-h-0 flex-1 overflow-y-auto px-1">
-                <fieldset disabled={busy} className="flex flex-col gap-4">
-                  <label className="space-y-1 text-ui">
-                    Description
-                    <Textarea
-                      aria-label="Description"
-                      maxLength={4096}
-                      value={draft.description}
-                      onChange={(e) => setDraft({ ...draft, description: e.target.value })}
-                    />
-                  </label>
-                  <div className="grid gap-4 sm:grid-cols-2">
-                    <label className="space-y-1 text-ui">
-                      Harness
-                      <select
-                        aria-label="Harness"
-                        className="h-9 w-full rounded-md border border-input bg-background px-3"
-                        value={draft.harness}
-                        onChange={(e) => setDraft({ ...draft, harness: e.target.value })}
-                      >
-                        {!Object.hasOwn(labels, draft.harness) && (
-                          <option value={draft.harness}>{draft.harness || "Unspecified"}</option>
-                        )}
-                        {Object.entries(labels).map(([value, label]) => (
-                          <option key={value} value={value}>
-                            {label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="space-y-1 text-ui">
-                      Model
-                      <Input
-                        aria-label="Model"
-                        value={draft.model}
-                        onChange={(e) => setDraft({ ...draft, model: e.target.value })}
-                      />
-                    </label>
-                  </div>
-                  <label className="space-y-1 text-ui">
-                    Instructions
-                    <Textarea
-                      aria-label="Instructions"
-                      className="min-h-32"
-                      value={draft.instructions}
-                      onChange={(e) => setDraft({ ...draft, instructions: e.target.value })}
-                    />
-                  </label>
-                  <div className="flex items-center justify-between">
-                    <h3 className="font-medium">MCP servers</h3>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() =>
-                        setDraft({
-                          ...draft,
-                          servers: [
-                            ...draft.servers,
-                            {
-                              key: randomUUID(),
-                              name: "",
-                              existing: false,
-                              editable: true,
-                              removed: false,
-                              transport: "http",
-                              description: "",
-                              url: "",
-                              command: "",
-                              args: [],
-                              credentials: [],
-                            },
-                          ],
-                        })
-                      }
-                    >
-                      Add server
-                    </Button>
-                  </div>
-                  {draft.servers.map((server, index) => (
-                    <MCPFields
-                      key={server.key}
-                      server={server}
-                      onChange={(change) => updateServer(index, change)}
-                      onRemove={() =>
-                        server.existing
-                          ? updateServer(index, { removed: !server.removed })
-                          : setDraft({
-                              ...draft,
-                              servers: draft.servers.filter((_, i) => i !== index),
-                            })
-                      }
-                    />
+      <BackButton
+        label="Custom agents"
+        onClick={() => request("back")}
+        componentId="settings.custom_agents.back"
+      />
+      <div className="mb-6 flex items-start justify-between gap-4">
+        <h1 className="min-w-0 break-words text-2xl font-semibold">{name}</h1>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label="Delete agent"
+          disabled={busy}
+          onClick={onDelete}
+        >
+          <TrashIcon className="size-4" />
+        </Button>
+      </div>
+      {!draft ? (
+        loadError ? (
+          <p role="alert">
+            {loadError}{" "}
+            <Button variant="link" onClick={() => void query.refetch()}>
+              Retry
+            </Button>
+          </p>
+        ) : (
+          <p role="status">Loading configuration…</p>
+        )
+      ) : (
+        <form
+          onSubmit={(event) => void submit(event)}
+          aria-label="Agent configuration"
+          className="flex flex-col gap-6"
+        >
+          <fieldset disabled={busy} className="flex min-w-0 flex-col gap-5">
+            <label className="space-y-1 text-ui">
+              Name
+              <Input aria-label="Name" value={name} readOnly aria-describedby="agent-name-note" />
+              <p id="agent-name-note" className="text-xs text-muted-foreground">
+                The agent name cannot be changed.
+              </p>
+            </label>
+            <label className="space-y-1 text-ui">
+              Description
+              <Textarea
+                aria-label="Description"
+                maxLength={4096}
+                value={draft.description}
+                onChange={(e) => setDraft({ ...draft, description: e.target.value })}
+              />
+            </label>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className="space-y-1 text-ui">
+                Harness
+                <select
+                  aria-label="Harness"
+                  className="h-9 w-full rounded-md border border-input bg-background px-3"
+                  value={draft.harness}
+                  onChange={(e) => setDraft({ ...draft, harness: e.target.value })}
+                >
+                  {!Object.hasOwn(labels, draft.harness) && (
+                    <option value={draft.harness}>{draft.harness || "Unspecified"}</option>
+                  )}
+                  {Object.entries(labels).map(([value, label]) => (
+                    <option key={value} value={value}>
+                      {label}
+                    </option>
                   ))}
-                </fieldset>
-              </div>
-              {(error || validation) && (
-                <p role="alert" className="text-ui text-destructive">
-                  {error || validation}
-                </p>
-              )}
-              {!revision?.etag && (
-                <p role="alert">
-                  The server did not provide a configuration revision. Reload before saving.
-                </p>
-              )}
-              <DialogFooter>
-                {(conflict || !revision?.etag) && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={busy}
-                    onClick={() => request("reload")}
-                  >
-                    Reload latest
-                  </Button>
-                )}
-                <Button
-                  type="button"
-                  variant="ghost"
-                  disabled={busy}
-                  onClick={() => request("close")}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  type="submit"
-                  loading={save.isPending}
-                  disabled={busy || !dirty || Boolean(validation) || conflict || !revision?.etag}
-                >
-                  Save changes
-                </Button>
-              </DialogFooter>
-            </form>
+                </select>
+              </label>
+              <label className="space-y-1 text-ui">
+                Model
+                <Input
+                  aria-label="Model"
+                  value={draft.model}
+                  onChange={(e) => setDraft({ ...draft, model: e.target.value })}
+                />
+              </label>
+            </div>
+            <label className="space-y-1 text-ui">
+              Instructions
+              <Textarea
+                aria-label="Instructions"
+                className="min-h-32"
+                value={draft.instructions}
+                onChange={(e) => setDraft({ ...draft, instructions: e.target.value })}
+              />
+            </label>
+            <div className="flex items-center justify-between">
+              <h3 className="font-medium">MCP servers</h3>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  setDraft({
+                    ...draft,
+                    servers: [
+                      ...draft.servers,
+                      {
+                        key: randomUUID(),
+                        name: "",
+                        existing: false,
+                        editable: true,
+                        removed: false,
+                        transport: "http",
+                        description: "",
+                        url: "",
+                        command: "",
+                        args: [],
+                        credentials: [],
+                      },
+                    ],
+                  })
+                }
+              >
+                Add server
+              </Button>
+            </div>
+            {draft.servers.map((server, index) => (
+              <MCPFields
+                key={server.key}
+                server={server}
+                onChange={(change) => updateServer(index, change)}
+                onRemove={() =>
+                  server.existing
+                    ? updateServer(index, { removed: !server.removed })
+                    : setDraft({
+                        ...draft,
+                        servers: draft.servers.filter((_, i) => i !== index),
+                      })
+                }
+              />
+            ))}
+            {!draft.servers.length && (
+              <p className="text-ui text-muted-foreground">No MCP servers listed.</p>
+            )}
+          </fieldset>
+          {(error || validation) && (
+            <p role="alert" className="text-ui text-destructive">
+              {error || validation}
+            </p>
           )}
-        </DialogContent>
-      </Dialog>
+          {!revision?.etag && (
+            <p role="alert">
+              The server did not provide a configuration revision. Reload before saving.
+            </p>
+          )}
+          <div className="sticky bottom-0 z-10 flex flex-wrap items-center justify-end gap-2 border-t border-border bg-background py-4">
+            <p className="mr-auto w-full text-xs text-muted-foreground @lg:w-auto">
+              Changes apply to sessions on their next turn.
+            </p>
+            {(conflict || !revision?.etag) && (
+              <Button
+                type="button"
+                variant="outline"
+                disabled={busy}
+                onClick={() => request("reload")}
+              >
+                Reload latest
+              </Button>
+            )}
+            <Button type="button" variant="ghost" disabled={busy} onClick={() => request("back")}>
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              loading={save.isPending}
+              disabled={busy || !dirty || Boolean(validation) || conflict || !revision?.etag}
+            >
+              Save changes
+            </Button>
+          </div>
+        </form>
+      )}
       <Dialog
         open={confirm !== null}
         onOpenChange={(open) => {
@@ -326,7 +328,7 @@ export function EditCustomAgentDialog({
               variant="destructive"
               onClick={() => {
                 if (confirm === "reload") void reload();
-                else close();
+                else navigate("/settings/custom-agents");
               }}
             >
               Discard changes

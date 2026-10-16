@@ -106,6 +106,13 @@ beforeEach(() => {
       users = users.filter((a) => a.id !== url.pathname.split("/").at(-1));
       return response({ deleted: true });
     }
+    if (url.pathname.endsWith("/config")) {
+      const id = decodeURIComponent(url.pathname.split("/").at(-2)!);
+      const found = users.find((item) => item.id === id)!;
+      return new Response(JSON.stringify({ ...editableConfig, ...found, mcp_servers: {} }), {
+        headers: { ETag: '"original"' },
+      });
+    }
     if (url.pathname.startsWith("/v1/agents/")) {
       const id = decodeURIComponent(url.pathname.slice("/v1/agents/".length));
       const owned = users.find((a) => a.id === id);
@@ -140,12 +147,15 @@ describe("Custom agents settings", () => {
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
   });
 
-  it("opens a bookmark with one detail request and no list scans", async () => {
+  it("opens a bookmark with direct detail and configuration requests and no list scans", async () => {
     mount("/settings/custom-agents/a1");
     expect(await screen.findByRole("heading", { name: "research" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Delete agent" })).toBeVisible();
-    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
-    expect(authenticatedFetch).toHaveBeenCalledWith("/v1/agents/a1", expect.anything());
+    await screen.findByLabelText("Instructions");
+    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
+      "/v1/agents/a1",
+      "/v1/agents/a1/config",
+    ]);
   });
 
   it("keeps an operator-added server agent read-only on a cold link", async () => {
@@ -198,6 +208,7 @@ describe("Custom agents settings", () => {
     expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
       "/v1/agents/a1",
       "/v1/agents/a1",
+      "/v1/agents/a1/config",
     ]);
   });
 
@@ -367,8 +378,9 @@ function configResponses({ fail = 0, etag = true }: { fail?: number; etag?: bool
 
 async function openEditor() {
   mount("/settings/custom-agents/a1");
-  fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
   await screen.findByDisplayValue("Original");
+  expect(screen.getByLabelText("Name")).toHaveAttribute("readonly");
+  expect(screen.queryByRole("dialog")).toBeNull();
 }
 
 describe("editing custom agents", () => {
@@ -385,7 +397,7 @@ describe("editing custom agents", () => {
     flags.edit = edit;
     mount("/settings/custom-agents/a1");
     await screen.findByRole("button", { name: "Delete agent" });
-    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("form", { name: "Agent configuration" })).toBeNull();
     expect(authenticatedFetch).not.toHaveBeenCalledWith(
       expect.stringContaining("/config"),
       expect.anything(),
@@ -394,11 +406,29 @@ describe("editing custom agents", () => {
   it("saves only changed fields, updates the summary, and never builds a replacement bundle", async () => {
     configResponses();
     await openEditor();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    const description = screen.getByLabelText("Description");
+    expect(description).not.toHaveAttribute("readonly");
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Updated" } });
+    fireEvent.change(description, { target: { value: "Updated" } });
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(await screen.findByText("Updated")).toBeVisible();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    expect(screen.getByLabelText("Description")).toBe(description);
+    expect(description).toHaveValue("Updated");
+    fireEvent.change(description, { target: { value: "Updated again" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    expect(description).toHaveValue("Updated again");
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/agents/a1",
+      expect.objectContaining({
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "If-Match": '"new"' },
+        body: '{"description":"Updated again"}',
+      }),
+    );
     expect(authenticatedFetch).toHaveBeenCalledWith(
       "/v1/agents/a1",
       expect.objectContaining({
@@ -422,6 +452,24 @@ describe("editing custom agents", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(await screen.findByRole("heading", { name: "Custom agents" })).toBeVisible();
+    fireEvent.click((await screen.findAllByRole("link", { name: "research" }))[0]);
+    expect(await screen.findByLabelText("Instructions")).toHaveValue(" literal\n");
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  });
+  it("confirms a dirty draft before returning to the list", async () => {
+    configResponses();
+    await openEditor();
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Unsaved" } });
+    fireEvent.click(screen.getByRole("button", { name: "Custom agents" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Keep editing" }));
+    expect(screen.getByLabelText("Description")).toHaveValue("Unsaved");
+    fireEvent.click(screen.getByRole("button", { name: "Custom agents" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
+    expect(await screen.findByRole("heading", { name: "Custom agents" })).toBeVisible();
+    expect(
+      vi.mocked(authenticatedFetch).mock.calls.some(([, init]) => init?.method === "PATCH"),
+    ).toBe(false);
   });
   it("keeps a conflicted draft until explicit reload, then allows editing the latest revision", async () => {
     const server = configResponses({ fail: 412 });
