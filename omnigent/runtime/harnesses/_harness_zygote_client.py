@@ -195,7 +195,7 @@ class HarnessZygoteClient:
         """Stop a child returned after its launch was cancelled."""
         try:
             proc = await asyncio.shield(fork)
-        except Exception:  # A rejected fork returned no process to stop.
+        except ZygoteHarnessUnavailable:  # A rejected fork returned no process to stop.
             return
         try:
             if proc.returncode is None:
