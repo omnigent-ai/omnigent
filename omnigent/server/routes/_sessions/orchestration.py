@@ -5528,9 +5528,7 @@ async def _ensure_native_terminal_ready(
         resp.text[:500],
         extra={"session_id": session_id},
     )
-    return _NativeTerminalEnsureOutcome(
-        error=_native_terminal_failure_from_runner_response(resp, display_name=display_name),
-    )
+    return _native_terminal_failure_from_runner_response(resp, display_name=display_name)
 
 
 async def _persist_native_terminal_failure(
@@ -5542,6 +5540,7 @@ async def _persist_native_terminal_failure(
     runner_router: RunnerRouter | None,
     *,
     created_by: str | None,
+    failure_context: FailureContext | None = None,
 ) -> str:
     """
     Persist a consumed user message and terminal-start error.
@@ -5572,6 +5571,7 @@ async def _persist_native_terminal_failure(
         in-process / test setups where the global client is used.
     :param created_by: Authenticated posting actor, e.g.
         ``"alice@example.com"``; ``None`` in single-user mode.
+    :param failure_context: Normalized cause metadata from the runner's ensure response.
     :returns: Store-assigned id of the consumed user message item.
     """
     turn_id = generate_task_id()
@@ -5605,6 +5605,7 @@ async def _persist_native_terminal_failure(
         "failed",
         ErrorDetail(code=error.code, message=error.message),
         failure_origin="native_terminal_boot_failed",
+        failure_context=failure_context,
     )
     # A boot failure on a native sub-agent must wake the parent — mirror
     # the normal terminal-status path (publish + forward), gated on
@@ -7435,6 +7436,7 @@ async def _dispatch_session_event_to_runner_impl(
                 ensure_outcome.error,
                 runner_router,
                 created_by=created_by,
+                failure_context=ensure_outcome.failure_context,
             )
             return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
         if ensure_outcome.policy_notice is not None:
@@ -8584,6 +8586,7 @@ async def _relay_runner_stream_once(
                                     else None
                                 ),
                                 failure_origin="relayed_runner_status",
+                                failure_context=event.get("failure_context"),
                                 blocked_on=(
                                     raw_blocked_on
                                     if isinstance(raw_blocked_on, str) and raw_blocked_on
