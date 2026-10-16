@@ -459,6 +459,10 @@ os_env:
 Prefer the narrowest filesystem and network access that supports the task. Do
 not pass secrets through the environment unless the tool genuinely needs them.
 
+`sys_os_*` tools run with `OMNIGENT_AGENT_NAME` set to the agent's `name`, under
+every sandbox type, so a credential helper or CLI wrapper can pick a per-agent
+identity. The runner sets it directly, so it needs no `env_passthrough` entry.
+
 You usually don't need to choose a `sandbox.type` — omit it and Omnigent picks
 the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS, or
 `windows_jobobject` on Windows), so the same YAML works across platforms. Use
