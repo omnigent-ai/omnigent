@@ -741,6 +741,18 @@ async def _best_effort_stop(
             await _stop(descendant_id)
 
 
+def _cancel_runner_relays(session_ids: list[str]) -> None:
+    """Cancel the runner relays of deleted sessions.
+
+    A relay riding out an offline runner's reconnect grace would otherwise fail
+    the deleted session's turn when the grace expires.
+    """
+    for session_id in session_ids:
+        handle = _runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+
+
 # Strong references to detached archive stops so the tasks can't be
 # garbage-collected mid-stop (asyncio only holds weak refs to tasks).
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
@@ -13040,6 +13052,7 @@ __all__ = [
     "_build_session_list_item",
     "_build_session_response",
     "_cancel_pending_archive_stop",
+    "_cancel_runner_relays",
     "_child_session_summaries_from_conversations",
     "_create_session_from_bundle",
     "_create_session_from_existing_agent",
