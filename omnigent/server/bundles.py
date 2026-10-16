@@ -147,6 +147,10 @@ def validate_agent_bundle(
         raise
     except ExtractionError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    except OSError:
+        raise OmnigentError(
+            "Agent bundle validation failed", code=ErrorCode.INTERNAL_ERROR
+        ) from None
     except Exception as exc:
         # Catch YAML parse errors and other unexpected failures
         # during spec loading so they surface as 400, not 500.

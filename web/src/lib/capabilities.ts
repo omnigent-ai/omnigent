@@ -219,6 +219,8 @@ export interface ServerInfo {
   agent_install?: boolean;
   /** True when GET /v1/agents/{id} is available; absent on older servers (off). */
   agent_detail?: boolean;
+  /** Owner-only configuration reads and conditional PATCH updates. */
+  agent_config_edit?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -392,6 +394,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
+          agent_config_edit: data.agent_config_edit === true,
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;

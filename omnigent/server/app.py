@@ -205,6 +205,8 @@ class ServerInfoResponse(BaseModel):
     agent_install: bool = False
     # GET /v1/agents/{id}; absent on older servers, which clients treat as unsupported.
     agent_detail: bool = False
+    # Owner configuration reads and conditional PATCH updates.
+    agent_config_edit: bool = False
     branding: BrandingInfo
 
 
@@ -3150,6 +3152,8 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
+                "agent_config_edit": agent_store.supports_config_edit
+                and artifact_store is not None,
                 "branding": branding_snapshot.config(),
             }
         )
@@ -3520,8 +3524,8 @@ def create_app(
         """
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
-            _intentional_stop_sessions,
             _mark_runner_sessions_offline,
+            _note_runner_idle_shutdown,
             _relinquish_session_live_state,
             _runner_live_on_another_replica_from_conversations,
         )
@@ -3574,9 +3578,7 @@ def create_app(
             return
         if idle_shutdown:
             # The sweep's stop path settles these to idle instead of failing them.
-            for conv in affected:
-                if conv.runner_id == runner_id and _intentional_stop_sessions.get(conv.id) is None:
-                    _intentional_stop_sessions[conv.id] = runner_id
+            _note_runner_idle_shutdown(runner_id, affected)
             _logger.info(
                 "Runner %s shut down with no active work; settling %d bound session(s)",
                 runner_id,
@@ -3648,10 +3650,22 @@ def create_app(
                 runner_id,
             )
             return
+        from omnigent.server.routes.sessions import _note_runner_idle_shutdown
+
+        idle_shutdown = connection.peer_close_reason == RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
         _logger.info(
             "Runner disconnected",
-            extra=debug_event("runner_disconnected", runner_id=runner_id),
+            extra=debug_event(
+                "runner_disconnected",
+                runner_id=runner_id,
+                peer_close_reason=connection.peer_close_reason,
+                idle_shutdown=idle_shutdown,
+            ),
         )
+        if idle_shutdown:
+            # Relays decide at the same deadline as the grace timer below and
+            # would fail a stale mid-turn status first; mark them now.
+            _note_runner_idle_shutdown(runner_id)
         # Capture this replica's own last stamp before clearing, so the grace
         # timer can tell a fresher stamp another replica writes later from
         # one we wrote ourselves (the clear itself never erases this record).
@@ -3671,7 +3685,7 @@ def create_app(
             _mark_disconnected_runner_failed(
                 runner_id,
                 reference_stamp,
-                idle_shutdown=connection.peer_close_reason == RUNNER_IDLE_SHUTDOWN_CLOSE_REASON,
+                idle_shutdown=idle_shutdown,
             ),
             name=f"runner-disconnect-grace-{runner_id}",
         )
