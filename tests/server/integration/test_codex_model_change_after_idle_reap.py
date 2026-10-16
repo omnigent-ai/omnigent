@@ -6,8 +6,9 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -58,12 +59,22 @@ class _LoopbackCodex:
     applied_updates: list[dict[str, Any]] = field(default_factory=list)
     rpc_errors: list[dict[str, Any]] = field(default_factory=list)
     response_errors: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    refuse_handshake: bool = False
+    proc: SimpleNamespace | None = None
 
     async def start(self) -> None:
         assert self.server is None
         bridge.clear_bridge_state(self.bridge_dir)
         self.ready.clear()
-        self.server = await serve(self.handle, "127.0.0.1", 0)
+        self.proc = SimpleNamespace(returncode=None)
+        self.server = await serve(
+            self.handle,
+            "127.0.0.1",
+            0,
+            process_request=lambda connection, _request: (
+                connection.respond(403, "Forbidden") if self.refuse_handshake else None
+            ),
+        )
         port = self.server.sockets[0].getsockname()[1]
         self.transport = f"ws://127.0.0.1:{port}"
         self.launches += 1
@@ -101,6 +112,8 @@ class _LoopbackCodex:
         self.ready.set()
 
     async def close(self) -> None:
+        if self.proc is not None:
+            self.proc.returncode = 0
         if self.startup_task is not None:
             self.startup_task.cancel()
             await asyncio.gather(self.startup_task, return_exceptions=True)
@@ -168,6 +181,7 @@ class _NativeSession:
     store: SqlAlchemyConversationStore
     runner: httpx.AsyncClient
     terminals: TerminalRegistry
+    resources: SessionResourceRegistry
     reaper: NativePaneReaper
     codex: _LoopbackCodex
     events: list[dict[str, Any]]
@@ -323,7 +337,15 @@ async def native_session(
             )
             monkeypatch.setattr(routes_core, "_ensure_runner_relay_ready", AsyncMock())
             session = _NativeSession(
-                session_id, store, runner, terminals, reaper, codex, events, runner_replies
+                session_id,
+                store,
+                runner,
+                terminals,
+                runner_app.state.session_resource_registry,
+                reaper,
+                codex,
+                events,
+                runner_replies,
             )
             await session.reopen_terminal()
             assert codex.launches == 1
@@ -344,93 +366,204 @@ async def test_connected_codex_model_change_before_idle_reap(
     assert native_session.codex.launches == 1
 
 
-@pytest.mark.parametrize(
-    ("lookup", "applies"),
-    [
-        ("unavailable", True),
-        ("missing-label", True),
-        ("explicit-label", True),
-        ("wrong-label", False),
-        ("wrong-session-map", False),
-        ("no-map", False),
-    ],
-)
-async def test_rotated_codex_settings_resolve_the_owned_launch_directory(
-    client: httpx.AsyncClient,
-    native_session: _NativeSession,
-    monkeypatch: pytest.MonkeyPatch,
-    lookup: str,
-    applies: bool,
+@pytest.mark.parametrize("combined", [False, True], ids=["model", "model-and-effort"])
+async def test_model_change_recovers_dead_backend_while_codex_pane_is_alive(
+    client: httpx.AsyncClient, native_session: _NativeSession, combined: bool
 ) -> None:
-    """A missing label can use the owned launch, but cannot override explicit ownership."""
-    from omnigent.inner.databricks_executor import DatabricksAuthError
-    from tests.runner.helpers import NullServerClient
-
     session = native_session
-    old_bridge_dir = session.codex.bridge_dir
+    pane = session.terminals.get(session.session_id, "codex", "main")
+    assert pane is not None and await pane.is_alive()
     await session.codex.close()
-    rotated_id = "rotated-" + session.session_id
-    rotated_bridge_dir = bridge.bridge_dir_for_bridge_id(rotated_id)
-    rotated_home = bridge.codex_home_for_bridge_dir(rotated_bridge_dir)
-    rotated_home.mkdir(parents=True)
-    (rotated_home / "config.toml").write_text(
-        f'model = "{_PREVIOUS_MODEL}"\nmodel_reasoning_effort = "high"\n'
+    assert native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] is session.codex
+    assert bridge.read_bridge_state(session.codex.bridge_dir) is not None
+    selection = {"model_override": _REQUESTED_MODEL}
+    if combined:
+        selection["reasoning_effort"] = "low"
+
+    response = await asyncio.wait_for(
+        client.patch(f"/v1/sessions/{session.session_id}", json=selection), timeout=5
     )
-    session.codex.bridge_dir = rotated_bridge_dir
-    await session.codex.start()
-    bridge.clear_bridge_state(old_bridge_dir)
-    mapped_dirs = {session.session_id: rotated_bridge_dir}
-    if lookup == "explicit-label":
-        mapped_dirs[session.session_id] = old_bridge_dir
-    elif lookup == "no-map":
-        mapped_dirs.clear()
-    elif lookup == "wrong-session-map":
-        state = bridge.read_bridge_state(rotated_bridge_dir)
-        assert state is not None
-        bridge.write_bridge_state(rotated_bridge_dir, replace(state, session_id="other-session"))
-    monkeypatch.setattr(native_runtime, "_AUTO_CODEX_BRIDGE_DIRS", mapped_dirs)
+
+    session.assert_applied(response, effort="low" if combined else "high")
+    assert session.codex.launches == 2
+
+
+async def test_codex_listener_refusal_preserves_a_live_backend_connection(
+    client: httpx.AsyncClient, native_session: _NativeSession
+) -> None:
+    session = native_session
+    accepted = app_server.CodexAppServerClient(ws_url=session.codex.transport)
+    await accepted.connect()
+    server = session.codex.server
+    assert server is not None
+    server.close(close_connections=False)
+    while server.is_serving():
+        await asyncio.sleep(0)
+
+    try:
+        response = await client.patch(
+            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+        )
+        _assert_codex_refusal(session, response)
+        assert session.codex.stops == 0
+        assert session.codex.launches == 1
+        result = await accepted.request("thread/list/loaded", {})
+        assert result["result"] == {
+            "data": [session.codex.thread_id],
+            "nextCursor": None,
+        }
+    finally:
+        await accepted.close()
+
+
+async def test_codex_refused_connection_does_not_close_a_replacement_backend(
+    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = native_session
+    await session.codex.close()
+    replacement = SimpleNamespace(
+        bridge_dir=session.codex.bridge_dir,
+        proc=SimpleNamespace(returncode=0),
+        close=AsyncMock(),
+    )
+    connect = app_server.CodexAppServerClient.connect
+    replaced = False
+
+    async def replace_before_refusal(rpc: app_server.CodexAppServerClient) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] = replacement
+            raise ConnectionRefusedError("The old listener disappeared during replacement")
+        await connect(rpc)
+
+    monkeypatch.setattr(app_server.CodexAppServerClient, "connect", replace_before_refusal)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    _assert_codex_refusal(session, response)
+    replacement.close.assert_not_awaited()
+    assert native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] is replacement
+    assert session.codex.launches == 1
+
+
+async def test_codex_unregistered_backend_is_not_restarted_after_connection_refusal(
+    client: httpx.AsyncClient, native_session: _NativeSession
+) -> None:
+    session = native_session
+    await session.codex.close()
+    native_runtime._AUTO_CODEX_APP_SERVERS.pop(session.session_id)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    _assert_codex_refusal(session, response)
+    assert session.codex.launches == 1
+    assert session.session_id not in native_runtime._AUTO_CODEX_APP_SERVERS
+
+
+async def test_codex_live_handshake_refusal_does_not_restart_backend(
+    client: httpx.AsyncClient, native_session: _NativeSession
+) -> None:
+    session = native_session
+    session.codex.refuse_handshake = True
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    _assert_codex_refusal(session, response)
+    assert session.codex.launches == 1
+    assert session.codex.stops == 0
+    assert session.codex.requests == []
+
+    session.codex.refuse_handshake = False
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    assert response.status_code == 200, response.text
+    session.assert_settings(_REQUESTED_MODEL)
+    assert len(session.codex.applied_updates) == 1
+    assert session.codex.launches == 1
+
+
+async def test_codex_connection_refused_after_settings_send_is_not_replayed(
+    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = native_session
+    request = app_server.CodexAppServerClient.request
+
+    async def lose_reply(
+        rpc: app_server.CodexAppServerClient, method: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        result = await request(rpc, method, params)
+        if method == "thread/settings/update":
+            raise ConnectionRefusedError("Settings reply was lost")
+        return result
+
+    monkeypatch.setattr(app_server.CodexAppServerClient, "request", lose_reply)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    assert response.status_code == 503, response.text
+    assert len(session.codex.applied_updates) == 1
+    assert session.codex.launches == 1
+    assert session.codex.stops == 0
+
+
+async def test_unowned_codex_pane_is_not_restarted_after_connection_refusal(
+    client: httpx.AsyncClient, native_session: _NativeSession
+) -> None:
+    session = native_session
+    await session.codex.close()
+    session.resources._terminal_roles.pop(
+        (session.session_id, terminal_resource_id("codex", "main"))
+    )
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    _assert_codex_refusal(session, response)
+    assert session.codex.launches == 1
+
+
+async def test_codex_replacement_connection_refusal_is_not_retried_again(
+    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = native_session
+    await session.codex.close()
+    launch = native_runtime._auto_create_codex_terminal
+
+    async def launch_without_listener(*args: Any, **kwargs: Any) -> SessionResourceView:
+        resource = await launch(*args, **kwargs)
+        await session.codex.close()
+        return resource
+
+    monkeypatch.setattr(native_runtime, "_auto_create_codex_terminal", launch_without_listener)
+    response = await asyncio.wait_for(
+        client.patch(
+            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+        ),
+        timeout=5,
+    )
+    _assert_codex_refusal(session, response)
+    assert session.codex.launches == 2
+    assert session.codex.requests == []
+
+
+async def test_codex_dead_backend_recovery_startup_timeout_refuses_settings(
+    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = native_session
+    await session.codex.close()
+    session.codex.ready_gate = asyncio.Event()
     monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_READY_TIMEOUT_S", 0.1)
     monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_READY_POLL_S", 0.005)
-    get = NullServerClient.get
-    post = NullServerClient.post
-    callbacks = {"labels": 0, "effort": 0}
-
-    async def labels(self: Any, url: str, **kwargs: Any) -> Any:
-        if not url.endswith("/labels"):
-            return await get(self, url, **kwargs)
-        callbacks["labels"] += 1
-        if lookup == "unavailable":
-            raise DatabricksAuthError("Credential service could not supply callback credentials")
-        live_labels = {}
-        if lookup in {"explicit-label", "wrong-label"}:
-            live_labels[bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = (
-                rotated_id if lookup == "explicit-label" else "wrong-" + session.session_id
-            )
-        return httpx.Response(200, json={"labels": live_labels}, request=httpx.Request("GET", url))
-
-    async def effort(self: Any, url: str, **kwargs: Any) -> Any:
-        if lookup == "unavailable" and url.endswith("/events"):
-            callbacks["effort"] += 1
-            raise DatabricksAuthError("Credential service could not supply callback credentials")
-        return await post(self, url, **kwargs)
-
-    monkeypatch.setattr(NullServerClient, "get", labels)
-    monkeypatch.setattr(NullServerClient, "post", effort)
     response = await asyncio.wait_for(
         client.patch(
             f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
         ),
         timeout=2,
     )
-
-    if applies:
-        session.assert_applied(response)
-    else:
-        _assert_codex_refusal(session, response)
+    _assert_codex_refusal(session, response)
     assert session.codex.launches == 2
-    assert callbacks["labels"] >= 1
-    assert callbacks["effort"] == int(lookup == "unavailable")
-    assert bridge.read_bridge_state(old_bridge_dir) is None
+    assert session.codex.requests == []
 
 
 @pytest.mark.parametrize("clear_bridge", [False, True], ids=["stale-bridge", "missing-bridge"])
