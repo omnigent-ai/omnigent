@@ -80,6 +80,57 @@ describe("ToolCard rendering", () => {
     expect(screen.getByText("3.3s")).toBeInTheDocument();
   });
 
+  it("shows a file edit as a Diff panel with removed and added lines", () => {
+    // WHY: an edit tool call must read as a change — the replaced line and its
+    // replacement both visible — not as a raw parameters JSON dump.
+    const { container } = renderCard({
+      name: "sys_os_edit",
+      argsSummary: "",
+      arguments: { path: "config.py", oldText: "timeout = 30\n", newText: "timeout = 60\n" },
+      output: JSON.stringify({ path: "config.py", replacements: 1, bytes_written: 20 }),
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("Diff")).toBeInTheDocument();
+    expect(screen.getAllByText(/-timeout = 30/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/\+timeout = 60/).length).toBeGreaterThan(0);
+  });
+
+  it("shows a full-file write's server-computed diff from the tool result", () => {
+    // WHY: sys_os_write replaces whole files; the replaced line exists only in
+    // the result's `diff` field, which must surface as the removed side.
+    const { container } = renderCard({
+      name: "sys_os_write",
+      argsSummary: "",
+      arguments: { path: "config.py", content: "timeout = 60\n" },
+      output: JSON.stringify({
+        path: "/w/config.py",
+        bytes_written: 13,
+        created: false,
+        diff: "--- /w/config.py\n+++ /w/config.py\n@@ -1 +1 @@\n-timeout = 30\n+timeout = 60\n",
+      }),
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("Diff")).toBeInTheDocument();
+    expect(screen.getAllByText(/-timeout = 30/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/\+timeout = 60/).length).toBeGreaterThan(0);
+  });
+
+  it("shows no Diff panel for a write that created a new file", () => {
+    // WHY: a brand-new file has no "before" side; the card falls back to the
+    // plain parameters/output panels without an empty diff.
+    const { container } = renderCard({
+      name: "sys_os_write",
+      argsSummary: "",
+      arguments: { path: "new.txt", content: "hello\n" },
+      output: JSON.stringify({ path: "/w/new.txt", bytes_written: 6, created: true }),
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.queryByText("Diff")).toBeNull();
+  });
+
   it("expands to reveal the Parameters panel and output on click", () => {
     // WHY: clicking the trigger must reveal the parameters JSON and the output
     // section — the collapsed-by-default content path.
