@@ -16,12 +16,14 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Generator
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, cast
 
 import httpx
@@ -30,7 +32,12 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
-from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
+from omnigent.runner.transports.ws_tunnel.serve import (
+    RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
+    RUNNER_TUNNEL_REJECTION_PREFIX,
+    RunnerTunnelAuthRejectedError,
+)
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
@@ -235,6 +242,30 @@ def _runner_threadpool_max_workers() -> int:
     if isinstance(raw_workers, bool) or not isinstance(raw_workers, int) or raw_workers < 1:
         raise RuntimeError("runner.threadpool_max_workers must be a positive integer")
     return raw_workers
+
+
+def _runner_last_activity(
+    tunnel_activity_at: float,
+    dispatch_activity_at: float | None,
+    forwarder_post_at: float | None,
+) -> float:
+    """Return the newest runner-activity timestamp across the activity clocks.
+
+    The tunnel clock covers server→runner request frames; the other two cover
+    outbound native-forwarder event posts (tunnel-dispatched batches and
+    direct HTTP posts), so a mirrored sub-agent that is still streaming keeps
+    an otherwise idle runner alive. A clock that never fired passes ``None``.
+
+    :param tunnel_activity_at: Last tunnel request-frame time (loop clock).
+    :param dispatch_activity_at: Last acknowledged tunnel event-batch time.
+    :param forwarder_post_at: Last native-forwarder POST round-trip time.
+    :returns: The latest of the non-``None`` timestamps.
+    """
+    return max(
+        stamp
+        for stamp in (tunnel_activity_at, dispatch_activity_at, forwarder_post_at)
+        if stamp is not None
+    )
 
 
 async def _run_inactivity_monitor(
@@ -554,6 +585,14 @@ class _InitialAuthTokenFactory:
         """True when the inner fallback factory's decline came from a 5xx."""
         with self._lock:
             return bool(getattr(self._fallback_factory, "declined_by_server_error", False))
+
+    @property
+    def sign_in_pending(self) -> bool:
+        """True while the fallback credential source waits on an interactive sign-in."""
+        with self._lock:
+            if self._initial_token is not None:
+                return False
+            return bool(getattr(self._fallback_factory, "sign_in_pending", False))
 
     def reset_decline(self) -> None:
         """Clear the inner fallback factory's ``declined`` latch, if any."""
@@ -1255,6 +1294,11 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     return dest
 
 
+# The server waits 10s for session init, so throttled spec fetches retry well inside that.
+_SPEC_FETCH_429_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
+_SPEC_FETCH_MAX_RETRY_AFTER_S = 2.0
+
+
 async def _resolve_agent_spec_from_server(
     server_client: httpx.AsyncClient,
     spec_cache_root: Path,
@@ -1278,8 +1322,10 @@ async def _resolve_agent_spec_from_server(
         directory, or ``None`` when the server returns 404 for the
         requested agent.
     :raises RuntimeError: If the server returns a non-200 status
-        other than 404.
+        other than 404, including a 429 that outlasts the retries.
     """
+    from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
+    from omnigent.native.native_terminal import request_with_429_retry
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
 
@@ -1291,7 +1337,13 @@ async def _resolve_agent_spec_from_server(
         )
         return None
     path = f"/v1/sessions/{session_id}/agent/contents"
-    resp = await server_client.get(path)
+    # Every runner re-initializes its sessions when the server restarts, and the
+    # resulting burst gets throttled; a failed fetch here fails the session's init.
+    resp = await request_with_429_retry(
+        lambda: server_client.get(path, headers={MCP_SELECTION_HEADER: "1"}),
+        delays_s=_SPEC_FETCH_429_RETRY_DELAYS_S,
+        max_retry_after_s=_SPEC_FETCH_MAX_RETRY_AFTER_S,
+    )
     if resp.status_code == 404:
         _logger.info(
             "spec_resolver: GET %s returned 404 for missing agent",
@@ -1323,10 +1375,25 @@ async def _resolve_agent_spec_from_server(
     # unsupported sub-agent and launch the parent with what this runner
     # *does* support, rather than failing every dispatch of the agent.
     # See omnigent.spec.load.
-    if not dest.exists():
-        dest.mkdir(parents=True)
-        load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    try:
+        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    except FileNotFoundError:
+        # Temp cleanup can leave a version directory without its bundle.
+        # Validate privately before replacing an incomplete cache entry.
+        spec_cache_root.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix=".spec-", dir=spec_cache_root) as staging_dir:
+            staging = Path(staging_dir)
+            load(resp.content, dest=staging, expand_env=expand_env, prune_invalid_sub_agents=True)
+            if dest.exists():
+                shutil.rmtree(dest)
+                _logger.warning(
+                    "Rebuilding incomplete agent bundle cache for %s",
+                    agent_id,
+                    extra={"session_id": session_id},
+                )
+            staging.rename(dest)
+        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    spec = selected_mcp_spec(spec, json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}")))
     _apply_host_interactive_shells(spec)
     return ResolvedSpec(spec=spec, workdir=dest)
 
@@ -1702,6 +1769,9 @@ async def _run_tunnel_from_env() -> None:
     # Reuse the tunnel's token factory for the app's httpx client so the
     # runner resolves Databricks auth once at boot, not twice.
     app = create_app(auth_token_factory=auth_token_factory, auth_resolved=True)
+    from omnigent.native._native_forwarder_health import (
+        last_post_at as native_forwarder_last_post_at,
+    )
     from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 
     event_dispatcher = RunnerEventDispatcher()
@@ -1733,9 +1803,17 @@ async def _run_tunnel_from_env() -> None:
     def _last_activity() -> float:
         """Return the last real runner activity time.
 
+        Outbound native-forwarder event posts count too, so a mirrored
+        sub-agent that is still streaming holds off the idle watchdog while
+        the parent session is idle.
+
         :returns: Monotonic timestamp from the runner event loop.
         """
-        return last_activity_at
+        return _runner_last_activity(
+            last_activity_at,
+            event_dispatcher.last_dispatch_at,
+            native_forwarder_last_post_at(),
+        )
 
     def _has_active_work() -> bool:
         """Return whether the runner is currently executing agent work.
@@ -2098,13 +2176,17 @@ def main() -> None:
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:
-        if not str(exc).startswith(RUNNER_TUNNEL_REJECTION_PREFIX):
+        if not str(exc).startswith(
+            (RUNNER_TUNNEL_REJECTION_PREFIX, RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+        ):
             raise
-        # A fatal server rejection is an expected, actionable exit — log the
+        # A fatal tunnel auth failure is an expected, actionable exit — log the
         # reason but keep stderr to the concise message (no traceback).
         _logger.error("runner exiting: %s", exc, extra={"session_id": runner_primary_session_id()})
         print(f"error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from None
+        # A refused credential gets its own code so the host reports a sign-in problem.
+        auth_rejected = isinstance(exc, RunnerTunnelAuthRejectedError)
+        raise SystemExit(RUNNER_AUTH_REJECTED_EXIT_CODE if auth_rejected else 1) from None
 
 
 if __name__ == "__main__":

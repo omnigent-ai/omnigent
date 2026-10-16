@@ -15,10 +15,13 @@ package-manager probe is driven by putting fake executables on ``PATH``.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shlex
 import shutil
 import subprocess
+import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -326,3 +329,236 @@ def test_check_bubblewrap_missing_no_pkg_manager_warns_generically(
     assert "Install it with your package manager" in r.stderr, (
         f"With no package manager the warning should be generic, got {r.stderr!r}."
     )
+
+
+@pytest.mark.parametrize(
+    ("args", "target"),
+    [
+        ("", "omnigent[databricks]"),
+        ("--version 1.2.3", "omnigent[databricks]==1.2.3"),
+        ("--repo https://github.com/o/r", "omnigent[databricks] @ git+https://github.com/o/r"),
+        ("--extra databricks", "omnigent[databricks]"),
+        ("--extra foo,databricks", "omnigent[foo,databricks]"),
+        ("--extra foo,bar --extra baz", "omnigent[databricks,foo,bar,baz]"),
+        ("--no-databricks", "omnigent"),
+        ("--no-databricks --extra antigravity", "omnigent[antigravity]"),
+        ("--extra antigravity --no-databricks", "omnigent[antigravity]"),
+        ("--no-databricks --extra databricks", "omnigent[databricks]"),
+    ],
+)
+def test_install_target_selects_extras(lib: Path, args: str, target: str) -> None:
+    r = run(
+        lib,
+        f"""
+        uv() {{ printf 'arg=%s\\n' "$@"; }}
+        parse_args {args}
+        normalize_repo_url
+        install_omnigent
+        """,
+    )
+    assert r.returncode == 0, r.stderr
+    assert [line[4:] for line in r.stdout.splitlines() if line.startswith("arg=")] == [
+        "tool",
+        "install",
+        "--force",
+        "-q",
+        "--python",
+        "3.12",
+        target,
+    ]
+
+
+_CLI_COMMANDS = """
+uname() { case "$1" in -s) echo Linux;; -m) echo x86_64;; esac; }
+uv() { [ "$1 $2" = 'python find' ] || return 1; printf '%s\\n' "$TEST_PYTHON"; }
+DATABRICKS_CLI_SHA256_LINUX_AMD64="$TEST_ARCHIVE_SHA256"
+DATABRICKS_CLI_SHA256_LINUX_ARM64="$TEST_ARCHIVE_SHA256"
+DATABRICKS_CLI_SHA256_DARWIN_AMD64="$TEST_ARCHIVE_SHA256"
+DATABRICKS_CLI_SHA256_DARWIN_ARM64="$TEST_ARCHIVE_SHA256"
+curl() {
+    printf '%s\\n' "$@" > "$TEST_CURL_LOG"
+    cp "$TEST_ARCHIVE" "$4"
+}
+"""
+
+
+@pytest.fixture
+def databricks_env(tmp_path: Path) -> dict[str, str]:
+    """Run the real shell/extraction path with a local release ZIP and isolated PATH."""
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    for command in ("chmod", "cp", "mkdir", "mktemp", "mv", "rm"):
+        executable = shutil.which(command)
+        assert executable is not None
+        (tools / command).symlink_to(executable)
+    bindir = tmp_path / "tool bin"
+    bindir.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    archive = tmp_path / "cli.zip"
+    with zipfile.ZipFile(archive, "w") as release:
+        release.writestr("databricks", '#!/bin/sh\n[ "$*" = "auth login --help" ]\n')
+    return {
+        "PATH": str(tools),
+        "TMPDIR": str(scratch),
+        "TEST_PYTHON": sys.executable,
+        "TEST_ARCHIVE": str(archive),
+        "TEST_ARCHIVE_SHA256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        "TEST_EXECUTED": str(tmp_path / "executed"),
+        "TEST_BIN_DIR": str(bindir),
+        "TEST_CURL_LOG": str(tmp_path / "curl.log"),
+        "TEST_LEDGER": str(tmp_path / "ledger.log"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("system", "arch", "release_platform"),
+    [
+        ("Linux", "x86_64", "linux_amd64"),
+        ("Linux", "aarch64", "linux_arm64"),
+        ("Darwin", "x86_64", "darwin_amd64"),
+        ("Darwin", "arm64", "darwin_arm64"),
+    ],
+)
+def test_install_databricks_cli(
+    lib: Path, databricks_env: dict[str, str], system: str, arch: str, release_platform: str
+) -> None:
+    r = run(
+        lib,
+        _CLI_COMMANDS
+        + f"""
+        uname() {{ case "$1" in -s) echo {system};; -m) echo {arch};; esac; }}
+        NON_INTERACTIVE=true
+        ensure_databricks_cli "$TEST_BIN_DIR"
+        "$TEST_BIN_DIR/databricks" auth login --help
+        printf 'owner=%s\\n' "$OMNIGENT_LEDGER_DEP_DATABRICKS"
+        """,
+        env=databricks_env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "owner=omnigent" in r.stdout
+    curl_args = Path(databricks_env["TEST_CURL_LOG"]).read_text().splitlines()
+    assert curl_args[:3] == [
+        "-fsSL",
+        "https://github.com/databricks/cli/releases/download/v1.21.0/"
+        f"databricks_cli_1.21.0_{release_platform}.zip",
+        "-o",
+    ]
+    assert list(Path(databricks_env["TMPDIR"]).iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("location", "usable"),
+    [("path", True), ("bin", True), ("path", False), ("bin", False), ("shadowed", False)],
+)
+def test_existing_databricks_cli_is_checked_without_replacement(
+    lib: Path, databricks_env: dict[str, str], location: str, usable: bool
+) -> None:
+    tools = Path(databricks_env["PATH"])
+    bindir = Path(databricks_env["TEST_BIN_DIR"])
+    existing = (tools if location == "path" else bindir) / "databricks"
+    contents = f"#!/bin/sh\nexit {0 if usable else 1}\n"
+    existing.write_text(contents)
+    existing.chmod(0o755)
+    if location == "shadowed":
+        global_cli = tools / "databricks"
+        global_cli.write_text("#!/bin/sh\nexit 0\n")
+        global_cli.chmod(0o755)
+    r = run(lib, _CLI_COMMANDS + '\nensure_databricks_cli "$TEST_BIN_DIR"', env=databricks_env)
+    assert (r.returncode == 0) == usable, r.stderr
+    if not usable:
+        assert "cannot run auth login" in r.stderr
+        assert "--no-databricks" in r.stderr
+    assert existing.read_text() == contents
+    assert not Path(databricks_env["TEST_CURL_LOG"]).exists()
+
+
+@pytest.mark.parametrize("failure", ["download", "checksum", "archive", "auth"])
+def test_databricks_install_failure_does_not_publish_binary(
+    lib: Path, databricks_env: dict[str, str], failure: str
+) -> None:
+    fault = ""
+    if failure == "download":
+        fault = "curl() { return 22; }"
+    elif failure == "checksum":
+        with zipfile.ZipFile(databricks_env["TEST_ARCHIVE"], "w") as release:
+            release.writestr("databricks", '#!/bin/sh\nprintf ran > "$TEST_EXECUTED"\n')
+    elif failure == "archive":
+        Path(databricks_env["TEST_ARCHIVE"]).write_bytes(b"incomplete download")
+    else:
+        with zipfile.ZipFile(databricks_env["TEST_ARCHIVE"], "w") as release:
+            release.writestr("databricks", "#!/bin/sh\nexit 1\n")
+    if failure in {"archive", "auth"}:
+        databricks_env["TEST_ARCHIVE_SHA256"] = hashlib.sha256(
+            Path(databricks_env["TEST_ARCHIVE"]).read_bytes()
+        ).hexdigest()
+    r = run(
+        lib,
+        _CLI_COMMANDS + f'\n{fault}\nensure_databricks_cli "$TEST_BIN_DIR"',
+        env=databricks_env,
+    )
+    assert r.returncode != 0
+    assert "Databricks CLI installation failed" in r.stderr
+    if failure == "checksum":
+        assert "checksum mismatch" in r.stderr
+        assert not Path(databricks_env["TEST_EXECUTED"]).exists()
+    assert not (Path(databricks_env["TEST_BIN_DIR"]) / "databricks").exists()
+    assert list(Path(databricks_env["TMPDIR"]).iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("args", "download_fails"),
+    [("", False), ("", True), ("--no-databricks --extra antigravity", False)],
+)
+def test_main_requires_selected_dependencies_before_reporting_success(
+    lib: Path, databricks_env: dict[str, str], args: str, download_fails: bool
+) -> None:
+    bindir = Path(databricks_env["TEST_BIN_DIR"])
+    omnigent = bindir / "omnigent"
+    omnigent.write_text(
+        '#!/bin/sh\nif [ "$*" = "_internal write-ledger --from-env" ]; then\n'
+        '  command -v databricks > "$TEST_LEDGER"\n'
+        '  printf "%s\\n" "$OMNIGENT_LEDGER_DEP_DATABRICKS" >> "$TEST_LEDGER"\n'
+        "fi\n"
+    )
+    omnigent.chmod(0o755)
+    (bindir / "omni").symlink_to(omnigent)
+    fault = "curl() { return 22; }" if download_fails else ""
+    r = run(
+        lib,
+        _CLI_COMMANDS
+        + f"""
+        uv() {{
+            case "$1 $2" in
+                'tool install') return 0;;
+                'tool dir') printf '%s\\n' "$TEST_BIN_DIR";;
+                'python find') printf '%s\\n' "$TEST_PYTHON";;
+                *) return 1;;
+            esac
+        }}
+        check_prerequisites() {{ :; }}
+        check_node() {{ :; }}
+        check_npm() {{ :; }}
+        check_tmux() {{ :; }}
+        check_bubblewrap() {{ :; }}
+        {fault}
+        main --non-interactive {args}
+        """,
+        env=databricks_env,
+    )
+    ledger = Path(databricks_env["TEST_LEDGER"])
+    if download_fails:
+        assert r.returncode != 0
+        assert "installed successfully" not in r.stdout
+        assert not ledger.exists()
+    else:
+        assert r.returncode == 0, r.stderr
+        assert ledger.exists()
+        if "--no-databricks" in args:
+            assert not Path(databricks_env["TEST_CURL_LOG"]).exists()
+            assert not (bindir / "databricks").exists()
+            assert "Databricks" not in r.stdout
+        else:
+            assert ledger.read_text().splitlines() == [str(bindir / "databricks"), "omnigent"]
+        assert "Omnigent installed successfully" in r.stdout
+        assert f'PATH="{bindir}:$PATH"' in r.stdout

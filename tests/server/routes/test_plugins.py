@@ -104,7 +104,7 @@ async def test_owner_gets_plugins(
     conn = _register(registry, CAP_PLUGINS)
     async with _client(app) as client:
         task = asyncio.create_task(client.get(_URL, headers={"x-test-user": "owner"}))
-        frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
+        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
         assert isinstance(frame, HostPluginsFrame)
         result.request_id = frame.request_id
         conn.pending_plugins[frame.request_id].set_result(result)

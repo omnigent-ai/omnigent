@@ -209,7 +209,7 @@ export function CommentsPanel({
               )}
               onClick={() => setTab(t)}
             >
-              {t === "open" ? "Open" : "Addressed"}
+              {t === "open" ? "Open" : "Sent"}
               {count > 0 && (
                 <span className="ml-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums">
                   {count}
@@ -307,7 +307,7 @@ export function CommentsPanel({
           )
         ) : addressedComments.length === 0 ? (
           <div className="flex items-center justify-center p-8 text-sm text-muted-foreground">
-            No addressed comments.
+            No sent comments.
           </div>
         ) : (
           <div className="space-y-2 p-3">
@@ -399,7 +399,7 @@ function CommentCard({
     if (!editing) setEditBody(c.body);
   }, [c.id, c.body, editing]);
 
-  const statusLabel = c.status === "addressed" ? "Addressed" : null;
+  const statusLabel = c.status === "addressed" ? "Sent" : null;
 
   function startEdit() {
     setEditBody(c.body);

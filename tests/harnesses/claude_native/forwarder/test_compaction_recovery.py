@@ -13,6 +13,7 @@ import pytest
 import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
+    TranscriptReadResult,
     record_hook_event,
 )
 from tests.harnesses.claude_native.forwarder._support import (
@@ -83,7 +84,12 @@ async def test_persist_native_compaction_item_posts_compaction_event(tmp_path: P
     assert body["data"]["token_count"] == 0
     # compacted_messages should contain the converted fake message.
     assert body["data"]["compacted_messages"] == [
-        {"type": "message", "role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello"}],
+            "forwarded_source_ids": ["native-message-0:0:message"],
+        },
     ]
 
 
@@ -109,12 +115,17 @@ async def test_persist_native_compaction_item_empty_items_uses_fallback(tmp_path
     client.post.return_value = post_response
 
     bridge_dir = tmp_path / "bridge"
+    fake_msg = MagicMock()
+    fake_msg.uuid = "snapshot-message"
+    fake_msg.type = "assistant"
+    fake_msg.message = {"content": [{"type": "text", "text": "retained context"}]}
 
     with (
         patch(
             "omnigent.harnesses.claude_native.forwarder.read_claude_session_id",
-            return_value=None,
+            return_value="claude-uuid-empty-items",
         ),
+        patch("claude_agent_sdk.get_session_messages", return_value=[fake_msg]),
     ):
         await forwarder._persist_native_compaction_item(
             client, session_id="conv_empty", bridge_dir=bridge_dir
@@ -123,8 +134,14 @@ async def test_persist_native_compaction_item_empty_items_uses_fallback(tmp_path
     post_call = client.post.call_args
     body = post_call[1]["json"] if "json" in post_call[1] else post_call[0][1]
     assert body["data"]["last_item_id"].startswith("compact_boundary_")
-    # No compacted_messages when claude_sid is None.
-    assert "compacted_messages" not in body["data"]
+    assert body["data"]["compacted_messages"] == [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": fake_msg.message["content"],
+            "forwarded_source_ids": ["snapshot-message:0:message"],
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -978,3 +995,364 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
     assert persisted.persisted_seqs == (minted_seq,)  # exactly one boundary
     assert persisted.pending is None
     assert after_ok.event_cursor > after_fail.event_cursor  # cursor advanced
+
+
+@pytest.mark.asyncio
+async def test_snapshot_failure_retries_and_can_recover(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    tracker = forwarder._PostRetryTracker(base_delay_s=0, max_delay_s=0)
+    persist = AsyncMock(
+        side_effect=[
+            forwarder._CompactionSnapshotError("Transcript is still incomplete"),
+            None,
+        ]
+    )
+    with patch.object(forwarder, "_persist_native_compaction_item", persist):
+        first = await forwarder._handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_snapshot_retry",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=tracker,
+        )
+        assert first is False
+        held = forwarder._read_compaction_state(bridge_dir)
+        assert held.pending is not None
+        assert held.persisted_seqs == ()
+
+        second = await forwarder._handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_snapshot_retry",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=tracker,
+        )
+
+    assert second is True
+    assert persist.await_count == 2
+    recovered = forwarder._read_compaction_state(bridge_dir)
+    assert recovered.pending is None
+    assert recovered.persisted_seqs == (1,)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_failure_backoff_does_not_repeat_read(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    tracker = forwarder._PostRetryTracker(base_delay_s=60, max_delay_s=60)
+    persist = AsyncMock(
+        side_effect=forwarder._CompactionSnapshotError("Transcript is still incomplete")
+    )
+    with patch.object(forwarder, "_persist_native_compaction_item", persist):
+        for _ in range(2):
+            handled = await forwarder._handle_compact_summary_item(
+                AsyncMock(),
+                session_id="conv_snapshot_backoff",
+                bridge_dir=bridge_dir,
+                item=_compact_summary_item(),
+                retry_tracker=tracker,
+            )
+            assert handled is False
+
+    assert persist.await_count == 1
+    assert forwarder._read_compaction_state(bridge_dir).pending is not None
+
+
+@pytest.mark.asyncio
+async def test_fallback_post_failure_does_not_reset_snapshot_retry_budget(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    tracker = forwarder._PostRetryTracker(base_delay_s=0, max_delay_s=0)
+    persist = AsyncMock(
+        side_effect=[
+            *[
+                forwarder._CompactionSnapshotError("Missing retained UUID")
+                for _ in range(forwarder._COMPACTION_SNAPSHOT_MAX_FAILURES - 1)
+            ],
+            httpx.ConnectError("Boundary service temporarily unavailable"),
+            None,
+        ]
+    )
+    with patch.object(forwarder, "_persist_native_compaction_item", persist):
+        for _ in range(forwarder._COMPACTION_SNAPSHOT_MAX_FAILURES):
+            assert not await forwarder._handle_compact_summary_item(
+                AsyncMock(),
+                session_id="conv_fallback_post_retry",
+                bridge_dir=bridge_dir,
+                item=_compact_summary_item(),
+                retry_tracker=tracker,
+            )
+        assert await forwarder._handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_fallback_post_retry",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=tracker,
+        )
+    assert persist.await_args_list[-2].kwargs["allow_snapshot_fallback"]
+    assert persist.await_args_list[-1].kwargs["allow_snapshot_fallback"]
+    assert forwarder._read_compaction_state(bridge_dir).persisted_seqs == (1,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_path", ["transcript", "hook", "alternating"])
+@pytest.mark.parametrize("separate_http_trackers", [False, True])
+async def test_exhausted_snapshot_uses_fallback_and_next_cycle_recovers(
+    tmp_path: Path,
+    first_path: str,
+    separate_http_trackers: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "source": "compact",
+            "session_id": "claude-1",
+        },
+    )
+    tracker = forwarder._PostRetryTracker(base_delay_s=0, max_delay_s=0)
+    item_tracker = forwarder._PostRetryTracker() if separate_http_trackers else tracker
+    hook_tracker = forwarder._PostRetryTracker() if separate_http_trackers else tracker
+
+    async def persist_with_fallback(*args: Any, **kwargs: Any) -> None:
+        if not kwargs["allow_snapshot_fallback"]:
+            raise forwarder._CompactionSnapshotError("Invalid metadata")
+
+    persist = AsyncMock(side_effect=persist_with_fallback)
+    client = AsyncMock()
+    hook_state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+
+    async def hook_once() -> forwarder.HookForwardState:
+        return await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_snapshot_exhausted",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=hook_tracker,
+            compaction_retry_tracker=tracker,
+            dedupe=forwarder._ForwardDedupeState(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+        )
+
+    with (
+        patch.object(forwarder, "_persist_native_compaction_item", persist),
+        patch.object(forwarder, "_post_external_compaction_status", AsyncMock()),
+    ):
+        for attempt in range(forwarder._COMPACTION_SNAPSHOT_MAX_FAILURES):
+            if first_path == "transcript" or (first_path == "alternating" and attempt % 2 == 0):
+                handled = await forwarder._handle_compact_summary_item(
+                    client,
+                    session_id="conv_snapshot_exhausted",
+                    bridge_dir=bridge_dir,
+                    item=_compact_summary_item(),
+                    retry_tracker=item_tracker,
+                    compaction_retry_tracker=tracker,
+                )
+            else:
+                hook_state = await hook_once()
+                handled = hook_state.event_cursor > 0
+        assert handled is True
+        assert persist.await_count == forwarder._COMPACTION_SNAPSHOT_MAX_FAILURES
+        persisted = forwarder._read_compaction_state(bridge_dir)
+        assert persisted.pending is None
+        assert persisted.persisted_seqs == (1,)
+        assert any(
+            record.levelno >= 30 and "snapshot" in record.getMessage() for record in caplog.records
+        )
+
+        if first_path == "transcript":
+            hook_state = await hook_once()
+            assert hook_state.event_cursor > 0
+        else:
+            assert await forwarder._handle_compact_summary_item(
+                client,
+                session_id="conv_snapshot_exhausted",
+                bridge_dir=bridge_dir,
+                item=_compact_summary_item(),
+                retry_tracker=item_tracker,
+                compaction_retry_tracker=tracker,
+            )
+        assert persist.await_count == forwarder._COMPACTION_SNAPSHOT_MAX_FAILURES
+
+    assert all(
+        call.kwargs.get("json", {}).get("type") != "compaction"
+        for call in client.post.call_args_list
+    )
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    successful = _persist_mock()
+    with patch.object(forwarder, "_persist_native_compaction_item", successful):
+        assert await forwarder._handle_compact_summary_item(
+            client,
+            session_id="conv_snapshot_exhausted",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("next genuine compaction"),
+            retry_tracker=item_tracker,
+            compaction_retry_tracker=tracker,
+        )
+    successful.assert_awaited_once()
+    recovered = forwarder._read_compaction_state(bridge_dir)
+    assert recovered.persisted_seqs == (1, 2)
+    assert recovered.pending is None
+
+
+@pytest.mark.asyncio
+async def test_exhausted_snapshot_allows_followup_transcript_forwarding(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("\n\n", encoding="utf-8")
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=str(transcript)
+    )
+    summary = _compact_summary_item()
+    followup = ClaudeTranscriptItem(
+        source_id="followup:0:message",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "output_text", "text": "follow-up"}]},
+        response_id="resp_followup",
+    )
+    read_result = TranscriptReadResult(
+        line_cursor=2,
+        byte_offset=2,
+        current_response_id="resp_followup",
+        items=[summary, followup],
+    )
+    tracker = forwarder._PostRetryTracker(base_delay_s=0, max_delay_s=0)
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript, line_cursor=0, byte_offset=0
+    )
+
+    async def persist_with_fallback(*args: Any, **kwargs: Any) -> None:
+        if not kwargs["allow_snapshot_fallback"]:
+            raise forwarder._CompactionSnapshotError("Invalid metadata")
+
+    persist = AsyncMock(side_effect=persist_with_fallback)
+    post_item = AsyncMock()
+    with (
+        patch.object(forwarder, "_persist_native_compaction_item", persist),
+        patch.object(forwarder, "_read_transcript_items_for_state", return_value=read_result),
+        patch.object(forwarder, "_post_external_conversation_item", post_item),
+    ):
+        for _ in range(forwarder._COMPACTION_SNAPSHOT_MAX_FAILURES):
+            state = await forwarder._forward_available_items(
+                client=AsyncMock(),
+                session_id="conv_snapshot_followup",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native",
+                state=state,
+                retry_tracker=tracker,
+                dedupe=forwarder._ForwardDedupeState(),
+            )
+        assert state.line_cursor == 2
+        assert summary.source_id in state.seen_source_ids
+        assert followup.source_id in state.seen_source_ids
+        post_item.assert_awaited_once()
+        assert post_item.call_args.kwargs["item"] == followup
+        assert forwarder._read_compaction_state(bridge_dir).persisted_seqs == (1,)
+
+
+@pytest.mark.asyncio
+async def test_persisted_fallback_survives_restart_and_state_mutations(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    await forwarder._mark_compaction_persisted(bridge_dir, 1, expect_completion_ack=True)
+    # The on-disk state, rather than the previous retry tracker, owns dedupe.
+    assert await forwarder._claim_standalone_completion(bridge_dir) is None
+    assert forwarder._read_compaction_state(bridge_dir).persisted_seqs == (1,)
+    persist = _persist_mock()
+    with patch.object(forwarder, "_persist_native_compaction_item", persist):
+        assert await forwarder._handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_snapshot_restart",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=forwarder._PostRetryTracker(),
+        )
+    persist.assert_not_awaited()
+    assert forwarder._read_compaction_state(bridge_dir).persisted_seqs == (1,)
+
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    await forwarder._mark_compaction_persisted(bridge_dir, 2, expect_completion_ack=True)
+    await forwarder._note_transcript_summary_without_token(bridge_dir)
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    assert await forwarder._discard_pending_compaction(bridge_dir, 3)
+    assert await forwarder._claim_standalone_completion(bridge_dir) == 4
+    state = forwarder._read_compaction_state(bridge_dir)
+    assert state.persisted_seqs == (1, 2)
+    assert state.pending is not None
+    assert state.pending.seq == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["transcript", "hook"])
+async def test_failed_items_get_does_not_mark_boundary_delivered(
+    tmp_path: Path, path: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    await forwarder._note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    client = AsyncMock()
+    client.get.side_effect = httpx.ReadError("latest-item response lost")
+    tracker = forwarder._PostRetryTracker(base_delay_s=0, max_delay_s=0)
+    # A response-read failure could be ambiguous for a POST, but this GET
+    # happened before any boundary event could have reached the server.
+    with (
+        patch.object(forwarder, "post_may_have_been_delivered", return_value=True),
+        patch.object(forwarder, "_post_external_compaction_status", AsyncMock()),
+    ):
+        if path == "transcript":
+            assert not await forwarder._handle_compact_summary_item(
+                client,
+                session_id="conv_snapshot_get",
+                bridge_dir=bridge_dir,
+                item=_compact_summary_item(),
+                retry_tracker=tracker,
+            )
+        else:
+            record_hook_event(
+                bridge_dir,
+                {
+                    "hook_event_name": "SessionStart",
+                    "source": "compact",
+                    "session_id": "claude-1",
+                },
+            )
+            hook_state = await forwarder._forward_available_status_events(
+                client=client,
+                session_id="conv_snapshot_get",
+                bridge_dir=bridge_dir,
+                state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+                retry_tracker=tracker,
+                dedupe=forwarder._ForwardDedupeState(),
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+            )
+            assert hook_state.event_cursor == 0
+    state = forwarder._read_compaction_state(bridge_dir)
+    assert state.pending is not None
+    assert state.persisted_seqs == ()
+    client.get.assert_awaited_once()
+    client.post.assert_not_awaited()

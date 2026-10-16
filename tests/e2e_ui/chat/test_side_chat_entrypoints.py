@@ -100,7 +100,7 @@ def test_composer_add_tray_offers_a_side_chat(
     runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
-    """The composer ``+`` tray starts a working chat on the parent's runner."""
+    """The ``+`` tray starts a working side chat whose composer also opens the slash menu."""
     base_url, session_id = seeded_session
     question = f"tray-side-{session_id}: answer in the side chat"
     reply = "The add tray started a side chat."
@@ -119,6 +119,13 @@ def test_composer_add_tray_offers_a_side_chat(
     response = httpx.get(f"{base_url}/v1/sessions/{side_chat_forks[0]}", timeout=10.0)
     response.raise_for_status()
     assert response.json()["runner_id"] == runner_id
+
+    # The live side chat shares the main composer's slash menu; /help is the
+    # built-in offered on every non-native harness, so it proves the menu opened.
+    side_input = page.get_by_test_id("side-chat-input")
+    expect(side_input).to_be_enabled(timeout=30_000)
+    side_input.fill("/")
+    expect(page.get_by_test_id("slash-menu-item-help")).to_be_visible(timeout=10_000)
 
 
 def test_rail_new_tab_menu_offers_a_side_chat(page: Page, seeded_session: tuple[str, str]) -> None:
@@ -299,6 +306,8 @@ def test_ask_in_side_chat_opens_a_quoted_side_chat_tab(
     base_url, session_id = seeded_session
     parent_reply = "Retry the upload with exponential backoff."
     side_reply = "Backoff spreads the retries out so the server can recover."
+    followup_reply = "The same side chat received the follow-up."
+    reply_answer = "Reply quotes also stay in this side chat."
     question = f"quote-side-{session_id}: why backoff?"
     configure_mock_llm(
         mock_llm_server_url,
@@ -308,7 +317,7 @@ def test_ask_in_side_chat_opens_a_quoted_side_chat_tab(
     )
     configure_mock_llm(
         mock_llm_server_url,
-        [{"text": side_reply}],
+        [{"text": side_reply}, {"text": followup_reply}, {"text": reply_answer}],
         key=f"quote-side-{session_id}",
         match=f"quote-side-{session_id}",
     )
@@ -328,6 +337,12 @@ def test_ask_in_side_chat_opens_a_quoted_side_chat_tab(
     assert side_chat_forks == []
 
     page.get_by_test_id("side-chat-input").fill(question)
+    page.locator(_ASSISTANT).get_by_text(parent_reply).select_text()
+    page.get_by_role("button", name="Ask in side chat", exact=True).click()
+    expect(rail.get_by_role("tab", name=re.compile(r"^Side chat "))).to_have_count(1)
+    expect(pane.get_by_test_id("composer-reply-quote")).to_have_count(2)
+    expect(page.get_by_test_id("side-chat-input")).to_have_value(question)
+    assert side_chat_forks == []
     page.get_by_test_id("side-chat-send").click()
     expect(pane.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible(timeout=30_000)
     assert len(side_chat_forks) == 1
@@ -335,6 +350,38 @@ def test_ask_in_side_chat_opens_a_quoted_side_chat_tab(
     assert f"> {parent_reply}" in child_text
     assert question in child_text
     assert question not in str(_items(base_url, session_id))
+
+    page.locator(_ASSISTANT).get_by_text(parent_reply).select_text()
+    page.get_by_role("button", name="Ask in side chat", exact=True).click()
+    expect(rail.get_by_role("tab", name=re.compile(r"^Side chat "))).to_have_count(1)
+    expect(pane.get_by_test_id("composer-reply-quote")).to_contain_text(parent_reply)
+    expect(page.get_by_test_id("side-chat-input")).to_be_focused()
+    assert len(side_chat_forks) == 1
+    followup = question + " explain again"
+    page.get_by_test_id("side-chat-input").fill(followup)
+    page.get_by_test_id("side-chat-send").click()
+    expect(pane.locator(_ASSISTANT).filter(has_text=followup_reply)).to_be_visible(timeout=30_000)
+    assert followup in str(_items(base_url, side_chat_forks[0]))
+    assert followup not in str(_items(base_url, session_id))
+
+    pane.locator(_ASSISTANT).get_by_text(followup_reply, exact=True).select_text()
+    reply_popup = page.get_by_role("button", name="Reply ↵", exact=True)
+    expect(reply_popup).to_be_visible()
+    popup_bounds = reply_popup.bounding_box()
+    viewport = page.viewport_size
+    assert popup_bounds is not None and viewport is not None
+    assert 0 <= popup_bounds["x"] <= viewport["width"] - popup_bounds["width"]
+    assert 0 <= popup_bounds["y"] <= viewport["height"] - popup_bounds["height"]
+    reply_popup.click()
+    expect(pane.get_by_test_id("composer-reply-quote")).to_contain_text(followup_reply)
+    expect(page.get_by_test_id("side-chat-input")).to_be_focused()
+    expect(rail.get_by_role("tab", name=re.compile(r"^Side chat "))).to_have_count(1)
+    reply_question = question + " explain this reply"
+    page.get_by_test_id("side-chat-input").fill(reply_question)
+    page.get_by_test_id("side-chat-send").click()
+    expect(pane.locator(_ASSISTANT).filter(has_text=reply_answer)).to_be_visible(timeout=30_000)
+    assert f"> {followup_reply}" in str(_items(base_url, side_chat_forks[0]))
+    assert reply_question not in str(_items(base_url, session_id))
 
 
 def test_side_chat_opens_in_a_drawer_on_mobile(
@@ -347,6 +394,7 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     base_url, session_id = seeded_session
     parent_reply = "Retry the upload with exponential backoff."
     side_reply = "Backoff spreads the retries out so the server can recover."
+    followup_reply = "The mobile side chat received the quoted reply."
     question = f"mobile-side-{session_id}: why backoff?"
     configure_mock_llm(
         mock_llm_server_url,
@@ -356,7 +404,7 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     )
     configure_mock_llm(
         mock_llm_server_url,
-        [{"text": side_reply}],
+        [{"text": side_reply}, {"text": followup_reply}],
         key=f"mobile-side-{session_id}",
         match=f"mobile-side-{session_id}",
     )
@@ -373,7 +421,27 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     drawer.get_by_test_id("side-chat-input").fill(question)
     drawer.get_by_test_id("side-chat-send").click()
     expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible(timeout=30_000)
+    expect(drawer.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
     assert len(side_chat_forks) == 1
+
+    drawer.locator(_ASSISTANT).get_by_text(side_reply, exact=True).select_text()
+    reply_popup = page.get_by_role("button", name="Reply ↵", exact=True)
+    expect(reply_popup).to_be_visible()
+    popup_bounds = reply_popup.bounding_box()
+    viewport = page.viewport_size
+    assert popup_bounds is not None and viewport is not None
+    assert 0 <= popup_bounds["x"] <= viewport["width"] - popup_bounds["width"]
+    assert 0 <= popup_bounds["y"] <= viewport["height"] - popup_bounds["height"]
+    reply_popup.click()
+    expect(drawer.get_by_test_id("composer-reply-quote")).to_contain_text(side_reply)
+    expect(drawer.get_by_test_id("side-chat-input")).to_be_focused()
+    drawer.get_by_test_id("side-chat-input").fill(question + " explain this reply")
+    drawer.get_by_test_id("side-chat-send").click()
+    expect(drawer.locator(_ASSISTANT).filter(has_text=followup_reply)).to_be_visible(
+        timeout=30_000
+    )
+    assert len(side_chat_forks) == 1
+    assert f"> {side_reply}" in str(_items(base_url, side_chat_forks[0]))
 
     # Closing the drawer keeps the side chat; the header menu brings it back.
     drawer.get_by_role("button", name="Close", exact=True).click()

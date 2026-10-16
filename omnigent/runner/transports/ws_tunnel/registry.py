@@ -90,8 +90,9 @@ class RunnerSession:
         directly.
     :param connected_at: Unix epoch float of connect time.
     :param last_frame_at: Unix epoch float of the most recent frame
-        from this runner. Updated on every receive — feeds the
-        watchdog inactivity check.
+        from this runner, retained for diagnostics.
+    :param last_frame_monotonic: Monotonic timestamp of the last frame,
+        used for watchdog inactivity checks across wall-clock corrections.
     :param owner: Authenticated user who established the tunnel,
         e.g. ``"alice@example.com"``. ``None`` when auth is
         disabled (single-user mode). Used to enforce runner
@@ -104,6 +105,8 @@ class RunnerSession:
     :param close_code: First server-requested close code, recorded under
         the registry lock before helpers can observe retirement.
     :param close_reason: Reason accompanying ``close_code``.
+    :param peer_close_reason: Reason in the runner's own close frame, e.g.
+        ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``; ``None`` until the runner closes.
     :param diagnostics: Timing observations owned by this connection's socket loop.
     """
 
@@ -115,6 +118,7 @@ class RunnerSession:
     connected_at: float
     last_frame_at: float
     owner: str | None
+    last_frame_monotonic: float = field(default_factory=time.monotonic, kw_only=True)
     generation: int = field(default_factory=lambda: next(_connection_generations))
     in_flight: dict[str, RequestState] = field(default_factory=dict)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
@@ -123,6 +127,7 @@ class RunnerSession:
     ws_channels: dict[str, WSChannelState] = field(default_factory=dict)
     close_code: int | None = None
     close_reason: str | None = None
+    peer_close_reason: str | None = None
     diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
 
 
@@ -291,6 +296,7 @@ class TunnelRegistry:
             connected_at=now,
             last_frame_at=now,
             owner=owner,
+            last_frame_monotonic=time.monotonic(),
         )
         with self._lock:
             old = self._sessions.pop(runner_id, None)
@@ -544,6 +550,7 @@ class TunnelRegistry:
             if self._sessions.get(session.runner_id) is not session:
                 return False
             session.last_frame_at = time.time()
+            session.last_frame_monotonic = time.monotonic()
             return True
 
     def seconds_since_last_frame(self, session: RunnerSession) -> float | None:
@@ -556,7 +563,7 @@ class TunnelRegistry:
         with self._lock:
             if self._sessions.get(session.runner_id) is not session:
                 return None
-            return time.time() - session.last_frame_at
+            return time.monotonic() - session.last_frame_monotonic
 
     # ── Per-request lifecycle ────────────────────────────
 
@@ -690,7 +697,7 @@ class TunnelRegistry:
             current = self._sessions.get(runner_id)
             if current is None or (session is not None and current is not session):
                 return False
-            current.last_frame_at = time.time()
+            self.mark_frame_seen(current)
             if not isinstance(frame, (WSFrame, WSCloseFrame)):
                 return False
             channel = current.ws_channels.get(frame.ch_id)
@@ -803,7 +810,7 @@ class TunnelRegistry:
             current = self._sessions.get(runner_id)
             if current is None or (session is not None and current is not session):
                 return False
-            current.last_frame_at = time.time()
+            self.mark_frame_seen(current)
             if not isinstance(frame, ResponseHeadFrame | ResponseBodyFrame | ResponseEndFrame):
                 return False
             req_id = frame.id

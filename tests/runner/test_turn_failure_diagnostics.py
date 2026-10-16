@@ -107,6 +107,7 @@ async def test_failed_turn_log_keeps_source_code_and_harness(
     assert row["event_name"] == "runner_turn_failed"
     attrs = row["attributes"]
     assert attrs["harness"] == "runner-test-default"
+    assert attrs["response_id"] == "resp-test"
     assert {key: value for key, value in attrs.items() if key.startswith("source_")} == expected
     assert "private prompt" not in json.dumps(attrs)
     assert "private failure detail" not in json.dumps(attrs)

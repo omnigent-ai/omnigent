@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,7 @@ import httpx
 import pytest
 
 from omnigent.harnesses.pi_native.main import _SESSION_LABELS, _materialize_pi_agent_spec
+from omnigent.inner._proc import process_alive
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests._helpers.live_server import isolated_local_server, local_server_env, terminate_process
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
@@ -64,7 +66,7 @@ def _parallel_response(workspace: Path) -> str:
 
 @pytest.fixture
 def pi_fork_rig(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> Iterator[tuple[httpx.Client, str, list[dict[str, Any]]]]:
     pi_binary = os.environ.get("OMNIGENT_PI_PATH") or shutil.which("pi")
     for binary in (pi_binary or "pi", "node"):
@@ -83,11 +85,50 @@ def pi_fork_rig(
         anthropic_sse_text_response("FORK-RESUME-OK", model=_MODEL),
     ]
     requests: list[dict[str, Any]] = []
+    auth_failures: list[str] = []
+    command_auth = getattr(request, "param", False)
+    token_file = workspace / "token"
+    mode_file = workspace / "auth-mode"
+    token_file.write_text("mock-key")
+    mode_file.write_text("ok")
+    auth = {"api_key": "mock-key"}
+    if command_auth:
+        helper = workspace / "token-helper.py"
+        helper.write_text(
+            "import json,os,pathlib,sys,time\n"
+            "root = pathlib.Path(__file__).parent\n"
+            "with (root / 'auth-pids.jsonl').open('a') as f:\n"
+            " row = {'helper':os.getpid(),'pi':os.environ.get('OMNIGENT_PI_NATIVE_PID')}\n"
+            " f.write(json.dumps(row) + '\\n')\n"
+            "mode = (root / 'auth-mode').read_text()\n"
+            "if mode == 'slow': time.sleep(40)\n"
+            "if mode == 'failed_exit':\n"
+            " print('PRIVATE-HELPER-ERROR',file=sys.stderr); sys.exit(7)\n"
+            "if mode == 'empty': sys.exit(0)\n"
+            "print((root / 'token').read_text())\n"
+        )
+        # Keep a shell after the helper so cleanup must reach its process group.
+        auth = {
+            "auth_command": shlex.join([sys.executable, str(helper)]) + "; code=$?; exit $code"
+        }
+        replies[2:] = [
+            anthropic_sse_text_response(f"AUTH-RECOVERED-{i}", model=_MODEL) for i in range(3)
+        ]
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             assert self.path.split("?", 1)[0] == "/v1/messages"
-            requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            bearer = self.headers.get("Authorization")
+            api_key = self.headers.get("X-Api-Key")
+            expected = token_file.read_text()
+            if bearer != f"Bearer {expected}" and api_key != expected:
+                auth_failures.append("provider received an unexpected credential")
+                self.send_error(401, "Unexpected test credential")
+                return
+            requests.append(body)
+            if command_auth and len(requests) == 1:
+                token_file.write_text("rotated-during-tools")
             payload = replies.pop(0).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -99,9 +140,21 @@ def pi_fork_rig(
     thread = threading.Thread(target=sidecar.serve_forever, daemon=True)
     thread.start()
     (config / "config.yaml").write_text(
-        "providers:\n  mock-pi:\n    kind: key\n    default: [anthropic]\n"
-        f"    anthropic:\n      base_url: http://127.0.0.1:{sidecar.server_port}\n"
-        f"      api_key: mock-key\n      models:\n        default: {_MODEL}\n"
+        json.dumps(
+            {
+                "providers": {
+                    "mock-pi": {
+                        "kind": "gateway" if command_auth else "key",
+                        "default": ["anthropic"],
+                        "anthropic": {
+                            "base_url": f"http://127.0.0.1:{sidecar.server_port}",
+                            **auth,
+                            "models": {"default": _MODEL},
+                        },
+                    }
+                }
+            }
+        )
     )
     for key in list(os.environ):
         if key.startswith(("OMNIGENT_", "RUNNER_", "PI_", "OPENAI_", "ANTHROPIC_")):
@@ -113,7 +166,7 @@ def pi_fork_rig(
     try:
         with (
             tempfile.TemporaryDirectory(prefix="pi-fork-", dir="/tmp") as short_tmp,
-            isolated_local_server(tmp_path) as base_url,
+            isolated_local_server(tmp_path, env={"OMNIGENT_CONFIG_HOME": str(config)}) as base_url,
             httpx.Client(
                 base_url=base_url,
                 trust_env=False,
@@ -152,6 +205,7 @@ def pi_fork_rig(
         sidecar.shutdown()
         sidecar.server_close()
         thread.join(timeout=5)
+        assert not auth_failures, auth_failures
 
 
 def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
@@ -237,3 +291,101 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
         for session_id in reversed(session_ids):
             with suppress(httpx.HTTPError):
                 client.delete(f"/v1/sessions/{session_id}")
+
+
+@pytest.mark.parametrize("pi_fork_rig", [True], indirect=True, ids=["token-command"])
+def test_pi_native_token_failure_recovers_without_replaying_tools(
+    pi_fork_rig: tuple[httpx.Client, str, list[dict[str, Any]]], tmp_path: Path
+) -> None:
+    """Real server/runner/Pi: refresh, classified failures, cleanup and same-PID recovery."""
+    client, runner_id, requests = pi_fork_rig
+    workspace = tmp_path / "workspace"
+    spec = _materialize_pi_agent_spec(tmp_path)
+    created = post_session_bundle(
+        client.post,
+        "/v1/sessions",
+        bundle_files({spec.name: spec.read_bytes()}),
+        metadata={"labels": dict(_SESSION_LABELS)},
+    )
+    created.raise_for_status()
+    session_id = created.json()["session_id"]
+
+    def items() -> list[dict[str, Any]]:
+        response = client.get(
+            f"/v1/sessions/{session_id}/items", params={"limit": 1000, "order": "asc"}
+        )
+        response.raise_for_status()
+        return response.json()["data"]
+
+    def send(text: str) -> None:
+        response = client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            },
+        )
+        response.raise_for_status()
+        assert response.json()["queued"]
+
+    def native_pids() -> set[str]:
+        return {
+            row["pi"]
+            for line in (workspace / "auth-pids.jsonl").read_text().splitlines()
+            if (row := json.loads(line))["pi"]
+        }
+
+    try:
+        bind_session_runner(client.patch, "", session_id, runner_id)
+        send("Read both files.")
+        _wait(lambda: "PARALLEL-TOOLS-DONE" in json.dumps(items()))
+        assert len(requests) == 2
+        pids = native_pids()
+        assert len(pids) == 1
+        for i, (mode, kind) in enumerate(
+            [
+                ("failed_exit", "failed_exit"),
+                ("empty", "empty"),
+                ("slow", "timeout"),
+            ]
+        ):
+            (workspace / "auth-mode").write_text(mode)
+            before = len(requests)
+            old_errors = {item["id"] for item in items() if item["type"] == "error"}
+            start = time.monotonic()
+            send(f"Check authentication {i}.")
+            error = _wait(
+                lambda old_errors=old_errors: next(
+                    (
+                        item
+                        for item in items()
+                        if item["type"] == "error" and item["id"] not in old_errors
+                    ),
+                    None,
+                )
+            )
+            assert error["code"] == f"pi_auth_{kind}", (
+                error,
+                [json.loads(p.read_text()) for p in tmp_path.rglob("*.result.json")],
+            )
+            assert time.monotonic() - start < 20
+            assert len(requests) == before
+            assert "PRIVATE-HELPER-ERROR" not in json.dumps(items())
+            if mode == "slow":
+                helper = json.loads((workspace / "auth-pids.jsonl").read_text().splitlines()[-1])[
+                    "helper"
+                ]
+                _wait(lambda helper=helper: not process_alive(helper))
+            (workspace / "auth-mode").write_text("ok")
+            send(f"Continue after authentication recovered {i}.")
+            _wait(lambda i=i: f"AUTH-RECOVERED-{i}" in json.dumps(items()))
+            assert len(requests) == before + 1
+            assert native_pids() == pids
+        history = json.dumps(requests[-1]["messages"])
+        for name in ("alpha", "beta"):
+            assert f"{name}-contents" in history
+        calls = [item for item in items() if item["type"] == "function_call"]
+        assert sorted(item["call_id"] for item in calls) == _CALL_IDS
+    finally:
+        with suppress(httpx.HTTPError):
+            client.delete(f"/v1/sessions/{session_id}")

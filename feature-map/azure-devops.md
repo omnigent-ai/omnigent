@@ -7,6 +7,7 @@ CLI sign-in reads the request. The panel identifies Azure requests with `!`.
 ## Sub-features
 
 - `summary`: organization/project/repository, request title, description and status.
+- `comments`: request comments on their own tab, whose label shows the count.
 - `changes`: local file diff and expanded context pinned to displayed revisions.
 - `associations`: link, select and unlink a request from another repository.
 - `partial`: retain loaded results and explain incomplete data or unavailable diffs.
@@ -39,7 +40,8 @@ not contact Azure DevOps or invoke the Azure CLI.
   `tests/e2e_ui/azure_devops/test_azure_devops_tab.py::test_azure_partial_results_keep_loaded_data_and_explain_unavailable_diff`
   and
   `tests/e2e_ui/azure_devops/test_azure_devops_tab.py::test_unsupported_remote_shows_empty_state_without_a_provider_name`
-  check visible explanations without implying an empty successful response.
+  check visible explanations, including the Comments tab's incomplete-list
+  notice, without implying an empty successful response.
 - `canvas`:
   `tests/e2e_ui/azure_devops/test_azure_devops_tab.py::test_azure_canvas_link_uses_provider_identity`
   checks the request's `!` number and exact external URL.

@@ -229,3 +229,23 @@ describe("label-less native sessions (e.g. created before a harness rename)", ()
     expect(shouldShowModelPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
   });
 });
+
+describe("shouldShowEffortPicker for SDK harnesses (declared effort family)", () => {
+  it("opens the picker for a label-less claude-sdk / codex session with a family", () => {
+    // WHY: the SDK executors already honor the session's reasoning_effort;
+    // only the label-only gate kept the control hidden.
+    expect(shouldShowEffortPicker({ labels: {}, harness: "claude-sdk" }, "anthropic")).toBe(true);
+    expect(shouldShowEffortPicker({ labels: {}, harness: "codex" }, "openai")).toBe(true);
+  });
+
+  it("stays closed with no family, a ladder-less family, or on a sub-agent child", () => {
+    expect(shouldShowEffortPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
+    expect(shouldShowEffortPicker({ labels: {}, harness: "openai-agents" }, "none")).toBe(false);
+    expect(
+      shouldShowEffortPicker(
+        { labels: {}, harness: "claude-sdk", parentSessionId: "parent" },
+        "anthropic",
+      ),
+    ).toBe(false);
+  });
+});

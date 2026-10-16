@@ -14,6 +14,177 @@ from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_co
 from omnigent.native.failure_telemetry import FailureContext
 
 
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "current_error",
+        "multiple_error_blocks",
+        "recovered_turn",
+        "failed_item_after_error",
+        "failed_error_item",
+        "later_turn",
+        "different_response",
+        "foreign_session",
+        "subagent_error",
+        "unknown_response",
+        "unmarked_prose",
+        "explicit_hook_detail",
+    ],
+)
+@pytest.mark.asyncio
+async def test_category_only_failure_retains_current_api_error_after_restart(
+    tmp_path: Path, scenario: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    error_text = "Not logged in · Please run /login"
+    records = [
+        {
+            "type": "user",
+            "uuid": "current-user",
+            "sessionId": "native-session",
+            "message": {"role": "user", "content": "Continue"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "current-error",
+            "sessionId": "other-session" if scenario == "foreign_session" else "native-session",
+            "isApiErrorMessage": scenario != "unmarked_prose",
+            "message": {"role": "assistant", "content": error_text},
+        },
+    ]
+    if scenario == "subagent_error":
+        records[1]["agentId"] = "native-child"
+    if scenario == "multiple_error_blocks":
+        records[1]["message"] = {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": error_text},
+                {"type": "text", "text": "The current request failed."},
+            ],
+        }
+    transcript_path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    hook = {
+        "hook_event_name": "StopFailure",
+        "session_id": "native-session",
+        "error": "authentication_failed",
+        "last_assistant_message": "The earlier task succeeded.",
+    }
+    if scenario == "explicit_hook_detail":
+        hook["error_details"] = "API Error: 401 Invalid token"
+    bridge.record_hook_event(bridge_dir, hook)
+    failures = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        event = json.loads(request.content)
+        if event["type"] == "external_session_status":
+            failures.append(event["data"])
+            return httpx.Response(
+                204
+                if scenario in {"failed_item_after_error", "failed_error_item"}
+                else (503 if len(failures) == 1 else 204)
+            )
+        source_id = event["data"]["source_id"]
+        if (scenario == "failed_error_item" and "current-error" in source_id) or (
+            scenario == "failed_item_after_error" and "later-record" in source_id
+        ):
+            return httpx.Response(503)
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        transcript_state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_synthetic",
+            bridge_dir=bridge_dir,
+            agent_name="test-agent",
+            state=forwarder.TranscriptForwardState(transcript_path, 0),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+        if scenario in {"recovered_turn", "failed_item_after_error", "later_turn"}:
+            role = "user" if scenario == "later_turn" else "assistant"
+            with transcript_path.open("a") as transcript:
+                transcript.write(
+                    json.dumps(
+                        {
+                            "type": role,
+                            "uuid": "later-record",
+                            "sessionId": "native-session",
+                            "message": {"role": role, "content": "Later progress"},
+                        }
+                    )
+                    + "\n"
+                )
+            transcript_state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_synthetic",
+                bridge_dir=bridge_dir,
+                agent_name="test-agent",
+                state=transcript_state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
+            )
+        response_id = (
+            None if scenario == "unknown_response" else transcript_state.current_response_id
+        )
+        if scenario == "different_response":
+            response_id = "resp_different_turn"
+        if scenario in {"failed_item_after_error", "failed_error_item"}:
+            persisted = forwarder._read_forward_state(bridge_dir)
+            assert persisted is not None
+            assert persisted.api_error_context == transcript_state.api_error_context
+            assert persisted.line_cursor == transcript_state.line_cursor
+            failed_record = (
+                "later-record" if scenario == "failed_item_after_error" else "current-error"
+            )
+            assert all(failed_record not in source_id for source_id in persisted.seen_source_ids)
+        for _ in range(1 if scenario in {"failed_item_after_error", "failed_error_item"} else 2):
+            # Both retry attempts use fresh in-memory state; evidence must survive on disk.
+            hook_state = await forwarder._forward_available_status_events(
+                client=client,
+                session_id="conv_synthetic",
+                bridge_dir=bridge_dir,
+                state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+                response_id=response_id,
+            )
+
+    assert hook_state.event_cursor == 1
+    assert len(failures) == (
+        1 if scenario in {"failed_item_after_error", "failed_error_item"} else 2
+    )
+    if len(failures) == 2:
+        assert failures[0] == failures[1]
+    failure = failures[-1]
+    context = failure["failure_context"]
+    assert failure["status"] == "failed"
+    assert failure.get("response_id") == response_id
+    assert context["failure_source"] == "claude_hook"
+    assert context["native_error_category"] == "authentication_failed"
+    if scenario in {"current_error", "multiple_error_blocks", "failed_error_item"}:
+        assert failure["failure_detail"].startswith(error_text + "\n\n")
+        assert "omni setup" in failure["failure_detail"]
+        assert context["detail_source"] == "explicit_api_error"
+        assert context["native_api_error_message"] is True
+        assert context["native_error_message"] == error_text
+        assert context["native_record_id"] == "current-error"
+    elif scenario == "explicit_hook_detail":
+        assert failure["failure_detail"] == hook["error_details"]
+        assert context["detail_source"] == "hook_error_details"
+    else:
+        assert failure["failure_detail"] == (
+            "Claude Code ended the turn with an API error (authentication_failed)."
+        )
+        assert context["detail_source"] == "hook_error_category"
+        assert "native_api_error_message" not in context
+
+
 @pytest.mark.asyncio
 async def test_hook_category_and_identity_survive_retry(tmp_path: Path) -> None:
     bridge_dir = tmp_path / "bridge"
@@ -23,6 +194,7 @@ async def test_hook_category_and_identity_survive_retry(tmp_path: Path) -> None:
             "hook_event_name": "StopFailure",
             "session_id": "native-session",
             "error": "server_error",
+            "error_details": "API Error: 500 Overloaded",
             "last_assistant_message": "I am waiting for a background task.",
         },
     )
@@ -59,13 +231,13 @@ async def test_hook_category_and_identity_survive_retry(tmp_path: Path) -> None:
     first, second = [request["data"] for request in requests]
     assert first == second
     assert second["failure_context"]["native_error_category"] == "server_error"
-    assert second["failure_context"]["detail_source"] == "hook_last_assistant_message"
+    assert second["failure_context"]["detail_source"] == "hook_error_details"
     assert second["failure_context"]["failure_id"]
     assert second["failure_context"]["native_hook_recorded_at"] > 0
     assert second["failure_context"]["native_session_id"] == "native-session"
     assert second["failure_context"]["diagnostic_capture_enabled"] is False
     assert second["response_id"] == "resp_synthetic"
-    assert second["failure_detail"] == "I am waiting for a background task."
+    assert second["failure_detail"] == "API Error: 500 Overloaded"
     assert "native_api_error_message" not in second["failure_context"]
 
 
@@ -80,7 +252,7 @@ async def test_hook_telemetry_failure_does_not_block_status(
             "hook_event_name": "StopFailure",
             "session_id": "native-session",
             "error": "server_error",
-            "last_assistant_message": "Generation failed.",
+            "error_details": "Generation failed.",
         },
     )
 
@@ -387,7 +559,7 @@ def test_hook_inference_fields_are_parsed_before_display_truncation(tmp_path: Pa
             "hook_event_name": "StopFailure",
             "session_id": "native-session",
             "error": "invalid_request",
-            "last_assistant_message": error_text,
+            "error_details": error_text,
         },
     )
     (record,) = bridge.read_hook_events_since_with_position(bridge_dir, 0).records

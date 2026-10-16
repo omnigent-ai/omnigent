@@ -13,7 +13,7 @@ import {
   useState,
 } from "react";
 import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
-import { ComposerHarnessTrigger } from "./ComposerControls";
+import { ComposerHarnessTrigger, ComposerMenuTooltip } from "./ComposerControls";
 import {
   COMPOSER_HARNESS_MENU_SIZE,
   HARNESS_MENU_CLASS_NAME,
@@ -30,7 +30,7 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
 type TriggerProps = ComponentProps<typeof ComposerHarnessTrigger> & { "data-testid"?: string };
@@ -181,7 +181,6 @@ export function HarnessPicker({
   onInitialSelectionFocus?: () => void;
   children: ReactNode;
 }) {
-  const guardedTooltip = useMenuGuardedTooltip(open);
   // Programmatic focus can retain :focus-visible during pointer-only interaction.
   const [pointerInteraction, setPointerInteraction] = useState(false);
   const [hasMenuInteraction, setHasMenuInteraction] = useState(false);
@@ -251,26 +250,14 @@ export function HarnessPicker({
         {tooltip == null ? (
           menuTrigger
         ) : (
-          <TooltipProvider>
-            <Tooltip open={guardedTooltip.open} onOpenChange={guardedTooltip.onOpenChange}>
-              <TooltipTrigger asChild>
-                <span className="flex min-w-0" {...guardedTooltip.triggerProps}>
-                  {menuTrigger}
-                </span>
-              </TooltipTrigger>
-              <TooltipContent
-                side="top"
-                className={cn(
-                  "max-w-80 flex-col items-start gap-0.5 px-3 py-2",
-                  tooltipVariant === "session-info" &&
-                    "w-64 max-w-[calc(100vw-2rem)] items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10",
-                )}
-                data-testid={tooltipTestId}
-              >
-                {tooltip}
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+          <ComposerMenuTooltip
+            menuOpen={open}
+            content={tooltip}
+            variant={tooltipVariant}
+            testId={tooltipTestId}
+          >
+            {menuTrigger}
+          </ComposerMenuTooltip>
         )}
         <HarnessPickerContent
           configOpen={configOpen}
@@ -605,32 +592,4 @@ export function HarnessPickerConfigPage({
       <div data-testid={testId}>{children}</div>
     </div>
   );
-}
-
-const MENU_CLOSE_TOOLTIP_GUARD_MS = 600;
-
-function useMenuGuardedTooltip(menuOpen: boolean) {
-  const [wantsOpen, setWantsOpen] = useState(false);
-  // Epoch millis until which open requests are ignored; Infinity while the
-  // menu is open. A ref, not state: it is only read when Radix requests an
-  // open, so changing it never needs a re-render.
-  const suppressedUntil = useRef(0);
-  useEffect(() => {
-    if (menuOpen) {
-      setWantsOpen(false);
-      suppressedUntil.current = Number.POSITIVE_INFINITY;
-    } else if (suppressedUntil.current === Number.POSITIVE_INFINITY) {
-      suppressedUntil.current = Date.now() + MENU_CLOSE_TOOLTIP_GUARD_MS;
-    }
-  }, [menuOpen]);
-  return {
-    open: wantsOpen && !menuOpen,
-    onOpenChange: (next: boolean) =>
-      setWantsOpen(next && !menuOpen && Date.now() >= suppressedUntil.current),
-    triggerProps: {
-      onPointerEnter: () => {
-        if (!menuOpen) suppressedUntil.current = 0;
-      },
-    },
-  } as const;
 }

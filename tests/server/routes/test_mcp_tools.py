@@ -99,7 +99,7 @@ async def test_owner_gets_mcp_tools(
                 _URL, json={**_REQUEST, "source_id": "a" * 64}, headers={"x-test-user": "owner"}
             )
         )
-        frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
+        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
         assert isinstance(frame, HostMcpToolsFrame)
         assert frame.source_id == "a" * 64
         assert (frame.harness, frame.server, frame.plugin) == ("claude", "odd/server", "toolkit")

@@ -19,9 +19,11 @@ from omnigent.debug_logging import record_to_row
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native import native_dispatch
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
+from omnigent.runner._entry import _RunnerDatabricksAuth
 from omnigent.runner.app import (
     _RUNNER_DISPATCHED_FIELD,
     ResolvedSpec,
@@ -138,6 +140,58 @@ async def test_session_labels_for_runner_spawn_empty_200_body_recovers(
 
 
 @pytest.mark.asyncio
+async def test_session_labels_for_runner_spawn_auth_failure_recovers(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A token the runner's auth can't mint returns the fallback, not a failed turn.
+
+    A token factory that raises ``DatabricksAuthError`` (an ``OSError``, not an
+    ``httpx`` error), as a host credential service's does when it has no token,
+    escapes the runner's auth flow. Codex-native turns fetch labels before
+    anything else, so that failed the whole turn ("turn setup failed: Host
+    credential service could not supply workspace credentials").
+
+    :param caplog: Pytest log capture fixture.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)
+    sent: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"labels": {}})
+
+    def _unmintable_token() -> str | None:
+        raise DatabricksAuthError("Host credential service could not supply workspace credentials")
+
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://ap",
+        auth=_RunnerDatabricksAuth(_unmintable_token),
+    ) as client:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            labels = await _session_labels_for_runner_spawn(
+                server_client=client,
+                session_id="5b8e6f0a2c4d4e1f9a7b3c2d1e0f9a8b",
+            )
+
+    assert labels == {}
+    assert sent == []
+    failure_records = [
+        record
+        for record in caplog.records
+        if "Failed to resolve session labels" in record.getMessage()
+    ]
+    assert len(failure_records) == 1
+    assert failure_records[0].levelno == logging.WARNING
+    assert "DatabricksAuthError" in failure_records[0].getMessage()
+
+
+@pytest.mark.asyncio
 async def test_resolve_native_spawn_env_bare_builder_takes_session_id_only() -> None:
     """A bare-shape harness (pi) calls its builder with just the session id."""
     captured: dict[str, Any] = {}
@@ -190,6 +244,50 @@ async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
 
     assert env == {"CODEX_BRIDGE": "bridge_xyz"}
     assert captured == {"session_id": "conv_codex", "bridge_id": "bridge_xyz"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("launched_into_label_dir", [True, False])
+async def test_resolve_native_spawn_env_codex_failed_label_read_keeps_the_launch_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    launched_into_label_dir: bool,
+) -> None:
+    """A Codex spawn whose label read fails reads bridge state where the terminal was launched.
+
+    A rotated session's terminal is launched into its bridge-id label's
+    directory. If the spawn-time label read then fails, the executor must still
+    get that directory, not the session id's; with no launch on this runner it
+    keeps the session id's directory.
+    """
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner.native import orchestration as native_orchestration
+
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    label_dir = codex_bridge.bridge_dir_for_bridge_id("bridge_rotated_from")
+    if launched_into_label_dir:
+        monkeypatch.setitem(native_orchestration._AUTO_CODEX_BRIDGE_DIRS, "conv_codex", label_dir)
+
+    def _labels_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    transport = httpx.MockTransport(_labels_handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        env = await _resolve_native_spawn_env(
+            "codex-native",
+            "conv_codex",
+            server_client=client,
+            optional_labels=None,
+        )
+
+    expected = (
+        label_dir
+        if launched_into_label_dir
+        else codex_bridge.bridge_dir_for_bridge_id("conv_codex")
+    )
+    assert env is not None
+    assert env[codex_bridge.CODEX_NATIVE_BRIDGE_DIR_ENV_VAR] == str(expected)
+    assert env[codex_bridge.CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR] == "conv_codex"
 
 
 @pytest.mark.asyncio
@@ -323,7 +421,27 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
         (
             "kiro-native",
             "_auto_create_kiro_terminal",
-            {"server_client", "ensure_comment_relay"},
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "goose-native",
+            "_auto_create_goose_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "hermes-native",
+            "_auto_create_hermes_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "qwen-native",
+            "_auto_create_qwen_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "devin-native",
+            "_auto_create_devin_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
         ),
         (
             "kimi-native",

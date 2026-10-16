@@ -25,6 +25,7 @@ export function ReplyDraftBlocks({
   onGrowth,
   disabled,
   activeTextId,
+  showTextInputs = true,
 }: {
   quotes: ReplyQuote[];
   keyboard: TextInputProps["keyboard"];
@@ -33,12 +34,13 @@ export function ReplyDraftBlocks({
   onGrowth?: () => void;
   disabled: boolean;
   activeTextId: string | null;
+  showTextInputs?: boolean;
 }) {
   return (
     <div className="flex flex-col gap-1.5 pb-2" data-testid="composer-reply-blocks">
       {quotes.map((quote, index) => (
         <div key={quote.id} className="flex flex-col gap-1.5">
-          {(quote.before !== "" || index > 0 || activeTextId === quote.id) && (
+          {showTextInputs && (quote.before !== "" || index > 0 || activeTextId === quote.id) && (
             <ReplyTextInput
               keyboard={keyboard}
               onGrowth={onGrowth}

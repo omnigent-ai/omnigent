@@ -16,7 +16,9 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.server.app import ServerInfoResponse
 from omnigent.server.feature_flags import Feature, FeatureFlags
+from omnigent.stores.agent_store import AgentStore
 
 pytestmark = pytest.mark.asyncio
 
@@ -90,7 +92,9 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "harness_install": False,
         "canvas": False,
         "arca_shutdown_warnings": False,
-        "harness_settings_ui": True,
+        "import_review": False,
+        "custom_agents_settings_ui": False,
+        "sidebar_grouping_ui": False,
     }
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
@@ -100,10 +104,34 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["installable_harnesses"] == []
     # Gates the web's archive worktree prompt; older servers omit it.
     assert data["archive_worktree_cleanup"] is True
+    assert data["agent_detail"] is True
+    assert data["agent_config_edit"] is True
     # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.
     assert data["single_user"] is True
+
+    # Older servers omit capabilities they do not support.
+    del data["agent_detail"]
+    assert ServerInfoResponse.model_validate(data).agent_detail is False
+    del data["agent_config_edit"]
+    assert ServerInfoResponse.model_validate(data).agent_config_edit is False
+
+
+async def test_info_disables_config_edit_for_unsupported_store(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stores inheriting the default capability cannot advertise configuration edits."""
+    monkeypatch.setattr(
+        type(app.state.agent_store), "supports_config_edit", AgentStore.supports_config_edit
+    )
+
+    response = await client.get("/v1/info")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["agent_config_edit"] is False
 
 
 async def test_info_single_user_false_without_marker(

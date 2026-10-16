@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TypeAlias
 
 import yaml
+
+_log = logging.getLogger(__name__)
+_cwd_missing_warned = False
 
 _Config: TypeAlias = dict[str, object]
 
@@ -35,7 +39,18 @@ def load_global_config(path: Path | None = None) -> _Config:
 
 def load_local_config(path: Path | None = None) -> _Config:
     """Load the project-level config, returning an empty mapping when absent."""
-    resolved_path = path or Path.cwd() / _LOCAL_CONFIG_RELPATH
+    global _cwd_missing_warned
+    if path is None:
+        try:
+            resolved_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
+        except OSError:
+            # A runner can outlive its working directory; no local config to load.
+            if not _cwd_missing_warned:
+                _cwd_missing_warned = True
+                _log.warning("load_local_config: cwd no longer exists; skipping project config")
+            return {}
+    else:
+        resolved_path = path
     if not resolved_path.exists():
         return {}
     with resolved_path.open() as config_file:

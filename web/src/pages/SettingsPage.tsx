@@ -75,6 +75,7 @@ import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
+import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
 import { IconSegmentedControl } from "@/components/theme/IconSegmentedControl";
@@ -261,6 +262,7 @@ import {
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
+import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -294,7 +296,7 @@ export function SettingsPage() {
   useOmnigentPageView(`settings.${section}`);
 
   const pageWrapperSettings = useMemo(() => {
-    if (section === "harnesses") {
+    if (section === "harnesses" || section === "custom-agents") {
       return {
         maxWidthClassName: "max-w-4xl",
         contentClassName: "px-4 md:px-8",
@@ -336,8 +338,22 @@ export function SettingsPage() {
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
       {section === "harnesses" && <SettingsHarnessesSection />}
+      {section === "custom-agents" && <SettingsCustomAgentsSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
+      {section === "mcp" && (
+        <Section title="MCP">
+          {info !== "loading" && info.enabled_connections?.includes("mcp") ? (
+            <McpRegistryConnections />
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              {info === "loading"
+                ? "Loading MCP services…"
+                : "MCP services are not configured on this server."}
+            </p>
+          )}
+        </Section>
+      )}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
@@ -813,6 +829,8 @@ function AppearanceSection() {
   // replace it with a note (plus a link to the host's own theme settings when
   // one is provided). The color palette, terminal theme, and font controls are
   // per-device prefs that don't conflict with host light/dark, so they stay.
+  // The link opens a new tab: in place, it would replace the app with the
+  // host page, and desktop windows have no Back control.
   const isEmbedded = useIsEmbedded();
   const themeSettingsUrl = getOmnigentThemeSettingsUrl();
   const { setTheme } = useTheme();
@@ -934,6 +952,8 @@ function AppearanceSection() {
                           {" "}
                           <a
                             href={themeSettingsUrl}
+                            target="_blank"
+                            rel="noreferrer"
                             className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
                           >
                             Click to open Databricks user preferences page.
@@ -947,6 +967,8 @@ function AppearanceSection() {
                 {themeSettingsUrl && (
                   <a
                     href={themeSettingsUrl}
+                    target="_blank"
+                    rel="noreferrer"
                     className="text-sm font-medium text-primary underline underline-offset-2 md:hidden"
                   >
                     Open Databricks preferences
@@ -1133,7 +1155,6 @@ function GithubMark({ className }: { className?: string }) {
 }
 
 /**
-/**
  * Which panel connects/disconnects each provider. The server's
  * ``enabled_connections`` list says WHICH panels to show; this map says HOW to
  * render each. Adding a provider is one entry here plus one string server-side.
@@ -1146,7 +1167,7 @@ const CONNECTION_PANELS: Record<string, ComponentType> = {
 /**
  * Sandbox Integrations settings. Renders one connect/disconnect panel per
  * provider the server reports in ``enabled_connections``, in that order. The
- * nav hides the section entirely when the list is empty.
+ * MCP accounts have their own page; the nav hides this section without other providers.
  */
 function IntegrationsSection() {
   const info = useServerInfo();

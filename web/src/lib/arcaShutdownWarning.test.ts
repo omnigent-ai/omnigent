@@ -6,11 +6,9 @@ import {
   isArcaWarningStorageKey,
   isDismissedToday,
   isWarnedToday,
-  isOptedOut,
   isWarningWindow,
   markWarnedToday,
   offersWorkweek,
-  optOut,
   resetArcaWarningStorageForTests,
 } from "./arcaShutdownWarning";
 
@@ -30,6 +28,7 @@ describe("Arca shutdown rules", () => {
     expect(isArcaWarningStorageKey("omnigent:arca-shutdown:warned")).toBe(true);
     expect(isArcaWarningStorageKey("omnigent:arca-host-id")).toBe(true);
     expect(isArcaWarningStorageKey("unrelated-setting")).toBe(false);
+    expect(isArcaWarningStorageKey("omnigent:arca-shutdown:opted-out")).toBe(false);
   });
 
   it("warns at 17:00 on weekdays through late evening, but not on weekends", () => {
@@ -65,8 +64,6 @@ describe("Arca shutdown rules", () => {
     expect(isWarnedToday(monday)).toBe(true);
     expect(isDismissedToday(tuesday)).toBe(false);
     expect(isWarnedToday(tuesday)).toBe(false);
-    optOut();
-    expect(isOptedOut()).toBe(true);
   });
 
   it("keeps choices in this tab when localStorage is unavailable", () => {
@@ -78,10 +75,8 @@ describe("Arca shutdown rules", () => {
     });
     dismissToday(MON_5PM);
     markWarnedToday(MON_5PM);
-    optOut();
     expect(isDismissedToday(MON_5PM)).toBe(true);
     expect(isWarnedToday(MON_5PM)).toBe(true);
-    expect(isOptedOut()).toBe(true);
   });
 
   it("prefers an in-memory write over an older stored day", () => {

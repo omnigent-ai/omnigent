@@ -54,6 +54,11 @@ jobs:
             .github/scripts/security-scan
             .github/scripts/merge-ready
             .github/security
+            .github/scripts/maintainer_approval.py
+            .github/scripts/dependabot_automerge.py
+            .github/scripts/dependabot_policy.py
+            .github/dependabot-automerge.json
+          sparse-checkout-cone-mode: false
           persist-credentials: false
 
       - name: Load maintainers
@@ -97,6 +102,29 @@ jobs:
           gh pr diff "$PR" --repo "$REPO" --name-only > "$GITHUB_WORKSPACE/changed.txt"
           echo "Changed files:"; cat "$GITHUB_WORKSPACE/changed.txt"
 
+      - name: Install trusted policy parser
+        if: >-
+          github.event.pull_request.user.login == 'dependabot[bot]'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dependabot-policy-env"
+          "$RUNNER_TEMP/dependabot-policy-env/bin/pip" install --disable-pip-version-check --only-binary=:all: PyYAML==6.0.3
+          echo "$RUNNER_TEMP/dependabot-policy-env/bin" >> "$GITHUB_PATH"
+
+      - name: Validate Dependabot action pins for CI
+        id: dependabot
+        if: >-
+          steps.gate.outputs.scan == 'true' &&
+          github.event.pull_request.user.login == 'dependabot[bot]'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          python3 .github/scripts/dependabot_automerge.py
+          --repository "$REPO" --pr-number "$PR" --expected-head "$HEAD_SHA"
+          --check-action-pins
+
       - name: Secret scan (added lines)
         if: ${{ steps.gate.outputs.scan == 'true' }}
         env:
@@ -113,6 +141,7 @@ jobs:
         if: ${{ steps.gate.outputs.scan == 'true' }}
         env:
           CHANGED_FILES: ${{ github.workspace }}/changed.txt
+          DEPENDABOT_WORKFLOW_PINS: ${{ steps.dependabot.outputs.workflow_pins }}
         run: bash .github/scripts/security-scan/sensitive-paths.sh
 
       - name: Check out PR head for static analysis
@@ -140,9 +169,20 @@ jobs:
         # and CVE-flagged versions. Only fires when uv.lock is in the changeset
         # to avoid blocking PRs when main's baseline lockfile already has open
         # advisories on main.
+        # Dependabot advisories are reviewed from Trivy after CI. Unchanged
+        # baseline findings must not prevent compatibility tests from running.
         if: ${{ steps.gate.outputs.scan == 'true' }}
+        env:
+          DEPENDABOT_PR: >-
+            ${{ github.event.pull_request.user.login == 'dependabot[bot]' &&
+                github.event.pull_request.user.type == 'Bot' &&
+                github.event.pull_request.head.repo.full_name == github.repository }}
         working-directory: pr
         run: |
+          if [ "$DEPENDABOT_PR" = "true" ]; then
+            echo "Dependabot update; Trivy findings are checked by the merge worker or a maintainer."
+            exit 0
+          fi
           if ! grep -qxF 'uv.lock' "$GITHUB_WORKSPACE/changed.txt"; then
             echo "uv.lock not changed; skipping OSV scan."
             exit 0
