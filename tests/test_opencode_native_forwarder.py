@@ -1081,16 +1081,17 @@ async def test_run_awaits_cancelled_question_tasks() -> None:
     assert fwd._question_tasks == {}
 
 
-async def test_question_asked_no_valid_options_rejects_without_hook() -> None:
-    """A question with no renderable options → reject_question, no card parked."""
+async def test_question_asked_missing_label_option_rejects_without_hook() -> None:
+    """An option without a string label → reject_question, no card parked."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
     await fwd.handle_event(
         _event(
             "question.asked",
             id="que_1",
-            # Options present but none carry a usable string label.
-            questions=[{"question": "Q?", "options": [{}, {"label": ""}]}],
+            # ``label`` is required by opencode's schema; a missing one means a
+            # shape this forwarder doesn't understand, unlike a blank string.
+            questions=[{"question": "Q?", "options": [{}]}],
         )
     )
     task = fwd._question_tasks["que_1"]
@@ -1121,7 +1122,7 @@ async def test_question_asked_mixed_valid_and_malformed_rejects_whole_request() 
             id="que_1",
             questions=[
                 {"question": "Valid?", "options": [{"label": "Yes"}]},
-                {"question": "Malformed", "options": [{"label": ""}]},
+                {"question": "Malformed", "options": "not-a-list"},
             ],
         )
     )
@@ -1130,6 +1131,114 @@ async def test_question_asked_mixed_valid_and_malformed_rejects_whole_request() 
     assert opencode.question_rejects == ["que_1"]
     assert opencode.question_replies == []
     assert _hook_post(server) is None
+
+
+async def test_question_asked_blank_label_option_parks_card_with_derived_label() -> None:
+    """A blank-label option derives its display label from the description.
+
+    opencode's terminal renders such an option via its description, so the chat
+    card must mirror it instead of silently rejecting the whole question (the
+    session otherwise looks stalled with the prompt visible only in the
+    terminal). Answering with the derived label replies with the ORIGINAL
+    (blank) label, indistinguishable from a terminal answer.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"0": "unnamed option"}}
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "question.asked",
+            id="que_1",
+            questions=[
+                {
+                    "question": "Which color?",
+                    "options": [
+                        {"label": "", "description": "unnamed option"},
+                        {"label": "Blue", "description": "the color blue"},
+                    ],
+                }
+            ],
+        )
+    )
+    task = fwd._question_tasks["que_1"]
+    await task
+    hook = _hook_post(server)
+    assert hook is not None
+    assert hook["ask_user_question"]["questions"][0]["options"] == [
+        {"label": "unnamed option"},
+        {"label": "Blue"},
+    ]
+    assert opencode.question_replies == [("que_1", [[""]])]
+    assert opencode.question_rejects == []
+
+
+async def test_question_asked_all_blank_labels_use_positional_labels() -> None:
+    """Blank labels without descriptions fall back to positional display labels."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"0": "Option 2"}}
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "question.asked",
+            id="que_1",
+            questions=[{"question": "Pick one", "options": [{"label": ""}, {"label": ""}]}],
+        )
+    )
+    task = fwd._question_tasks["que_1"]
+    await task
+    options = _hook_post(server)["ask_user_question"]["questions"][0]["options"]
+    assert options == [{"label": "Option 1"}, {"label": "Option 2"}]
+    assert opencode.question_replies == [("que_1", [[""]])]
+
+
+async def test_question_asked_derived_label_collision_gets_suffix() -> None:
+    """A derived label colliding with a real label is suffixed, and maps back."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {"action": "accept", "content": {"0": "Red (2)"}}
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "question.asked",
+            id="que_1",
+            questions=[
+                {
+                    "question": "Which?",
+                    "options": [{"label": "Red"}, {"label": "", "description": "Red"}],
+                }
+            ],
+        )
+    )
+    task = fwd._question_tasks["que_1"]
+    await task
+    options = _hook_post(server)["ask_user_question"]["questions"][0]["options"]
+    assert options == [{"label": "Red"}, {"label": "Red (2)"}]
+    assert opencode.question_replies == [("que_1", [[""]])]
+
+
+async def test_question_asked_multi_select_maps_derived_and_passes_custom_text() -> None:
+    """Multi-select answers map derived labels back; custom text passes through."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    server.hook_response = {
+        "action": "accept",
+        "content": {"0": ["unnamed option", "typed by hand"]},
+    }
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "question.asked",
+            id="que_1",
+            questions=[
+                {
+                    "question": "Pick any",
+                    "multiple": True,
+                    "options": [{"label": "", "description": "unnamed option"}, {"label": "Blue"}],
+                }
+            ],
+        )
+    )
+    task = fwd._question_tasks["que_1"]
+    await task
+    assert opencode.question_replies == [("que_1", [["", "typed by hand"]])]
 
 
 async def test_question_asked_dedupes_concurrent_same_request() -> None:
