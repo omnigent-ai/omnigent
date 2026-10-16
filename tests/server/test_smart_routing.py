@@ -2118,7 +2118,7 @@ def test_build_route_options_sends_canonical_harness_names() -> None:
 
 def test_injected_menu_arms_carry_canonical_harness_names() -> None:
     """Arms the task_v1 menu injects are tagged codex/claude, not native ids."""
-    source = TaskV1RouteOptionSource()
+    source = TaskV1RouteOptionSource(router_name="task_v1")
     options = source.build_route_options(["codex-native"], {"codex-native": ["system.ai.glm-5-3"]})
     assert len(options) > 1, "the codex scenario menu should inject arms"
     assert {o.harness for o in options} == {"codex"}
@@ -2204,7 +2204,9 @@ def test_resolve_selection_never_leaves_the_offered_harnesses() -> None:
 def _substitute(arm: str, models: Sequence[str], harness: str = "codex") -> str:
     from omnigent.server.smart_routing import RoutePick, TaskV1RouteOptionSource
 
-    source = TaskV1RouteOptionSource(model_prefixes=["databricks-", "system.ai."])
+    source = TaskV1RouteOptionSource(
+        router_name="task_v1", model_prefixes=["databricks-", "system.ai."]
+    )
     resolved = source.resolve_selection(RoutePick(model=arm), [harness], {harness: list(models)})
     assert resolved is not None, f"{arm} resolved to nothing"
     assert resolved.raw_model == arm
@@ -2389,10 +2391,13 @@ def test_a_configured_menu_applies_to_a_router_other_than_task_v1() -> None:
     assert [o.model for o in options] == ["gpt-5-4", "acme-large"]
 
 
-def test_an_unconfigured_menu_stays_off_for_a_router_other_than_task_v1() -> None:
+@pytest.mark.parametrize("router_name", [None, "task_v3", "task_v9"])
+def test_catalog_only_routers_do_not_inherit_the_legacy_menu(router_name: str | None) -> None:
     from omnigent.server.smart_routing import RoutingSettings, route_option_source
 
-    settings = RoutingSettings(router_name="task_v9")
+    settings = (
+        RoutingSettings() if router_name is None else RoutingSettings(router_name=router_name)
+    )
     options = route_option_source(settings).build_route_options(
         ["codex"], {"codex": ["databricks-gpt-5-4"]}
     )
@@ -2533,11 +2538,14 @@ _PREFIXES_DEFAULT = "<MODEL_ID_PREFIXES>"
         (
             None,
             {
-                "router_name": "task_v1",
+                "router_name": "task_v3",
                 "selection_model": None,
                 "model_prefixes": _PREFIXES_DEFAULT,
             },
         ),
+        ({}, {"router_name": "task_v3"}),
+        ({"router_name": "  "}, {"router_name": "task_v3"}),
+        ({"router_name": " task_v1 "}, {"router_name": "task_v1"}),
         # Every key set: each one is read.
         (
             {
@@ -2881,7 +2889,7 @@ _DOTTED_CODEX_CATALOG: list[str] = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.5", "g
 def test_dot_spelled_picker_rows_match_the_router_arms(arm: str, expected: str) -> None:
     from omnigent.server.smart_routing import RoutePick, TaskV1RouteOptionSource
 
-    source = TaskV1RouteOptionSource()
+    source = TaskV1RouteOptionSource(router_name="task_v1")
     resolved = source.resolve_selection(
         RoutePick(model=arm), ["codex"], {"codex": list(_DOTTED_CODEX_CATALOG)}
     )
@@ -2891,7 +2899,7 @@ def test_dot_spelled_picker_rows_match_the_router_arms(arm: str, expected: str) 
 def test_dot_spelled_rows_are_not_offered_twice() -> None:
     from omnigent.server.smart_routing import TaskV1RouteOptionSource
 
-    source = TaskV1RouteOptionSource()
+    source = TaskV1RouteOptionSource(router_name="task_v1")
     options = source.build_route_options(["codex"], {"codex": list(_DOTTED_CODEX_CATALOG)})
     models = [option.model for option in options]
     assert len(models) == len(set(models))

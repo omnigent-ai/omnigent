@@ -781,7 +781,7 @@ def router_permanently_disabled(status_code: int, body: str) -> bool:
 # expects to be offered, how a pick maps back to a servable catalog id, and
 # which harness can run it. Callers never see router vocabulary.
 
-DEFAULT_ROUTER_NAME = "task_v1"
+DEFAULT_ROUTER_NAME = "task_v3"
 
 # Catalog ids carry these prefixes; the router keys ids bare. A deployment with
 # different ones sets ``routing.model_prefix``. Kept in sync with
@@ -881,7 +881,7 @@ def scenario_menus(
     """
     if menus is not None:
         return menus
-    if router_name is not None and router_name != DEFAULT_ROUTER_NAME:
+    if router_name is not None and router_name != "task_v1":
         return _NO_MENUS
     return TASK_V1_MENUS
 
@@ -954,7 +954,8 @@ class RoutingSettings:
     it instead of forking this module; ``None`` on any of them keeps the
     module-level constant, which stays the single definition of the default.
 
-    :param router_name: Router strategy to invoke, e.g. ``"task_v1"``.
+    :param router_name: Router strategy to invoke. Defaults to ``"task_v3"``,
+        matching Unity Gateway; an explicit name keeps that strategy.
     :param selection_model: Model the router should use for its own
         extraction call, sent as ``route_selector.config.model``. ``None``
         leaves the router's frozen default in place.
@@ -1352,11 +1353,10 @@ def _redirect_incompatible_pick(
 
 
 class TaskV1RouteOptionSource:
-    """Route-options source for the ``task_v1`` generation of the router.
+    """Catalog-backed route options with support for legacy ``task_v1`` menus.
 
-    Offers the scenario menu the router demands (injecting arms the workspace
-    has no endpoint for), ignores the echoed harness tag — passthrough and
-    untrusted — and maps a pick back to a servable catalog id.
+    Offers the catalog plus any required scenario menu, maps harness names to
+    the router's vocabulary, and resolves a pick back to a servable catalog id.
     """
 
     def __init__(
@@ -1630,7 +1630,7 @@ def route_option_source(
 class ExternalRoutingClient:
     """Routing client backed by an external ``routes:select`` service.
 
-    Calls an external routing service (the Databricks AI-Gateway ``task_v1``
+    Calls an external routing service (the Databricks AI-Gateway ``task_v3``
     router, or any endpoint speaking the ``omnigent.api.routing.v1`` proto)
     instead of running a local judge. The candidate models come from
     ``available_models`` (the same live catalog the built-in judge sees),
@@ -1659,7 +1659,7 @@ class ExternalRoutingClient:
         :param base_url: Routing service base, e.g.
             ``"https://host/ai-gateway/routing/v1"``.
             ``/routes:select`` is appended.
-        :param router_name: Router strategy name, e.g. ``"task_v1"``.
+        :param router_name: Router strategy name, e.g. ``"task_v3"``.
         :param auth: Optional static httpx auth (e.g. a bearer built from an
             explicit ``api_key``). ``None`` for an unauthenticated endpoint or
             when *databricks_profile* supplies per-call OAuth instead.
