@@ -119,6 +119,37 @@ def test_classify_codex_error_budget_exhausted_not_auth() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        "0000a401-0000-4000-8000-000000000000",
+        "00000000-4030-4000-8000-000000000000",
+        "00000000-0000-4000-8000-0000000c4013",
+    ],
+)
+def test_classify_codex_error_rate_limit_request_id_not_auth(request_id: str) -> None:
+    """A 429 whose request id happens to contain "401"/"403" is not auth.
+
+    The message fallback must match the status only as a standalone token,
+    and an explicit rate limit never asks the user to sign in again.
+    """
+    message = f"exceeded retry limit, last status: 429 Too Many Requests, request id: {request_id}"
+    assert fwd._classify_codex_error({}, message) == fwd._CODEX_ERROR_KIND_GENERIC
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "unexpected status 401 Unauthorized: token expired",
+        "unexpected status 403 Forbidden: missing scope",
+        "stream error: status 401, request id: 00000000-0000-4000-8000-000000000000",
+    ],
+)
+def test_classify_codex_error_standalone_auth_status_is_auth(message: str) -> None:
+    """A real 401/403 status in the message still classifies as auth."""
+    assert fwd._classify_codex_error({}, message) == fwd._CODEX_ERROR_KIND_AUTH
+
+
 def test_terminal_error_from_turn_reads_and_classifies_turn_error() -> None:
     """``_terminal_error_from_turn`` returns the classified ``turn.error``.
 
