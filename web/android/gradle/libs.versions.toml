@@ -10,7 +10,7 @@ androidxBrowser = "1.9.0"
 # AppCompat 1.8.x is currently in preview; stick with the latest stable 1.7.x.
 androidxAppcompat = "1.7.1"
 junit = "4.13.2"
-robolectric = "4.16.1"
+robolectric = "4.17"
 androidxTestCore = "1.7.0"
 androidxTestRunner = "1.7.0"
 androidxTestRules = "1.7.0"
