@@ -163,7 +163,7 @@ class MainActivityTest {
     }
 
     @Test
-    fun `workspace with missing OAuth configuration fails closed before WebView load`() {
+    fun `workspace without WebView profile support fails closed before WebView load`() {
         val workspace = "https://dbc-123.cloud.databricks.com/omnigent?o=42"
         ServerStore(ApplicationProvider.getApplicationContext()).connect(workspace)
 
@@ -173,7 +173,9 @@ class MainActivityTest {
         val setup = shadowOf(activity).nextStartedActivity
         assertEquals(ConnectActivity::class.java.name, setup.component!!.className)
         assertEquals(workspace, setup.getStringExtra(ConnectActivity.EXTRA_SERVER_URL))
-        assertTrue(setup.getStringExtra(ConnectActivity.EXTRA_ERROR)!!.contains("client ID"))
+        // Robolectric's WebView has no multi-profile support for workspace cookies.
+        val error = setup.getStringExtra(ConnectActivity.EXTRA_ERROR)!!
+        assertTrue(error.contains("Update Android System WebView"))
     }
 
     @Test
