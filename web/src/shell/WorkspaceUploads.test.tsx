@@ -529,7 +529,10 @@ it.each(["space", "header", "empty tree", "Changes"])(
             : (document.querySelector("[data-upload-tree]") as HTMLElement);
     const directory = usesPanel ? "" : "src";
     const transfer = { types: ["Files"], files: [new File(["bytes"], "root.txt")] };
-    if (surface === "header") expect(screen.getByRole("status")).toBeEmptyDOMElement();
+    if (surface === "header") {
+      expect(screen.getAllByRole("status")).toHaveLength(2);
+      expect(screen.getAllByRole("status")[1]).toBeEmptyDOMElement();
+    }
     fireEvent.dragOver(target, { dataTransfer: transfer });
     expect(screen.getByText("Upload to workspace")).toBeVisible();
     expect(
@@ -580,13 +583,16 @@ function tree(props: Partial<Parameters<typeof FolderTree>[0]> = {}) {
 it("keeps one empty live region mounted and announces each tree drop destination", async () => {
   view("", tree({ browseLocation: "" }));
   await screen.findByRole("button", { name: "Upload files" });
-  const liveRegion = screen.getByRole("status");
+  const regions = screen.getAllByRole("status");
+  expect(regions).toHaveLength(2);
+  const [liveRegion, rootRegion] = regions;
+  expect(rootRegion).toBeEmptyDOMElement();
   expect(liveRegion).toHaveAttribute("aria-live", "polite");
   expect(liveRegion).toBeEmptyDOMElement();
   const transfer = { types: ["Files"], files: [new File(["bytes"], "new.txt")] };
 
   fireEvent.dragOver(screen.getByText("assets/"), { dataTransfer: transfer });
-  expect(screen.getByRole("status")).toBe(liveRegion);
+  expect(screen.getAllByRole("status")).toContain(liveRegion);
   expect(liveRegion).toHaveTextContent("Upload to assets");
   fireEvent.dragOver(screen.getByText("existing.txt"), { dataTransfer: transfer });
   expect(liveRegion).toHaveTextContent("Upload to assets");
@@ -597,7 +603,7 @@ it("keeps one empty live region mounted and announces each tree drop destination
   });
   expect(liveRegion).toHaveTextContent("Upload to workspace root");
   fireEvent.dragEnd(screen.getByText("other/"), { dataTransfer: transfer });
-  expect(screen.getByRole("status")).toBe(liveRegion);
+  expect(screen.getAllByRole("status")).toContain(liveRegion);
   expect(liveRegion).toBeEmptyDOMElement();
 
   fireEvent.dragOver(screen.getByText("assets/"), { dataTransfer: transfer });
@@ -609,6 +615,13 @@ it("keeps one empty live region mounted and announces each tree drop destination
   fireEvent.dragOver(screen.getByText("other/"), { dataTransfer: transfer });
   fireEvent.dragEnd(document, { dataTransfer: transfer });
   expect(liveRegion).toBeEmptyDOMElement();
+
+  fireEvent.dragOver(screen.getByTestId("files-content"), { dataTransfer: transfer });
+  expect(screen.getAllByRole("status")).toContain(rootRegion);
+  expect(rootRegion).toHaveTextContent("Upload to demo");
+  expect(liveRegion).toBeEmptyDOMElement();
+  fireEvent.dragEnd(document, { dataTransfer: transfer });
+  expect(rootRegion).toBeEmptyDOMElement();
 });
 
 it("swaps the folder icon and tints its row, then freezes the DROP row despite stale hover", async () => {
@@ -624,7 +637,7 @@ it("swaps the folder icon and tints its row, then freezes the DROP row despite s
   expect(folder.querySelector("svg.lucide-folder, svg.lucide-folder-open")).toBeNull();
   expect(assets).toHaveClass("text-foreground");
   expect(folder).not.toHaveClass("ring-2");
-  expect(screen.getByRole("status")).toHaveTextContent("Upload to src/assets");
+  expect(screen.getByText("Upload to src/assets", { selector: '[role="status"]' })).toBeVisible();
   expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(0);
   expect(screen.queryByText("Upload to workspace")).toBeNull();
   fireEvent.drop(screen.getByText("other/"), { dataTransfer: transfer });
@@ -657,7 +670,7 @@ it("shows the dashed root zone while a root-level file row is the drop target", 
   fireEvent.dragOver(screen.getByText("top.txt"), { dataTransfer: transfer });
   expect(screen.getByText("Upload to workspace")).toBeVisible();
   expect(screen.getByText("to src")).toBeVisible();
-  expect(screen.getByRole("status")).toHaveTextContent("Upload to src");
+  expect(screen.getByText("Upload to src", { selector: '[role="status"]' })).toBeVisible();
   const rootCue = document.querySelector('[data-drop-variant="upload"]') as HTMLElement;
   expect(rootCue).toHaveClass("pointer-events-none", "border-dashed", "bg-transparent");
   expect(rootCue).not.toHaveClass("bg-background/90");
@@ -860,7 +873,7 @@ it("does not commit the expanded tree again for same-row dragover", async () => 
   const row = screen.getByText("dir0/");
   const transfer = { types: ["Files"] };
   fireEvent.dragOver(row, { dataTransfer: transfer });
-  expect(screen.getByRole("status")).toHaveTextContent("Upload to src/dir0");
+  expect(screen.getByText("Upload to src/dir0", { selector: '[role="status"]' })).toBeVisible();
   const before = commits.mock.calls.length;
   for (let index = 0; index < 25; index++) fireEvent.dragOver(row, { dataTransfer: transfer });
   expect(commits).toHaveBeenCalledTimes(before);
@@ -893,7 +906,7 @@ it("names an offscreen parent folder in the dashed fallback zone", async () => {
   });
   expect(screen.getByText("Upload to workspace")).toBeVisible();
   expect(screen.getByText("to src/assets")).toBeVisible();
-  expect(screen.getByRole("status")).toHaveTextContent("Upload to src/assets");
+  expect(screen.getByText("Upload to src/assets", { selector: '[role="status"]' })).toBeVisible();
   expect(document.querySelectorAll('[data-drop-variant="upload"]')).toHaveLength(1);
 });
 
@@ -1015,7 +1028,7 @@ it.each([500, 502, 504, 429, 503, "transport", "generic JSON"])(
     expect(document.querySelector("[data-upload-drop-root]")).toBeTruthy();
     expect(fireEvent.dragOver(row, { dataTransfer: transfer })).toBe(false);
     expect(document.querySelector("[data-upload-hover]")).toBeTruthy();
-    expect(screen.getByRole("status")).toHaveTextContent("Upload to src/assets");
+    expect(screen.getByText("Upload to src/assets", { selector: '[role="status"]' })).toBeVisible();
     expect(fireEvent.drop(row, { dataTransfer: transfer })).toBe(false);
     expect(enqueueUploads).toHaveBeenCalledExactlyOnceWith(
       expect.anything(),
