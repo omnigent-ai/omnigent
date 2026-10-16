@@ -38,6 +38,9 @@ from tests.server.helpers import websocket_scope as _websocket_scope
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "33296f9b15e02671c34e013dd711407e"
+# Binding persistence can exceed two seconds under parallel CI load.
+# A receive timeout cancels the ASGI app and disconnects the fake host.
+_LAUNCH_FRAME_TIMEOUT_S = 10.0
 
 
 def _make_hello(
@@ -566,7 +569,7 @@ async def test_launch_runner_happy_path(
         from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
 
         for _ in range(20):
-            output = await comm.receive_output(timeout=budget(2.0))
+            output = await comm.receive_output(timeout=budget(_LAUNCH_FRAME_TIMEOUT_S))
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -690,7 +693,7 @@ async def test_launch_runner_categorical_failure_returns_specific_status(
         from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
 
         for _ in range(20):
-            output = await comm.receive_output(timeout=budget(2.0))
+            output = await comm.receive_output(timeout=budget(_LAUNCH_FRAME_TIMEOUT_S))
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
