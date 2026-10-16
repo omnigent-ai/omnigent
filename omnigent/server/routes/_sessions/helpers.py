@@ -86,7 +86,7 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
-from omnigent.process_logging import redact_log_text
+from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
@@ -4888,10 +4888,11 @@ def _log_external_error_item(session_id: str, item: ConversationItem) -> None:
     if data.code in _ERROR_ITEM_CODES_WITHOUT_LOG_TEXT:
         text = "(text withheld)"
     else:
-        # Redact before clipping: a credential cut at the bound would otherwise
-        # survive as a fragment the redactor no longer recognises.
+        # Sanitize before clipping: terminal controls, whitespace-delimited credentials
+        # and URL userinfo are stripped. A credential cut at the bound would otherwise
+        # survive as a fragment the sanitizer no longer recognises.
         message = data.message
-        text = redact_log_text(message[:_ERROR_ITEM_LOG_REDACT_PREFIX_CHARS])
+        text = sanitize_diagnostic_text(message[:_ERROR_ITEM_LOG_REDACT_PREFIX_CHARS])
         unredacted = max(0, len(message) - _ERROR_ITEM_LOG_REDACT_PREFIX_CHARS)
         if len(text) > _ERROR_ITEM_LOG_TEXT_MAX_CHARS or unredacted:
             dropped = len(text) - _ERROR_ITEM_LOG_TEXT_MAX_CHARS + unredacted

@@ -12951,3 +12951,64 @@ async def test_external_pi_followup_dropped_error_item_logs_no_text(
     assert row["message"] == "error item [pi_followup_delivery_dropped]: (text withheld)"
     assert row["attributes"]["code"] == "pi_followup_delivery_dropped"
     assert "synthetic queued words" not in str(rows)
+
+
+async def test_external_error_item_redacts_whitespace_delimited_passwords(
+    client: httpx.AsyncClient,
+) -> None:
+    """Error item text with whitespace-delimited passwords is redacted."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    text = "Auth failed: password=secretpass123 user=bob@example.com"
+
+    with capture_debug_rows("server") as rows:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events", json=_error_item_event(text)
+        )
+    assert resp.status_code in (200, 202), resp.text
+
+    (row,) = _error_item_log_rows(rows)
+    message = str(row["message"])
+    assert "secretpass123" not in message
+    assert "[REDACTED]" in message
+
+
+async def test_external_error_item_redacts_url_userinfo(
+    client: httpx.AsyncClient,
+) -> None:
+    """Error item text with URL userinfo is redacted."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    text = "Connection error: https://user:password@host.example.com/path"
+
+    with capture_debug_rows("server") as rows:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events", json=_error_item_event(text)
+        )
+    assert resp.status_code in (200, 202), resp.text
+
+    (row,) = _error_item_log_rows(rows)
+    message = str(row["message"])
+    assert "password@" not in message
+    assert "[REDACTED]@" in message
+
+
+async def test_external_error_item_redacts_http_cookies(
+    client: httpx.AsyncClient,
+) -> None:
+    """Error item text with HTTP cookies is redacted."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    text = "Request failed: Cookie: session_id=abc123def456; auth_token=xyz789"
+
+    with capture_debug_rows("server") as rows:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events", json=_error_item_event(text)
+        )
+    assert resp.status_code in (200, 202), resp.text
+
+    (row,) = _error_item_log_rows(rows)
+    message = str(row["message"])
+    assert "abc123def456" not in message
+    assert "xyz789" not in message
+    assert "[REDACTED]" in message
