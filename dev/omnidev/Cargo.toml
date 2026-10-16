@@ -14,7 +14,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 ratatui = "0.29"
-ansi-to-tui = "7"
+ansi-to-tui = "8"
 unicode-width = "0.2"
 notify = "8"
 notify-debouncer-full = "0.5"
