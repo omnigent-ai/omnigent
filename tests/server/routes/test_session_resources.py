@@ -9889,7 +9889,9 @@ async def test_relay_settles_a_message_codex_refused_and_the_next_mirror_is_clea
     )
     try:
         with pytest.raises(InnerExecutorError) as raised:
-            await adapter.run_turn(CreateResponseRequest(model="test-agent", input="huge paste"), ctx)
+            await adapter.run_turn(
+                CreateResponseRequest(model="test-agent", input="huge paste"), ctx
+            )
     finally:
         await adapter.on_shutdown()
     refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
