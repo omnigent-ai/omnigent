@@ -888,6 +888,32 @@ class HostStore:
                 return None
             return _row_to_host(row)
 
+    def host_identity_taken(self, *, host_id: str, user_id: str, name: str) -> bool:
+        """
+        Whether a host row already holds *host_id*, or *name* for *user_id*.
+
+        Counts deleted hosts still awaiting sandbox cleanup: their rows keep
+        both keys, so registering a new host under either would fail.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param user_id: The would-be owner, e.g. ``"alice@example.com"``.
+        :param name: The would-be display name, e.g. ``"managed-a1b2c3d4"``.
+        :returns: ``True`` when either key is taken in this workspace.
+        """
+        with self._session("select_host_identity_taken") as session:
+            row = session.execute(
+                select(SqlHost.host_id)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    or_(
+                        SqlHost.host_id == host_id,
+                        (SqlHost.user_id == user_id) & (SqlHost.name == name),
+                    ),
+                )
+                .limit(1)
+            ).first()
+            return row is not None
+
     def reserve_sandbox_host(
         self, *, host_id: str, name: str, user_id: str, provider: str
     ) -> Host | None:

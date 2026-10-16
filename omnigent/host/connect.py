@@ -5265,9 +5265,10 @@ def _serve_host_until_exit(
 
     telemetry.init("omni-host")
 
-    from omnigent.host.identity import host_config_path
+    from omnigent.host.identity import export_configured_slice_key, host_config_path
 
     path = host_config_path(config_path)
+    export_configured_slice_key(path)
     try:
         identity = load_or_create_host_identity(path)
     except ValueError as exc:

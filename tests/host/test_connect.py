@@ -6498,6 +6498,30 @@ def test_run_host_process_mirrors_structured_logs_on_foreground_tty(
     configure_logging.assert_called_once_with("host", log_to_stderr=True)
 
 
+def test_run_host_process_keys_its_tunnel_from_the_launch_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A managed launch's ``host.slice_key_enabled`` keys the very first tunnel handshake."""
+    host_id = "0123456789abcdef0123456789abcdef"
+    config = tmp_path / "config.yaml"
+    config.write_text("host:\n  slice_key_enabled: true\n")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
+    monkeypatch.setenv("OMNIGENT_HOST_ID", host_id)
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-01234567")
+    monkeypatch.delenv("OMNIGENT_RUNNER_SLICE_KEY", raising=False)
+    # Set first so teardown restores the variable the startup export writes.
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "")
+    monkeypatch.delenv("OMNIGENT_HOST_SLICE_KEY_ENABLED")
+    spy = _ConnectSpy([asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+
+    run_host_process(server_url="https://srv.example.com", config_path=config)
+
+    headers = spy.calls[0]["additional_headers"]
+    assert headers["X-Databricks-Omnigent-Slice-Key"] == host_id  # type: ignore[index]
+
+
 def test_run_host_process_announces_session_log_dir_on_start(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
