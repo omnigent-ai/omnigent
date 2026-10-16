@@ -28,9 +28,13 @@ Streaming model:
 - Cancellation: :meth:`interrupt_session` -> ``conversation.cancel()``, which
   surfaces ``TurnCancelled``.
 
-Authentication is Gemini-native: a direct API key (``api_key``) or Vertex AI
-(``vertex`` + ``project`` + ``location``). The SDK has no OpenAI-compatible
-``base_url``, so there is deliberately no gateway / Databricks routing path.
+Authentication is Gemini-native: a direct API key (``api_key``), Vertex AI
+(``vertex`` + ``project`` + ``location``), or Databricks Unity Gateway's native
+Gemini route (``gateway_base_url`` + ``databricks_profile``). On the gateway path
+every model target points at the gateway with a Databricks bearer token (and the
+model provider service header, when set), so no request reaches Google directly.
+The SDK takes static headers, so the agent is rebuilt (and re-seeded with the
+session's history) before its token expires.
 
 SDK touchpoints are isolated in :meth:`_open_agent`, :meth:`_build_sdk_tools`,
 :meth:`_build_post_tool_hook`, and :meth:`_drive_turn`, and duck-typed to
@@ -44,13 +48,15 @@ import contextlib
 import importlib
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
+from omnigent.databricks_ai_gateway import model_provider_service_headers
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.spec.types import RetryPolicy
 
@@ -72,11 +78,125 @@ from .executor import (
     describe_exception,
 )
 
+if TYPE_CHECKING:
+    from .databricks_executor import _DatabricksCliToken
+
 logger = logging.getLogger(__name__)
 
 # Sentinel the producer pushes when the step stream is exhausted, so the
 # consumer can distinguish "turn finished" from a queued event.
 _STREAM_DONE = object()
+
+# On the Databricks gateway path, rebuild the agent when its bearer token has
+# less than this left, so a turn never starts on a token about to expire.
+_GATEWAY_TOKEN_REFRESH_MARGIN_SECONDS = 600.0
+# Lifetime assumed for a token from databricks-sdk, which reports no expiry. Longer
+# than the refresh margin, so the token is re-minted (cheaply) every ~50 minutes.
+_SDK_TOKEN_TTL_SECONDS = 3600.0
+
+
+def _sdk_profile_token(profile: str) -> _DatabricksCliToken:
+    """Mint a bearer token for PROFILE with ``databricks-sdk`` (any auth type, PATs too).
+
+    :param profile: Databricks config profile, e.g. ``"DEFAULT"``.
+    :returns: The token, with an assumed expiry of ``_SDK_TOKEN_TTL_SECONDS``.
+    :raises ValueError: If the SDK is not installed or the profile yields no bearer token.
+    """
+    from .databricks_executor import _DatabricksCliToken
+
+    try:
+        from databricks.sdk.core import Config
+    except ImportError as exc:
+        raise ValueError("databricks-sdk is not installed") from exc
+    try:
+        header = Config(profile=profile).authenticate().get("Authorization", "")
+    except Exception as exc:  # the SDK raises several types for auth/config errors
+        raise ValueError(str(exc)) from exc
+    if not header.startswith("Bearer "):
+        raise ValueError(f"profile {profile!r} did not yield a bearer token")
+    return _DatabricksCliToken(
+        access_token=header.removeprefix("Bearer "),
+        expires_at=time.time() + _SDK_TOKEN_TTL_SECONDS,
+    )
+
+
+# Placeholder Gemini key for gateway endpoints: the SDK requires one, and the
+# gateway authenticates the bearer token instead.
+_GATEWAY_PLACEHOLDER_API_KEY = "databricks"
+
+# A turn-level SDK error naming a rejected tool call (a policy denial, or a call
+# with bad arguments) is returned to the model this many times per turn before
+# the turn fails.
+_MAX_TOOL_ERROR_RECOVERIES = 2
+_RECOVERABLE_TOOL_ERROR = re.compile(r"tool call|denied by|pre-tool hook", re.IGNORECASE)
+
+
+def _tool_error_recovery_prompt(error: str) -> str:
+    """Return the follow-up message that hands a rejected tool call back to the model.
+
+    :param error: The SDK's error text, e.g. ``"invalid tool call error (invalid_args)"``.
+    :returns: The message to send in the same conversation.
+    """
+    return (
+        f"Your last tool call failed and was not run: {error}\n"
+        "Do not repeat that call. Continue the task using the tools available to you."
+    )
+
+
+def _is_zero_value(value: object) -> bool:
+    """Whether *value* is the zero value Gemini emits for an unset field.
+
+    :param value: A tool argument value.
+    :returns: ``True`` for ``None``, ``""``, ``0`` / ``0.0`` (not ``False``),
+        ``[]`` and ``{}``.
+    """
+    if value is None or isinstance(value, bool):
+        return value is None
+    if isinstance(value, (int, float)):
+        return value == 0
+    return isinstance(value, (str, list, dict)) and len(value) == 0
+
+
+def _tool_with_schema_cls(antigravity: ModuleType | None) -> Any | None:  # type: ignore[explicit-any]
+    """Return the SDK's ``ToolWithSchema`` wrapper class, or ``None`` if absent.
+
+    :param antigravity: The imported ``google.antigravity`` module, or ``None``.
+    :returns: ``google.antigravity.tools.tool_runner.ToolWithSchema`` when the
+        installed SDK provides it, else ``None``.
+    """
+    if antigravity is None:
+        return None
+    runner = getattr(getattr(antigravity, "tools", None), "tool_runner", None)
+    module_name = getattr(antigravity, "__name__", None)
+    if runner is None and isinstance(module_name, str):
+        try:
+            runner = importlib.import_module(f"{module_name}.tools.tool_runner")
+        except ImportError:
+            return None
+    cls = getattr(runner, "ToolWithSchema", None)
+    return cls if isinstance(cls, type) else None
+
+
+def _usage_since(conversation: SDKConversation, start: SDKUsage) -> SDKUsage:
+    """Return the token usage *conversation* accrued since the *start* snapshot.
+
+    :param conversation: The SDK ``Conversation``; newer SDKs expose a running
+        ``total_usage`` (a ``UsageMetadata`` supporting subtraction).
+    :param start: ``conversation.total_usage`` taken when the turn began, or
+        ``None`` when the SDK has no such property.
+    :returns: The turn's ``UsageMetadata``, or ``None`` when it can't be
+        computed or no tokens were used.
+    """
+    if start is None:
+        return None
+    end = getattr(conversation, "total_usage", None)
+    if end is None:
+        return None
+    try:
+        delta = end - start
+    except TypeError:
+        return None
+    return delta if (getattr(delta, "total_token_count", 0) or 0) > 0 else None
 
 
 class _NeverRaisedError(BaseException):
@@ -96,6 +216,7 @@ SDKUsage: TypeAlias = Any  # type: ignore[explicit-any]
 SDKTool: TypeAlias = Any  # type: ignore[explicit-any]
 SDKHook: TypeAlias = Any  # type: ignore[explicit-any]
 SDKConfig: TypeAlias = Any  # type: ignore[explicit-any]
+SDKModelTarget: TypeAlias = Any  # type: ignore[explicit-any]
 SDKHookContext: TypeAlias = Any  # type: ignore[explicit-any]
 ToolArgs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ToolResult: TypeAlias = Any  # type: ignore[explicit-any]
@@ -306,6 +427,8 @@ class _AntigravitySessionState:
         the terminal :class:`TurnComplete`.
     :param interrupt_requested: Set by :meth:`interrupt_session` so the
         consumer suppresses a trailing :class:`TurnComplete` after cancel.
+    :param gateway_token_expires_at: Epoch seconds when the agent's Databricks
+        gateway token expires, or ``None`` off the gateway path.
     """
 
     agent: SDKAgent = None
@@ -315,6 +438,7 @@ class _AntigravitySessionState:
     active_queue: _EventQueue | None = field(default=None)
     last_usage: SDKUsage = None
     interrupt_requested: bool = False
+    gateway_token_expires_at: float | None = None
 
 
 class AntigravityExecutor(Executor):
@@ -328,6 +452,8 @@ class AntigravityExecutor(Executor):
         vertex: bool = False,
         project: str | None = None,
         location: str | None = None,
+        gateway_base_url: str | None = None,
+        databricks_profile: str | None = None,
         retry_policy: RetryPolicy | None = None,
     ) -> None:
         """Create an AntigravityExecutor.
@@ -344,14 +470,26 @@ class AntigravityExecutor(Executor):
             ``"my-gcp-project"``. ``None`` unless *vertex* is set.
         :param location: GCP region for the Vertex AI path, e.g.
             ``"us-central1"``. ``None`` unless *vertex* is set.
+        :param gateway_base_url: Unity Gateway Gemini route, e.g.
+            ``"https://example.cloud.databricks.com/ai-gateway/gemini"``. When
+            set, every model call goes there instead of Google; requires
+            *databricks_profile*, and takes precedence over *api_key* / *vertex*.
+        :param databricks_profile: Databricks CLI profile the gateway bearer
+            token is minted from, e.g. ``"DEFAULT"``.
         :param retry_policy: Optional retry policy, reserved for parity with
             the other SDK executors. ``None`` uses defaults.
+        :raises ValueError: If *gateway_base_url* is set without
+            *databricks_profile*.
         """
+        if gateway_base_url and not databricks_profile:
+            raise ValueError("gateway_base_url requires databricks_profile")
         self._model_override = model
         self._api_key = api_key
         self._vertex = vertex
         self._project = project
         self._location = location
+        self._gateway_base_url = gateway_base_url or None
+        self._databricks_profile = databricks_profile or None
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._session_states: dict[str, _AntigravitySessionState] = {}
         # Set by the harness ExecutorAdapter when unset; the SDK tools route
@@ -581,8 +719,10 @@ class AntigravityExecutor(Executor):
         Sends *prompt*, then iterates ``receive_steps()`` mapping each
         :class:`Step` to text / reasoning / tool-request events on
         ``state.active_queue``. Tool *completions* are enqueued separately by
-        the ``PostToolCallHook`` on the same event loop. Always enqueues
-        :data:`_STREAM_DONE` last so the consumer stops cleanly.
+        the ``PostToolCallHook`` on the same event loop. A rejected tool call
+        is sent back to the model in the same conversation, up to
+        :data:`_MAX_TOOL_ERROR_RECOVERIES` times, instead of failing the turn.
+        Always enqueues :data:`_STREAM_DONE` last so the consumer stops cleanly.
 
         :param state: The session state (conversation, queue, pending tools).
         :param prompt: The user text to send for this turn.
@@ -591,62 +731,103 @@ class AntigravityExecutor(Executor):
         assert queue is not None  # set by run_turn before spawning this task
         conversation = state.conversation
         seen_tool_ids: set[str] = set()
+        recoveries = 0
+        next_prompt: str | None = prompt
+        # Newer SDKs report usage per model call on the conversation, not on
+        # steps (``Step.usage_metadata`` is always ``None`` there); the turn's
+        # usage is the growth of the running total across all its sends.
+        turn_start_usage = getattr(conversation, "total_usage", None)
         try:
-            await conversation.send(prompt)
-            async for step in conversation.receive_steps():
-                # Only surface MODEL->USER steps. The SDK echoes the user's
-                # input and environment-directed steps in the same stream (its
-                # ``receive_chunks`` filters identically); without this the
-                # user's prompt leaks back into the assistant response.
-                is_model_to_user = (
-                    _enum_name(getattr(step, "source", None)) == "MODEL"
-                    and _enum_name(getattr(step, "target", None)) == "USER"
-                )
-                if is_model_to_user:
-                    thinking_delta = getattr(step, "thinking_delta", "") or ""
-                    if thinking_delta:
-                        queue.put_nowait(
-                            ReasoningChunk(delta=thinking_delta, event_type="reasoning_text")
-                        )
-                    content_delta = getattr(step, "content_delta", "") or ""
-                    if content_delta:
-                        queue.put_nowait(TextChunk(text=content_delta))
-
-                usage = getattr(step, "usage_metadata", None)
-                if usage is not None:
-                    state.last_usage = usage
-
-                self._emit_tool_requests(step, state, seen_tool_ids)
-
-                step_type = _enum_name(getattr(step, "type", None))
-                status = _enum_name(getattr(step, "status", None))
-
-                # Fallback completion: results normally arrive via the
-                # PostToolCallHook, which pops the call from pending_tools. If a
-                # TOOL_CALL step reaches a terminal status with the call still
-                # pending (e.g. an error surfaced outside the hook), close it
-                # from the step. Both paths pop, so it fires once.
-                if step_type == "TOOL_CALL" and status in (
-                    "DONE",
-                    "ERROR",
-                    "TERMINAL_ERROR",
-                    "CANCELED",
-                ):
-                    self._complete_pending_from_step(step, state, status)
-
-                if status == "CANCELED":
-                    queue.put_nowait(TurnCancelled(reason="user_cancelled", phase="model"))
-                    return
-                if status in ("ERROR", "TERMINAL_ERROR") and step_type != "TOOL_CALL":
-                    # Turn-level failure (tool errors close above). TERMINAL_ERROR
-                    # is non-retryable; plain ERROR may succeed on retry. Fall back
-                    # to a generic message when the SDK reports none, so the turn
-                    # isn't mis-reported as a silent empty success.
-                    message = (
-                        getattr(step, "error", "") or f"Antigravity turn failed (status={status})"
+            while next_prompt is not None:
+                await conversation.send(next_prompt)
+                next_prompt = None
+                async for step in conversation.receive_steps():
+                    # Only surface MODEL->USER steps. The SDK echoes the user's
+                    # input and environment-directed steps in the same stream (its
+                    # ``receive_chunks`` filters identically); without this the
+                    # user's prompt leaks back into the assistant response.
+                    is_model_to_user = (
+                        _enum_name(getattr(step, "source", None)) == "MODEL"
+                        and _enum_name(getattr(step, "target", None)) == "USER"
                     )
-                    queue.put_nowait(ExecutorError(message=message, retryable=(status == "ERROR")))
-                    return
+                    if is_model_to_user:
+                        thinking_delta = getattr(step, "thinking_delta", "") or ""
+                        if thinking_delta:
+                            queue.put_nowait(
+                                ReasoningChunk(delta=thinking_delta, event_type="reasoning_text")
+                            )
+                        content_delta = getattr(step, "content_delta", "") or ""
+                        if content_delta:
+                            queue.put_nowait(TextChunk(text=content_delta))
+
+                    usage = getattr(step, "usage_metadata", None)
+                    if usage is not None:
+                        state.last_usage = usage
+
+                    self._emit_tool_requests(step, state, seen_tool_ids)
+
+                    step_type = _enum_name(getattr(step, "type", None))
+                    status = _enum_name(getattr(step, "status", None))
+
+                    # Fallback completion: results normally arrive via the
+                    # PostToolCallHook, which pops the call from pending_tools. If a
+                    # TOOL_CALL step reaches a terminal status with the call still
+                    # pending (e.g. an error surfaced outside the hook), close it
+                    # from the step. Both paths pop, so it fires once.
+                    if step_type == "TOOL_CALL" and status in (
+                        "DONE",
+                        "ERROR",
+                        "TERMINAL_ERROR",
+                        "CANCELED",
+                    ):
+                        self._complete_pending_from_step(step, state, status)
+
+                    if status == "CANCELED":
+                        if next_prompt is not None and not state.interrupt_requested:
+                            # The SDK cancelling the request it aborted, not a user stop.
+                            continue
+                        queue.put_nowait(TurnCancelled(reason="user_cancelled", phase="model"))
+                        return
+                    if status in ("ERROR", "TERMINAL_ERROR") and step_type != "TOOL_CALL":
+                        if next_prompt is not None:
+                            # Tail of a trajectory already handed back to the model
+                            # (e.g. the SDK cancelling the request it aborted). Drain
+                            # the stream to its end so the next send() starts idle.
+                            continue
+                        # Turn-level failure (tool errors close above). TERMINAL_ERROR
+                        # is non-retryable; plain ERROR may succeed on retry. Fall back
+                        # to a generic message when the SDK reports none, so the turn
+                        # isn't mis-reported as a silent empty success.
+                        message = (
+                            getattr(step, "error", "")
+                            or f"Antigravity turn failed (status={status})"
+                        )
+                        # The SDK reports a rejected tool call (policy denial, bad
+                        # arguments) as a turn-level ERROR and stops; hand it back to
+                        # the model in the same conversation rather than failing.
+                        if (
+                            status == "ERROR"
+                            and recoveries < _MAX_TOOL_ERROR_RECOVERIES
+                            and not state.interrupt_requested
+                            and _RECOVERABLE_TOOL_ERROR.search(message)
+                        ):
+                            recoveries += 1
+                            logger.warning(
+                                "Antigravity tool call failed; returning the error to the "
+                                "model (%d/%d): %s",
+                                recoveries,
+                                _MAX_TOOL_ERROR_RECOVERIES,
+                                message,
+                            )
+                            next_prompt = _tool_error_recovery_prompt(message)
+                            continue
+                        queue.put_nowait(
+                            ExecutorError(message=message, retryable=(status == "ERROR"))
+                        )
+                        return
+            turn_usage = _usage_since(conversation, turn_start_usage)
+            if turn_usage is not None:
+                state.last_usage = turn_usage
         except asyncio.CancelledError:
             # Consumer teardown; conversation.cancel() already requested by
             # interrupt_session, nothing to emit.
@@ -774,8 +955,9 @@ class AntigravityExecutor(Executor):
     ) -> tuple[_AntigravitySessionState, bool]:
         """Return the session state with a current SDK agent + conversation.
 
-        Rebuilds the agent when the model, system prompt, or tool set changes;
-        otherwise reuses it to preserve conversation state. The state object
+        Rebuilds the agent when the model, system prompt, or tool set changes,
+        or when its Databricks gateway token is about to expire; otherwise
+        reuses it to preserve conversation state. The state object
         is preserved across rebuilds so the agent's ``PostToolCallHook`` (which
         closes over it) stays valid.
 
@@ -803,7 +985,11 @@ class AntigravityExecutor(Executor):
             # turn. A reused session is already registered.
             state = _AntigravitySessionState()
 
-        if state.agent is not None and state.agent_signature == signature:
+        if (
+            state.agent is not None
+            and state.agent_signature == signature
+            and not self._gateway_token_due(state)
+        ):
             return state, False
 
         if state.agent is not None:
@@ -847,7 +1033,10 @@ class AntigravityExecutor(Executor):
         resolved model / prompt / credentials / tools / hooks and enters the
         agent's async context. Omnigent's tools are exposed as callables
         (``LocalAgentConfig.tools``) routing through :attr:`_tool_executor`, so
-        the agent runs them under policy. A ``PostToolCallHook`` surfaces a
+        the agent runs them under policy. When they are present the SDK's own
+        builtin tools (file view/write, run_command, web, sub-agents, ...) are
+        removed from the model's context, since they would bypass that policy
+        and the agent's sandbox. A ``PostToolCallHook`` surfaces a
         :class:`ToolCallComplete` for every tool the agent runs.
 
         :param state: The session state the tool-completion hook closes over.
@@ -859,16 +1048,47 @@ class AntigravityExecutor(Executor):
         """
         antigravity = _ensure_antigravity_sdk()
         config_kwargs: _StrAnyDict = {"system_instructions": system_prompt or None}
-        sdk_tools = self._build_sdk_tools(tools)
+        sdk_tools = self._build_sdk_tools(tools, antigravity)
         if sdk_tools:
             config_kwargs["tools"] = sdk_tools
+            capabilities = self._omnigent_tools_only_capabilities(antigravity)
+            if capabilities is not None:
+                config_kwargs["capabilities"] = capabilities
+            else:
+                logger.warning(
+                    "google-antigravity SDK has no CapabilitiesConfig/BuiltinTools; its "
+                    "builtin tools stay enabled alongside Omnigent's"
+                )
         config_kwargs["hooks"] = [self._build_post_tool_hook(antigravity, state)]
+        if self._gateway_base_url is not None:
+            gateway_token = await self._mint_gateway_token()
+            config_kwargs["models"] = self._build_gateway_models(
+                antigravity, model=model, token=gateway_token.access_token
+            )
+            state.gateway_token_expires_at = gateway_token.expires_at
         config = self._build_local_agent_config(antigravity, model=model, kwargs=config_kwargs)
         agent = antigravity.Agent(config)
         # Agent is documented as an async context manager; enter it if so.
         if hasattr(agent, "__aenter__"):
             agent = await agent.__aenter__()
         return agent
+
+    @staticmethod
+    def _omnigent_tools_only_capabilities(antigravity: ModuleType) -> SDKConfig | None:
+        """Build a ``CapabilitiesConfig`` that leaves only the SDK's ``finish`` tool.
+
+        Omnigent's tools then handle every file, shell, web and sub-agent action,
+        under Omnigent's policy and the agent's sandbox.
+
+        :param antigravity: The imported ``google.antigravity`` module.
+        :returns: The capabilities config, or ``None`` when the installed SDK
+            has no ``CapabilitiesConfig`` / ``BuiltinTools.FINISH``.
+        """
+        capabilities_cls = getattr(antigravity, "CapabilitiesConfig", None)
+        finish = getattr(getattr(antigravity, "BuiltinTools", None), "FINISH", None)
+        if capabilities_cls is None or finish is None:
+            return None
+        return capabilities_cls(enabled_tools=[finish], enable_subagents=False)
 
     def _build_post_tool_hook(
         self, antigravity: ModuleType, state: _AntigravitySessionState
@@ -926,21 +1146,30 @@ class AntigravityExecutor(Executor):
 
         return _OmnigentToolCompleteHook()
 
-    def _build_sdk_tools(self, tools: list[ToolSpec]) -> list[SDKTool]:
-        """Build SDK tools (plain callables) from Omnigent tool specs.
+    def _build_sdk_tools(
+        self, tools: list[ToolSpec], antigravity: ModuleType | None = None
+    ) -> list[SDKTool]:
+        """Build SDK tools from Omnigent tool specs.
 
-        The SDK introspects each callable's ``__name__`` / ``__doc__`` for its
-        function declaration. Each routes through :attr:`_tool_executor`, so
-        the agent reaches Omnigent's tool registry under policy. Returns ``[]``
-        when there are no tools or no executor bridge yet (the agent then runs
-        with its native + MCP tools only).
+        Each tool's JSON ``parameters`` schema is attached with the SDK's
+        ``ToolWithSchema`` wrapper so the model sees the real argument names
+        and types; a bare ``(*args, **kwargs)`` callable gives it no parameter
+        declaration and it has to guess (e.g. ``filePath`` for ``path``, or no
+        arguments at all). Falls back to the bare callable when the SDK has no
+        such wrapper. Each routes through :attr:`_tool_executor`, so the agent
+        reaches Omnigent's tool registry under policy. Returns ``[]`` when
+        there are no tools or no executor bridge yet (the agent then runs with
+        its native + MCP tools only).
 
         :param tools: Omnigent tool specs (``name`` / ``description`` /
             ``parameters``).
-        :returns: A list of named async callables, or ``[]``.
+        :param antigravity: The imported ``google.antigravity`` module, used
+            to find ``ToolWithSchema``; ``None`` builds bare callables.
+        :returns: A list of SDK tools, or ``[]``.
         """
         if not tools or self._tool_executor is None:
             return []
+        with_schema = _tool_with_schema_cls(antigravity)
         sdk_tools: list[SDKTool] = []
         for tool in tools:
             name = tool.get("name")
@@ -948,10 +1177,19 @@ class AntigravityExecutor(Executor):
                 continue
             description = tool.get("description")
             description = description if isinstance(description, str) else ""
-            sdk_tools.append(self._make_tool_callable(name, description))
+            parameters = tool.get("parameters")
+            callable_tool = self._make_tool_callable(
+                name, description, parameters if isinstance(parameters, dict) else None
+            )
+            if with_schema is not None and isinstance(parameters, dict) and parameters:
+                sdk_tools.append(with_schema(callable_tool, input_schema=parameters))
+            else:
+                sdk_tools.append(callable_tool)
         return sdk_tools
 
-    def _make_tool_callable(self, tool_name: str, description: str) -> _ToolCallable:
+    def _make_tool_callable(
+        self, tool_name: str, description: str, parameters: _StrAnyDict | None = None
+    ) -> _ToolCallable:
         """Build a named async callable the SDK can register as a tool.
 
         Accepts the SDK's arg shape (kwargs, a single dict, or a JSON string)
@@ -959,10 +1197,19 @@ class AntigravityExecutor(Executor):
         are set so the SDK's function-declaration introspection picks up the
         name and description.
 
+        Gemini's function calling fills optional parameters it means to leave
+        unset with zero values (``0``, ``""``, ``[]``, ``{}``), which tools then
+        reject (e.g. ``sys_os_read`` with ``limit: 0`` -> "limit must be >= 1").
+        Optional parameters (not in the schema's ``required``) carrying such a
+        value are dropped so the tool applies its own default.
+
         :param tool_name: The Omnigent tool name, e.g. ``"sys_shell"``.
         :param description: Human-readable tool description for the model.
+        :param parameters: The tool's JSON schema, or ``None``.
         :returns: An async callable bound to *tool_name*.
         """
+        required = set((parameters or {}).get("required") or [])
+        declared = set(((parameters or {}).get("properties") or {}).keys())
 
         async def _invoke(*args: Any, **kwargs: Any) -> ToolResult:  # type: ignore[explicit-any]
             if self._tool_executor is None:
@@ -978,6 +1225,11 @@ class AntigravityExecutor(Executor):
                     tool_args = parsed if isinstance(parsed, dict) else {"input": args[0]}
                 except json.JSONDecodeError:
                     tool_args = {"input": args[0]}
+            tool_args = {
+                key: value
+                for key, value in tool_args.items()
+                if key in required or key not in declared or not _is_zero_value(value)
+            }
             return await self._tool_executor(tool_name, tool_args)
 
         # The SDK builds the function declaration from these.
@@ -997,30 +1249,114 @@ class AntigravityExecutor(Executor):
 
         Threads Gemini-native auth (``api_key`` or Vertex AI) and drops any
         field the installed SDK doesn't accept, rather than crashing on drift.
+        Gateway ``models`` (from :meth:`_build_gateway_models`) carry their own
+        endpoint, so the shorthand model / auth fields are skipped for them.
 
         :param antigravity: The imported ``google.antigravity`` module.
         :param model: The resolved model id to pin, or ``None`` to use the SDK
             default.
-        :param kwargs: Base config kwargs (system instructions, tools, hooks).
+        :param kwargs: Base config kwargs (system instructions, tools, hooks,
+            and on the gateway path ``models``).
         :returns: A ``LocalAgentConfig`` instance.
+        :raises RuntimeError: If gateway ``models`` are given but the installed
+            SDK has no ``models`` field — dropping them would send the turn to
+            Google instead of the gateway.
         """
         local_config_cls = antigravity.LocalAgentConfig
         supported = self._config_field_names(local_config_cls)
         candidate: _StrAnyDict = dict(kwargs)
-        if model is not None:
-            candidate["model"] = model
-        if self._api_key:
-            candidate["api_key"] = self._api_key
-        if self._vertex:
-            candidate["vertex"] = True
-            if self._project:
-                candidate["project"] = self._project
-            if self._location:
-                candidate["location"] = self._location
+        if "models" in candidate:
+            if supported is not None and "models" not in supported:
+                raise RuntimeError(
+                    "Databricks gateway routing needs a google-antigravity SDK whose "
+                    "LocalAgentConfig accepts `models`; upgrade google-antigravity."
+                )
+        else:
+            if model is not None:
+                candidate["model"] = model
+            if self._api_key:
+                candidate["api_key"] = self._api_key
+            if self._vertex:
+                candidate["vertex"] = True
+                if self._project:
+                    candidate["project"] = self._project
+                if self._location:
+                    candidate["location"] = self._location
         filtered = {
             key: value for key, value in candidate.items() if supported is None or key in supported
         }
         return local_config_cls(**filtered)
+
+    def _gateway_token_due(self, state: _AntigravitySessionState) -> bool:
+        """Whether the session's gateway token is close enough to expiry to rebuild.
+
+        :param state: The session state holding the token expiry.
+        :returns: ``True`` on the gateway path when the token expires within
+            :data:`_GATEWAY_TOKEN_REFRESH_MARGIN_SECONDS`; ``False`` otherwise.
+        """
+        expires_at = state.gateway_token_expires_at
+        if self._gateway_base_url is None or expires_at is None:
+            return False
+        return expires_at - time.time() <= _GATEWAY_TOKEN_REFRESH_MARGIN_SECONDS
+
+    async def _mint_gateway_token(self) -> _DatabricksCliToken:
+        """Mint a Databricks bearer token for the gateway from the CLI profile.
+
+        Tries the Databricks CLI first, which needs no extra install. ``databricks
+        auth token`` only serves OAuth logins, so a token-based profile (a PAT, as
+        in a Databricks personal sandbox) falls back to ``databricks-sdk`` when it
+        is installed.
+
+        :returns: The token and its expiry.
+        :raises RuntimeError: If neither source can mint a token.
+        """
+        from .databricks_executor import _databricks_cli_profile_token
+
+        profile = self._databricks_profile
+        assert profile is not None  # enforced in __init__ with gateway_base_url
+        try:
+            return await asyncio.to_thread(_databricks_cli_profile_token, profile)
+        except ValueError as cli_exc:
+            try:
+                return await asyncio.to_thread(_sdk_profile_token, profile)
+            except ValueError:
+                raise RuntimeError(
+                    f"Could not get a Databricks token for profile {profile!r} to call "
+                    f"Unity Gateway: {cli_exc}. Run `databricks auth login --profile {profile}`."
+                ) from cli_exc
+
+    def _build_gateway_models(
+        self, antigravity: ModuleType, *, model: str | None, token: str
+    ) -> list[SDKModelTarget]:
+        """Build the single gateway ``ModelTarget`` every model call routes to.
+
+        It declares every ``ModelType`` so the SDK adds none of its default
+        targets, which would call Google directly.
+
+        :param antigravity: The imported ``google.antigravity`` module.
+        :param model: The model id the gateway serves, e.g. ``"gemini-3.8-flash"``.
+            ``None`` uses the SDK's default model name.
+        :param token: Databricks bearer token for the gateway.
+        :returns: A one-element ``LocalAgentConfig.models`` list.
+        :raises RuntimeError: If no model is set and the SDK names no default.
+        """
+        name = model or getattr(getattr(antigravity, "models", None), "DEFAULT_MODEL", None)
+        if not name:
+            raise RuntimeError(
+                "Databricks gateway routing needs executor.model set to a Gemini "
+                "model the gateway serves, e.g. gemini-3.8-flash."
+            )
+        headers = {"Authorization": f"Bearer {token}", **model_provider_service_headers()}
+        endpoint = antigravity.GeminiAPIEndpoint(
+            base_url=self._gateway_base_url,
+            http_headers=headers,
+            api_key=_GATEWAY_PLACEHOLDER_API_KEY,
+        )
+        return [
+            antigravity.ModelTarget(
+                name=name, types=list(antigravity.ModelType), endpoint=endpoint
+            )
+        ]
 
     @staticmethod
     def _config_field_names(config_cls: Any) -> set[str] | None:  # type: ignore[explicit-any]
@@ -1059,6 +1395,11 @@ class AntigravityExecutor(Executor):
         usage: _StrAnyDict = {}
         prompt_tokens = getattr(meta, "prompt_token_count", None)
         output_tokens = getattr(meta, "candidates_token_count", None)
+        thoughts = getattr(meta, "thoughts_token_count", None)
+        if isinstance(thoughts, int) and thoughts > 0:
+            # Gemini bills thinking tokens at the output rate but reports them
+            # outside ``candidates_token_count``.
+            output_tokens = (output_tokens or 0) + thoughts
         total_tokens = getattr(meta, "total_token_count", None)
         cached = getattr(meta, "cached_content_token_count", None)
         if prompt_tokens is not None:
@@ -1089,12 +1430,12 @@ class AntigravityExecutor(Executor):
         if closer is not None:
             try:
                 await closer(None, None, None)
-            except Exception:  # noqa: BLE001 — agent teardown is best-effort
+            except Exception:
                 logger.debug("Antigravity agent close failed", exc_info=True)
             return
         aclose = getattr(agent, "aclose", None)
         if aclose is not None:
             try:
                 await aclose()
-            except Exception:  # noqa: BLE001 — agent teardown is best-effort
+            except Exception:
                 logger.debug("Antigravity agent aclose failed", exc_info=True)

@@ -49,6 +49,8 @@ _ALL_ANTIGRAVITY_ENV = (
     "HARNESS_ANTIGRAVITY_VERTEX",
     "HARNESS_ANTIGRAVITY_PROJECT",
     "HARNESS_ANTIGRAVITY_LOCATION",
+    "HARNESS_ANTIGRAVITY_GATEWAY_BASE_URL",
+    "HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE",
 )
 
 
@@ -74,8 +76,7 @@ def test_executor_factory_threads_env_vars(monkeypatch: pytest.MonkeyPatch) -> N
     """The ``HARNESS_ANTIGRAVITY_*`` env vars thread into the executor ctor.
 
     Locks in the canonical Gemini-native env-var contract the spawn-env builder
-    (``_build_antigravity_spawn_env`` in workflow.py) emits. There are no
-    ``*_GATEWAY_*`` vars — the SDK has no OpenAI-compatible base_url.
+    (``_build_antigravity_spawn_env`` in workflow.py) emits.
     """
     monkeypatch.setenv("HARNESS_ANTIGRAVITY_MODEL", "gemini-3-pro")
     monkeypatch.setenv("HARNESS_ANTIGRAVITY_API_KEY", "ag-test-key")
@@ -92,6 +93,20 @@ def test_executor_factory_threads_env_vars(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["location"] == "us-central1"
 
 
+def test_executor_factory_threads_gateway_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Databricks gateway env vars thread into the executor ctor."""
+    monkeypatch.setenv(
+        "HARNESS_ANTIGRAVITY_GATEWAY_BASE_URL",
+        "https://example.cloud.databricks.com/ai-gateway/gemini",
+    )
+    monkeypatch.setenv("HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE", "dev")
+
+    captured = _capture_factory_kwargs(monkeypatch)
+
+    assert captured["gateway_base_url"] == "https://example.cloud.databricks.com/ai-gateway/gemini"
+    assert captured["databricks_profile"] == "dev"
+
+
 def test_executor_factory_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     """Unset env vars resolve to ``None`` / ``False`` (SDK uses ambient creds)."""
     for var in _ALL_ANTIGRAVITY_ENV:
@@ -105,6 +120,8 @@ def test_executor_factory_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -
     assert captured["vertex"] is False
     assert captured["project"] is None
     assert captured["location"] is None
+    assert captured["gateway_base_url"] is None
+    assert captured["databricks_profile"] is None
 
 
 @pytest.mark.parametrize(

@@ -84,11 +84,12 @@ _CLAUDE_FAMILY_HARNESSES: frozenset[str] = frozenset(
 # intentionally not included: a live SDK probe completed a Claude
 # tool-calling turn on the gateway over the chat wire, so the harness is
 # multi-model like pi and accepts any validated id (no family rejection).
-# antigravity is Gemini-native: it authenticates a direct Gemini API key /
-# Vertex AI and has no Databricks/gateway path (see _build_antigravity_spawn_env
-# in omnigent/runtime/workflow.py). So unlike the single-vendor harnesses above,
-# the rule here is framed as a *reject-list* of the families it definitively
-# cannot serve (Claude / GPT, and any ``databricks-``-prefixed gateway id),
+# antigravity is Gemini-native: a direct Gemini API key, Vertex AI, or Unity
+# Gateway's native Gemini route with provider model ids (see
+# _build_antigravity_spawn_env in omnigent/runtime/workflow.py). So unlike the
+# single-vendor harnesses above, the rule here is framed as a *reject-list* of
+# the families it definitively cannot serve (Claude / GPT, and any
+# ``databricks-``-prefixed gateway id),
 # rather than a strict Gemini allow-list — bare/ambiguous ids (e.g. a future
 # ``gemini-pro`` alias the SDK accepts) still pass through to the Gemini-native
 # SDK path. Mirrors how the cross-family rejection above fails loud at the

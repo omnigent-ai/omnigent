@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import collections
 import enum
+import sys
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -221,15 +223,19 @@ class _FakeLocalAgentConfig:
         self,
         *,
         system_instructions: str | None = None,
-        model: str | None | object = _MODEL_NOT_PROVIDED,
+        model: str | object | None = _MODEL_NOT_PROVIDED,
         api_key: str | None = None,
         vertex: bool | None = None,
         project: str | None = None,
         location: str | None = None,
         tools: Any = None,
         hooks: Any = None,
+        models: Any = None,
+        capabilities: Any = None,
     ) -> None:
         self.system_instructions = system_instructions
+        self.models = models
+        self.capabilities = capabilities
         self.model = model if isinstance(model, str) else None
         self.model_provided = model is not _MODEL_NOT_PROVIDED
         self.api_key = api_key
@@ -238,6 +244,37 @@ class _FakeLocalAgentConfig:
         self.location = location
         self.tools = tools
         self.hooks = hooks
+
+
+class _FakeModelType(enum.Enum):
+    TEXT = "text"
+    IMAGE = "image"
+
+
+@dataclass
+class _FakeGeminiAPIEndpoint:
+    base_url: str | None = None
+    http_headers: dict[str, str] | None = None
+    api_key: str | None = None
+
+
+@dataclass
+class _FakeModelTarget:
+    name: str | None = None
+    types: list[_FakeModelType] | None = None
+    endpoint: _FakeGeminiAPIEndpoint | None = None
+
+
+class _FakeBuiltinTools(enum.Enum):
+    VIEW_FILE = "view_file"
+    RUN_COMMAND = "run_command"
+    FINISH = "finish"
+
+
+@dataclass
+class _FakeCapabilitiesConfig:
+    enabled_tools: list[_FakeBuiltinTools] | None = None
+    enable_subagents: bool = True
 
 
 class _FakePostToolCallHook:
@@ -269,9 +306,18 @@ def _install_fake_sdk(
     class _FakeTypes:
         AntigravityCancelledError = _AntigravityCancelledError
 
+    class _FakeModels:
+        DEFAULT_MODEL = "gemini-sdk-default"
+
     class _FakeModule:
         LocalAgentConfig = _FakeLocalAgentConfig
+        GeminiAPIEndpoint = _FakeGeminiAPIEndpoint
+        ModelTarget = _FakeModelTarget
+        ModelType = _FakeModelType
+        CapabilitiesConfig = _FakeCapabilitiesConfig
+        BuiltinTools = _FakeBuiltinTools
         hooks = _FakeHooks
+        models = _FakeModels
         types = _FakeTypes
 
         @staticmethod
@@ -792,6 +838,11 @@ async def test_sys_tools_exposed_as_callables_routing_through_executor(
         {"name": "sys_shell", "args": {"cmd": "ls"}},
         {"name": "sys_shell", "args": {"cmd": "pwd"}},
     ]
+    # Omnigent's tools replace the SDK's builtins (which bypass Omnigent policy):
+    # only the control-flow finish tool stays, and SDK sub-agents are off.
+    capabilities = captured["configs"][0].capabilities
+    assert capabilities.enabled_tools == [_FakeBuiltinTools.FINISH]
+    assert capabilities.enable_subagents is False
 
 
 @pytest.mark.asyncio
@@ -807,6 +858,8 @@ async def test_no_tool_executor_means_no_sdk_tools(monkeypatch: pytest.MonkeyPat
     )
 
     assert captured["configs"][0].tools is None
+    # Nothing replaces the SDK's builtin tools, so they stay as the SDK sets them.
+    assert captured["configs"][0].capabilities is None
 
 
 @pytest.mark.asyncio
@@ -1392,3 +1445,511 @@ async def test_next_turn_rebuilds_after_interrupt(monkeypatch: pytest.MonkeyPatc
     completes = [e for e in events if isinstance(e, TurnComplete)]
     assert len(completes) == 1
     assert completes[0].response == "second-reply"
+
+
+# ── Databricks Unity Gateway routing ────────────────────────────────────
+
+_GATEWAY_URL = "https://example.cloud.databricks.com/ai-gateway/gemini"
+
+
+def _fake_cli_tokens(monkeypatch: pytest.MonkeyPatch, lifetimes: list[float]) -> list[str]:
+    """Patch the Databricks CLI token minter to hand out ``tok-N`` tokens.
+
+    :param monkeypatch: pytest monkeypatch fixture.
+    :param lifetimes: Seconds until expiry for each successive token.
+    :returns: The profiles each mint was requested for, in order.
+    """
+    from omnigent.inner import databricks_executor
+
+    calls: list[str] = []
+
+    def _mint(profile: str) -> Any:
+        calls.append(profile)
+        lifetime = lifetimes[len(calls) - 1]
+        return databricks_executor._DatabricksCliToken(
+            access_token=f"tok-{len(calls)}", expires_at=time.time() + lifetime
+        )
+
+    monkeypatch.setattr(databricks_executor, "_databricks_cli_profile_token", _mint)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_gateway_routes_every_model_type_through_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gateway path builds one all-types target on the gateway endpoint.
+
+    No shorthand ``model`` / ``api_key`` / Vertex field is set, so the SDK adds
+    none of its default targets (which would call Google directly).
+    """
+    from omnigent.databricks_ai_gateway import MODEL_PROVIDER_SERVICE_ENV_VAR
+
+    monkeypatch.setenv(MODEL_PROVIDER_SERVICE_ENV_VAR, "main.ai.gemini_prod")
+    calls = _fake_cli_tokens(monkeypatch, [3600.0])
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("ok")]])
+    executor = AntigravityExecutor(
+        model="gemini-3.8-flash",
+        api_key="ignored-gemini-key",
+        vertex=True,
+        gateway_base_url=_GATEWAY_URL,
+        databricks_profile="dev",
+    )
+
+    await _drain(executor, [{"role": "user", "content": "hi", "session_id": "s1"}])
+
+    assert calls == ["dev"]
+    cfg = captured["configs"][0]
+    assert cfg.model_provided is False
+    assert cfg.api_key is None
+    assert cfg.vertex is None
+    (target,) = cfg.models
+    assert target.name == "gemini-3.8-flash"
+    assert set(target.types) == set(_FakeModelType)
+    assert target.endpoint.base_url == _GATEWAY_URL
+    assert target.endpoint.http_headers == {
+        "Authorization": "Bearer tok-1",
+        "Databricks-Model-Provider-Service": "main.ai.gemini_prod",
+    }
+    assert target.endpoint.api_key == ag._GATEWAY_PLACEHOLDER_API_KEY
+
+
+@pytest.mark.asyncio
+async def test_gateway_without_model_uses_sdk_default_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no model configured, the gateway target names the SDK default."""
+    monkeypatch.delenv("HARNESS_DATABRICKS_MODEL_PROVIDER_SERVICE", raising=False)
+    _fake_cli_tokens(monkeypatch, [3600.0])
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("ok")]])
+    executor = AntigravityExecutor(gateway_base_url=_GATEWAY_URL, databricks_profile="dev")
+
+    await _drain(executor, [{"role": "user", "content": "hi", "session_id": "s1"}])
+
+    (target,) = captured["configs"][0].models
+    assert target.name == "gemini-sdk-default"
+    assert target.endpoint.http_headers == {"Authorization": "Bearer tok-1"}
+
+
+@pytest.mark.asyncio
+async def test_gateway_agent_reused_while_token_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A token well within its lifetime keeps the cached agent."""
+    calls = _fake_cli_tokens(monkeypatch, [3600.0])
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("a")], [_text_step("b")]])
+    executor = AntigravityExecutor(
+        model="gemini-3.8-flash", gateway_base_url=_GATEWAY_URL, databricks_profile="dev"
+    )
+
+    await _drain(executor, [{"role": "user", "content": "one", "session_id": "s1"}])
+    await _drain(executor, [{"role": "user", "content": "two", "session_id": "s1"}])
+
+    assert len(captured["agents"]) == 1
+    assert calls == ["dev"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_agent_rebuilt_with_fresh_token_before_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token inside the refresh margin rebuilds the agent with a new token,
+    and the rebuilt agent is re-seeded with the session's history."""
+    calls = _fake_cli_tokens(
+        monkeypatch, [ag._GATEWAY_TOKEN_REFRESH_MARGIN_SECONDS - 60.0, 3600.0]
+    )
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("a")], [_text_step("b")]])
+    executor = AntigravityExecutor(
+        model="gemini-3.8-flash", gateway_base_url=_GATEWAY_URL, databricks_profile="dev"
+    )
+
+    await _drain(executor, [{"role": "user", "content": "first", "session_id": "s1"}])
+    second = [
+        {"role": "user", "content": "first", "session_id": "s1"},
+        {"role": "assistant", "content": "answer one", "session_id": "s1"},
+        {"role": "user", "content": "second", "session_id": "s1"},
+    ]
+    await _drain(executor, second)
+
+    assert calls == ["dev", "dev"]
+    assert len(captured["agents"]) == 2
+    assert captured["agents"][0].closed is True
+    headers = captured["configs"][1].models[0].endpoint.http_headers
+    assert headers["Authorization"] == "Bearer tok-2"
+    (rebuilt_send,) = captured["agents"][1].conversation.sends
+    assert "assistant: answer one" in rebuilt_send
+    assert "second" in rebuilt_send
+
+
+@pytest.mark.asyncio
+async def test_gateway_token_failure_yields_executor_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CLI that cannot mint a token fails the turn with a login hint."""
+    from omnigent.inner import databricks_executor
+
+    def _fail(profile: str) -> Any:
+        raise ValueError("not logged in")
+
+    monkeypatch.setattr(databricks_executor, "_databricks_cli_profile_token", _fail)
+    monkeypatch.setattr(ag, "_sdk_profile_token", _fail)
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("ok")]])
+    executor = AntigravityExecutor(
+        model="gemini-3.8-flash", gateway_base_url=_GATEWAY_URL, databricks_profile="dev"
+    )
+
+    events = await _drain(executor, [{"role": "user", "content": "hi", "session_id": "s1"}])
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert errors
+    assert "databricks auth login --profile dev" in errors[0].message
+    assert "not logged in" in errors[0].message
+    assert captured["agents"] == []
+    assert executor._session_states == {}
+
+
+@pytest.mark.asyncio
+async def test_gateway_token_falls_back_to_sdk_for_token_profiles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`databricks auth token` serves only OAuth logins; a PAT profile (as in a
+    Databricks personal sandbox) still reaches the gateway through databricks-sdk."""
+    from omnigent.inner import databricks_executor
+    from omnigent.inner.databricks_executor import _DatabricksCliToken
+
+    def _cli_fail(profile: str) -> Any:
+        raise ValueError("cache: databricks OAuth is not configured for this host")
+
+    sdk_profiles: list[str] = []
+
+    def _sdk(profile: str) -> _DatabricksCliToken:
+        sdk_profiles.append(profile)
+        return _DatabricksCliToken(access_token="pat-token", expires_at=time.time() + 3600)
+
+    monkeypatch.setattr(databricks_executor, "_databricks_cli_profile_token", _cli_fail)
+    monkeypatch.setattr(ag, "_sdk_profile_token", _sdk)
+    executor = AntigravityExecutor(
+        model="gemini-3.8-flash", gateway_base_url=_GATEWAY_URL, databricks_profile="DEFAULT"
+    )
+
+    token = await executor._mint_gateway_token()
+
+    assert token.access_token == "pat-token"
+    assert sdk_profiles == ["DEFAULT"]
+
+
+def test_sdk_profile_token_reads_bearer_from_sdk_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SDK fallback turns the profile's Authorization header into a token."""
+    import types
+
+    class _Config:
+        def __init__(self, profile: str) -> None:
+            self.profile = profile
+
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": f"Bearer pat-for-{self.profile}"}
+
+    core = types.ModuleType("databricks.sdk.core")
+    core.Config = _Config  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "databricks.sdk.core", core)
+
+    token = ag._sdk_profile_token("DEFAULT")
+
+    assert token.access_token == "pat-for-DEFAULT"
+    assert token.expires_at > time.time() + 3000
+
+
+@pytest.mark.asyncio
+async def test_gateway_fails_loud_when_sdk_lacks_models_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An SDK without ``LocalAgentConfig.models`` must not silently drop the
+    gateway target and fall back to calling Google."""
+    _fake_cli_tokens(monkeypatch, [3600.0])
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_text_step("ok")]])
+    monkeypatch.setattr(
+        AntigravityExecutor,
+        "_config_field_names",
+        staticmethod(lambda _cls: {"system_instructions", "model", "api_key", "tools", "hooks"}),
+    )
+    executor = AntigravityExecutor(
+        model="gemini-3.8-flash", gateway_base_url=_GATEWAY_URL, databricks_profile="dev"
+    )
+
+    events = await _drain(executor, [{"role": "user", "content": "hi", "session_id": "s1"}])
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert errors
+    assert "upgrade google-antigravity" in errors[0].message
+    assert captured["agents"] == []
+
+
+def test_gateway_requires_databricks_profile() -> None:
+    """A gateway URL without a profile to mint tokens from is rejected."""
+    with pytest.raises(ValueError, match="databricks_profile"):
+        AntigravityExecutor(gateway_base_url=_GATEWAY_URL)
+
+
+# ── Rejected tool calls go back to the model ────────────────────────────
+
+
+def _turn_error(message: str) -> _YieldStep:
+    """A turn-level ERROR step, as the SDK reports a rejected tool call."""
+    return _YieldStep(
+        _FakeStep(step_type=_StepType.FINISH, status=_StepStatus.ERROR, error=message)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        'Denied by policy "confirm_run_command". (denied by pre-tool hook)',
+        "invalid tool call error (invalid_args) unsupported mime type application/octet-stream",
+    ],
+)
+async def test_rejected_tool_call_is_returned_to_the_model(
+    monkeypatch: pytest.MonkeyPatch, error: str
+) -> None:
+    """The error goes back into the same conversation and the turn carries on.
+
+    The SDK's trailing CANCELED step for the request it aborted is drained, not
+    reported as a user cancel.
+    """
+    captured = _install_fake_sdk(
+        monkeypatch,
+        scripts=[
+            [
+                _text_step("looking "),
+                _turn_error(error),
+                _YieldStep(_FakeStep(step_type=_StepType.FINISH, status=_StepStatus.CANCELED)),
+            ],
+            [_text_step("found it")],
+        ],
+    )
+    executor = AntigravityExecutor()
+
+    events = await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+
+    sends = captured["agents"][0].conversation.sends
+    assert sends[0] == "go"
+    assert len(sends) == 2
+    assert error in sends[1]
+    assert "Do not repeat that call" in sends[1]
+    assert not any(isinstance(e, (ExecutorError, TurnCancelled)) for e in events)
+    assert "".join(e.text for e in events if isinstance(e, TextChunk)) == "looking found it"
+    assert isinstance(events[-1], TurnComplete)
+
+
+@pytest.mark.asyncio
+async def test_tool_error_recovery_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A model that keeps making bad calls fails the turn after the recovery budget."""
+    bad = "invalid tool call error (invalid_args)"
+    scripts = [[_turn_error(bad)] for _ in range(ag._MAX_TOOL_ERROR_RECOVERIES + 1)]
+    captured = _install_fake_sdk(monkeypatch, scripts=scripts)
+    executor = AntigravityExecutor()
+
+    events = await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+
+    assert len(captured["agents"][0].conversation.sends) == ag._MAX_TOOL_ERROR_RECOVERIES + 1
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert errors[0].message == bad
+
+
+@pytest.mark.asyncio
+async def test_non_tool_turn_error_still_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only tool-call rejections are handed back; other turn errors fail as before."""
+    captured = _install_fake_sdk(monkeypatch, scripts=[[_turn_error("quota exhausted")]])
+    executor = AntigravityExecutor()
+
+    events = await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+
+    assert captured["agents"][0].conversation.sends == ["go"]
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert [e.message for e in errors] == ["quota exhausted"]
+
+
+# ── Usage from the conversation's running total (newer SDKs) ────────────
+
+
+@dataclass
+class _RunningUsage:
+    """Mirror of the SDK's ``UsageMetadata``, which supports subtraction."""
+
+    prompt_token_count: int = 0
+    cached_content_token_count: int = 0
+    candidates_token_count: int = 0
+    thoughts_token_count: int = 0
+    total_token_count: int = 0
+
+    def __sub__(self, other: _RunningUsage) -> _RunningUsage:
+        return _RunningUsage(
+            *(
+                getattr(self, name) - getattr(other, name)
+                for name in (
+                    "prompt_token_count",
+                    "cached_content_token_count",
+                    "candidates_token_count",
+                    "thoughts_token_count",
+                    "total_token_count",
+                )
+            )
+        )
+
+
+class _UsageCountingConversation(_FakeConversation):
+    """Fake conversation whose ``total_usage`` grows by a fixed amount per send.
+
+    Steps carry no ``usage_metadata``, as on SDK releases that deprecated it.
+    """
+
+    per_send = _RunningUsage(
+        prompt_token_count=1000,
+        cached_content_token_count=400,
+        candidates_token_count=20,
+        thoughts_token_count=30,
+        total_token_count=1050,
+    )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # A previous turn's usage is already in the running total.
+        self._usage = _RunningUsage(prompt_token_count=5, total_token_count=5)
+
+    async def send(self, prompt: Any, **kwargs: Any) -> None:
+        await super().send(prompt, **kwargs)
+        u, d = self._usage, self.per_send
+        self._usage = _RunningUsage(
+            u.prompt_token_count + d.prompt_token_count,
+            u.cached_content_token_count + d.cached_content_token_count,
+            u.candidates_token_count + d.candidates_token_count,
+            u.thoughts_token_count + d.thoughts_token_count,
+            u.total_token_count + d.total_token_count,
+        )
+
+    @property
+    def total_usage(self) -> _RunningUsage:
+        return self._usage
+
+
+@pytest.mark.asyncio
+async def test_turn_usage_comes_from_conversation_total(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no per-step usage, the turn reports the growth of ``total_usage``.
+
+    Thinking tokens count as output (Gemini bills them at the output rate), and
+    a tool-error recovery's second send is included in the same turn.
+    """
+    import sys
+
+    monkeypatch.setattr(sys.modules[__name__], "_FakeConversation", _UsageCountingConversation)
+    _install_fake_sdk(
+        monkeypatch,
+        scripts=[
+            [_text_step("a"), _turn_error("invalid tool call error (invalid_args)")],
+            [_text_step("b")],
+        ],
+    )
+    executor = AntigravityExecutor(model="gemini-3.8-flash")
+
+    seen: list[dict[str, Any]] = []
+
+    def _observer(
+        *, model: str | None, input_tokens: int, output_tokens: int, total_tokens: int
+    ) -> None:
+        seen.append(
+            {"model": model, "in": input_tokens, "out": output_tokens, "total": total_tokens}
+        )
+
+    remove = add_observer(_observer)
+    try:
+        events = await _drain(executor, [{"role": "user", "content": "go", "session_id": "s1"}])
+    finally:
+        remove()
+
+    (complete,) = [e for e in events if isinstance(e, TurnComplete)]
+    # Two sends: prompt 2000 (800 cached), candidates 40 + thoughts 60, total 2100.
+    assert complete.usage == {
+        "model": "gemini-3.8-flash",
+        "input_tokens": 1200,
+        "output_tokens": 100,
+        "total_tokens": 2100,
+        "cache_read_input_tokens": 800,
+    }
+    assert seen == [{"model": "gemini-3.8-flash", "in": 1200, "out": 100, "total": 2100}]
+
+
+class _FakeToolWithSchema:
+    """Mirror of ``google.antigravity.tools.tool_runner.ToolWithSchema``."""
+
+    def __init__(self, fn: Any, input_schema: dict[str, Any]) -> None:
+        self.fn = fn
+        self.input_schema = input_schema
+        self.__name__ = fn.__name__
+        self.__doc__ = fn.__doc__
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return await self.fn(*args, **kwargs)
+
+
+def test_sdk_tools_carry_their_json_schema() -> None:
+    """Omnigent tools reach the SDK with their parameter schema, so the model sees
+    the real argument names instead of a parameterless declaration."""
+    executor = AntigravityExecutor()
+
+    async def _tool_executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"name": name, "args": args}
+
+    executor._tool_executor = _tool_executor
+    schema = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+    module = SimpleNamespace(
+        __name__="fake_antigravity",
+        tools=SimpleNamespace(tool_runner=SimpleNamespace(ToolWithSchema=_FakeToolWithSchema)),
+    )
+
+    (with_schema, bare) = executor._build_sdk_tools(
+        [
+            {"name": "sys_os_read", "description": "Read a file.", "parameters": schema},
+            {"name": "no_params", "description": "No schema.", "parameters": {}},
+        ],
+        module,  # type: ignore[arg-type]
+    )
+
+    assert isinstance(with_schema, _FakeToolWithSchema)
+    assert with_schema.input_schema == schema
+    assert with_schema.__name__ == "sys_os_read"
+    assert asyncio.run(with_schema(path="a.py")) == {
+        "name": "sys_os_read",
+        "args": {"path": "a.py"},
+    }
+    # A tool without a schema stays a plain callable.
+    assert not isinstance(bare, _FakeToolWithSchema)
+    assert bare.__name__ == "no_params"
+
+
+def test_zero_valued_optional_args_are_dropped() -> None:
+    """Gemini fills unset optional parameters with zero values; those are dropped so
+    the tool uses its own default, while required and undeclared arguments pass."""
+    executor = AntigravityExecutor()
+    seen: list[dict[str, Any]] = []
+
+    async def _tool_executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        seen.append(args)
+        return {"ok": True}
+
+    executor._tool_executor = _tool_executor
+    schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "limit": {"type": "integer"},
+            "offset": {"type": "integer"},
+            "recursive": {"type": "boolean"},
+        },
+        "required": ["path", "offset"],
+    }
+    tool = executor._make_tool_callable("sys_os_read", "Read a file.", schema)
+
+    asyncio.run(tool(path="a.py", limit=0, offset=0, recursive=False, extra=""))
+
+    # limit (optional, 0) dropped; offset kept (required); False kept (not a zero
+    # value); extra kept (not declared, so not ours to judge).
+    assert seen == [{"path": "a.py", "offset": 0, "recursive": False, "extra": ""}]

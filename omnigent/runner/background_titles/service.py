@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 import httpx
 
+from omnigent.databricks_ai_gateway import MODEL_PROVIDER_SERVICE_ENV_VAR
 from omnigent.harness_plugins import (
     BackgroundTitleGeneratorSpec,
     background_title_generators,
@@ -176,6 +177,10 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         raise RuntimeError(f"background title generator {spec.generator!r} is not callable")
     typed_generator = cast(BackgroundTitleGenerator, generator)
     title_model = background_title_model(context.harness)
+    if MODEL_PROVIDER_SERVICE_ENV_VAR in context.spawn_env:
+        # A model provider service only serves its own listed models, never the
+        # economy alias; title the session on its own (provider) model instead.
+        title_model = None
     if title_model is not None and context.title_model is None:
         try:
             title = await typed_generator(replace(context, title_model=title_model))

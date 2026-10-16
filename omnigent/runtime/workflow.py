@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.databricks_ai_gateway import GEMINI_GATEWAY_PATH
 from omnigent.entities import (
     NON_CONTENT_ITEM_TYPES,
     CompactionData,
@@ -249,10 +250,9 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         catalog_family="openai",
     ),
     # NB: ``antigravity`` is intentionally absent. Unlike the gateway
-    # harnesses above, the Antigravity SDK authenticates Gemini-natively
-    # (API key or Vertex AI) and has no OpenAI-compatible ``base_url``, so it
-    # has no ucode gateway entry — ``_build_antigravity_spawn_env`` threads
-    # ``HARNESS_ANTIGRAVITY_API_KEY`` / ``_VERTEX`` directly.
+    # harnesses above, the Antigravity SDK speaks the native Gemini API, so it
+    # has no ucode gateway entry — ``_build_antigravity_spawn_env`` threads its
+    # API key / Vertex / Databricks gateway env vars directly.
 }
 
 
@@ -531,7 +531,8 @@ _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     "pi": "HARNESS_PI_DATABRICKS_PROFILE",
     "openai-agents-sdk": "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE",
     "qwen": "HARNESS_QWEN_DATABRICKS_PROFILE",
-    # NB: no ``antigravity`` — it has no Databricks/gateway path (Gemini-native).
+    # NB: no ``antigravity`` — its Databricks profile is set by
+    # ``_build_antigravity_spawn_env``, not the provider-config path.
     # NB: no ``kimi`` — upstream kimi has no per-spawn provider override flag,
     # so Omnigent cannot thread a Databricks gateway through. Users configure
     # providers via ``kimi provider add`` in ``~/.kimi-code/config.toml``
@@ -2400,18 +2401,24 @@ def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
     Map ``spec.executor`` fields → the ``HARNESS_ANTIGRAVITY_*`` env vars the
     antigravity harness wrap reads.
 
-    Antigravity is Gemini-native with no OpenAI-compatible ``base_url``, so there
-    is no gateway / ucode / Databricks path — only a direct API key or Vertex AI.
+    Antigravity is Gemini-native with no OpenAI-compatible ``base_url``. Auth is a
+    direct API key, Vertex AI, or Databricks Unity Gateway's native Gemini route.
     API-key resolution (first wins): (1) spec ``executor.auth`` api_key; (2) the
     dedicated ``antigravity:`` config block from ``omnigent setup``; (3) an
     ambient ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY``. The legacy global
     ``auth:`` block is deliberately NOT consulted: it carries the OpenAI/gateway
     key the other SDK harnesses inherit (an ``sk-…`` key), which the Gemini-native
     SDK can't use — adopting it would guarantee an auth failure / mis-billing and
-    shadow the user's ambient ``GEMINI_API_KEY``. Any ``base_url`` is dropped (the
-    SDK has no such field). Vertex AI is opt-in via ``executor.config``
-    vertex/project/location, independent of the key path. A ``DatabricksAuth`` is
-    unsupported — warned and ignored.
+    shadow the user's ambient ``GEMINI_API_KEY``. Any api-key ``base_url`` is
+    dropped. Vertex AI is opt-in via ``executor.config`` vertex/project/location,
+    independent of the key path.
+
+    A ``DatabricksAuth`` routes through ``<workspace>/ai-gateway/gemini`` (the
+    gateway's native ``generateContent`` route): the profile's workspace host
+    becomes ``HARNESS_ANTIGRAVITY_GATEWAY_BASE_URL`` and the profile itself
+    ``HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE``, from which the harness mints
+    bearer tokens with the Databricks CLI (``databricks-sdk`` for token-based
+    profiles). No Gemini key is adopted on that path.
 
     Model: ``executor.model`` wins. When unset, ``antigravity.model`` from
     config is threaded so brain-picker sessions do not inherit an unintended
@@ -2435,14 +2442,26 @@ def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
         env["HARNESS_ANTIGRAVITY_MODEL"] = model
 
     spec_auth = spec.executor.auth
-    if spec_auth is not None and not isinstance(spec_auth, ApiKeyAuth):
-        # Non-api_key auth implies gateway/base_url routing the SDK can't do.
+    if isinstance(spec_auth, DatabricksAuth):
+        workspace_url = get_workspace_url_for_profile(spec_auth.profile)
+        if workspace_url is None:
+            raise OmnigentError(
+                f"antigravity harness: Databricks profile {spec_auth.profile!r} has no "
+                "workspace host; run `databricks auth login --profile "
+                f"{spec_auth.profile}` first",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        env["HARNESS_ANTIGRAVITY_GATEWAY_BASE_URL"] = (
+            f"{workspace_url.rstrip('/')}{GEMINI_GATEWAY_PATH}"
+        )
+        env["HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE"] = spec_auth.profile
+    elif spec_auth is not None and not isinstance(spec_auth, ApiKeyAuth):
+        # Any other non-api_key auth implies routing the SDK can't do.
         # Warn (don't drop silently — that looks like "my auth didn't take").
         _logger.warning(
             "antigravity harness: spec executor.auth is %s, but the Antigravity "
-            "SDK only supports a direct API key or Vertex AI. Ignoring it and "
-            "falling back to ambient Gemini credentials — configure an api_key, "
-            "or executor.config vertex/project/location, instead.",
+            "SDK only supports a direct API key, Vertex AI, or Databricks auth. "
+            "Ignoring it and falling back to ambient Gemini credentials.",
             type(spec_auth).__name__,
         )
 
