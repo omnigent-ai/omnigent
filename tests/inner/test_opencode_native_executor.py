@@ -66,6 +66,7 @@ def _seed_state(
     session_id: str = "conv_1",
     opencode_session_id: str = "ses_1",
     model_override: str | None = None,
+    variant_override: str | None = None,
 ) -> None:
     write_bridge_state(
         bridge_dir,
@@ -75,6 +76,7 @@ def _seed_state(
             opencode_session_id=opencode_session_id,
             auth_secret="pw",
             model_override=model_override,
+            variant_override=variant_override,
         ),
     )
 
@@ -154,6 +156,25 @@ async def test_run_turn_pins_resolved_model_on_prompt(
     assert body["model"] == {"providerID": "anthropic", "modelID": "claude-opus-4"}
 
 
+async def test_run_turn_pins_variant_override_on_prompt(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A variant pinned alongside the model reaches the prompt body."""
+    _seed_state(
+        tmp_path,
+        model_override="opencode-go/deepseek-v4.1-flash",
+        variant_override="max",
+    )
+    executor = _executor(tmp_path, monkeypatch)
+    events = await _run(executor, "hello")
+    assert [type(e) for e in events] == [TurnComplete]
+    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
+    assert len(prompt_reqs) == 1
+    body = prompt_reqs[0][2]
+    assert body["model"] == {"providerID": "opencode-go", "modelID": "deepseek-v4.1-flash"}
+    assert body["variant"] == "max"
+
+
 async def test_run_turn_omits_model_when_no_override(
     fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -163,6 +184,26 @@ async def test_run_turn_omits_model_when_no_override(
     await _run(executor, "hello")
     prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
     assert "model" not in prompt_reqs[0][2]
+
+
+async def test_run_turn_pins_variant_without_model_override(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A variant-only pin reaches the prompt even with no model override.
+
+    A spec that sets ``executor.variant`` but no model leaves OpenCode on its
+    own default model; the variant must still ride the prompt rather than be
+    dropped because the bridge state has no ``model_override``.
+    """
+    _seed_state(tmp_path, variant_override="max")
+    executor = _executor(tmp_path, monkeypatch)
+    events = await _run(executor, "hello")
+    assert [type(e) for e in events] == [TurnComplete]
+    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
+    assert len(prompt_reqs) == 1
+    body = prompt_reqs[0][2]
+    assert body["variant"] == "max"
+    assert "model" not in body
 
 
 async def test_run_turn_no_user_content_errors(
