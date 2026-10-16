@@ -1,0 +1,20 @@
+---
+# One pre-created tenant namespace for `namespace_provisioning: external`.
+# The name is what `namespace_template` renders for the owner (default
+# `omnigent-u-{owner}`): a label-safe owner such as `alice` renders verbatim; an
+# owner that needs normalizing (`alice@example.com`) renders as the normalized
+# form plus an 8-hex SHA-256 suffix, e.g. `omnigent-u-alice-example-com-ff8d9819`.
+# The server checks the omnigent.ai/tenant label matches the session owner and
+# refuses to share a namespace labelled for somebody else.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: omnigent-u-alice
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: runner
+    omnigent.ai/tenant: alice
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

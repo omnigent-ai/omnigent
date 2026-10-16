@@ -46,6 +46,7 @@ Platform notes that shape this launcher:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib
 import logging
 import os
@@ -122,6 +123,37 @@ out-of-cluster fallback. Ignored when in-cluster config loads."""
 # and defeat the two-namespace blast-radius split.
 _DEFAULT_NAMESPACE: str = "omnigent-sandboxes"
 _DEFAULT_SERVICE_ACCOUNT: str = "omnigent-runner"
+
+# Dual-layer data plane: with ``namespace_strategy: per-user`` each session
+# owner's sandboxes land in their own namespace rendered from
+# ``namespace_template``, so Kubernetes' namespace-scoped tenancy controls
+# (ResourceQuota, NetworkPolicy, Pod Security, RBAC) bound one user at a time.
+NAMESPACE_STRATEGY_SHARED: str = "shared"
+NAMESPACE_STRATEGY_PER_USER: str = "per-user"
+NAMESPACE_STRATEGIES: tuple[str, ...] = (NAMESPACE_STRATEGY_SHARED, NAMESPACE_STRATEGY_PER_USER)
+NAMESPACE_PROVISIONING_SERVER: str = "server"
+NAMESPACE_PROVISIONING_EXTERNAL: str = "external"
+NAMESPACE_PROVISIONING_MODES: tuple[str, ...] = (
+    NAMESPACE_PROVISIONING_EXTERNAL,
+    NAMESPACE_PROVISIONING_SERVER,
+)
+DEFAULT_NAMESPACE_TEMPLATE: str = "omnigent-u-{owner}"
+# ``namespace/name`` of the server's own ServiceAccount, the subject the server
+# binds the sandbox-manager ClusterRole to inside a namespace it provisions.
+# Matches deploy/kubernetes/overlays/sandbox-runners/serviceaccount-server.yaml.
+DEFAULT_SERVER_SERVICE_ACCOUNT: str = "omnigent/omnigent-server"
+# ClusterRole carrying the same rules as the overlay's namespaced Role; bound per
+# tenant namespace so the server's rights stay scoped to namespaces it owns.
+SANDBOX_MANAGER_CLUSTER_ROLE: str = "omnigent-sandbox-manager"
+# The one bundled NetworkPolicy template: no ingress to runner Pods at all.
+NETWORK_POLICY_DEFAULT_DENY_INGRESS: str = "default-deny-ingress"
+NETWORK_POLICY_TEMPLATES: tuple[str, ...] = (NETWORK_POLICY_DEFAULT_DENY_INGRESS,)
+POD_SECURITY_LEVELS: tuple[str, ...] = ("privileged", "baseline", "restricted")
+_TENANT_LABEL: str = "omnigent.ai/tenant"
+_OWNER_PLACEHOLDER: str = "{owner}"
+# Hex digits of the owner's SHA-256 appended when normalization or truncation
+# could make two owners collide on one namespace name.
+_OWNER_HASH_LEN: int = 8
 
 # Pod resource sizing. Matches the other launchers' 2 vCPU / 4 GiB ceiling; a
 # low request keeps the Pod schedulable on modest nodes while the limit caps a
@@ -387,6 +419,70 @@ def _validate_k8s_name_env(
             f"environment variable {env_var} is not a valid Kubernetes name "
             f"({form}, max {max_len} chars): {value!r}"
         )
+
+
+def _owner_slug(owner: str, max_len: int) -> str:
+    """
+    Reduce a session owner to a DNS-label fragment of at most *max_len* chars.
+
+    Lowercase, every run outside ``[a-z0-9-]`` becomes ``-``, runs of ``-``
+    collapse and leading/trailing ``-`` are stripped. Whenever that lost
+    information (the owner was not already such a label) or the fragment had to
+    be truncated, a short stable hash of the ORIGINAL owner is appended so two
+    distinct owners can never share a namespace (``a.b`` vs ``a-b``, or two
+    long emails with the same prefix).
+
+    :param owner: The session owner, e.g. ``"alice@example.com"``.
+    :param max_len: Characters available for the fragment inside the template.
+    :returns: The fragment, e.g. ``"alice-example-com-3f2a9c1e"``.
+    :raises ValueError: When *owner* is empty or *max_len* cannot hold a hash.
+    """
+    if not owner.strip():
+        raise ValueError("session owner is empty; cannot derive a tenant namespace")
+    if max_len < _OWNER_HASH_LEN + 2:
+        raise ValueError(
+            f"namespace template leaves only {max_len} chars for the owner; "
+            f"at least {_OWNER_HASH_LEN + 2} are needed"
+        )
+    slug = re.sub(r"[^a-z0-9-]+", "-", owner.lower())
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    lossless = slug == owner and len(slug) <= max_len
+    if lossless:
+        return slug
+    digest = hashlib.sha256(owner.encode("utf-8")).hexdigest()[:_OWNER_HASH_LEN]
+    head = slug[: max_len - _OWNER_HASH_LEN - 1].rstrip("-")
+    return f"{head}-{digest}" if head else digest
+
+
+def tenant_namespace(owner: str, template: str = DEFAULT_NAMESPACE_TEMPLATE) -> str:
+    """
+    Render the namespace that holds *owner*'s sandboxes.
+
+    *template* must contain ``{owner}`` exactly once; the owner is substituted
+    as a collision-safe DNS-label fragment (see :func:`_owner_slug`) sized so
+    the whole name fits the 63-char namespace limit.
+
+    :param owner: The session owner (``host.user_id``), e.g.
+        ``"alice@example.com"``.
+    :param template: The ``sandbox.kubernetes.namespace_template`` value.
+    :returns: A valid RFC 1123 label, e.g. ``"omnigent-u-alice-example-com-3f2a9c1e"``.
+    :raises ValueError: When the template has no single ``{owner}`` placeholder,
+        the fixed part is not label-safe, or the owner cannot be rendered.
+    """
+    if template.count(_OWNER_PLACEHOLDER) != 1:
+        raise ValueError(
+            f"namespace template must contain {_OWNER_PLACEHOLDER!r} exactly once: {template!r}"
+        )
+    fixed = template.replace(_OWNER_PLACEHOLDER, "")
+    if fixed and not re.fullmatch(r"[a-z0-9-]+", fixed):
+        raise ValueError(
+            f"namespace template may only contain lowercase letters, digits and '-' "
+            f"around {_OWNER_PLACEHOLDER!r}: {template!r}"
+        )
+    name = template.replace(_OWNER_PLACEHOLDER, _owner_slug(owner, 63 - len(fixed)))
+    if not _DNS1123_LABEL_RE.fullmatch(name):
+        raise ValueError(f"rendered tenant namespace is not a valid DNS label: {name!r}")
+    return name
 
 
 def _resolve_pod_resources(resources: dict[str, object] | None) -> dict[str, dict[str, str]]:
@@ -696,6 +792,154 @@ def build_token_secret_manifest(
         },
         "type": "Opaque",
         "stringData": {HOST_TOKEN_ENV_VAR: token},
+    }
+
+
+def _tenant_metadata_labels(owner: str) -> dict[str, str]:
+    """GC/selector labels every provisioned tenant object carries."""
+    return {
+        _MANAGED_BY_LABEL: _MANAGED_BY_VALUE,
+        _TENANT_LABEL: _owner_slug(owner, _LABEL_VALUE_MAX_LEN),
+    }
+
+
+def build_tenant_namespace_manifest(
+    *,
+    name: str,
+    owner: str,
+    labels: Mapping[str, str] | None = None,
+    pod_security: str | None = None,
+) -> dict[str, object]:
+    """
+    Build the Namespace manifest for one tenant (``namespace_provisioning: server``).
+
+    :param name: The namespace from :func:`tenant_namespace`.
+    :param owner: The session owner it belongs to; stamped (normalized) as the
+        ``omnigent.ai/tenant`` label the ``external`` mode also keys on.
+    :param labels: Extra ``namespace_labels``; a ``{owner}`` placeholder in a
+        value is replaced by the normalized owner.
+    :param pod_security: Pod Security Admission level to enforce/warn/audit,
+        or ``None`` to leave admission to the cluster's defaults.
+    :returns: The Namespace manifest dict.
+    """
+    tenant = _owner_slug(owner, _LABEL_VALUE_MAX_LEN)
+    merged: dict[str, str] = {
+        "app.kubernetes.io/name": "omnigent",
+        "app.kubernetes.io/component": "runner",
+        **{k: v.replace(_OWNER_PLACEHOLDER, tenant) for k, v in (labels or {}).items()},
+        **_tenant_metadata_labels(owner),
+    }
+    if pod_security is not None:
+        merged.update(
+            {
+                "pod-security.kubernetes.io/enforce": pod_security,
+                "pod-security.kubernetes.io/enforce-version": "latest",
+                "pod-security.kubernetes.io/warn": pod_security,
+                "pod-security.kubernetes.io/audit": pod_security,
+            }
+        )
+    return {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name, "labels": merged}}
+
+
+def build_runner_service_account_manifest(
+    *, namespace: str, name: str, owner: str
+) -> dict[str, object]:
+    """
+    Build the (powerless, token-less) runner ServiceAccount for a tenant namespace.
+
+    :param namespace: The tenant namespace.
+    :param name: The ServiceAccount name runner Pods run as.
+    :param owner: The tenant, for the GC/selector labels.
+    :returns: The ServiceAccount manifest dict.
+    """
+    return {
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": _tenant_metadata_labels(owner),
+        },
+        "automountServiceAccountToken": False,
+    }
+
+
+def build_sandbox_manager_rolebinding_manifest(
+    *, namespace: str, owner: str, server_service_account: str
+) -> dict[str, object]:
+    """
+    Build the RoleBinding granting the server SA the sandbox-manager ClusterRole
+    in ONE tenant namespace.
+
+    A RoleBinding to a ClusterRole scopes the ClusterRole's rules to the binding's
+    namespace, so the server's Job/Pod/Secret rights never widen beyond the
+    namespaces it provisioned.
+
+    :param namespace: The tenant namespace.
+    :param owner: The tenant, for the GC/selector labels.
+    :param server_service_account: ``namespace/name`` of the server's SA.
+    :returns: The RoleBinding manifest dict.
+    """
+    sa_namespace, sa_name = server_service_account.split("/", 1)
+    return {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {
+            "name": SANDBOX_MANAGER_CLUSTER_ROLE,
+            "namespace": namespace,
+            "labels": _tenant_metadata_labels(owner),
+        },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": SANDBOX_MANAGER_CLUSTER_ROLE,
+        },
+        "subjects": [{"kind": "ServiceAccount", "name": sa_name, "namespace": sa_namespace}],
+    }
+
+
+def build_tenant_resource_quota_manifest(
+    *, namespace: str, owner: str, hard: Mapping[str, str]
+) -> dict[str, object]:
+    """
+    Build the per-tenant ResourceQuota (``namespace_defaults.resource_quota``).
+
+    :param namespace: The tenant namespace.
+    :param owner: The tenant, for the GC/selector labels.
+    :param hard: The quota's ``spec.hard`` entries, e.g. ``{"pods": "10"}``.
+    :returns: The ResourceQuota manifest dict.
+    """
+    return {
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {
+            "name": "omnigent-tenant",
+            "namespace": namespace,
+            "labels": _tenant_metadata_labels(owner),
+        },
+        "spec": {"hard": dict(hard)},
+    }
+
+
+def build_default_deny_ingress_policy_manifest(*, namespace: str, owner: str) -> dict[str, object]:
+    """
+    Build the bundled ``default-deny-ingress`` NetworkPolicy: no Pod in the
+    tenant namespace accepts ingress, so one tenant's runner can never address
+    another's (egress stays open — the host must dial the server).
+
+    :param namespace: The tenant namespace.
+    :param owner: The tenant, for the GC/selector labels.
+    :returns: The NetworkPolicy manifest dict.
+    """
+    return {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": NETWORK_POLICY_DEFAULT_DENY_INGRESS,
+            "namespace": namespace,
+            "labels": _tenant_metadata_labels(owner),
+        },
+        "spec": {"podSelector": {}, "policyTypes": ["Ingress"]},
     }
 
 
@@ -1281,6 +1525,12 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         pod_ready_timeout_s: int | None = None,
         runtime_class: str | None = None,
         home_size_limit: str | None = _HOME_SIZE_LIMIT_DEFAULT,
+        namespace_strategy: str = NAMESPACE_STRATEGY_SHARED,
+        namespace_template: str | None = None,
+        namespace_provisioning: str = NAMESPACE_PROVISIONING_EXTERNAL,
+        namespace_labels: Mapping[str, str] | None = None,
+        namespace_defaults: Mapping[str, object] | None = None,
+        server_service_account: str | None = None,
     ) -> None:
         """
         Store provider config for lazy use by :meth:`start_host` / :meth:`terminate`.
@@ -1294,6 +1544,22 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         :param home_size_limit: ``sizeLimit`` for the writable-HOME emptyDir
             of every Pod, or ``None`` for an unbounded emptyDir (the caller
             decides; ``sandbox.kubernetes.home_size_limit: null`` maps here).
+        :param namespace_strategy: ``"shared"`` (every sandbox in *namespace*)
+            or ``"per-user"`` (each owner's sandboxes in their own namespace,
+            rendered by :func:`tenant_namespace` from the owner bound via
+            :meth:`bind_owner`).
+        :param namespace_template: Per-user namespace template holding one
+            ``{owner}``; ``None`` for :data:`DEFAULT_NAMESPACE_TEMPLATE`.
+        :param namespace_provisioning: ``"external"`` (an operator pre-creates
+            tenant namespaces; a missing one fails the launch) or ``"server"``
+            (the server creates the namespace, runner SA, RoleBinding and
+            *namespace_defaults* on first use).
+        :param namespace_labels: Extra labels for server-provisioned namespaces.
+        :param namespace_defaults: ``resource_quota`` / ``network_policy`` /
+            ``pod_security`` applied when the server provisions a namespace.
+        :param server_service_account: ``namespace/name`` of the server's own
+            SA, the RoleBinding subject in server mode; ``None`` for
+            :data:`DEFAULT_SERVER_SERVICE_ACCOUNT`.
         """
         self._image_ref = image
         self._namespace = namespace
@@ -1310,9 +1576,28 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._pod_ready_timeout_s = pod_ready_timeout_s
         self._runtime_class = runtime_class
         self._home_size_limit = home_size_limit
+        self._namespace_strategy = namespace_strategy
+        self._namespace_template = namespace_template or DEFAULT_NAMESPACE_TEMPLATE
+        self._namespace_provisioning = namespace_provisioning
+        self._namespace_labels = dict(namespace_labels) if namespace_labels else None
+        self._namespace_defaults = dict(namespace_defaults) if namespace_defaults else {}
+        self._server_service_account = server_service_account or DEFAULT_SERVER_SERVICE_ACCOUNT
+        self._owner: str | None = None
         self._core: k8s_client.CoreV1Api | None = None
         self._batch: k8s_client.BatchV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
+
+    def bind_owner(self, owner: str) -> None:
+        """
+        Bind the session owner whose namespace this launcher's sandboxes live in.
+
+        The server calls this right after constructing a launcher for a specific
+        host (launch, relaunch, resume, terminate), so every later namespace
+        resolution is per-tenant. A no-op under the ``shared`` strategy.
+
+        :param owner: The host's ``user_id``, e.g. ``"alice@example.com"``.
+        """
+        self._owner = owner
 
     # ── config / clients ────────────────────────────────────
 
@@ -1362,6 +1647,20 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         _, batch = self._load_clients()
         return batch
 
+    def _load_rbac(self) -> k8s_client.RbacAuthorizationV1Api:
+        """Return an ``RbacAuthorizationV1Api`` on the cached ``ApiClient``."""
+        from kubernetes import client
+
+        self._load_clients()
+        return client.RbacAuthorizationV1Api(self._api_client)
+
+    def _load_networking(self) -> k8s_client.NetworkingV1Api:
+        """Return a ``NetworkingV1Api`` on the cached ``ApiClient``."""
+        from kubernetes import client
+
+        self._load_clients()
+        return client.NetworkingV1Api(self._api_client)
+
     def _close_clients(self) -> None:
         """
         Close the cached ``ApiClient`` (its urllib3 ``PoolManager``) and drop
@@ -1407,16 +1706,178 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
 
     def _resolve_namespace(self) -> str:
         """
-        Resolve the namespace: constructor → env override → default.
+        Resolve the namespace every object of the current sandbox lives in.
+
+        ``shared``: constructor → env override → default. ``per-user``: the
+        bound owner's namespace from :func:`tenant_namespace` — never a global
+        default, so a launcher that forgot :meth:`bind_owner` fails loudly
+        instead of landing one user's Pods in another's namespace.
 
         :returns: The namespace to create Pods in.
-        :raises click.ClickException: When the env-var override is invalid.
+        :raises click.ClickException: When the env-var override is invalid, or
+            the per-user strategy has no bound owner / unrenderable template.
         """
-        return (
-            self._namespace
-            or self._name_env_override(NAMESPACE_ENV_VAR, kind="label")
-            or _DEFAULT_NAMESPACE
-        )
+        if self._namespace_strategy == NAMESPACE_STRATEGY_SHARED:
+            return (
+                self._namespace
+                or self._name_env_override(NAMESPACE_ENV_VAR, kind="label")
+                or _DEFAULT_NAMESPACE
+            )
+        if self._owner is None:
+            raise click.ClickException(
+                f"sandbox.kubernetes.namespace_strategy is '{self._namespace_strategy}' "
+                "but this launch has no session owner to derive the namespace from"
+            )
+        try:
+            return tenant_namespace(self._owner, self._namespace_template)
+        except ValueError as exc:
+            raise click.ClickException(f"cannot derive the tenant namespace: {exc}") from exc
+
+    def _ensure_tenant_namespace(self, namespace: str) -> None:
+        """
+        Make sure the per-user *namespace* exists before anything is created in it.
+
+        ``external``: the namespace must pre-exist and carry this owner's
+        ``omnigent.ai/tenant`` label (so a slug collision with an operator's
+        namespace for somebody else is refused, not silently shared).
+        ``server``: a missing namespace is created together with the runner SA,
+        the sandbox-manager RoleBinding and the configured defaults; an existing
+        one is left untouched (defaults apply on first creation only).
+
+        :param namespace: The resolved tenant namespace.
+        :raises click.ClickException: When the namespace is missing in external
+            mode, belongs to another tenant, or cannot be provisioned.
+        """
+        from kubernetes.client.rest import ApiException
+
+        assert self._owner is not None
+        owner = self._owner
+        tenant = _owner_slug(owner, _LABEL_VALUE_MAX_LEN)
+        core = self._load_core()
+        try:
+            existing = core.read_namespace(
+                namespace, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
+            )
+        except ApiException as exc:
+            if getattr(exc, "status", None) != 404:
+                raise click.ClickException(
+                    _format_api_error("read tenant namespace", namespace, exc)
+                ) from exc
+            existing = None
+        if existing is not None:
+            labels = getattr(getattr(existing, "metadata", None), "labels", None) or {}
+            stamped = labels.get(_TENANT_LABEL)
+            if stamped is not None and stamped != tenant:
+                raise click.ClickException(
+                    f"Kubernetes namespace '{namespace}' is labelled "
+                    f"{_TENANT_LABEL}={stamped!r}, not this session's owner; refusing to "
+                    "share it. Choose a namespace_template that cannot collide."
+                )
+            return
+        if self._namespace_provisioning != NAMESPACE_PROVISIONING_SERVER:
+            raise click.ClickException(
+                f"Kubernetes namespace '{namespace}' for this session's owner does not "
+                "exist. With sandbox.kubernetes.namespace_provisioning: external an "
+                f"operator must create it (labelled {_TENANT_LABEL}={tenant}) with the "
+                f"'{SANDBOX_MANAGER_CLUSTER_ROLE}' RoleBinding and the runner "
+                "ServiceAccount — see deploy/kubernetes/overlays/sandbox-runners/"
+                "tenant-namespaces/README.md — or switch to namespace_provisioning: server."
+            )
+        self._provision_tenant_namespace(namespace, owner)
+
+    def _provision_tenant_namespace(self, namespace: str, owner: str) -> None:
+        """
+        Create *namespace* and its baseline objects (``namespace_provisioning: server``).
+
+        Each create treats 409 (already exists — a concurrent launch for the
+        same owner won the race) as success, so provisioning is idempotent.
+
+        :param namespace: The tenant namespace to create.
+        :param owner: The session owner it belongs to.
+        :raises click.ClickException: On any other API failure, naming the object.
+        """
+        from kubernetes.client.rest import ApiException
+
+        defaults = self._namespace_defaults
+        pod_security = defaults.get("pod_security")
+        quota = defaults.get("resource_quota")
+        policy = defaults.get("network_policy")
+        core = self._load_core()
+        timeout = _POD_READY_REQUEST_TIMEOUT_S
+        creates: list[tuple[str, Callable[[], object]]] = [
+            (
+                "namespace",
+                lambda: core.create_namespace(
+                    build_tenant_namespace_manifest(
+                        name=namespace,
+                        owner=owner,
+                        labels=self._namespace_labels,
+                        pod_security=str(pod_security) if pod_security else None,
+                    ),
+                    _request_timeout=timeout,
+                ),
+            ),
+            (
+                "serviceaccount",
+                lambda: core.create_namespaced_service_account(
+                    namespace,
+                    build_runner_service_account_manifest(
+                        namespace=namespace, name=self._resolve_service_account(), owner=owner
+                    ),
+                    _request_timeout=timeout,
+                ),
+            ),
+            (
+                "rolebinding",
+                lambda: self._load_rbac().create_namespaced_role_binding(
+                    namespace,
+                    build_sandbox_manager_rolebinding_manifest(
+                        namespace=namespace,
+                        owner=owner,
+                        server_service_account=self._server_service_account,
+                    ),
+                    _request_timeout=timeout,
+                ),
+            ),
+        ]
+        if isinstance(quota, Mapping) and quota:
+            creates.append(
+                (
+                    "resourcequota",
+                    lambda: core.create_namespaced_resource_quota(
+                        namespace,
+                        build_tenant_resource_quota_manifest(
+                            namespace=namespace,
+                            owner=owner,
+                            hard={str(k): str(v) for k, v in quota.items()},
+                        ),
+                        _request_timeout=timeout,
+                    ),
+                )
+            )
+        if policy == NETWORK_POLICY_DEFAULT_DENY_INGRESS:
+            creates.append(
+                (
+                    "networkpolicy",
+                    lambda: self._load_networking().create_namespaced_network_policy(
+                        namespace,
+                        build_default_deny_ingress_policy_manifest(
+                            namespace=namespace, owner=owner
+                        ),
+                        _request_timeout=timeout,
+                    ),
+                )
+            )
+        click.echo(f"▸ Provisioning Kubernetes tenant namespace '{namespace}'")
+        for kind, create in creates:
+            try:
+                create()
+            except ApiException as exc:
+                if getattr(exc, "status", None) == 409:
+                    continue
+                raise click.ClickException(
+                    _format_api_error(f"provision tenant {kind}", namespace, exc)
+                ) from exc
 
     def _resolve_secret(self) -> str | None:
         """
@@ -1572,6 +2033,12 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         if on_stage is not None:
             on_stage("starting")
         core = self._load_core()
+        try:
+            if self._namespace_strategy != NAMESPACE_STRATEGY_SHARED:
+                self._ensure_tenant_namespace(namespace)
+        except BaseException:
+            self._close_clients()
+            raise
         click.echo(
             f"▸ Creating Kubernetes {self.workload_kind} '{sandbox_id}' in "
             f"namespace '{namespace}' from {image}"

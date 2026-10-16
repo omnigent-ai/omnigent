@@ -927,6 +927,20 @@ class SandboxHostLauncher(SandboxLifecycle):
         """Bind credentials needed for background cleanup in one workspace."""
         return nullcontext()
 
+    def bind_owner(self, owner: str) -> None:
+        """
+        Bind the session owner a launcher instance acts for.
+
+        Called by the server right after constructing a launcher for one host
+        (launch, relaunch, resume, terminate) and before any other method.
+        Providers that place each owner's sandboxes in their own tenant unit
+        (the Kubernetes per-user namespace strategy) override it; the default
+        ignores the owner.
+
+        :param owner: The host's ``user_id``, e.g. ``"alice@example.com"``.
+        """
+        del owner
+
     @abstractmethod
     def start_host(
         self,

@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# One tenant namespace for `namespace_provisioning: external`. Copy per user and
+# rename `omnigent-u-alice` / the `omnigent.ai/tenant: alice` label (or template
+# it from your IdP export / GitOps loop).
+resources:
+  - namespace.yaml
+  - serviceaccount-runner.yaml
+  - rolebinding.yaml
+  - resourcequota.yaml
+  - networkpolicy-default-deny-ingress.yaml

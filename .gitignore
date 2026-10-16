@@ -5,7 +5,7 @@
 !.github/**
 .github/**/.*/
 
-.venv/
+.venv
 build/
 dist/
 !examples/extensions/hello-page/src/omnigent_hello_extension/dist/
