@@ -32,14 +32,15 @@ def _assert_folder_cue(page: Page, path: str) -> None:
     expect(row).to_have_class(re.compile(r"\bbg-info/10\b"))
     expect(row.locator("svg.lucide-upload")).to_have_count(1)
     expect(row.locator("svg.lucide-folder, svg.lucide-folder-open")).to_have_count(0)
-    expect(row.locator("[data-upload-glow]")).to_have_count(1)
     expect(row).not_to_have_class(re.compile(r"\bring-2\b"))
     expect(page.locator('[role="status"]').filter(has_text=f"Upload to {path}")).to_have_count(1)
     expect(page.locator('[data-drop-variant="upload"]')).to_have_count(0)
 
 
 def _folder_name_contrast(page: Page, path: str) -> float:
-    return page.locator(f'[data-drop-dir="{path}"][data-drop-folder] [data-upload-glow]').evaluate(
+    return page.locator(
+        f'[data-drop-dir="{path}"][data-drop-folder] button > span.truncate.text-ui'
+    ).evaluate(
         """name => {
           const canvas = document.createElement('canvas');
           const context = canvas.getContext('2d');
