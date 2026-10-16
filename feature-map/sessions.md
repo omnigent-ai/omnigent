@@ -63,7 +63,9 @@ the header menu), and each place is a separate entry point.
   a new session; the original remains available and missing files are not restored.
 - `message-recovery`: a message racing initial runner binding or replacement
   reaches the available runner without a false failed turn. Native sessions
-  initialize before delivery; SDK sub-agents reuse their loaded session state.
+  initialize before delivery, including when an idle reconnect already restored
+  the tunnel. Later messages reuse that generation's completed initialization;
+  SDK sub-agents reuse their loaded session state.
 - `import-progress`: import recent sessions or one session by ID from an online
   machine. Settings shows a spinner and count; the sidebar heading retains
   progress after leaving Settings. Results stay compact, with expandable failure
@@ -502,6 +504,10 @@ plain `uv run pytest`, which starts a private server for the test.
   distinguishes a replacement live on another replica from a failed launch
   with an old heartbeat or a local heartbeat. This controls liveness evidence;
   it does not drive an actual cross-replica host migration.
+- **`message-recovery`, already-connected native runner (server integration):**
+  `tests/server/integration/test_session_host_launch.py::test_relaunch_posts_session_init_before_forwarding_message`
+  checks Claude and Codex first-input initialization, suppression of replaying
+  persisted input, and reuse on the next message without repeating child recovery.
 - **`message-recovery`, SDK sub-agent (server integration, plain `uv run pytest`):**
   `tests/server/integration/test_sessions_child_sessions.py::test_sdk_subagent_recovery_skips_session_init`
   covers recovery during ancestor healing and during the final binding refresh,

@@ -1116,7 +1116,7 @@ async def test_inline_launch_rejects_bad_workspace(
 
 
 async def _inline_launch_session(
-    client: httpx.AsyncClient, comm: ApplicationCommunicator
+    client: httpx.AsyncClient, comm: ApplicationCommunicator, *, harness: str | None = None
 ) -> dict[str, str]:
     """Inline-launch a host-bound session and return its id + runner_id.
 
@@ -1127,9 +1127,11 @@ async def _inline_launch_session(
 
     :param client: Test HTTP client bound to the host-wired app.
     :param comm: Connected host communicator.
+    :param harness: Optional native harness for the uploaded agent.
     :returns: ``{"id": <session id>, "runner_id": <token-bound id>}``.
     """
-    agent = await create_test_agent(client)
+    executor = {"type": "omnigent", "config": {"harness": harness}} if harness else None
+    agent = await create_test_agent(client, executor=executor)
     launch_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     create_resp = await client.post(
         "/v1/sessions",
@@ -2773,10 +2775,12 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     )
 
 
+@pytest.mark.parametrize("connected_harness", [None, "claude-native", "codex-native"])
 async def test_relaunch_posts_session_init_before_forwarding_message(
     client: httpx.AsyncClient,
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
+    connected_harness: str | None,
 ) -> None:
     """The auto-relaunch path runs the session-init handshake (POST
     /v1/sessions) BEFORE forwarding the user's message to the runner.
@@ -2805,13 +2809,17 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
     in ``post_event``'s relaunch branch and ``runner_paths`` loses its
     leading ``/v1/sessions`` POST (first assertion fails). Move it after
     the forward and the index-ordering assertion fails.
+
+    Connected native cases cover idle reconnects whose initialization was
+    deferred. Their first input still needs the handshake; a second input
+    must reuse the completed initialization.
     """
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
 
     comm = await _connect_host(app)
-    session = await _inline_launch_session(client, comm)
+    session = await _inline_launch_session(client, comm, harness=connected_harness)
     session_id = session["id"]
 
     # Record runner POSTs in arrival order so we can assert the handshake
@@ -2831,6 +2839,9 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
             runner_paths.append(request.url.path)
             if request.url.path == "/v1/sessions":
                 init_bodies.append(json.loads(request.content))
+                return httpx.Response(
+                    201, json={"session_init_protocol_version": 2, "terminal_ready": True}
+                )
         if request.url.path.endswith("/events"):
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(200, json={})
@@ -2841,14 +2852,14 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
     )
 
     async def _staged_get_runner_client(sid: str, router: object) -> httpx.AsyncClient | None:
-        """Return ``None`` so the route enters the relaunch branch.
+        """Resolve an already-connected native runner, or drive relaunch.
 
         :param sid: Session id being routed (unused; one session here).
         :param router: Real app runner router (unused — staged here).
-        :returns: ``None``.
+        :returns: The recording client for connected native cases, else ``None``.
         """
         del sid, router
-        return None
+        return fake_runner if connected_harness else None
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _staged_get_runner_client)
 
@@ -2895,6 +2906,17 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
 
     monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _noop_relay_ready)
 
+    from omnigent.server import child_session_recovery
+
+    restorations: list[str] = []
+    schedule_restoration = child_session_recovery.schedule_child_restoration
+
+    def _record_restoration(parent: Conversation, *args: Any, **kwargs: Any) -> None:
+        restorations.append(parent.id)
+        schedule_restoration(parent, *args, **kwargs)
+
+    monkeypatch.setattr(child_session_recovery, "schedule_child_restoration", _record_restoration)
+
     try:
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
@@ -2906,6 +2928,16 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
                 },
             },
         )
+        if connected_harness:
+            assert resp.status_code < 300, resp.text
+            second_response = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "next"}]},
+                },
+            )
+            assert second_response.status_code < 300, second_response.text
     finally:
         # Always close the recording client, even if the POST raised, so a
         # regression can't leak the AsyncClient / emit unclosed-client warnings.
@@ -2926,6 +2958,7 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
         f"the user message should still be forwarded to the runner's /events; "
         f"recorded runner POSTs were {runner_paths!r}"
     )
+    assert len(event_paths) == (2 if connected_harness else 1)
     assert runner_paths.index("/v1/sessions") < runner_paths.index(event_paths[0]), (
         f"session-init handshake must precede the message forward so the "
         f"transcript forwarder is watching first; got order {runner_paths!r}"
@@ -2935,6 +2968,12 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
     assert init_bodies and init_bodies[0]["session_id"] == session_id, (
         f"handshake body should target session {session_id!r}; got {init_bodies!r}"
     )
+    assert len(init_bodies) == 1, "later messages must reuse completed initialization"
+    assert restorations == [session_id], "later messages must not schedule child recovery again"
+    from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
+
+    envelope = parse_runner_session_init_envelope(init_bodies[0])
+    assert envelope is not None and envelope.suppress_recovery_turn
 
 
 async def test_codex_goal_relaunch_posts_session_init_before_goal_event(
