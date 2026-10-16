@@ -81,7 +81,11 @@ from omnigent.harness_plugins import (
 from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
-from omnigent.native.failure_telemetry import failure_log_attributes
+from omnigent.native.failure_telemetry import (
+    FailureContext,
+    failure_log_attributes,
+    normalize_failure_context,
+)
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -4635,10 +4639,12 @@ class _RunnerForwardResult:
     :param status_code: Runner response status, e.g. ``204``.
     :param body: Runner response body text. Empty string when the runner
         returns no body.
+    :param failure_context: Bounded runner diagnostics from an unsuccessful control request.
     """
 
     status_code: int
     body: str
+    failure_context: FailureContext | None = None
 
 
 def _require_external_status_forward(
@@ -6892,7 +6898,10 @@ def _surface_model_change_forward_failure(
         model,
         reason,
         runner_result.body,
-        extra={"session_id": session_id},
+        extra={
+            "session_id": session_id,
+            "attributes": failure_log_attributes(runner_result.failure_context),
+        },
     )
     target = model or "its default model"
     _publish_error_event(
@@ -7097,16 +7106,26 @@ async def _forward_session_change_to_runner_impl(
             extra={"session_id": session_id},
         )
         return None
+    failure_context: FailureContext = {}
     if resp.status_code >= 400:
+        with contextlib.suppress(ValueError, TypeError):
+            payload = resp.json()
+            if isinstance(payload, dict):
+                failure_context = normalize_failure_context(payload.get("failure_context"))
         _logger.warning(
             "Session-change forward rejected for session=%s type=%r status=%s body=%s",
             session_id,
             event.get("type"),
             resp.status_code,
             resp.text,
-            extra={"session_id": session_id},
+            extra={
+                "session_id": session_id,
+                "attributes": failure_log_attributes(failure_context),
+            },
         )
-    return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
+    return _RunnerForwardResult(
+        status_code=resp.status_code, body=resp.text, failure_context=failure_context or None
+    )
 
 
 async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:

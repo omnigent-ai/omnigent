@@ -55,6 +55,28 @@ a `Bearer` prefix. For example, `api key: is missing` now becomes
 Whitespace-delimited label/value matching without `:` or `=`, URL-userinfo
 masking, and cookie-value masking are confined to diagnostic sanitization.
 
+## Runner control failures
+
+Failed native control responses and unhandled runner HTTP 500 responses carry
+bounded `failure_context` metadata. The existing server control-forward and
+model-change failure records retain it, so the cause remains available when
+runner-local logs cannot be collected. Unhandled 500 responses use JSON;
+control error codes, HTTP statuses, and display details retain their existing
+behavior. Errors after a streaming response starts keep their stream-specific
+handling.
+
+`failure_id` joins the response and runner/server records. `failure_source` is
+`runner_request`. The `runner_request_*` fields identify exception and direct
+cause/context types, module/function/line origins, available OS errno, and the
+control operation or route template. They omit raw exception messages, paths,
+arguments, request bodies, and query strings. Missing fields mean unavailable
+evidence. Full tracebacks remain in the local runner log.
+
+The active request session takes precedence over the runner's primary session
+when attributing these records. Older peers may omit this metadata; malformed
+and unknown fields are ignored. This metadata is independent of the native
+stderr capture flag.
+
 ## Codex continuous diagnostics
 
 Enabled capture also configures the app-server's `RUST_LOG` filter. Without an

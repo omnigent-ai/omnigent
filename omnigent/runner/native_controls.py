@@ -29,7 +29,7 @@ from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.runner.app_support import (
-    _client_safe_error_detail,
+    _client_safe_error_payload,
     _SpecEntry,
 )
 from omnigent.runner.native import (
@@ -567,9 +567,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "codex_native_settings_update_failed",
-                    "detail": _client_safe_error_detail(
-                        exc, context="codex-native settings update"
-                    ),
+                    **_client_safe_error_payload(exc, context="codex-native settings update"),
                 },
             ), settings
         finally:
@@ -774,9 +772,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "codex_native_approval_mode_failed",
-                    "detail": _client_safe_error_detail(
-                        exc, context="codex-native approval mode change"
-                    ),
+                    **_client_safe_error_payload(exc, context="codex-native approval mode change"),
                 },
             )
         if not offered:
@@ -916,7 +912,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "pi_native_effort_failed",
-                    "detail": _client_safe_error_detail(exc, context="pi-native effort change"),
+                    **_client_safe_error_payload(exc, context="pi-native effort change"),
                 },
             )
         return Response(status_code=204)
@@ -949,7 +945,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "pi_native_model_failed",
-                    "detail": _client_safe_error_detail(exc, context="pi-native model change"),
+                    **_client_safe_error_payload(exc, context="pi-native model change"),
                 },
             )
         return Response(status_code=204)
@@ -1022,7 +1018,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "claude_native_permission_mode_failed",
-                    "detail": _client_safe_error_detail(
+                    **_client_safe_error_payload(
                         exc, context="claude-native permission mode change"
                     ),
                 },
@@ -1156,9 +1152,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "claude_native_effort_failed",
-                    "detail": _client_safe_error_detail(
-                        exc, context="claude-native effort change"
-                    ),
+                    **_client_safe_error_payload(exc, context="claude-native effort change"),
                 },
             )
         return Response(status_code=204)
@@ -1312,7 +1306,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "claude_native_model_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native model change"),
+                    **_client_safe_error_payload(exc, context="claude-native model change"),
                 },
             )
         # Verify against the statusLine snapshot the forwarder already polls:
@@ -1419,7 +1413,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "cursor_native_model_failed",
-                    "detail": _client_safe_error_detail(exc, context="cursor-native model change"),
+                    **_client_safe_error_payload(exc, context="cursor-native model change"),
                 },
             )
         return Response(status_code=204)
@@ -1448,7 +1442,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "kiro_native_model_failed",
-                    "detail": _client_safe_error_detail(exc, context="kiro-native model change"),
+                    **_client_safe_error_payload(exc, context="kiro-native model change"),
                 },
             )
         return Response(status_code=204)
@@ -1489,7 +1483,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "devin_native_model_failed",
-                    "detail": _client_safe_error_detail(exc, context="devin-native model change"),
+                    **_client_safe_error_payload(exc, context="devin-native model change"),
                 },
             )
         return Response(status_code=204)
@@ -1518,7 +1512,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "devin_native_permission_mode_failed",
-                    "detail": _client_safe_error_detail(
+                    **_client_safe_error_payload(
                         exc, context="devin-native permission mode change"
                     ),
                 },
@@ -1558,7 +1552,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "devin_native_effort_failed",
-                    "detail": _client_safe_error_detail(exc, context="devin-native effort change"),
+                    **_client_safe_error_payload(exc, context="devin-native effort change"),
                 },
             )
         return Response(status_code=204)
@@ -1582,7 +1576,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "devin_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="devin-native compact"),
+                    **_client_safe_error_payload(exc, context="devin-native compact"),
                 },
             )
         return Response(status_code=200)
@@ -1611,7 +1605,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "claude_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native compact"),
+                    **_client_safe_error_payload(exc, context="claude-native compact"),
                 },
             )
         return Response(status_code=200)
@@ -1638,7 +1632,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "codex_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="codex-native compact"),
+                    **_client_safe_error_payload(exc, context="codex-native compact"),
                 },
             )
         return Response(status_code=200)
@@ -1683,7 +1677,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "opencode_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="opencode-native compact"),
+                    **_client_safe_error_payload(exc, context="opencode-native compact"),
                 },
             )
         finally:
@@ -1778,7 +1772,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "opencode_native_clear_failed",
-                    "detail": _client_safe_error_detail(exc, context="opencode-native clear"),
+                    **_client_safe_error_payload(exc, context="opencode-native clear"),
                 },
             )
         return Response(status_code=200)
@@ -1804,7 +1798,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "cursor_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="cursor-native compact"),
+                    **_client_safe_error_payload(exc, context="cursor-native compact"),
                 },
             )
         return Response(status_code=200)
@@ -1828,7 +1822,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "pi_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="pi-native compact"),
+                    **_client_safe_error_payload(exc, context="pi-native compact"),
                 },
             )
         return Response(status_code=200)
@@ -1960,7 +1954,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "hermes_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="hermes-native compact"),
+                    **_client_safe_error_payload(exc, context="hermes-native compact"),
                 },
             )
         return Response(status_code=200)
@@ -1981,7 +1975,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "qwen_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="qwen-native compact"),
+                    **_client_safe_error_payload(exc, context="qwen-native compact"),
                 },
             )
         return Response(status_code=200)
@@ -2128,7 +2122,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "claude_native_cost_popup_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native cost popup"),
+                    **_client_safe_error_payload(exc, context="claude-native cost popup"),
                 },
             )
         return Response(status_code=204)
@@ -2162,7 +2156,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "codex_native_cost_popup_failed",
-                    "detail": _client_safe_error_detail(exc, context="codex-native cost popup"),
+                    **_client_safe_error_payload(exc, context="codex-native cost popup"),
                 },
             )
         return Response(status_code=204)
@@ -2196,7 +2190,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "opencode_native_cost_popup_failed",
-                    "detail": _client_safe_error_detail(exc, context="opencode-native cost popup"),
+                    **_client_safe_error_payload(exc, context="opencode-native cost popup"),
                 },
             )
         return Response(status_code=204)
@@ -2225,9 +2219,7 @@ def build_native_controls(
                 status_code=503,
                 content={
                     "error": "opencode_native_blocked_notice_failed",
-                    "detail": _client_safe_error_detail(
-                        exc, context="opencode-native blocked notice"
-                    ),
+                    **_client_safe_error_payload(exc, context="opencode-native blocked notice"),
                 },
             )
         return Response(status_code=204)
