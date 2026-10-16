@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
     from pathlib import Path
 
-    from omnigent.onboarding.sandboxes.types import RepoWorkspace
+    from omnigent.onboarding.sandboxes.types import RepoWorkspace, SandboxInfo
 
 
 DEFAULT_HOST_IMAGE: str = "ghcr.io/omnigent-ai/omnigent-host:latest"
@@ -948,6 +948,20 @@ class SandboxHostLauncher(SandboxLifecycle):
         here; deployment-wide capability discovery remains unbound. The default
         does nothing for providers using only deployment credentials.
         """
+
+    def get_or_create_for_user(self, *, repos: Sequence[RepoWorkspace] = ()) -> SandboxInfo | None:
+        """Select or create the bound user's reusable sandbox and prepare its workspace.
+
+        Called for each new managed session when ``reusable_hosts`` is enabled.
+        Return the canonical sandbox ID and a nonempty ``workspace_path`` for
+        this session. The controller must authorize the bound principal and
+        make concurrent create-or-get calls idempotent. Omnigent reuses the
+        box's host registration and never calls ``provision`` on this path.
+
+        Return ``None`` to use normal fresh provisioning (the default). Raise
+        on errors; they must not fall back to creating a different box.
+        """
+        return None
 
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         """Set request context before provider preparation, allocation, or resume.
