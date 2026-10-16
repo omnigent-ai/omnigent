@@ -220,10 +220,11 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
           valid = false;
           return;
         }
-        children(token.tokens ?? [], inner);
-        const text = pieces.slice(begin).join("");
-        const marker = ALERT_MARKER.exec(text);
+        const tokens = token.tokens ?? [];
+        children(tokens, inner);
+        const marker = ALERT_MARKER.exec(tokens[0]?.text ?? "");
         if (marker) {
+          const text = pieces.slice(begin).join("");
           pieces.splice(begin, pieces.length - begin, text.slice(marker[0].length));
           starts.splice(charBegin, marker[0].length);
           ends.splice(charBegin, marker[0].length);

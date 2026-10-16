@@ -67,6 +67,7 @@ const cases: [string, string, number, string?][] = [
   ["nested task lists", "- [ ] word\n  - [x] ⟦word⟧\n- [ ] word", 1],
   ["mixed task lists", "- [ ] word\n  - ⟦word⟧\n- [x] word", 1],
   ["alert", "> [!NOTE]\n> word\n> ⟦word⟧\n\nword", 1],
+  ["standalone alert marker", "> [!NOTE]\n>\n> word\n\nword ⟦word⟧", 2],
   ["fence language", "word\n\n```word\n⟦word⟧ word\n```", 1],
   ["indented code", "word\n\n    word\n    ⟦word⟧", 2],
   ["inline code", "word ` ⟦word⟧ ` word", 1],
