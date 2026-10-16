@@ -61,6 +61,14 @@ the header menu), and each place is a separate entry point.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory to fork the conversation into
   a new session; the original remains available and missing files are not restored.
+- `compaction-model-recovery`: a Codex turn that failed while compacting on the
+  previous model shows the provider's error and why on a gray error card, with
+  **Fork session…**. A spent-budget card is gray for every harness, since it
+  isn't an Omnigent failure. Rate-limit and transient failures keep **Retry**
+  instead and point to Fork in the session menu. A fork onto another model
+  rebuilds the conversation from its history instead of cloning Codex's rollout,
+  and fails rather than starting empty if that rebuild fails; the original is
+  unchanged.
 - `message-recovery`: a message racing initial runner binding or replacement
   reaches the available runner without a false failed turn. Native sessions
   initialize before delivery; SDK sub-agents reuse their loaded session state.
@@ -88,7 +96,7 @@ the header menu), and each place is a separate entry point.
 - `canvas-session-health`: an opened Canvas session receives host health and
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
-  (Default / Created / Updated), Display (All / My / Shared / Archived), Ordering
+  (Default / Status / Created / Updated), Display (All / My / Shared / Archived), Ordering
   (Updated / Created) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. Created ordering keeps sessions newest-created first as messages
   arrive;
@@ -96,10 +104,17 @@ the header menu), and each place is a separate entry point.
   clears the cached rows and shows loading while session timestamps refresh,
   including project folders, pins, and Archived. With the flag off,
   sessions always use Updated regardless of the saved preference. Shared sessions
-  get their own section above Sessions. Status grouping is hidden until
-  working/idle detection is reliable; saved Status selections fall back to Default.
+  get their own section above Sessions. Status groups are Needs attention, Unread,
+  Working, Draft, and Done. Working stays visible with muted “No sessions” text
+  when empty. Starting or running sessions enter Working immediately; idle must
+  last 10 seconds before they leave it. Errors and approvals bypass that delay.
+  This only affects grouping, and existing hover/rename holds still apply.
   Created and Updated group by their respective date, independently of ordering,
-  with headings such as “Created today” and “Updated yesterday”. Both replace
+  with the Created/Updated prefix only on the first date section, followed by
+  headings such as “Yesterday” and “Earlier”. Environment metadata shows an icon
+  with its label available to screen readers. Branch also resolves the workspace's
+  checked-out branch when none was recorded at session creation, without hovering.
+  All groupings replace
   Projects, Shared and Sessions with titled groups; the first group's header takes
   the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
   the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
@@ -154,7 +169,7 @@ menu, then filter by project.
 
 **Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
 Projects header holds Grouping, Display, Ordering and Show. In
-Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
+Status, Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
 first group's header. The Select sessions button sits beside it and selects
 project, Shared and Sessions rows together; the Sessions header keeps only New
 session. Hovering a row opens
@@ -207,6 +222,14 @@ The action also appears on an eligible error card inside a Canvas conversation
 or side chat; it continues that conversation, including when another parent
 conversation is open alongside it.
 
+**Codex compaction on the previous model:** in a Codex session whose turn failed
+while compacting on the model its last turn used, choose **Fork session…** on
+the error card. The fork dialog opens for that session; pick the model to
+continue on. A rate-limit or transient failure shows **Retry** instead; fork
+from the session header menu. The action also appears on such a card inside a
+Canvas conversation or side chat, and forks that displayed conversation rather
+than the main session.
+
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
@@ -239,7 +262,11 @@ chats** reopens it. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
-without choosing a workspace.
+without choosing a workspace. The side-chat composer opens the same `/` menu
+affordance as the main composer but with a narrower set — `/help` and the
+session's skills: `/help` is answered locally and a recognised skill runs
+in-process through `slash_command`; a native terminal side chat shows no menu
+and forwards slash text to the vendor TUI.
 
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
@@ -351,6 +378,18 @@ plain `uv run pytest`, which starts a private server for the test.
   mobile drawer recover the child while leaving the neighboring parent intact.
   Host filesystem and fork/launch responses are mocked; this does not prove a
   native CLI received history or started in that directory.
+- **`compaction-model-recovery`:**
+  `tests/harnesses/codex_native/forwarder/test_turn_errors.py::test_error_during_compaction_reports_the_previous_model_it_ran_on`
+  covers detection;
+  `tests/server/integration/test_sessions_endpoints.py::test_native_failures_are_coded_live_and_after_reload`
+  (plain `uv run pytest`) covers the card live and after reload, including
+  retryable and expired-login failures that keep their own codes;
+  `tests/runner/test_codex_model_pick_fallback.py::test_fork_onto_another_model_rebuilds_history_instead_of_cloning`
+  covers the rebuilt fork, and
+  `tests/runner/test_codex_model_pick_fallback.py::test_fork_onto_another_model_fails_when_its_history_cannot_be_rebuilt`
+  its failed rebuild. The card's hint and **Fork session…** action have
+  component coverage in `web/src/components/blocks/StatusBlocks.test.tsx`.
+  No browser test drives the card into the fork dialog.
 - **`fork`, whole session and resources:**
   `tests/e2e_ui/fork_session/test_fork_preserves_image_attachment.py::test_fork_carries_image_reference_and_its_resource`.
   This uses the header menu and checks that the fork's image URL loads.
@@ -502,6 +541,12 @@ plain `uv run pytest`, which starts a private server for the test.
   distinguishes a replacement live on another replica from a failed launch
   with an old heartbeat or a local heartbeat. This controls liveness evidence;
   it does not drive an actual cross-replica host migration.
+- **`message-recovery`, rotated Codex session (own environment):**
+  `tests/e2e/test_codex_rotated_bridge_relaunch_e2e.py::test_rotated_codex_session_relaunches_into_its_bridge_directory`
+  drives `/new` in real Codex, stops that session's host-launched runner, then
+  sends a chat message to relaunch it. Chat and terminal replies must both
+  reach the rotated conversation with retained or missing bridge state. Only
+  model replies are scripted; no browser interaction is claimed.
 - **`message-recovery`, SDK sub-agent (server integration, plain `uv run pytest`):**
   `tests/server/integration/test_sessions_child_sessions.py::test_sdk_subagent_recovery_skips_session_init`
   covers recovery during ancestor healing and during the final binding refresh,
@@ -595,7 +640,7 @@ plain `uv run pytest`, which starts a private server for the test.
   ordinary sessions still return to the new-session page in
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
 - **`view-options`:**
-  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_date_grouping_and_show_toggles_persist_across_reload`,
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_grouping_and_show_toggles_persist_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
   (enable the flag by patching `GET /v1/info`). Unit tests in

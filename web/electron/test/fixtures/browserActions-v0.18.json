@@ -1,0 +1,57 @@
+{
+  "source": "a8676d23e88df7918f4f8ef1c7c4e3186e710354:web/src/hooks/useBrowserAgentRelay.ts",
+  "requests": [
+    {
+      "action": "snapshot",
+      "args": {},
+      "script": "(() => {\n  const snapshotId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : ('snap-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));\n  window.__omni_refs__ = new Map();\n  window.__omni_snapshot_id__ = snapshotId;\n  let nextRef = 0;\n  const lines = [];\n\n  const TAG_ROLE = {\n    a: 'link', button: 'button', textarea: 'textbox', select: 'combobox',\n    nav: 'navigation', main: 'main', header: 'banner', footer: 'contentinfo',\n    form: 'form', section: 'region', article: 'article', aside: 'complementary',\n    ul: 'list', ol: 'list', li: 'listitem', img: 'image', label: 'label',\n    table: 'table', tr: 'row', td: 'cell', th: 'columnheader',\n    dialog: 'dialog', summary: 'button', details: 'group',\n  };\n  const isInteractiveTag = (tag) =>\n    tag === 'a' || tag === 'button' || tag === 'input' ||\n    tag === 'textarea' || tag === 'select' || tag === 'label' ||\n    tag === 'summary';\n  const isHeading = (tag) => tag && tag.length === 2 && tag[0] === 'h' && tag[1] >= '1' && tag[1] <= '6';\n\n  function getRole(el) {\n    const explicit = el.getAttribute && el.getAttribute('role');\n    if (explicit) return explicit;\n    const tag = el.tagName && el.tagName.toLowerCase();\n    if (!tag) return null;\n    if (tag === 'input') {\n      const t = (el.type || 'text').toLowerCase();\n      if (t === 'submit' || t === 'button' || t === 'reset') return 'button';\n      if (t === 'checkbox') return 'checkbox';\n      if (t === 'radio') return 'radio';\n      if (t === 'range') return 'slider';\n      if (t === 'hidden') return null;\n      return 'textbox';\n    }\n    if (isHeading(tag)) return 'heading';\n    if (TAG_ROLE[tag]) return TAG_ROLE[tag];\n    if (el.hasAttribute && (el.hasAttribute('tabindex') || el.hasAttribute('onclick'))) return 'generic';\n    return null;\n  }\n\n  function getName(el, depth = 0) {\n    if (depth > 4) return '';\n    if (el.getAttribute) {\n      const lbl = el.getAttribute('aria-label');\n      if (lbl) return lbl;\n      const alt = el.getAttribute('alt');\n      if (alt) return alt;\n      const ph = el.getAttribute('placeholder');\n      if (ph) return ph;\n      const ttl = el.getAttribute('title');\n      if (ttl) return ttl;\n    }\n    const tag = el.tagName && el.tagName.toLowerCase();\n    if (tag === 'input' && el.value && el.type !== 'password') return String(el.value).slice(0, 80);\n    let text = '';\n    for (const node of el.childNodes) {\n      if (node.nodeType === 3) text += node.textContent;\n      else if (node.nodeType === 1) {\n        const childTag = node.tagName && node.tagName.toLowerCase();\n        if (depth === 0 && isInteractiveTag(childTag)) continue;\n        text += getName(node, depth + 1);\n      }\n      if (text.length > 80) break;\n    }\n    return text.trim().replace(/\\s+/g, ' ').slice(0, 80);\n  }\n\n  function isVisible(el) {\n    if (!el.getBoundingClientRect) return false;\n    const style = window.getComputedStyle(el);\n    if (style.display === 'none' || style.visibility === 'hidden') return false;\n    if (style.opacity === '0') return false;\n    const rect = el.getBoundingClientRect();\n    return rect.width > 0 && rect.height > 0;\n  }\n\n  function walk(el, depth) {\n    if (!(el instanceof Element)) return;\n    if (!isVisible(el)) return;\n    const role = getRole(el);\n    const picked = role !== null && role !== 'generic';\n    let childDepth = depth;\n    if (picked) {\n      const ref = ++nextRef;\n      window.__omni_refs__.set(ref, new WeakRef(el));\n      const name = getName(el);\n      const indent = '  '.repeat(depth);\n      let line = indent + '- ' + role;\n      if (name) line += ' ' + JSON.stringify(name);\n      line += ' [ref=' + ref + ']';\n      lines.push(line);\n      childDepth = depth + 1;\n    }\n    for (const child of el.children) {\n      walk(child, childDepth);\n    }\n  }\n\n  if (document.body) walk(document.body, 0);\n\n  return JSON.stringify({\n    snapshot_id: snapshotId,\n    url: window.location.href,\n    title: document.title,\n    tree: lines.join('\\n'),\n  });\n})()"
+    },
+    {
+      "action": "click",
+      "args": {
+        "selector": "button[title=\"Save\"]"
+      },
+      "script": "(() => { const el = document.querySelector(\"button[title=\\\"Save\\\"]\"); if (!el) throw new Error('selector not found: ' + \"button[title=\\\"Save\\\"]\");  el.scrollIntoView({ block: 'center', inline: 'center' }); el.click(); return 'ok'; })()"
+    },
+    {
+      "action": "click",
+      "args": {
+        "ref": 1
+      },
+      "script": "(() => { const el = (window.__omni_refs__ && window.__omni_refs__.get(1))?.deref(); if (!window.__omni_refs__) throw new Error('no snapshot in this page — call browser_snapshot first'); if (!window.__omni_refs__.has(1)) throw new Error('ref ' + 1 + ' not in snapshot — call browser_snapshot again'); if (!el) throw new Error('ref ' + 1 + ' was garbage-collected — call browser_snapshot again');  el.scrollIntoView({ block: 'center', inline: 'center' }); el.click(); return 'ok'; })()"
+    },
+    {
+      "action": "click",
+      "args": {
+        "ref": 1,
+        "snapshot_id": "snapshot-1"
+      },
+      "script": "(() => { if (window.__omni_snapshot_id__ !== \"snapshot-1\") throw new Error('snapshot ' + \"snapshot-1\" + ' was superseded by ' + (window.__omni_snapshot_id__ || '(none)') + ' — call browser_snapshot again'); const el = (window.__omni_refs__ && window.__omni_refs__.get(1))?.deref(); if (!window.__omni_refs__) throw new Error('no snapshot in this page — call browser_snapshot first'); if (!window.__omni_refs__.has(1)) throw new Error('ref ' + 1 + ' not in snapshot — call browser_snapshot again'); if (!el) throw new Error('ref ' + 1 + ' was garbage-collected — call browser_snapshot again');  el.scrollIntoView({ block: 'center', inline: 'center' }); el.click(); return 'ok'; })()"
+    },
+    {
+      "action": "type",
+      "args": {
+        "selector": "input[aria-label=\"Name\"]",
+        "text": "Ada \"Lovelace\"\\notes\n☀"
+      },
+      "script": "(() => { const el = document.querySelector(\"input[aria-label=\\\"Name\\\"]\"); if (!el) throw new Error('selector not found: ' + \"input[aria-label=\\\"Name\\\"]\");  el.focus(); const setter = Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value')?.set; if (setter) setter.call(el, \"Ada \\\"Lovelace\\\"\\\\notes\\n☀\"); else el.value = \"Ada \\\"Lovelace\\\"\\\\notes\\n☀\"; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return 'ok'; })()"
+    },
+    {
+      "action": "type",
+      "args": {
+        "ref": 2,
+        "text": "Ada"
+      },
+      "script": "(() => { const el = (window.__omni_refs__ && window.__omni_refs__.get(2))?.deref(); if (!window.__omni_refs__) throw new Error('no snapshot in this page — call browser_snapshot first'); if (!window.__omni_refs__.has(2)) throw new Error('ref ' + 2 + ' not in snapshot — call browser_snapshot again'); if (!el) throw new Error('ref ' + 2 + ' was garbage-collected — call browser_snapshot again');  el.focus(); const setter = Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value')?.set; if (setter) setter.call(el, \"Ada\"); else el.value = \"Ada\"; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return 'ok'; })()"
+    },
+    {
+      "action": "type",
+      "args": {
+        "ref": 2,
+        "snapshot_id": "snapshot-1",
+        "text": "Ada"
+      },
+      "script": "(() => { if (window.__omni_snapshot_id__ !== \"snapshot-1\") throw new Error('snapshot ' + \"snapshot-1\" + ' was superseded by ' + (window.__omni_snapshot_id__ || '(none)') + ' — call browser_snapshot again'); const el = (window.__omni_refs__ && window.__omni_refs__.get(2))?.deref(); if (!window.__omni_refs__) throw new Error('no snapshot in this page — call browser_snapshot first'); if (!window.__omni_refs__.has(2)) throw new Error('ref ' + 2 + ' not in snapshot — call browser_snapshot again'); if (!el) throw new Error('ref ' + 2 + ' was garbage-collected — call browser_snapshot again');  el.focus(); const setter = Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value')?.set; if (setter) setter.call(el, \"Ada\"); else el.value = \"Ada\"; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return 'ok'; })()"
+    }
+  ]
+}

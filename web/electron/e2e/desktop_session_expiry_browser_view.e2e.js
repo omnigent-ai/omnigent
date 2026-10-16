@@ -24,6 +24,7 @@ const path = require("node:path");
 
 const {
   desktopDepsAvailable,
+  execInBrowserView,
   openBrowserFixture,
   spawnServer,
   launchDesktop,
@@ -182,13 +183,6 @@ async function openView(window, conversationId, url) {
   return openBrowserFixture(window, conversationId, url);
 }
 
-async function execInView(window, conversationId, js) {
-  return window.evaluate(
-    ([cid, code]) => window.omnigentDesktop.browserExecute(cid, code),
-    [conversationId, js],
-  );
-}
-
 async function setActive(window, conversationId) {
   return window.evaluate((cid) => window.omnigentDesktop.browserSetActive(cid), conversationId);
 }
@@ -202,7 +196,7 @@ async function waitForViewOnOrigin(window, conversationId, origin, timeoutMs = 3
   for (;;) {
     // oxlint-disable-next-line no-await-in-loop -- Poll each navigation probe sequentially.
     const r = await Promise.race([
-      execInView(window, conversationId, "location.origin"),
+      execInBrowserView(window, conversationId, "location.origin"),
       new Promise((resolve) => {
         setTimeout(() => resolve(null), 3_000);
       }),
@@ -289,7 +283,7 @@ describe(
           assert.equal(opened.ok, true, `browser view open failed: ${opened.error}`);
           await setActive(window, "conv_A");
           await waitForViewOnOrigin(window, "conv_A", server.serverUrl);
-          const painted = await execInView(
+          const painted = await execInBrowserView(
             window,
             "conv_A",
             `document.body.innerHTML = '<div style="font: 28px sans-serif; padding: 40px; background: #1a7f37; color: white; height: 100vh;">' +

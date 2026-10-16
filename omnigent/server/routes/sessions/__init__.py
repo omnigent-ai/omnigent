@@ -638,6 +638,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _maybe_wake_stale_resumable_managed_sandbox as _maybe_wake_stale_resumable_managed_sandbox,
     _native_subagent_wrapper_labels as _native_subagent_wrapper_labels,
     _native_terminal_runtime as _native_terminal_runtime,
+    _note_runner_idle_shutdown as _note_runner_idle_shutdown,
     _persist_external_codex_subagent_start as _persist_external_codex_subagent_start,
     _persist_external_conversation_item as _persist_external_conversation_item,
     _persist_external_devin_subagent_start as _persist_external_devin_subagent_start,

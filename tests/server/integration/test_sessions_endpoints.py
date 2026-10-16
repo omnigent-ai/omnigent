@@ -5681,9 +5681,43 @@ _CODEX_MODEL_CARD = {
 }
 
 
+_CODEX_COMPACTION_MODELS = {
+    "compaction_model": "system.ai.gpt-6-astra",
+    "selected_model": "system.ai.gpt-6-1-sol",
+}
+_CODEX_COMPACTION_BUDGET_DETAIL = (
+    'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+    '"Budget \\"example-budget\\" has reached its limit of $100."}'
+)
+_CODEX_COMPACTION_BUDGET_CARD = {
+    "title": "gpt-6-astra is over its AI gateway budget",
+    "cause": (
+        "The AI gateway refused a compaction request on gpt-6-astra: its budget is exhausted. "
+        "Codex retries it every turn before switching to gpt-6-1-sol, so switching models "
+        "doesn't help."
+    ),
+    "remediation": (
+        "Fork this session to continue on gpt-6-1-sol. The fork rebuilds the conversation "
+        "from its history, so it doesn't need gpt-6-astra. Or ask an admin to raise that "
+        "budget."
+    ),
+}
+_CODEX_COMPACTION_RETRY_CARD = {
+    "title": "Codex can't compact on gpt-6-astra right now",
+    "cause": (
+        "Codex compacts this conversation on the previous model, gpt-6-astra, before "
+        "switching to gpt-6-1-sol, and that model is temporarily unavailable."
+    ),
+    "remediation": "Retry later, or choose Fork in the session menu to continue on gpt-6-1-sol.",
+}
+_CODEX_LOGIN_EXPIRED_DETAIL = (
+    "unexpected status 401 Unauthorized: Provided authentication token is expired."
+)
+
+
 @pytest.mark.parametrize("wire_output", [False, True])
 @pytest.mark.parametrize(
-    ("detail", "expected_code", "card", "wrapper", "reauth_required"),
+    ("detail", "expected_code", "card", "wrapper", "reauth_required", "status_extra"),
     [
         (
             'API Error: 499 {"error_code":"CANCELLED","message":""}',
@@ -5691,11 +5725,62 @@ _CODEX_MODEL_CARD = {
             {},
             "claude-code-native-ui",
             False,
+            {},
         ),
-        (_OLD_CLI_DETAIL, "client_update_required", _OLD_CLI_CARD, "claude-code-native-ui", False),
-        (_CODEX_MODEL_DETAIL, None, _CODEX_MODEL_CARD, "codex-native-ui", False),
-        (_CODEX_MODEL_DETAIL, "native_turn_error", {}, "claude-code-native-ui", False),
-        (_CODEX_MODEL_DETAIL, "codex_reauth_required", {}, "codex-native-ui", True),
+        (
+            _OLD_CLI_DETAIL,
+            "client_update_required",
+            _OLD_CLI_CARD,
+            "claude-code-native-ui",
+            False,
+            {},
+        ),
+        (_CODEX_MODEL_DETAIL, None, _CODEX_MODEL_CARD, "codex-native-ui", False, {}),
+        (_CODEX_MODEL_DETAIL, "native_turn_error", {}, "claude-code-native-ui", False, {}),
+        (_CODEX_MODEL_DETAIL, "codex_reauth_required", {}, "codex-native-ui", True, {}),
+        (
+            _CODEX_COMPACTION_BUDGET_DETAIL,
+            "codex_compaction_model_failed",
+            _CODEX_COMPACTION_BUDGET_CARD,
+            "codex-native-ui",
+            False,
+            _CODEX_COMPACTION_MODELS,
+        ),
+        # A retry can clear a temporary failure, so its retryable code stays.
+        (
+            "unexpected status 429 Too Many Requests: rate limit exceeded",
+            "rate_limit_exceeded",
+            _CODEX_COMPACTION_RETRY_CARD,
+            "codex-native-ui",
+            False,
+            _CODEX_COMPACTION_MODELS,
+        ),
+        (
+            "unexpected status 503 Service Unavailable",
+            "transient_upstream_error",
+            _CODEX_COMPACTION_RETRY_CARD,
+            "codex-native-ui",
+            False,
+            _CODEX_COMPACTION_MODELS,
+        ),
+        # A fork doesn't renew an expired login, so the sign-in recovery stays.
+        (
+            _CODEX_LOGIN_EXPIRED_DETAIL,
+            "codex_reauth_required",
+            {},
+            "codex-native-ui",
+            True,
+            _CODEX_COMPACTION_MODELS,
+        ),
+        # Only a Codex session's compaction runs on its previous model.
+        (
+            _CODEX_COMPACTION_BUDGET_DETAIL,
+            "budget_exhausted",
+            {},
+            "claude-code-native-ui",
+            False,
+            _CODEX_COMPACTION_MODELS,
+        ),
     ],
 )
 async def test_native_failures_are_coded_live_and_after_reload(
@@ -5707,6 +5792,7 @@ async def test_native_failures_are_coded_live_and_after_reload(
     card: dict[str, str],
     wrapper: str,
     reauth_required: bool,
+    status_extra: dict[str, str],
 ) -> None:
     """Native failures keep their diagnosis and raw detail through status and persistence."""
     published: list[dict[str, Any]] = []
@@ -5741,7 +5827,7 @@ async def test_native_failures_are_coded_live_and_after_reload(
     )
     assert item_resp.status_code == 202, item_resp.text
 
-    data: dict[str, Any] = {"status": "failed", "response_id": response_id}
+    data: dict[str, Any] = {"status": "failed", "response_id": response_id, **status_extra}
     if reauth_required:
         data["reauth_required"] = True
     if wire_output:
@@ -8636,7 +8722,6 @@ async def test_post_external_permission_mode_change_is_quiet_when_unchanged(
 @pytest.mark.parametrize(
     "mode",
     [
-        "dontAsk",  # real CLI mode, but never rendered as a pane footer
         "turbo",  # not a mode at all
         "",
     ],
@@ -8646,7 +8731,7 @@ async def test_post_external_permission_mode_change_rejects_unsupported_modes(
     mode: str,
 ) -> None:
     """
-    Only switchable modes become labels; anything else fails loud.
+    Only modes the pane footer can report become labels; anything else fails loud.
 
     A footer misread into an unknown value would otherwise persist a mode the
     PATCH path and the web picker can't represent, leaving the picker blank.
@@ -8666,17 +8751,19 @@ async def test_post_external_permission_mode_change_rejects_unsupported_modes(
     assert "external_permission_mode_change" in resp.text
 
 
-async def test_post_external_permission_mode_change_accepts_bypass_read_back(
+@pytest.mark.parametrize("mode", ["bypassPermissions", "dontAsk"])
+async def test_post_external_permission_mode_change_accepts_launch_only_read_back(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    mode: str,
 ) -> None:
     """
-    A pane reporting bypass lands on the label and rewrites the launch arg.
+    A pane reporting a launch-only mode lands on the label and rewrites the launch arg.
 
-    Bypass is launch-only and stays rejected as a PATCH target, but a session
-    launched into it (or cycled back to it inside the TUI) must read back as
-    bypass, or the picker shows a stale mode and a relaunch reopens in the
-    mode last recorded instead of the one the pane is in.
+    Bypass and don't-ask stay rejected as PATCH targets, but a session launched
+    into either must read back as that mode, or the picker shows a stale mode
+    and a relaunch reopens in the mode last recorded instead of the one the
+    pane is in.
     """
     published: list[tuple[str, dict[str, Any]]] = []
     _capture_published(monkeypatch, published)
@@ -8690,20 +8777,15 @@ async def test_post_external_permission_mode_change_accepts_bypass_read_back(
         f"/v1/sessions/{session['id']}/events",
         json={
             "type": "external_permission_mode_change",
-            "data": {"permission_mode": "bypassPermissions"},
+            "data": {"permission_mode": mode},
         },
     )
     assert resp.status_code == 202, resp.text
     assert [event["type"] for _, event in published] == ["session.permission_mode"]
-    assert published[0][1]["permission_mode"] == "bypassPermissions"
+    assert published[0][1]["permission_mode"] == mode
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "bypassPermissions"
-    assert snapshot["terminal_launch_args"] == [
-        "--model",
-        "opus",
-        "--permission-mode",
-        "bypassPermissions",
-    ]
+    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == mode
+    assert snapshot["terminal_launch_args"] == ["--model", "opus", "--permission-mode", mode]
 
 
 async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
