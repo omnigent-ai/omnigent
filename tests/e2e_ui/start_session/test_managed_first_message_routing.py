@@ -262,7 +262,7 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             # The unbound sandbox is launching; the composer must not report a missing host.
             host_chip = page.get_by_test_id("composer-host-select")
             await expect(host_chip).to_have_attribute(
-                "aria-label", "Host Sandbox, Provisioning sandbox"
+                "aria-label", "Host Modal Sandbox, Provisioning sandbox"
             )
             await expect(host_chip.locator(".lucide-monitor-cloud")).to_be_visible()
 

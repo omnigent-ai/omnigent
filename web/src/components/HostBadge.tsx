@@ -175,10 +175,11 @@ export function HostBadge({
           },
         ]
       : [{ label: "Host", value: "None" }];
+    const launchHost = launch?.provider ? sandboxOptionLabel(launch.provider) : "Sandbox";
     if (launchStatus) {
-      label = `Host Sandbox, ${launchStatus}`;
+      label = `Host ${launchHost}, ${launchStatus}`;
       tooltipRows = [
-        { label: "Host", value: "Sandbox" },
+        { label: "Host", value: launchHost },
         { label: "Status", value: launchStatus },
       ];
     }
@@ -219,7 +220,7 @@ export function HostBadge({
                   )}
                 />
               )}
-              <span>{launchStatus ? "Sandbox" : (badge?.label ?? "No host bound")}</span>
+              <span>{launchStatus ? launchHost : (badge?.label ?? "No host bound")}</span>
             </DropdownMenuItem>
             {reconnectable && (
               <DropdownMenuItem disabled={readOnly} onSelect={onReconnect}>

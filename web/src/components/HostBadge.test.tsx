@@ -649,8 +649,11 @@ describe("HostBadge", () => {
 describe("HostBadge during a sandbox launch", () => {
   afterEach(() => useChatStore.setState({ conversationId: null, sandboxStatus: null }));
 
-  function launch(stage: SandboxLaunchStage, hostId: string | null): void {
-    useChatStore.setState({ conversationId: "conv_1", sandboxStatus: { stage, error: null } });
+  function launch(stage: SandboxLaunchStage, hostId: string | null, provider?: string): void {
+    useChatStore.setState({
+      conversationId: "conv_1",
+      sandboxStatus: { stage, error: null, provider },
+    });
     useSessionMock.mockReturnValue({ session: { hostId } });
   }
 
@@ -676,13 +679,13 @@ describe("HostBadge during a sandbox launch", () => {
     expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).not.toBeInTheDocument();
   });
 
-  it("keeps the launch on screen until the bound sandbox's host record loads", () => {
-    launch("connecting", "host_sb");
+  it("names the launching provider until the bound sandbox's host record loads", () => {
+    launch("connecting", "host_sb", "modal");
     useHostsMock.mockReturnValue({ data: [] });
     useSessionHostOnlineMock.mockReturnValue(false);
     const { rerender } = render(<HostBadge sessionId="conv_1" appearance="composer" />);
     const trigger = screen.getByTestId("composer-host-select");
-    expect(trigger).toHaveAccessibleName("Host Sandbox, Starting agent");
+    expect(trigger).toHaveAccessibleName("Host Modal Sandbox, Starting agent");
 
     useHostsMock.mockReturnValue({
       data: [host({ host_id: "host_sb", name: "managed-sb", sandbox_provider: "modal" })],

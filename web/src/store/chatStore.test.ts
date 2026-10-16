@@ -6795,8 +6795,13 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         conversationId: "conv_abc",
         stage: "cloning",
         error: null,
+        provider: "arclet",
       });
-      expect(useChatStore.getState().sandboxStatus).toEqual({ stage: "cloning", error: null });
+      expect(useChatStore.getState().sandboxStatus).toEqual({
+        stage: "cloning",
+        error: null,
+        provider: "arclet",
+      });
     });
 
     it("clears the indicator on ready", () => {
