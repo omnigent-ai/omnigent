@@ -90,7 +90,7 @@ from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
-from omnigent.runner.launch_failure import classify_native_turn_error
+from omnigent.runner.launch_failure import classify_native_turn_error, diagnose_model_unavailable
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
@@ -3349,6 +3349,27 @@ async def _persist_external_assistant_message(
     return persisted.id
 
 
+def _diagnose_external_error(data: ErrorData) -> ErrorData:
+    """
+    Attach the shared model-unavailable card to a bare forwarded provider error.
+
+    Pi mirrors provider rejections verbatim (``Pi model error: 404 …``) with no
+    next step; a harness that already classified its failure keeps its own card.
+    """
+    if data.level == "info" or data.title or data.cause or data.remediation:
+        return data
+    diagnosis = diagnose_model_unavailable(data.message)
+    if diagnosis is None:
+        return data
+    return data.model_copy(
+        update={
+            "title": diagnosis.title,
+            "cause": diagnosis.cause,
+            "remediation": diagnosis.remediation,
+        }
+    )
+
+
 def _parse_external_conversation_item(
     body: SessionEventInput,
 ) -> NewConversationItem:
@@ -3405,6 +3426,8 @@ def _parse_external_conversation_item(
         ) from exc
     if message_id is not None and isinstance(data, MessageData) and data.role == "assistant":
         data = data.model_copy(update={"stream_message_id": message_id})
+    if isinstance(data, ErrorData):
+        data = _diagnose_external_error(data)
     return NewConversationItem(
         type=item_type,
         response_id=response_id.strip(),

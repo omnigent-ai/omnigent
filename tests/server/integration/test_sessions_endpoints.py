@@ -12887,3 +12887,102 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+_PI_MODEL_NOT_FOUND = (
+    'Pi model error: 404 {"type":"error","error":{"type":"not_found_error",'
+    '"message":"model: anthropic/claude-opus-4-8"}}'
+)
+_MODEL_UNAVAILABLE_REMEDIATION = (
+    "Choose a different model with the model picker or /model, or check that the "
+    "provider is configured and your account can access this model."
+)
+
+
+@pytest.mark.parametrize(
+    ("item_data", "card"),
+    [
+        pytest.param(
+            {"source": "execution", "code": "RuntimeError", "message": _PI_MODEL_NOT_FOUND},
+            {
+                "title": "Model unavailable",
+                "cause": _PI_MODEL_NOT_FOUND,
+                "remediation": _MODEL_UNAVAILABLE_REMEDIATION,
+            },
+            id="bare-provider-rejection-gains-card",
+        ),
+        pytest.param(
+            {
+                "source": "execution",
+                "code": "pi_model_change_failed",
+                "message": _PI_MODEL_NOT_FOUND,
+                "title": "Pi kept its model",
+                "remediation": "Pick another model.",
+            },
+            {"title": "Pi kept its model", "cause": None, "remediation": "Pick another model."},
+            id="harness-card-preserved",
+        ),
+        pytest.param(
+            {
+                "source": "execution",
+                "code": "RuntimeError",
+                "message": _PI_MODEL_NOT_FOUND,
+                "cause": "The provider rejected the pinned model.",
+            },
+            {
+                "title": None,
+                "cause": "The provider rejected the pinned model.",
+                "remediation": None,
+            },
+            id="poster-cause-preserved",
+        ),
+        pytest.param(
+            {
+                "source": "execution",
+                "code": "RuntimeError",
+                "message": (
+                    'Pi model error: 401 {"type":"error","error":{"type":"authentication_error",'
+                    '"message":"invalid x-api-key"}}'
+                ),
+            },
+            {"title": None, "cause": None, "remediation": None},
+            id="unrelated-error-unlabeled",
+        ),
+    ],
+)
+async def test_external_error_item_model_unavailable_card_live_and_after_reload(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    item_data: dict[str, str],
+    card: dict[str, str | None],
+) -> None:
+    """
+    A provider model rejection a native harness forwards verbatim gains the
+    shared recovery card on both the live frame and the persisted item, while
+    the original code and message stay intact. Harness-classified and
+    unrelated errors are left as posted.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {"item_type": "error", "item_data": item_data},
+        },
+    )
+    assert resp.status_code in (200, 202), resp.text
+
+    done = [ev for _sid, ev in published if ev.get("type") == "response.output_item.done"]
+    assert len(done) == 1
+    items = await client.get(f"/v1/sessions/{session['id']}/items")
+    errors = [item for item in items.json()["data"] if item["type"] == "error"]
+    assert len(errors) == 1
+    for shown in (done[0]["item"], errors[0]):
+        assert shown["code"] == item_data["code"]
+        assert shown["message"] == item_data["message"]
+        for field, value in card.items():
+            assert shown.get(field) == value, (field, shown)

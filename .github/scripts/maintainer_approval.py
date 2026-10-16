@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -250,6 +251,23 @@ def main() -> int:
     if decision.approved:
         print(decision.reason)
         return 0
+    if (
+        os.environ.get("DEPENDABOT_AUTOMERGE_MODE") == "merge"
+        and (pull.get("user") or {}).get("login") == "dependabot[bot]"
+    ):
+        from dependabot_automerge import evaluate
+
+        try:
+            candidate = evaluate(
+                args.repository,
+                args.pr_number,
+                os.environ.get("EXPECTED_HEAD") or pull["head"]["sha"],
+            )
+        except (ValueError, KeyError, TypeError, OSError, subprocess.CalledProcessError) as exc:
+            print(f"Dependabot update requires human review: {exc}")
+        else:
+            print(f"Dependabot update policy satisfied: {', '.join(candidate['packages'])}")
+            return 0
     print(f"::error::{decision.reason}")
     return 1
 

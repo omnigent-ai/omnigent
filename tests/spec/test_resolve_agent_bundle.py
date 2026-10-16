@@ -77,7 +77,13 @@ def test_resolve_markdown_links_resolve_from_their_own_directory() -> None:
     broken = []
     # rglob does not descend into the symlinked shared skills, so list them explicitly.
     shared = [
-        _AGENT / "skills" / name for name in ("otto-pr-review-loop", "otto-review-remediation")
+        _AGENT / "skills" / name
+        for name in (
+            "otto-pr-review-loop",
+            "otto-review-remediation",
+            "otto-impact-assessment",
+            "otto-drive-pr",
+        )
     ]
     assert all(skill.is_dir() for skill in shared)
     documents = {*_AGENT.rglob("*.md"), *(doc for skill in shared for doc in skill.rglob("*.md"))}
