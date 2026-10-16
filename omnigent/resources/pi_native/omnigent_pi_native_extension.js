@@ -1769,18 +1769,19 @@ module.exports = function (pi) {
     if (!pendingModelError) return;
     const pending = pendingModelError;
     pendingModelError = null;
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    await postConversationItem(
+      config,
+      {
         response_id: pending.responseId,
         item_type: "error",
         item_data: {
           source: "execution",
-          code: "RuntimeError",
+          code: pending.code,
           message: `Pi model error: ${pending.message}`,
         },
       },
-    });
+      pending.sourceId,
+    );
   }
 
   function rememberContext(ctx) {
@@ -2348,7 +2349,12 @@ module.exports = function (pi) {
     if (stopReason === "error" && errorMessage) {
       // Pi >= 0.80.4 retries provider errors with backoff before the run
       // settles; keep only the latest error until the outcome is known.
-      pendingModelError = { responseId, message: errorMessage };
+      pendingModelError = {
+        responseId,
+        message: errorMessage,
+        code: authFailure ? authFailure.code : "RuntimeError",
+        sourceId: assistantMessageSourceId(message, responseId, errorMessage),
+      };
       return;
     }
     // A completed assistant message means Pi recovered from a withheld error.

@@ -3926,6 +3926,7 @@ const originalError = "API key auth failed for provider omnigent: " +
       role: "assistant", provider: "omnigent", stopReason: "error", errorMessage: originalError,
       content: [],
     }}, ctx);
+    await handlers.agent_settled({}, ctx);
     const error = postedEvents.find(e => e.data && e.data.item_type === "error");
     assert.ok(error);
     assert.equal(bodies.length, 2);
@@ -3943,6 +3944,7 @@ const originalError = "API key auth failed for provider omnigent: " +
         role: "assistant", provider: "omnigent", stopReason: "error", errorMessage: originalError,
         content: [], timestamp: Date.now(),
       }}, ctx);
+      await handlers.agent_settled({}, ctx);
       const nextError = postedEvents.find(e => e.data && e.data.item_type === "error");
       assert.equal(nextError.data.item_data.code, "RuntimeError");
     }
