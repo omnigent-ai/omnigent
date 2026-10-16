@@ -372,7 +372,7 @@ def _redact_log_tail(tail: str) -> str:
     return redact_log_text(tail, include_whitespace_credentials=True)
 
 
-def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
+def _runner_exit_error(exit_code: int | None, log_path: Path, *, disk_full: bool) -> str:
     """Compose the human-readable error for a runner that died.
 
     Carries the actual cause to the user: exit code, the host-side log
@@ -386,6 +386,8 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     :param exit_code: The runner process's exit code, e.g. ``1``.
         ``None`` when unknown.
     :param log_path: The runner's captured stdout/stderr log file.
+    :param disk_full: :func:`_host_disk_full` for *log_path*, sampled once per
+        exit so the message and :func:`_runner_exit_category` agree.
     :returns: A multi-line error message ready to surface verbatim in
         a CLI error or API ``error`` field.
     """
@@ -397,7 +399,7 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     if tail.strip():
         lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
         message += "\n--- runner log tail ---\n" + _redact_log_tail("\n".join(lines))
-    if _host_disk_full(log_path):
+    if disk_full:
         # A runner on a full disk usually dies before it can log why.
         message += "\nThe host's disk is full (no space left on device); free space and retry."
     return message
@@ -417,9 +419,9 @@ def _host_disk_full(log_path: Path) -> bool:
         return False
 
 
-def _runner_exit_category(log_path: Path) -> ErrorCategory:
+def _runner_exit_category(disk_full: bool) -> ErrorCategory:
     """Blame a runner exit on the host when its disk is full."""
-    return ErrorCategory.HOST if _host_disk_full(log_path) else ErrorCategory.RUNNER
+    return ErrorCategory.HOST if disk_full else ErrorCategory.RUNNER
 
 
 def _print_lifecycle_line(text: str) -> None:
@@ -2061,12 +2063,13 @@ class HostProcess:
             # The runner died before Popen returned — its actual error
             # is in the captured log, so ship the tail with the result
             # instead of making the user go find the file on the host.
-            error = _runner_exit_error(proc.returncode, log_path)
+            disk_full = _host_disk_full(log_path)
+            error = _runner_exit_error(proc.returncode, log_path, disk_full=disk_full)
             self._trigger_maintenance("runner_launch_failed")
             # The returned result retains the diagnostic tail, while
             # _launch_failed limits the host lifecycle line to its first line.
             return self._launch_failed(
-                frame, error, error_category=_runner_exit_category(log_path)
+                frame, error, error_category=_runner_exit_category(disk_full)
             )
 
         # One live runner per session: the session's previous runner —
@@ -2501,14 +2504,19 @@ class HostProcess:
                 _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
                 return
             # Pre-connect code 0 is a failed launch; send its cause to the server.
-            error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+            error = _runner_exit_error(
+                handle.proc.returncode,
+                handle.log_path,
+                disk_full=_host_disk_full(handle.log_path),
+            )
             _logger.info(
                 "Runner %s exited cleanly (code 0) before connecting; reporting exit",
                 runner_id,
             )
             await self._report_runner_exit(runner_id, error, had_connected=had_connected)
             return
-        error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+        disk_full = _host_disk_full(handle.log_path)
+        error = _runner_exit_error(handle.proc.returncode, handle.log_path, disk_full=disk_full)
         # A non-zero runner exit is a runner-process fault (or a full host
         # disk) that blocks the session; the specific cause lives in the
         # unparsed log tail (lifecycle stage unknown).
@@ -2521,7 +2529,7 @@ class HostProcess:
                 session_id=handle.session_id,
                 stage="runner_process",
                 runner_id=runner_id,
-                error_category=_runner_exit_category(handle.log_path).value,
+                error_category=_runner_exit_category(disk_full).value,
                 error_impact=ErrorImpact.BLOCKING.value,
                 error_phase=ErrorPhase.UNKNOWN.value,
             ),
