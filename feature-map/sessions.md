@@ -61,6 +61,14 @@ the header menu), and each place is a separate entry point.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory to fork the conversation into
   a new session; the original remains available and missing files are not restored.
+- `compaction-model-recovery`: a Codex turn that failed while compacting on the
+  previous model shows the provider's error and why on a gray error card, with
+  **Fork session…**. A spent-budget card is gray for every harness, since it
+  isn't an Omnigent failure. Rate-limit and transient failures keep **Retry**
+  instead and point to Fork in the session menu. A fork onto another model
+  rebuilds the conversation from its history instead of cloning Codex's rollout,
+  and fails rather than starting empty if that rebuild fails; the original is
+  unchanged.
 - `message-recovery`: a message racing initial runner binding or replacement
   reaches the available runner without a false failed turn. Native sessions
   initialize before delivery; SDK sub-agents reuse their loaded session state.
@@ -214,6 +222,14 @@ The action also appears on an eligible error card inside a Canvas conversation
 or side chat; it continues that conversation, including when another parent
 conversation is open alongside it.
 
+**Codex compaction on the previous model:** in a Codex session whose turn failed
+while compacting on the model its last turn used, choose **Fork session…** on
+the error card. The fork dialog opens for that session; pick the model to
+continue on. A rate-limit or transient failure shows **Retry** instead; fork
+from the session header menu. The action also appears on such a card inside a
+Canvas conversation or side chat, and forks that displayed conversation rather
+than the main session.
+
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
@@ -246,7 +262,11 @@ chats** reopens it. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
-without choosing a workspace.
+without choosing a workspace. The side-chat composer opens the same `/` menu
+affordance as the main composer but with a narrower set — `/help` and the
+session's skills: `/help` is answered locally and a recognised skill runs
+in-process through `slash_command`; a native terminal side chat shows no menu
+and forwards slash text to the vendor TUI.
 
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
@@ -358,6 +378,18 @@ plain `uv run pytest`, which starts a private server for the test.
   mobile drawer recover the child while leaving the neighboring parent intact.
   Host filesystem and fork/launch responses are mocked; this does not prove a
   native CLI received history or started in that directory.
+- **`compaction-model-recovery`:**
+  `tests/harnesses/codex_native/forwarder/test_turn_errors.py::test_error_during_compaction_reports_the_previous_model_it_ran_on`
+  covers detection;
+  `tests/server/integration/test_sessions_endpoints.py::test_native_failures_are_coded_live_and_after_reload`
+  (plain `uv run pytest`) covers the card live and after reload, including
+  retryable and expired-login failures that keep their own codes;
+  `tests/runner/test_codex_model_pick_fallback.py::test_fork_onto_another_model_rebuilds_history_instead_of_cloning`
+  covers the rebuilt fork, and
+  `tests/runner/test_codex_model_pick_fallback.py::test_fork_onto_another_model_fails_when_its_history_cannot_be_rebuilt`
+  its failed rebuild. The card's hint and **Fork session…** action have
+  component coverage in `web/src/components/blocks/StatusBlocks.test.tsx`.
+  No browser test drives the card into the fork dialog.
 - **`fork`, whole session and resources:**
   `tests/e2e_ui/fork_session/test_fork_preserves_image_attachment.py::test_fork_carries_image_reference_and_its_resource`.
   This uses the header menu and checks that the fork's image URL loads.
@@ -509,6 +541,12 @@ plain `uv run pytest`, which starts a private server for the test.
   distinguishes a replacement live on another replica from a failed launch
   with an old heartbeat or a local heartbeat. This controls liveness evidence;
   it does not drive an actual cross-replica host migration.
+- **`message-recovery`, rotated Codex session (own environment):**
+  `tests/e2e/test_codex_rotated_bridge_relaunch_e2e.py::test_rotated_codex_session_relaunches_into_its_bridge_directory`
+  drives `/new` in real Codex, stops that session's host-launched runner, then
+  sends a chat message to relaunch it. Chat and terminal replies must both
+  reach the rotated conversation with retained or missing bridge state. Only
+  model replies are scripted; no browser interaction is claimed.
 - **`message-recovery`, SDK sub-agent (server integration, plain `uv run pytest`):**
   `tests/server/integration/test_sessions_child_sessions.py::test_sdk_subagent_recovery_skips_session_init`
   covers recovery during ancestor healing and during the final binding refresh,

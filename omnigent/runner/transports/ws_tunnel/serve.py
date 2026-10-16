@@ -39,8 +39,10 @@ from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_SIGN_IN_PENDING_WAIT_S,
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
+    mark_sign_in_pending,
     touch_connect_marker,
 )
 from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
@@ -197,6 +199,12 @@ _AUTH_REDIRECT_SCHEMES = {"http", "https"}
 # slept through a token's lifetime) never kills a live session — this
 # mirrors the host tunnel's ``_LOGIN_REDIRECT_FATAL_ATTEMPTS`` posture.
 _LOGIN_REDIRECT_FATAL_ATTEMPTS = 3
+
+# A never-connected runner with a pending host sign-in polls before upgrading.
+# Keep this wait below the host connect watchdog's deadline so a runner waiting
+# for credentials is not reported as hung.
+_SIGN_IN_PENDING_WAIT_S = RUNNER_SIGN_IN_PENDING_WAIT_S
+_SIGN_IN_PENDING_POLL_INTERVAL_S = 2.0
 
 
 async def dispatch_via_asgi(
@@ -425,6 +433,10 @@ async def serve_tunnel(
     # the server actually saw.
     attempt = 0
     disconnected_monotonic: float | None = None
+    # When this never-connected runner started waiting for a pending sign-in.
+    sign_in_wait_started: float | None = None
+    # A repeated sign-in cannot extend this launch's bounded wait.
+    sign_in_wait_ended = False
 
     def _mark_connected() -> None:
         nonlocal connected_this_attempt
@@ -470,11 +482,60 @@ async def serve_tunnel(
         if shutdown_event is not None and shutdown_event.is_set():
             # A shutdown requested between reconnect attempts (no live
             # connection to drain): nothing to flush, just stop looping.
+            mark_sign_in_pending(runner_id, None)
             return
         connected_this_attempt = False
         disconnect_error: BaseException | None = None
         close_details: _CloseDetails | None = None
-        auth_token = await _refresh_auth_token(auth_token, auth_token_factory)
+        try:
+            auth_token = await _refresh_auth_token(auth_token, auth_token_factory)
+            pending = (
+                await _sign_in_pending(auth_token_factory)
+                if not ever_connected and not sign_in_wait_ended
+                else False
+            )
+        except BaseException:
+            mark_sign_in_pending(runner_id, None)
+            raise
+        if not ever_connected and not sign_in_wait_ended:
+            if pending and sign_in_wait_started is None:
+                sign_in_wait_started = time.monotonic()
+                mark_sign_in_pending(runner_id, sign_in_wait_started + _SIGN_IN_PENDING_WAIT_S)
+                _logger.warning(
+                    "Runner tunnel is waiting up to %.0fs for the host sign-in to finish",
+                    _SIGN_IN_PENDING_WAIT_S,
+                    extra=debug_event(
+                        "runner_tunnel_sign_in_wait_started",
+                        session_id=runner_primary_session_id(),
+                        runner_id=runner_id,
+                    ),
+                )
+            if sign_in_wait_started is not None:
+                waited_s = time.monotonic() - sign_in_wait_started
+                if pending and waited_s < _SIGN_IN_PENDING_WAIT_S:
+                    try:
+                        await asyncio.sleep(_SIGN_IN_PENDING_POLL_INTERVAL_S)
+                    except BaseException:
+                        mark_sign_in_pending(runner_id, None)
+                        raise
+                    continue
+                sign_in_wait_ended = True
+                mark_sign_in_pending(runner_id, None)
+                if not pending:
+                    # Sign-in can finish between the token call and the flag read.
+                    auth_token = await _refresh_auth_token(auth_token, auth_token_factory)
+                _logger.info(
+                    "Runner tunnel stopped waiting for the host sign-in after %.0fs: %s",
+                    waited_s,
+                    "still pending" if pending else "no longer pending",
+                    extra=debug_event(
+                        "runner_tunnel_sign_in_wait_finished",
+                        session_id=runner_primary_session_id(),
+                        runner_id=runner_id,
+                        outcome="timed_out" if pending else "resolved",
+                        waited_s=round(waited_s, 1),
+                    ),
+                )
         reconnecting = ever_connected
         retry_reason = "connection closed cleanly"
         recycle = False
@@ -773,6 +834,25 @@ async def serve_tunnel(
         # promptly at the base delay instead of doubling toward the cap.
         if not recycle:
             delay_s = min(delay_s * 2, _MAX_RECONNECT_DELAY_S)
+
+
+async def _sign_in_pending(factory: Callable[[], str | None] | None) -> bool:
+    """Return whether *factory*'s credential source is waiting on a sign-in.
+
+    Read off the event loop like the factory call: the flag can wait on a lock
+    the factory holds through a concurrent mint request.
+    """
+    if factory is None:
+        return False
+    try:
+        return bool(await asyncio.to_thread(getattr, factory, "sign_in_pending", False))
+    except Exception:  # noqa: BLE001 - optional status cannot prevent a tunnel upgrade.
+        _logger.warning(
+            "sign_in_pending read failed; continuing with the available credential",
+            exc_info=True,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return False
 
 
 def _prepare_auth_retry(factory: Callable[[], str | None] | None) -> None:
