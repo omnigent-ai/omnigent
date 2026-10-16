@@ -339,8 +339,10 @@ from omnigent.server.routes._sessions.common import (
     _session_status_cache as _session_status_cache,
     _session_terminal_pending_cache as _session_terminal_pending_cache,
     get_server_host_registry as get_server_host_registry,
+    get_server_host_store as get_server_host_store,
     get_server_runner_router as get_server_runner_router,
     set_server_host_registry as set_server_host_registry,
+    set_server_host_store as set_server_host_store,
     set_server_runner_router as set_server_runner_router,
 )
 
@@ -603,7 +605,12 @@ from omnigent.server.routes._sessions.helpers import (
 # Higher-layer orchestration flows (runner relay, session-event dispatch,
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
 from omnigent.server.routes._sessions.orchestration import (
+    HOST_OFFLINE_HOLD_S as HOST_OFFLINE_HOLD_S,
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
+    _HOST_OFFLINE_RECHECK_S as _HOST_OFFLINE_RECHECK_S,
+    _host_offline_state as _host_offline_state,
+    _log_host_offline_hold as _log_host_offline_hold,
+    _split_host_offline_holds as _split_host_offline_holds,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
     _stop_host_runner_intentionally as _stop_host_runner_intentionally,

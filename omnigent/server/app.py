@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager, suppress
 from importlib import import_module
 from itertools import batched, groupby
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
 from fastapi import FastAPI, Query, Request
@@ -121,6 +121,7 @@ from omnigent.server.routes.sessions import (
     announce_hosts_changed,
     create_sessions_router,
     set_server_host_registry,
+    set_server_host_store,
     set_server_runner_router,
 )
 from omnigent.server.routes.sharing import create_sharing_router
@@ -151,6 +152,9 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+
+if TYPE_CHECKING:
+    from omnigent.entities import Conversation
 
 _logger = logging.getLogger(__name__)
 _RECONNECT_BINDING_BATCH_SIZE = 128
@@ -2098,6 +2102,8 @@ def create_app(
     # refill their model catalog from the session's host, from background
     # tasks with no request in scope.
     set_server_host_registry(host_registry)
+    # Runner-disconnect handling reads host liveness from background tasks.
+    set_server_host_store(host_store)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
     # hold a session's runner tunnel serve the same sidebar fields. The
@@ -3526,12 +3532,16 @@ def create_app(
             ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``. Its idle watchdog found no
             active work, so a stale mid-turn status is settled like a Stop.
         """
+        from omnigent.server.routes._sessions.orchestration import _session_host_id
         from omnigent.server.routes.sessions import (
+            HOST_OFFLINE_HOLD_S,
             RUNNER_DISCONNECT_GRACE_S,
+            _host_offline_state,
             _mark_runner_sessions_offline,
             _note_runner_idle_shutdown,
             _relinquish_session_live_state,
             _runner_live_on_another_replica_from_conversations,
+            _split_host_offline_holds,
         )
         from omnigent.server.schemas import ErrorDetail
 
@@ -3594,19 +3604,137 @@ def create_app(
                 ),
             )
         else:
-            _logger.warning(
+            # Each interrupted turn logs its own failure; the sweep itself is routine.
+            _logger.info(
                 "Runner %s disconnected; reconciling %d bound session(s)",
                 runner_id,
                 len(affected),
             )
-        await _mark_runner_sessions_offline(
-            affected,
-            ErrorDetail(
-                code="runner_disconnected",
-                message="Runner disconnected unexpectedly.",
-            ),
-            conversation_store,
+        error = ErrorDetail(
+            code="runner_disconnected",
+            message="Runner disconnected unexpectedly.",
         )
+        if not idle_shutdown:
+            settle_now, held = _split_host_offline_holds(affected)
+            host_id = next((conv.host_id for conv in held if conv.host_id is not None), None)
+            if held and host_id is None:
+                host_id = await _session_host_id(held[0], conversation_store)
+            if held and await _host_offline_state(host_id) is True:
+                await _mark_runner_sessions_offline(settle_now, error, conversation_store)
+                outcome = await _hold_while_host_offline(runner_id, host_id, held, reference_stamp)
+                if outcome not in ("expired", "host_back_without_runner"):
+                    return
+                try:
+                    affected = await asyncio.to_thread(
+                        conversation_store.list_conversations_by_runner_id, runner_id
+                    )
+                except Exception:  # noqa: BLE001 — the sweep re-checks each held row itself
+                    _logger.warning(
+                        "Runner %s: bound-session reload failed after host-offline hold",
+                        runner_id,
+                        exc_info=True,
+                    )
+                    affected = held
+                if outcome == "expired":
+                    error = ErrorDetail(
+                        code="runner_disconnected",
+                        message=(
+                            "The host for this session went offline and did not "
+                            f"come back within {HOST_OFFLINE_HOLD_S / 3600:g} hours."
+                        ),
+                    )
+        await _mark_runner_sessions_offline(affected, error, conversation_store)
+
+    async def _hold_while_host_offline(
+        runner_id: str,
+        host_id: str | None,
+        held: "list[Conversation]",
+        reference_stamp: int | None,
+    ) -> str:
+        """Wait for a runner whose host went offline mid-turn, and report how it ended.
+
+        Holding the interrupted turns instead of failing them lets a laptop that
+        slept or lost its network resume the turn when it returns. The hold
+        lives in the runner's disconnect-grace slot, so a reconnect resolves it
+        and a crash report cancels it. A host that returns without its runner
+        gets one more grace for the runner, then the turns fail as before.
+        Unreadable rows keep the deadline and retry on the next check.
+
+        :param runner_id: The dropped runner.
+        :param host_id: The offline host the runner ran on.
+        :param held: The interrupted sessions being held.
+        :param reference_stamp: This replica's last liveness stamp for the runner.
+        :returns: ``"runner_reconnected"``, ``"live_elsewhere"`` or
+            ``"server_shutdown"`` when nothing should fail, else ``"expired"``
+            or ``"host_back_without_runner"``.
+        """
+        from omnigent.server.routes.sessions import (
+            _HOST_OFFLINE_RECHECK_S,
+            HOST_OFFLINE_HOLD_S,
+            RUNNER_DISCONNECT_GRACE_S,
+            _host_offline_state,
+            _log_host_offline_hold,
+            _relinquish_session_live_state,
+            _runner_live_on_another_replica_from_conversations,
+        )
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + HOST_OFFLINE_HOLD_S
+        host_back_at: float | None = None
+        _log_host_offline_hold(
+            "runner_disconnect_held_host_offline",
+            held,
+            runner_id=runner_id,
+            host_id=host_id,
+            hold_s=HOST_OFFLINE_HOLD_S,
+        )
+        while True:
+            now = loop.time()
+            wait_until = deadline
+            if host_back_at is not None:
+                wait_until = min(wait_until, host_back_at + RUNNER_DISCONNECT_GRACE_S)
+            if now >= wait_until:
+                outcome = "expired" if host_back_at is None else "host_back_without_runner"
+                break
+            reconnected = await tunnel_registry.wait_for_runner(
+                runner_id, timeout_s=min(_HOST_OFFLINE_RECHECK_S, wait_until - now)
+            )
+            if reconnected is not None:
+                outcome = "runner_reconnected"
+                break
+            if shutdown_state.server_shutting_down():
+                outcome = "server_shutdown"
+                break
+            try:
+                current = await asyncio.to_thread(
+                    conversation_store.list_conversations_by_runner_id, runner_id
+                )
+            except Exception:  # noqa: BLE001 — keep holding; the next check retries
+                _logger.warning(
+                    "Runner %s: host-offline hold re-check failed; retrying",
+                    runner_id,
+                    exc_info=True,
+                )
+                continue
+            if _runner_live_on_another_replica_from_conversations(
+                current, runner_id, reference_stamp
+            ):
+                for conv in current:
+                    _relinquish_session_live_state(conv.id)
+                outcome = "live_elsewhere"
+                break
+            if host_back_at is None and await _host_offline_state(host_id) is False:
+                host_back_at = loop.time()
+        _log_host_offline_hold(
+            "runner_disconnect_hold_ended",
+            held,
+            runner_id=runner_id,
+            host_id=host_id,
+            outcome=outcome,
+            held_s=round(loop.time() - started, 3),
+        )
+        return outcome
 
     async def _on_runner_disconnect(runner_id: str, connection: RunnerSession) -> None:
         """Schedule offline-marking for the turns *this* runner interrupted.
