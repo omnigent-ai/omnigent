@@ -418,6 +418,26 @@ quota. The next enabled launch in the same bridge directory removes the prior
 owned file and its rotated predecessor. Other user debug files are never read
 or deleted.
 
+## Codex bridge availability
+
+When an input cannot be delivered because bridge state is unavailable, the
+executor emits one INFO `codex_bridge_state_unavailable` record after its
+existing startup wait. Polling does not emit this record. `bridge_state_status`
+distinguishes `missing`, `not_file`, `unreadable`, `invalid_encoding`,
+`invalid_json`, and `invalid_state`; `bridge_state_errno` retains an observed
+OS error number when available. Invalid UTF-8 is treated as unavailable state,
+like malformed JSON, rather than escaping as a decoding exception.
+
+`wait_sleep_ms` is accumulated polling sleep, and `wait_budget_ms` is the
+current nominal budget. `startup_wait_extended` records whether a configured
+command received its longer allowance. `startup_error_present` distinguishes
+a runner-reported startup failure, and `startup_failure_coded` indicates a
+semantic failure code without exporting the marker's content.
+The record uses the same state read that stopped delivery and carries existing
+input correlation IDs when available. It contains no file paths, state bytes,
+startup-error text, or user input. Error wording, wait budgets, and undelivered
+input handling are unchanged.
+
 ## Verification
 
 ```sh

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -124,12 +125,53 @@ def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.cwd == str(tmp_path)
+    observation = codex_native_bridge.read_bridge_state_result(tmp_path)
+    assert observation.state == state
+    assert observation.status == "ready"
+    assert observation.os_errno is None
 
     clear_active_turn_id_if_matches(tmp_path, "turn_1")
 
     updated = read_bridge_state(tmp_path)
     assert updated is not None
     assert updated.cwd == str(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("contents", "status"),
+    [
+        pytest.param(None, "missing", id="missing"),
+        pytest.param(b"\xff", "invalid_encoding", id="invalid-utf8"),
+        pytest.param(b"{", "invalid_json", id="invalid-json"),
+        pytest.param(b"[]", "invalid_state", id="invalid-shape"),
+        pytest.param(
+            b'{"session_id":"private-state-content"}', "invalid_state", id="missing-fields"
+        ),
+    ],
+)
+def test_invalid_bridge_state_is_unavailable_with_content_free_status(
+    tmp_path: Path, contents: bytes | None, status: str
+) -> None:
+    if contents is not None:
+        (tmp_path / "state.json").write_bytes(contents)
+
+    assert read_bridge_state(tmp_path) is None
+    observation = codex_native_bridge.read_bridge_state_result(tmp_path)
+    assert observation.state is None
+    assert observation.status == status
+    assert observation.os_errno == (errno.ENOENT if contents is None else None)
+    assert "private-state-content" not in str(observation)
+
+
+def test_bridge_state_rejects_non_file_without_reading_it(tmp_path: Path) -> None:
+    (tmp_path / "state.json").mkdir()
+
+    assert read_bridge_state(tmp_path) is None
+    observation = codex_native_bridge.read_bridge_state_result(tmp_path)
+    assert observation.state is None
+    assert observation.status == "not_file"
+    assert observation.os_errno is None
+    assert str(tmp_path) not in str(observation)
 
 
 @pytest.fixture
