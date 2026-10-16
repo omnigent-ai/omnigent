@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
@@ -36,6 +37,7 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
+from tests.runner.conftest import _drain_session_event_queue
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -359,6 +361,32 @@ def test_list_resources_filters_by_type(tmp_path: Path) -> None:
 
     term_page = reg.list_resources("conv_1", resource_type="terminal")
     assert all(r.type == "terminal" for r in term_page.data)
+
+
+@pytest.mark.asyncio
+async def test_runner_pane_status_publishes_pty_activity_source() -> None:
+    """Pane-derived status is labeled so the server can treat it as UI-only."""
+    from omnigent.runner import app as app_module
+    from omnigent.runner.app import create_runner_app
+
+    registry = SessionResourceRegistry()
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(204)),
+        base_url="http://server",
+    )
+    try:
+        create_runner_app(server_client=server_client, resource_registry=registry)
+        publisher = registry._session_status_publisher
+        assert publisher is not None
+        publisher("conv_pty_status", "idle", None)
+    finally:
+        await server_client.aclose()
+
+    events = _drain_session_event_queue(
+        app_module._session_event_queues_ref.get("conv_pty_status")
+    )
+    app_module._session_event_queues_ref.pop("conv_pty_status", None)
+    assert events == [{"type": "session.status", "status": "idle", "source": "pty_activity"}]
 
 
 @pytest.mark.asyncio

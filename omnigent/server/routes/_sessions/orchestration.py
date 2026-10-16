@@ -8791,6 +8791,22 @@ async def _relay_runner_stream(
             return
 
 
+# Terminal-native harnesses whose hook forwarder posts the authoritative
+# end-of-turn external_session_status. pi-native and kiro-native have no
+# forwarder: their pane idle is the only end-of-turn signal, so it still
+# completes a scheduled run.
+_PTY_ACTIVITY_HOOK_FORWARDER_HARNESSES = frozenset(
+    {
+        "claude-native",
+        "cursor-native",
+        "goose-native",
+        "hermes-native",
+        "kimi-native",
+        "qwen-native",
+    }
+)
+
+
 async def _relay_runner_stream_once(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -8833,6 +8849,8 @@ async def _relay_runner_stream_once(
     """
     text_acc: list[str] = []
     current_response_id: str | None = None
+    pty_activity_harness: str | None = None
+    pty_activity_harness_resolved = False
     pending_subagent_return_id: str | None = None
     pending_subagent_return_status = "completed"
     # Model/agent label from the turn header, stamped on text segments
@@ -9023,6 +9041,24 @@ async def _relay_runner_stream_once(
                                     None,
                                     conversation_store,
                                 )
+                            # A pane idle also fires right after launch and in
+                            # mid-turn lulls, so it closes a scheduled run only for
+                            # harnesses with no hook forwarder; the others close it
+                            # with their Stop hook's external_session_status.
+                            completes_scheduled_run = True
+                            if event.get("source") == "pty_activity":
+                                if not pty_activity_harness_resolved:
+                                    conv = await asyncio.to_thread(
+                                        conversation_store.get_conversation, session_id
+                                    )
+                                    pty_activity_harness = await asyncio.to_thread(
+                                        _resolve_harness, conv
+                                    )
+                                    pty_activity_harness_resolved = True
+                                completes_scheduled_run = (
+                                    pty_activity_harness
+                                    not in _PTY_ACTIVITY_HOOK_FORWARDER_HARNESSES
+                                )
                             # PTY-activity status is a UI signal only. Terminal
                             # sub-agent delivery rides the Stop/StopFailure hook
                             # via external_session_status (the codex-shared path)
@@ -9076,6 +9112,7 @@ async def _relay_runner_stream_once(
                                     if isinstance(raw_blocked_on, str) and raw_blocked_on
                                     else None
                                 ),
+                                completes_scheduled_run=completes_scheduled_run,
                             )
                         if status == "running":
                             text_acc.clear()

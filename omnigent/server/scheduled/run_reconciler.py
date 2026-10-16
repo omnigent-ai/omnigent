@@ -10,7 +10,9 @@ fired from ``_publish_status`` the instant a fired conversation's turn reaches
 a terminal edge, flips the run ``running`` → ``succeeded``/``failed``. It rides
 the same long-lived SSE relay that already persists the conversation's
 ``live_status`` for a browserless scheduled fire, so it needs no live client
-and no periodic poll.
+and no periodic poll. For terminal-native harnesses with a hook forwarder, the
+terminal edge is the forwarder's ``external_session_status``; their pane-activity
+``idle`` does not complete a run.
 
 This module is the **sole orphan backstop**: a pure age-based force-fail run
 on the READ path. If a run is left ``running`` because its terminal event never

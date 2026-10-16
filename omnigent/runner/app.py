@@ -1664,7 +1664,11 @@ def create_runner_app(
         status: str,
         blocked_on: str | None = None,
     ) -> None:
-        event: dict[str, object] = {"type": "session.status", "status": status}
+        event: dict[str, object] = {
+            "type": "session.status",
+            "status": status,
+            "source": "pty_activity",
+        }
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         _publish_event(session_id, event)
