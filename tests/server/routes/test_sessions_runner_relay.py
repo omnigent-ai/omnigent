@@ -9,7 +9,7 @@ import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -3488,8 +3488,9 @@ async def test_relay_relinquishes_a_turn_this_replica_handed_off(
         assert session_id not in sessions_module._session_status_cache
         assert not any(row["event_name"] == "session_turn_failed" for row in rows)
         outcome = next(row for row in rows if row["event_name"] == "runner_stream_disconnected")
-        assert outcome["attributes"]["decision"] == "handed_off"
-        assert outcome["attributes"]["runner_handoff_reason"] == "rebalance"
+        attributes = cast("dict[str, object]", outcome["attributes"])
+        assert attributes["decision"] == "handed_off"
+        assert attributes["runner_handoff_reason"] == "rebalance"
     finally:
         shutdown_state.reset_for_tests()
         gate.set()
