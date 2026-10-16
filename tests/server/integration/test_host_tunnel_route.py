@@ -588,9 +588,20 @@ async def test_host_replacement_names_retirement_without_inventing_close_code(
         await asyncio.gather(old.future, return_exceptions=True)
 
 
-@pytest.mark.parametrize("cancellation", ["task", "scope"])
 @pytest.mark.parametrize(
-    "offline_result", ["success", "failure", "blocked", "diagnostics_failure"]
+    ("offline_result", "cancellation"),
+    [
+        ("success", "task"),
+        ("success", "scope"),
+        ("failure", "task"),
+        ("failure", "scope"),
+        ("blocked", "task"),
+        ("blocked", "scope"),
+        ("diagnostics_failure", "task"),
+        ("diagnostics_failure", "scope"),
+        ("diagnostics_blocked", "scope"),
+        ("callback_blocked", "scope"),
+    ],
 )
 async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
     db_uri: str,
@@ -616,6 +627,8 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
         finally:
             # Observe finalization at a cancellation checkpoint, retaining the real monitor.
             await anyio.lowlevel.checkpoint()
+            if offline_result == "diagnostics_blocked":
+                await asyncio.Event().wait()
             cleanup_completed.set()
             if offline_result == "diagnostics_failure":
                 raise RuntimeError("test diagnostics finalization failure")
@@ -644,10 +657,11 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
 
         # Hold only the persistence boundary; registration and reads remain real.
         monkeypatch.setattr(store, "set_offline", interrupted_offline)
-    if offline_result == "blocked":
+    if offline_result in {"blocked", "diagnostics_blocked", "callback_blocked"}:
         monkeypatch.setattr(
             host_tunnel, "_DISCONNECT_CLEANUP_TIMEOUT_S", budget(0.5), raising=False
         )
+    if offline_result == "blocked":
         # Reconnects within one timestamp tick still need protection from a stale write.
         frozen_time = now_epoch()
         monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: frozen_time)
@@ -661,6 +675,8 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
     async def on_disconnect(host_id: str, _owner: str | None) -> None:
         await anyio.lowlevel.checkpoint()
         disconnected.append(host_id)
+        if offline_result == "callback_blocked":
+            await asyncio.Event().wait()
 
     app.include_router(
         create_host_tunnel_router(
@@ -705,7 +721,7 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
                 comm.future.result()
         else:
             comm.future.result()
-        assert cleanup_completed.is_set()
+        assert cleanup_completed.is_set() == (offline_result != "diagnostics_blocked")
         assert disconnected == [_HOST_ID]
         assert all(task.done() for task in helpers)
         assert registry.get(_HOST_ID) is None
@@ -730,6 +746,10 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
             assert store.is_online(_HOST_ID), "A timed-out write must not retire the reconnect"
         if offline_result == "diagnostics_failure":
             assert "test diagnostics finalization failure" in caplog.text
+        if offline_result == "diagnostics_blocked":
+            assert "Timed out closing host" in caplog.text
+        if offline_result == "callback_blocked":
+            assert "on_host_disconnect callback timed out" in caplog.text
     finally:
         offline_release.set()
         if offline_started.is_set():
