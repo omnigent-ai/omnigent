@@ -5,10 +5,9 @@ A file the FileViewer classifies as a model (STL / 3MF / OBJ, via the shared
 ``<canvas>`` under the ``aria-label="3D preview of …"`` host — not as
 syntax-highlighted source nor the binary placeholder.
 
-We seed ASCII STL and OBJ fixtures because the filesystem PUT endpoint can only
-seed text (``str.encode(encoding)`` — base64 is not a text codec), and both
-ASCII formats are valid UTF-8 that round-trips through that path. STL is routed
-by its MIME type (``mimetypes.guess_type('x.stl')`` →
+We seed ASCII STL and OBJ fixtures as UTF-8 text through the filesystem PUT
+endpoint (a binary fixture would travel as ``encoding: latin-1``, one character
+per byte). STL is routed by its MIME type (``mimetypes.guess_type('x.stl')`` →
 ``application/vnd.ms-pki.stl``, a recognized model type); OBJ has no model MIME
 (``application/x-tgif``) so it exercises the extension fallback. Seeded via the
 filesystem PUT endpoint (no agent run).
