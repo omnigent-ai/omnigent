@@ -18,6 +18,9 @@ connectivity for a failure recent enough to plausibly be the cause of the
 stall, and a successful POST clears the slot (:func:`note_post_success`) so a
 recovered connection can't have an old failure misattributed to a later,
 unrelated stall.
+
+Connection-owned child liveness separately lets the runner's pane reaper spare
+a quiet native sub-agent until its turn or forwarder connection ends.
 """
 
 from __future__ import annotations
@@ -34,6 +37,67 @@ _state: dict[str, tuple[float, str] | None] = {"last_post_failure": None}
 # idle watchdog reads it, so a sub-agent still streaming while its parent is idle
 # counts as activity; once posts stop, the idle window bounds the hold.
 _last_post_at: dict[str, float | None] = {"value": None}
+
+_subagent_activity: dict[str, NativeSubagentActivity] = {}
+
+
+class NativeSubagentActivity:
+    """Track child execution for one live native-forwarder connection."""
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.active_threads: dict[str, str | None] = {}
+        self._observed_threads: set[str] = set()
+        self._lifecycle_threads: set[str] = set()
+        _subagent_activity[session_id] = self
+
+    def discover(self, thread_id: str) -> None:
+        """Hold a newly observed child without reversing a known terminal edge."""
+        if thread_id not in self._observed_threads:
+            self.note(thread_id, active=True, authoritative=False)
+
+    def tracks(self, thread_id: str) -> bool:
+        """Return whether this connection has observed *thread_id* as a child."""
+        return thread_id in self._observed_threads
+
+    def note(
+        self,
+        thread_id: str,
+        *,
+        active: bool,
+        turn_id: str | None = None,
+        authoritative: bool = True,
+    ) -> None:
+        """Prefer child lifecycle edges over untimed snapshots and previous-turn ends."""
+        if not authoritative and thread_id in self._lifecycle_threads:
+            return
+        self._observed_threads.add(thread_id)
+        if authoritative:
+            self._lifecycle_threads.add(thread_id)
+        current_turn = self.active_threads.get(thread_id)
+        if active:
+            self.active_threads[thread_id] = turn_id or current_turn
+        elif current_turn in {None, turn_id}:
+            self.active_threads.pop(thread_id, None)
+
+    def move(self, session_id: str) -> None:
+        """Keep child work attached to a pane whose parent session rotated."""
+        if _subagent_activity.get(self.session_id) is not self:
+            return
+        self.close()
+        self.session_id = session_id
+        _subagent_activity[session_id] = self
+
+    def close(self) -> None:
+        """Release this connection's hold without touching its replacement."""
+        if _subagent_activity.get(self.session_id) is self:
+            _subagent_activity.pop(self.session_id, None)
+
+
+def has_active_subagents(session_id: str) -> bool:
+    """Return whether the current native forwarder observes active child work."""
+    activity = _subagent_activity.get(session_id)
+    return activity is not None and bool(activity.active_threads)
 
 
 def record_post_failure(event_type: str, error: BaseException) -> None:
