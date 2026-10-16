@@ -306,7 +306,8 @@ def _build_sys_session_send_schema(
             "The user-input message to send to the sub-agent. The sub-agent "
             "treats this as the first user turn in its conversation. Pass a "
             "plain string for the normal contract, or pass "
-            "{input, purpose, model, harness, cost_budget} when a spec-level "
+            "{input, purpose, model, workspace, harness, cost_budget} when a "
+            "spec-level "
             "policy requires explicit dispatch metadata, a per-dispatch model "
             "override, an allowlisted harness override, or a per-subagent "
             "cost budget."
@@ -316,7 +317,8 @@ def _build_sys_session_send_schema(
             "The user-input message to send to the sub-agent. The sub-agent "
             "treats this as the first user turn in its conversation. Pass a "
             "plain string for the normal contract, or pass "
-            "{input, purpose, model, cost_budget} when a spec-level policy "
+            "{input, purpose, model, workspace, cost_budget} when a spec-level "
+            "policy "
             "requires explicit dispatch metadata, a per-dispatch model "
             "override, or a per-subagent cost budget."
         )
@@ -394,6 +396,20 @@ def _build_sys_session_send_schema(
                                             "session; unsupported harness/value "
                                             "combinations are rejected. Omitted = "
                                             "the harness or model default."
+                                        ),
+                                    },
+                                    "workspace": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "description": (
+                                            "Optional absolute workspace for the "
+                                            "sub-agent. The path must exist and be "
+                                            "a directory; when the sub-agent's "
+                                            "configured os_env.cwd is absolute the "
+                                            "workspace must also resolve inside it. "
+                                            "Sub-agents without an os_env.cwd reject "
+                                            "it. Applies only when this send CREATES "
+                                            "the sub-agent session."
                                         ),
                                     },
                                     "file_ids": {
