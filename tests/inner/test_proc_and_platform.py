@@ -695,3 +695,47 @@ def test_malloc_tuning_env_honors_overrides(monkeypatch: pytest.MonkeyPatch) -> 
         "MALLOC_ARENA_MAX": "1",
         "MALLOC_TRIM_THRESHOLD_": "65536",
     }
+
+
+def test_resolve_cli_binary_windows_fallback_matches_pathext_extension(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """On Windows the off-PATH fallback resolves a ``.EXE``/``.CMD`` shim.
+
+    ``resolve_cli_binary`` falls back to ``_cli_fallback_dirs`` when a CLI is
+    not on ``PATH``. The installed binary is ``claude.EXE`` (the Claude Code
+    Windows installer drops it in ``~/.local/bin``), not a bare ``claude`` — so
+    the fallback must expand the name with ``PATHEXT`` or it never matches and
+    the harness is wrongly reported "not configured". Before the PATHEXT
+    expansion this returned ``None`` on Windows.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.CMD")
+    shim = tmp_path / "claude.EXE"
+    shim.write_text("")
+    shim.chmod(0o755)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (tmp_path,))
+
+    # ``which`` returns None, so resolution must come from the fallback ladder.
+    resolved = _platform.resolve_cli_binary("claude", which=lambda _n: None)
+    assert resolved == str(shim)
+
+
+def test_resolve_cli_binary_posix_fallback_keeps_bare_name(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """On POSIX the PATHEXT expansion is skipped (bare name only).
+
+    Guards that the Windows ``.EXE`` matching does not leak into POSIX
+    resolution: a ``claude.EXE`` present but no bare ``claude`` must yield
+    ``None``.
+    """
+    monkeypatch.setattr(os, "name", "posix")
+    shim = tmp_path / "claude.EXE"
+    shim.write_text("")
+    shim.chmod(0o755)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (tmp_path,))
+
+    assert _platform.resolve_cli_binary("claude", which=lambda _n: None) is None
