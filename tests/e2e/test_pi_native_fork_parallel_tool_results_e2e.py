@@ -22,6 +22,7 @@ import httpx
 import pytest
 
 from omnigent.harnesses.pi_native.main import _SESSION_LABELS, _materialize_pi_agent_spec
+from omnigent.inner._proc import process_alive
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests._helpers.live_server import isolated_local_server, local_server_env, terminate_process
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
@@ -297,8 +298,6 @@ def test_pi_native_token_failure_recovers_without_replaying_tools(
     pi_fork_rig: tuple[httpx.Client, str, list[dict[str, Any]]], tmp_path: Path
 ) -> None:
     """Real server/runner/Pi: refresh, classified failures, cleanup and same-PID recovery."""
-    from omnigent.inner._proc import process_alive
-
     client, runner_id, requests = pi_fork_rig
     workspace = tmp_path / "workspace"
     spec = _materialize_pi_agent_spec(tmp_path)

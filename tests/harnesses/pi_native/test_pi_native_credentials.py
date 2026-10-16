@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import shutil
 import stat
+import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from omnigent.harnesses.pi_native import auth_command
 from omnigent.harnesses.pi_native import credentials as creds
+from omnigent.inner._proc import process_alive
 
 
 @pytest.fixture(autouse=True)
@@ -838,12 +846,6 @@ def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
 def test_generated_token_command_reports_only_safe_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, kind: str, token: str
 ) -> None:
-    import os
-    import shutil
-    import subprocess
-
-    from omnigent.harnesses.pi_native import auth_command
-
     if os.name != "posix" or shutil.which("node") is None:
         pytest.skip("the native Pi token wrapper requires POSIX and Node")
     if kind == "timeout":
@@ -3875,16 +3877,6 @@ def test_curated_tier_alias_resolves_before_bracket_strip() -> None:
 def test_native_token_helper_reaps_its_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
-    import os
-    import shlex
-    import shutil
-    import subprocess
-    import sys
-    import time
-
-    from omnigent.harnesses.pi_native import auth_command
-    from omnigent.inner._proc import process_alive
-
     if os.name == "nt" or shutil.which("node") is None:
         pytest.skip("POSIX process-group cleanup requires Node")
     if outcome in ("timeout", "shell_parent"):

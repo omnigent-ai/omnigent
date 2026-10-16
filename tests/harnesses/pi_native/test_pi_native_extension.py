@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -3682,8 +3683,6 @@ const statuses = () => posted.filter(e => e.type === "external_session_status");
 
 
 def test_native_auth_errors_are_correlated_and_redacted(tmp_path: Path) -> None:
-    import json
-
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for the Pi extension")

@@ -39,6 +39,11 @@ from omnigent.databricks_ai_gateway import (
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
     is_databricks_ai_gateway_url,
 )
+from omnigent.harnesses.pi_native.auth_command import (
+    AUTH_DIR_ENV,
+    AUTH_DIR_NAME,
+    wrap_auth_command,
+)
 from omnigent.inner._proc import kill_tree, spawn_kwargs
 from omnigent.models import model_catalog
 from omnigent.models.databricks_model_discovery import preferred_served_claude_model
@@ -1904,8 +1909,6 @@ def write_pi_models_config(
         rendered = provider.to_models_config()
     agent_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(agent_dir, 0o700)
-    from omnigent.harnesses.pi_native.auth_command import wrap_auth_command
-
     rendered = deepcopy(rendered)
     for provider_id, config in rendered["providers"].items():
         api_key = config.get("apiKey")
@@ -2027,8 +2030,6 @@ def pi_native_provider_launch(
     if os.name == "posix" and any(
         config.get("apiKey", "").startswith("!") for config in rendered["providers"].values()
     ):
-        from omnigent.harnesses.pi_native.auth_command import AUTH_DIR_ENV, AUTH_DIR_NAME
-
         env[AUTH_DIR_ENV] = str(agent_dir / AUTH_DIR_NAME)
     if provider.inference_bound:
         env["OMNIGENT_PI_INFERENCE_BOUND"] = "1"
