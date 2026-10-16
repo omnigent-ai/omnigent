@@ -3672,19 +3672,18 @@ wheels = [
 
 [[package]]
 name = "openshell"
-version = "0.0.89"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cloudpickle" },
+    { name = "googleapis-common-protos" },
     { name = "grpcio" },
     { name = "httpx" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0f/17/5eabfb94c00f8bd608a1e9d7c7320e200bbdde044ac1b64abc69ad1e6e5a/openshell-0.0.89-py3-none-macosx_13_0_arm64.whl", hash = "sha256:544f6f670b4b4158e4221ce6024e916c2f4f27c3d0c48387901cbc425cf1a6c4", size = 8393701, upload-time = "2026-07-22T17:55:05.874Z" },
-    { url = "https://files.pythonhosted.org/packages/66/6d/4d4a2d06532de5fd3561a40fd1669d224820aa51baf55276af3e258b82e9/openshell-0.0.89-py3-none-manylinux_2_39_aarch64.whl", hash = "sha256:94610327fa3428a5e366bf385a7831e27d87efaa009f1216449a5db4327ec9cf", size = 8490622, upload-time = "2026-07-22T17:55:25.982Z" },
-    { url = "https://files.pythonhosted.org/packages/01/98/f6d824285dbf3891e9c5f6fc826c23f790b3014b0fd5f4cd587a14335e05/openshell-0.0.89-py3-none-manylinux_2_39_x86_64.whl", hash = "sha256:9c83e1958693666290793e8f19933634e7e1a8bfc062061a0372014d5cea74fb", size = 8954597, upload-time = "2026-07-22T17:55:51.038Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/0d/9f0c2e133bd4bfc96b9e261b870d58230d7d98fc6c51ae8f7f71f8520157/openshell-0.1.2-py3-none-any.whl", hash = "sha256:8c409da4f176d42418d92366fe201f47cceef2c0fa432bfbce2bf938649d59cf", size = 150901, upload-time = "2026-09-28T03:58:28.39Z" },
 ]
 
 [[package]]
