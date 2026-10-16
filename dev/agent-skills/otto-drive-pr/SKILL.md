@@ -18,4 +18,6 @@ relative to the directory supplied by the native Skill tool.
 Substep numbers follow Resolve's `resolve-drive-pr`: 4.3 is the shared
 `otto-pr-review-loop`, and 4.4/4.5 are the agent's own live-validation and
 maintainer-handoff steps. "Fix" and "bug" mean the PR's change. The review path
-and fork takeovers apply only to agents that review other authors' PRs.
+and fork takeovers apply only to agents that review other authors' PRs. Handoff
+fields named here (`ci_status`, `ui_preview`, `validation_surface`,
+`files_changed`) are Resolve's; record the same facts in your agent's handoff.
