@@ -225,6 +225,10 @@ def delete_host_in_session(session: Session, row: SqlHost) -> Host:
     return _row_to_host(row)
 
 
+class HostOwnershipConflict(IntegrityError):
+    """A peer presented a host_id that another account owns."""
+
+
 class HostStore:
     """
     Persistent store for host registrations backed by SQLAlchemy.
@@ -287,8 +291,8 @@ class HostStore:
         able to claim another user's host_id — so re-owning is gated
         behind *allow_host_id_reown*, which the server sets only for the
         loopback single-user local server. Remote / multi-user servers
-        never set it, so the hijack boundary stays intact (the INSERT
-        raises ``IntegrityError`` and fails the handshake closed).
+        never set it, so the hijack boundary stays intact (the lookup
+        raises :class:`HostOwnershipConflict` and fails the handshake closed).
 
         :param host_id: Stable host identifier, e.g.
             ``"host_a1b2c3d4..."``.
@@ -354,10 +358,10 @@ class HostStore:
                 if row.deleted_at is not None:
                     raise ValueError("host has been deleted")
                 # W2-class boundary: a different user must not claim another
-                # user's host_id. Raise the same IntegrityError the old UNIQUE
-                # constraint produced so the tunnel handler rejects the hijack.
+                # user's host_id. The IntegrityError subclass keeps the tunnel
+                # handler's rejection and is never retried below.
                 if row.user_id != user_id and not allow_host_id_reown:
-                    raise IntegrityError(
+                    raise HostOwnershipConflict(
                         "host_id already owned by a different user",
                         params={"host_id": host_id, "user_id": user_id},
                         orig=Exception("UNIQUE constraint failed: hosts.host_id"),
@@ -426,7 +430,15 @@ class HostStore:
             session.add(row)
             return _row_to_host(row)
 
-        return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
+        try:
+            return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
+        except HostOwnershipConflict:
+            raise
+        except IntegrityError:
+            # A racing first registration of this host_id can commit between the
+            # lookup and the INSERT; the row now exists, so one more attempt takes
+            # the update path. Deterministic conflicts fail the same way again.
+            return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
 
     @staticmethod
     def _rotate_host_id(
