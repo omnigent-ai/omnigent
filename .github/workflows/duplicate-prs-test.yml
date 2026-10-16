@@ -13,6 +13,7 @@ on:
       - .github/workflows/duplicate-prs.test.js
       - .github/workflows/close-superseded-pr.js
       - .github/workflows/close-superseded-pr.test.js
+      - .github/workflows/close-superseded-pr.yml
   workflow_dispatch:
 
 permissions:
@@ -30,6 +31,9 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
       - name: Run duplicate-PR unit test
         run: node .github/workflows/duplicate-prs.test.js
       - name: Run superseded-PR unit test
