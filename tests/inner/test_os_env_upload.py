@@ -124,7 +124,6 @@ def test_publication_rechecks_staging_bytes(
         id=changed_id,
         name="changed.bin",
         size=len(payload),
-        sha256=digest,
         on_conflict=conflict,
     )
     assert helper.call({"op": "append", "id": changed_id, "offset": 0}, payload)["offset"] == 3
@@ -148,7 +147,6 @@ def test_publication_rechecks_staging_bytes(
         id=unchanged_id,
         name="unchanged.bin",
         size=len(payload),
-        sha256=digest,
         on_conflict=conflict,
     )
     assert helper.call({"op": "append", "id": unchanged_id, "offset": 0}, payload)[
