@@ -267,7 +267,7 @@ export function dateBucket(timestamp: number, now: Date): DateBucket {
 }
 
 /**
- * Split `rows` into non-empty groups in `order`, keeping input order within each
+ * Split `rows` into groups in `order`, keeping input order within each
  * group. A row with no key (or one outside `order`) lands in the last group
  * rather than vanishing.
  */
@@ -275,6 +275,7 @@ export function groupConversations<K extends string>(
   rows: readonly Conversation[],
   keyOf: (c: Conversation) => K | undefined,
   order: readonly K[],
+  keepEmpty?: K,
 ): { title: K; conversations: Conversation[] }[] {
   const byKey = new Map<K, Conversation[]>(order.map((key) => [key, []]));
   const fallback = byKey.get(order[order.length - 1]);
@@ -285,7 +286,7 @@ export function groupConversations<K extends string>(
   }
   return order.flatMap((title) => {
     const conversations = byKey.get(title) ?? [];
-    return conversations.length > 0 ? [{ title, conversations }] : [];
+    return conversations.length > 0 || title === keepEmpty ? [{ title, conversations }] : [];
   });
 }
 

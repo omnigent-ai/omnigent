@@ -205,6 +205,8 @@ class ServerInfoResponse(BaseModel):
     agent_install: bool = False
     # GET /v1/agents/{id}; absent on older servers, which clients treat as unsupported.
     agent_detail: bool = False
+    # Owner configuration reads and conditional PATCH updates.
+    agent_config_edit: bool = False
     branding: BrandingInfo
 
 
@@ -3150,6 +3152,8 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
+                "agent_config_edit": agent_store.supports_config_edit
+                and artifact_store is not None,
                 "branding": branding_snapshot.config(),
             }
         )

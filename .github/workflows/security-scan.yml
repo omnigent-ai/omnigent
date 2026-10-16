@@ -104,19 +104,17 @@ jobs:
 
       - name: Install trusted policy parser
         if: >-
-          github.event.pull_request.user.login == 'dependabot[bot]' &&
-          vars.DEPENDABOT_AUTOMERGE_MODE == 'merge'
+          github.event.pull_request.user.login == 'dependabot[bot]'
         run: |
           python3 -m venv "$RUNNER_TEMP/dependabot-policy-env"
           "$RUNNER_TEMP/dependabot-policy-env/bin/pip" install --disable-pip-version-check --only-binary=:all: PyYAML==6.0.3
           echo "$RUNNER_TEMP/dependabot-policy-env/bin" >> "$GITHUB_PATH"
 
-      - name: Evaluate Dependabot update policy
+      - name: Validate Dependabot action pins for CI
         id: dependabot
         if: >-
           steps.gate.outputs.scan == 'true' &&
-          github.event.pull_request.user.login == 'dependabot[bot]' &&
-          vars.DEPENDABOT_AUTOMERGE_MODE == 'merge'
+          github.event.pull_request.user.login == 'dependabot[bot]'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -125,6 +123,7 @@ jobs:
         run: >-
           python3 .github/scripts/dependabot_automerge.py
           --repository "$REPO" --pr-number "$PR" --expected-head "$HEAD_SHA"
+          --check-action-pins
 
       - name: Secret scan (added lines)
         if: ${{ steps.gate.outputs.scan == 'true' }}
@@ -170,14 +169,18 @@ jobs:
         # and CVE-flagged versions. Only fires when uv.lock is in the changeset
         # to avoid blocking PRs when main's baseline lockfile already has open
         # advisories on main.
-        # Eligible pilot updates use completed Trivy reports at merge time.
+        # Dependabot advisories are reviewed from Trivy after CI. Unchanged
+        # baseline findings must not prevent compatibility tests from running.
         if: ${{ steps.gate.outputs.scan == 'true' }}
         env:
-          DEPENDABOT_ELIGIBLE: ${{ steps.dependabot.outputs.eligible }}
+          DEPENDABOT_PR: >-
+            ${{ github.event.pull_request.user.login == 'dependabot[bot]' &&
+                github.event.pull_request.user.type == 'Bot' &&
+                github.event.pull_request.head.repo.full_name == github.repository }}
         working-directory: pr
         run: |
-          if [ "$DEPENDABOT_ELIGIBLE" = "true" ]; then
-            echo "Eligible Dependabot update; Trivy policy is enforced by the merge worker."
+          if [ "$DEPENDABOT_PR" = "true" ]; then
+            echo "Dependabot update; Trivy findings are checked by the merge worker or a maintainer."
             exit 0
           fi
           if ! grep -qxF 'uv.lock' "$GITHUB_WORKSPACE/changed.txt"; then
