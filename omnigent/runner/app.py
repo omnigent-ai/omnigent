@@ -88,6 +88,7 @@ from omnigent.runner.acp_subagent_sessions import (
 from omnigent.runner.app_support import (
     SpecResolver,
     _client_safe_error_detail,
+    _client_safe_error_payload,
     _CommentRelayBinding,
     _require_full_native_lock_coverage,
     _resolve_forwarded_message_content,
@@ -2186,6 +2187,23 @@ def create_runner_app(
         return JSONResponse(
             status_code=exc.http_status,
             content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    @app.exception_handler(Exception)
+    async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        route = getattr(request.scope.get("route"), "path", None)
+        session_id = request.path_params.get("session_id")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "runner_request_failed",
+                **_client_safe_error_payload(
+                    exc,
+                    context="runner HTTP request",
+                    session_id=session_id if isinstance(session_id, str) else None,
+                    route=route if isinstance(route, str) else None,
+                ),
+            },
         )
 
     @app.exception_handler(ValueError)
