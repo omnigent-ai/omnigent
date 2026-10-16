@@ -46,6 +46,12 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
+# when the host's launch handler raised instead of returning a result. Unlike
+# the codes above this is not a categorical refusal — the fault may have landed
+# after the runner was already spawned — so it reports the failure without
+# claiming the launch is terminal.
+LAUNCH_HANDLER_FAILED_ERROR_CODE = "launch_handler_failed"
+
 # Capability tokens a host advertises in ``HostHelloFrame.capabilities``. A token
 # is present only in builds that have the feature, so the server gates on
 # presence — no host-version table to maintain, and a build that lacks the
